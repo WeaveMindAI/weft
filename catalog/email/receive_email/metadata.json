@@ -26,7 +26,6 @@
     {
       "name": "fromContains",
       "type": "String",
-      "required": false,
       "label": "From contains",
       "placeholder": "Only fire when the sender contains this",
       "description": "Only fire on messages whose From header contains this text. Leave empty for any sender."
@@ -34,7 +33,6 @@
     {
       "name": "subjectContains",
       "type": "String",
-      "required": false,
       "label": "Subject contains",
       "placeholder": "Only fire when the subject contains this",
       "description": "Only fire on messages whose subject contains this text. Leave empty for any subject."

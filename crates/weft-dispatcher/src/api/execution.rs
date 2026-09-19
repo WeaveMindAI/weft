@@ -20,6 +20,11 @@ use crate::journal::{ExecutionPage, ExecutionQuery};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
+/// How many ambiguous matches an error names before it stops. Enough to
+/// recognise the run you meant, few enough that the instruction after
+/// them is still on screen.
+const AMBIGUOUS_PREFIX_SHOWN: usize = 5;
+
 /// The one execution of the caller's whose color starts with `prefix`
 /// (a full uuid resolves to itself). 404 when nothing matches, 409
 /// when the prefix is short enough to match several, naming them.
@@ -43,11 +48,22 @@ pub async fn resolve_color(
     match matches.as_slice() {
         [] => Err((StatusCode::NOT_FOUND, format!("no execution starts with '{prefix}'"))),
         [one] => Ok(Json(serde_json::json!({ "color": one.to_string() }))),
+        // A count and a few short ids, never the whole list: an empty or
+        // one-character prefix matches everything the project ever ran,
+        // and printing a hundred full uuids buries the one sentence that
+        // says what to do about it.
         several => Err((
             StatusCode::CONFLICT,
             format!(
-                "'{prefix}' starts more than one execution ({}, ...); give more characters",
-                several.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+                "'{prefix}' starts {} executions ({}{}); give more characters",
+                several.len(),
+                several
+                    .iter()
+                    .take(AMBIGUOUS_PREFIX_SHOWN)
+                    .map(|c| c.to_string()[..8].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if several.len() > AMBIGUOUS_PREFIX_SHOWN { ", ..." } else { "" },
             ),
         )),
     }
@@ -62,11 +78,35 @@ pub async fn cancel(
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
     authorize_execution(&*state.journal, &caller.0, color).await?;
+    // A run that already ended has nothing to cancel: said so, with
+    // its status, instead of a silent no-op the caller would wait on
+    // forever (the editor's Stop once sat on "Cancelling..." for a run
+    // that had finished an hour before).
+    if let Some(summary) = state
+        .journal
+        .execution_summary(color)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execution summary: {e}")))?
+    {
+        if let Some(refusal) = already_ended(&summary.status) {
+            return Err((StatusCode::CONFLICT, format!("execution {color} already ended ({refusal})")));
+        }
+    }
     cancel_color(&state, color, &CancelCause::User).await.map_err(|e| {
         tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The status word to answer a cancel of a run that is over with, or
+/// `None` while the run can still be cancelled (running, or a corrupt
+/// row whose terminal nobody can read: cancelling it is the safe side).
+fn already_ended(status: &str) -> Option<&str> {
+    match status {
+        "completed" | "failed" | "cancelled" => Some(status),
+        _ => None,
+    }
 }
 
 /// Cancel every color in `targets`, each with its own cause, attempting
@@ -161,10 +201,9 @@ pub async fn cancel_color(
 }
 
 /// THE definition of a dispatcher-side cancel write: the ordered
-/// `(event, dedup_key)` list that flips a color terminal. Pure, so the
-/// transactional cancel writers (`Journal::cancel_execution` and
-/// `Journal::cancel_never_claimed_execution`) emit IDENTICAL rows and
-/// can never drift on the ordering rule, the dedup-key format, or the
+/// `(event, dedup_key)` list that flips a color terminal. Pure, so
+/// every transactional cancel writer emits IDENTICAL rows and can
+/// never drift on the ordering rule, the dedup-key format, or the
 /// closure-emission policy.
 ///
 /// Per-node cancellations come BEFORE `ExecutionCancelled` (always the last
@@ -203,7 +242,7 @@ pub fn cancel_terminal_events(
                         continue;
                     }
                     let frames_key: String =
-                        e.frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".");
+                        weft_core::frames::frames_text(&e.frames);
                     writes.push((
                         ExecEvent::NodeCancelled {
                             color,
@@ -266,6 +305,36 @@ pub async fn program_for_cancel(
         );
     }
     Ok(lookup.program())
+}
+
+/// Is anything actually WORKING on this execution?
+///
+/// An execution advances because a task carries it: a `pending` one a
+/// worker will claim, or a `claimed` one a worker holds. With neither,
+/// the run is recorded as going and nothing is going to move it, which
+/// is a different state from "still in flight" and has to be told apart
+/// from it. A caller that waits on the first forever is waiting on a
+/// run that is already over.
+///
+/// Deliberately a question about WORK, not about time: nothing here
+/// ages a run out, because a legitimate setup may take as long as the
+/// nodes inside it take. Only the absence of any task says nobody is
+/// coming.
+pub(crate) async fn execution_is_being_worked_on(
+    state: &DispatcherState,
+    color: Color,
+) -> anyhow::Result<bool> {
+    // `task.color` is TEXT, so the color goes in as its string form;
+    // binding the uuid itself matches nothing and would read as "no
+    // task", which here means "declare every run dead".
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT count(*) FROM task \
+         WHERE color = $1 AND status IN ('pending', 'claimed')",
+    )
+    .bind(color.to_string())
+    .fetch_optional(&state.pg_pool)
+    .await?;
+    Ok(row.map(|(n,)| n > 0).unwrap_or(false))
 }
 
 /// The terminal outcome recorded for a color, if any. The journal is
@@ -383,8 +452,18 @@ pub async fn get(
 /// One wait a parked run holds: the node, the token that answers it,
 /// and the signal kind (a `timer` is woken, anything else expects a
 /// value).
+///
+/// The node is here twice on purpose, because two different questions
+/// are asked of it. `id` is what the runtime keys the wait by, which
+/// for a node inside an included file carries the file's path
+/// (`@src:sweep.key`) and is never shown to anyone. `node` is that same
+/// node the way the program spells it, and it is the one on the wire:
+/// this rides the run summary that `weft ps` prints and that an agent
+/// reads through `--json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParkedWait {
+    #[serde(skip)]
+    pub id: String,
     pub node: String,
     pub token: String,
     pub kind: String,
@@ -403,7 +482,12 @@ fn waits_of(signals: &[crate::journal::SignalRegistration], color: Color) -> any
         .filter(|s| s.is_resume && s.color == Some(color))
         .map(|s| {
             let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&s.spec_json)?;
-            Ok(ParkedWait { node: s.node_id.clone(), token: s.token.clone(), kind: spec.kind })
+            Ok(ParkedWait {
+                id: s.node_id.clone(),
+                node: weft_core::project::plain_id(&s.node_id),
+                token: s.token.clone(),
+                kind: spec.kind,
+            })
         })
         .collect()
 }
@@ -492,9 +576,25 @@ pub async fn outputs(
     authorize_execution(&*state.journal, &caller.0, color).await?;
     let sources = crate::projection::reconstruct_execution(&state, color).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
+    let project = sources[&color].project();
+    // A forwarding boundary is the compiler's: what entered a group is
+    // the wire of the node that fed it, what left is the wire of the
+    // node that filled it, so its wire says nothing a person's wire
+    // does not, and its name (the group's) would collide with theirs.
+    // A loop's Out is different: the list it gathers over the
+    // iterations exists nowhere else, so it stays, as the loop's own
+    // output (`doubler.results`).
+    let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
+        && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
     let wires = sources[&color].output_wires()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let nodes = sources[&color].project().nodes.iter().map(|node| node.id.clone()).collect();
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .iter().filter(|wire| !boundary(&wire.node))
+        .map(|wire| weft_core::run_spec::ExpectedWire::spell(project, wire)).collect();
+    // Every place of the run, spelled the way the wires are: a node in
+    // an included file once per site that reaches it, a group once.
+    let nodes = weft_core::project::selection::every_place(project).iter()
+        .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))
 }
 
@@ -602,6 +702,11 @@ pub struct ListExecutionsParams {
     pub started_before: Option<u64>,
     /// Only runs of this phase (`fire`, `trigger_setup`, `infra_setup`).
     pub phase: Option<weft_core::context::Phase>,
+    /// Only runs started by this entry node.
+    pub entry_node: Option<String>,
+    /// Only runs that ended this way (`completed`, `failed`,
+    /// `cancelled`, `running`).
+    pub status: Option<String>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
@@ -619,6 +724,8 @@ pub async fn list_executions(
         started_after: params.started_after,
         started_before: params.started_before,
         phase: params.phase,
+        entry_node: params.entry_node,
+        status: params.status,
     };
     let mut page = state
         .journal
@@ -650,6 +757,8 @@ pub async fn latest_for_project(
         started_after: None,
         started_before: None,
         phase: None,
+        entry_node: None,
+        status: None,
     };
     let mut page = state
         .journal
@@ -660,13 +769,19 @@ pub async fn latest_for_project(
     page.executions.into_iter().next().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `POST /executions/{color}/wake/{node}`: resolve a pure time wait
-/// now. The node's registered suspension for this color must be a
-/// timer (`weft_core::signal::Timer::TAG`); the fire carries the
-/// payload a timer tick carries (`scheduledTime` = `actualTime` = now)
-/// through the same lifecycle gate every fire passes. Any other kind
-/// is refused naming it: a wait that expects a value is answered with
-/// one (`weft fire`-less: the form URL, the extension), never skipped.
+/// `POST /executions/{color}/wake/{node}`: resolve a wait now, instead
+/// of waiting for whatever it waits for.
+///
+/// This side decides whether the wake may happen: the caller's tenancy,
+/// and that the node really has a wait parked on this color. What the
+/// wait then wakes WITH is the signal kind's own shape, so the listener
+/// holding it is asked, and it answers with nothing for every kind that
+/// has no truthful stand-in (a form is waiting for an answer; there is
+/// no inventing one). Those are refused naming the kind, and the fire
+/// goes through the same lifecycle gate every other fire passes.
+///
+/// Nothing here knows which kinds can be woken. That is why: a tier
+/// that minted one kind's payload would have to be edited for the next.
 pub async fn wake(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -679,27 +794,50 @@ pub async fn wake(
     let waits = parked_waits(&state, color)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
-    let Some(wait) = waits.into_iter().find(|w| w.node == node) else {
+    // Either spelling of the node reaches its wait: the CLI resolves to
+    // the runtime's id before it calls, and anything addressing this
+    // endpoint on its own has only ever seen the spelled form.
+    let Some(wait) = waits.into_iter().find(|w| w.id == node || w.node == node) else {
         // Bounded, like every other caller string this surface echoes: the
         // node name is a raw path segment, so an enormous one would come
-        // straight back in the body.
-        let node = weft_core::truncate_user_string(&node, 256);
+        // straight back in the body. Then read as a person reads it: the
+        // caller may have sent the compiler's id, and the message names a
+        // command whose `--node` takes the spelling the program uses.
+        let node = weft_core::project::plain_id(&weft_core::truncate_user_string(&node, 256));
         return Err((
             StatusCode::NOT_FOUND,
             format!("'{node}' is not waiting on anything in {color}; `weft events {color} --node {node}` shows what it did"),
         ));
     };
-    if wait.kind != <weft_core::signal::Timer as weft_core::signal::Signal>::TAG {
+    // WHETHER a wake may happen is this side's question, and it has been
+    // answered above: the project is live, the node really is waiting,
+    // the caller may touch it. WHAT it wakes with is the signal kind's,
+    // so the listener holding it is asked. A kind that cannot be woken
+    // by hand answers with nothing, and the refusal below names the kind
+    // without this tier ever knowing one.
+    let handle = state
+        .listeners
+        .ensure_placed_handle(
+            &wait.token,
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve the signal's listener: {e:#}")))?;
+    let payload = crate::listener::wake_by_hand(&handle, &wait.token)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ask what it wakes with: {e:#}")))?;
+    let Some(payload) = payload else {
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "'{node}' is waiting on a {} signal, which expects a value; answer it (its form, in the browser extension or through its signal URL) instead of waking it",
+                "'{}' is waiting on a {} signal, which expects a value; answer it (its form, in the browser extension or through its signal URL) instead of waking it",
+                weft_core::project::plain_id(&node),
                 wait.kind
             ),
         ));
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    let payload = serde_json::json!({ "scheduledTime": now, "actualTime": now });
+    };
     crate::api::signal::fire_registered_signal(&state, &wait.token, payload).await
 }
 
@@ -832,6 +970,7 @@ mod waits_tests {
             consumer_payload: None,
             surface_kind: "public_entry".into(),
             mount_path: None,
+            mount_methods: Vec::new(),
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
@@ -855,10 +994,26 @@ mod waits_tests {
         assert_eq!(
             waits,
             vec![
-                ParkedWait { node: "hold".into(), token: "a".into(), kind: "timer".into() },
-                ParkedWait { node: "review".into(), token: "c".into(), kind: "form".into() },
+                ParkedWait { id: "hold".into(), node: "hold".into(), token: "a".into(), kind: "timer".into() },
+                ParkedWait { id: "review".into(), node: "review".into(), token: "c".into(), kind: "form".into() },
             ]
         );
+    }
+
+    /// A wait on a node inside an included file is keyed by the file's
+    /// path, which nobody can be asked to type. The list carries both:
+    /// the id stays off the wire for the match, the spelling goes out
+    /// for whoever reads the run.
+    #[test]
+    fn a_wait_inside_an_included_file_goes_out_spelled() {
+        let mine = Color::new_v4();
+        let signals = vec![signal("a", Some(mine), "@src:sweep.key", true, "timer")];
+        let waits = waits_of(&signals, mine).unwrap();
+        assert_eq!(waits[0].id, "@src:sweep.key", "the match key is the runtime's");
+        assert_eq!(waits[0].node, "sweep.key", "what goes out is what the program says");
+        let wire = serde_json::to_value(&waits[0]).unwrap();
+        assert_eq!(wire["node"], "sweep.key");
+        assert!(wire.get("id").is_none(), "the internal id never reaches the wire");
     }
 }
 
@@ -882,7 +1037,7 @@ mod cancel_tests {
 
     fn open_firing(color: Color) -> Vec<ExecEvent> {
         vec![
-            ExecEvent::NodeKicked { color, node_id: "wait".into(), firing: true, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeKicked { color, node_id: "wait".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             ExecEvent::NodeStarted { color, node_id: "wait".into(), frames: vec![], at_unix: 1 },
         ]
     }
@@ -902,5 +1057,40 @@ mod cancel_tests {
         let kinds: Vec<&str> = without.iter().map(|(e, _)| e.kind_str()).collect();
         assert_eq!(kinds, vec!["execution_cancelled"]);
         assert!(matches!(&without[0].0, ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));
+    }
+}
+
+#[cfg(test)]
+mod wake_tier_boundary {
+    /// This module's own source, read at compile time. The test module
+    /// is cut off first, since the words to look for would otherwise be
+    /// found in the looking.
+    fn code() -> &'static str {
+        include_str!("execution.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("a split always yields a first piece")
+    }
+
+    /// Waking a parked wait must name no signal kind and mint no kind's
+    /// payload. Which kinds can be woken, and with what, is the
+    /// listener's answer (`/wake_by_hand`), because it is the tier that
+    /// owns the kinds.
+    ///
+    /// A source check, because putting it back is SILENT: a second
+    /// wakeable kind would simply be refused with "that expects a
+    /// value", which reads like a deliberate rule rather than a tier
+    /// that was never told.
+    #[test]
+    fn waking_names_no_kind_and_mints_no_payload() {
+        for needle in ["Timer", "\"timer\"", "scheduledTime", "actualTime"] {
+            assert!(
+                !code().contains(needle),
+                "the wake handler must not know a signal kind: found `{needle}`. \
+                 What a wait wakes with is the kind's own shape and comes from \
+                 the listener; minting one here means the next wakeable kind is \
+                 quietly unwakeable."
+            );
+        }
     }
 }

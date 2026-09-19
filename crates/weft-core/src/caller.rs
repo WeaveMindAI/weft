@@ -13,7 +13,8 @@
 //!
 //! - [`CallerConnection`] is the I/O boundary (a trait). The production
 //!   impl (engine crate) talks over the worker<->gateway socket; the
-//!   fake (test-helpers) records calls and scripts inbound messages. The
+//!   fake (shipped, the node-test rig attaches it) records calls and
+//!   scripts inbound messages. The
 //!   engine wires one onto the `ContextHandle` for runs that have a live
 //!   connection; runs without one expose `None`.
 //! - [`CallerHandle`] is the ergonomic author-facing wrapper
@@ -30,11 +31,9 @@
 //! module re-expresses the relevant subset as a runtime
 //! [`CallerRuntimeConfig`] the connection layer reads.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-// `Ordering` is only used by the hand-rolled fake (test-helpers); gate the
-// import so a default build (fake compiled out) has no unused import.
-#[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
@@ -44,6 +43,131 @@ use serde_json::Value;
 use crate::error::WeftResult;
 use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Protocol};
 use crate::wait::SuspendPolicy;
+
+/// What the caller sent to OPEN the exchange, as the gateway saw it:
+/// the request line of an HTTP call, or the upgrade request of a
+/// WebSocket. One shape for both protocols, built when the caller
+/// ARRIVES (the dispatcher's `live_arrival` task), by merging what the
+/// routing token signed at the handshake (the route, the gate's
+/// verdict, the path captures) with the method, query and headers as
+/// they actually arrived. From there it is carried everywhere it is
+/// read: the
+/// trigger's wake payload (so a trigger node fans it onto ports), the
+/// execute task's start record (so the worker puts it on the
+/// connection), and [`HttpRequestParts`] (beside the body).
+///
+/// `path` is the path AS CALLED under the project, without the tenant
+/// prefix and without a leading slash (`chat/room7`); `params` are the
+/// route pattern's captures for it (`{"room": "room7"}`); `caller` is
+/// the identity the auth gate established (`None` on an open route).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRequest {
+    /// Absent reads as empty rather than refusing, so a trigger whose
+    /// method is fixed by the protocol can leave it out of what it
+    /// wakes with. A socket upgrade is always a GET, so requiring it
+    /// there would make a hand-typed `weft run --fire` fail deep in the
+    /// node instead of at the envelope check that names the fix.
+    #[serde(default)]
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<Value>,
+}
+
+impl LiveRequest {
+    /// Read a header case-insensitively, as HTTP headers are.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The status line and headers of an HTTP response. Held by the
+/// worker until the program's first outbound item, so the program
+/// decides them; a `Default` head is `200` with no headers. Ignored
+/// on a WebSocket connection, whose only head is the upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseHead {
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// Bytes a reader of this body ignores (an SSE comment line, a bare
+    /// newline between ndjson lines), which the worker writes when the
+    /// body has been quiet for a heartbeat. A write is the only thing
+    /// that finds a caller who left without a word, so a body with no
+    /// filler (a raw stream, where any byte is payload) is only found
+    /// gone when the program next writes, or when the connection itself
+    /// reports the drop. Whoever frames the body names its filler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<String>,
+}
+
+impl Default for ResponseHead {
+    fn default() -> Self {
+        Self { status: 200, headers: Vec::new(), keepalive: None }
+    }
+}
+
+impl ResponseHead {
+    pub fn new(status: u16) -> Self {
+        Self { status, headers: Vec::new(), keepalive: None }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// The head with the filler this body's framing ignores (see
+    /// [`Self::keepalive`]).
+    pub fn with_keepalive(mut self, filler: impl Into<String>) -> Self {
+        self.keepalive = Some(filler.into());
+        self
+    }
+
+    /// Does the head already name a content type?
+    pub fn has_content_type(&self) -> bool {
+        self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    }
+
+    /// The head with a content type matching the chunk's shape
+    /// (`application/json`, `text/plain; charset=utf-8`,
+    /// `application/octet-stream`), unless it already names one.
+    pub fn with_content_type_for(mut self, chunk: &OutboundChunk) -> Self {
+        if !self.has_content_type() {
+            let ct = match chunk {
+                OutboundChunk::Json(_) => "application/json",
+                OutboundChunk::Text(_) => "text/plain; charset=utf-8",
+                OutboundChunk::Bytes(_) => "application/octet-stream",
+            };
+            self.headers.push(("content-type".into(), ct.into()));
+        }
+        self
+    }
+}
+
+/// Why a WebSocket session ends, as the close frame carries it. The
+/// default is the normal closure (`1000`) with no reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseReason {
+    pub code: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+impl Default for CloseReason {
+    fn default() -> Self {
+        Self { code: 1000, reason: String::new() }
+    }
+}
 
 /// Runtime subset of the live-connection config the connection layer
 /// reads. Derived once from the trigger's live-caller config when the
@@ -56,11 +180,16 @@ pub struct CallerRuntimeConfig {
     pub data_type: DataType,
     pub backpressure: Backpressure,
     pub error_mode: ErrorMode,
-    /// Worker-clock bound for the connect barrier and any bounded
-    /// caller-reply wait. Always > 0 (validated on the signal).
+    /// Worker-clock bound on the wait for the caller to attach before
+    /// the run starts. Always > 0 (validated on the signal).
     pub connect_timeout_secs: u64,
     /// Reject an inbound body / message larger than this.
     pub max_inbound_bytes: u64,
+    /// How long the caller's machine may leave what we sent it
+    /// unacknowledged before the connection is called dead. `0` leaves
+    /// the machine's own default. See
+    /// [`crate::signal::DEFAULT_CALLER_SILENCE_SECS`].
+    pub caller_silence_secs: u64,
     /// Max total session duration. `0` = no cap.
     pub max_session_secs: u64,
     /// The run's suspension defaults (the single `can_suspend` axis +
@@ -73,13 +202,18 @@ pub struct CallerRuntimeConfig {
     /// connection retains for cursors. Bounds RAM on a long-lived socket;
     /// cursors only read this window (never the DB). Always >= 1.
     pub inbound_window: usize,
+    /// What the journal keeps of this conversation. The same type a bus
+    /// carries, so the two cannot answer differently: how long a window
+    /// accumulates before one row goes out, whether content is kept at
+    /// all, and where it gets trimmed.
+    pub journal: crate::stream_journal::JournalPolicy,
 }
 
 impl CallerRuntimeConfig {
     /// Project a live-caller trigger's config onto the runtime subset the
     /// connection layer needs. `protocol` comes from which kind fired
-    /// (`ApiEndpoint` -> `Http`, `LiveSocket` -> `Websocket`), not a config
-    /// field, so it is passed alongside the shared body.
+    /// (`Route` -> `Http`, `Socket` -> `Websocket`), not a config field,
+    /// so it is passed alongside the shared body.
     pub fn from_config(cfg: &LiveConnectionConfig, protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -88,9 +222,11 @@ impl CallerRuntimeConfig {
             error_mode: cfg.error_mode,
             connect_timeout_secs: cfg.connect_timeout_secs,
             max_inbound_bytes: cfg.max_inbound_bytes,
+            caller_silence_secs: cfg.caller_silence_secs,
             max_session_secs: cfg.max_session_secs,
             suspend: cfg.suspend,
             inbound_window: cfg.window.unwrap_or(DEFAULT_INBOUND_WINDOW),
+            journal: cfg.journal_policy(),
         }
     }
 }
@@ -143,22 +279,17 @@ pub enum CallerError {
     /// silently double-finishing.
     #[error("response/session already completed")]
     AlreadyTerminated,
-    /// The CONNECT barrier (`ensure_connected` / waiting for the caller to
-    /// attach) elapsed without the caller arriving. Worker-clock driven so a
-    /// never-arriving caller cannot pin a worker forever. This is the ONLY
-    /// place a `Timeout` arises: an inbound read (`receive` / `request`) is
-    /// unbounded and never yields `Timeout` (a node may wait hours for the
-    /// next message); a read ends via a message, `Disconnected`, or the
-    /// session cap.
-    #[error("caller did not connect within {waited_secs}s")]
-    Timeout { waited_secs: u64 },
+    /// A response head was given after the first item already went to
+    /// the wire. The status line and headers are committed by the first
+    /// outbound item (an explicit head, or a chunk with the defaults),
+    /// so a later head cannot be honored; fails loud rather than
+    /// silently dropping the status the program asked for.
+    #[error("response head already sent; status and headers are set by the first outbound item")]
+    HeadAlreadySent,
     /// An inbound body / message exceeded `max_inbound_bytes`. Rejected
     /// loud (untrusted-caller abuse vector).
     #[error("inbound payload {got_bytes} bytes exceeds cap {cap_bytes}")]
     InboundTooLarge { got_bytes: u64, cap_bytes: u64 },
-    /// The total session exceeded `max_session_secs`.
-    #[error("session exceeded max duration {cap_secs}s")]
-    SessionExpired { cap_secs: u64 },
     /// The cursor's offset was trimmed out of the in-RAM window (cursors
     /// only read RAM, never the DB). The cursor is MOVED to `oldest_resident`
     /// (the earliest message still retained), so the next `receive()` resumes
@@ -179,14 +310,24 @@ pub enum CallerError {
     /// frame encode failed). Fails loud; never silently dropped.
     #[error("caller transport error: {0}")]
     Transport(String),
+    /// This exchange stopped being written to the journal, so the run
+    /// refuses to keep answering: what it said from here on would exist
+    /// nowhere afterwards. The twin of the bus's
+    /// `SendError::JournalDegraded`, and for the same reason: of the
+    /// three ways to handle a lost record, carrying on quietly is the
+    /// one that leaves a run looking clean with its conversation
+    /// missing, which nobody finds until they go looking.
+    #[error("this caller's exchange is no longer being recorded: {0}")]
+    JournalLost(String),
 }
 
 impl CallerError {
     /// Does this outcome mean "the inbound stream has ended, stop reading"
-    /// (as opposed to a failure to propagate)? True for the genuinely terminal
-    /// outcomes a read loop should break on cleanly: the caller disconnected,
-    /// the connect barrier timed out, or the session cap fired. The stream is
-    /// over and nothing more will arrive.
+    /// (as opposed to a failure to propagate)? True for the one genuinely
+    /// terminal outcome a read loop should break on cleanly: the caller
+    /// disconnected, so nothing more will arrive. The session cap lands here
+    /// too, because the engine enforces it at the transport
+    /// (`ExchangeEnd::SessionCapExceeded`) by closing the connection.
     ///
     /// `FellBehind` is deliberately NOT here: it is RESUMABLE, not terminal.
     /// The stream continues; this reader merely lost the trimmed-out messages
@@ -203,12 +344,7 @@ impl CallerError {
     /// [`WsCaller::recv_next`] / [`CallerCursor::recv_next`] which return
     /// `Ok(None)` exactly on these.
     pub fn ends_stream(&self) -> bool {
-        matches!(
-            self,
-            CallerError::Disconnected
-                | CallerError::Timeout { .. }
-                | CallerError::SessionExpired { .. }
-        )
+        matches!(self, CallerError::Disconnected)
     }
 }
 
@@ -223,16 +359,6 @@ pub fn check_inbound_size(got_bytes: u64, cap_bytes: u64) -> Result<(), CallerEr
     }
 }
 
-/// Pure session-duration cap check. `cap_secs == 0` disables the cap.
-/// `Ok(())` if within budget, `Err(SessionExpired)` otherwise.
-pub fn check_session_duration(elapsed_secs: u64, cap_secs: u64) -> Result<(), CallerError> {
-    if cap_secs != 0 && elapsed_secs > cap_secs {
-        Err(CallerError::SessionExpired { cap_secs })
-    } else {
-        Ok(())
-    }
-}
-
 /// Whether a node's terminal act may proceed, given whether the
 /// connection has already been terminated. Pure transition: `false ->
 /// true` is the only legal terminal, every later one is rejected. The
@@ -242,6 +368,18 @@ pub fn check_session_duration(elapsed_secs: u64, cap_secs: u64) -> Result<(), Ca
 pub fn try_terminate(already_terminated: bool) -> Result<(), CallerError> {
     if already_terminated {
         Err(CallerError::AlreadyTerminated)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether an explicit response head may still be sent, given whether
+/// anything already went to the wire. Same pure transition shape as
+/// [`try_terminate`]: the first outbound item commits the head, every
+/// later head is refused.
+pub fn try_send_head(wire_started: bool) -> Result<(), CallerError> {
+    if wire_started {
+        Err(CallerError::HeadAlreadySent)
     } else {
         Ok(())
     }
@@ -276,7 +414,8 @@ pub enum InboundMessage {
 /// [`CallerHandle`] above this); methods invalid for the active protocol
 /// return `CallerError::WrongProtocol`. Implementations:
 ///   - production (engine crate): drives the worker<->gateway socket.
-///   - fake (test-helpers): records calls, scripts inbound messages.
+///   - fake (below, shipped: the node-test rig attaches it): records
+///     calls, scripts inbound messages.
 ///
 /// All methods take `&self`: a connection is shared (`Arc`) across the
 /// concurrently-running nodes of one execution, which talk to the caller
@@ -289,13 +428,28 @@ pub trait CallerConnection: Send + Sync {
     /// Is the caller attached right now? Never fails; pure status read.
     fn is_connected(&self) -> bool;
 
-    /// Wait until the caller is actually attached. The worker is woken
-    /// before the caller is pointed at it (true for BOTH protocols), so
-    /// this may wait; if already connected it returns immediately. Bounded
-    /// by `connect_timeout_secs`; on expiry returns `Timeout`. If the
-    /// caller was attached then dropped, returns `Disconnected` carrying
-    /// the resolved policy action.
+    /// Has anything been queued toward the wire yet (a chunk, a
+    /// terminal, a head)? Once true the response head is committed and
+    /// an explicit one is refused (`HeadAlreadySent`). Pure status
+    /// read, so a node that may run before or after a stream (a Close)
+    /// can pick the right terminal without a refusal round-trip.
+    fn wire_started(&self) -> bool;
+
+    /// Is the caller still attached? Returns immediately, never waits:
+    /// `Ok(())` when the socket is there, otherwise the resolved
+    /// disconnect outcome (under `cancel` a `Disconnected`, under
+    /// `keep-running` an `Ok(())` into the void).
+    ///
+    /// The bounded wait for a caller to show up happens once, earlier:
+    /// `run_pod::attach_live_caller` waits on `wait_for_attach` for
+    /// `connect_timeout_secs` before the run starts. A no-show leaves
+    /// the run with no caller at all, and `ctx.caller()` fails.
     async fn ensure_connected(&self) -> Result<(), CallerError>;
+
+    /// What the caller sent to open the exchange (method, path, route
+    /// parameters, query, headers, the gate's identity). Valid for both
+    /// protocols: an HTTP call's request line, a WebSocket's upgrade.
+    fn handshake(&self) -> Arc<LiveRequest>;
 
     /// Append a non-terminal outbound chunk (HTTP `write`, WS `send`).
     /// Free-for-all: concurrent chunks from multiple nodes interleave on
@@ -303,14 +457,30 @@ pub trait CallerConnection: Send + Sync {
     /// transport failure or if the caller is gone under a `cancel` policy
     /// (`Disconnected`); under `keep-running` a gone caller is a silent
     /// no-op (`Ok(())`) into the void.
-    async fn send_chunk(&self, chunk: OutboundChunk) -> Result<(), CallerError>;
+    ///
+    /// `head` sets the HTTP status line and headers; it is honored only
+    /// on the FIRST outbound item (`HeadAlreadySent` after that). A
+    /// WebSocket connection ignores it: its only head is the upgrade.
+    async fn send_chunk(
+        &self,
+        head: Option<ResponseHead>,
+        chunk: OutboundChunk,
+    ) -> Result<(), CallerError>;
 
     /// Terminate the exchange: HTTP one-shot `respond(body)` (a final
     /// body with no prior streaming) OR `close()` after streaming; WS
     /// `close()`. First terminal wins; a later one returns
     /// `AlreadyTerminated`. `final_chunk` carries the one-shot HTTP body
-    /// (`Some`) or is `None` for a bare close.
-    async fn terminate(&self, final_chunk: Option<OutboundChunk>) -> Result<(), CallerError>;
+    /// (`Some`) or is `None` for a bare close. `head` follows the same
+    /// first-item rule as [`Self::send_chunk`]; `close` is the WebSocket
+    /// close frame's code and reason (`None` = normal closure), ignored
+    /// on HTTP.
+    async fn terminate(
+        &self,
+        head: Option<ResponseHead>,
+        final_chunk: Option<OutboundChunk>,
+        close: Option<CloseReason>,
+    ) -> Result<(), CallerError>;
 
     /// WebSocket only: await the next inbound message at `cursor` (the
     /// reader's next absolute offset to read over the windowed inbound log),
@@ -342,10 +512,10 @@ pub trait CallerConnection: Send + Sync {
         cursor: &std::sync::atomic::AtomicU64,
     ) -> Result<InboundMessage, CallerError>;
 
-    /// HTTP only: the inbound request parts (method, path, query,
-    /// headers, body) decoded per the declared data type. WebSocket
-    /// inbound flows through `receive`/`request` instead.
-    /// `Err(WrongProtocol)` on WebSocket.
+    /// HTTP only: the inbound request (the handshake plus the body
+    /// decoded per the declared data type). WebSocket inbound flows
+    /// through `receive`/`request` instead. `Err(WrongProtocol)` on
+    /// WebSocket.
     fn http_request(&self) -> Result<Arc<HttpRequestParts>, CallerError>;
 
     /// WebSocket only: the current "now" offset of the inbound stream (one
@@ -375,15 +545,13 @@ pub trait CallerConnection: Send + Sync {
     fn last_inbound_offset(&self) -> Option<u64>;
 }
 
-/// The inbound HTTP request a node reads on an `http` live connection.
-/// Body is decoded to an [`InboundMessage`] per the declared data type;
+/// The inbound HTTP request a node reads on an `http` live connection:
+/// the handshake (method, path, params, query, headers, caller) and the
+/// body decoded to an [`InboundMessage`] per the declared data type;
 /// the size cap was already enforced at decode time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequestParts {
-    pub method: String,
-    pub path: String,
-    pub query: String,
-    pub headers: Vec<(String, String)>,
+    pub request: LiveRequest,
     pub body: InboundMessage,
 }
 
@@ -404,15 +572,6 @@ impl CallerHandle {
     pub fn from_connection(conn: Arc<dyn CallerConnection>) -> Self {
         match conn.config().protocol {
             Protocol::Http => CallerHandle::Http(HttpCaller { conn }),
-            // FORWARD-ONLY default, pinned at attach: the handle's built-in
-            // cursor starts at the inbound stream's current "now", so a node
-            // sees messages that arrive AFTER it got the handle, not the
-            // whole prior history. Pinning at handle-construction (not at
-            // first `receive`) closes the subscribe race: anything that
-            // lands between attach and the first read is at/after this
-            // offset and still seen. Same model as the bus's `cursor()`.
-            // To read history, mint a positioned cursor (`cursor_from_start`
-            // / `cursor_at` / `cursor_including_last`).
             Protocol::Websocket => {
                 // Pin at ATTACH (connection-open), not at this call: a
                 // message arriving between the connection opening and the
@@ -436,6 +595,11 @@ impl CallerHandle {
     /// protocols.
     pub async fn ensure_connected(&self) -> WeftResult<()> {
         self.conn().ensure_connected().await.map_err(Into::into)
+    }
+
+    /// What the caller sent to open the exchange, for either protocol.
+    pub fn request(&self) -> Arc<LiveRequest> {
+        self.conn().handshake()
     }
 
     fn conn(&self) -> &Arc<dyn CallerConnection> {
@@ -467,33 +631,65 @@ impl HttpCaller {
         self.conn.is_connected()
     }
 
-    /// The inbound request (method, path, query, headers, body).
+    /// Has anything gone toward the wire yet? While `false` the status
+    /// line is still yours to set (`write_with`, `respond_with`,
+    /// `close_with`); once `true` only the plain forms are accepted.
+    pub fn wire_started(&self) -> bool {
+        self.conn.wire_started()
+    }
+
+    /// The inbound request: the handshake (method, path, params, query,
+    /// headers, caller) and the decoded body.
     pub fn request_parts(&self) -> WeftResult<Arc<HttpRequestParts>> {
         self.conn.http_request().map_err(Into::into)
     }
 
     /// Stream a non-terminal chunk to the caller. Multiple nodes may
-    /// stream concurrently; chunks interleave.
+    /// stream concurrently; chunks interleave. The first chunk on the
+    /// wire commits a `200` head with a content type matching its shape;
+    /// to choose the status or headers, use [`Self::write_with`] for
+    /// that first chunk.
     pub async fn write(&self, chunk: OutboundChunk) -> WeftResult<()> {
-        self.conn.send_chunk(chunk).await.map_err(Into::into)
+        self.conn.send_chunk(None, chunk).await.map_err(Into::into)
     }
 
-    /// One-shot response: a final body with no prior streaming.
+    /// [`Self::write`] with an explicit response head. Only valid as the
+    /// FIRST outbound item; after that it fails with `HeadAlreadySent`.
+    pub async fn write_with(&self, head: ResponseHead, chunk: OutboundChunk) -> WeftResult<()> {
+        self.conn.send_chunk(Some(head), chunk).await.map_err(Into::into)
+    }
+
+    /// One-shot response: a final body with no prior streaming, under
+    /// a `200` head with a content type matching the body's shape.
     /// Terminal; first terminal wins.
     pub async fn respond(&self, body: OutboundChunk) -> WeftResult<()> {
-        self.conn.terminate(Some(body)).await.map_err(Into::into)
+        self.conn.terminate(None, Some(body), None).await.map_err(Into::into)
     }
 
-    /// Close the response after streaming. Terminal; first terminal wins.
+    /// [`Self::respond`] with an explicit status and headers. Terminal.
+    pub async fn respond_with(&self, head: ResponseHead, body: OutboundChunk) -> WeftResult<()> {
+        self.conn.terminate(Some(head), Some(body), None).await.map_err(Into::into)
+    }
+
+    /// Close the response after streaming (or, with nothing streamed,
+    /// answer `204` with no body). Terminal; first terminal wins.
     pub async fn close(&self) -> WeftResult<()> {
-        self.conn.terminate(None).await.map_err(Into::into)
+        self.conn.terminate(None, None, None).await.map_err(Into::into)
+    }
+
+    /// [`Self::close`] with an explicit head and no body (a `404` with
+    /// nothing to say). Terminal; only valid as the first outbound item.
+    pub async fn close_with(&self, head: ResponseHead) -> WeftResult<()> {
+        self.conn.terminate(Some(head), None, None).await.map_err(Into::into)
     }
 }
 
 /// WebSocket talk surface: full duplex. Holds a built-in FORWARD cursor
-/// pinned at attach (its `receive`/`request` see messages arriving after
-/// the handle was obtained, never prior history), matching the bus's
-/// default. To read history, mint a positioned [`CallerCursor`] via
+/// pinned at ATTACH, not at the `ctx.caller()` call, so `receive` /
+/// `request` see everything since the connection opened, including what
+/// landed while the node was starting (see
+/// [`CallerConnection::inbound_attach_offset`]). To start somewhere
+/// else, mint a positioned [`CallerCursor`] via
 /// `cursor_from_start` / `cursor_at` / `cursor_including_last`. Each cursor
 /// is an independent broadcast reader (no inter-node stealing).
 #[derive(Clone)]
@@ -517,7 +713,7 @@ impl WsCaller {
 
     /// Send a message (non-terminal). Concurrent sends interleave.
     pub async fn send(&self, msg: OutboundChunk) -> WeftResult<()> {
-        self.conn.send_chunk(msg).await.map_err(Into::into)
+        self.conn.send_chunk(None, msg).await.map_err(Into::into)
     }
 
     /// Await the next inbound message on this handle's built-in cursor
@@ -557,9 +753,16 @@ impl WsCaller {
         recv_next_from(self.conn.receive(&self.cursor).await)
     }
 
-    /// Close the session. Terminal; first terminal wins.
+    /// Close the session with a normal-closure frame (`1000`, no
+    /// reason). Terminal; first terminal wins.
     pub async fn close(&self) -> WeftResult<()> {
-        self.conn.terminate(None).await.map_err(Into::into)
+        self.conn.terminate(None, None, None).await.map_err(Into::into)
+    }
+
+    /// Close the session with an explicit close code and reason.
+    /// Terminal; first terminal wins.
+    pub async fn close_with(&self, close: CloseReason) -> WeftResult<()> {
+        self.conn.terminate(None, None, Some(close)).await.map_err(Into::into)
     }
 
     // ----- cursor positioning (mirrors the bus) -------------------------
@@ -670,16 +873,23 @@ fn recv_next_from(
 }
 
 // ----- Hand-rolled fake (layer-3 test rig) ---------------------------
+//
+// Shipped, not `#[cfg(test)]`: the node-test rig (`crate::node_test`,
+// itself a shipped artifact the per-package test binary links) attaches
+// it so a catalog node talking to a caller is testable at the fake tier.
 
 /// One recorded interaction with the fake caller connection. Append-only
 /// log, in call order; tests assert against it. Dumb by construction: the
 /// fake records and replays scripted state, no business logic.
-#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerCall {
     EnsureConnected,
-    SendChunk(OutboundChunk),
-    Terminate(Option<OutboundChunk>),
+    SendChunk { head: Option<ResponseHead>, chunk: OutboundChunk },
+    Terminate {
+        head: Option<ResponseHead>,
+        final_chunk: Option<OutboundChunk>,
+        close: Option<CloseReason>,
+    },
     Receive,
     Request(OutboundChunk),
     HttpRequest,
@@ -687,29 +897,32 @@ pub enum CallerCall {
 
 /// Hand-rolled fake `CallerConnection` for contract tests. Records every
 /// call in an append-only log and serves scripted state (connected flag,
-/// queued inbound messages, the HTTP request parts). Enforces the one
-/// piece of real state a fake legitimately owns: the terminate-once latch
-/// (a pure transition via [`try_terminate`]), because "first terminal
-/// wins" is the contract under test and must behave like production.
-#[cfg(any(test, feature = "test-helpers"))]
+/// queued inbound messages, the handshake, the HTTP body). Enforces the
+/// two pieces of real state a fake legitimately owns, both pure
+/// transitions shared with production: the terminate-once latch
+/// ([`try_terminate`]) and the head-before-first-item rule
+/// ([`try_send_head`]), because "first terminal wins" and "the first
+/// item commits the head" are the contracts under test.
 pub struct FakeCallerConnection {
     config: CallerRuntimeConfig,
     inner: std::sync::Mutex<FakeCallerInner>,
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 #[derive(Default)]
 struct FakeCallerInner {
     connected: bool,
     terminated: bool,
+    /// Something already went to the wire (a head can no longer be set).
+    wire_started: bool,
     calls: Vec<CallerCall>,
     /// Inbound messages handed out by `receive` / `request` in order.
     inbound: std::collections::VecDeque<InboundMessage>,
-    /// Scripted HTTP request parts returned by `http_request`.
-    http_request: Option<Arc<HttpRequestParts>>,
+    /// The scripted handshake (`with_handshake`); empty by default.
+    handshake: Arc<LiveRequest>,
+    /// The scripted HTTP body returned inside `http_request`.
+    http_body: Option<InboundMessage>,
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 impl FakeCallerConnection {
     /// A fake that starts already connected (the common case: the caller
     /// arrived before the node ran).
@@ -745,8 +958,55 @@ impl FakeCallerConnection {
             .push_back(msg);
     }
 
-    pub fn set_http_request(&self, parts: HttpRequestParts) {
-        self.inner.lock().expect("fake caller poisoned").http_request = Some(Arc::new(parts));
+    /// Script what the caller sent to open the exchange (both protocols).
+    pub fn set_handshake(&self, request: LiveRequest) {
+        self.inner.lock().expect("fake caller poisoned").handshake = Arc::new(request);
+    }
+
+    /// Script the HTTP body `http_request` hands out beside the handshake.
+    pub fn set_http_body(&self, body: InboundMessage) {
+        self.inner.lock().expect("fake caller poisoned").http_body = Some(body);
+    }
+
+    /// Every response head the fake was handed, in order. On a
+    /// well-behaved exchange that is at most one, on the first item.
+    pub fn heads(&self) -> Vec<ResponseHead> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                CallerCall::SendChunk { head, .. } | CallerCall::Terminate { head, .. } => head,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every chunk the fake was handed (streamed and final), in order.
+    pub fn chunks(&self) -> Vec<OutboundChunk> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                CallerCall::SendChunk { chunk, .. } => Some(chunk),
+                CallerCall::Terminate { final_chunk, .. } => final_chunk,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The terminal call's close reason, if the exchange was terminated.
+    pub fn close_reason(&self) -> Option<Option<CloseReason>> {
+        self.calls().into_iter().find_map(|c| match c {
+            CallerCall::Terminate { close, .. } => Some(close),
+            _ => None,
+        })
+    }
+
+    /// Enforce the head-before-first-item rule and mark the wire started.
+    fn commit_head(g: &mut FakeCallerInner, head: &Option<ResponseHead>) -> Result<(), CallerError> {
+        if head.is_some() {
+            try_send_head(g.wire_started)?;
+        }
+        g.wire_started = true;
+        Ok(())
     }
 
     /// The append-only call log, in order.
@@ -774,7 +1034,6 @@ impl FakeCallerConnection {
     }
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
 impl CallerConnection for FakeCallerConnection {
     fn config(&self) -> &CallerRuntimeConfig {
@@ -785,35 +1044,50 @@ impl CallerConnection for FakeCallerConnection {
         self.inner.lock().expect("fake caller poisoned").connected
     }
 
+    fn wire_started(&self) -> bool {
+        self.inner.lock().expect("fake caller poisoned").wire_started
+    }
+
     async fn ensure_connected(&self) -> Result<(), CallerError> {
         self.record(CallerCall::EnsureConnected);
         if self.is_connected() {
             Ok(())
         } else {
-            // The fake never blocks: a test scripts arrival via
-            // `set_connected(true)` before the call. A no-show is a
-            // bounded-wait timeout (the caller never arrived); a
-            // was-connected-then-dropped drop is modeled by the talk
-            // methods via the disconnect policy, not here.
-            Err(CallerError::Timeout {
-                waited_secs: self.config.connect_timeout_secs,
-            })
-        }
-    }
-
-    async fn send_chunk(&self, chunk: OutboundChunk) -> Result<(), CallerError> {
-        self.record(CallerCall::SendChunk(chunk));
-        if self.is_connected() {
-            Ok(())
-        } else {
+            // Same as production: this never waits, so a test scripts
+            // arrival via `set_connected(true)` before the call, and a
+            // caller that is not there resolves through the disconnect
+            // policy.
             self.disconnected_outcome()
         }
     }
 
-    async fn terminate(&self, final_chunk: Option<OutboundChunk>) -> Result<(), CallerError> {
-        self.record(CallerCall::Terminate(final_chunk));
+    fn handshake(&self) -> Arc<LiveRequest> {
+        self.inner.lock().expect("fake caller poisoned").handshake.clone()
+    }
+
+    async fn send_chunk(
+        &self,
+        head: Option<ResponseHead>,
+        chunk: OutboundChunk,
+    ) -> Result<(), CallerError> {
         let mut g = self.inner.lock().expect("fake caller poisoned");
+        g.calls.push(CallerCall::SendChunk { head: head.clone(), chunk });
+        if !g.connected {
+            return self.disconnected_outcome();
+        }
+        Self::commit_head(&mut g, &head)
+    }
+
+    async fn terminate(
+        &self,
+        head: Option<ResponseHead>,
+        final_chunk: Option<OutboundChunk>,
+        close: Option<CloseReason>,
+    ) -> Result<(), CallerError> {
+        let mut g = self.inner.lock().expect("fake caller poisoned");
+        g.calls.push(CallerCall::Terminate { head: head.clone(), final_chunk, close });
         try_terminate(g.terminated)?;
+        Self::commit_head(&mut g, &head)?;
         g.terminated = true;
         Ok(())
     }
@@ -832,8 +1106,8 @@ impl CallerConnection for FakeCallerConnection {
         // every message, mirroring production). The fake never blocks, so an
         // exhausted script models "no more is coming" = a disconnect, the
         // SAME terminal production surfaces when the inbound log closes.
-        // Production `receive` NEVER returns `Timeout` (the read is unbounded;
-        // a node may wait hours), so the fake must not either.
+        // Production `receive` is unbounded (a node may wait hours) and has
+        // no deadline outcome, so the fake must not invent one.
         let idx = cursor.load(Ordering::SeqCst) as usize;
         let g = self.inner.lock().expect("fake caller poisoned");
         match g.inbound.get(idx).cloned() {
@@ -856,7 +1130,7 @@ impl CallerConnection for FakeCallerConnection {
                 protocol: self.config.protocol.as_wire_str(),
             });
         }
-        // Exhausted script = disconnect (see `receive`), never `Timeout`.
+        // Exhausted script = disconnect (see `receive`), never a deadline.
         let idx = cursor.load(Ordering::SeqCst) as usize;
         let g = self.inner.lock().expect("fake caller poisoned");
         match g.inbound.get(idx).cloned() {
@@ -878,9 +1152,11 @@ impl CallerConnection for FakeCallerConnection {
                 protocol: self.config.protocol.as_wire_str(),
             });
         }
-        g.http_request
+        let body = g
+            .http_body
             .clone()
-            .ok_or_else(|| CallerError::Transport("no http request scripted".into()))
+            .ok_or_else(|| CallerError::Transport("no http body scripted".into()))?;
+        Ok(Arc::new(HttpRequestParts { request: (*g.handshake).clone(), body }))
     }
 
     fn inbound_now_offset(&self) -> u64 {
@@ -938,15 +1214,6 @@ mod tests {
     }
 
     #[test]
-    fn session_duration_cap_disabled_at_zero() {
-        assert!(check_session_duration(1_000_000, 0).is_ok(), "0 disables the cap");
-        assert!(check_session_duration(10, 30).is_ok());
-        assert!(check_session_duration(30, 30).is_ok(), "at cap is allowed");
-        let err = check_session_duration(31, 30).expect_err("over cap");
-        assert!(matches!(err, CallerError::SessionExpired { cap_secs: 30 }));
-    }
-
-    #[test]
     fn terminate_once_then_locks_out() {
         assert!(try_terminate(false).is_ok(), "first terminal wins");
         let err = try_terminate(true).expect_err("second terminal rejected");
@@ -957,16 +1224,19 @@ mod tests {
     fn runtime_config_projects_from_config() {
         let cfg = LiveConnectionConfig {
             path: "chat".into(),
+            methods: Vec::new(),
             auth: crate::signal::PublicEntryAuth::None,
             suspend: SuspendPolicy { can_suspend: true, default_hold_secs: 120 },
             connect_timeout_secs: 12,
             heartbeat_interval_secs: 25,
+            caller_silence_secs: 45,
             max_inbound_bytes: 4096,
             max_session_secs: 600,
             data_type: DataType::Text,
             backpressure: Backpressure::DropNewest,
             error_mode: ErrorMode::DropChunk,
             journal_mode: crate::signal::JournalMode::Journaled,
+            journal_window_secs: None,
             window: None,
         };
         let rc = CallerRuntimeConfig::from_config(&cfg, Protocol::Websocket);
@@ -979,6 +1249,10 @@ mod tests {
         assert_eq!(rc.connect_timeout_secs, 12);
         assert_eq!(rc.max_inbound_bytes, 4096);
         assert_eq!(rc.max_session_secs, 600);
+        assert_eq!(
+            rc.caller_silence_secs, 45,
+            "the trigger's own silence bound reaches the connection layer"
+        );
     }
 
     fn http_cfg() -> CallerRuntimeConfig {
@@ -989,15 +1263,39 @@ mod tests {
             error_mode: ErrorMode::Surface,
             connect_timeout_secs: 5,
             max_inbound_bytes: 1024,
+            caller_silence_secs: crate::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
             // Caller-tied: a gone caller cancels (exercised below).
             suspend: tied(),
             inbound_window: DEFAULT_INBOUND_WINDOW,
+            journal: crate::stream_journal::JournalPolicy::default(),
         }
     }
 
     fn ws_cfg() -> CallerRuntimeConfig {
         CallerRuntimeConfig { protocol: Protocol::Websocket, ..http_cfg() }
+    }
+
+    /// What `outlivesCaller` decides, which is the whole lifetime axis.
+    ///
+    /// Off (the default): the run is the caller's, so the caller going
+    /// away cancels it. On: the run is its own, and a caller going away
+    /// is a no-op, so whatever it was doing carries on. Nothing else is
+    /// refused for it: what the run does after answering is the author's
+    /// to bound, and the language does not guess which loops are
+    /// legitimate.
+    #[test]
+    fn who_owns_the_run_decides_what_a_disconnect_does() {
+        assert_eq!(
+            resolve_disconnect(tied()),
+            DisconnectAction::CancelExecution,
+            "a tied run ends with its caller"
+        );
+        assert_eq!(
+            resolve_disconnect(SuspendPolicy { can_suspend: true, default_hold_secs: 0 }),
+            DisconnectAction::ContinueIntoVoid,
+            "a run that outlives its caller carries on, writing into the void"
+        );
     }
 
     #[tokio::test]
@@ -1015,20 +1313,135 @@ mod tests {
         assert_eq!(
             fake.calls(),
             vec![
-                CallerCall::SendChunk(OutboundChunk::Json(serde_json::json!("a"))),
-                CallerCall::Terminate(Some(OutboundChunk::Json(serde_json::json!("done")))),
-                CallerCall::Terminate(None),
+                CallerCall::SendChunk {
+                    head: None,
+                    chunk: OutboundChunk::Json(serde_json::json!("a")),
+                },
+                CallerCall::Terminate {
+                    head: None,
+                    final_chunk: Some(OutboundChunk::Json(serde_json::json!("done"))),
+                    close: None,
+                },
+                CallerCall::Terminate { head: None, final_chunk: None, close: None },
+            ]
+        );
+        assert_eq!(
+            fake.chunks(),
+            vec![
+                OutboundChunk::Json(serde_json::json!("a")),
+                OutboundChunk::Json(serde_json::json!("done"))
             ]
         );
     }
 
+    /// The head rides the FIRST item only: an explicit head on the first
+    /// write is recorded, a head after the wire started is refused.
     #[tokio::test]
-    async fn ensure_connected_waits_then_oks_and_times_out() {
+    async fn a_head_is_honored_first_and_refused_after() {
+        let fake = FakeCallerConnection::connected(http_cfg());
+        let CallerHandle::Http(http) = CallerHandle::from_connection(fake.clone()) else {
+            unreachable!()
+        };
+        let head = ResponseHead::new(201).with_header("x-run", "abc").with_keepalive("\n");
+        http.write_with(head.clone(), OutboundChunk::Text("first".into())).await.unwrap();
+        let err = http
+            .respond_with(ResponseHead::new(500), OutboundChunk::Text("late".into()))
+            .await
+            .expect_err("a head after the first item is refused");
+        assert!(err.to_string().contains("head already sent"), "got: {err}");
+        // The log keeps every call, refused ones included: the first
+        // head is the one that went out.
+        assert_eq!(fake.heads()[0], head);
+        // A terminal WITHOUT a head still lands after the refusal (the
+        // refused call was not the terminal: nothing was committed).
+        http.close().await.expect("close still works");
+    }
+
+    /// The handshake reaches both protocols through the shared accessor,
+    /// and `request_parts` pairs it with the scripted body.
+    #[tokio::test]
+    async fn the_handshake_is_shared_and_the_http_body_rides_beside_it() {
+        let fake = FakeCallerConnection::connected(http_cfg());
+        let mut req = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
+        req.params.insert("room".into(), "room7".into());
+        req.headers.push(("Content-Type".into(), "application/json".into()));
+        fake.set_handshake(req.clone());
+        fake.set_http_body(InboundMessage::Json(serde_json::json!({"text": "hi"})));
+        let handle = CallerHandle::from_connection(fake.clone());
+        assert_eq!(*handle.request(), req);
+        assert_eq!(handle.request().header("content-type"), Some("application/json"));
+        let CallerHandle::Http(http) = handle else { unreachable!() };
+        let parts = http.request_parts().unwrap();
+        assert_eq!(parts.request, req);
+        assert_eq!(parts.body, InboundMessage::Json(serde_json::json!({"text": "hi"})));
+    }
+
+    #[test]
+    fn a_head_gets_a_content_type_for_the_chunk_unless_it_names_one() {
+        let json = ResponseHead::default().with_content_type_for(&OutboundChunk::Json(serde_json::json!(1)));
+        assert_eq!(json.status, 200);
+        assert_eq!(json.headers, vec![("content-type".to_string(), "application/json".to_string())]);
+        let text = ResponseHead::new(201).with_content_type_for(&OutboundChunk::Text("x".into()));
+        assert_eq!(text.headers[0].1, "text/plain; charset=utf-8");
+        let bytes = ResponseHead::default().with_content_type_for(&OutboundChunk::Bytes(vec![1]));
+        assert_eq!(bytes.headers[0].1, "application/octet-stream");
+        let kept = ResponseHead::default()
+            .with_header("Content-Type", "text/event-stream")
+            .with_content_type_for(&OutboundChunk::Text("x".into()));
+        assert_eq!(kept.headers.len(), 1, "an explicit content type is kept, case-insensitively");
+    }
+
+    #[test]
+    fn wire_shapes_round_trip() {
+        let mut req = LiveRequest { method: "GET".into(), path: "users/me".into(), ..Default::default() };
+        req.query.insert("verbose".into(), "1".into());
+        req.caller = Some(serde_json::json!({"key": 0}));
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["method"], "GET");
+        assert!(v.get("params").is_none(), "empty maps are omitted on the wire");
+        assert_eq!(serde_json::from_value::<LiveRequest>(v).unwrap(), req);
+
+        let parts = HttpRequestParts { request: req, body: InboundMessage::Text("t".into()) };
+        let back: HttpRequestParts = serde_json::from_value(serde_json::to_value(&parts).unwrap()).unwrap();
+        assert_eq!(back, parts);
+
+        let head = ResponseHead::new(404).with_header("x-a", "b").with_keepalive(": \n\n");
+        let back: ResponseHead = serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
+        assert_eq!(back, head);
+        let bare: ResponseHead = serde_json::from_value(serde_json::json!({"status": 204})).unwrap();
+        assert!(bare.headers.is_empty());
+        assert!(bare.keepalive.is_none());
+        let plain = serde_json::to_value(ResponseHead::new(200)).unwrap();
+        assert!(plain.get("keepalive").is_none(), "no filler is omitted on the wire");
+
+        let close = CloseReason { code: 1008, reason: "policy".into() };
+        let back: CloseReason = serde_json::from_value(serde_json::to_value(&close).unwrap()).unwrap();
+        assert_eq!(back, close);
+        let bare: CloseReason = serde_json::from_value(serde_json::json!({"code": 1000})).unwrap();
+        assert_eq!(bare, CloseReason::default());
+    }
+
+    #[tokio::test]
+    async fn a_ws_close_carries_its_reason() {
+        let fake = FakeCallerConnection::connected(ws_cfg());
+        let CallerHandle::Websocket(ws) = CallerHandle::from_connection(fake.clone()) else {
+            unreachable!()
+        };
+        ws.close_with(CloseReason { code: 4000, reason: "done".into() }).await.unwrap();
+        assert_eq!(
+            fake.close_reason(),
+            Some(Some(CloseReason { code: 4000, reason: "done".into() }))
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_connected_is_a_status_read_not_a_wait() {
         let fake = FakeCallerConnection::disconnected(http_cfg());
         let handle = CallerHandle::from_connection(fake.clone());
-        // No-show: bounded timeout, fails loud.
-        let err = handle.ensure_connected().await.expect_err("no-show times out");
-        assert!(err.to_string().contains("did not connect"), "got: {err}");
+        // No caller attached: resolves through the disconnect policy right
+        // away (this config is tied, so cancelled) instead of waiting.
+        let err = handle.ensure_connected().await.expect_err("no caller attached");
+        assert!(matches!(err, crate::error::WeftError::Cancelled), "got: {err:?}");
         // Caller arrives: now a no-op success.
         fake.set_connected(true);
         handle.ensure_connected().await.expect("connected now");
@@ -1063,10 +1476,9 @@ mod tests {
         let CallerHandle::Websocket(ws) = CallerHandle::from_connection(fake.clone()) else {
             panic!("ws config must yield a Websocket handle");
         };
-        // Forward-default: the handle's cursor is pinned at attach, so the
-        // reply must arrive AFTER the handle exists to be seen (the real
-        // request/reply order; a message sent before subscribing is not
-        // replayed by a forward cursor).
+        // The cursor is pinned at attach, so everything on the inbound log
+        // is readable whenever it was pushed; queueing the reply here just
+        // keeps the real request/reply order.
         fake.push_inbound(InboundMessage::Json(serde_json::json!("pong")));
         let reply = ws.request(OutboundChunk::Json(serde_json::json!("ping"))).await.unwrap();
         assert_eq!(reply, InboundMessage::Json(serde_json::json!("pong")));

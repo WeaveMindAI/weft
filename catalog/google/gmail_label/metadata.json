@@ -28,13 +28,11 @@
     {
       "name": "add",
       "type": "String | List[String]",
-      "required": false,
       "label": "Add labels"
     },
     {
       "name": "remove",
       "type": "String | List[String]",
-      "required": false,
       "label": "Remove labels"
     }
   ],

@@ -1,6 +1,6 @@
 # Examples
 
-Each folder is one complete weft project: the `main.weft`, every prompt,
+Each folder is one complete weft project: the `src/main.weft`, every prompt,
 script and SQL file it references, and a `nodes/base_catalog` that is a
 symlink to this repo's `catalog/`, so the examples always compile against
 the catalog you have checked out.

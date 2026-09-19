@@ -1,4 +1,5 @@
-//! Every fixture's catalog parses, checked without a cluster.
+//! Every fixture's catalog parses AND its graph compiles, checked
+//! without a cluster.
 //!
 //! A fixture's `metadata.json` is only read once the rig has built and
 //! deployed, so a typo in it (a widget kind that does not exist, a field
@@ -42,6 +43,113 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
         }
     }
     anyhow::ensure!(broken.is_empty(), "fixture catalogs that do not parse:\n{}", broken.join("\n"));
+    Ok(())
+}
+
+/// Every fixture's GRAPH compiles: it parses against its own catalog
+/// plus the stdlib, enriches, and validate finds nothing STRUCTURALLY
+/// wrong with it.
+///
+/// The catalog check above catches a bad `metadata.json`; this catches
+/// a bad `.weft`, which is the other half and the one an author writing
+/// a fixture gets wrong more often. A mistake here used to surface
+/// minutes into a cluster run as a failure of whatever feature the
+/// fixture was written to prove, which reads like a bug in the feature
+/// rather than a typo in its fixture.
+///
+/// STRUCTURAL, not runtime: a fixture is deliberately incomplete until
+/// the rig fills it in (`substitute_in_main` writes the live path, a
+/// chat id, a bucket), so "this required input has no driver" is the
+/// fixture working as intended, not a mistake. The structural tier is
+/// exactly the one that does not depend on the rig having run, which is
+/// what makes this test honest without a cluster.
+/// The fixtures that are INCOMPLETE on disk on purpose: their test
+/// writes the missing value in before running (a chat id read from the
+/// environment, a file the rig uploads first), so the graph only stands
+/// up once the rig has been through it.
+///
+/// Named one by one rather than matched by the diagnostic, so adding a
+/// fixture that genuinely does not compile fails here instead of
+/// quietly joining a category.
+const FILLED_IN_BY_THE_RIG: [&str; 6] = [
+    "access_s3",
+    "access_telegram",
+    "audio_transcribe",
+    "config_media",
+    "email_send",
+    "fetch_once",
+];
+
+#[test]
+fn every_fixture_graph_compiles() -> anyhow::Result<()> {
+    let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;
+    let mut never_needed: Vec<&str> = Vec::new();
+    let mut broken: Vec<String> = Vec::new();
+    for fixture in fixtures()? {
+        let name =
+            fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let main = fixture.join("src").join("main.weft");
+        if !main.is_file() {
+            continue;
+        }
+        let source = std::fs::read_to_string(&main)?;
+        // The project's own node roots (`nodes/` AND `src/`, since a node
+        // may sit beside the file that includes it) plus the stdlib. The
+        // rig copies the stdlib into each project at deploy time; here
+        // every root is read where it already is, so this stays a plain
+        // cargo test with no copying and no cluster.
+        let mut roots = weft_compiler::project::node_roots(&fixture).to_vec();
+        roots.push(stdlib.clone());
+        let catalog = match weft_catalog::FsCatalog::discover_roots_with_policy(
+            &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
+            weft_catalog::DiscoverPolicy::Strict,
+        ) {
+            Ok(c) => c,
+            // The catalog's own failure is the other test's finding; not
+            // repeating it here keeps one mistake to one report.
+            Err(_) => continue,
+        };
+        // The two anchors the CLI gives a program, and they differ:
+        // `@file("assets/...")` resolves from the PROJECT ROOT, while
+        // `@include("lib/x.weft")` resolves from the including file's
+        // OWN directory, which for the program is `src/`.
+        let src = fixture.join("src");
+        let (_, diagnostics) = weft_compiler::compile_strict(
+            &source,
+            uuid::Uuid::new_v4(),
+            weft_compiler::CompileFs::disk(&fixture).anchored_at(Some(&src)),
+            &catalog,
+            weft_compiler::validate::ValidationMode::Structural,
+            None,
+        );
+        let errors: Vec<String> = diagnostics
+            .into_iter()
+            .filter(|d| d.severity == weft_compiler::Severity::Error)
+            .map(|d| format!("{}: {}", d.code.clone().unwrap_or_default(), d.message))
+            .collect();
+        let excused = FILLED_IN_BY_THE_RIG.contains(&name.as_str());
+        if !errors.is_empty() && !excused {
+            broken.push(format!("{name}:\n    {}", errors.join("\n    ")));
+        }
+        if errors.is_empty() && excused {
+            never_needed.push(FILLED_IN_BY_THE_RIG
+                .iter()
+                .find(|f| **f == name)
+                .expect("just matched"));
+        }
+    }
+    anyhow::ensure!(
+        broken.is_empty(),
+        "fixture graphs that do not compile:\n{}",
+        broken.join("\n")
+    );
+    // An excuse nobody needs any more is a lie about the fixture, and
+    // it hides the next real break behind it.
+    anyhow::ensure!(
+        never_needed.is_empty(),
+        "these fixtures compile on their own now; drop them from \
+         FILLED_IN_BY_THE_RIG: {never_needed:?}"
+    );
     Ok(())
 }
 

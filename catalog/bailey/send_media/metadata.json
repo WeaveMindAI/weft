@@ -31,13 +31,11 @@
       "type": "String",
       "widget": {
         "kind": "textarea"
-      },
-      "required": false
+      }
     },
     {
       "name": "voiceNote",
       "type": "Boolean",
-      "required": false,
       "default": false,
       "widget": {
         "kind": "checkbox"

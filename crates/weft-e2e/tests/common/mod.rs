@@ -220,7 +220,9 @@ pub async fn tree_of(project: &weft_e2e::project::Project) -> anyhow::Result<Val
     Ok(serde_json::from_str(project.weft(&["tree", "--json"]).await?.trim())?)
 }
 
-/// Whether a node's rows in a replay came from the seed.
-pub fn inherited(replay: &weft_e2e::Replay, node: &str) -> bool {
-    replay.for_node(node).any(|e| e.field("inherited_from").is_some())
+/// Whether a node's rows in a run came from the seed. The node is
+/// spelled the way the source reads (`triage.up` is the file's node
+/// under the call `triage`).
+pub fn inherited(run: &weft_e2e::run::SettledRun, node: &str) -> bool {
+    run.events_of(node).any(|e| e.field("inherited_from").is_some())
 }

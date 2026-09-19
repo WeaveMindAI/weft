@@ -57,9 +57,14 @@ async fn a_project_runs_its_own_postgres_and_talks_to_it() -> Result<()> {
 
     // The first run is the one that reads the password off the
     // database and publishes the connection.
-    round_trip(&mut project)
-        .await?
-        .assert_input("out", "data", &json!([{ "body": BODY }]))?;
+    let first = round_trip(&mut project).await?;
+    first.assert_input("out", "data", &json!([{ "body": BODY }]))?;
+
+    // An optional port that stayed silent reached the database as SQL
+    // NULL instead of refusing the query. The author wrote `photo?`,
+    // sent nothing, and the row is written with an empty column: one
+    // node, no branch, no split insert.
+    first.assert_input("absent", "data", &json!([{ "body": "no picture", "tag": null }]))?;
 
     // The second run: the database no longer hands its password out,
     // so this only works through the stored connection. Two rows now,

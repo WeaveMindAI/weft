@@ -1,0 +1,68 @@
+{
+  "type": "Reply",
+  "label": "Reply",
+  "description": "Answer the caller of this run with one message. Behind a Route it is the response: status, headers and body, and the exchange ends. Behind a Socket it is one message and the socket stays open (status and headers have no meaning there and are refused if set). The body's shape follows the trigger's dataType: any value for json, a String for text, a stored file for bytes. On a json route a stored file anywhere in the body (a picture kept at project scope, say) goes out as `{ url, mimeType, filename, sizeBytes }`, the url being a link the caller can fetch straight into an `<img>`.",
+  "tags": [
+    "api",
+    "http",
+    "websocket",
+    "reply",
+    "response"
+  ],
+  "icon": "Send",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "body",
+      "type": "T",
+      "required": true,
+      "description": "What to send: any value on a json route (an object, a list, a string), a String on a text route, a stored file on a bytes route."
+    },
+    {
+      "name": "status",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 100,
+        "max": 599,
+        "step": 1
+      },
+      "default": 200,
+      "label": "Status",
+      "description": "The HTTP status of the response (Route only)."
+    },
+    {
+      "name": "headers",
+      "type": "Dict[String, String]",
+      "description": "Extra response headers by name (Route only). A content-type here overrides the one the body's shape implies."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "Fires true once the message has been handed to the caller."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "run_reaches",
+          "direction": "upstream",
+          "types": [
+            "Route",
+            "Socket"
+          ]
+        }
+      },
+      "then": {
+        "message": "Reply '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "level": "structural",
+        "severity": "warning"
+      }
+    }
+  ]
+}

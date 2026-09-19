@@ -96,6 +96,13 @@ pub enum Phase {
     /// in the verb; node ids in detail).
     InfraProvisionStart,
     InfraProvisionDone,
+    /// The command is about to wait for the project's running
+    /// executions to finish before it lands. Detail carries
+    /// `{ "capSeconds": N }` when the user set `--drain-timeout`, and
+    /// nothing when the dispatcher's own cap applies. Emitted before
+    /// the call that waits, because the wait itself happens on the
+    /// dispatcher: without it the command looks hung.
+    DrainWait,
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
     TriggerRegisterDone,
@@ -136,10 +143,47 @@ struct Event<'a> {
 /// one lowercase `error:` line on stderr. The cause chain rides along
 /// in the message (`{e:#}`), since readers build their errors from
 /// context and the chain is where the "why" lives.
+/// What a failure that never reached the daemon says, first, before the
+/// transport noise.
+///
+/// Worth its own sentence because the three reasons a request does not
+/// arrive (the daemon is not started, this machine only has the editor
+/// extension, the address is wrong) are all fixed by the person rather
+/// than by the program, and none of them is what "error sending request
+/// for url" reads like.
+///
+/// A host wrapping the CLI does NOT match on this sentence: the same
+/// answer rides the `--json` error event as `daemonUnreachable`, which
+/// is a fact rather than wording, so this line is free to be rephrased.
+const DAEMON_UNREACHABLE: &str = "the weft daemon is not answering";
+
+/// True when the request never reached the daemon at all: nothing was
+/// refused, nothing answered. A status the daemon returns, however bad,
+/// is not this.
+fn daemon_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout())
+    })
+}
+
 pub fn report_plain_error(json: bool, e: &anyhow::Error) {
-    let message = format!("{e:#}");
+    let unreachable = daemon_unreachable(e);
+    let message = if unreachable {
+        format!(
+            "{DAEMON_UNREACHABLE}. Start it with `weft daemon start`, or install it if this \
+             machine only has the editor extension. ({e:#})"
+        )
+    } else {
+        format!("{e:#}")
+    };
     if json {
-        let detail = serde_json::json!({ "message": message });
+        // SYNC: daemonUnreachable <-> extension-vscode/src/cli.ts CliFailure
+        let detail = serde_json::json!({
+            "message": message,
+            "daemonUnreachable": unreachable,
+        });
         let ev = Event { ts_unix: now_unix(), verb: None, phase: Phase::Error, detail: Some(&detail) };
         println!("{}", serde_json::to_string(&ev).expect("Event serializes"));
     } else {
@@ -277,6 +321,25 @@ impl Progress {
         );
     }
 
+    /// Say what the call about to be made will wait for, and for how
+    /// long. `deactivation` is the wire object the verb is about to
+    /// send.
+    ///
+    /// The POLICY decides whether there is a wait, and the mode has no
+    /// say: it is the same rule as `DeactivateSpec::drains`, so park and
+    /// hibernate both wait when the person asked to wait. (Wipe cannot
+    /// reach here with `wait`; the spec's validator refuses that pair.)
+    pub fn drain_wait(&self, deactivation: &Value, cap_seconds: Option<u64>) {
+        let field = |name: &str| deactivation.get(name).and_then(|v| v.as_str());
+        if field("runningPolicy") != Some("wait") {
+            return;
+        }
+        self.emit(
+            Phase::DrainWait,
+            cap_seconds.map(|cap| serde_json::json!({ "capSeconds": cap })),
+        );
+    }
+
     pub fn dispatcher_call_start(&self, path: &str) {
         self.emit(
             Phase::DispatcherCallStart,
@@ -407,6 +470,16 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
             format!("dropped {n} stale image tag{}", if n == 1 { "" } else { "s" })
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
+        Phase::DrainWait => {
+            let cap = match ev.detail.and_then(|d| d.get("capSeconds")).and_then(|v| v.as_u64()) {
+                Some(cap) => format!("at most {cap}s"),
+                None => "up to the dispatcher's cap".to_string(),
+            };
+            format!(
+                "waiting for this project's running executions to finish, {cap}, then the rest \
+                 are cancelled (`--running-policy cancel` stops them now)"
+            )
+        }
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
         Phase::InfraWait => {
             let verb = ev

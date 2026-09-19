@@ -1,9 +1,9 @@
 {
   "type": "LiveWsEcho",
   "label": "Live: WebSocket Echo",
-  "description": "Demo node for a WebSocket live connection. Holds a two-way conversation: echoes each message the caller sends, with a turn counter, until they close. Wire under a LiveSocket trigger.",
+  "description": "Demo node for a WebSocket live connection driven through the ctx. Holds a two-way conversation: echoes each message the caller sends, with a turn counter, until they close. Wire under a Socket trigger.",
   "tags": [
-    "live",
+    "api",
     "websocket",
     "demo",
     "chat"
@@ -12,10 +12,10 @@
   "color": "#06b6d4",
   "inputs": [
     {
-      "name": "started",
-      "type": "Boolean",
-      "required": false,
-      "description": "Kick from the LiveSocket trigger."
+      "name": "path",
+      "type": "String",
+      "required": true,
+      "description": "The path the caller opened, off the Socket trigger; what starts this node."
     }
   ],
   "outputs": [

@@ -1,11 +1,8 @@
 //! Discover and fire the triggers an outside party calls IN to.
 //!
-//! Covers two firing surfaces:
-//!   - Public-entry webhooks: a registered signal with a `mount_path`, fired by
-//!     `POST /{mount_path}` with the request body (and an `X-Api-Key` header if
-//!     the signal declared api_key auth).
-//!   - Token signals (forms, human-in-the-loop resumes): fired by
-//!     `POST /signal/{signal_token}`.
+//! Token signals (forms, human-in-the-loop resumes) are fired by
+//! `POST /signal/{signal_token}`. A route or socket a caller reaches at
+//! `/connect/...` is the other surface, and it lives in [`crate::live`].
 //!
 //! Discovery is via a signal token (in `Authorization: Bearer`):
 //! `GET /signal-token/signals` returns the
@@ -39,7 +36,7 @@ impl DiscoveredSignal {
             .or_else(|| self.0.get("node_id"))
             .and_then(Value::as_str)
     }
-    /// The signal kind tag (`form`, `api_endpoint`, `live_socket`, ...).
+    /// The signal kind tag (`form`, `route`, `socket`, ...).
     pub fn kind(&self) -> Option<&str> {
         self.0.get("kind").and_then(Value::as_str)
     }
@@ -142,34 +139,6 @@ impl SignalScope {
             s.node_id() == Some(node_id)
         })
         .await
-    }
-}
-
-/// Fire a public-entry webhook by mount path with a JSON body, passing the api
-/// key header if `api_key` is set. The mount path is the signal's `mount_path`
-/// (with or without a leading slash; normalized here).
-pub async fn fire_webhook(
-    disp: &Dispatcher,
-    mount_path: &str,
-    body: &Value,
-    api_key: Option<&str>,
-) -> Result<()> {
-    let path = format!("/{}", mount_path.trim_start_matches('/'));
-    // Build the request directly so we can attach the optional header; the
-    // shared client's post_empty doesn't carry custom headers.
-    let url = format!("{}{}", disp.base(), path);
-    let client = reqwest::Client::new();
-    let mut req = client.post(&url).json(body);
-    if let Some(key) = api_key {
-        req = req.header("X-Api-Key", key);
-    }
-    let resp = req.send().await.with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok(())
-    } else {
-        bail!("POST {url} -> HTTP {status}: {text}")
     }
 }
 

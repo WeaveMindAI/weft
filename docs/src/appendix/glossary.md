@@ -151,8 +151,8 @@ activation, then a fire per event.
 **Unit.** One pod template inside an infra spec. Each has its own status and
 its own stop behavior, and the infra verbs act on one at a time.
 
-**Version.** The project's program files (`.weft`, `weft.toml`, `nodes/`,
-`prompts/`, `scripts/`, `sql/`, `assets/`, `examples/`, plus the installed
+**Version.** The project's program files (`src/`, `weft.toml`, `nodes/`,
+`assets/`, `examples/`, plus the installed
 weft's own version), named by a hash of their contents, so the same code is
 always the same version however many times you run it. Your `layouts/` and
 your notes are not in it. The seeded `nodes/base_catalog/` is not listed file

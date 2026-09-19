@@ -22,6 +22,8 @@ import {
   type TreeJson,
   type VersionTreeNode,
 } from './version-tree';
+import { describeOutcome, statusThemeIcon } from './outcome';
+import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
@@ -40,6 +42,12 @@ export interface ExecutionSummary {
   /** The tags the run put on itself (`ctx.tag_execution`), in claim
    *  order; the handle a sibling's `ctx.stop_tagged` selects on. */
   tags: string[];
+  /** For a cancelled run: who or what stopped it. Decides the row's
+   *  icon (a person stopping it is not the runtime cutting it). */
+  cancel_cause?: CancelCause | null;
+  /** Node firings the run skipped; said beside `completed`, never
+   *  drawn as a different icon (a skipped branch is a normal run). */
+  skipped_nodes?: number;
 }
 
 export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -264,7 +272,11 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       }
       rebuilt = [];
       const seen = new Set<string>();
-      for (let offset = 0; offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
+      // The list is the open project's runs and nothing else. With no
+      // project open there is nothing to list, so nothing is fetched:
+      // an unscoped read returned every project's history, and that is
+      // what the view showed until the graph opened and pinned one.
+      for (let offset = 0; projectId && offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
         const page = await this.fetchPage(offset, projectId);
         total = page.total;
         for (const e of page.executions) {
@@ -389,10 +401,12 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     // A failed fetch is on screen, not just in the console: the rows
     // below it are the last successful list, not the current truth.
     if (this.lastError) nodes.push(new ListErrorNode(this.lastError));
-    // The server already ordered newest-first; no client sort.
-    for (const s of this.cache) {
-      nodes.push(new ExecutionNode(s, this.pinnedProject?.id === s.project_id));
+    if (!this.pinnedProject) {
+      nodes.push(new HintNode('Open a project to see its runs'));
+      return nodes;
     }
+    // The server already ordered newest-first; no client sort.
+    for (const s of this.cache) nodes.push(new ExecutionNode(s));
     if (this.cache.length < this.total) nodes.push(new LoadMoreNode(this.total - this.cache.length));
     return nodes;
   }
@@ -469,6 +483,8 @@ export class RunNode extends vscode.TreeItem {
       started_at: run.started_at,
       completed_at: run.completed_at,
       tags: [],
+      cancel_cause: run.cancel_cause,
+      skipped_nodes: run.skipped_nodes,
     };
     this.description = runDescription(run, headRun);
     this.tooltip = new vscode.MarkdownString(
@@ -483,7 +499,7 @@ export class RunNode extends vscode.TreeItem {
       ].join('\n\n'),
     );
     this.contextValue = `weftRun-${run.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(run.status);
+    this.iconPath = statusThemeIcon(run.status, run.cancel_cause);
     this.command = { command: 'weft.viewExecution', title: 'View', arguments: [this] };
   }
 }
@@ -507,23 +523,18 @@ interface ExecutionPage {
 }
 
 export class ExecutionNode extends vscode.TreeItem {
-  constructor(public readonly summary: ExecutionSummary, pinned: boolean) {
-    const statusIcon = {
-      running: '$(sync~spin)',
-      completed: '$(check)',
-      failed: '$(error)',
-      cancelled: '$(circle-slash)',
-      corrupt: '$(warning)',
-    }[summary.status.toLowerCase()] ?? '$(circle-outline)';
+  constructor(public readonly summary: ExecutionSummary) {
     const started = new Date(summary.started_at * 1000).toLocaleString();
     // A corrupt row has no entry node (its journal payload no longer
-    // decodes); it is listed so the user can see and delete it.
+    // decodes); it is listed so the user can see and delete it. The
+    // icon is `iconPath` below, never text in the label (a codicon
+    // reference in a label renders as its literal `$(name)`).
     const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
-    super(`${statusIcon} ${name} (${started})`, vscode.TreeItemCollapsibleState.None);
+    super(`${name} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.color;
     const tags = summary.tags;
     const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';
-    this.description = `${summary.status}${tagged}${pinned ? '' : '  ·  other project'}`;
+    this.description = `${describeOutcome(summary.status, summary.cancel_cause, summary.skipped_nodes)}${tagged}`;
     this.tooltip = new vscode.MarkdownString(
       [
         `**exec** ${summary.color}`,
@@ -535,7 +546,7 @@ export class ExecutionNode extends vscode.TreeItem {
       ].join('\n\n'),
     );
     this.contextValue = `weftExecution-${summary.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(summary.status);
+    this.iconPath = statusThemeIcon(summary.status, summary.cancel_cause);
     this.command = {
       command: 'weft.viewExecution',
       title: 'View',
@@ -544,19 +555,3 @@ export class ExecutionNode extends vscode.TreeItem {
   }
 }
 
-function statusThemeIcon(status: string): vscode.ThemeIcon {
-  switch (status.toLowerCase()) {
-    case 'running':
-      return new vscode.ThemeIcon('sync~spin', new vscode.ThemeColor('charts.blue'));
-    case 'completed':
-      return new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
-    case 'failed':
-      return new vscode.ThemeIcon('error', new vscode.ThemeColor('errorForeground'));
-    case 'cancelled':
-      return new vscode.ThemeIcon('circle-slash');
-    case 'corrupt':
-      return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
-    default:
-      return new vscode.ThemeIcon('circle-outline');
-  }
-}

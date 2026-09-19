@@ -80,6 +80,12 @@ weft run --emit incoming='{"message":"the emitted output value"}' --detach
 Bake runs preparation and saves the resulting trigger settings without arming
 listeners. A fire uses those settings and gives exactly one trigger its wake
 payload. An emit supplies declared outputs without executing that trigger.
+
+The payload you type is checked against what that trigger declares it wakes
+with, before anything is built or started, and the check is exact: a missing
+field is refused, and so is a field the trigger does not declare, each named.
+`weft run --fire` prints the shape it wanted, which is the quickest way to see
+what a trigger takes ([`firesWith`](../nodes/metadata.md#fireswith)).
 The same trigger cannot use both forms. Trigger inputs are prepared through
 bake; a trigger cannot be a from start.
 

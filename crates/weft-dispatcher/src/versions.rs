@@ -32,6 +32,9 @@ use sqlx::PgPool;
 use weft_core::run_spec::RunSpec;
 use weft_core::Color;
 
+/// Postgres SQLSTATE for a foreign key violation.
+const FOREIGN_KEY_VIOLATION: &str = "23503";
+
 /// The `project_version` + `version_run` tables. Canonical DDL edited in
 /// place; an existing database is carried forward by `./setup.sh
 /// --migration <name>` (the contract is `weft_task_store::schema_guard`'s
@@ -49,16 +52,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // one); `label` is a checkpoint's name.
         r#"CREATE TABLE IF NOT EXISTS project_version (
             id           TEXT NOT NULL,
-            -- Deliberately NO foreign key to `project`. `weft rm` with no
-            -- flags UNREGISTERS a project and deliberately keeps its run
-            -- history; only `weft rm --journal` throws the runs away. The
-            -- program a surviving run ran is kept for the same reason
-            -- (`project_definition`), and the tree rows are the other half
-            -- of that same record: which version a run was on, what it
-            -- inherited, and which example supplied its starting parameters.
-            -- Cascading here kept the run and its program and
-            -- threw that half away. `retire_unused_versions` drops the
-            -- versions no surviving run needs once the project is gone.
+            -- Deliberately NO foreign key to `project`: the tree's life is
+            -- the store's to decide, not the database's. A project's
+            -- removal (`ProjectStore::remove`) drops the tree explicitly,
+            -- so the same id registered again never inherits a tree it did
+            -- not make and no version keeps naming stored files of a
+            -- project that no longer exists. The journal's executions go
+            -- the same way, at the same moment, so a removal leaves the
+            -- person their files and nothing else.
+            -- `retire_unused_versions` is the backstop for a removal that
+            -- failed halfway, not a step of the ordinary one.
             project_id   UUID NOT NULL,
             parent_id    TEXT,
             manifest     JSONB NOT NULL,
@@ -118,6 +121,17 @@ pub struct VersionRow {
     pub manifest: Manifest,
     pub label: Option<String>,
     pub created_at: u64,
+}
+
+/// The tree row a run would hang off is gone: the project was removed
+/// (`weft rm`) or the version pruned, after the run's birth reached the
+/// journal. Both stores answer an `insert_run` for such a run with this,
+/// so a reader can tell "nothing to record in" from a storage failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("version {version} of project {project} is not in the tree (the project was removed, or the version pruned)")]
+pub struct VersionMissing {
+    pub project: uuid::Uuid,
+    pub version: String,
 }
 
 // The database row. NOT a wire type: `tree` answers `RunSummary`
@@ -465,7 +479,15 @@ impl VersionStoreOps for PostgresVersionStore {
         .bind(&run.example)
         .bind(run.created_at as i64)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|error| match &error {
+            // The composite foreign key onto `project_version`: the only
+            // constraint this insert can trip besides its primary key.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some(FOREIGN_KEY_VIOLATION) => {
+                anyhow::Error::new(VersionMissing { project: run.project_id, version: run.version_id.clone() })
+            }
+            _ => anyhow::Error::new(error),
+        })?;
         Ok(())
     }
 
@@ -586,6 +608,17 @@ pub struct MockVersionStore {
     /// The projects that exist, standing in for the `project` table the
     /// head columns live on and the version FK points at.
     projects: std::sync::Mutex<BTreeSet<uuid::Uuid>>,
+    /// Versions something still depends on: an armed trigger's settings
+    /// came from one, or a live execution is running one. A plain set
+    /// because that is all this has to be; the real store works it out
+    /// from the signal rows and the journal, and a fake that tried to
+    /// reproduce THAT would be a second implementation to get wrong.
+    ///
+    /// It exists because the real `delete_versions` REFUSES these, and a
+    /// fake that deletes them happily makes every test of the refusal
+    /// pass while production errors. Put the versions a case wants
+    /// protected in here with `mark_in_use`.
+    in_use: std::sync::Mutex<BTreeSet<String>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -594,15 +627,40 @@ impl MockVersionStore {
         Self::default()
     }
 
+    /// Say that something still depends on this version, so a prune of
+    /// it is refused exactly as the real store refuses one.
+    pub fn mark_in_use(&self, version: &str) {
+        self.in_use.lock().unwrap().insert(version.to_string());
+    }
+
     /// Register a project, as `project` holding a row for it.
     pub fn add_project(&self, project: uuid::Uuid) {
         self.projects.lock().unwrap().insert(project);
         self.heads.lock().unwrap().entry(project).or_default();
     }
 
-    /// Drop the project row, as `weft rm` does. The tree rows stay: that
-    /// is the behaviour under test.
+    /// Drop the project and its whole tree, as `weft rm` does
+    /// (`PostgresProjectStore::remove` deletes every `project_version`
+    /// row in the same transaction as the project, and `version_run`
+    /// cascades off it).
+    ///
+    /// The tree rows used to stay here, and the tests that rode on that
+    /// certified a guarantee production does not give. A fake that
+    /// erases less than the real store is a fake that hides exactly the
+    /// leak it should catch.
     pub fn remove_project(&self, project: uuid::Uuid) {
+        self.projects.lock().unwrap().remove(&project);
+        self.heads.lock().unwrap().remove(&project);
+        self.versions.lock().unwrap().retain(|v| v.project_id != project);
+        self.runs.lock().unwrap().retain(|r| r.project_id != project);
+    }
+
+    /// Drop ONLY the project row, leaving its tree behind: the state a
+    /// removal that failed halfway leaves, and the only state the
+    /// retirement sweep can still find work in. Not a shape `weft rm`
+    /// produces, which is why it is spelled differently from
+    /// [`Self::remove_project`].
+    pub fn forget_project_row(&self, project: uuid::Uuid) {
         self.projects.lock().unwrap().remove(&project);
         self.heads.lock().unwrap().remove(&project);
     }
@@ -644,6 +702,14 @@ impl VersionStoreOps for MockVersionStore {
     }
 
     async fn delete_versions(&self, project: uuid::Uuid, ids: &[String]) -> anyhow::Result<()> {
+        // The same refusal, in the same words, as the real store: a
+        // version something still depends on is not deletable. Without
+        // it a test could prune a version out from under an armed
+        // trigger and see it work.
+        let in_use = self.in_use.lock().unwrap();
+        anyhow::ensure!(!ids.iter().any(|id| in_use.contains(id)),
+            "these versions still supply trigger settings or running executions; stop the runs and replace or wipe those trigger settings before pruning");
+        drop(in_use);
         self.versions.lock().unwrap().retain(|v| !(v.project_id == project && ids.contains(&v.id)));
         self.runs.lock().unwrap().retain(|r| !(r.project_id == project && ids.contains(&r.version_id)));
         Ok(())
@@ -703,15 +769,15 @@ impl VersionStoreOps for MockVersionStore {
         // enforces them.
         let mut runs = self.runs.lock().unwrap();
         anyhow::ensure!(!runs.iter().any(|r| r.color == run.color), "run {} is already recorded", run.color);
-        anyhow::ensure!(
-            self.versions
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|v| v.project_id == run.project_id && v.id == run.version_id),
-            "version {} is not recorded in this project",
-            run.version_id
-        );
+        let known = self
+            .versions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.project_id == run.project_id && v.id == run.version_id);
+        if !known {
+            return Err(VersionMissing { project: run.project_id, version: run.version_id.clone() }.into());
+        }
         runs.push(run.clone());
         Ok(())
     }
@@ -1106,14 +1172,27 @@ mod tests {
         assert_eq!(sweepable_versions(&versions, &[], &head), vec!["v3"]);
     }
 
+    /// A run on a version the tree does not hold answers the one error a
+    /// reader can act on, the same way Postgres's foreign key does.
+    #[tokio::test]
+    async fn a_run_on_an_unknown_version_names_the_missing_version() {
+        let store = MockVersionStore::new();
+        let project = uuid::Uuid::nil();
+        store.add_project(project);
+        let err = store.insert_run(&run(1, "never-committed", 3)).await.expect_err("no such version");
+        let missing = err.downcast_ref::<VersionMissing>().expect("the typed error, not a message");
+        assert_eq!(missing.version, "never-committed");
+        assert_eq!(missing.project, project);
+    }
+
     /// A removed project keeps exactly the tree its surviving runs need.
     ///
-    /// `weft rm` with no flags unregisters and deliberately keeps the run
-    /// history, so the row saying which version a run was on, what it
-    /// inherited and which example it ran has to survive with it. The
-    /// versions nothing points at any more are of no use to anybody and go.
+    /// `weft rm` takes the whole tree with the project, in the same
+    /// transaction, and the runs cascade off it. Nothing of a removed
+    /// project is left to prune, which is the point: what used to be
+    /// kept could not be reached or freed by anything afterwards.
     #[tokio::test]
-    async fn a_removed_projects_runs_keep_their_place_in_the_tree() {
+    async fn removing_a_project_takes_its_whole_tree() {
         let store = MockVersionStore::new();
         let project = uuid::Uuid::nil();
         store.add_project(project);
@@ -1121,25 +1200,17 @@ mod tests {
         store.upsert_version(&version("never-ran", Some("ran"), &[("main.weft", "2")], 2)).await.unwrap();
         store.insert_run(&run(1, "ran", 3)).await.unwrap();
 
-        // Nothing happens while the project is still registered.
+        // Nothing is pruned while the project is still registered: a
+        // version with no run is still a version you can go back to.
         assert_eq!(store.retire_unused_versions(project, &[color(1)]).await.unwrap(), 0);
         assert_eq!(store.versions(project).await.unwrap().len(), 2);
 
         store.remove_project(project);
-        assert_eq!(
-            store.retire_unused_versions(project, &[color(1)]).await.unwrap(),
-            1,
-            "only the run-less version goes"
-        );
-        let left = store.versions(project).await.unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].id, "ran");
-        assert_eq!(store.runs(project).await.unwrap().len(), 1, "the run's own row is untouched");
-
-        // And once its last run is cleaned, the version goes too.
-        store.delete_run(color(1)).await.unwrap();
-        assert_eq!(store.retire_unused_versions(project, &[]).await.unwrap(), 1);
-        assert!(store.versions(project).await.unwrap().is_empty());
+        assert!(store.versions(project).await.unwrap().is_empty(), "the tree went with it");
+        assert!(store.runs(project).await.unwrap().is_empty(), "and the runs cascaded");
+        // So the prune finds nothing rather than something: it exists
+        // for a removal that failed halfway, not for the ordinary one.
+        assert_eq!(store.retire_unused_versions(project, &[]).await.unwrap(), 0);
     }
 
     /// A run row the journal has never heard of goes, and the lineage of a
@@ -1152,6 +1223,11 @@ mod tests {
     /// ever. The second is `parent_id`, which carries no foreign key:
     /// deleting a run-less ancestor would leave the survivor parented on a
     /// row that is gone, and nothing would reject it.
+    ///
+    /// This uses `forget_project_row` rather than `remove_project`:
+    /// an ordinary removal takes the whole tree, so the only way tree
+    /// rows outlive their project is a removal that failed halfway,
+    /// which is the case this sweep exists for.
     #[tokio::test]
     async fn retirement_drops_what_no_journal_knows_and_keeps_the_lineage() {
         let store = MockVersionStore::new();
@@ -1166,7 +1242,7 @@ mod tests {
         store.upsert_version(&version("stillborn", Some("root"), &[("main.weft", "4")], 5)).await.unwrap();
         store.insert_run(&run(2, "stillborn", 6)).await.unwrap();
 
-        store.remove_project(project);
+        store.forget_project_row(project);
         // The journal knows only the first color.
         let dropped = store.retire_unused_versions(project, &[color(1)]).await.unwrap();
         assert_eq!(dropped, 2, "the unknown run row and its now-bare version");

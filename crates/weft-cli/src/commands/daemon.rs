@@ -6,10 +6,8 @@
 //! the shared images land in the node via `kind load docker-image`, on
 //! a registry-backed cluster the same manifests pull them instead.
 
-use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -32,25 +30,29 @@ pub struct ClusterConfig {
     pub kube_context: String,
     pub system_namespace: String,
     pub db_namespace: String,
+    /// Loopback port the dispatcher's API answers at on kind: the kind
+    /// node maps it to the dispatcher's node port (see [`MappedPort`]).
+    /// Baked into the node's shape, so changing it rebuilds the node.
     pub dispatcher_port: u16,
-    /// Local port the daemon forwards the cluster ingress controller
-    /// to. Storage file downloads (and any ingress-served URL) are
-    /// minted as `http://127.0.0.1:<ingress_port>/...` in local dev,
-    /// reached via this forward. Distinct from `dispatcher_port`
-    /// (the dispatcher's own API): downloads stream straight from the
-    /// storage box through the ingress, never through the dispatcher.
+    /// Loopback port the cluster ingress controller answers at on kind,
+    /// mapped the same way. Storage file downloads (and any
+    /// ingress-served URL) are minted as
+    /// `http://127.0.0.1:<ingress_port>/...` in local dev. Distinct
+    /// from `dispatcher_port` (the dispatcher's own API): downloads
+    /// stream straight from the storage box through the ingress, never
+    /// through the dispatcher.
     pub ingress_port: u16,
-    /// Local port the daemon forwards the live-connection gateway (Envoy
-    /// Gateway) to. A caller's URL is minted as
-    /// `http://<pod>.<ns>.<host>:<gateway_port>/...` in local dev and
-    /// reached via this forward. Distinct from `ingress_port` (the nginx
-    /// ingress for storage downloads); the live gateway is a separate
-    /// front door.
+    /// Loopback port the live-connection gateway (Envoy Gateway)
+    /// answers at on kind, mapped the same way. A caller's URL is
+    /// minted as `http://<pod>.<ns>.<host>:<gateway_port>/...` in local
+    /// dev. Distinct from `ingress_port` (the nginx ingress for storage
+    /// downloads); the live gateway is a separate front door.
     pub gateway_port: u16,
-    /// Local port the daemon forwards the bundled SeaweedFS object store to.
-    /// Runtime-file downloads are presigned BUCKET urls signed for this
-    /// host-reachable address (the broker's in-cluster I/O endpoint is
-    /// unreachable from the host / a browser).
+    /// Loopback port the bundled SeaweedFS object store's docker
+    /// container (a host container, not a pod; see `ensure_object_store`)
+    /// is published on. Runtime-file downloads are presigned BUCKET urls
+    /// signed for this host-reachable address (the broker's in-cluster
+    /// I/O endpoint is unreachable from the host / a browser).
     pub seaweed_port: u16,
     /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
     /// range; the broker NetworkPolicy allows TokenReview egress to
@@ -125,12 +127,28 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "10.244.0.0/16".into());
         let cluster_dns_ip =
             std::env::var("WEFT_CLUSTER_DNS_IP").unwrap_or_default().trim().to_string();
-        let backend = match std::env::var("WEFT_CLUSTER_BACKEND")
-            .as_deref()
-            .ok()
-        {
-            Some("k8s") => ClusterBackend::K8s,
-            _ => ClusterBackend::Kind,
+        // Unlike the CIDRs above, a misread backend is not something a
+        // later consumer can catch: every command branches on it, and
+        // the default branch is the one that runs `kind create cluster`
+        // against whatever cluster the operator's kubectl points at. So
+        // a value we do not recognise stops the process here, where the
+        // typo is, rather than becoming "kind" everywhere. It exits
+        // instead of returning an error because this config is a
+        // process-wide `OnceLock` every command reads, with no caller
+        // in a position to answer for it.
+        let backend = match std::env::var("WEFT_CLUSTER_BACKEND").as_deref() {
+            Ok("k8s") => ClusterBackend::K8s,
+            Ok("kind") => ClusterBackend::Kind,
+            Err(_) => ClusterBackend::Kind,
+            Ok(other) if other.trim().is_empty() => ClusterBackend::Kind,
+            Ok(other) => {
+                eprintln!(
+                    "WEFT_CLUSTER_BACKEND is set to '{other}', which weft does not know. \
+                     It takes 'kind' (the local cluster weft builds and owns) or 'k8s' \
+                     (a cluster you already run). Unset it for 'kind'."
+                );
+                std::process::exit(2);
+            }
         };
         Self {
             cluster_name,
@@ -198,7 +216,7 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 ///
 /// Public base URL policy:
 /// - Kind (local dev): default to `http://127.0.0.1:<ingress_port>`
-///   (the daemon forwards the cluster ingress there) and set
+///   (the kind node maps the cluster ingress there) and set
 ///   WEFT_LOCAL_DEV=1 so the dispatcher accepts the loopback host.
 ///   An operator may still override WEFT_DISPATCHER_PUBLIC_BASE_URL.
 /// - K8s (real cluster): the operator MUST set
@@ -220,6 +238,17 @@ async fn manifest_template_vars(
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
 
+    // The operator's machine, as the cluster sees it: on kind, the
+    // docker network's gateway address is what every packet from this
+    // machine carries when it enters the node (the object store dial,
+    // a listener's watch on a local service, the CLI arriving through
+    // a mapped node port). Read once; three defaults below derive from
+    // it. A real cluster has no such address.
+    let host_gateway = match cfg.backend {
+        ClusterBackend::Kind => Some(kind_network_gateway_ipv4().await?),
+        ClusterBackend::K8s => None,
+    };
+
     // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
     // bytes to this bucket, and workers read/write it DIRECTLY via presigned URLs.
     // The store is ALWAYS external to the cluster, reached over S3 (endpoint from
@@ -237,11 +266,9 @@ async fn manifest_template_vars(
         // real cluster has no such address to derive, so absence there
         // is a configuration error, named instead of surfacing as a
         // "docker network inspect kind failed".
-        Err(_) => match cfg.backend {
-            ClusterBackend::Kind => {
-                format!("http://{}:{}", kind_network_gateway_ipv4().await?, cfg.seaweed_port)
-            }
-            ClusterBackend::K8s => anyhow::bail!(
+        Err(_) => match &host_gateway {
+            Some(gateway) => format!("http://{gateway}:{}", cfg.seaweed_port),
+            None => anyhow::bail!(
                 "WEFT_OBJECT_STORE_ENDPOINT is required for the k8s backend; set it to \
                  the S3 endpoint the cluster reaches"
             ),
@@ -309,13 +336,28 @@ async fn manifest_template_vars(
     // there; on a real cluster it defaults to a benign unused /32.
     let listener_allow_cidr = match std::env::var("WEFT_LISTENER_ALLOW_CIDR") {
         Ok(v) => v,
-        Err(_) => match cfg.backend {
-            ClusterBackend::Kind => format!("{}/32", kind_network_gateway_ipv4().await?),
-            ClusterBackend::K8s => "192.0.2.0/32".into(),
+        Err(_) => match &host_gateway {
+            Some(gateway) => format!("{gateway}/32"),
+            None => "192.0.2.0/32".into(),
         },
     };
     check_cidr(&listener_allow_cidr, false)
         .map_err(|e| anyhow::anyhow!("WEFT_LISTENER_ALLOW_CIDR='{listener_allow_cidr}': {e}"))?;
+
+    // Where a packet that entered through a mapped node port comes
+    // from, for the dispatcher's ingress NetworkPolicy. The kind node
+    // maps the operator's loopback ports to NodePort Services
+    // (deploy/k8s/kind-node-ports.yaml), and a connection arriving that
+    // way carries the operator's machine's address on the cluster
+    // network: kube-proxy rewrites the destination before the policy
+    // engine sees the packet and the source only after, so the /32 of
+    // the docker gateway is exactly what the policy compares against.
+    // A real cluster maps no node port, so it opens a benign unused
+    // address instead.
+    let node_port_source_cidr = match &host_gateway {
+        Some(gateway) => format!("{gateway}/32"),
+        None => "192.0.2.0/32".into(),
+    };
 
     let (public_base_url, local_dev) = match cfg.backend {
         ClusterBackend::Kind => {
@@ -345,8 +387,8 @@ async fn manifest_template_vars(
     let (gateway_host, gateway_base_url, caller_token_secret) = match cfg.backend {
         ClusterBackend::Kind => {
             // nip.io wildcard: `<anything>.127-0-0-1.nip.io` -> 127.0.0.1,
-            // reached via the daemon's gateway port-forward. A fixed dev
-            // secret keeps tokens stable across local restarts.
+            // where the kind node maps the gateway's node port. A fixed
+            // dev secret keeps tokens stable across local restarts.
             let host = std::env::var("WEFT_GATEWAY_HOST")
                 .unwrap_or_else(|_| "127-0-0-1.nip.io".to_string());
             let base = std::env::var("WEFT_GATEWAY_BASE_URL")
@@ -379,15 +421,42 @@ async fn manifest_template_vars(
         std::env::var("WEFT_OBJECT_STORE_BUCKET").unwrap_or_else(|_| "weft".to_string());
     let object_store_region =
         std::env::var("WEFT_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let object_store_access_key =
-        std::env::var("WEFT_OBJECT_STORE_ACCESS_KEY").unwrap_or_else(|_| "weft-local".to_string());
-    let object_store_secret_key = std::env::var("WEFT_OBJECT_STORE_SECRET_KEY")
-        .unwrap_or_else(|_| "weft-local-dev-secret".to_string());
+    // The credentials and the browser-facing address. Their defaults
+    // describe the store `ensure_object_store` starts on this machine:
+    // a known key pair and a loopback port. On a real cluster each of
+    // them would be a wrong answer nobody notices (a bucket that
+    // refuses every write, or download links pointing at the reader's
+    // own machine), so like their siblings above they are required
+    // rather than defaulted there.
+    let object_store_access_key = match std::env::var("WEFT_OBJECT_STORE_ACCESS_KEY") {
+        Ok(v) => v,
+        Err(_) if cfg.backend == ClusterBackend::Kind => "weft-local".to_string(),
+        Err(_) => anyhow::bail!(
+            "WEFT_OBJECT_STORE_ACCESS_KEY is required for the k8s backend; the default is \
+             the key pair of the store weft runs on a developer's own machine"
+        ),
+    };
+    let object_store_secret_key = match std::env::var("WEFT_OBJECT_STORE_SECRET_KEY") {
+        Ok(v) => v,
+        Err(_) if cfg.backend == ClusterBackend::Kind => "weft-local-dev-secret".to_string(),
+        Err(_) => anyhow::bail!(
+            "WEFT_OBJECT_STORE_SECRET_KEY is required for the k8s backend; the default is \
+             the key pair of the store weft runs on a developer's own machine"
+        ),
+    };
     // PUBLIC endpoint (the browser reaches): the store container is published on the
     // host's loopback too, so the browser hits 127.0.0.1:<seaweed_port> directly.
-    // An operator sets this to the S3 store's public URL via env.
-    let object_store_public_endpoint = std::env::var("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", cfg.seaweed_port));
+    let object_store_public_endpoint = match std::env::var("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT") {
+        Ok(v) => v,
+        Err(_) if cfg.backend == ClusterBackend::Kind => {
+            format!("http://127.0.0.1:{}", cfg.seaweed_port)
+        }
+        Err(_) => anyhow::bail!(
+            "WEFT_OBJECT_STORE_PUBLIC_ENDPOINT is required for the k8s backend; set it to \
+             the address a BROWSER reaches the store at, which is what download links \
+             are signed for"
+        ),
+    };
 
     // The content-addressed image refs the manifests pin, one var per
     // service, named by the same `image_env` the override read uses so
@@ -403,6 +472,7 @@ async fn manifest_template_vars(
         ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
         ("WEFT_STORE_ALLOW_CIDR", store_allow_cidr),
         ("WEFT_LISTENER_ALLOW_CIDR", listener_allow_cidr),
+        ("WEFT_NODE_PORT_SOURCE_CIDR", node_port_source_cidr),
         ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
         ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
         // The ADDITIONAL internet-reachable address, empty when none:
@@ -429,7 +499,71 @@ async fn manifest_template_vars(
         ("WEFT_OBJECT_STORE_SECRET_KEY", object_store_secret_key),
         ("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT", object_store_public_endpoint),
     ]);
+    // The node ports the kind node's port mappings land on, so the
+    // NodePort Services and the kind config are rendered from ONE set
+    // of numbers (see `MappedPort`).
+    vars.extend(MappedPort::ALL.iter().map(|&m| (m.template_var(), m.node_port().to_string())));
     Ok(vars)
+}
+
+/// The three services the operator's machine reaches inside the kind
+/// cluster, each at a loopback port of its own: the dispatcher's API
+/// (the CLI and the editor), the ingress controller (storage
+/// downloads) and the live-connection gateway (route callers).
+///
+/// Each is exposed by a NodePort Service pinned to a fixed node port
+/// (`deploy/k8s/kind-node-ports.yaml`), and the kind config maps that
+/// node port to the configured loopback port on the host, so the
+/// docker port mapping is the whole path in: no process on this
+/// machine holds it open. This type is the one place the node ports
+/// live; the manifest and the kind config both render from it.
+///
+/// A real cluster (the k8s backend) applies none of this: its services
+/// are reached at the operator's external addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappedPort {
+    Dispatcher,
+    Ingress,
+    Gateway,
+}
+
+impl MappedPort {
+    const ALL: [MappedPort; 3] = [MappedPort::Dispatcher, MappedPort::Ingress, MappedPort::Gateway];
+
+    /// The fixed node port. All three sit in the lower band of the
+    /// default node-port range (30000-32767): the apiserver reserves
+    /// the first min(max(16, range/16), 128) = 128 ports of the range
+    /// for explicitly requested node ports and hands dynamic
+    /// allocations (ingress-nginx's own Service, the Service Envoy
+    /// Gateway generates) ports from the rest first, so a Service that
+    /// is created before ours never takes one of these.
+    /// SYNC: node ports <-> deploy/k8s/kind-node-ports.yaml (rendered
+    ///       from these through the template vars, never typed there)
+    fn node_port(self) -> u16 {
+        match self {
+            MappedPort::Dispatcher => 30099,
+            MappedPort::Ingress => 30098,
+            MappedPort::Gateway => 30097,
+        }
+    }
+
+    /// The loopback port on this machine the node port is mapped to.
+    fn host_port(self, cfg: &ClusterConfig) -> u16 {
+        match self {
+            MappedPort::Dispatcher => cfg.dispatcher_port,
+            MappedPort::Ingress => cfg.ingress_port,
+            MappedPort::Gateway => cfg.gateway_port,
+        }
+    }
+
+    /// The `${...}` placeholder the manifest names this node port by.
+    fn template_var(self) -> &'static str {
+        match self {
+            MappedPort::Dispatcher => "WEFT_DISPATCHER_NODE_PORT",
+            MappedPort::Ingress => "WEFT_INGRESS_NODE_PORT",
+            MappedPort::Gateway => "WEFT_GATEWAY_NODE_PORT",
+        }
+    }
 }
 
 /// The Kubernetes apiserver's ClusterIP: by convention the FIRST
@@ -455,7 +589,7 @@ pub enum DaemonAction {
     /// One verb for boot AND refresh (`restart` is a CLI alias): the
     /// reconcile below is idempotent, so "the daemon was fully up" and
     /// "nothing exists yet" are just states it converges from.
-    Start { rebuild: bool, rebuild_cluster: bool, public_url: Option<bool> },
+    Start { rebuild: bool, rebuild_cluster: bool, public_url: Option<bool>, clear_access_apps: bool },
     Stop,
     Status,
     Logs { tail: usize, follow: bool },
@@ -463,14 +597,67 @@ pub enum DaemonAction {
 
 pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Start { rebuild, rebuild_cluster, public_url } => {
+        DaemonAction::Start { rebuild, rebuild_cluster, public_url, clear_access_apps } => {
             set_public_url_choice(public_url)?;
-            reconcile(rebuild, rebuild_cluster).await
+            reconcile(&ctx, rebuild, rebuild_cluster, clear_access_apps).await
         }
         DaemonAction::Stop => stop().await,
         DaemonAction::Status => status(&ctx).await,
         DaemonAction::Logs { tail, follow } => logs(tail, follow).await,
     }
+}
+
+/// Where this boot proves the dispatcher reachable, and what the ready
+/// line names: on kind, the loopback port the node maps to the
+/// dispatcher's node port; on a real cluster, the address the CLI is
+/// configured to talk to (`--dispatcher` / WEFT_DISPATCHER_URL), which
+/// is the operator's external ingress host.
+fn dispatcher_reach_url(cfg: &ClusterConfig, ctx: &Ctx) -> String {
+    match cfg.backend {
+        ClusterBackend::Kind => format!("http://127.0.0.1:{}", cfg.dispatcher_port),
+        ClusterBackend::K8s => ctx.dispatcher_url().trim_end_matches('/').to_string(),
+    }
+}
+
+/// Why `weft daemon start` stops on the k8s backend, and what the
+/// operator would have to bring for it to mean anything.
+///
+/// The backend exists because parts of weft are cluster-shaped already
+/// (images pull from a registry, the manifests template every address).
+/// What it does not have is anybody who installs the pieces `reconcile`
+/// assumes: on kind weft installs the ingress controller and the Envoy
+/// Gateway controller itself, and then patches that controller's config
+/// to turn on the two extension APIs `gateway.yaml` is written against.
+/// None of that runs there, yet `gateway.yaml` is applied on both
+/// backends. The kinder of the two outcomes is a raw apiserver error
+/// about a CRD nobody registered; the other one is a clean apply onto a
+/// controller running upstream defaults, where every live connection
+/// then fails and the cluster looks healthy.
+///
+/// So this refuses, and says what it would need, rather than getting
+/// half way and leaving the operator to work out which half.
+fn refuse_k8s_backend() -> anyhow::Error {
+    anyhow::anyhow!(
+        "WEFT_CLUSTER_BACKEND=k8s: weft cannot bring a daemon up on a cluster it does not \
+         build. Deploying weft beyond one machine is not designed yet, and the pieces \
+         `weft daemon start` assumes are the ones it installs for itself on kind:\n\
+         \n\
+         \x20 - the Envoy Gateway controller, with `extensionApis.enableBackend` and \
+         `extensionApis.enableEnvoyPatchPolicy` set to true in its `envoy-gateway-config` \
+         ConfigMap and the controller restarted onto them. `deploy/k8s/gateway.yaml` is \
+         written against both, and applies without complaint onto a controller that has \
+         neither.\n\
+         \x20 - an ingress controller answering the `nginx` class (`deploy/k8s/ingress.yaml`).\n\
+         \x20 - the gateway variables: WEFT_GATEWAY_HOST (a wildcard host with DNS and a \
+         certificate pointed at the gateway), WEFT_GATEWAY_BASE_URL, WEFT_CALLER_TOKEN_SECRET.\n\
+         \x20 - the object store: WEFT_OBJECT_STORE_ENDPOINT, WEFT_OBJECT_STORE_PUBLIC_ENDPOINT, \
+         WEFT_OBJECT_STORE_ACCESS_KEY, WEFT_OBJECT_STORE_SECRET_KEY, plus \
+         WEFT_DISPATCHER_PUBLIC_BASE_URL.\n\
+         \x20 - a kube context (WEFT_KUBE_CONTEXT) pointing at that cluster, and images in a \
+         registry it can pull from (`WEFT_IMAGE_REGISTRY=<registry> weft build-images --push`).\n\
+         \n\
+         Unset WEFT_CLUSTER_BACKEND to run the local cluster weft owns."
+    )
 }
 
 /// THE daemon boot: `daemon start` and `daemon restart` both run this
@@ -488,33 +675,30 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
 /// Every step is idempotent, so "the daemon was fully up" and "the
 /// cluster does not even exist yet" are both just states this
 /// converges from.
-async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
+async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access_apps: bool) -> Result<()> {
     let cfg = cluster_config();
+    // The checkout this install comes from: manifests and the
+    // shared-credentials file are read from it, and a successful boot
+    // records it so a later `weft daemon start` from anywhere (a
+    // project folder, say) finds the same one.
+    let repo_root = weft_compiler::build::resolve_weft_root()
+        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     require_binary("kubectl").await?;
     require_binary("docker").await?;
-    // The port-forward pid verification shells out to ps on every
-    // reconcile; missing ps must fail here, not mid-restart.
-    require_binary("ps").await?;
 
-    // On the k8s backend a local rebuild has no route into the
-    // cluster: there is no kind node to load into and this path never
-    // pushes. Refuse up front instead of burning a build and then
-    // restarting three tiers onto exactly the bytes they already run.
-    if rebuild && cfg.backend == ClusterBackend::K8s {
-        anyhow::bail!(
-            "--rebuild only reaches a kind cluster; for the k8s backend, rebuild and \
-             publish with `WEFT_IMAGE_REGISTRY=<your registry> weft build-images --push` \
-             (the same variable the manifests template the image refs from, so the \
-             cluster pulls what you pushed), then re-run `weft daemon start`."
-        );
+    if cfg.backend == ClusterBackend::K8s {
+        return Err(refuse_k8s_backend());
     }
 
     // The cluster + its ingress controller + the Envoy Gateway
     // controller before anything else (gateway.yaml's CRs need Envoy's
-    // CRDs; everything needs a cluster to apply into). All idempotent:
-    // a no-op once present, which is what makes this self-healing over
-    // a missing/partial cluster (a fresh machine, a `kind delete`, a
-    // daemon process alive while its cluster is gone).
+    // CRDs and its two extension APIs; everything needs a cluster to
+    // apply into). All idempotent: a no-op once present, which is what
+    // makes this self-healing over a missing/partial cluster (a fresh
+    // machine, a `kind delete`, a daemon process alive while its
+    // cluster is gone). Everything past the refusal above is on kind,
+    // so this is not a branch so much as the shape of the one backend
+    // that gets here.
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
         ensure_cluster(cfg, rebuild_cluster).await?;
@@ -549,7 +733,7 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     // under-rolling once left a stale broker silently stripping
     // journal fields for a day).
     let mut pending = PendingStamps::default();
-    let changes = apply_platform_state(cfg, &imgs, &mut pending).await?;
+    let changes = apply_platform_state(cfg, &imgs, &repo_root, clear_access_apps, &mut pending).await?;
 
     recover_failed_dispatcher_update(&cfg.system_namespace, &imgs.dispatcher).await?;
 
@@ -560,52 +744,27 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     wait_workload_ready("statefulset", "weft-dispatcher", &cfg.system_namespace).await?;
 
     // One linear pass, so no combination of change flags can skip a
-    // step it needed: the dispatcher roll, the broker roll and the
-    // forward reconcile each fire on their own condition (see
-    // `rolls_for` for what triggers each), never on a branch agreeing
-    // with two others.
-    let rolls = rolls_for(&changes, rebuild, all_forward_pids_live(cfg).await);
+    // step it needed: the dispatcher roll and the broker roll each fire
+    // on their own condition (see `rolls_for` for what triggers each),
+    // never on a branch agreeing with the other.
+    let rolls = rolls_for(&changes, rebuild);
     if rolls.dispatcher {
         roll_workload("statefulset", "weft-dispatcher", &cfg.system_namespace).await?;
     }
     if rolls.broker {
         roll_workload("deployment", "weft-broker", &cfg.db_namespace).await?;
     }
-    // The port-forward is bound to a single Pod IP, so a dispatcher
-    // recreate (the apply's own roll on a dispatcher.yaml change, or
-    // the explicit roll above) kills it; and even with nothing rolled,
-    // a background `kubectl port-forward` dies if its pod restarts out
-    // of band or its port is squatted, AND the GATEWAY forward is
-    // SKIPPED on the very first boot (the Envoy Gateway Service is not
-    // programmed yet). Every boot must leave the COMPLETE forward set
-    // working, so `rolls.forwards` checks EVERY desired forward's pid,
-    // not just the dispatcher's.
-    let mut forwards_restarted = false;
-    if rolls.forwards {
-        restart_port_forwards().await?;
-        forwards_restarted = true;
-    }
-    // Reachability is the gate, never pid liveness alone: a recorded
-    // pid can be live and useless (a reboot recycled it into an
-    // unrelated process; a kubectl wedged on a gone pod), so every
-    // boot ends by probing /health. A failed probe over forwards this
-    // run did NOT rebuild gets one rebuild-and-reprobe; a failure
-    // after a rebuild is real and bails.
-    let health = format!("http://127.0.0.1:{}/health", cfg.dispatcher_port);
-    if let Err(probe) = wait_for_dispatcher_health(&health).await {
-        if rolls.forwards {
-            return Err(probe);
-        }
-        restart_port_forwards().await?;
-        forwards_restarted = true;
-        wait_for_dispatcher_health(&health).await?;
-    }
+    // Reachability from THIS machine is the gate: the rollout above
+    // proved the pod Ready inside the cluster, and this proves the path
+    // in (the node's port mapping and the NodePort Service on kind).
+    let reach = dispatcher_reach_url(cfg, ctx);
+    wait_for_dispatcher_health(&reach).await?;
     // The summary says what actually happened: applies and rolls are
     // different facts (a manifest change is applied but may roll
     // nothing here; a --rebuild rolls everything with no stamp moving),
     // and a line deduced from the wrong one lies in both directions.
     let mut applied: Vec<&str> = Vec::new();
-    if changes.dispatcher_manifest || changes.postgres_manifest || changes.other_manifests {
+    if changes.postgres_manifest || changes.other_manifests {
         applied.push("manifests");
     }
     if changes.sealing_key {
@@ -629,9 +788,6 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     if rolls.broker {
         rolled.push("broker");
     }
-    if forwards_restarted {
-        rolled.push("port-forwards");
-    }
     if applied.is_empty() && rolled.is_empty() {
         println!("daemon already on the latest images and manifests; nothing to roll");
     } else if rolled.is_empty() {
@@ -647,8 +803,9 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     }
 
     // Every roll the detected changes demanded has completed: persist
-    // the change stamps.
+    // the change stamps, and the checkout this boot installed from.
     pending.flush();
+    record_repo_root(&repo_root)?;
 
     // The pooled listener / supervisor Deployments were rendered by the
     // dispatcher with the image IT knew at spawn time, so an image
@@ -676,11 +833,10 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     // Ready, or a listing this pass could not read at all).
     anyhow::ensure!(
         pooled_failures.is_empty(),
-        "the daemon is up at http://127.0.0.1:{}, but the pooled listener / \
+        "the daemon is up at {reach}, but the pooled listener / \
          supervisor tiers could not be fully reconciled:\n  {}\nRe-run \
          `weft daemon start` to retry, and inspect with \
          `kubectl --context {} get deploy -A -l weft.dev/role -o wide`.",
-        cfg.dispatcher_port,
         pooled_failures.join("\n  "),
         cfg.kube_context,
     );
@@ -689,8 +845,8 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
         ClusterBackend::K8s => "k8s",
     };
     println!(
-        "daemon ready at http://127.0.0.1:{} ({} cluster '{}', system ns '{}')",
-        cfg.dispatcher_port, backend, cfg.cluster_name, cfg.system_namespace,
+        "daemon ready at {reach} ({} cluster '{}', system ns '{}')",
+        backend, cfg.cluster_name, cfg.system_namespace,
     );
     Ok(())
 }
@@ -735,9 +891,6 @@ async fn provision_images(rebuild: bool) -> Result<images::SystemImages> {
 /// tags, so no stamp can see it; it rides this struct so `rolls_for`
 /// decides from ONE input).
 struct DetectedChanges {
-    /// dispatcher.yaml moved: its apply recreates the dispatcher pod,
-    /// which kills the pod-bound forwards.
-    dispatcher_manifest: bool,
     /// postgres.yaml moved: it carries the database-credentials
     /// Secret, which BOTH the dispatcher and the broker read as env
     /// (`secretKeyRef` -> WEFT_DATABASE_URL) injected only at pod
@@ -745,10 +898,11 @@ struct DetectedChanges {
     /// rolls both (over-rolling on a non-credential edit is a cheap
     /// restart; under-rolling once left services on a dead URL).
     postgres_manifest: bool,
-    /// Any other manifest moved (namespaces, broker, ingress, RBAC,
-    /// gateway): applied, and either self-rolling (a spec change) or
-    /// effective with no restart (policies, routes); feeds only the
-    /// summary line.
+    /// Any other manifest moved (namespaces, dispatcher, broker,
+    /// ingress, RBAC, gateway, the kind node ports): applied, and
+    /// either self-rolling (a spec change) or effective with no
+    /// restart (policies, routes, Services); feeds only the summary
+    /// line.
     other_manifests: bool,
     sealing_key: bool,
     apps: bool,
@@ -762,23 +916,16 @@ struct DetectedChanges {
 /// A dispatcher SPEC change is deliberately NOT a dispatcher-roll
 /// trigger: the apply itself rolls it and is gated Ready before
 /// `rolls_for` runs; re-adding it here would roll the dispatcher
-/// twice on every code edit. `forwards` says whether the port-forward
-/// set must be torn down and re-spawned: a dispatcher pod recreate
-/// (the apply on a dispatcher.yaml change, or the explicit roll)
-/// kills the pod-bound forwards, and dead recorded pids mean the set
-/// is already broken.
+/// twice on every code edit.
 struct Rolls {
     dispatcher: bool,
     broker: bool,
-    forwards: bool,
 }
 
-fn rolls_for(c: &DetectedChanges, rebuilt: bool, forward_pids_live: bool) -> Rolls {
-    let dispatcher = c.sealing_key || c.postgres_manifest || rebuilt;
+fn rolls_for(c: &DetectedChanges, rebuilt: bool) -> Rolls {
     Rolls {
-        dispatcher,
+        dispatcher: c.sealing_key || c.postgres_manifest || rebuilt,
         broker: c.sealing_key || c.apps || c.postgres_manifest || rebuilt,
-        forwards: c.dispatcher_manifest || dispatcher || !forward_pids_live,
     }
 }
 
@@ -905,10 +1052,10 @@ async fn recover_failed_dispatcher_update(namespace: &str, image: &str) -> Resul
 async fn apply_platform_state(
     cfg: &ClusterConfig,
     imgs: &images::SystemImages,
+    repo_root: &Path,
+    clear_access_apps: bool,
     pending: &mut PendingStamps,
 ) -> Result<DetectedChanges> {
-    let repo_root = weft_compiler::build::resolve_weft_root()
-        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
     let mut other_manifests = false;
     // The var set is computed ONCE (it is not free: a docker network
@@ -922,6 +1069,19 @@ async fn apply_platform_state(
     for name in ["system-namespace.yaml", "db-namespace.yaml"] {
         other_manifests |=
             kubectl_apply_changed(&manifests.join(name), &template_vars, pending).await?;
+    }
+    // The node ports the kind node maps to this machine's loopback
+    // (see `MappedPort`): one NodePort Service per front door, in the
+    // namespaces the cluster, ingress and gateway installs above
+    // created. Kind only; a real cluster is reached at the operator's
+    // external addresses.
+    if cfg.backend == ClusterBackend::Kind {
+        other_manifests |= kubectl_apply_changed(
+            &manifests.join("kind-node-ports.yaml"),
+            &template_vars,
+            pending,
+        )
+        .await?;
     }
     // The public tunnel next, when opted in: its minted address is an
     // ADDITIONAL internet-reachable door, substituted into the
@@ -955,7 +1115,7 @@ async fn apply_platform_state(
     // is invisible to the pod SPEC, which is why they carry their own
     // change signals (the caller rolls the broker on them).
     let sealing_key = apply_sealing_key_secret(cfg, pending).await?;
-    let apps = apply_access_apps_secret(cfg, pending).await?;
+    let apps = apply_access_apps_secret(cfg, repo_root, clear_access_apps, pending).await?;
     other_manifests |=
         kubectl_apply_changed(&manifests.join("broker.yaml"), &template_vars, pending).await?;
     wait_workload_ready("deployment", "weft-broker", &cfg.db_namespace).await?;
@@ -966,24 +1126,23 @@ async fn apply_platform_state(
     // supervisor + listener pods (tenant-agnostic, in the
     // control-plane namespace), bound into project namespaces by
     // RoleBindings the dispatcher creates at first infra apply.
-    // dispatcher.yaml's change flag is its own too: its apply
-    // recreates the dispatcher pod, which the forward reconcile keys
-    // on (see `DetectedChanges::dispatcher_manifest`).
-    let dispatcher_manifest =
-        kubectl_apply_changed(&manifests.join("dispatcher.yaml"), &template_vars, pending).await?;
     for name in [
+        "dispatcher.yaml",
         "ingress.yaml",
         "cluster-rbac.yaml",
-        // Live caller connection gateway (Envoy Gateway CRs). Applied
-        // after the controller install (`ensure_envoy_gateway`) so the
-        // CRDs exist. `${GATEWAY_HOST}` is substituted from template vars.
+        // Live caller connection gateway (Envoy Gateway CRs). These
+        // need the controller's CRDs registered and its two extension
+        // APIs turned on, which `ensure_envoy_gateway` did above. It
+        // only ran because we are on kind: the k8s backend is refused
+        // at the top of `reconcile` precisely so this never applies
+        // onto a controller nobody set up. `${GATEWAY_HOST}` is
+        // substituted from template vars.
         "gateway.yaml",
     ] {
         other_manifests |=
             kubectl_apply_changed(&manifests.join(name), &template_vars, pending).await?;
     }
     Ok(DetectedChanges {
-        dispatcher_manifest,
         postgres_manifest,
         other_manifests,
         sealing_key,
@@ -1349,127 +1508,8 @@ async fn wait_for_quick_tunnel_url() -> Result<String> {
     }
 }
 
-/// A background `kubectl port-forward` the daemon owns. Each forward
-/// tracks its own pid + log file (keyed by `name`) so they start,
-/// stop, and report liveness independently.
-struct PortForward {
-    /// Which forward this is; `name.as_str()` keys the pid/log files.
-    name: Forward,
-    namespace: String,
-    /// Service name. Most are fixed; the live gateway's data-plane
-    /// Service name is generated by Envoy Gateway, so it is resolved by
-    /// label at `port_forwards` build time (hence `String`, not `&str`).
-    service: String,
-    local_port: u16,
-    remote_port: u16,
-}
-
-/// Every port-forward the daemon maintains:
-/// - dispatcher: the control plane API (CLI / extension talk here).
-///   Always present.
-/// - ingress: the kind ingress controller, so storage file downloads
-///   minted as `http://127.0.0.1:<ingress_port>/storage/...` are
-///   reachable from the operator's machine. Downloads stream straight
-///   from the storage box through the ingress; the dispatcher is
-///   never in the byte path, so this is a separate forward, not a
-///   route through the dispatcher port. Kind-only: a real k8s
-///   operator sets a real external ingress host
-///   (WEFT_DISPATCHER_PUBLIC_BASE_URL) reachable without a forward,
-///   and the ingress-nginx Service name may differ in their cluster.
-async fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
-    let mut forwards = vec![PortForward {
-        name: Forward::Dispatcher,
-        namespace: cfg.system_namespace.clone(),
-        service: "weft-dispatcher".to_string(),
-        local_port: Forward::Dispatcher.local_port(cfg),
-        remote_port: 9999,
-    }];
-    if cfg.backend == ClusterBackend::Kind {
-        forwards.push(PortForward {
-            name: Forward::Ingress,
-            namespace: "ingress-nginx".to_string(),
-            service: "ingress-nginx-controller".to_string(),
-            local_port: Forward::Ingress.local_port(cfg),
-            remote_port: 80,
-        });
-        // No object-store port-forward: the store runs as a HOST docker container
-        // (see `ensure_object_store`) already published on 127.0.0.1:<seaweed_port>,
-        // so the browser reaches it directly and in-cluster pods reach it via the
-        // kind gateway IP. Nothing to forward out of the cluster.
-        // Live connection gateway: forward the local gateway port to the
-        // Envoy Gateway data-plane Service. Its name is generated by Envoy
-        // Gateway, so resolve it by the owning-gateway label. Skipped if
-        // not yet present (first boot before the Gateway is programmed);
-        // the next restart picks it up.
-        if let Some(svc) = resolve_envoy_gateway_service().await {
-            forwards.push(PortForward {
-                name: Forward::Gateway,
-                namespace: "envoy-gateway-system".to_string(),
-                service: svc,
-                local_port: Forward::Gateway.local_port(cfg),
-                remote_port: 80,
-            });
-        }
-    }
-    forwards
-}
-
-/// Resolve the Envoy Gateway data-plane Service name for our Gateway.
-/// Envoy Gateway generates it (e.g. `envoy-envoy-gateway-system-weft-...`),
-/// labeled with the owning gateway, so we look it up rather than hardcode.
-/// Returns `None` if not yet created (the Gateway isn't programmed yet).
-async fn resolve_envoy_gateway_service() -> Option<String> {
-    // Short request timeout: this is called from `port_forwards`, which
-    // `status` awaits BEFORE its reachability probe. Without a bound, a
-    // slow/down apiserver would hang `weft daemon status` instead of letting
-    // it report quickly. A miss (svc not yet programmed, or apiserver slow)
-    // simply means "no gateway forward yet", recovered on the next call.
-    let out = kubectl(&[
-        "--request-timeout=5s",
-        "-n",
-        "envoy-gateway-system",
-        "get",
-        "svc",
-        "-l",
-        "gateway.envoyproxy.io/owning-gateway-name=weft-live-gateway",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ])
-    .output()
-    .await
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-fn data_dir_pid_file(fwd: Forward) -> PathBuf {
-    data_dir().join(format!("port-forward-{}.pid", fwd.as_str()))
-}
-
-fn pf_log_file(fwd: Forward) -> PathBuf {
-    data_dir().join(format!("port-forward-{}.log", fwd.as_str()))
-}
-
 async fn stop() -> Result<()> {
     let cfg = cluster_config();
-    // ps is what the kill below verifies pids with: check it up front
-    // so a missing tool fails before anything is half-stopped.
-    require_binary("ps").await?;
-    kill_existing_port_forwards(cfg).with_context(|| {
-        format!(
-            "the port-forwards were left running and the dispatcher was NOT scaled down; \
-             clear them and re-run `weft daemon stop`, or scale it by hand: \
-             kubectl --context {} -n {} scale statefulset/weft-dispatcher --replicas=0",
-            cfg.kube_context, cfg.system_namespace
-        )
-    })?;
     let _ = kubectl(&[
         "-n", &cfg.system_namespace, "scale", "statefulset/weft-dispatcher", "--replicas=0",
     ])
@@ -1479,236 +1519,14 @@ async fn stop() -> Result<()> {
     Ok(())
 }
 
-/// THE identity of each forward the daemon may own: its stable name
-/// (the pid/log filename key) and its local port, the one piece of a
-/// forward's identity known WITHOUT resolving live cluster state (the
-/// gateway's Service name is generated by Envoy Gateway). One type
-/// feeds both the spawner (`port_forwards`) and the pid verification,
-/// so the two can never disagree, and a typo is a compile error. The
-/// actual forward set is a subset depending on backend + what's
-/// programmed yet; killing a name with no pid file is a no-op, so
-/// `ALL` being a superset is safe.
-#[derive(Clone, Copy)]
-enum Forward {
-    Dispatcher,
-    Ingress,
-    Gateway,
-}
-
-impl Forward {
-    const ALL: [Forward; 3] = [Forward::Dispatcher, Forward::Ingress, Forward::Gateway];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Forward::Dispatcher => "dispatcher",
-            Forward::Ingress => "ingress",
-            Forward::Gateway => "gateway",
-        }
-    }
-
-    fn local_port(self, cfg: &ClusterConfig) -> u16 {
-        match self {
-            Forward::Dispatcher => cfg.dispatcher_port,
-            Forward::Ingress => cfg.ingress_port,
-            Forward::Gateway => cfg.gateway_port,
-        }
-    }
-}
-
-/// Kill every running `kubectl port-forward` we previously spawned
-/// (dispatcher + ingress + gateway). Called on stop and before we
-/// re-establish forwards after a Pod rollout. Idempotent.
-fn kill_existing_port_forwards(cfg: &ClusterConfig) -> Result<()> {
-    for fwd in Forward::ALL {
-        let (name, local_port) = (fwd.as_str(), fwd.local_port(cfg));
-        let pid_file = data_dir_pid_file(fwd);
-        if let Some(pid) = read_pid(&pid_file) {
-            // The record is only a number, and a reboot recycles pids:
-            // verify it still names OUR kubectl port-forward before
-            // signalling, or a stale file would SIGTERM whatever
-            // unrelated process inherited the pid.
-            if pid_runs_our_forward(pid, local_port, cfg)? {
-                signal_term(pid).with_context(|| {
-                    format!(
-                        "could not signal the {name} port-forward (pid {pid}); \
-                         it still holds port {local_port}; kill it by hand: kill -9 {pid}"
-                    )
-                })?;
-            } else if process_alive(pid) {
-                eprintln!(
-                    "note: the recorded {name} port-forward pid ({pid}) now runs \
-                     something else (recycled after a reboot?); dropping the record"
-                );
-            }
-            // A pid whose process is simply gone is the ordinary end
-            // of a forward (its pod rolled, it exited); nothing to
-            // say, just drop the record.
-            let _ = fs::remove_file(&pid_file);
-        } else if pid_file.exists() {
-            // Unusable record (empty or garbled, e.g. a crash between
-            // the file's truncate and its write). The forward it named
-            // may still be alive and holding the port, so look for one
-            // before dropping the record: dropping over a live forward
-            // would make the next start lose the bind with nothing
-            // left that knows the pid.
-            if let Some(pid) = find_forward_process(local_port, cfg)? {
-                anyhow::bail!(
-                    "the recorded {name} port-forward pid file is unusable, but a \
-                     kubectl port-forward on port {local_port} is still running \
-                     (pid {pid}); kill it by hand: kill -9 {pid}"
-                );
-            }
-            eprintln!("note: dropping an unusable {name} port-forward pid record");
-            let _ = fs::remove_file(&pid_file);
-        }
-    }
-    Ok(())
-}
-
-/// Find a running kubectl port-forward of OURS (our kube context, this
-/// local port) by scanning the whole process table: the recovery for a
-/// pid record that exists but cannot be read.
-fn find_forward_process(local_port: u16, cfg: &ClusterConfig) -> Result<Option<i32>> {
-    // Separate -o flags: BSD/macOS ps reads everything after `=` in
-    // one -o argument as header text, so a combined "pid=,args="
-    // would yield a pid-only column there.
-    let out = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "args="])
-        .output()
-        .context("cannot run `ps` to scan for a stray port-forward")?;
-    anyhow::ensure!(out.status.success(), "ps exited {}", out.status);
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let line = line.trim_start();
-        if forward_args_match(line, local_port, cfg) {
-            if let Some(pid) = line.split_whitespace().next().and_then(|p| p.parse().ok()) {
-                return Ok(Some(pid));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Whether `pid` currently runs OUR kubectl port-forward: the one
-/// pinned to our kube context and binding this forward's local port.
-/// Matching the bare verb is not enough (a recycled pid can land on
-/// the user's own unrelated `kubectl port-forward`, which we must
-/// never signal). `ps -o args=` is portable across Linux and macOS; a
-/// non-success ps exit means the process is gone (Ok(false)), while
-/// ps itself being unrunnable is an error the caller must surface
-/// (guessing either way would signal or strand a process we could
-/// not identify).
-fn pid_runs_our_forward(pid: i32, local_port: u16, cfg: &ClusterConfig) -> Result<bool> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "args=", "-p", &pid.to_string()])
-        .output()
-        .with_context(|| {
-            format!(
-                "cannot run `ps` to verify pid {pid}; check it by hand and, if it is a \
-                 stale weft port-forward, kill it"
-            )
-        })?;
-    if !out.status.success() {
-        return Ok(false);
-    }
-    Ok(forward_args_match(&String::from_utf8_lossy(&out.stdout), local_port, cfg))
-}
-
-/// Whether a ps args line names OUR kubectl port-forward on this
-/// local port. THE one matcher, shared by the per-pid verification
-/// and the whole-table scan, so the two cannot drift.
-fn forward_args_match(args: &str, local_port: u16, cfg: &ClusterConfig) -> bool {
-    args.contains("kubectl")
-        && args.contains("port-forward")
-        && args.contains(&format!("--context {}", cfg.kube_context))
-        && args.contains(&format!(" {local_port}:"))
-}
-
-/// Tear the forward set down and bring it back up: THE one sequence
-/// every rebuild takes. SIGTERM is asynchronous, so between kill and
-/// spawn the old processes are DRAINED (a bounded wait on actual
-/// process exit): a replacement racing a dying forward for the same
-/// local port would lose the bind, die into its log file, and leave a
-/// pid file pointing at a corpse. Our own spawned children are reaped
-/// first (see `reap_spawned_forwards`): an unreaped zombie answers
-/// `kill(pid, 0)` forever and would wedge the drain.
-async fn restart_port_forwards() -> Result<()> {
-    reap_spawned_forwards();
-    // Only pids that ARE port-forwards get drained: the kill below
-    // drops stale records (a reboot-recycled pid) without signalling,
-    // and waiting on such a pid would sit out the whole deadline
-    // watching an unrelated process.
-    let cfg = cluster_config();
-    let mut pids: Vec<i32> = Vec::new();
-    for fwd in Forward::ALL {
-        if let Some(pid) = read_pid(&data_dir_pid_file(fwd)) {
-            if pid_runs_our_forward(pid, fwd.local_port(cfg), cfg)? {
-                pids.push(pid);
-            }
-        }
-    }
-    kill_existing_port_forwards(cfg).context(
-        "clearing the old port-forwards failed; deal with the named process, \
-         then re-run `weft daemon start`",
-    )?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while pids.iter().any(|&pid| process_alive(pid)) {
-        reap_spawned_forwards();
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "kubectl port-forward pid {:?} is still alive 10s after SIGTERM; \
-                 kill it by hand and re-run `weft daemon start`.",
-                pids.iter().filter(|&&p| process_alive(p)).collect::<Vec<_>>()
-            );
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    start_port_forwards().await
-}
-
-/// Every port-forward child THIS process spawned, held so they can be
-/// reaped: `start_port_forwards` never waits on its children, and an
-/// exited-but-unreaped child stays a zombie whose pid answers
-/// `kill(pid, 0)` with success, which would make the drain above read
-/// it as alive forever.
-fn spawned_forwards() -> &'static std::sync::Mutex<Vec<std::process::Child>> {
-    static CHILDREN: OnceLock<std::sync::Mutex<Vec<std::process::Child>>> = OnceLock::new();
-    CHILDREN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-fn reap_spawned_forwards() {
-    let mut children = spawned_forwards().lock().expect("forwards mutex");
-    children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
-}
-
-/// Does every CURRENTLY-DESIRED port-forward have a live recorded pid?
-/// A live pid is NOT proof the forward works (a reboot can recycle a
-/// recorded pid into an unrelated process, a kubectl can wedge on a
-/// gone pod), so this is only the cheap pre-check; the boot's real
-/// gate is the /health probe in `reconcile`. Iterates the real set
-/// (`port_forwards`), not a static name list: the gateway forward is
-/// absent from the set until the Envoy Gateway is programmed, so it
-/// never drags liveness down before it exists; once it IS in the set,
-/// a missing pid correctly reports down (no fail-open).
-async fn all_forward_pids_live(cfg: &ClusterConfig) -> bool {
-    port_forwards(cfg).await.iter().all(|pf| {
-        read_pid(&data_dir_pid_file(pf.name))
-            .map(process_alive)
-            .unwrap_or(false)
-    })
-}
-
 async fn status(ctx: &Ctx) -> Result<()> {
     let cfg = cluster_config();
-    let pf_alive = all_forward_pids_live(cfg).await;
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
             println!(
-                "daemon: running (cluster '{}', system ns '{}', port-forward {}); {} project(s)",
-                cfg.cluster_name,
-                cfg.system_namespace,
-                if pf_alive { "up" } else { "down" },
-                n,
+                "daemon: running (cluster '{}', system ns '{}'); {} project(s)",
+                cfg.cluster_name, cfg.system_namespace, n,
             );
         }
         Err(e) => {
@@ -1769,8 +1587,48 @@ const NODE_POSTGRES_PATH: &str = "/var/weft-postgres";
 
 /// The cluster's shape. Fingerprinted, so a change here rebuilds the node
 /// rather than being silently ignored on every machine that already has one.
-fn kind_cluster_config() -> String {
+///
+/// The port mappings are the whole path from this machine into the
+/// cluster: docker publishes each configured loopback port straight to
+/// the node port its NodePort Service pins (see [`MappedPort`]), so a
+/// connection to `127.0.0.1:<dispatcher_port>` is DNAT'd to the
+/// dispatcher pod with no process on this machine in between.
+/// Loopback only: the dispatcher's API must never listen on a LAN
+/// address, and kind's default listen address is `0.0.0.0`.
+fn kind_cluster_config(cfg: &ClusterConfig) -> String {
     let host_dir = postgres_data_dir();
+    let mappings: String = MappedPort::ALL
+        .iter()
+        .map(|&m| (m.node_port(), m.host_port(cfg)))
+        // The band a door lands on, published at the same number on
+        // both sides: one number for a person to read, and the whole
+        // band rather than one port per door because a kind node's
+        // mappings are fixed when it is built, and a door opened later
+        // has to have somewhere to land without rebuilding the
+        // cluster (which destroys every project's database).
+        // ...and the rest of the node-port range, at the same number on
+        // both sides. The WHOLE range, because the apiserver is what
+        // allocates a door's port and a port it could pick that the
+        // machine does not publish would answer nothing. Narrow enough
+        // to publish (see `NODE_PORTS`), and fixed when the node is
+        // built, so a door opened next week lands without rebuilding
+        // the cluster (which destroys every project's database).
+        .chain(
+            weft_core::infra::NODE_PORTS
+                .filter(|port| !MappedPort::ALL.iter().any(|m| m.node_port() == *port))
+                .map(|port| (port, port)),
+        )
+        .map(|(node_port, host_port)| {
+            format!(
+                "      - containerPort: {node_port}\n        hostPort: {host_port}\n        listenAddress: \"127.0.0.1\"\n        protocol: TCP\n"
+            )
+        })
+        .collect();
+    let node_port_range = format!(
+        "{}-{}",
+        weft_core::infra::NODE_PORTS.start(),
+        weft_core::infra::NODE_PORTS.end()
+    );
     format!(
         r#"kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -1782,19 +1640,113 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            service-node-port-range: "{node_port_range}"
     extraPortMappings:
-      - containerPort: 80
-        hostPort: 80
-        protocol: TCP
-      - containerPort: 443
-        hostPort: 443
-        protocol: TCP
-    extraMounts:
+{mappings}    extraMounts:
       - hostPath: {}
         containerPath: {NODE_POSTGRES_PATH}
 "#,
-        host_dir.display()
+        host_dir.display(),
+        node_port_range = node_port_range,
     )
+}
+
+/// Make sure every mapped loopback port can bind before a node is
+/// built. Docker binds each one when the node container starts, and a
+/// port something else holds fails `kind create cluster` with a docker
+/// error that names neither the port's purpose nor the holder.
+///
+/// The one holder this code knows is its own past: a weft older than
+/// this one kept `kubectl port-forward` tunnels alive on these ports
+/// through `weft daemon supervise-forward` keepers, and those outlive
+/// an install (they hold the old binary's inode). An upgrade has to
+/// come up by itself, so they are stopped here, with their pid and log
+/// files, and only a port held by something unknown is refused.
+async fn free_mapped_ports(cfg: &ClusterConfig) -> Result<()> {
+    let stale = stale_forward_processes();
+    if !stale.is_empty() {
+        println!(
+            "stopping {} port-forward keeper process(es) left by an older weft (pid {})",
+            stale.len(),
+            stale.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        for pid in &stale {
+            let _ = tokio::process::Command::new("kill").arg(pid.to_string()).status().await;
+        }
+        remove_forward_litter();
+    }
+    for m in MappedPort::ALL {
+        let port = m.host_port(cfg);
+        // A killed keeper's socket closes shortly after the signal; give
+        // it a moment before deciding the port is somebody else's.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(_) => break,
+                Err(_) if !stale.is_empty() && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(e) => anyhow::bail!(
+                    "127.0.0.1:{port} is not free ({e}), and the kind node needs it for the \
+                     {m:?} port mapping. Find what holds it (`ss -ltnp | grep :{port}`), stop \
+                     it, and re-run `weft daemon start`."
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pids of every `weft daemon supervise-forward` keeper and every
+/// `kubectl port-forward` it spawned, read off `/proc`: processes an
+/// older weft left running, which nothing else stops.
+fn stale_forward_processes() -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else { continue };
+        let args: Vec<&str> = raw.split(|b| *b == 0).filter_map(|a| std::str::from_utf8(a).ok()).collect();
+        if is_stale_forward_cmdline(&args) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Whether a process command line is an old weft's keeper or the
+/// tunnel it kept: `weft daemon supervise-forward ...`, or `kubectl
+/// port-forward` aimed at one of the daemon's services.
+fn is_stale_forward_cmdline(args: &[&str]) -> bool {
+    let program = args.first().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or("");
+    match program {
+        "weft" => args.get(1) == Some(&"daemon") && args.get(2) == Some(&"supervise-forward"),
+        "kubectl" => {
+            args.contains(&"port-forward")
+                && args.iter().any(|a| *a == "svc/weft-dispatcher" || a.starts_with("svc/ingress-nginx") || a.starts_with("svc/envoy-"))
+        }
+        _ => false,
+    }
+}
+
+/// Remove the pid and log files the old keepers wrote under the data
+/// dir; nothing reads them any more.
+fn remove_forward_litter() {
+    let Ok(entries) = std::fs::read_dir(data_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("port-forward-") && (name.ends_with(".pid") || name.ends_with(".log")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Whether the running kind node carries the postgres host mount. The
@@ -1848,6 +1800,19 @@ fn install_is_stale(name: &str, want: &str) -> bool {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).as_deref() != Some(want)
 }
 
+/// Record the checkout the daemon was just installed from, so the
+/// resolver's last rung (`weft_catalog::weft_repo_root`) answers with
+/// it from any working directory. setup.sh writes the same file for a
+/// prebuilt CLI; the daemon writes it on every successful boot.
+// SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root), setup.sh (prebuilt CLI install: repo-root write)
+fn record_repo_root(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    let file = data_dir().join("repo-root");
+    std::fs::write(&file, root.to_string_lossy().as_bytes())
+        .with_context(|| format!("record the weft checkout in {}", file.display()))?;
+    Ok(())
+}
+
 /// Record what was just installed, after it succeeded.
 fn record_install(name: &str, want: &str) -> Result<()> {
     std::fs::create_dir_all(data_dir())?;
@@ -1863,7 +1828,7 @@ fn kind_config_stamp() -> PathBuf {
 
 
 async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()> {
-    let config = kind_cluster_config();
+    let config = kind_cluster_config(cfg);
     // The kind binary's version is part of the node's identity: the Kubernetes
     // version a node runs comes from kind's default node image, so a different
     // kind builds a different cluster even from identical config. Without this
@@ -1883,10 +1848,13 @@ async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()
 
     // A node is a container, so its shape (port mappings, mounts, image)
     // cannot change in place: the only way to apply a change is to build
-    // a new node. The SYSTEM database survives that (its files live on
-    // the host, mounted back in), but every project's own database (a
-    // PostgresDatabase infra node's volume) lives inside the node and
-    // dies with it, so rebuilding is never a silent side effect.
+    // a new node, and a shape change rebuilds on its own, because there
+    // is nothing else a person could do with the old node (an install
+    // has to come up by itself). The SYSTEM database survives that (its
+    // files live on the host, mounted back in), but every project's own
+    // database (a PostgresDatabase infra node's volume) lives inside the
+    // node and dies with it, so the rebuild says so before it starts.
+    // `--rebuild-cluster` forces one when the shape did not change.
     if exists {
         let have = std::fs::read_to_string(kind_config_stamp()).ok();
         let have = have.as_deref().map(str::trim);
@@ -1900,17 +1868,13 @@ async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()
         if adoptable {
             std::fs::create_dir_all(data_dir())?;
             std::fs::write(kind_config_stamp(), &want)?;
-        } else if have != Some(want.as_str()) {
-            if !rebuild_cluster {
-                anyhow::bail!(
-                    "the cluster's shape changed (kind config or kind version), and \
-                     a node cannot change in place.\n\
-                     {}\n\
-                     Run `weft daemon start --rebuild-cluster` to rebuild it.",
-                    rebuild_data_notice()
-                );
-            }
-            println!("rebuilding the kind node. {}", rebuild_data_notice());
+        } else if have != Some(want.as_str()) || rebuild_cluster {
+            let why = if have != Some(want.as_str()) {
+                "its shape changed (kind config or kind version), and a node cannot change in place"
+            } else {
+                "--rebuild-cluster asked for it"
+            };
+            println!("rebuilding the kind node: {why}. {}", rebuild_data_notice());
             let status = images::quiet_stdout("kind")
                 .args(["delete", "cluster", "--name", &cfg.cluster_name])
                 .status()
@@ -1963,6 +1927,7 @@ async fn ensure_cluster_nodes_running(cfg: &ClusterConfig) -> Result<()> {
 
 /// Build the node from `config` and record the fingerprint it was built from.
 async fn create_cluster(cfg: &ClusterConfig, config: &str, fingerprint: &str) -> Result<()> {
+    free_mapped_ports(cfg).await?;
     // The config bind-mounts this directory into the node, and kind
     // refuses a mount whose source does not exist. This is the one
     // moment the directory has to be there.
@@ -2414,11 +2379,20 @@ async fn ensure_envoy_gateway() -> Result<()> {
     Ok(())
 }
 
-/// Enable the Backend API (DynamicResolver) in the controller's config.
-/// `EnvoyGateway` is the config FILE's kind, living in the
-/// `envoy-gateway-config` ConfigMap, not a cluster CR, so we patch the
-/// ConfigMap's `extensionApis` and restart the controller to pick it up.
-/// Idempotent: a no-op once `enableBackend: true` is already present.
+/// Enable the extension APIs the live-caller gateway needs, in the
+/// controller's config. `EnvoyGateway` is the config FILE's kind, living
+/// in the `envoy-gateway-config` ConfigMap, not a cluster CR, so we patch
+/// the ConfigMap's `extensionApis` and restart the controller to pick it
+/// up. Idempotent: a no-op once both are already present.
+///
+/// Two of them, for two things the gateway cannot do without:
+///   - `enableBackend`: the DynamicResolver the route resolves each
+///     worker pod through, so one route serves every pod.
+///   - `enableEnvoyPatchPolicy`: lets `gateway.yaml` put a socket option
+///     on the listener, which is how a caller who VANISHES (no close, no
+///     goodbye: a closed lid, a dropped network) is ever noticed. Without
+///     it the gateway holds that connection, and the worker's run behind
+///     it, until the kernel gives up a quarter of an hour later.
 async fn enable_envoy_backend_api() -> Result<()> {
     let out = kubectl(&[
         "-n",
@@ -2435,24 +2409,33 @@ async fn enable_envoy_backend_api() -> Result<()> {
         anyhow::bail!("could not read envoy-gateway-config ConfigMap");
     }
     let current = String::from_utf8_lossy(&out.stdout).to_string();
-    if current.contains("enableBackend: true") {
+    const ENABLED: &str =
+        "extensionApis:\n  enableBackend: true\n  enableEnvoyPatchPolicy: true";
+    if current.contains("enableBackend: true")
+        && current.contains("enableEnvoyPatchPolicy: true")
+    {
         return Ok(()); // already enabled
     }
     // Replace the empty `extensionApis: {}` with the enabled block. The
     // controller writes `extensionApis: {}` by default; if a future
     // version changes that spelling this match misses and we bail loud
-    // rather than silently leaving the Backend API off.
-    if !current.contains("extensionApis: {}") {
+    // rather than silently leaving the extension APIs off.
+    //
+    // An install from before the patch policy was needed carries the
+    // older one-line block, so that spelling is upgraded in place rather
+    // than left half-enabled.
+    let patched = if current.contains("extensionApis: {}") {
+        current.replace("extensionApis: {}", ENABLED)
+    } else if current.contains("extensionApis:\n  enableBackend: true") {
+        current.replace("extensionApis:\n  enableBackend: true", ENABLED)
+    } else {
         anyhow::bail!(
             "envoy-gateway-config has an unexpected extensionApis shape; \
-             cannot enable the Backend API automatically. Set \
-             `extensionApis.enableBackend: true` in the ConfigMap manually."
-        );
-    }
-    let patched = current.replace(
-        "extensionApis: {}",
-        "extensionApis:\n  enableBackend: true",
-    );
+             cannot enable the Backend API and the patch policy automatically. \
+             Set `extensionApis.enableBackend: true` and \
+             `extensionApis.enableEnvoyPatchPolicy: true` in the ConfigMap manually."
+        )
+    };
     // Apply the new ConfigMap data. `kubectl patch --type merge` with the
     // full data key replaces just that field.
     let patch = serde_json::json!({ "data": { "envoy-gateway.yaml": patched } }).to_string();
@@ -2685,93 +2668,42 @@ fn parse_pooled_listing(listing: &str) -> (Vec<(String, String, String)>, Vec<St
     (rows, malformed)
 }
 
-async fn start_port_forwards() -> Result<()> {
-    let cfg = cluster_config();
-    fs::create_dir_all(data_dir())?;
-    for pf in port_forwards(cfg).await {
-        // TRUNCATED per spawn: the two health-probe bails tail this
-        // file as evidence about the CURRENT forward, and an appended
-        // log would show a previous run's happy banner (and grow
-        // forever).
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(pf_log_file(pf.name))?;
-        let err = log.try_clone()?;
-        let child = std::process::Command::new("kubectl")
-            .args([
-                "--context", &cfg.kube_context,
-                "-n", &pf.namespace,
-                "port-forward", &format!("svc/{}", pf.service),
-                &format!("{}:{}", pf.local_port, pf.remote_port),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .with_context(|| format!("spawn kubectl port-forward ({})", pf.name.as_str()))?;
-        let pid = child.id();
-        // Into the reap list FIRST: from here the child can always be
-        // found again. A pid-file write that fails must not strand a
-        // live forward recorded nowhere (holding the port with nothing
-        // able to kill it), so on that failure the child dies with the
-        // error.
-        spawned_forwards().lock().expect("forwards mutex").push(child);
-        if let Err(e) = fs::write(data_dir_pid_file(pf.name), pid.to_string()) {
-            let mut children = spawned_forwards().lock().expect("forwards mutex");
-            if let Some(child) = children.iter_mut().find(|c| c.id() == pid) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            return Err(anyhow::Error::new(e).context(format!(
-                "record the {} port-forward's pid (the forward was stopped again)",
-                pf.name.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Block until the dispatcher's /health answers through its forward,
-/// bailing with the forward's log tail after 30s (the log is where a
-/// lost bind race or a dead pod names itself).
-async fn wait_for_dispatcher_health(url: &str) -> Result<()> {
+/// Block until the dispatcher's /health answers at `base` from this
+/// machine, bailing after 30s with what to look at. The pod was proved
+/// Ready inside the cluster before this runs, so a failure here is the
+/// path in: on kind, the node's port mapping or the NodePort Service;
+/// on a real cluster, the address the CLI was told to use.
+async fn wait_for_dispatcher_health(base: &str) -> Result<()> {
     // A per-request timeout well under the deadline: without one, a
-    // forward that ACCEPTS the connection and never answers (a kubectl
-    // wedged on a gone pod, the exact case this probe exists to catch)
-    // would hang `send()` forever and the 30s deadline, checked only
-    // between attempts, would never fire.
+    // hop that ACCEPTS the connection and never answers would hang
+    // `send()` forever and the 30s deadline, checked only between
+    // attempts, would never fire.
     let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let url = format!("{base}/health");
     loop {
         if std::time::Instant::now() >= deadline {
-            let log = pf_log_file(Forward::Dispatcher);
-            let tail = std::fs::read_to_string(&log)
-                .map(|s| {
-                    s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n  ")
-                })
-                .unwrap_or_default();
-            if tail.trim().is_empty() {
-                // No log means kubectl never got as far as writing
-                // one: the spawn itself failed, or nothing answered.
-                let cfg = cluster_config();
-                anyhow::bail!(
-                    "{url} did not become reachable within 30s, and the port-forward \
-                     log ({}) is empty or missing, so kubectl never started forwarding; \
-                     check the cluster: kubectl --context {} -n {} get pods",
-                    log.display(),
+            let cfg = cluster_config();
+            match cfg.backend {
+                ClusterBackend::Kind => anyhow::bail!(
+                    "{url} did not become reachable within 30s, although the dispatcher pod \
+                     is Ready. The path in is the node's port mapping and the NodePort \
+                     Service; inspect them:\n  \
+                     docker port {}-control-plane\n  \
+                     kubectl --context {} -n {} get svc weft-dispatcher-node-port -o wide",
+                    cfg.cluster_name,
                     cfg.kube_context,
                     cfg.system_namespace
-                );
+                ),
+                ClusterBackend::K8s => anyhow::bail!(
+                    "{url} did not become reachable within 30s, although the dispatcher pod \
+                     is Ready. On the k8s backend the CLI reaches the dispatcher at \
+                     --dispatcher / WEFT_DISPATCHER_URL, which must name the address the \
+                     cluster's ingress serves it at (WEFT_DISPATCHER_PUBLIC_BASE_URL)."
+                ),
             }
-            anyhow::bail!(
-                "{url} did not become reachable within 30s.\n\
-                 The dispatcher port-forward's log ({}) ends with:\n  {tail}",
-                log.display()
-            );
         }
-        if let Ok(r) = client.get(url).send().await {
+        if let Ok(r) = client.get(&url).send().await {
             if r.status().is_success() {
                 return Ok(());
             }
@@ -2797,9 +2729,15 @@ pub(crate) fn kubectl(args: &[&str]) -> Command {
 /// literal handed to kubectl. THE one renderer for every path that
 /// parses a templated manifest (apply and delete alike).
 async fn render_manifest(path: &Path, vars: &[(&str, String)]) -> Result<String> {
-    let mut manifest = tokio::fs::read_to_string(path)
+    let manifest = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    substitute_placeholders(manifest, vars, path)
+}
+
+/// The substitution itself, on text already read; `path` only names
+/// the file in the error.
+fn substitute_placeholders(mut manifest: String, vars: &[(&str, String)], path: &Path) -> Result<String> {
     for (key, value) in vars {
         manifest = manifest.replace(&format!("${{{key}}}"), value);
     }
@@ -3252,35 +3190,51 @@ async fn apply_sealing_key_secret(
     Ok(changed)
 }
 
-/// The OAuth apps file, packed into the `weft-access-apps`
-/// Secret the broker mounts. `WEFT_ACCESS_APPS_FILE` (the shell, or the
-/// `.env` the CLI loaded) names it; the default is `access-apps.json`
-/// in the working directory. Absent = an empty secret, so the broker
-/// simply has no apps configured and every service needs a
-/// project-declared one. Returns whether the secret's content changed
-/// since the last apply. The kubelet's in-place mount refresh only
-/// works for a secret that already existed when the pod started; a
-/// secret created AFTER the pod started never mounts into the running
-/// pod, so a change here must roll the broker.
-/// A file that IS named but unreadable is loud:
-/// silently shipping no apps would surface later as a confusing
-/// "no app configured" on a node the operator thought was set up.
+/// The shared-credentials file (OAuth apps and the runtime's own
+/// provider keys), packed into the `weft-access-apps` Secret the broker
+/// mounts. `WEFT_ACCESS_APPS_FILE` (the shell, or the `.env` the CLI
+/// loaded) names it; the default is `access-apps.json` at the root of
+/// the weft checkout the daemon was installed from, never the working
+/// directory (a `weft daemon start` from a project folder once found
+/// nothing there and wiped every shared key). Returns whether the
+/// secret's content changed since the last apply. The kubelet's
+/// in-place mount refresh only works for a secret that already existed
+/// when the pod started; a secret created AFTER the pod started never
+/// mounts into the running pod, so a change here must roll the broker.
+///
+/// A file that IS named but unreadable is loud: silently shipping no
+/// apps would surface later as a confusing "no app configured" on a
+/// node the operator thought was set up. And an absent default file
+/// never empties a secret that holds keys: the cluster keeps what it
+/// has and says so; `--clear-access-apps` is the one way to empty it.
 async fn apply_access_apps_secret(
     cfg: &ClusterConfig,
+    repo_root: &Path,
+    clear: bool,
     pending: &mut PendingStamps,
 ) -> Result<bool> {
-    let path = std::env::var(weft_core::access::spec::APPS_FILE_ENV)
+    let explicit = std::env::var(weft_core::access::spec::APPS_FILE_ENV)
         .ok()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "access-apps.json".to_string());
-    let explicit = std::env::var(weft_core::access::spec::APPS_FILE_ENV).is_ok();
+        .filter(|p| !p.trim().is_empty());
+    let path = access_apps_file(explicit.as_deref(), repo_root);
     let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => String::new(),
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => None,
         Err(e) => {
             return Err(anyhow::Error::new(e)).with_context(|| {
-                format!("read access apps file '{path}' (from WEFT_ACCESS_APPS_FILE)")
+                format!("read access apps file '{}' (from WEFT_ACCESS_APPS_FILE)", path.display())
             })
+        }
+    };
+    let contents = match access_apps_plan(contents, access_apps_secret_holds_keys(cfg).await?, clear) {
+        AccessAppsPlan::Apply(contents) => contents,
+        AccessAppsPlan::Keep => {
+            println!(
+                "shared-credentials file {} is absent; the cluster keeps the keys it holds \
+                 (pass --clear-access-apps to remove them)",
+                path.display()
+            );
+            return Ok(false);
         }
     };
     let secret = serde_json::json!({
@@ -3293,6 +3247,64 @@ async fn apply_access_apps_secret(
     .to_string();
     kubectl_apply_stdin(&secret, "weft-access-apps secret").await?;
     Ok(manifest_apply_changed_by_stamp(Path::new("access-apps-secret"), &secret, pending))
+}
+
+/// Where the shared-credentials file is read from: the explicit
+/// `WEFT_ACCESS_APPS_FILE` when set, else `access-apps.json` at the
+/// root of the weft checkout.
+fn access_apps_file(explicit: Option<&str>, repo_root: &Path) -> PathBuf {
+    match explicit {
+        Some(path) => PathBuf::from(path),
+        None => repo_root.join(ACCESS_APPS_SECRET_KEY),
+    }
+}
+
+/// What one boot does with the shared-credentials secret.
+#[derive(Debug, PartialEq, Eq)]
+enum AccessAppsPlan {
+    /// Write this content (possibly empty) into the secret.
+    Apply(String),
+    /// The file is absent and the cluster holds keys: leave them.
+    Keep,
+}
+
+/// The decision: a present file is applied as it is; an absent one
+/// empties the secret only when it holds nothing or `clear` asks.
+fn access_apps_plan(file: Option<String>, secret_holds_keys: bool, clear: bool) -> AccessAppsPlan {
+    match file {
+        Some(contents) => AccessAppsPlan::Apply(contents),
+        None if secret_holds_keys && !clear => AccessAppsPlan::Keep,
+        None => AccessAppsPlan::Apply(String::new()),
+    }
+}
+
+/// Whether the cluster's `weft-access-apps` secret currently holds
+/// anything. A missing secret (a fresh cluster) holds nothing; a
+/// kubectl failure for any other reason is loud, since deciding
+/// "empty" on it is exactly the wipe this guards against.
+async fn access_apps_secret_holds_keys(cfg: &ClusterConfig) -> Result<bool> {
+    let out = kubectl(&[
+        "get", "secret", "weft-access-apps", "-n", &cfg.db_namespace,
+        "-o", &format!("jsonpath={{.data.{}}}", ACCESS_APPS_SECRET_KEY.replace('.', "\\.")),
+    ])
+    .output()
+    .await
+    .context("kubectl get secret weft-access-apps")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("NotFound") || stderr.contains("not found") {
+            return Ok(false);
+        }
+        anyhow::bail!("kubectl get secret weft-access-apps failed: {}", stderr.trim());
+    }
+    let encoded = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if encoded.is_empty() {
+        return Ok(false);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .context("decode the weft-access-apps secret")?;
+    Ok(!String::from_utf8_lossy(&decoded).trim().is_empty())
 }
 
 /// The key the apps json is stored under in the secret, and therefore
@@ -3399,37 +3411,170 @@ async fn require_binary(name: &str) -> Result<()> {
     anyhow::bail!("`{name}` not found on PATH. Install it and retry.");
 }
 
-fn read_pid(pid_file: &Path) -> Option<i32> {
-    fs::read_to_string(pid_file).ok()?.trim().parse().ok()
-}
-
-fn process_alive(pid: i32) -> bool {
-    unsafe {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        // EPERM means the pid EXISTS but belongs to someone else:
-        // that process is alive, just not signalable by us.
-        kill(pid, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error()
-                == Some(1 /* EPERM */)
-    }
-}
-
-fn signal_term(pid: i32) -> Result<()> {
-    unsafe {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        if kill(pid, 15) != 0 {
-            return Err(anyhow::anyhow!("kill SIGTERM failed"));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        access_apps_file, access_apps_plan, kind_cluster_config, substitute_placeholders,
+        AccessAppsPlan, ClusterBackend, ClusterConfig, MappedPort,
+    };
+
+    fn kind_config_with_ports(dispatcher: u16, ingress: u16, gateway: u16) -> ClusterConfig {
+        ClusterConfig {
+            cluster_name: "weft-test".into(),
+            kube_context: "kind-weft-test".into(),
+            system_namespace: "weft-system".into(),
+            db_namespace: "weft-db".into(),
+            dispatcher_port: dispatcher,
+            ingress_port: ingress,
+            gateway_port: gateway,
+            seaweed_port: 9096,
+            service_cidr: "10.96.0.0/12".into(),
+            pod_cidr: "10.244.0.0/16".into(),
+            cluster_dns_ip: String::new(),
+            backend: ClusterBackend::Kind,
+        }
+    }
+
+    /// The kind config maps each front door's node port to the
+    /// configured loopback port, on loopback only, and nothing else:
+    /// the old 80/443 host-port squat is gone, and a changed port
+    /// changes the config (so the fingerprint rebuilds the node).
+    #[test]
+    fn kind_config_maps_every_front_door_to_its_loopback_port_and_nothing_else() {
+        let cfg = kind_config_with_ports(19999, 19998, 19097);
+        let config = kind_cluster_config(&cfg);
+        for (m, host_port) in [
+            (MappedPort::Dispatcher, 19999),
+            (MappedPort::Ingress, 19998),
+            (MappedPort::Gateway, 19097),
+        ] {
+            let mapping = format!(
+                "      - containerPort: {}\n        hostPort: {host_port}\n        listenAddress: \"127.0.0.1\"\n        protocol: TCP\n",
+                m.node_port()
+            );
+            assert!(config.contains(&mapping), "missing mapping for {m:?} in:\n{config}");
+        }
+        // ...plus the door band, published at the same number on both
+        // sides. The whole band is mapped when the node is BUILT,
+        // because a kind node's mappings cannot change afterwards and
+        // a door opened next week has to land somewhere without
+        // rebuilding the cluster (which destroys every project's
+        // database).
+        // Every other port in the range is published at the same number
+        // on both sides: the apiserver allocates a door's port out of
+        // this range, so one it could pick and the machine does not
+        // publish would answer nothing.
+        for port in weft_core::infra::NODE_PORTS {
+            if MappedPort::ALL.iter().any(|m| m.node_port() == port) {
+                continue; // a front door, checked above at its own host port
+            }
+            let mapping = format!(
+                "      - containerPort: {port}\n        hostPort: {port}\n        listenAddress: \"127.0.0.1\"\n        protocol: TCP\n"
+            );
+            assert!(config.contains(&mapping), "node port {port} is not published in:\n{config}");
+        }
+        assert_eq!(
+            config.matches("hostPort:").count(),
+            weft_core::infra::NODE_PORTS.count(),
+            "every node port the apiserver may allocate, published once:\n{config}"
+        );
+        // The apiserver is told to allocate only inside the published
+        // range, so there is no port it could hand out that this
+        // machine cannot reach.
+        assert!(
+            config.contains(&format!(
+                "service-node-port-range: \"{}-{}\"",
+                weft_core::infra::NODE_PORTS.start(),
+                weft_core::infra::NODE_PORTS.end()
+            )),
+            "{config}"
+        );
+        // Every one of them is loopback: a door must never answer to
+        // another machine on the network, and kind's default listen
+        // address is 0.0.0.0.
+        assert_eq!(
+            config.matches("listenAddress: \"127.0.0.1\"").count(),
+            config.matches("hostPort:").count()
+        );
+        assert!(!config.contains("hostPort: 80\n") && !config.contains("hostPort: 443\n"));
+        assert_ne!(config, kind_cluster_config(&kind_config_with_ports(9999, 19998, 19097)));
+
+        // No key twice at the node's own level. kind refuses the whole
+        // config on a duplicate ("mapping key already defined") and the
+        // cluster is ALREADY DELETED by then, so the machine is left
+        // with no runtime at all. Adding a second `kubeadmConfigPatches`
+        // rather than another item under the first one did exactly that.
+        let mut node_keys: Vec<&str> = config
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|rest| !rest.starts_with(' ') && !rest.starts_with('-'))
+            .filter_map(|rest| rest.split(':').next())
+            .collect();
+        let before = node_keys.len();
+        node_keys.sort_unstable();
+        node_keys.dedup();
+        assert_eq!(before, node_keys.len(), "a key is defined twice on the node:\n{config}");
+    }
+
+    /// Every pinned node port sits in the lower band of the default
+    /// node-port range that the apiserver reserves for explicit
+    /// requests (the first 128 of 30000-32767), so a Service created
+    /// before ours (ingress-nginx's, Envoy Gateway's) never gets one
+    /// of them from a dynamic allocation.
+    #[test]
+    fn node_ports_sit_in_the_static_band_and_are_distinct() {
+        let ports: Vec<u16> = MappedPort::ALL.iter().map(|m| m.node_port()).collect();
+        for &p in &ports {
+            assert!((30000..30128).contains(&p), "{p} is outside the static band");
+        }
+        let mut unique = ports.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ports.len(), "node ports collide: {ports:?}");
+    }
+
+    /// The shipped node-port manifest renders every front door's
+    /// Service from the same numbers the kind config maps, one
+    /// Service per namespace the front doors live in.
+    #[test]
+    fn kind_node_ports_manifest_pins_every_mapped_node_port() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/kind-node-ports.yaml");
+        let text = std::fs::read_to_string(&path).expect("manifest readable");
+        let vars: Vec<(&str, String)> = MappedPort::ALL
+            .iter()
+            .map(|&m| (m.template_var(), m.node_port().to_string()))
+            .collect();
+        let rendered = substitute_placeholders(text, &vars, &path).expect("renders");
+        for m in MappedPort::ALL {
+            let line = format!("nodePort: {}\n", m.node_port());
+            assert_eq!(rendered.matches(&line).count(), 1, "{m:?} pinned once:\n{rendered}");
+        }
+        assert_eq!(rendered.matches("type: NodePort").count(), 3);
+        for ns in ["namespace: weft-system", "namespace: ingress-nginx", "namespace: envoy-gateway-system"] {
+            assert!(rendered.contains(ns), "missing {ns}");
+        }
+    }
+
+    #[test]
+    fn the_shared_credentials_file_is_the_checkouts_unless_named() {
+        let root = Path::new("/srv/weft");
+        assert_eq!(access_apps_file(None, root), PathBuf::from("/srv/weft/access-apps.json"));
+        assert_eq!(access_apps_file(Some("/etc/apps.json"), root), PathBuf::from("/etc/apps.json"));
+    }
+
+    #[test]
+    fn an_absent_file_never_empties_a_secret_that_holds_keys() {
+        let present = || Some("{\"apps\": []}".to_string());
+        assert_eq!(access_apps_plan(present(), true, false), AccessAppsPlan::Apply(present().unwrap()));
+        assert_eq!(access_apps_plan(present(), false, true), AccessAppsPlan::Apply(present().unwrap()));
+        assert_eq!(access_apps_plan(None, true, false), AccessAppsPlan::Keep);
+        assert_eq!(access_apps_plan(None, true, true), AccessAppsPlan::Apply(String::new()));
+        assert_eq!(access_apps_plan(None, false, false), AccessAppsPlan::Apply(String::new()));
+    }
+
     #[test]
     fn dispatcher_recovery_only_replaces_crashing_owned_old_images() {
         let pod = serde_json::json!({
@@ -3471,68 +3616,46 @@ mod tests {
 
     /// The roll decision, pinned as an explicit table (never a
     /// restatement of the formula) so editing `rolls_for` cannot
-    /// silently keep this green. Inputs are (dispatcher_manifest,
-    /// postgres_manifest, other_manifests, sealing_key, apps, rebuilt,
-    /// forward_pids_live); expectations are (dispatcher, broker,
-    /// forwards). Every single-trigger row plus the historically
-    /// dangerous combinations: a dispatcher spec change resets only
-    /// the forwards (the apply itself rolled the pod); a postgres
-    /// change rolls BOTH pods (its credentials Secret is env at pod
-    /// start on each, invisible to their specs); other manifests roll
-    /// and reset nothing; the sealing key rolls both; apps rolls the
-    /// broker alone (the case a branchy version once used to skip the
-    /// forward reconcile on); a forced rebuild rolls both; dead
-    /// forward pids reset the forwards even with nothing changed.
+    /// silently keep this green. Inputs are (postgres_manifest,
+    /// other_manifests, sealing_key, apps, rebuilt); expectations are
+    /// (dispatcher, broker). Every single-trigger row plus the
+    /// historically dangerous combinations: a postgres change rolls
+    /// BOTH pods (its credentials Secret is env at pod start on each,
+    /// invisible to their specs); other manifests (the dispatcher's
+    /// own included: its apply rolls it) roll nothing here; the
+    /// sealing key rolls both; apps rolls the broker alone; a forced
+    /// rebuild rolls both.
     #[test]
     fn each_roll_trigger_fires_exactly_where_it_must() {
-        type Inputs = (bool, bool, bool, bool, bool, bool, bool);
-        type Expected = (bool, bool, bool);
+        type Inputs = (bool, bool, bool, bool, bool);
+        type Expected = (bool, bool);
         #[rustfmt::skip]
         let table: &[(Inputs, Expected)] = &[
             // nothing changed
-            ((false, false, false, false, false, false, true),  (false, false, false)),
-            ((false, false, false, false, false, false, false), (false, false, true)),
-            // dispatcher.yaml only: forwards, no explicit rolls
-            ((true,  false, false, false, false, false, true),  (false, false, true)),
-            ((true,  false, false, false, false, false, false), (false, false, true)),
-            // postgres.yaml only: both pods (credentials env), and the
-            // dispatcher roll drags the forwards
-            ((false, true,  false, false, false, false, true),  (true,  true,  true)),
-            // other manifests only: applied, nothing rolls or resets
-            ((false, false, true,  false, false, false, true),  (false, false, false)),
+            ((false, false, false, false, false), (false, false)),
+            // postgres.yaml only: both pods (credentials env)
+            ((true,  false, false, false, false), (true,  true)),
+            // other manifests only: applied, nothing rolls
+            ((false, true,  false, false, false), (false, false)),
             // sealing key only
-            ((false, false, false, true,  false, false, true),  (true,  true,  true)),
-            // apps only: broker WITHOUT dispatcher, forwards untouched
-            ((false, false, false, false, true,  false, true),  (false, true,  false)),
-            ((false, false, false, false, true,  false, false), (false, true,  true)),
+            ((false, false, true,  false, false), (true,  true)),
+            // apps only: broker WITHOUT dispatcher
+            ((false, false, false, true,  false), (false, true)),
             // rebuilt only
-            ((false, false, false, false, false, true,  true),  (true,  true,  true)),
+            ((false, false, false, false, true),  (true,  true)),
             // combinations
-            ((true,  false, false, true,  false, false, true),  (true,  true,  true)),
-            ((true,  false, true,  false, true,  false, true),  (false, true,  true)),
-            ((false, true,  false, false, true,  false, true),  (true,  true,  true)),
-            ((false, false, false, true,  true,  false, false), (true,  true,  true)),
-            ((true,  true,  true,  true,  true,  true,  false), (true,  true,  true)),
+            ((false, true,  false, true,  false), (false, true)),
+            ((true,  false, false, true,  false), (true,  true)),
+            ((false, false, true,  true,  false), (true,  true)),
+            ((true,  true,  true,  true,  true),  (true,  true)),
         ];
         for &(inputs, want) in table {
-            let (dispatcher_manifest, postgres_manifest, other_manifests, sealing_key, apps, rebuilt, pids_live) =
-                inputs;
+            let (postgres_manifest, other_manifests, sealing_key, apps, rebuilt) = inputs;
             let rolls = rolls_for(
-                &DetectedChanges {
-                    dispatcher_manifest,
-                    postgres_manifest,
-                    other_manifests,
-                    sealing_key,
-                    apps,
-                },
+                &DetectedChanges { postgres_manifest, other_manifests, sealing_key, apps },
                 rebuilt,
-                pids_live,
             );
-            assert_eq!(
-                (rolls.dispatcher, rolls.broker, rolls.forwards),
-                want,
-                "inputs: {inputs:?}"
-            );
+            assert_eq!((rolls.dispatcher, rolls.broker), want, "inputs: {inputs:?}");
         }
     }
 
@@ -3766,5 +3889,23 @@ mod tests {
             endpoint_host("http://user:pw@10.0.0.5:9000"),
             EndpointHost::PrivateIpv4("10.0.0.5".parse().unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_forward_tests {
+    use super::is_stale_forward_cmdline;
+
+    /// The two shapes an older weft left behind are recognized by their
+    /// command line, and nothing else that mentions a port is.
+    #[test]
+    fn only_an_old_keeper_or_its_tunnel_counts_as_stale() {
+        assert!(is_stale_forward_cmdline(&["/home/u/.local/share/weft/bin/weft", "daemon", "supervise-forward", "dispatcher"]));
+        assert!(is_stale_forward_cmdline(&["kubectl", "-n", "weft-system", "port-forward", "svc/weft-dispatcher", "9999:9999"]));
+        assert!(is_stale_forward_cmdline(&["kubectl", "-n", "ingress-nginx", "port-forward", "svc/ingress-nginx-controller", "9998:80"]));
+        assert!(!is_stale_forward_cmdline(&["weft", "daemon", "start"]));
+        assert!(!is_stale_forward_cmdline(&["kubectl", "-n", "weft-db", "port-forward", "svc/weft-postgres", "15433:5432"]));
+        assert!(!is_stale_forward_cmdline(&["ssh", "-L", "9999:localhost:9999", "host"]));
+        assert!(!is_stale_forward_cmdline(&[]));
     }
 }

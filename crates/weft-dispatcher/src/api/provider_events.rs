@@ -4,18 +4,24 @@
 //!
 //! The dispatcher stays secret-free: the raw request (exact bytes,
 //! headers, query) is forwarded to the broker, which holds the
-//! registered apps' secrets and answers a verdict. This side then
-//! does what it owns: find the matching subscriptions in the signal
-//! table, evaluate each one's filter, and push each fire through the
-//! same lifecycle gate every external fire passes (a parked project
-//! parks the fire; a wiped one refuses it).
+//! registered apps' secrets and answers a verdict.
+//!
+//! Then this side does what it owns, and STOPS there. It owns the
+//! public door, the verdict, narrowing the candidates to the signals
+//! hanging off the connections the broker named, holding each to its
+//! tenant, and pushing every resulting fire through the same lifecycle
+//! gate every external fire passes (a parked project parks the fire; a
+//! wiped one refuses it). It does NOT own which signals a push feeds:
+//! that reads a trigger kind's own settings, the kinds live in the
+//! listener, and asking it is one call (`/match_push`). Nothing here
+//! names a kind, and a new sort of push-fed trigger is listener code
+//! only.
 //!
 //! Delivery is at-least-once: the 200 goes out only after every
 //! matched fire is handed to the durable side, so a crash before the
-//! answer makes the provider retry and re-fire. The pre-fire
-//! predicates and the fire handling itself are where a retried
-//! delivery is a no-op or a user-visible re-run; no content dedup
-//! runs here.
+//! answer makes the provider retry and re-fire. The listener's filter
+//! pass and the fire handling itself are where a retried delivery is a
+//! no-op or a user-visible re-run; no content dedup runs here.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -27,7 +33,6 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 
 use weft_broker_client::protocol::{EventVerdict, EventVerifyRequest};
-use weft_core::signal::predicate;
 
 use crate::state::DispatcherState;
 
@@ -91,8 +96,15 @@ pub async fn receive_event(
             StatusCode::OK.into_response()
         }
         EventVerdict::Deliver { named_event, targets, signal_token } => {
-            let matched = match match_signals(&state, &topic, &named_event, &targets, signal_token)
-                .await
+            let matched = match match_signals(
+                &state,
+                &service,
+                &topic,
+                &named_event,
+                &targets,
+                signal_token,
+            )
+            .await
             {
                 Ok(m) => m,
                 Err(e) => {
@@ -123,12 +135,23 @@ pub async fn receive_event(
     }
 }
 
-/// The subscriptions this push feeds, with each one's filter already
-/// applied. Subscription-routed pushes name their signal; account-
-/// routed ones match every `provider_events` entry signal registered
-/// against one of the target connections, on the same topic.
+/// The signals this push feeds, with each one's payload.
+///
+/// Two steps, and the split between them is the tier boundary. HERE:
+/// narrow the candidates to the signals hanging off the connections the
+/// broker named, and hold each to the tenant it was matched under. THE
+/// LISTENER: decide which of those the push actually addresses and what
+/// it wakes with, because that reads a kind's own settings (its topic,
+/// its subscription scope) and applies the signal's filter through the
+/// one gate every fire passes.
+///
+/// Nothing in this function names a signal kind, and nothing in it reads
+/// a kind's config. That is the point: a second kind of push-fed trigger
+/// lands as listener code, and a push that feeds one is not silently
+/// matched by nothing here.
 async fn match_signals(
     state: &DispatcherState,
+    service: &str,
     topic: &str,
     named_event: &Value,
     targets: &[weft_broker_client::protocol::EventTargetWire],
@@ -145,7 +168,7 @@ async fn match_signals(
     let rows = match signal_token {
         Some(token) => {
             sqlx::query(
-                "SELECT token, tenant_id, spec_json FROM signal
+                "SELECT token, tenant_id, access_id FROM signal
                  WHERE token = $1",
             )
             .bind(token)
@@ -159,9 +182,8 @@ async fn match_signals(
             // the spec, exactly so this match is one indexed filter
             // instead of a spec-parsing table scan.
             sqlx::query(
-                "SELECT token, tenant_id, spec_json FROM signal
-                 WHERE access_id = ANY($1)
-                   AND (spec_json::jsonb ->> 'kind') = 'provider_events'",
+                "SELECT token, tenant_id, access_id FROM signal
+                 WHERE access_id = ANY($1)",
             )
             .bind(&access_ids)
             .fetch_all(&state.pg_pool)
@@ -169,44 +191,61 @@ async fn match_signals(
         }
     };
 
-    let mut matched = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
     for row in rows {
         let token: String = row.try_get("token")?;
         let tenant_id: String = row.try_get("tenant_id")?;
-        let spec_json: String = row.try_get("spec_json")?;
-        let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
-            .map_err(|e| anyhow::anyhow!("malformed spec_json for signal {token}: {e}"))?;
+        let access_id: Option<String> = row.try_get("access_id")?;
         // Defense in depth on the account-routed path: the signal's
         // connection must belong to the tenant the broker matched it
         // under. A mismatch means the rows drifted; refuse the pair
-        // rather than fire across the wall.
+        // rather than fire across the wall. This is a tenancy check,
+        // not a routing one, which is why it stays on this side.
         if !targets.is_empty() {
             let target_ok = targets.iter().any(|t| {
-                spec.access.as_ref().map(|a| a.id.as_str()) == Some(t.access_id.as_str())
-                    && t.tenant_id == tenant_id
+                access_id.as_deref() == Some(t.access_id.as_str()) && t.tenant_id == tenant_id
             });
             if !target_ok {
                 continue;
             }
         }
-        // Only subscriptions on THIS topic: one connection may hold
-        // topics with overlapping field names, and a mailbox push
-        // must not fire a file-watch trigger.
-        let signal_topic = spec.config.get("topic").and_then(Value::as_str).unwrap_or("");
-        if signal_topic != topic {
-            continue;
+        candidates.push(token);
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Ask the pods holding them. A push can feed subscriptions spread
+    // over several listener pods, so the candidates are grouped by
+    // holder and each pod asked once. A signal with no live holder is
+    // re-placed first: a parked webhook trigger's holder may have been
+    // reaped while the subscription stayed alive at the provider, and
+    // dropping the push because nothing happened to be running is the
+    // silent loss the fire path already refuses to take.
+    let mut by_pod: BTreeMap<String, (crate::listener::ListenerHandle, Vec<String>)> =
+        BTreeMap::new();
+    for token in candidates {
+        let handle = state
+            .listeners
+            .ensure_placed_handle(&token, state.listener_backend.as_ref(), &state.pg_pool, state.pod_id.as_str())
+            .await?;
+        by_pod
+            .entry(handle.admin_url.clone())
+            .or_insert_with(|| (handle, Vec::new()))
+            .1
+            .push(token);
+    }
+
+    let push = weft_listener::protocol::PushEvent {
+        service: service.to_string(),
+        topic: topic.to_string(),
+        event: named_event.clone(),
+    };
+    let mut matched = Vec::new();
+    for (handle, tokens) in by_pod.into_values() {
+        for m in crate::listener::match_push(&handle, &push, &tokens).await? {
+            matched.push(MatchedSignal { token: m.token, payload: m.payload });
         }
-        // App-wide subscriptions are served ONLY by the dial-out
-        // socket (a push routes to one account's connections, which
-        // can never mean "every install of your app"); a push must
-        // not half-serve one.
-        if spec.config.get("scope").and_then(Value::as_str) == Some("app") {
-            continue;
-        }
-        if !predicate::matches(&spec.match_predicates, named_event) {
-            continue;
-        }
-        matched.push(MatchedSignal { token, payload: named_event.clone() });
     }
     Ok(matched)
 }
@@ -241,6 +280,57 @@ async fn dispatch_one(state: &DispatcherState, m: MatchedSignal) -> Result<(), S
                 "event fire refused"
             );
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tier_boundary {
+    /// This module's own source, read at compile time.
+    const SOURCE: &str = include_str!("provider_events.rs");
+
+    /// The source WITHOUT this test module, since the list of things to
+    /// look for would otherwise be found in the looking.
+    fn code() -> &'static str {
+        SOURCE.split("#[cfg(test)]").next().expect("a split always yields a first piece")
+    }
+
+    /// The public events receiver must hold NO knowledge of any trigger
+    /// kind. It takes the push at the door, has it verified, narrows the
+    /// candidates by connection, and asks the listener which of them the
+    /// push feeds; the listener owns the rest because the rest is a
+    /// kind's own vocabulary.
+    ///
+    /// This is a source check rather than a behaviour check on purpose.
+    /// The damage from putting the knowledge back is SILENT: a second
+    /// sort of push-fed trigger simply never matches, the provider is
+    /// answered 200, and nothing fires anywhere with no error to see. So
+    /// the thing to catch is the shape, at the moment somebody writes
+    /// it, not a symptom later.
+    #[test]
+    fn the_receiver_names_no_kind_and_reads_no_kind_config() {
+        // Each of these was here before the matching moved to the
+        // listener, and each is one way the knowledge creeps back.
+        let forbidden = [
+            // Matching rows by kind tag.
+            ("\"provider_events\"", "match signals by kind tag"),
+            // Parsing a signal's spec to read a kind's settings.
+            ("spec_json", "parse a signal spec to read a kind's config"),
+            // A kind's own config keys.
+            ("\"topic\"", "read a kind's topic setting"),
+            ("\"scope\"", "read a kind's subscription scope"),
+            // The filter gate, which the listener owns for every kind.
+            ("predicate::matches", "re-implement the shared filter gate"),
+        ];
+        for (needle, what) in forbidden {
+            assert!(
+                !code().contains(needle),
+                "the events receiver must not {what}: found `{needle}`. \
+                 Which signals a push feeds is the listener's answer \
+                 (`/match_push`), because it reads a trigger kind's own \
+                 settings. Adding it back here means a new push-fed kind \
+                 silently matches nothing."
+            );
         }
     }
 }

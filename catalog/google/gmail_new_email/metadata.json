@@ -22,7 +22,6 @@
     {
       "name": "query",
       "type": "String",
-      "required": false,
       "label": "Search query",
       "placeholder": "label:inbox",
       "description": "A Gmail search query filtering which messages fire. Empty = every new message."
@@ -94,6 +93,9 @@
       "type": "List[File]"
     }
   ],
+  "firesWith": {
+    "item": "{ id: String }"
+  },
   "features": {
     "isTrigger": true
   }

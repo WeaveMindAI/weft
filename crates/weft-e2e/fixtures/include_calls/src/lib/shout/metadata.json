@@ -1,0 +1,26 @@
+{
+  "type": "Shout",
+  "label": "Shout",
+  "description": "Upper-case a text. A node that lives beside the file that uses it, under src/, to prove the catalog finds it there and the worker image carries it.",
+  "tags": [
+    "text",
+    "custom",
+    "e2e"
+  ],
+  "icon": "!",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": true
+    }
+  ],
+  "outputs": [
+    {
+      "name": "loud",
+      "type": "String"
+    }
+  ],
+  "requires_infra": false
+}

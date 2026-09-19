@@ -1,0 +1,17 @@
+# Every node of an included file is named through the SITE that includes
+# the file, never by the file's own path, and that holds for the verbs
+# that take a node as well as the ones that print one.
+#
+#   src -> gate (an @include) -> out   the file parks on a timer
+#   gate.key                           an access node, nothing runs it
+#
+# `weft wake <color> gate.hold` resolves the timer, `weft connect --node
+# gate.key` picks its connection, and `@src:lib:gate.hold` is refused.
+
+src = Text { value: "hello" }
+
+gate = @include("lib/gate.weft")
+gate.text = src.value
+
+out = Debug
+out.data = gate.out

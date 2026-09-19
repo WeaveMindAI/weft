@@ -35,7 +35,6 @@
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "The preview line to speak. Absent = a fitting line is generated."
     },
     {

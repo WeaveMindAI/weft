@@ -4,10 +4,8 @@
 //! fire path, and reconnect-backoff ladder with the other event-source
 //! kinds; the only thing specific here is the timer-driven GET.
 
-use std::sync::Arc;
 
 use anyhow::Result;
-use dashmap::DashMap;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, MissedTickBehavior};
@@ -30,12 +28,7 @@ impl KindHandler for PollEndpointHandler {
         PollEndpoint::TAG
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::Internal,
             auth: SignalAuth::None,

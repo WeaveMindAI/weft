@@ -5,22 +5,48 @@
 use super::{local_time, Ctx};
 use crate::commands::daemon::ClusterBackend;
 
+/// A value put into a query string. A node id is the author's own
+/// spelling, so it can hold anything they typed; only the handful of
+/// characters that would end the value or start another parameter have
+/// to move, and everything else stays readable in a log line.
+fn query_escaped(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '&' => "%26".to_string(),
+            '=' => "%3D".to_string(),
+            '#' => "%23".to_string(),
+            '+' => "%2B".to_string(),
+            '%' => "%25".to_string(),
+            ' ' => "%20".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 /// One page of the dispatcher's execution listing. The body is
 /// `{"executions": [...], "total": N}`; anything else is a broken
 /// contract and fails loudly rather than reading as "no executions".
 async fn executions_page(
     client: &crate::client::DispatcherClient,
-    limit: u32,
-    offset: u64,
-    project: Option<&str>,
-    phase: Option<&str>,
+    filter: &ListFilter,
 ) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
-    let mut path = format!("/executions?limit={limit}&offset={offset}");
-    if let Some(p) = project {
+    let mut path =
+        format!("/executions?limit={}&offset={}", filter.limit, filter.offset);
+    if let Some(p) = &filter.project {
         path.push_str(&format!("&project_id={p}"));
     }
-    if let Some(p) = phase {
-        path.push_str(&format!("&phase={p}"));
+    if let Some(p) = filter.phase {
+        path.push_str(&format!("&phase={}", p.as_str()));
+    }
+    if let Some(node) = &filter.node {
+        path.push_str(&format!("&entry_node={}", query_escaped(node)));
+    }
+    if let Some(since) = filter.since {
+        path.push_str(&format!("&started_after={since}"));
+    }
+    if let Some(status) = &filter.status {
+        path.push_str(&format!("&status={status}"));
     }
     let resp: serde_json::Value = client.get_json(&path).await?;
     let rows = resp
@@ -37,15 +63,26 @@ async fn executions_page(
     Ok((rows, total))
 }
 
-pub async fn list(
-    ctx: Ctx,
-    limit: u32,
-    project: Option<String>,
-    phase: Option<weft_core::context::Phase>,
-) -> anyhow::Result<()> {
+/// What `weft executions` narrows the listing to. One struct rather
+/// than six positional arguments, so adding the next filter does not
+/// re-thread every call site.
+#[derive(Debug, Clone)]
+pub struct ListFilter {
+    pub limit: u32,
+    pub offset: u32,
+    pub project: Option<String>,
+    pub phase: Option<weft_core::context::Phase>,
+    /// The node whose firing started the run.
+    pub node: Option<String>,
+    /// Unix second: only runs that started at or after it.
+    pub since: Option<u64>,
+    /// How the run ended: completed, failed, cancelled, or running.
+    pub status: Option<String>,
+}
+
+pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
     let client = ctx.client();
-    let (arr, total) =
-        executions_page(&client, limit, 0, project.as_deref(), phase.map(|p| p.as_str())).await?;
+    let (arr, total) = executions_page(&client, &filter).await?;
     if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
         return Ok(());
     }
@@ -84,8 +121,9 @@ pub async fn list(
     if (arr.len() as u64) < total {
         println!(
             "showing {} of {total} (one page; the dispatcher caps how many a page can hold, \
-             so read the rest through the API)",
-            arr.len()
+             so walk the rest with --offset {}, or narrow with --node / --since)",
+            arr.len(),
+            filter.offset as u64 + arr.len() as u64
         );
     }
     Ok(())
@@ -98,22 +136,66 @@ pub async fn list(
 #[derive(Debug, Default, Clone)]
 pub struct EventsFilter {
     pub node: Option<String>,
+    /// The call sites the named node's rows must run under, outermost
+    /// first: what `--node auth.check` resolves to beside the node's
+    /// id (`Auth.check` under `["auth"]`). Empty = any, or none.
+    pub call_path: Vec<String>,
     pub kind: Option<String>,
     pub full: bool,
 }
 
 impl EventsFilter {
+    /// Read `--node` the way the program is written: through the call
+    /// sites (`auth.check`), which the compiled definition turns into
+    /// the node's own id and the call path its rows carry. Without a
+    /// definition the spelling is taken as the id itself. A node of an
+    /// included file has no spelling of its own: it is always named
+    /// through a site.
+    pub fn resolve_node(&mut self, project: &weft_core::ProjectDefinition) -> anyhow::Result<()> {
+        if let Some(spelled) = &self.node {
+            if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
+                anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `--node {group}`, and its rows come with it");
+            }
+            if let Some((group, _)) = spelled.rsplit_once(".__in").or_else(|| spelled.rsplit_once(".__out")).filter(|(_, rest)| rest.is_empty()) {
+                anyhow::bail!("'{spelled}' is a boundary the compiler made; name the site, `--node {group}`, and its rows come with it");
+            }
+            let (id, call_path) = weft_core::project::resolve_address(project, spelled);
+            if call_path.is_empty() {
+                if let Some(node) = project.nodes.iter().find(|n| n.id == id) {
+                    if weft_core::project::selection::enclosing_body(project, node).is_some() {
+                        anyhow::bail!("'{spelled}' is inside an included file; name it through the site that includes the file, like `site.{}`",
+                            weft_core::project::address_of(project, &id, &["site".into()]).trim_start_matches("site."));
+                    }
+                }
+            }
+            self.node = Some(id);
+            self.call_path = call_path;
+        }
+        Ok(())
+    }
+
     /// Whether one replay row survives the filters. A node filter is
     /// exact (a node's id), so a run-level row (a start, a completion,
-    /// the run failing) never passes one: it names no node. A kind
-    /// filter matches the kind exactly or as a substring, so `failed`
-    /// finds both `node_failed` and `execution_failed`, and `loop`
-    /// finds the loop lifecycle.
+    /// the run failing) never passes one: it names no node; and when
+    /// the node was named through call sites, only the rows under
+    /// that call path pass. A kind filter matches the kind exactly or
+    /// as a substring, so `failed` finds both `node_failed` and
+    /// `execution_failed`, and `loop` finds the loop lifecycle.
     pub fn keeps(&self, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
-        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row) == Some(n));
-        kind_ok && node_ok
+        // `--node gate` names the group: its own two boundaries are
+        // its rows too.
+        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
+            id == n || id == weft_core::project::boundary_in_id(n) || id == weft_core::project::boundary_out_id(n)));
+        let call_ok = self.call_path.is_empty() || {
+            let frames: weft_core::frames::LoopFrames = row
+                .get("frames")
+                .and_then(|f| serde_json::from_value(f.clone()).ok())
+                .unwrap_or_default();
+            weft_core::frames::call_path(&frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
+        };
+        kind_ok && node_ok && call_ok
     }
 }
 
@@ -157,13 +239,46 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
     };
     let node = row_node(row).unwrap_or("");
     let mut line = format!("{at} {kind:<23} {node}");
-    let Some(fields) = row.as_object() else {
-        return line;
-    };
-    for (key, value) in fields {
-        // An absent value and an empty one say the same nothing: a
-        // `frames=[]` on every root-level firing is noise in the column
-        // the reader is scanning.
+    if silent_completion(row) {
+        // An empty output is dropped by the tail below, exactly like
+        // every other empty field, which left this line identical to a
+        // node that emitted plenty. It is not: every port closed, so
+        // everything downstream of it skipped, and whoever is reading
+        // this is usually reading it because a value never arrived.
+        line.push_str("  output=(nothing emitted)");
+    }
+    for (key, value) in printed_fields(row) {
+        line.push_str(&format!("  {key}={}", field_text(value, full)));
+    }
+    line
+}
+
+/// A firing that completed without emitting on any port. The run is not
+/// wrong (a node may decide it has nothing to say) but the consequence
+/// is total: every output closes and the whole branch behind it skips.
+/// The row carries `output` as null or an empty object depending on the
+/// path that built it, and both mean the same nothing here.
+fn silent_completion(row: &serde_json::Value) -> bool {
+    if row.get("kind").and_then(|v| v.as_str()) != Some("node_completed") {
+        return false;
+    }
+    match row.get("output") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// The fields one row shows in its generic tail: everything it carries
+/// except the columns printed in their own place, and except the ones
+/// saying nothing (an absent value and an empty one say the same
+/// nothing, and a `frames=[]` on every root-level firing is noise in
+/// the column the reader is scanning).
+///
+/// One reader, so what a line prints and what counts as cut can never
+/// disagree.
+fn printed_fields(row: &serde_json::Value) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+    row.as_object().into_iter().flatten().filter(|(key, value)| {
         let empty = match value {
             serde_json::Value::Null => true,
             serde_json::Value::Array(items) => items.is_empty(),
@@ -171,12 +286,18 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
             serde_json::Value::String(text) => text.is_empty(),
             _ => false,
         };
-        if COLUMNS.contains(&key.as_str()) || empty {
-            continue;
-        }
-        line.push_str(&format!("  {key}={}", field_text(value, full)));
-    }
-    line
+        !COLUMNS.contains(&key.as_str()) && !empty
+    })
+}
+
+/// Whether the compact line for this row had to cut a value short.
+///
+/// The cut is silent, and the value it cuts is often the exact thing
+/// being chased (a reply body, a model's answer). So the reader is told
+/// `--full` exists at the one moment it would help, instead of
+/// abandoning the journal for `curl`.
+pub fn any_value_cut(row: &serde_json::Value) -> bool {
+    printed_fields(row).any(|(_, value)| field_text(value, true).chars().count() > SUMMARY_CHARS)
 }
 
 /// One field of a replay row as the line shows it: a string bare (an
@@ -206,8 +327,18 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
     format!("{cut}...")
 }
 
-pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Result<()> {
+pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow::Result<()> {
     let color = super::resolve_color(&ctx, &color).await?;
+    // `--node` is spelled through the call sites, the way the program
+    // reads; the project's compiled definition says which id and which
+    // call path that is, and the rows print their node the same way.
+    // Outside a project the spelling is the id and the rows show ids.
+    let definition = ctx.project().ok()
+        .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
+        .map(|(definition, _)| definition);
+    if let Some(definition) = &definition {
+        filter.resolve_node(definition)?;
+    }
     let client = ctx.client();
     let resp: serde_json::Value = client
         .get_json(&format!("/executions/{color}/replay"))
@@ -215,7 +346,9 @@ pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Re
     let arr = resp
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
-    let kept: Vec<&serde_json::Value> = arr.iter().filter(|row| filter.keeps(row)).collect();
+    let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
+        .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
+        .collect();
     if ctx.json_out(&kept)? {
         return Ok(());
     }
@@ -226,10 +359,98 @@ pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Re
         );
         return Ok(());
     }
-    for row in kept {
+    for row in &kept {
         println!("{}", event_line(row, filter.full));
     }
+    if !filter.full && kept.iter().any(any_value_cut) {
+        println!("(some values were cut to fit; `--full` prints them whole, `--json` for a tool)");
+    }
     Ok(())
+}
+
+/// The row with everything it names spelled the way the program
+/// reads: a node of an included file through the site its call frames
+/// say (`one.strip`), so two calls of one file read apart; a group's
+/// boundary as the group (`gate`), with `boundary=in|out` saying which
+/// end; the call frames, a loop's id, a skip's scope, the run's
+/// subgraph, the seed's origins and the completion's outputs the same
+/// way. The loop frames stay, for the iteration.
+///
+/// `None` for a row of an included file's own boundary: the site's
+/// boundary carries the same values under the same name (`one`), and
+/// the hop between the two is the compiler's, not a person's.
+pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    use weft_core::frames::{call_path, Frame, Located, LoopFrames};
+    use weft_core::project::{address_of, group_address, selection::is_body};
+    let boundary_group = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref());
+    let boundary_of = |id: &str| boundary_group(id)
+        .map(|b| match b.role { weft_core::project::GroupBoundaryRole::In => "in", weft_core::project::GroupBoundaryRole::Out => "out" });
+    let spell_place = |place: &Located| address_of(project, &place.id, &place.path);
+    let spell_frames = |frames: &LoopFrames| -> Vec<Value> {
+        let mut above: Vec<String> = Vec::new();
+        frames.iter().map(|frame| match frame {
+            Frame::Loop { index } => serde_json::json!({ "index": index }),
+            Frame::Call { site } => {
+                let spelled = address_of(project, site, &above);
+                above.push(site.clone());
+                serde_json::json!({ "site": spelled })
+            }
+        }).collect()
+    };
+    let frames: LoopFrames = row.get("frames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+    let path: Vec<String> = call_path(&frames).into_iter().map(str::to_string).collect();
+    let key = ["node", "node_id"].into_iter().find(|key| row.get(key).and_then(|v| v.as_str()).is_some());
+    if let Some(key) = key {
+        let id = row[key].as_str().unwrap_or_default().to_string();
+        if boundary_group(&id).is_some_and(|b| is_body(project, &b.group_id)) { return None; }
+        row[key] = Value::String(address_of(project, &id, &path));
+        if let Some(role) = boundary_of(&id) { row["boundary"] = Value::String(role.into()); }
+    }
+    if !frames.is_empty() {
+        row["frames"] = Value::Array(spell_frames(&frames));
+    }
+    // A loop's lifecycle rows name the loop and the frames around it.
+    let parent_frames: LoopFrames = row.get("parent_frames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+    if let Some(group) = row.get("group_id").and_then(|g| g.as_str()).map(str::to_string) {
+        let parent_path: Vec<String> = call_path(&parent_frames).into_iter().map(str::to_string).collect();
+        row["group_id"] = Value::String(group_address(project, &group, &parent_path));
+    }
+    if !parent_frames.is_empty() {
+        row["parent_frames"] = Value::Array(spell_frames(&parent_frames));
+    }
+    if let Some(scope) = row.get("reason").and_then(|r| r.get("scope")).and_then(|s| s.as_str()).map(str::to_string) {
+        // A site is refused in its caller's frames, one above the
+        // call frame its body's rows carry.
+        let scope_path = if path.last() == Some(&scope) { &path[..path.len() - 1] } else { &path[..] };
+        row["reason"]["scope"] = Value::String(group_address(project, &scope, scope_path));
+    }
+    // A place list or map (`subgraph`, `seed.origins`, `outputs`): each
+    // key spelled, boundaries folded into their group.
+    let places = |value: &Value| -> Vec<(Located, Value)> {
+        match value {
+            Value::Array(items) => items.iter().filter_map(|i| serde_json::from_value::<Located>(i.clone()).ok().map(|p| (p, Value::Null))).collect(),
+            Value::Object(map) => map.iter().filter_map(|(k, v)| serde_json::from_str::<Located>(&format!("\"{k}\"")).ok().map(|p| (p, v.clone()))).collect(),
+            _ => Vec::new(),
+        }
+    };
+    if let Some(subgraph) = row.get("subgraph").cloned() {
+        let mut seen = std::collections::BTreeSet::new();
+        row["subgraph"] = Value::Array(places(&subgraph).into_iter()
+            .filter(|(place, _)| boundary_of(&place.id).is_none())
+            .map(|(place, _)| spell_place(&place)).filter(|s| seen.insert(s.clone())).map(Value::String).collect());
+    }
+    for key in ["outputs", "origins"] {
+        let holder = if key == "origins" { row.get_mut("seed") } else { Some(&mut row) };
+        let Some(holder) = holder else { continue };
+        if let Some(map) = holder.get(key).cloned().filter(|v| v.is_object()) {
+            let spelled: serde_json::Map<String, Value> = places(&map).into_iter()
+                .filter(|(place, _)| boundary_of(&place.id).is_none())
+                .map(|(place, v)| (spell_place(&place), v)).collect();
+            holder[key] = Value::Object(spelled);
+        }
+    }
+    Some(row)
 }
 
 pub async fn clean(
@@ -325,15 +546,24 @@ pub async fn clean(
     let mut count = 0usize;
     let mut swept = 0usize;
     loop {
-        let mut offset = 0u64;
+        let mut offset = 0u32;
         let mut deleted_this_pass = 0usize;
         loop {
-            let (rows, total) =
-                executions_page(&client, 200, offset, project.as_deref(), None).await?;
+            // The sweep wants every run, so it narrows by project only.
+            let page = ListFilter {
+                limit: 200,
+                offset,
+                project: project.clone(),
+                phase: None,
+                node: None,
+                since: None,
+                status: None,
+            };
+            let (rows, total) = executions_page(&client, &page).await?;
             if rows.is_empty() {
                 break;
             }
-            let fetched = rows.len() as u64;
+            let fetched = rows.len() as u32;
             for row in rows {
                 let Some(color) = row.get("color").and_then(|v| v.as_str()) else { continue };
                 let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -362,7 +592,7 @@ pub async fn clean(
                 }
             }
             offset += fetched;
-            if offset >= total {
+            if u64::from(offset) >= total {
                 break;
             }
         }
@@ -778,9 +1008,18 @@ async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
     Ok(done)
 }
 
-/// What the shared worker compile cache takes on disk, per cache key,
-/// and how to drop it.
+/// What the two compile caches on this host take on disk and how to
+/// drop each: the node-test cache `weft test-node` builds into, and the
+/// worker compile cache every image build shares, per cache key.
 async fn report_compile_cache_size() -> anyhow::Result<()> {
+    match super::test_node::cache_size_bytes()? {
+        None => println!("node-test cache: nothing built on this host"),
+        Some(bytes) => println!(
+            "node-test cache: {:.1}GB; it wipes itself past WEFT_TEST_CACHE_CAP_GB (6 by default), \
+             `weft rm --local` drops one project's slice, `weft clean --build-cache` drops it whole",
+            bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        ),
+    }
     let caches = crate::images::worker_compile_caches().await?;
     if caches.is_empty() {
         println!("worker compile cache: no BuildKit record (nothing built on this host, or already pruned)");
@@ -826,8 +1065,13 @@ async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
 /// This is the heavy reclaim: cargo deps, intermediate Rust compile
-/// state, etc. The next build will re-download deps and re-link.
+/// state, etc. The next build will re-download deps and re-link. The
+/// host's node-test cache goes with it: it is the same kind of thing
+/// (compiled engine plus dependencies, re-made by the next build), and
+/// "drop every build cache" should mean every one.
 async fn clean_build_cache() -> anyhow::Result<()> {
+    println!("dropping the node-test cache (the next `weft test-node` builds cold)…");
+    super::test_node::wipe_cache()?;
     println!("pruning docker BuildKit cache (next build will be slower)…");
     let status = crate::images::docker()
         .args(["buildx", "prune", "--force"])
@@ -859,11 +1103,58 @@ mod tests {
         assert!(exact.keeps(&done) && !exact.keeps(&failed));
         let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
         assert!(by_node.keeps(&failed) && !by_node.keeps(&done) && !by_node.keeps(&run_failed));
+        // Named through a call site, only the rows under that call pass.
+        let in_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]});
+        let other_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]});
+        let by_call = EventsFilter { node: Some("Auth.check".into()), call_path: vec!["auth".into()], ..Default::default() };
+        assert!(by_call.keeps(&in_call) && !by_call.keeps(&other_call));
+        let any_call = EventsFilter { node: Some("Auth.check".into()), ..Default::default() };
+        assert!(any_call.keeps(&in_call) && any_call.keeps(&other_call));
     }
 
     /// The compact line cuts a long value at the summary width on a
     /// character boundary; `full` prints it whole; and everything the
     /// row carries reaches the line, including the fields only one
+    /// A node that completed without emitting says so on its own line.
+    ///
+    /// The generic tail drops empty fields, which is right for almost
+    /// everything and wrong for exactly this: a firing that emitted
+    /// nothing closed every one of its ports, so the whole branch behind
+    /// it skipped. Without the words, the line is indistinguishable from
+    /// a node that emitted plenty, and the person reading is usually
+    /// reading BECAUSE a value never arrived.
+    #[test]
+    fn a_completion_that_emitted_nothing_says_so() {
+        for output in [json!({}), json!(null)] {
+            let row = json!({
+                "kind": "node_completed", "node": "pick",
+                "at_unix": 1_756_838_207u64, "output": output,
+            });
+            let line = event_line(&row, false);
+            assert!(line.contains("(nothing emitted)"), "{line}");
+        }
+        // Absent entirely is the same nothing.
+        let bare = json!({ "kind": "node_completed", "node": "pick", "at_unix": 1_756_838_207u64 });
+        assert!(event_line(&bare, false).contains("(nothing emitted)"));
+
+        // A node that emitted is untouched, and says nothing about silence.
+        let spoke = json!({
+            "kind": "node_completed", "node": "pick",
+            "at_unix": 1_756_838_207u64, "output": {"value": 1},
+        });
+        let line = event_line(&spoke, false);
+        assert!(!line.contains("nothing emitted"), "{line}");
+        assert!(line.contains("output="), "{line}");
+
+        // Only completions: a skip carries its own reason and says why
+        // already, so the words would be noise on top of a better line.
+        let skipped = json!({
+            "kind": "node_skipped", "node": "pick",
+            "at_unix": 1_756_838_207u64, "reason": {"kind": "did_not_flow"},
+        });
+        assert!(!event_line(&skipped, false).contains("nothing emitted"));
+    }
+
     /// kind has.
     #[test]
     fn event_line_summarises_and_expands() {
@@ -932,5 +1223,30 @@ mod tests {
             busy.report("stale worker image(s)"),
             "removed 1 stale worker image(s), 1 already reclaimed, 3 still in use (kept)"
         );
+    }
+}
+
+#[cfg(test)]
+mod cut_notice_tests {
+    use serde_json::json;
+
+    use super::any_value_cut;
+
+    /// The cut is silent, and the value it cuts is usually the one
+    /// being chased. The line telling the reader `--full` exists has to
+    /// appear exactly when something was cut, and not otherwise: a
+    /// notice on every run is noise nobody reads.
+    #[test]
+    fn a_row_says_whether_it_lost_anything() {
+        let long = json!({ "kind": "node_completed", "output": { "text": "x".repeat(400) } });
+        assert!(any_value_cut(&long));
+
+        let short = json!({ "kind": "node_completed", "output": { "text": "ok" } });
+        assert!(!any_value_cut(&short));
+
+        // A long value in a column printed in its own place is not part
+        // of the tail, so it cannot be what was cut.
+        let column = json!({ "kind": "node_completed", "node": "n".repeat(400) });
+        assert!(!any_value_cut(&column));
     }
 }

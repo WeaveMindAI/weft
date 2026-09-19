@@ -23,7 +23,7 @@ import type {
   CancelCause,
   CorruptionSite,
   HostMessage,
-  LoopIteration,
+  Frame,
   LoopTerminationReason,
   NodeExecEvent,
   Seed,
@@ -42,14 +42,13 @@ export type DispatcherEvent = { event_id: string } & (
   // one was seeded from (`weft run --seed`); `provided_ports` names the
   // input ports supplied at a run's `--from` or `--group` start.
   // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
-  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string; at_unix: number }
+  | { kind: 'node_started'; color: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_suspended'; color: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; color: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_cancelled'; color: string; node: string; frames: Frame[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_completed'; color: string; node: string; frames: Frame[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_failed'; color: string; node: string; frames: Frame[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_skipped'; color: string; node: string; frames: Frame[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown; at_unix: number }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
   | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
@@ -82,7 +81,7 @@ export type DispatcherEvent = { event_id: string } & (
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
   // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
-  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
+  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -98,26 +97,25 @@ export type DispatcherEvent = { event_id: string } & (
   // SYNC: DispatcherEvent 'bus_window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals
   | { kind: 'bus_joined'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
   | { kind: 'bus_left'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
-  | { kind: 'bus_window'; color: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload: WirePayload; payload_byte_size: number; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
+  | { kind: 'bus_window'; color: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
   | { kind: 'bus_closed'; color: string; project_id: string; bus_id: string; offset: number; at_unix: number }
   // Live caller connection events. One caller per execution (keyed by
   // color, no bus_id). The webview replays the caller exchange the same
   // way it replays a bus; `payload` is the same tagged WirePayload a
   // bus window's messages carry.
-  // SYNC: DispatcherEvent 'caller_inbound'/'caller_outbound' <-> crates/weft-journal/src/events.rs CallerInbound/CallerOutbound, crates/weft-dispatcher/src/events.rs CallerInbound/CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound'/'outbound'
+  // SYNC: DispatcherEvent 'caller_window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window'
   | { kind: 'caller_connected'; color: string; project_id: string; offset: number; protocol: string; at_unix: number }
-  | { kind: 'caller_inbound'; color: string; project_id: string; offset: number; payload: WirePayload; payload_byte_size: number; at_unix: number }
-  | { kind: 'caller_outbound'; color: string; project_id: string; offset: number; payload: WirePayload; payload_byte_size: number; terminal: boolean; at_unix: number }
+  | { kind: 'caller_window'; color: string; project_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; terminal?: boolean; at_unix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; at_unix: number }
   | { kind: 'caller_errored'; color: string; project_id: string; offset: number; message: string; at_unix: number }
   | { kind: 'caller_disconnected'; color: string; project_id: string; offset: number; reason: string; at_unix: number }
   // Loop events. Carry the inspector groupId + parent_frames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
   // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
-  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_cap: number | null; parallel: boolean; at_unix: number }
-  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; at_unix: number }
-  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null; at_unix: number }
-  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason; at_unix: number }
+  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; iter_cap: number | null; parallel: boolean; at_unix: number }
+  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; at_unix: number }
+  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; done_vote?: boolean | null; at_unix: number }
+  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; reason: LoopTerminationReason; at_unix: number }
   // Graph-level participation: a node is wired to a bus. Derived
   // dispatcher-side from emitted pulses carrying a bus marker,
   // so source AND target nodes get one BusParticipant edge each.
@@ -392,20 +390,6 @@ export class ExecutionFollower implements vscode.Disposable {
         this.post({ kind: 'execEvent', event: execEvent });
         break;
       }
-      case 'port_type_mismatch': {
-        // Non-terminal: attach a warning to the firing's row without a
-        // state change. The node keeps running; one port's value was
-        // dropped and the port closed.
-        this.post({
-          kind: 'execPortWarning',
-          nodeId: e.node,
-          frames: e.frames,
-          port: e.port,
-          expected: e.expected,
-          actual: e.actual,
-        });
-        break;
-      }
       case 'execution_completed':
       case 'execution_failed':
         this.post({
@@ -463,6 +447,7 @@ export class ExecutionFollower implements vscode.Disposable {
               msgKind: m.msg_kind,
               payload: m.payload,
               payloadByteSize: m.payload_byte_size,
+              trimmed: m.trimmed,
               atUnix: m.at_unix,
             },
           });
@@ -512,27 +497,23 @@ export class ExecutionFollower implements vscode.Disposable {
           event: { kind: 'connected', offset: e.offset, protocol: e.protocol, atUnix: e.at_unix },
         });
         break;
-      case 'caller_inbound':
+      case 'caller_window':
         this.post({
           kind: 'callerEvent',
           event: {
-            kind: 'inbound',
-            offset: e.offset,
-            payload: e.payload,
-            payloadByteSize: e.payload_byte_size,
-            atUnix: e.at_unix,
-          },
-        });
-        break;
-      case 'caller_outbound':
-        this.post({
-          kind: 'callerEvent',
-          event: {
-            kind: 'outbound',
-            offset: e.offset,
-            payload: e.payload,
-            payloadByteSize: e.payload_byte_size,
-            terminal: e.terminal,
+            kind: 'window',
+            firstOffset: e.first_offset,
+            lastOffset: e.last_offset,
+            messages: e.messages.map((m) => ({
+              offset: m.offset,
+              direction: m.direction,
+              payload: m.payload,
+              payloadByteSize: m.payload_byte_size,
+              trimmed: m.trimmed,
+              terminal: m.terminal,
+              atUnix: m.at_unix,
+            })),
+            totals: e.totals,
             atUnix: e.at_unix,
           },
         });
@@ -610,6 +591,11 @@ export class ExecutionFollower implements vscode.Disposable {
           nodeId: e.node_id,
           frames: e.frames,
           costId: e.cost_id,
+          service: e.service,
+          // A seeded run inherits the costs of the run it was seeded
+          // from. Dropping this made those read as money this run spent,
+          // so a seeded run looked as expensive as the one it reused.
+          inheritedFrom: e.inherited_from ?? null,
           amountUsd: e.amount_usd,
           origin: e.origin,
         });

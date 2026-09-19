@@ -26,6 +26,27 @@ pub mod key;
 #[cfg(feature = "runtime")]
 pub mod media;
 
+/// The most one port value may weigh on a wire, as JSON. Bytes belong
+/// in storage (a stored-file value is a few hundred bytes whatever the
+/// file weighs); a value over this fails the node that emitted it. The
+/// broker's journal write bounds one recorded event with headroom over
+/// this, so the node's refusal is the one a user ever sees.
+pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
+
+/// Whether `value` may travel a wire from port `port` of node `node`:
+/// the refusal names the port, the weight and where bytes belong.
+pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX);
+    if bytes <= MAX_WIRE_VALUE_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "port '{port}' of '{node}' carries {} KB; a wire carries at most {} KB. Bytes belong in a stored file: put the data in storage and send the file value",
+        bytes.div_ceil(1024),
+        MAX_WIRE_VALUE_BYTES / 1024
+    ))
+}
+
 /// Boxed byte stream used for streaming put/get. `'static` so it can
 /// cross the `ContextHandle` trait object; chunks are `Bytes` so
 /// hops are zero-copy.
@@ -674,16 +695,41 @@ pub struct KeepRequest {
 /// `POST /v1/storage/presign`: mint a temporary link to a stored file, scoped
 /// to the one key with a short TTL: the internet-reachable link when the
 /// install serves one, else one signed for the cluster's own address.
+/// `POST /v1/storage/public-link` takes the same shape plus `reach`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignRequest {
     pub key: String,
     pub ttl_secs: Option<u64>,
+    /// Who the link is for (public-link only; presign ignores it).
+    #[serde(default)]
+    pub reach: LinkReach,
 }
 
-/// `POST /v1/storage/public-link`: mint a temporary URL the OPEN
-/// INTERNET can fetch the file from. `url: None` = no publicly
-/// addressable store and no public relay, so no such URL exists; the
-/// caller falls back to inline bytes. Same request shape as presign.
+/// Who has to be able to open a minted link. The two askers reach
+/// different addresses: a provider on the open internet cannot open a
+/// loopback link, while the browser that just called a local install's
+/// route reached it at that very loopback address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkReach {
+    /// The open internet (a provider fetching media): only an address
+    /// the internet resolves counts; a local install answers `None`.
+    #[default]
+    Internet,
+    /// A caller of this install (the browser a route answers): the
+    /// internet address when there is one, else the install's own
+    /// stable base, loopback included.
+    Caller,
+}
+
+/// `POST /v1/storage/public-link`: mint a temporary URL for the file
+/// at whatever address the request's [`LinkReach`] asks for. Under
+/// `Internet` that is an address the internet resolves, and `url: None`
+/// means there is none (no publicly addressable store and no public
+/// relay), so the caller falls back to inline bytes. Under `Caller` it
+/// is that same address when there is one, else the install's own base,
+/// loopback included, so `None` there means the install has neither.
+/// Same request shape as presign.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicLinkResponse {
     pub url: Option<String>,
@@ -789,10 +835,33 @@ pub struct Tenanted<T> {
 /// scope keys and adds the authenticated tenant before forwarding to storage.
 /// An empty set retires every
 /// asset; retirement starts a TTL instead of deleting files old runs need.
+///
+/// `keys` are this build's own files and must all be there (the build
+/// just uploaded them). `kept` are files an older version of the project
+/// still names: kept alive when present, reported back when gone, since
+/// a version whose blob expired or was removed must not stop the next
+/// build from publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetReferencesRequest {
     pub project: String,
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub kept: Vec<String>,
+}
+
+/// The broker's answer to an asset references update: the `kept` keys
+/// that no longer exist, so the dispatcher can say which version lost
+/// a file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetReferencesResponse {
+    pub missing: Vec<String>,
+}
+
+/// The dispatcher's answer to a publish: one warning per version that
+/// names a stored file that no longer exists, for the person to read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetsPublished {
+    pub warnings: Vec<String>,
 }
 
 /// `POST /v1/storage/admin/list-prefix`: the files under one scope-boundary
@@ -933,15 +1002,19 @@ pub fn sniff_file_kind(head: &[u8]) -> Option<crate::weft_type::FileKind> {
     }
 }
 
-/// Hold a file's bytes to the kind its `@asset` declared: an `Image`
-/// declaration over video bytes is a loud error naming the source and
-/// both kinds, and bytes with no known signature cannot be the declared
-/// kind either. `Blob` checks nothing (it is the declaration for "bytes
-/// of any shape"), and so does a declaration that is not a file type.
+/// Hold a file's bytes to the kind something declared for them: an
+/// `Image` declaration over video bytes is a loud error naming both
+/// kinds, and bytes with no known signature cannot be the declared kind
+/// either. `Blob` checks nothing (it is the declaration for "bytes of
+/// any shape"), and so does a declaration that is not a file type.
+///
+/// The error names WHAT is wrong and nothing about where it came from,
+/// because the same check runs over an `@asset` in source and over a
+/// caller's upload, and a caller must never be shown a piece of weft
+/// syntax their request has nothing to do with. Each caller frames it.
 pub fn check_declared_kind(
     declared: &crate::weft_type::WeftType,
     head: &[u8],
-    source: &str,
 ) -> Result<(), String> {
     use crate::weft_type::FileKind;
     let Some(kind) = declared.concrete_file_kind() else { return Ok(()) };
@@ -951,13 +1024,13 @@ pub fn check_declared_kind(
     match sniff_file_kind(head) {
         Some(found) if found == kind => Ok(()),
         Some(found) => Err(format!(
-            "@asset({source:?}, {declared}): the file's bytes are {}, not {}",
+            "the bytes are {}, not the {} that was declared",
             found.primitive(),
             kind.primitive()
         )),
         None => Err(format!(
-            "@asset({source:?}, {declared}): the file's bytes carry no {} signature this \
-             weft knows (declare it Blob to skip the check)",
+            "the bytes carry no {} signature this weft knows (declare it Blob to skip \
+             the check)",
             kind.primitive()
         )),
     }
@@ -1013,14 +1086,24 @@ mod sniff_tests {
     #[test]
     fn a_declaration_is_held_to_the_bytes() {
         let image = WeftType::primitive(WeftPrimitive::Image);
-        assert!(check_declared_kind(&image, b"\x89PNG\r\n\x1a\n", "a.png").is_ok());
-        let e = check_declared_kind(&image, b"ID3\x04", "a.png").unwrap_err();
-        assert!(e.contains("are Audio, not Image"), "{e}");
-        let e = check_declared_kind(&image, b"just text", "notes.txt").unwrap_err();
+        assert!(check_declared_kind(&image, b"\x89PNG\r\n\x1a\n").is_ok());
+        let e = check_declared_kind(&image, b"ID3\x04").unwrap_err();
+        assert!(e.contains("are Audio, not the Image"), "{e}");
+        let e = check_declared_kind(&image, b"just text").unwrap_err();
         assert!(e.contains("no Image signature"), "{e}");
         // Blob and text declarations check nothing.
-        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::Blob), b"just text", "x").is_ok());
-        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3", "x").is_ok());
+        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::Blob), b"just text").is_ok());
+        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3").is_ok());
+    }
+
+    /// The reason says what is wrong with the bytes and nothing about
+    /// weft's own syntax: a caller uploading a file must not be shown
+    /// `@asset(...)`, which belongs to source they never wrote.
+    #[test]
+    fn the_reason_carries_no_source_syntax() {
+        let image = WeftType::primitive(WeftPrimitive::Image);
+        let e = check_declared_kind(&image, b"ID3\x04").unwrap_err();
+        assert!(!e.contains("@asset"), "{e}");
     }
 }
 
@@ -1061,6 +1144,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn a_wire_value_is_weighed_as_json_and_refused_over_the_cap() {
+        assert!(check_wire_value("n", "out", &json!({"a": "b"})).is_ok());
+        let at_cap = json!("x".repeat(MAX_WIRE_VALUE_BYTES - 2));
+        assert!(check_wire_value("n", "out", &at_cap).is_ok(), "the cap itself passes");
+        let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
+        let refusal = check_wire_value("pic", "bytes", &over).unwrap_err();
+        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB; a wire carries at most 100 KB"), "{refusal}");
+        assert!(refusal.contains("stored file"), "{refusal}");
+    }
+
+    #[test]
     fn filename_from_url_extracts_last_segment() {
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg"), "clip.ogg");
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg?token=1"), "clip.ogg");
@@ -1084,10 +1178,10 @@ mod tests {
     fn admin_upload_envelopes_round_trip() {
         let references = Tenanted {
             tenant: "alice".into(),
-            inner: AssetReferencesRequest { project: "p1".into(), keys: vec![] },
+            inner: AssetReferencesRequest { project: "p1".into(), keys: vec![], kept: vec![] },
         };
         let value = serde_json::to_value(&references).unwrap();
-        assert_eq!(value, json!({"tenant": "alice", "project": "p1", "keys": []}));
+        assert_eq!(value, json!({"tenant": "alice", "project": "p1", "keys": [], "kept": []}));
         let back: Tenanted<AssetReferencesRequest> = serde_json::from_value(value).unwrap();
         assert!(back.inner.keys.is_empty(), "empty retires the last source asset");
         assert!(serde_json::from_value::<AssetReferencesRequest>(json!({"project": "p1"})).is_err());
@@ -1309,12 +1403,16 @@ mod tests {
         assert_eq!(back.key, keep.key);
         assert_eq!(back.ttl, keep.ttl);
 
-        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900) };
+        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: LinkReach::Caller };
         let v = serde_json::to_value(&presign).unwrap();
-        assert_eq!(v, json!({"key": "t/project/p/1", "ttl_secs": 900}));
+        assert_eq!(v, json!({"key": "t/project/p/1", "ttl_secs": 900, "reach": "caller"}));
         let back: PresignRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.key, presign.key);
         assert_eq!(back.ttl_secs, presign.ttl_secs);
+        assert_eq!(back.reach, LinkReach::Caller);
+        // An older asker sends no reach: the internet, the strict one.
+        let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttl_secs": null})).unwrap();
+        assert_eq!(bare.reach, LinkReach::Internet);
     }
 
     #[test]

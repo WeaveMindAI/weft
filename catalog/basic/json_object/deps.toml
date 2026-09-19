@@ -1,0 +1,13 @@
+# Extra dependencies this node needs beyond the codegen base
+# (weft, weft-providers, tokio, serde, serde_json, async-trait,
+# anyhow, tracing). Base deps are always available; list only the
+# extras here.
+[dependencies]
+# This node PROMISES the keys come out in the order they were wired,
+# and that only holds with serde_json's `preserve_order` (without it
+# its map is a BTreeMap and the object comes out alphabetical). The
+# feature is additive and merges with the codegen base's plain
+# `serde_json = "1"`, so declaring it here is what pins the promise
+# to this node instead of leaving it to whatever else the build
+# happens to pull in.
+serde_json = { version = "1", features = ["preserve_order"] }

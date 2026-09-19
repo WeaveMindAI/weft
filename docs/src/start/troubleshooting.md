@@ -24,9 +24,19 @@ export WEFT_DISPATCHER_URL=http://localhost:19999
 weft daemon start
 ```
 
-Put **both** exports in your shell config. The first is the port the daemon
-binds and the second is where the CLI looks, and a later `weft daemon stop` in
-a shell missing the first one goes hunting for a daemon on 9999.
+Put **both** exports in your shell config. The first is the port the cluster
+maps to your machine and the second is where the CLI looks, and a later `weft
+daemon stop` in a shell missing the first one goes hunting for a daemon on
+9999.
+
+The port is part of the cluster's shape (the local cluster is a container,
+and Docker publishes the port when that container is created), so changing it
+on a machine that already has a cluster makes `weft daemon start` rebuild the
+cluster, and it says so before it does. Your system database survives the
+rebuild; every project's own database lives inside the cluster and does not,
+so pick the port before you have projects you care about. The same goes for
+`WEFT_INGRESS_PORT` (9998, storage downloads) and `WEFT_GATEWAY_PORT` (9097,
+live callers).
 
 ## `kind` not found on PATH
 

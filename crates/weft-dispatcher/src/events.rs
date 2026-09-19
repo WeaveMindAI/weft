@@ -81,7 +81,7 @@ pub enum DispatcherEvent {
         color: Color,
         entry_node: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        subgraph: Option<Vec<String>>,
+        subgraph: Option<Vec<weft_core::frames::Located>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<weft_journal::Seed>,
         project_id: String,
@@ -141,11 +141,6 @@ pub enum DispatcherEvent {
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
     NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
-    /// A node emitted a value whose type is incompatible with the
-    /// declared (possibly narrowed) type of `port`. The engine refused
-    /// the value and closed the port (downstream sees null); the node did
-    /// NOT fail. The extension renders this as a per-port warning.
-    PortTypeMismatch { color: Color, node: String, frames: LoopFrames, port: String, expected: String, actual: String, project_id: String, at_unix: u64 },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
     // SYNC: LoopInstantiated <-> extension-vscode/src/execFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
@@ -303,28 +298,17 @@ pub enum DispatcherEvent {
         protocol: String,
         at_unix: u64,
     },
-    /// A message arrived from the caller. `payload` is the tagged
-    /// `WirePayload` (json value or base64 bytes), the same wire
-    /// vocabulary as a bus window's messages.
-    // SYNC: CallerInbound <-> crates/weft-journal/src/events.rs CallerInbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'
-    CallerInbound {
+    /// What the conversation said during one window, both directions in
+    /// one row, the same shape and clock as a bus window. A message
+    /// whose content was not kept still appears carrying its size.
+    // SYNC: CallerWindow <-> crates/weft-journal/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+    CallerWindow {
         color: Color,
         project_id: String,
-        offset: u64,
-        payload: weft_core::bus::WirePayload,
-        payload_byte_size: u64,
-        at_unix: u64,
-    },
-    /// A message was sent to the caller. `terminal` marks the final
-    /// outbound (HTTP respond/close, WS close).
-    // SYNC: CallerOutbound <-> crates/weft-journal/src/events.rs CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'outbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_outbound'
-    CallerOutbound {
-        color: Color,
-        project_id: String,
-        offset: u64,
-        payload: weft_core::bus::WirePayload,
-        payload_byte_size: u64,
-        terminal: bool,
+        first_offset: u64,
+        last_offset: u64,
+        messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
+        totals: Vec<weft_core::stream_journal::CallerWindowTotal>,
         at_unix: u64,
     },
     /// A node error surfaced to the caller.
@@ -386,7 +370,6 @@ impl DispatcherEvent {
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
             | Self::NodeSkipped { project_id, .. }
-            | Self::PortTypeMismatch { project_id, .. }
             | Self::LoopInstantiated { project_id, .. }
             | Self::LoopIterationLaunched { project_id, .. }
             | Self::LoopOutFired { project_id, .. }
@@ -408,8 +391,7 @@ impl DispatcherEvent {
             | Self::BusClosed { project_id, .. }
             | Self::BusParticipant { project_id, .. }
             | Self::CallerConnected { project_id, .. }
-            | Self::CallerInbound { project_id, .. }
-            | Self::CallerOutbound { project_id, .. }
+            | Self::CallerWindow { project_id, .. }
             | Self::CallerErrored { project_id, .. }
             | Self::CallerDisconnected { project_id, .. }
             | Self::JournalCorruption { project_id, .. } => project_id,
@@ -430,7 +412,6 @@ impl DispatcherEvent {
             | Self::NodeCompleted { color, .. }
             | Self::NodeFailed { color, .. }
             | Self::NodeSkipped { color, .. }
-            | Self::PortTypeMismatch { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
             | Self::LoopOutFired { color, .. }
@@ -442,8 +423,7 @@ impl DispatcherEvent {
             | Self::BusClosed { color, .. }
             | Self::BusParticipant { color, .. }
             | Self::CallerConnected { color, .. }
-            | Self::CallerInbound { color, .. }
-            | Self::CallerOutbound { color, .. }
+            | Self::CallerWindow { color, .. }
             | Self::CallerErrored { color, .. }
             | Self::CallerDisconnected { color, .. }
             | Self::JournalCorruption { color, .. } => Some(*color),

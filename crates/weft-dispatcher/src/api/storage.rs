@@ -271,25 +271,48 @@ pub async fn asset_references(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Json(mut req): Json<weft_core::storage::AssetReferencesRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<weft_core::storage::AssetsPublished>, ApiError> {
     let project = req.project.parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
-    // The build's own assets plus every blob a surviving version of the
+    // The build's own assets, plus every blob a surviving version of the
     // project names: the version tree shares the asset plane, and a
     // version's files must outlive the builds that stopped referencing
     // them. What no version and no build names expires as before, which
-    // is how a prune reclaims its blobs.
-    req.keys.extend(
+    // is how a prune reclaims its blobs. A version's blob is KEPT, not
+    // required: one that expired or was removed is that version's loss
+    // (it cannot be branched back to), never a reason the next build
+    // cannot publish. Requiring it left a project unable to build at
+    // all, with the way out being the build itself.
+    let versions = state.versions.versions(project).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?;
+    // Which versions name each blob, so a missing one is reported as
+    // the version's loss, by the id `weft tree` shows.
+    let mut named_by: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for version in &versions {
+        for key in crate::api::versions::blob_keys(project, std::iter::once((version.id.as_str(), &version.manifest)))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?
+        {
+            named_by.entry(ensure_tenant_key(&caller.0, &key)?).or_default().push(version.id[..8].to_string());
+        }
+    }
+    req.kept.extend(
         crate::api::versions::version_blob_keys(&state, project)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?,
     );
-    for key in &mut req.keys {
+    for key in req.keys.iter_mut().chain(req.kept.iter_mut()) {
         *key = ensure_tenant_key(&caller.0, key)?;
     }
-    crate::storage::set_asset_references(&state, caller.0.as_str(), req)
+    let outcome = crate::storage::set_asset_references(&state, caller.0.as_str(), req)
         .await.map_err(storage_err)?;
-    Ok(StatusCode::NO_CONTENT)
+    let warnings: Vec<String> = outcome.missing.iter().map(|key| {
+        let versions = named_by.get(key).map(|v| v.join(", ")).unwrap_or_else(|| "the registered sources".into());
+        tracing::warn!(%project, key, %versions, "a version names a stored file that no longer exists");
+        let (noun, verb, that) = if versions.contains(", ") { ("versions", "name", "those versions") } else { ("version", "names", "that version") };
+        format!("{noun} {versions} {verb} a stored file that no longer exists in storage ({}); {that} cannot be branched back to, `weft prune` drops it",
+            key.rsplit('/').next().unwrap_or(key))
+    }).collect();
+    Ok(Json(weft_core::storage::AssetsPublished { warnings }))
 }
 
 /// POST /storage/upload/parts: reserve + presign the parts the caller

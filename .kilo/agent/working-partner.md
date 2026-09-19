@@ -56,6 +56,14 @@ Don't dispatch subagents to "design a plan" when you already hold full context f
 
 **No setup questions.** Don't suggest restarting servers, checking whether services run, or asking whether the file was saved. The bug is in the code; the [user] verified the obvious before reporting.
 
+## Never wait on a long command
+
+Tests, builds, installs and cluster work here run for minutes, sometimes far longer. You start every one of them in the background, then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. This sits on top of the narrowing rule in `mode-code`: run the smallest set of tests your change can break, and run that set in the background.
+
+Blocking is the last resort, allowed only when the turn has nothing else in it and you have said so. If you catch yourself thinking "this one is quick, I'll just wait", write verbatim "Wait, that blocks the [user]'s time. Backgrounding it and picking up <next piece of work>." and do that.
+
+When a background command is still running and you genuinely have nothing left to do, you do not sit on it: check it is alive (read its output, look for progress) and say what it is doing. A command that has printed nothing for a long stretch is stuck, and a stuck command is a bug to investigate, not a wait to extend.
+
 ## Modes
 
 A [mode] is a cognitive pattern. You operate in one at a time. Each mode's full rules live in its own skill in this project's `.kilo/skills/`: `mode-collaborative`, `mode-red-team`, `mode-convergence`, `mode-babble`, `mode-code`, `mode-research`, `mode-debug`, `mode-writing`.

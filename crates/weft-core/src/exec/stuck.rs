@@ -50,16 +50,6 @@ pub fn stuck_report(
         let Some(node_pulses) = pulses.get(&node.id) else {
             continue;
         };
-        let wired: Vec<String> = edge_idx
-            .get_incoming(project, &node.id)
-            .iter()
-            .map(|e| e.target_handle.clone().unwrap_or_else(|| "default".to_string()))
-            .fold(Vec::new(), |mut acc, port| {
-                if !acc.contains(&port) {
-                    acc.push(port);
-                }
-                acc
-            });
         // One entry per exact firing point: pulses only meet when their
         // color and frames agree, so that is the unit that is stuck.
         // Kept in first-seen order (the table's own), which is what a
@@ -79,6 +69,16 @@ pub fn stuck_report(
             }
         }
         for ((_, frames), holding) in groups {
+            let wired: Vec<String> = edge_idx
+                .get_incoming(project, &node.id, &frames)
+                .iter()
+                .map(|e| e.target_handle.clone().unwrap_or_else(|| "default".to_string()))
+                .fold(Vec::new(), |mut acc, port| {
+                    if !acc.contains(&port) {
+                        acc.push(port);
+                    }
+                    acc
+                });
             let missing = wired.iter().filter(|w| !holding.contains(w)).cloned().collect();
             firings.push(StuckFiring { node_id: node.id.clone(), frames, holding, missing });
         }
@@ -87,13 +87,13 @@ pub fn stuck_report(
 }
 
 /// `#3` for the fourth iteration of one loop, `#3.0` one level deeper,
-/// nothing at the root: the same suffix `weft logs` prints.
+/// `#@auth` inside the include `auth` uses, nothing at the root: the
+/// same suffix `weft logs` prints.
 fn frames_suffix(frames: &LoopFrames) -> String {
     if frames.is_empty() {
         return String::new();
     }
-    let path: Vec<String> = frames.iter().map(|f| f.index.to_string()).collect();
-    format!("#{}", path.join("."))
+    format!("#{}", crate::frames::frames_text(frames))
 }
 
 impl fmt::Display for StuckReport {
@@ -124,8 +124,8 @@ impl fmt::Display for StuckReport {
 
 #[cfg(test)]
 mod tests {
+    use crate::frames::Frame;
     use super::*;
-    use crate::frames::LoopIteration;
     use crate::pulse::Pulse;
     use serde_json::json;
 
@@ -201,8 +201,8 @@ mod tests {
         );
         let idx = EdgeIndex::build(&p);
         let color = uuid::Uuid::new_v4();
-        let f2 = vec![LoopIteration { index: 2 }];
-        let f5 = vec![LoopIteration { index: 5 }];
+        let f2 = vec![Frame::Loop { index: 2 }];
+        let f5 = vec![Frame::Loop { index: 5 }];
         let mut pulses = PulseTable::new();
         pulses.insert(
             "step".into(),

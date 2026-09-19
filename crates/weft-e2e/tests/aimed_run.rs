@@ -4,7 +4,7 @@
 //! branch in.
 //!
 //! The fixture holds two independent chains and a leaf hanging off the
-//! first (see fixtures/aimed_run/main.weft). Three contracts are pinned:
+//! first (see fixtures/aimed_run/src/main.weft). Three contracts are pinned:
 //!
 //!  - untargeted: every root is kicked and everything runs;
 //!  - aimed at a chain's end: that chain's root is the only kick, the

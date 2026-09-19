@@ -170,15 +170,18 @@ async fn tick_project(
     // PER-UNIT: one infra node deploys N units (workloads), each with
     // independent health, so a flaky sidecar doesn't drag a healthy
     // primary into "node flaky" (and can be remediated on its own).
+    // The node label carries the value that stands for the node id
+    // (`node_label_value`), never the id itself, so the key is that
+    // value on both sides.
     let mut by_unit: HashMap<(String, String), (i64, i64)> = HashMap::new();
     for w in &workloads {
-        let (Some(node_id), Some(unit)) =
-            (w.labels.get("weft.dev/node"), w.labels.get("weft.dev/unit"))
+        let (Some(node_label), Some(unit)) =
+            (w.labels.get(weft_core::infra::NODE_LABEL), w.labels.get("weft.dev/unit"))
         else {
             continue;
         };
         let entry = by_unit
-            .entry((node_id.clone(), unit.clone()))
+            .entry((node_label.clone(), unit.clone()))
             .or_insert((0, 0));
         entry.0 += w.desired;
         entry.1 += w.ready;
@@ -200,7 +203,8 @@ async fn tick_project(
         }
         for unit in n.units.keys() {
             let key = (n.node_id.clone(), unit.clone());
-            let (desired, ready) = by_unit.get(&key).copied().unwrap_or((0, 0));
+            let on_label = (weft_core::infra::node_label_value(&n.node_id), unit.clone());
+            let (desired, ready) = by_unit.get(&on_label).copied().unwrap_or((0, 0));
             let ratio = if desired > 0 {
                 (ready as f32 / desired as f32).clamp(0.0, 1.0)
             } else {
@@ -261,7 +265,7 @@ async fn tick_project(
                     continue;
                 }
                 let (desired, ready) = by_unit
-                    .get(&(n.node_id.clone(), unit.clone()))
+                    .get(&(weft_core::infra::node_label_value(&n.node_id), unit.clone()))
                     .copied()
                     .unwrap_or((0, 0));
                 let observation = NodeObservation {

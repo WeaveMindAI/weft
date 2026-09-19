@@ -1,0 +1,33 @@
+# One file included three times: twice in a chain at the top, once inside
+# a loop. The file itself holds a loop and a node that sits beside it.
+#
+#   src -> one (clean) -> two (clean) -> out      two calls, chained
+#   items -> outer (Loop over the file) -> total  a call inside a loop
+
+src = Text { value: " hello " }
+
+one = @include("lib/clean.weft")
+one.text = src.value
+
+two = @include("lib/clean.weft")
+two.text = one.out
+
+out = Debug
+out.data = two.out
+
+items = ExecPython() -> (values: List[String]) {
+  code: "return {'values': ['a', 'b']}"
+}
+
+outer = Loop(values: List[String]) -> (results: List[String | Null]) {
+  parallel: false
+  over: ["values"]
+
+  call = @include("lib/clean.weft")
+  call.text = self.values
+  self.results = call.out
+}
+outer.values = items.values
+
+total = Debug
+total.data = outer.results

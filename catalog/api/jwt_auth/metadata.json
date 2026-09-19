@@ -1,0 +1,66 @@
+{
+  "type": "JwtAuth",
+  "label": "JWT Auth",
+  "description": "Gate a Route or Socket with signed identity tokens from an issuer that publishes its keys (a frontend's BetterAuth, Clerk, Auth0, Firebase, or any OIDC provider). Store the issuer and its JWKS address on the connection; a caller presents `Authorization: Bearer <jwt>`, the gateway verifies the signature, issuer and expiry (and the audience, when you set one) before a run starts, and the trigger's `caller` port carries the token's claims (`sub`, `email`, whatever the issuer put there). Wire the access output into the trigger's `auth` input.",
+  "tags": [
+    "api",
+    "auth",
+    "access",
+    "jwt",
+    "oidc"
+  ],
+  "icon": "ShieldCheck",
+  "color": "#06b6d4",
+  "service": {
+    "service": "jwt_auth",
+    "label": "JWT issuer",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "issuer",
+          "label": "Issuer",
+          "placeholder": "https://auth.example.com (the token's iss claim)",
+          "secret": false
+        },
+        {
+          "name": "jwks_url",
+          "label": "JWKS URL",
+          "placeholder": "https://auth.example.com/.well-known/jwks.json",
+          "secret": false
+        },
+        {
+          "name": "audience",
+          "label": "Audience",
+          "placeholder": "optional: the aud claim a token must carry",
+          "optional": true,
+          "secret": false
+        }
+      ]
+    },
+    "identity": "{issuer}",
+    "verify": {
+      "kind": "oidc",
+      "issuers": ["{issuer}"],
+      "jwks_url": "{jwks_url}"
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Issuer"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "The issuer: wire it into a Route or Socket's `auth` input."
+    }
+  ],
+  "requires_infra": false
+}

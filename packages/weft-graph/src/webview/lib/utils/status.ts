@@ -46,6 +46,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 	switch (reason.kind) {
 		case 'did_not_flow': return 'its `_should_flow` said no';
 		case 'flow_closed': return 'nothing ever answered its `_should_flow`';
+		case 'did_flow': return 'its `_should_not_flow` saw a value';
 		case 'required_input_closed': return `the required input '${reason.port}' closed`;
 		case 'every_input_closed': return 'every input closed';
 		case 'one_of_group_closed':

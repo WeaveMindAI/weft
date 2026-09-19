@@ -18,13 +18,11 @@
     },
     {
       "name": "body",
-      "type": "JsonDict",
-      "required": false
+      "type": "JsonDict"
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]",
-      "required": false
+      "type": "Dict[String, String]"
     },
     {
       "name": "method",

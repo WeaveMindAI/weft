@@ -1,0 +1,14 @@
+# A route gated by signed identity tokens from a real issuer: the rig stores
+# the issuer (from the environment), then calls the route with no token, a
+# forged token, and a genuine one, asserting the gateway's 401s and that the
+# token's claims reach the run on `caller`.
+
+issuer = JwtAuth
+me = Route { path: "__E2E_PATH__/me", method: "GET" }
+me.auth = issuer.access
+show = ExecPython(caller: JsonDict | Null) -> (body: JsonDict) {
+  code: "return {'body': {'iss': caller.get('iss'), 'sub': caller.get('sub')}}"
+}
+show.caller = me.caller
+answer = Reply
+answer.body = show.body

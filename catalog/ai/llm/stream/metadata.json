@@ -17,20 +17,17 @@
       "name": "prompt",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone)."
     },
     {
       "name": "history",
       "type": "ChatHistory",
-      "required": false,
       "accepts": ["wire"],
       "description": "The conversation so far (a Chat Message chain or a previous call's history output)."
     },
     {
       "name": "media",
       "type": "Media | List[Media]",
-      "required": false,
       "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them."
     },
     {
@@ -43,14 +40,12 @@
     {
       "name": "params",
       "type": "Dict[String, String | Number | Boolean | List[String]]",
-      "required": false,
       "accepts": ["wire"],
       "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply."
     },
     {
       "name": "tools",
       "type": "JsonDict | List[JsonDict]",
-      "required": false,
       "accepts": ["wire"],
       "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
     },

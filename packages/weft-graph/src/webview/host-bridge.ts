@@ -107,12 +107,18 @@ function resolveParentGroup(node: HostNode, groupIds: Set<string>): string | und
   return undefined;
 }
 
-// Strip the scope prefix so nested groups show their local label in
-// editors (v1 parser:4389 sets `label = group.originalName || id`).
-function localName(id: string, parentId: string | undefined): string {
-  if (!parentId) return id;
-  const prefix = parentId + '.';
-  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
+/** How a group id reads to a PERSON, which is never the id itself for an
+ *  included file's body. A body id is the file's path (`@src:lib:clean`),
+ *  unspellable on purpose, so it shows as the file's own name (`clean`);
+ *  a nested group's id carries its parents, so it shows as its own
+ *  segment; anything else is already a name somebody wrote. */
+// SYNC: displayName <-> crates/weft-compiler/src/source_name.rs display_name
+function displayName(id: string, parentId: string | undefined): string {
+  const prefix = parentId ? parentId + '.' : '';
+  const local = prefix && id.startsWith(prefix) ? id.slice(prefix.length) : id;
+  if (!local.startsWith('@')) return local;
+  const segments = local.slice(1).split(':');
+  return segments[segments.length - 1] || local;
 }
 
 function groupToNodeInstance(g: HostGroup): NodeInstance {
@@ -133,11 +139,10 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     // (LoopIn/LoopOut boundary nodes) is unaffected by this.
     nodeType: isLoop ? 'Loop' : 'Group',
     // A user-written label wins when the language grows one (today the
-    // wire always says null); the display name is the id's LOCAL
-    // segment, so a nested group renders "inner", never "outer.inner"
-    // (this covers the anonymous included-file group too, whose id is
-    // derived from its filename).
-    label: g.label ?? localName(g.id, parentId),
+    // wire always says null); the display name is what a person reads
+    // the id as, so a nested group renders "inner" and an included
+    // file's body renders its file name, never `@src:lib:clean`.
+    label: g.label ?? displayName(g.id, parentId),
     // The webview reads the parent group from `config.parentId` (buildNodes,
     // getLayoutKey, edge scoping, the ancestor-collapse walk all read it there),
     // so the structural parent MUST be mirrored into config on every parse. Before

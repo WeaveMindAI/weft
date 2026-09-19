@@ -29,7 +29,7 @@ struct Cli {
     /// bar; the readers (status, ps, executions, events, logs, files,
     /// listener inspect, token, stop, connect) print what the
     /// dispatcher answered; test-node prints its reports as one JSON
-    /// array. The rest (new, follow, daemon, catalog, clean, update)
+    /// array. The rest (new, follow, daemon, catalog, tangle, clean)
     /// ignore it; describe-nodes, parse and validate are JSON already.
     #[arg(long, global = true)]
     json: bool,
@@ -39,16 +39,17 @@ struct Cli {
 enum Cmd {
     /// Scaffold a new project (git init, main.weft, weft.toml). With
     /// `--assistant <name>` also install the Tangle assistant persona for
-    /// that AI coding assistant, symlinked from this weft checkout's
-    /// `tangle/<name>/`, so a later `git pull` + `./setup.sh` of the
-    /// checkout refreshes Tangle in every such project at once. The choice
-    /// is remembered: later runs of `weft new` install the same assistants
+    /// that AI coding assistant, COPIED from this weft checkout's
+    /// `tangle/<name>/`, so the project keeps the version that created it
+    /// and `weft tangle update` is what refreshes it. The choice is
+    /// remembered: later runs of `weft new` install the same assistants
     /// with no flag; `--assistant none` clears it.
     New {
         name: String,
         /// Install the Tangle persona for this AI coding assistant
-        /// (e.g. `claude-code`/`cc` or `kilo-code`/`kc`), symlinked from the weft
-        /// checkout so updating weft updates Tangle. Repeatable, and
+        /// (e.g. `claude-code`/`cc` or `kilo-code`/`kc`), copied from the weft
+        /// checkout so the project keeps what it was created with
+        /// (`weft tangle update` refreshes it). Repeatable, and
         /// remembered as the default for future projects; `none` opts out.
         #[arg(long = "assistant", value_name = "NAME")]
         assistants: Vec<String>,
@@ -364,7 +365,7 @@ enum Cmd {
     /// cwd project is unregistered: the dispatcher deactivates it,
     /// terminates its infra pods, and reclaims its stored data.
     /// Add flags to escalate: `--journal` drops execution history,
-    /// `--local` wipes `.weft/target/` on the host, `--all`
+    /// `--local` wipes this project's build artifacts, `--all`
     /// implies every flag. An explicit project id overrides the
     /// cwd discovery.
     Rm {
@@ -479,6 +480,12 @@ enum Cmd {
         #[command(subcommand)]
         action: CatalogAction,
     },
+    /// Manage the project's Tangle persona: the AI assistant prompts,
+    /// skills and commands copied in by `weft new --assistant`.
+    Tangle {
+        #[command(subcommand)]
+        action: TangleAction,
+    },
     /// Manage signal tokens: scoped credentials that let an external
     /// client listen for + reply to a project's waiting nodes.
     Token {
@@ -501,6 +508,26 @@ enum Cmd {
         /// fired since the change" is `--phase fire`.
         #[arg(long, value_parser = parse_phase)]
         phase: Option<weft_core::context::Phase>,
+        /// Only runs this node started. The filter that finds YOUR run
+        /// in a project answering thousands: everything else about a
+        /// run is shared by every run beside it. Spelled the way the
+        /// program spells the node (`cards.post`).
+        #[arg(long)]
+        node: Option<String>,
+        /// Only runs that started within the last <duration>: `10m`,
+        /// `2h`, `3d`. The other half of finding your own run, when you
+        /// know roughly when you made it.
+        #[arg(long, value_parser = parse_duration_ago)]
+        since: Option<u64>,
+        /// Skip this many runs before the page. With `--limit`, how you
+        /// walk past the first page.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Only runs that ended this way: `completed`, `failed`,
+        /// `cancelled`, or `running` for the ones still going. "Which
+        /// of mine broke" is `--status failed`.
+        #[arg(long, value_parser = parse_run_status)]
+        status: Option<String>,
     },
     /// Print a past execution's events in order, one line each:
     /// time, kind, node, and a short summary of the value or error.
@@ -509,7 +536,9 @@ enum Cmd {
     /// prints the replay rows the graph view reads.
     Events {
         color: String,
-        /// Only events of this node (its id in the source).
+        /// Only events of this node, spelled the way the source reads:
+        /// `auth.check` is the node `check` of the file the site `auth`
+        /// includes, and only that use of it.
         #[arg(long)]
         node: Option<String>,
         /// Only events of this kind (`node_failed`, `node_completed`,
@@ -547,7 +576,7 @@ enum Cmd {
     ///   <UUID>            one execution
     ///   --images          unreferenced worker images for the cwd project
     ///                     (use --all to span every project)
-    ///   --build-cache     docker buildkit cache prune
+    ///   --build-cache     drop the docker buildkit cache and the node-test cache
     ///   --all             with the journal subject: nuke every execution
     ///                     with --images: every project's images
     ///   --project <id>    that project's runs, all of them. They
@@ -579,7 +608,9 @@ enum Cmd {
         /// images (~1.4GB each; the next build re-makes the base).
         #[arg(long, default_value_t = false)]
         images: bool,
-        /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
+        /// Drop every build cache: the docker BuildKit cache and the
+        /// host's node-test cache (heavy: the next build and the next
+        /// `weft test-node` compile the engine and every dependency again).
         #[arg(long, default_value_t = false)]
         build_cache: bool,
         /// Answer the confirmation a journal deletion asks for.
@@ -600,6 +631,22 @@ enum CatalogAction {
     /// edited in place under `base_catalog/` IS overwritten; copy a
     /// node out of `base_catalog/` first if you want to keep changes.
     Update,
+}
+
+#[derive(Debug, Subcommand)]
+enum TangleAction {
+    /// Re-copy this project's Tangle files from the installed weft.
+    /// Every file the template owns is replaced, so edits you made to
+    /// the personas, skills or commands in place ARE overwritten;
+    /// anything the assistant wrote next to them is left alone. With
+    /// no flag it refreshes the assistants the project already has;
+    /// `--assistant <name>` also installs one that is not here yet.
+    Update {
+        /// Assistant to install or refresh (repeatable). Same names
+        /// and shorthands as `weft new --assistant`.
+        #[arg(long = "assistant", value_name = "NAME")]
+        assistants: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -696,6 +743,11 @@ enum InfraAction {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
     },
+    /// The doors this project's infrastructure has: which pieces of it
+    /// a client on this machine can reach, and at what address. A door
+    /// is declared by the node (its endpoint says so), so this only
+    /// ever reports; nothing here opens or closes one.
+    ListDoors,
     /// Scale infra workloads to 0 (PVCs preserved). When the project
     /// is Active, triggers deactivate via the standard picker.
     Stop {
@@ -795,11 +847,12 @@ enum FilesAction {
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
-    /// Bring the daemon to the desired state: ensure the kind cluster,
-    /// ingress, images and dispatcher exist, roll whatever changed,
-    /// and open the port-forwards so the CLI can talk to it on
-    /// localhost. Idempotent, so it is both the first boot and the
-    /// refresh; `restart` is an alias for the same reconcile.
+    /// Bring the daemon to the desired state: ensure the kind cluster
+    /// (with its loopback port mappings, so the CLI talks to the
+    /// dispatcher on localhost), ingress, images and dispatcher exist,
+    /// and roll whatever changed. Idempotent, so it is both the first
+    /// boot and the refresh; `restart` is an alias for the same
+    /// reconcile.
     #[command(visible_alias = "restart")]
     Start {
         /// Force-rebuild every shared image (the four system images
@@ -808,12 +861,12 @@ enum DaemonAction {
         /// or hand-modified.
         #[arg(long)]
         rebuild: bool,
-        /// Allow rebuilding the kind NODE when its shape changed (a
-        /// config or kind-version change). The system database survives
-        /// (its files live on the host); every project's own database
-        /// (a PostgresDatabase infra node's volume) lives inside the
-        /// node and is destroyed with it. Without this flag a shape
-        /// change refuses and explains.
+        /// Rebuild the kind NODE even when its shape did not change (a
+        /// shape change, a config or kind-version change, rebuilds on
+        /// its own). The system database survives (its files live on
+        /// the host); every project's own database (a PostgresDatabase
+        /// infra node's volume) lives inside the node and is destroyed
+        /// with it.
         #[arg(long)]
         rebuild_cluster: bool,
         /// Expose the PUBLIC TRIGGER SURFACE (/events/..., /signal/...)
@@ -825,10 +878,14 @@ enum DaemonAction {
         /// Close the public trigger surface (tear the tunnel down).
         #[arg(long)]
         no_public_url: bool,
+        /// Empty the shared-credentials secret when the checkout has
+        /// no `access-apps.json`. Without this flag an absent file
+        /// keeps whatever keys the cluster already holds.
+        #[arg(long)]
+        clear_access_apps: bool,
     },
-    /// Stop the running daemon. Scales the dispatcher Deployment to
-    /// 0 and tears down the local port-forward. The kind cluster
-    /// and persistent state stay intact.
+    /// Stop the running daemon. Scales the dispatcher to 0. The kind
+    /// cluster and persistent state stay intact.
     Stop,
     /// Report whether the daemon is reachable.
     Status,
@@ -869,6 +926,9 @@ impl InfraAction {
                 (commands::infra::InfraAction::Upgrade, opts_from(opts))
             }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
+            InfraAction::ListDoors => {
+                (commands::infra::InfraAction::ListDoors, Default::default())
+            }
             InfraAction::Cancel => (commands::infra::InfraAction::Cancel, Default::default()),
             InfraAction::NodeStop { node_id, force } => (
                 commands::infra::InfraAction::NodeStop { node_id, force },
@@ -908,11 +968,12 @@ fn public_url_choice(on: bool, off: bool) -> Option<bool> {
 impl From<DaemonAction> for commands::daemon::DaemonAction {
     fn from(value: DaemonAction) -> Self {
         match value {
-            DaemonAction::Start { rebuild, rebuild_cluster, public_url, no_public_url } => {
+            DaemonAction::Start { rebuild, rebuild_cluster, public_url, no_public_url, clear_access_apps } => {
                 commands::daemon::DaemonAction::Start {
                     rebuild,
                     rebuild_cluster,
                     public_url: public_url_choice(public_url, no_public_url),
+                    clear_access_apps,
                 }
             }
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
@@ -922,6 +983,46 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
             }
         }
     }
+}
+
+/// `--status` against the names a run can actually end with, so a
+/// typo is a refusal naming the set rather than an empty listing that
+/// reads as "nothing matched".
+fn parse_run_status(text: &str) -> Result<String, String> {
+    const ENDINGS: [&str; 4] = ["completed", "failed", "cancelled", "running"];
+    let text = text.trim().to_ascii_lowercase();
+    if ENDINGS.contains(&text.as_str()) {
+        return Ok(text);
+    }
+    Err(format!("'{text}' is not how a run ends; use one of: {}", ENDINGS.join(", ")))
+}
+
+/// `--since 10m` as the unix second that long ago. A duration rather
+/// than a timestamp, because the question is always "the run I made a
+/// moment ago" and nobody wants to work out what time that was.
+fn parse_duration_ago(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (count, unit_secs) = match text.chars().last() {
+        Some('s') => (&text[..text.len() - 1], 1u64),
+        Some('m') => (&text[..text.len() - 1], 60),
+        Some('h') => (&text[..text.len() - 1], 3600),
+        Some('d') => (&text[..text.len() - 1], 86_400),
+        _ => {
+            return Err(format!(
+                "'{text}' has no unit; say how long ago in seconds, minutes, hours or days \
+                 (`30s`, `10m`, `2h`, `3d`)"
+            ))
+        }
+    };
+    let count: u64 = count
+        .parse()
+        .map_err(|_| format!("'{text}' is not a whole number of units (`10m`, `2h`, `3d`)"))?;
+    let ago = count.saturating_mul(unit_secs);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("the machine clock is before 1970: {e}"))?
+        .as_secs();
+    Ok(now.saturating_sub(ago))
 }
 
 /// `--phase` as the phase itself, so the set of names has ONE
@@ -1100,15 +1201,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Catalog { action } => match action {
             CatalogAction::Update => commands::catalog::update(ctx).await,
         },
+        Cmd::Tangle { action } => match action {
+            TangleAction::Update { assistants } => commands::tangle::update(ctx, assistants).await,
+        },
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit, project, phase } => {
-            commands::executions::list(ctx, limit, project, phase).await
+        Cmd::Executions { limit, project, phase, node, since, offset, status } => {
+            commands::executions::list(
+                ctx,
+                commands::executions::ListFilter {
+                    limit, offset, project, phase, node, since, status,
+                },
+            )
+            .await
         }
         Cmd::Events { color, node, kind, full } => {
             commands::executions::events(
                 ctx,
                 color,
-                commands::executions::EventsFilter { node, kind, full },
+                commands::executions::EventsFilter { node, call_path: Vec::new(), kind, full },
             )
             .await
         }

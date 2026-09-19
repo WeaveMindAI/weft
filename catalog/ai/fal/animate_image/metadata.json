@@ -33,7 +33,6 @@
     {
       "name": "tailImage",
       "type": "Image",
-      "required": false,
       "description": "The last frame, for models that pin one (tail_image_url)."
     },
     {
@@ -66,7 +65,6 @@
     {
       "name": "params",
       "type": "JsonDict",
-      "required": false,
       "description": "Model-specific extras merged into the request (duration, cfg_scale, ...). Declared knobs win."
     }
   ],

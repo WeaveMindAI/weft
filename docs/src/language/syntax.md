@@ -88,7 +88,7 @@ because it says nothing about the type.
 
 ```weft
 step = ExecPython -> (out: String) {
-  code: @file("scripts/step.py")
+  code: @file("assets/scripts/step.py")
   text: draft.answer      # a String port, from the wire
   limit: 3                # a Number port, from the literal
   notes?: review.notes    # optional: a closure here does not skip the node
@@ -152,16 +152,18 @@ step = ExecPython() -> (out: Number) {
 
 ### Reserved keys
 
-Keys starting with `_` are reserved, and there are exactly three.
+Keys starting with `_` are reserved, and there are exactly four.
 
 | Key | What it does |
 |---|---|
 | `_label: "..."` | sets the node's display label. A quoted string, settable once, never by wire. |
 | `_tags: ["a", "b"]` | attaches tags, used by signal scoping. |
 | `_should_flow: <wire or false>` | decides whether this node runs at all. |
+| `_should_not_flow: <wire or true>` | the same decision read the other way round: it runs when the thing wired here did NOT happen. |
 
-<!-- SYNC: reserved keys <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
-     packages/weft-graph/src/protocol.ts SHOULD_FLOW_PORT,
+<!-- SYNC: reserved keys <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT
+     and SHOULD_NOT_FLOW_PORT, packages/weft-graph/src/protocol.ts
+     SHOULD_FLOW_PORT and SHOULD_NOT_FLOW_PORT,
      packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README) -->
 
 Any other leading-underscore key is a compile error, so the namespace stays
@@ -196,6 +198,34 @@ escalation = Group(question: String) -> (answer: String) {
 
 The node itself never sees this port: it is the language deciding whether to
 call the node, not data the node reads.
+
+### Running on the thing that did not happen
+
+If you want a node to run when something did NOT arrive, wire that something
+into `_should_not_flow` instead. Every answer flips: a value arriving means
+the node stays off, and a closure, the structural "nothing is coming", is
+what runs it.
+
+```weft
+route = Route -> (photo: File) { path: "cards", method: "POST" }
+
+# A card sent without a picture: `photo` closes, so this runs.
+default_art = FetchToStorage { url: "https://example.com/blank.png" }
+default_art._should_not_flow = route.photo
+```
+
+This is the one port in the language that starts a node on a closure.
+Everything else skips when its inputs close, which is why "act on the thing
+that is not there" needs its own spelling: there would otherwise be nothing
+left alive to notice.
+
+Reach for it when the absence is DATA, like a key the caller did not send or
+an optional input nobody filled. When the absence is a DECISION your own node
+made, it is usually clearer to have that node say so on a second output port
+and gate on that, because the wire then reads forwards.
+
+A node has one gate. Wiring both spellings is a compile error (`two-gates`)
+rather than some rule about which wins.
 
 ## Inline port signatures
 

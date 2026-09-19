@@ -16,7 +16,7 @@ fn map(entries: &[(&str, &str)]) -> MapFileReader {
 fn map_reads_content_and_identity() {
     let reader = map(&[("proj/prompts/system.txt", "be helpful")]);
     let resolved = reader
-        .resolve_and_read(Path::new("proj/prompts"), Path::new("system.txt"))
+        .resolve_and_read(Path::new("proj"), Path::new("proj/prompts"), Path::new("system.txt"))
         .unwrap();
     assert_eq!(resolved.content, "be helpful");
     // Identity is the normalized join, the key downstream uses for cycle
@@ -30,7 +30,7 @@ fn map_resolves_dot_and_parent_within_root() {
     // `sub/../a.txt` from base `proj` normalizes to `proj/a.txt`: a `..` that
     // stays within the path is fine (it cancels a real component).
     let resolved = reader
-        .resolve_and_read(Path::new("proj"), Path::new("sub/../a.txt"))
+        .resolve_and_read(Path::new("proj"), Path::new("proj"), Path::new("sub/../a.txt"))
         .unwrap();
     assert_eq!(resolved.identity, PathBuf::from("proj/a.txt"));
     assert_eq!(resolved.content, "A");
@@ -40,7 +40,7 @@ fn map_resolves_dot_and_parent_within_root() {
 fn map_missing_file_errors() {
     let reader = map(&[("proj/a.txt", "A")]);
     let err = reader
-        .resolve_and_read(Path::new("proj"), Path::new("b.txt"))
+        .resolve_and_read(Path::new("proj"), Path::new("proj"), Path::new("b.txt"))
         .unwrap_err();
     assert!(err.contains("not found"), "got: {err}");
 }
@@ -51,7 +51,7 @@ fn map_rejects_escape_above_root() {
     // equivalent of the disk backing's canonicalize-then-prefix-check escape.
     let reader = map(&[("secret.txt", "leak")]);
     let err = reader
-        .resolve_and_read(Path::new("proj"), Path::new("../secret.txt"))
+        .resolve_and_read(Path::new("proj"), Path::new("proj"), Path::new("../secret.txt"))
         .unwrap_err();
     assert!(err.contains("escapes"), "got: {err}");
 }
@@ -84,12 +84,35 @@ fn disk_and_map_reject_the_same_escape() {
     std::fs::write(dir.path().join("secret.txt"), "leak").unwrap();
 
     let disk_err = DiskFileReader
-        .resolve_and_read(&root, Path::new("../secret.txt"))
+        .resolve_and_read(&root, &root, Path::new("../secret.txt"))
         .unwrap_err();
     assert!(disk_err.contains("escapes"), "disk: {disk_err}");
 
     let map_err = map(&[("secret.txt", "leak")])
-        .resolve_and_read(Path::new("project"), Path::new("../secret.txt"))
+        .resolve_and_read(Path::new("project"), Path::new("project"), Path::new("../secret.txt"))
         .unwrap_err();
     assert!(map_err.contains("escapes"), "map: {map_err}");
+}
+
+#[test]
+fn a_climb_that_stays_inside_the_root_is_allowed_on_both_backings() {
+    // An `@include` path is relative to the file that writes it, and the
+    // program lives in `src/`, so `@include("../lib/x.weft")` climbs one
+    // level and lands inside the project: the wall is the root, not the
+    // writing file's own directory.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::write(root.join("assets/x.txt"), "inside").unwrap();
+    let disk = DiskFileReader
+        .resolve_and_read(&root, &root.join("src"), Path::new("../assets/x.txt"))
+        .unwrap();
+    assert_eq!(disk.content, "inside");
+
+    let map = map(&[("project/assets/x.txt", "inside")])
+        .resolve_and_read(Path::new("project"), Path::new("project/src"), Path::new("../assets/x.txt"))
+        .unwrap();
+    assert_eq!(map.content, "inside");
+    assert_eq!(map.identity, PathBuf::from("project/assets/x.txt"));
 }

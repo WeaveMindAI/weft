@@ -28,7 +28,8 @@ use weft_core::access::spec::{lookup_path, Door};
 use weft_access_store::GrantedQuery;
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, MintAppRequest,
-    MintAppResponse, SharedAppChoice, SharedDoorPick, StartedOAuth,
+    MintAppResponse, SharedAppChoice, SharedCredentialsAnswer, SharedCredentialsQuery,
+    SharedDoorPick, StartedOAuth,
 };
 use weft_core::storage::Tenanted;
 use weft_core::AccessSpec;
@@ -49,6 +50,28 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/access/admin/lookup", post(lookup))
         .route("/v1/access/admin/granted", post(granted))
         .route("/v1/access/admin/picker-token", post(picker_token))
+        .route("/v1/access/admin/shared-credentials", post(shared_credentials))
+}
+
+/// POST /v1/access/admin/shared-credentials: which of the asked
+/// services the runtime holds its own credential for right now. The
+/// dispatcher asks when it lists connections, so a runtime-owned row
+/// whose key is gone from the shared-credentials file reads as not
+/// connected instead of as a connection that fails at run time.
+// SYNC: shared_credentials <-> crates/weft-core/src/access/wire.rs SharedCredentialsQuery
+async fn shared_credentials(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<SharedCredentialsQuery>,
+) -> Result<Json<SharedCredentialsAnswer>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let mut available = Vec::new();
+    for service in req.services {
+        if state.credentials.available(&service).await {
+            available.push(service);
+        }
+    }
+    Ok(Json(SharedCredentialsAnswer { available }))
 }
 
 /// A shared-door failure is caller-fixable configuration (the fix is

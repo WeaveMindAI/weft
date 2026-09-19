@@ -11,13 +11,11 @@ use crate::cst::parse;
 /// call sites stay signature-free.
 fn apply_edits(
     source: &str,
-    base_dir: Option<&std::path::Path>,
     source_id: &str,
     ops: &[EditOp],
 ) -> Result<(String, TextEdit), EditError> {
     super::apply_edits(
         source,
-        base_dir,
         source_id,
         ops,
         std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
@@ -25,11 +23,11 @@ fn apply_edits(
 }
 
 fn apply(source: &str, ops: Vec<EditOp>) -> String {
-    apply_edits(source, None, "Untitled", &ops).expect("edits apply").0
+    apply_edits(source, "Untitled", &ops).expect("edits apply").0
 }
 
 fn apply_err(source: &str, ops: Vec<EditOp>) -> String {
-    apply_edits(source, None, "Untitled", &ops).expect_err("edits must be refused").to_string()
+    apply_edits(source, "Untitled", &ops).expect_err("edits must be refused").to_string()
 }
 
 /// Assert the source re-parses into a well-formed tree: it round-trips (lossless
@@ -156,7 +154,7 @@ fn walk(parent: &crate::cst::SyntaxNode, prefix: &mut Vec<String>, nodes: &mut V
 /// Apply ops, then apply the returned inverse edit: the original source must
 /// come back byte-for-byte (the reversible-action / undo contract).
 fn assert_reversible(source: &str, ops: Vec<EditOp>) {
-    let (new_source, inverse) = apply_edits(source, None, "Untitled", &ops).expect("edits apply");
+    let (new_source, inverse) = apply_edits(source, "Untitled", &ops).expect("edits apply");
     assert_ne!(new_source, source, "op should change source");
     let restored = apply_text_edit(&new_source, &inverse).expect("inverse applies");
     assert_eq!(restored, source, "inverse edit must restore the original exactly");
@@ -247,7 +245,7 @@ fn inverse_edit_preserves_file_marker() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sys.txt"), "you are helpful").unwrap();
     let src = "t = Text {\n  value: @file(\"sys.txt\")\n}\n";
-    let (new_source, inverse) = apply_edits(src, Some(dir.path()), "Untitled", &[
+    let (new_source, inverse) = apply_edits(src, "Untitled", &[
         EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"replaced\"".into(), form: None },
     ]).expect("edits apply");
     assert!(new_source.contains("value: \"replaced\""), "{new_source}");
@@ -403,7 +401,6 @@ fn set_config_rejects_a_newline_outside_braces() {
     // refuses it: this is the genuine break-out the gate exists for.
     let err = apply_edits(
         "t = Text { value: \"x\" }\n",
-        None,
         "Untitled",
         &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "1\n2".into(), form: None }],
     )
@@ -688,7 +685,6 @@ fn move_into_current_scope_is_a_noop_not_a_self_collision() {
     // target) must still fail loud, not be swallowed as a no-op.
     let err = apply_edits(
         "g = Group() -> () {\n  d = Debug {}\n}\nd = Debug {}\n",
-        None,
         "Untitled",
         &[EditOp::MoveNodeScope { node: "d".into(), target_group: Some("g".into()) }],
     )
@@ -1243,7 +1239,7 @@ fn add_edge_rejects_a_dotted_endpoint_ref() {
     // 3-segment endpoint the grammar silently truncates (mis-wiring). The
     // edit refuses it loudly instead.
     let src = "g = Group() -> () {\n  inner = Text() -> (value: String)\n}\nsink = Debug { }\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+    let err = apply_edits(src, "Untitled", &[EditOp::AddEdge {
         scope_group: None, path: vec![],
         source: "g.inner".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
@@ -1258,7 +1254,7 @@ fn add_edge_rejects_an_intermediate_ancestor_ref() {
     // inside `outer.inner` must NOT resolve to `outer.y` (the compiler would
     // leave the authored `sink.data = y.value` dangling), so the edit refuses.
     let src = "outer = Group() -> () {\n  y = Text() -> (value: String)\n  inner = Group() -> () {\n    sink = Debug { }\n  }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+    let err = apply_edits(src, "Untitled", &[EditOp::AddEdge {
         scope_group: Some("outer.inner".into()), path: vec![],
         source: "y".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
@@ -1309,7 +1305,7 @@ fn rename_group_to_taken_id_fails_loud() {
     // Regression: renaming onto an existing id would make two same-id decls and
     // self-referential edges. Must fail loud instead.
     let src = "d = Debug\ngrp = Group() -> (o: String) {\n  t = Text { value: \"x\" }\n  self.o = t.value\n}\nd.data = grp.o\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "d".into() }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "d".into() }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
@@ -1331,7 +1327,7 @@ fn unparseable_edit_fails_loud_not_silent() {
     // Targeting a node that doesn't exist is a hard error, never a silent no-op
     // that loses the user's intent.
     let src = "t = Text { value: \"x\" }\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::RemoveNode { node: "nope".into() }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::RemoveNode { node: "nope".into() }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
 }
 
@@ -1345,19 +1341,19 @@ fn set_config_must_not_clobber_a_wiring_edge() {
     // guard in `find_connection_origin_field` (it matched the edge by target).
     let src = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\n";
     // SetConfig on the wired port must ADD a config field, never touch the edge.
-    let (out, _) = apply_edits(src, None, "Untitled",
+    let (out, _) = apply_edits(src, "Untitled",
         &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
     assert!(out.contains("b.data = a.value"), "wiring edge survives SetConfig: {out}");
     parse_ok(&out);
     // RemoveConfig on the wired port must NOT delete the edge.
-    let (out2, _) = apply_edits(src, None, "Untitled",
+    let (out2, _) = apply_edits(src, "Untitled",
         &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
     assert!(out2.contains("b.data = a.value"), "wiring edge survives RemoveConfig: {out2}");
     parse_ok(&out2);
 
     // The genuine config-origin form (one endpoint) is still edited in place.
     let cfg = "b = Debug\nb.data = \"old\"\n";
-    let (out3, _) = apply_edits(cfg, None, "Untitled",
+    let (out3, _) = apply_edits(cfg, "Untitled",
         &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"new\"".into(), form: None }]).expect("set config-origin");
     assert!(out3.contains("b.data = \"new\"") && !out3.contains("\"old\""), "config-origin edited in place: {out3}");
     parse_ok(&out3);
@@ -1371,12 +1367,12 @@ fn set_config_never_destroys_an_inline_expression() {
     // silently deleted with its subgraph) and the literal takes the
     // slot. RemoveConfig likewise drops the driver but keeps the node.
     let src = "b = Debug\nb.data = Upper { text: \"hi\" }.out\n";
-    let (out, _) = apply_edits(src, None, "Untitled",
+    let (out, _) = apply_edits(src, "Untitled",
         &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
     parse_ok(&out);
     assert!(out.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out}");
     assert!(compiled_edges(&out).is_empty(), "the literal replaced the wire: {out}");
-    let (out2, _) = apply_edits(src, None, "Untitled",
+    let (out2, _) = apply_edits(src, "Untitled",
         &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
     parse_ok(&out2);
     assert!(out2.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out2}");
@@ -1399,7 +1395,6 @@ fn edit_inside_anonymous_root_resolves_by_source_id() {
     // Edit the ROOT child by its source-id-scoped id, the form the editor sends.
     let (out, _) = apply_edits(
         src,
-        None,
         "MyCleaner",
         &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into(), form: None }],
     )
@@ -1413,7 +1408,6 @@ fn edit_inside_anonymous_root_resolves_by_source_id() {
     // hard not-found rather than a silent guess.
     let err = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into(), form: None }],
     )
@@ -1529,21 +1523,21 @@ fn ambiguous_bare_id_fails_loud() {
     // Two `t` in different groups: a bare `t` op must error, never guess + splice
     // the wrong node.
     let src = "g1 = Group() -> () {\n  t = Text { value: \"a\" }\n}\ng2 = Group() -> () {\n  t = Text { value: \"b\" }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into(), form: None }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into(), form: None }]).unwrap_err();
     assert!(matches!(err, EditError::AmbiguousId(_)), "{err:?}");
 }
 
 #[test]
 fn add_duplicate_id_fails_loud() {
     let src = "t = Text { value: \"x\" }\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::AddNode { id: "t".into(), node_type: "Debug".into(), parent_group: None }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::AddNode { id: "t".into(), node_type: "Debug".into(), parent_group: None }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
 #[test]
 fn add_edge_to_missing_endpoint_fails_loud() {
     let src = "b = Debug\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+    let err = apply_edits(src, "Untitled", &[EditOp::AddEdge {
         source: "ghost".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
@@ -1552,7 +1546,7 @@ fn add_edge_to_missing_endpoint_fails_loud() {
 #[test]
 fn rename_group_to_empty_fails_loud() {
     let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "".into() }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "".into() }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
 
@@ -1562,7 +1556,7 @@ fn set_label_on_group_fails_loud() {
     // the group body, which the lowering rejects as a compile error.
     // The edit must fail at edit time with a kind mismatch instead.
     let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel { node: "grp".into(), label: Some("Hi".into()) }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::SetLabel { node: "grp".into(), label: Some("Hi".into()) }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
 
@@ -1604,7 +1598,7 @@ fn ops_refuse_an_identifier_that_would_inject_source() {
         EditOp::AddLoop { label: inject.into(), parent_group: None },
     ];
     for op in cases {
-        let err = apply_edits(src, None, "Untitled", std::slice::from_ref(&op)).unwrap_err();
+        let err = apply_edits(src, "Untitled", std::slice::from_ref(&op)).unwrap_err();
         assert!(
             matches!(err, EditError::InvalidArgument(_)),
             "op {op:?} must be refused, got {err:?}"
@@ -1615,7 +1609,6 @@ fn ops_refuse_an_identifier_that_would_inject_source() {
     let with_group = "g = Group() {\n  t = Text {}\n}\n";
     let err = apply_edits(
         with_group,
-        None,
         "Untitled",
         &[EditOp::RenameGroup { group: "g".into(), new_label: inject.into() }],
     )
@@ -1658,14 +1651,13 @@ fn every_name_written_into_source_is_guarded() {
             scope_group: None, path: vec![],
         },
     ] {
-        let err = apply_edits(two, None, "Untitled", &[op]).unwrap_err();
+        let err = apply_edits(two, "Untitled", &[op]).unwrap_err();
         assert!(matches!(err, EditError::InvalidArgument(_)), "port name: {err:?}");
     }
 
     // A config key.
     let err = apply_edits(
         two,
-        None,
         "Untitled",
         &[EditOp::SetConfig { node: "a".into(), key: inject.into(), value: "1".into(), form: None }],
     )
@@ -1675,7 +1667,6 @@ fn every_name_written_into_source_is_guarded() {
     // A port signature's name, and its type expression.
     let err = apply_edits(
         two,
-        None,
         "Untitled",
         &[EditOp::UpdateNodePorts {
             node: "a".into(),
@@ -1690,7 +1681,6 @@ fn every_name_written_into_source_is_guarded() {
 
     let err = apply_edits(
         two,
-        None,
         "Untitled",
         &[EditOp::UpdateNodePorts {
             node: "a".into(),
@@ -1734,7 +1724,6 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
     ] {
         let err = apply_edits(
             two,
-            None,
             "Untitled",
             &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: harmful.into(), form: None }],
         )
@@ -1765,7 +1754,6 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
         assert!(
             apply_edits(
                 two,
-                None,
                 "Untitled",
                 &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: ok.into(), form: None }],
             )
@@ -1778,7 +1766,6 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
     for harmful in ["[", "```", "String) -> ()\nevil = Text {}\nq: (r", "Number, evil: String"] {
         let err = apply_edits(
             two,
-            None,
             "Untitled",
             &[EditOp::UpdateNodePorts {
                 node: "n".into(),
@@ -1795,7 +1782,6 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
         assert!(
             apply_edits(
                 two,
-                None,
                 "Untitled",
                 &[EditOp::UpdateNodePorts {
                     node: "n".into(),
@@ -1822,7 +1808,6 @@ fn keyword_shaped_names_are_refused() {
     for kw in ["Group", "Loop", "true", "false"] {
         let err = apply_edits(
             src,
-            None,
             "Untitled",
             &[EditOp::SetConfig { node: "a".into(), key: kw.into(), value: "1".into(), form: None }],
         )
@@ -1834,7 +1819,6 @@ fn keyword_shaped_names_are_refused() {
     for kw in ["Group", "Loop", "LoopIn", "LoopOut", "Passthrough"] {
         let err = apply_edits(
             src,
-            None,
             "Untitled",
             &[EditOp::AddNode { id: "c".into(), node_type: kw.into(), parent_group: None }],
         )
@@ -1852,7 +1836,6 @@ fn ops_refuse_a_reserved_local_id() {
     for bad in ["self", "Group", "Loop", "LoopIn", "Passthrough", "a__b"] {
         let err = apply_edits(
             src,
-            None,
             "Untitled",
             &[EditOp::AddNode {
                 id: bad.into(),
@@ -1873,7 +1856,6 @@ fn set_group_description_refuses_a_newline() {
     let src = "g = Group() {\n  t = Text {}\n}\n";
     let err = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::SetGroupDescription {
             group: "g".into(),
@@ -2061,7 +2043,7 @@ fn edit_soak_never_corrupts() {
             };
             // Ops that legitimately error (bad target, collision, ...) are skipped;
             // every SUCCESSFUL edit must satisfy the full structural invariants.
-            if let Ok((new_src, _)) = apply_edits(&src, None, "Untitled", &[op]) {
+            if let Ok((new_src, _)) = apply_edits(&src, "Untitled", &[op]) {
                 parse_ok(&new_src);
                 src = new_src;
             }
@@ -2191,7 +2173,7 @@ fn set_label_escapes_triple_backtick_value() {
     // compiler's heredoc decode. Only the escape's own literal spelling
     // (`\```` inside the value) is unencodable and errs loudly.
     let src = "n = Text { value: \"x\" }\n";
-    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::SetLabel {
+    let (out, _) = apply_edits(src, "Untitled", &[EditOp::SetLabel {
         node: "n".into(),
         label: Some("a\n```\nb".into()),
     }])
@@ -2202,7 +2184,7 @@ fn set_label_escapes_triple_backtick_value() {
     let n = project.nodes.iter().find(|n| n.id == "n").expect("node");
     assert_eq!(n.label.as_deref(), Some("a\n```\nb"), "label round-trips verbatim");
 
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel {
+    let err = apply_edits(src, "Untitled", &[EditOp::SetLabel {
         node: "n".into(),
         label: Some("a\n\\```\nb".into()),
     }])
@@ -2218,7 +2200,7 @@ fn heredoc_content_is_verbatim() {
     // spaces on the last line vanished.)
     let src = "n = Text { value: \"x\" }\n";
     let content = "    line1\n    line2   ";
-    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+    let (out, _) = apply_edits(src, "Untitled", &[EditOp::SetConfig {
         node: "n".into(),
         key: "value".into(),
         value: format!("```\n{content}\n```"),
@@ -2243,21 +2225,21 @@ fn insert_and_replace_config_value_agree_on_containment() {
     // and a stray `}` closed the node body early, silently corrupting the tree.
     let bad = "}}}";
     // INSERT path: the key doesn't exist yet -> insert_field.
-    let insert_err = apply_edits("n = Text {}\n", None, "Untitled",
+    let insert_err = apply_edits("n = Text {}\n", "Untitled",
         &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into(), form: None }]).unwrap_err();
     assert!(matches!(insert_err, EditError::InvalidArgument(_)), "insert must reject uncontained value: {insert_err:?}");
     // REPLACE path: the key already exists -> replace_value_after.
-    let replace_err = apply_edits("n = Text { k: \"old\" }\n", None, "Untitled",
+    let replace_err = apply_edits("n = Text { k: \"old\" }\n", "Untitled",
         &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into(), form: None }]).unwrap_err();
     assert!(matches!(replace_err, EditError::InvalidArgument(_)), "replace must reject uncontained value: {replace_err:?}");
 
     // And BOTH accept a well-formed multi-line heredoc value (its newlines live
     // inside one opaque token, so they don't break containment).
-    let (inserted, _) = apply_edits("n = Text {}\n", None, "Untitled",
+    let (inserted, _) = apply_edits("n = Text {}\n", "Untitled",
         &[EditOp::SetLabel { node: "n".into(), label: Some("line1\nline2".into()) }]).expect("insert heredoc label");
     parse_ok(&inserted);
     assert!(inserted.contains("line1\nline2"), "heredoc body present: {inserted}");
-    let (replaced, _) = apply_edits("n = Text { _label: \"old\"\n  value: \"x\" }\n", None, "Untitled",
+    let (replaced, _) = apply_edits("n = Text { _label: \"old\"\n  value: \"x\" }\n", "Untitled",
         &[EditOp::SetLabel { node: "n".into(), label: Some("line1\nline2".into()) }]).expect("replace heredoc label");
     parse_ok(&replaced);
     assert!(replaced.contains("line1\nline2"), "heredoc body present: {replaced}");
@@ -2290,7 +2272,7 @@ fn set_config_rejects_value_that_breaks_containment() {
     // position (an operator like `|` in a type expr, even an NBSP) is allowed:
     // it round-trips and the compiler flags an invalid value downstream.
     let src = "n = Text { value: \"x\" }\n";
-    let reject = |v: &str| apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: v.into(), form: None }]);
+    let reject = |v: &str| apply_edits(src, "Untitled", &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: v.into(), form: None }]);
     assert!(matches!(reject("}"), Err(EditError::InvalidArgument(_))), "bare close brace");
     assert!(matches!(reject("a\nb"), Err(EditError::InvalidArgument(_))), "raw newline");
     // A union type expression is legitimate value content, NOT rejected.
@@ -2310,7 +2292,7 @@ fn add_node_with_free_local_in_target_scope_succeeds() {
 #[test]
 fn move_node_into_occupied_scope_fails_loud() {
     let src = "g = Group() -> () {\n  x = Debug\n}\nx = Text { value: \"a\" }\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
@@ -2335,7 +2317,7 @@ fn move_node_wired_across_scope_refused() {
     // (same-scope-only), so the move is refused loudly (matches the graph view's
     // pre-move guard).
     let src = "g = Group() -> () {}\nx = Text { value: \"a\" }\ny = Debug\ny.data = x.value\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
+    let err = apply_edits(src, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
 
@@ -2473,7 +2455,6 @@ fn rename_group_rejects_loop_target() {
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::RenameGroup {
             group: "my".into(),
@@ -2489,7 +2470,6 @@ fn remove_group_rejects_loop_target() {
     let src = "my = Loop() -> () {\n  parallel: true\n  body = Text {}\n}\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::RemoveGroup { group: "my".into() }],
     );
@@ -2511,7 +2491,6 @@ fn rename_loop_rejects_group_target() {
     let src = "g = Group() -> () {\n}\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::RenameLoop {
             loop_id: "g".into(),
@@ -2526,7 +2505,6 @@ fn rename_loop_rejects_node_target() {
     let src = "n = Text { value: \"x\" }\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::RenameLoop {
             loop_id: "n".into(),
@@ -2626,7 +2604,6 @@ fn move_loop_scope_blocks_when_wired_across_scope() {
     let src = "outer = Group() -> () {\n}\nmy = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\nd = Debug\nd.data = my.results\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::MoveLoopScope {
             loop_id: "my".into(),
@@ -2648,7 +2625,6 @@ fn move_group_scope_rejects_loop_target() {
     let src = "outer = Group() -> () {\n}\nmy = Loop() -> () {\n  parallel: true\n}\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::MoveGroupScope {
             group: "my".into(),
@@ -2663,7 +2639,6 @@ fn move_loop_scope_rejects_group_target() {
     let src = "outer = Group() -> () {\n}\ng = Group() -> () {\n}\n";
     let result = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::MoveLoopScope {
             loop_id: "g".into(),
@@ -2938,7 +2913,6 @@ fn move_container_into_own_descendant_is_rejected_before_mutating() {
     let src = "outer = Group {\n  inner = Group {\n    t = Text {}\n  }\n}\n";
     let err = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::MoveGroupScope { group: "outer".into(), target_group: Some("outer.inner".into()) }],
     )
@@ -2951,7 +2925,6 @@ fn move_container_into_own_descendant_is_rejected_before_mutating() {
 
     let err2 = apply_edits(
         src,
-        None,
         "Untitled",
         &[EditOp::MoveGroupScope { group: "outer".into(), target_group: Some("outer".into()) }],
     )
@@ -3058,7 +3031,7 @@ fn remove_config_on_an_inline_node_removes_the_field() {
 #[test]
 fn set_config_on_an_inline_node_refuses_the_statement_form() {
     let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+    let err = apply_edits(src, "Untitled", &[EditOp::SetConfig {
         node: "a__data".into(), key: "value".into(), value: "\"x\"".into(),
         form: Some(ValueForm::Connection),
     }])
@@ -3117,7 +3090,7 @@ fn labeling_an_inline_node_works_in_place() {
 #[test]
 fn moving_an_inline_within_its_own_scope_is_a_no_op() {
     let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
-    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope {
+    let (out, _) = apply_edits(src, "Untitled", &[EditOp::MoveNodeScope {
         node: "a__data".into(), target_group: None,
     }]).expect("in-place move is a no-op");
     assert_eq!(out, src, "a drag ended in place must not restructure the source");
@@ -3524,7 +3497,7 @@ fn set_config_writes_a_container_port_value() {
 #[test]
 fn set_config_refuses_a_key_that_is_not_a_container_port() {
     let group = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\n";
-    let err = apply_edits(group, None, "Untitled", &[EditOp::SetConfig {
+    let err = apply_edits(group, "Untitled", &[EditOp::SetConfig {
         node: "g".into(), key: "typo".into(), value: "\"v\"".into(), form: None,
     }])
     .unwrap_err();
@@ -3534,7 +3507,7 @@ fn set_config_refuses_a_key_that_is_not_a_container_port() {
     );
 
     let lp = "l = Loop(x: String) -> (y: String) {\n  over: items\n  self.y = self.x\n}\n";
-    let err = apply_edits(lp, None, "Untitled", &[EditOp::SetConfig {
+    let err = apply_edits(lp, "Untitled", &[EditOp::SetConfig {
         node: "l".into(), key: "over".into(), value: "\"v\"".into(), form: None,
     }])
     .unwrap_err();
@@ -3568,7 +3541,7 @@ fn set_config_reads_ports_from_the_tree_not_the_header_text() {
         node: "g".into(), key: "items".into(), value: "\"v\"".into(), form: None,
     }]);
     assert!(out.contains("g.items = \"v\""), "{out}");
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+    let err = apply_edits(src, "Untitled", &[EditOp::SetConfig {
         node: "g".into(), key: "Number]".into(), value: "\"v\"".into(), form: None,
     }])
     .unwrap_err();
@@ -3759,7 +3732,7 @@ fn add_edge_with_a_path_writes_the_dotted_source() {
         source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
     }]);
     assert!(!removed.contains("b.data"), "{removed}");
-    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+    let err = apply_edits(src, "Untitled", &[EditOp::AddEdge {
         source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(),
         scope_group: None, path: vec!["bad key".into()],
     }]).expect_err("a path key is an identifier");
@@ -3842,4 +3815,64 @@ fn port_updates_reject_a_duplicate_port_name_per_side() {
     assert!(err.contains("duplicate input port 'a'"), "{err}");
     let err = apply_err(src, vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![], outputs: dup, removed_inputs: vec![], removed_outputs: vec![] }]);
     assert!(err.contains("duplicate output port 'a'"), "{err}");
+}
+
+/// The editor's gate toggle, as the ops it actually sends.
+///
+/// Flipping a gate is not a new operation: a wire moves with
+/// RemoveEdge + AddEdge and a written value with RemoveConfig +
+/// SetConfig, so it undoes and round-trips like any other edit. This
+/// pins that those ops accept the reserved gate ports, because nothing
+/// else in the editor writes to one and a refusal here would surface as
+/// a right-click that silently does nothing.
+#[test]
+fn the_gate_toggles_between_its_two_spellings() {
+    // A WIRED gate: the wire moves to the other port.
+    let wired = "src = Text { value: \"x\" }\nn = Debug\nn.data = src.value\nn._should_flow = src.value\n";
+    let out = apply(wired, vec![
+        EditOp::RemoveEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_flow".into(),
+            scope_group: None,
+        },
+        EditOp::AddEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_not_flow".into(),
+            scope_group: None, path: Vec::new(),
+        },
+    ]);
+    assert!(out.contains("n._should_not_flow = src.value"), "{out}");
+    assert!(!out.contains("n._should_flow ="), "the old spelling is gone: {out}");
+    parse_ok(&out);
+
+    // And back again, so the gesture is reversible by the same route.
+    let back = apply(&out, vec![
+        EditOp::RemoveEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_not_flow".into(),
+            scope_group: None,
+        },
+        EditOp::AddEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_flow".into(),
+            scope_group: None, path: Vec::new(),
+        },
+    ]);
+    assert!(back.contains("n._should_flow = src.value"), "{back}");
+    assert!(!back.contains("_should_not_flow"), "{back}");
+    parse_ok(&back);
+
+    // A WRITTEN gate: the two forms mirror each other, so the value
+    // flips with the key (`_should_flow: false` means the same as
+    // `_should_not_flow: true`).
+    let written = "n = Debug {\n  _should_flow: false\n}\n";
+    let flipped = apply(written, vec![
+        EditOp::RemoveConfig { node: "n".into(), key: "_should_flow".into(), form: None },
+        EditOp::SetConfig {
+            node: "n".into(), key: "_should_not_flow".into(), value: "true".into(), form: None,
+        },
+    ]);
+    assert!(flipped.contains("_should_not_flow: true"), "{flipped}");
+    assert!(!flipped.contains("_should_flow: false"), "{flipped}");
+    parse_ok(&flipped);
 }

@@ -214,6 +214,10 @@ impl LiveTestRunner {
                 waits.clone(),
                 bus_coordinator.clone(),
                 declared,
+                // The rig's capturing wrapper answers the declared
+                // inputs (it knows the manifest); the inner handle is
+                // never asked.
+                std::collections::HashMap::new(),
                 // From the node's manifest, so a stream consumer's
                 // `await_signal` is refused in a live test exactly as
                 // in an execution (the rig DOES serve stream consumers:

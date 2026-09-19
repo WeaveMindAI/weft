@@ -234,7 +234,10 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
 }
 
 /// Deleting versions cascades to their runs; a project's removal
-/// cascades to everything.
+/// drops its whole tree (the store deletes it explicitly: a version
+/// left behind kept naming stored files of a project that no longer
+/// existed, and the same id registered again inherited a tree it
+/// never made).
 #[sqlx::test]
 async fn deleting_versions_cascades_to_their_runs(pool: PgPool) {
     let (_, projects, versions) = setup(&pool).await;
@@ -252,6 +255,6 @@ async fn deleting_versions_cascades_to_their_runs(pool: PgPool) {
     assert!(versions.run(r1).await.unwrap().is_some());
     assert_eq!(versions.versions(project).await.unwrap().len(), 1);
     assert!(projects.remove(project).await.unwrap());
-    assert_eq!(versions.versions(project).await.unwrap().len(), 1, "removing the live project preserves its history");
-    assert!(versions.run(r1).await.unwrap().is_some());
+    assert!(versions.versions(project).await.unwrap().is_empty(), "removing the project drops its tree");
+    assert!(versions.run(r1).await.unwrap().is_none(), "and the tree's runs with it");
 }

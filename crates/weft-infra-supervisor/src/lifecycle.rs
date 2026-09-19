@@ -158,6 +158,32 @@ fn manifest_unit(manifest: &serde_json::Value) -> Option<&str> {
         .as_str()
 }
 
+/// Say what a failed apply means where the raw apiserver message would
+/// leave a person guessing. Only one case needs it today: a door's
+/// Service asks the apiserver for a node port, and when the cluster's
+/// range is full the answer is "failed to allocate a nodePort: range is
+/// full", which says nothing about doors, about which project ate the
+/// range, or about what to do next. Nothing on the weft side allocates
+/// these numbers (the apiserver owns the range), so this is the first
+/// place that can name the door.
+fn explain_apply_failure(manifest: &serde_json::Value, err: anyhow::Error) -> anyhow::Error {
+    let is_door = manifest.get("kind").and_then(|k| k.as_str()) == Some("Service")
+        && manifest.pointer("/spec/type").and_then(|t| t.as_str()) == Some("NodePort");
+    let text = err.to_string();
+    if !is_door || !text.contains("nodePort") {
+        return err;
+    }
+    let name = manifest
+        .pointer("/metadata/name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("<unnamed>");
+    err.context(format!(
+        "opening the door '{name}' needs a free port in the range this cluster publishes, \
+         and every one of them is already serving a door. Close a door you are not using, \
+         or stop the project holding it"
+    ))
+}
+
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How often the unbounded readiness wait logs a "still waiting" breadcrumb, so
 /// a stuck workload is legible without a hard-fail deadline killing a slow but
@@ -225,11 +251,17 @@ async fn wait_for_readiness(
     let instance_selector = format!("{INFRA_SELECTOR},weft.dev/instance={instance_id}");
     // A user apply is a user-controlled operation: a slow-warmup workload (a
     // model server pulling weights) can legitimately take a long time, so this
-    // wait is NOT capped by a fixed hard-fail deadline (matching the sibling
-    // drain wait, which the same theme made unbounded + cancellable). The user
-    // interrupts a workload that will never come up via cancel (polled at
+    // wait is NOT capped by a fixed hard-fail deadline. The user interrupts a
+    // workload that will never come up via cancel (polled at
     // CANCEL_POLL_INTERVAL); a periodic breadcrumb makes a stuck readiness
     // legible in the logs rather than a silent hang.
+    //
+    // The sibling drain wait IS capped, and differently on purpose: there the
+    // person says how long they are willing to hold (`drain_timeout_secs`) and
+    // what is still running past it is cancelled, because a deactivate that
+    // waits for ever on one long execution is a deactivate nobody can finish.
+    // Here there is nothing to cancel INSTEAD of waiting: the workload either
+    // comes up or the user stops it.
     let mut next_cancel_check = state.clock.now();
     let mut next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
     loop {
@@ -1016,7 +1048,11 @@ async fn execute_apply(
         for manifest in &manifests {
             match manifest_unit(manifest) {
                 Some(unit) if !reconcile.contains(unit) => continue, // frozen up unit
-                _ => state.kube.apply(manifest).await?,
+                _ => state
+                    .kube
+                    .apply(manifest)
+                    .await
+                    .map_err(|e| explain_apply_failure(manifest, e))?,
             }
         }
         wait_for_readiness(state, cmd.id, &namespace, &instance_id).await?;
@@ -1131,8 +1167,8 @@ fn mint_instance_id(project_id: &str, node_id: &str) -> String {
     // K8s names: lowercase alphanum + `-`, max 63. The instance id
     // ends up as a Deployment / Service / PVC name; leave room for
     // suffixes like `-data` or `-api`.
-    let pid = sanitize(project_id).chars().take(8).collect::<String>();
-    let nid = sanitize(node_id).chars().take(20).collect::<String>();
+    let pid = infra::name_segment(project_id).chars().take(8).collect::<String>();
+    let nid = infra::name_segment(node_id).chars().take(20).collect::<String>();
     let suffix = Uuid::new_v4().simple().to_string();
     // 10 hex chars = 40 bits of entropy. 6 was a birthday-risk
     // ceiling for high-frequency apply cycles on hot tenants; 10
@@ -1140,28 +1176,6 @@ fn mint_instance_id(project_id: &str, node_id: &str) -> String {
     // alongside the truncated project + node prefixes.
     let short_suffix: String = suffix.chars().take(10).collect();
     format!("wn-{pid}-{nid}-{short_suffix}")
-}
-
-fn sanitize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_dash = false;
-    for c in s.chars() {
-        let lc = c.to_ascii_lowercase();
-        if lc.is_ascii_alphanumeric() {
-            out.push(lc);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    while out.starts_with('-') {
-        out.remove(0);
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
 }
 
 fn compute_endpoints(
@@ -1216,13 +1230,6 @@ fn compute_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_strips_non_alphanum() {
-        assert_eq!(sanitize("Foo_Bar-123"), "foo-bar-123");
-        assert_eq!(sanitize("a/b/c"), "a-b-c");
-        assert_eq!(sanitize("--leading--"), "leading");
-    }
 
     #[test]
     fn mint_instance_id_format() {

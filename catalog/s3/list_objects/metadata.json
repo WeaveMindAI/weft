@@ -25,7 +25,6 @@
     {
       "name": "prefix",
       "type": "String",
-      "required": false,
       "label": "Prefix",
       "description": "Only keys starting with this. Empty = the whole bucket."
     }

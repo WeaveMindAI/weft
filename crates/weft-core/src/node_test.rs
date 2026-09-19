@@ -183,6 +183,12 @@ pub struct NodeTest {
     run: TestFn,
 }
 
+/// How long one fake-tier test may run before the runner gives up on
+/// it and fails it by name. Generous next to any honest fake (they do
+/// no real I/O and finish in milliseconds), short next to a person
+/// waiting on a suite that has silently stopped.
+pub const FAKE_TEST_DEADLINE_SECS: u64 = 30;
+
 impl NodeTest {
     /// A pure-logic test: no ctx, no I/O.
     pub fn basic(name: &'static str, run: fn() -> WeftResult<()>) -> Self {
@@ -281,17 +287,38 @@ impl NodeTest {
         }
     }
 
-    /// Run a fake test against a fresh rig. Panics fail this one test.
+    /// Run a fake test against a fresh rig. Panics fail this one test,
+    /// and so does hanging: a test that never returns fails by NAME
+    /// after [`FAKE_TEST_DEADLINE_SECS`] instead of stalling the suite.
+    ///
+    /// The bound is here and not in each test because the shapes that
+    /// hang are the rig's own (a cursor parked on a bus nothing closes,
+    /// a caller nobody attaches), and without it the runner is killed
+    /// from outside with no test named at all, which leaves bisecting
+    /// by hand as the only way to find the culprit.
     pub async fn run_fake(&self) -> WeftResult<()> {
+        self.run_fake_within(std::time::Duration::from_secs(FAKE_TEST_DEADLINE_SECS)).await
+    }
+
+    /// [`Self::run_fake`] with the bound named, so a test of the bound
+    /// itself does not have to wait it out.
+    pub async fn run_fake_within(&self, deadline: std::time::Duration) -> WeftResult<()> {
         match &self.run {
             TestFn::Fake(f) => {
-                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                let body = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                     f(FakeRig::new()),
-                ))
-                .await
-                {
-                    Ok(result) => result,
-                    Err(payload) => Err(panic_error(self.name, payload)),
+                ));
+                match tokio::time::timeout(deadline, body).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(payload)) => Err(panic_error(self.name, payload)),
+                    Err(_) => Err(WeftError::NodeExecution(format!(
+                        "test '{}' did not finish within {}s. Something in \
+                         it is waiting for what it never gets: a cursor reading a bus nothing \
+                         closes, a caller nobody attaches, a signal nobody answers. Close the bus \
+                         (or attach the caller) on every path the test takes",
+                        self.name,
+                        deadline.as_secs_f64(),
+                    ))),
                 }
             }
             _ => Err(WeftError::Config(format!(
@@ -627,6 +654,11 @@ struct FakeState {
     /// The wake payload for the NEXT `run` (a firing trigger's
     /// `ctx.wake`). Taken (consumed) when a run starts.
     wake: Mutex<Option<Value>>,
+    /// The live caller the run is attached to (`attach_caller`), what
+    /// `ctx.caller()` and its protocol-typed forms answer. `None` = a
+    /// run with nobody on the line, which is what every node not behind
+    /// a Route or Socket sees.
+    caller: Mutex<Option<Arc<dyn crate::caller::CallerConnection>>>,
     /// Every `register_signal` call: (spec, port snapshot).
     registered_signals: Mutex<Vec<(SignalSpec, Value)>>,
     /// Every `await_signal` the node made, in order. What a node parks
@@ -648,6 +680,9 @@ struct FakeState {
     /// Declared-output-type overrides: what the compiler resolves for
     /// a `MustOverride` output port in a real graph.
     output_types: Mutex<HashMap<String, WeftType>>,
+    /// Declared custom input ports, what the compiler merges onto a
+    /// node with `canAddInputPorts` from the source's inline list.
+    input_types: Mutex<HashMap<String, WeftType>>,
     /// Live buses opened during a run, keyed by their serialized
     /// marker, so the marker resolves back (in the node and in the
     /// test's post-run read).
@@ -729,12 +764,14 @@ impl FakeState {
             requests: Mutex::new(Vec::new()),
             signals: Mutex::new(VecDeque::new()),
             wake: Mutex::new(None),
+            caller: Mutex::new(None),
             registered_signals: Mutex::new(Vec::new()),
             awaited_signals: Mutex::new(Vec::new()),
             connection_values: Mutex::new(BTreeMap::new()),
             published: Mutex::new(std::collections::BTreeSet::new()),
             connection_permissions: Mutex::new(BTreeMap::new()),
             output_types: Mutex::new(HashMap::new()),
+            input_types: Mutex::new(HashMap::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
@@ -847,6 +884,35 @@ impl FakeRig {
         *self.state.wake.lock().unwrap() = Some(payload);
     }
 
+    /// Attach a scripted live caller for the next runs: what a Route or
+    /// Socket trigger's execution carries. Build it with
+    /// `FakeCallerConnection::connected(config)`, script its handshake,
+    /// body and inbound messages, run the node, then assert on its
+    /// recorded calls (`heads`, `chunks`, `close_reason`, `calls`).
+    pub fn attach_caller(&self, conn: Arc<crate::caller::FakeCallerConnection>) {
+        *self.state.caller.lock().unwrap() = Some(conn);
+    }
+
+    /// Mint a live bus the test feeds itself, and its marker to place
+    /// on a `Bus` input: `inputs = json!({"bus": marker})`. The same
+    /// registry the run's `ctx.bus` resolves markers through, so the
+    /// node under test reads what the test sent. The producer side of
+    /// what [`Self::bus`] reads back after a run.
+    pub fn seed_bus(
+        &self,
+        opts: crate::bus::BusOptions,
+    ) -> WeftResult<(crate::bus::BusHandle, Value)> {
+        let handle = crate::bus::BusHandle::create_with_options(opts)
+            .map_err(|e| WeftError::NodeExecution(format!("create bus: {e}")))?;
+        let marker = handle.marker();
+        self.state
+            .buses
+            .lock()
+            .unwrap()
+            .insert(marker.to_string(), handle.new_handle());
+        Ok((handle, marker))
+    }
+
     /// A connection marker for `service`, to place on an access input:
     /// `inputs = json!({"account": rig.access("slack"), ...})`. Opening
     /// it answers a client whose requests hit the canned routes.
@@ -860,6 +926,14 @@ impl FakeRig {
     /// type need no declaration.
     pub fn output_type(&self, port: &str, ty: WeftType) {
         self.state.output_types.lock().unwrap().insert(port.to_string(), ty);
+    }
+
+    /// Declare a custom input port with its type, what the compiler
+    /// merges onto a node written `ExecPython(photo: Image)`
+    /// (`ctx.declared_inputs` reads it). Ports the metadata declares
+    /// need no declaration.
+    pub fn input_type(&self, port: &str, ty: WeftType) {
+        self.state.input_types.lock().unwrap().insert(port.to_string(), ty);
     }
 
     /// What the node published as `service`'s connection, or `None` if
@@ -1057,8 +1131,27 @@ impl FakeRig {
         inputs: Value,
     ) -> WeftResult<(CaptureBox, ExecutionContext, RegisteredFeeds)> {
         let manifest = node.manifest();
-        let (bag, feeds) = manifest_input_bag(manifest, inputs)?;
+        let (mut bag, feeds) = manifest_input_bag(manifest, inputs)?;
+        // A case's declared created ports are part of what the node
+        // declares, whether or not the case delivered on them. The
+        // compiler supplies both halves in production; here the case does.
+        for port in self.state.input_types.lock().unwrap().keys() {
+            bag.declare_port(port.clone());
+        }
         let wake = self.state.wake.lock().unwrap().take();
+        // The same gate production applies before a trigger's body
+        // runs: a firing payload has to be exactly what the node
+        // declared it wakes with. A test that wakes a trigger with a
+        // payload the node could never receive proves nothing, and
+        // that is not hypothetical: every Slack trigger's test woke it
+        // without the `type` field Slack puts on every event, so the
+        // node passed its tests and failed on the first real message.
+        if manifest.features.is_trigger {
+            if let Some(payload) = &wake {
+                crate::node::check_fire_payload(&manifest.fires_with, Some(payload))
+                    .map_err(WeftError::NodeExecution)?;
+            }
+        }
         // Declared overrides play the compiler's role for MustOverride
         // ports; concrete metadata types stand as-is. The output map is
         // derived from the BAG (defaults applied), never the raw case
@@ -1073,6 +1166,7 @@ impl FakeRig {
         let handle = Arc::new(TestHandle {
             state: self.state.clone(),
             capture: Capture::new(outputs),
+            declared_inputs: declared_input_map(manifest, &self.state.input_types.lock().unwrap()),
             wake,
             publishes: manifest.publishes.clone(),
             has_generator_input: manifest.has_generator_input(),
@@ -1314,6 +1408,18 @@ impl Drop for RegisteredFeeds {
     }
 }
 
+/// The input ports a rig run declares: the metadata's own plus the
+/// custom ones the test declared (`rig.input_type`).
+fn declared_input_map(manifest: &NodeMetadata, custom: &HashMap<String, WeftType>) -> HashMap<String, WeftType> {
+    let mut declared: HashMap<String, WeftType> = manifest
+        .inputs
+        .iter()
+        .map(|i| (i.name.clone(), i.input_type.clone()))
+        .collect();
+    declared.extend(custom.iter().map(|(k, v)| (k.clone(), v.clone())));
+    declared
+}
+
 /// Every output port a run may emit on: the manifest's own, plus the
 /// ones this node DERIVES from its config (a form's fields, a switch's
 /// cases). `config` is the case's inputs, which is where a rig run
@@ -1387,15 +1493,32 @@ impl Capture {
         let mut streams = self.stream_outputs.lock().unwrap();
         let closed = self.closed_ports.lock().unwrap();
         // Gate order mirrors production's `pulse_downstream`: all
-        // ports declared, then the one-emission-per-port claim
-        // (generator ports accept repeats, but never past a close),
-        // then the runtime output-type check, so a multi-fault
-        // emission errors on the same gate here and there.
+        // ports declared, then the runtime output-type check, then the
+        // one-emission-per-port claim (generator ports accept repeats,
+        // but never past a close), so a multi-fault emission errors on
+        // the same gate here and there.
         for port in output.outputs.keys() {
             if !self.declared.contains_key(port) {
                 return Err(WeftError::NodeExecution(format!(
                     "the node emitted on undeclared output port '{port}'; declare it in \
                      metadata.json's outputs list, or correct the port name in the body"
+                )));
+            }
+        }
+        // The same gate production applies: a value the port's
+        // declared type does not accept fails THIS call and nothing
+        // else. The port is left open, so a node that catches the
+        // error can try the port again with something else, and
+        // whatever the firing already sent stays sent. Generator ports
+        // check each ITEM against the element type, again as
+        // production does.
+        for (port, value) in &output.outputs {
+            let declared = self.declared[port].port_value_type();
+            if !declared.accepts_runtime_value(value) {
+                return Err(WeftError::NodeExecution(format!(
+                    "the node emitted a value on port '{port}' that its declared type \
+                     '{declared}' does not accept; nothing was sent and the port is still \
+                     open, so this emission can be retried with a value that fits"
                 )));
             }
         }
@@ -1415,23 +1538,6 @@ impl Capture {
                 return Err(WeftError::NodeExecution(format!(
                     "the node touched output port '{port}' twice in one firing; each port \
                      can be emitted or closed at most once"
-                )));
-            }
-        }
-        // DELIBERATELY stricter than production here: production
-        // closes a mistyped port silently (downstream sees null) and
-        // delivers the rest of the emission; the rig fails the run
-        // instead, because a test exists precisely to surface that
-        // silent degradation. Do not "fix" this back to a mirror.
-        // Generator ports check each ITEM against the element type,
-        // the same per-item gate production applies.
-        for (port, value) in &output.outputs {
-            let declared = self.declared[port].port_value_type();
-            if !declared.accepts_runtime_value(value) {
-                return Err(WeftError::NodeExecution(format!(
-                    "the node emitted a value on port '{port}' that its declared type \
-                     '{declared}' does not accept; production would refuse the value and \
-                     close the port (downstream sees null)"
                 )));
             }
         }
@@ -1571,6 +1677,7 @@ fn unsupported(what: &str) -> WeftError {
 struct TestHandle {
     state: Arc<FakeState>,
     capture: Capture,
+    declared_inputs: HashMap<String, WeftType>,
     wake: Option<Value>,
     /// The service this node declares it publishes a connection to
     /// (`publishes` in its metadata), so the fake answers exactly what
@@ -1816,6 +1923,10 @@ impl ContextHandle for TestHandle {
         &self.capture.declared
     }
 
+    fn declared_input_ports(&self) -> &HashMap<String, WeftType> {
+        &self.declared_inputs
+    }
+
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
         // No downstream graph in a rig run: the harness is the
         // consumer and takes every yield instantly, so a delivery-
@@ -2059,12 +2170,19 @@ impl ContextHandle for TestHandle {
 
     async fn storage_public_link(
         &self,
-        _key: &str,
+        key: &str,
         _ttl_secs: Option<u64>,
+        reach: crate::storage::LinkReach,
     ) -> WeftResult<Option<String>> {
-        // The honest answer for a store nobody can reach: no public
-        // link. Callers (externalize) fall back to inline bytes.
-        Ok(None)
+        match reach {
+            // The honest answer for a store nobody on the internet can
+            // reach: no public link. Callers (externalize) fall back to
+            // inline bytes.
+            crate::storage::LinkReach::Internet => Ok(None),
+            // A caller of the fake install: a stable fake address, so a
+            // test can assert the link a door hands out.
+            crate::storage::LinkReach::Caller => Ok(Some(format!("{FAKE_CALLER_LINK_BASE}/public/files/{key}"))),
+        }
     }
 
     fn wake_payload(&self) -> Option<&Value> {
@@ -2072,7 +2190,7 @@ impl ContextHandle for TestHandle {
     }
 
     fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> {
-        None
+        self.state.caller.lock().unwrap().clone()
     }
 }
 
@@ -2201,6 +2319,10 @@ pub enum HandleRole<'a> {
 /// in-flight set on exactly this id, and the rigs' error messages name
 /// it, so a drifted copy would silently blind the watchdog.
 pub const NODE_UNDER_TEST_ID: &str = "node-under-test";
+
+/// The base the fake rig mints caller links under (`StorageHandle::
+/// caller_link`): a stable address a test asserts against.
+pub const FAKE_CALLER_LINK_BASE: &str = "https://fake-weft.test";
 
 /// The firing id every [`HandleRole::Harness`] handle runs as, keeping
 /// the test code's own waits out of the watchdog's picture.
@@ -2377,6 +2499,7 @@ impl LiveRig {
         let handle = Arc::new(CapturingHandle {
             inner,
             capture: Capture::new(outputs_by_name),
+            declared_inputs: declared_input_map(manifest, &HashMap::new()),
         });
         let ctx = test_context(manifest, bag, handle.clone());
         let result = node.run(ctx).await;
@@ -2392,6 +2515,7 @@ impl LiveRig {
 struct CapturingHandle {
     inner: Arc<dyn ContextHandle>,
     capture: Capture,
+    declared_inputs: HashMap<String, WeftType>,
 }
 
 #[async_trait::async_trait]
@@ -2476,6 +2600,10 @@ impl ContextHandle for CapturingHandle {
 
     fn declared_output_ports(&self) -> &HashMap<String, WeftType> {
         &self.capture.declared
+    }
+
+    fn declared_input_ports(&self) -> &HashMap<String, WeftType> {
+        &self.declared_inputs
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
@@ -2573,8 +2701,9 @@ impl ContextHandle for CapturingHandle {
         &self,
         key: &str,
         ttl_secs: Option<u64>,
+        reach: crate::storage::LinkReach,
     ) -> WeftResult<Option<String>> {
-        self.inner.storage_public_link(key, ttl_secs).await
+        self.inner.storage_public_link(key, ttl_secs, reach).await
     }
 
     fn wake_payload(&self) -> Option<&Value> {
@@ -3143,6 +3272,25 @@ mod tests {
         });
         let err = fake.run_fake().await.expect_err("async panic too").to_string();
         assert!(err.contains("panicked"), "{err}");
+    }
+
+    /// The other half of that promise: a test that never RETURNS fails
+    /// by name too. Before this, the suite stalled and whoever killed
+    /// it got no test name at all, so the only way to find the culprit
+    /// was to run them one at a time.
+    #[tokio::test]
+    async fn a_hanging_body_fails_by_name_instead_of_stalling_the_suite() {
+        let hangs = NodeTest::fake("hangs", |_rig| async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let err = hangs
+            .run_fake_within(std::time::Duration::from_millis(20))
+            .await
+            .expect_err("a hang is a failure")
+            .to_string();
+        assert!(err.contains("'hangs'"), "the culprit is named: {err}");
+        assert!(err.contains("nothing closes"), "it says what usually causes it: {err}");
     }
 
     /// Running a test through the wrong tier's runner is a loud

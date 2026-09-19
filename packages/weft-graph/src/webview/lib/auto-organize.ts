@@ -6,7 +6,7 @@
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
 import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral } from './types';
-import { CONFIG_STRIP_BAR_PX, configStripOpenPx } from './constants/container-layout';
+import { CONFIG_STRIP_BAR_PX, configStripOpenPx, containerPaddingPx, expandedContainerMinPx } from './constants/container-layout';
 import { LOOP_CONFIG_FIELDS } from './utils/input-field';
 import { SHOULD_FLOW_PORT } from '../../protocol';
 
@@ -295,13 +295,13 @@ export async function autoOrganize(
 		}
 	}
 
-	// Builder groups need room for the header plus per-port label rows on
-	// both sides; simplified groups draw a slim header and bare dots, so the
-	// same padding would wrap a 96px square in a sea of empty box (the
-	// giant-group look). Sized to each view's real chrome.
-	const GROUP_TOP_PADDING = simplified ? 48 : 80;
-	const GROUP_SIDE_PADDING = simplified ? 28 : 60;
-	const GROUP_BOTTOM_PADDING = simplified ? 28 : 60;
+	// Sized to each view's real chrome (see containerPaddingPx): the same
+	// padding in both views would wrap a 96px square in a sea of empty box.
+	const {
+		top: GROUP_TOP_PADDING,
+		side: GROUP_SIDE_PADDING,
+		bottom: GROUP_BOTTOM_PADDING,
+	} = containerPaddingPx(simplified);
 	const COLLAPSED_GROUP_WIDTH = 200;
 	const COLLAPSED_GROUP_HEIGHT = 80;
 
@@ -318,8 +318,8 @@ export async function autoOrganize(
 		const node = projectNodes.find(n => n.id === nodeId);
 		const literals = (node as { portLiterals?: Record<string, unknown> } | undefined)?.portLiterals;
 		if (!node || !containerHasConfigStrip(node.nodeType, literals)) return 0;
-		const configCollapsed = (node.config as Record<string, unknown> | undefined)?.configCollapsed === true;
-		if (configCollapsed) return CONFIG_STRIP_BAR_PX;
+		const configOpen = (node.config as Record<string, unknown> | undefined)?.configOpen === true;
+		if (!configOpen) return CONFIG_STRIP_BAR_PX;
 		// The open strip grows with its field list: one row per written
 		// port literal, plus the loop knob rows. Same derivation as
 		// GroupNode's stripFields, so the reserved space follows the
@@ -729,12 +729,12 @@ export async function autoOrganize(
 			const inputs = (scopeNode.inputs || []).map(p => p.name);
 			const outputs = (scopeNode.outputs || []).map(p => p.name);
 			// Floor only: ELK grows the group to fit its children, so this minimum
-			// just sets how small an (almost) empty group may get. Keep it small so
-			// the group hugs its content instead of leaving a big empty band at the
-			// bottom/right when the content is short (common with simplified-view
-			// squares). Don't use measured DOM size, it would block shrinking.
-			const minW = 120;
-			const minH = 100;
+			// just sets how small an (almost) empty group may get. It is the
+			// renderer's own floor, so a size handed out here is a size the
+			// container draws at (a smaller floor let a one-node simplified loop
+			// come out below what its CSS drew, spilling past its parent). Never
+			// the measured DOM size: that would block shrinking.
+			const { w: minW, h: minH } = expandedContainerMinPx(simplified);
 			// Port positions on the east side need a reference width.
 			// Use a large value; ELK will place the east ports at the final computed width.
 			const portRefW = 400;

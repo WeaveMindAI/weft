@@ -125,6 +125,13 @@ mod fs_hashes {
     /// participates in the binary / infra / builder-base hashes.
     pub const BUILDER_BASE_DOCKERFILE: &str = "deploy/docker/worker-builder-base.Dockerfile";
 
+    /// The script that Dockerfile runs to split the compiled artifacts
+    /// into its two image layers. Hashed with the Dockerfile for the
+    /// same reason: it decides what the baked image contains, so an
+    /// edit here must mint a new base tag rather than leave every host
+    /// holding an image built by the old rule.
+    pub const BUILDER_BASE_SPLIT_SCRIPT: &str = "deploy/docker/worker-builder-base-split.sh";
+
     /// Fold the worker build environment into `hasher`: the worker crate
     /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
     /// crates a worker build links), the workspace manifests + toolchain
@@ -152,11 +159,9 @@ mod fs_hashes {
         for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
-        hash_path(
-            hasher,
-            BUILDER_BASE_DOCKERFILE,
-            &weft_root.join(BUILDER_BASE_DOCKERFILE),
-        )?;
+        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT] {
+            hash_path(hasher, rel, &weft_root.join(rel))?;
+        }
         // The stdlib packages' dependency declarations. The builder base
         // compiles the stock worker, whose dependency tree (and the
         // feature unification of every shared crate in it) is the fixed
@@ -257,9 +262,11 @@ mod fs_hashes {
         hash_image_recipe(&mut shared, project)?;
         hash_type_registry(&mut shared, catalog);
         // Fingerprints describe the compiled worker, whose type set can be
-        // wider than this graph. Built-in boundaries always ship in the engine.
+        // wider than this graph. Built-in boundaries (a group's, a loop's,
+        // a call site's and a body's halves) always ship in the engine.
         let mut types = crate::codegen::node_types_for(definition, catalog, node_set);
         types.extend(crate::weft_compiler::RESERVED_TYPE_KEYWORDS.iter().map(|t| (*t).to_string()));
+        types.extend(weft_core::project::boundary_types::ALL.iter().map(|t| (*t).to_string()));
         let mut packages: std::collections::BTreeMap<Vec<PathBuf>, SourceHash> = std::collections::BTreeMap::new();
         let mut result = std::collections::BTreeMap::new();
         for node_type in types {
@@ -677,10 +684,11 @@ mod fs_hashes {
         use crate::compile_enriched_with_diagnostics;
         let source = project
             .read_main_weft()
-            .map_err(|e| CompileLoadError::Read(format!("read main.weft: {e}")))?;
+            .map_err(|e| CompileLoadError::Read(format!("read {}: {e}", project.main_weft().display())))?;
         let catalog = build_project_catalog(&project.root)
             .map_err(|e| CompileLoadError::Read(format!("catalog: {e}")))?;
-        let fs = crate::CompileFs::disk(&project.root);
+        let src_dir = project.src_dir();
+        let fs = crate::CompileFs::disk(&project.root).anchored_at(Some(&src_dir));
         let definition = compile_enriched_with_diagnostics(&source, project.id(), fs, &catalog)
             .map_err(CompileLoadError::Diagnostics)?;
         Ok((definition, catalog))
@@ -730,7 +738,7 @@ mod fs_hashes {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
                 let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
-                assert!(before.contains_key("Passthrough"));
+                assert!(before.contains_key("Passthrough") && before.contains_key("IncludeIn") && before.contains_key("CallOut"));
                 if matches!(set, crate::codegen::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }

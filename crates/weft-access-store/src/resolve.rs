@@ -426,6 +426,29 @@ pub async fn resolve_event_source(
     })
 }
 
+/// What verifying a CALLER against a connection needs: the scheme the
+/// connection's service recipe declares (`verify`) and the connection's
+/// stored values the scheme reads its material from. The tenant wall
+/// applies as everywhere; a connection of another service is refused
+/// by name. A stored read: the scheme keys on pasted material, so no
+/// refresh and no provider call.
+pub struct CallerVerifier {
+    pub verify: Option<weft_core::access::events::VerifyKind>,
+    pub values: BTreeMap<String, String>,
+}
+
+pub async fn caller_verifier(
+    pool: &PgPool,
+    tenant: &str,
+    access_id: uuid::Uuid,
+    service: &str,
+) -> anyhow::Result<CallerVerifier> {
+    let grant =
+        read_walled_grant(pool, tenant, access_id, service, &[], Freshness::Stored).await?;
+    let values = grant.spec.handoff_values(&grant.values);
+    Ok(CallerVerifier { verify: grant.spec.verify.clone(), values })
+}
+
 /// A stable content hash of an events-recipe map: sha256 hex of its
 /// canonical JSON (BTreeMap keys are ordered, so serialization is
 /// deterministic). `None` for a spec with no topics. What scopes a

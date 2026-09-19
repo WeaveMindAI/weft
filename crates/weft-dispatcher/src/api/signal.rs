@@ -9,8 +9,8 @@
 
 use anyhow::Context;
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, Method, StatusCode},
     response::Response,
     Json,
 };
@@ -1547,13 +1547,17 @@ pub async fn signals_visible_to(
 
 /// `POST /<mount_path>` catch-all. External clients hit this for
 /// any signal whose `surface_kind = 'public_entry'` (Webhook,
-/// ApiPost, future public-form). Looks up the row by `mount_path`,
-/// applies the auth gate (api_key check, future schemes), park
-/// gate, then `dispatch_listener_outcome`. Path components that
-/// don't match a registered mount_path 404.
+/// ApiPost, future public-form). Splits the tenant off the called
+/// path, MATCHES it against that tenant's registered patterns (a
+/// pattern like `cards/{id}` is not a string to compare), then reads
+/// the matched row and lets it through the park gate into
+/// `dispatch_listener_outcome`. Two calls it refuses rather than
+/// serves, both because the answer lives at `/connect`: a pattern
+/// that captured part of the path, and a row gated by a connection.
+/// So what fires here is always a bare, open address. Anything that
+/// matches nothing 404s.
 pub async fn fire_public_entry(
     State(state): State<DispatcherState>,
-    headers: HeaderMap,
     Path(mount_path): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
@@ -1565,23 +1569,65 @@ pub async fn fire_public_entry(
     } else {
         format!("/{}", mount_path)
     };
+    // Deliberately vague, and the same words whatever went wrong: this
+    // door faces the open internet, so telling a stranger the
+    // difference between "no such address" and "that address exists but
+    // is not taking fires" tells them what this account runs.
+    let refuse = || {
+        (
+            StatusCode::NOT_FOUND,
+            "Project is not accepting requests. Please contact the project administrator."
+                .to_string(),
+        )
+    };
+    // The stored address is `/<tenant>/<pattern>`, and a pattern is not
+    // a string to compare: `cards/{id}` has to be MATCHED against
+    // `cards/7`. This used to be an equality lookup, so a registered
+    // address holding a capture could never be reached through here at
+    // all, whatever was called.
+    let (tenant, called) = split_tenant(&normalized).map_err(|_| refuse())?;
+    let rows: Vec<RouteRow> = sqlx::query_as::<_, (String, Vec<String>, String)>(
+        "SELECT s.mount_path, s.mount_methods, s.token \
+         FROM signal s \
+         WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' \
+           AND s.mount_path IS NOT NULL",
+    )
+    .bind(tenant)
+    .fetch_all(&state.pg_pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mount lookup: {e}")))?
+    .into_iter()
+    .map(|(mount_path, mount_methods, token)| RouteRow { mount_path, mount_methods, token })
+    .collect();
+    let (matched, params) = resolve_route(&rows, tenant, "POST", called).map_err(|_| refuse())?;
+    // An address with a capture in it is a live route's shape, and a
+    // live route is served (and gated, and answered) at `/connect`.
+    // Reached here it would fire the program with the capture thrown
+    // away, so the program would run without the part of the address
+    // that said which thing it was about. Say so instead.
+    if !params.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this address captures part of the path, which is a live route: call it at \
+                 /connect{normalized}"
+            ),
+        ));
+    }
     let row = sqlx::query(
-        "SELECT s.token, s.project_id, s.tenant_id, s.auth_kind, s.auth_config, \
+        "SELECT s.token, s.project_id, s.tenant_id, s.auth_kind, \
                 COALESCE(p.status, 'inactive') AS status, \
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
          FROM signal s \
          LEFT JOIN project p ON p.id::text = s.project_id \
-         WHERE s.mount_path = $1",
+         WHERE s.token = $1",
     )
-    .bind(&normalized)
+    .bind(&matched.token)
     .fetch_optional(&state.pg_pool)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mount lookup: {e}")))?
-    .ok_or((
-        StatusCode::NOT_FOUND,
-        "Project is not accepting requests. Please contact the project administrator.".into(),
-    ))?;
+    .ok_or_else(refuse)?;
 
     let token: String = row
         .try_get("token")
@@ -1604,11 +1650,19 @@ pub async fn fire_public_entry(
     let auth_kind: String = row
         .try_get("auth_kind")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let auth_config: Option<Value> = row
-        .try_get("auth_config")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
 
-    apply_auth_gate(&auth_kind, auth_config.as_ref(), &headers)?;
+    // The bare-path fire is open or nothing: a connection-gated entry is
+    // a live route, served (and gated) at `/connect/...`; naming that here
+    // beats a silent drop at the listener.
+    if auth_kind != "none" {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "this entry is gated by a connection (auth '{auth_kind}'); call it at \
+                 /connect{normalized}"
+            ),
+        ));
+    }
 
     let payload = body.map(|Json(v)| v).unwrap_or(Value::Null);
 
@@ -1663,47 +1717,60 @@ pub(crate) fn handshake_response(
 }
 
 
-/// Apply the configured auth gate to the request. Returns Ok(())
-/// on pass, Err with appropriate status on fail. Generic in
-/// `auth_kind`; new schemes add a branch here.
-fn apply_auth_gate(
+/// The auth gate of a live route: who may open a connection on it.
+/// `none` admits everyone; `connection` asks the broker to check the
+/// caller against the connection the route names (the broker holds the
+/// connection's `verify` recipe and its material; the dispatcher never
+/// sees a secret). Answers the identity the check established, which
+/// rides the request as its `caller`; a refusal is the broker's flat
+/// `401`, and anything else that goes wrong is a `500` naming it.
+/// Generic in `auth_kind`: a new scheme is a new arm here and a new
+/// `SignalAuth` variant, never a node name.
+async fn caller_gate(
+    state: &DispatcherState,
     auth_kind: &str,
     auth_config: Option<&Value>,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, String)> {
+    tenant: &str,
+    call: &CallerRequestParts<'_>,
+) -> Result<Option<Value>, (StatusCode, String)> {
     match auth_kind {
-        "none" => Ok(()),
-        "api_key" => {
-            let cfg = auth_config.ok_or((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_key auth has no config".into(),
-            ))?;
-            let header_name = cfg
-                .get("header_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("X-Api-Key");
-            let value_hash = cfg
-                .get("value_hash")
-                .and_then(|v| v.as_str())
-                .ok_or((
+        "none" => Ok(None),
+        "connection" => {
+            let cfg = auth_config
+                .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "connection auth has no config".into()))?;
+            let field = |name: &str| -> Result<String, (StatusCode, String)> {
+                cfg.get(name).and_then(Value::as_str).map(str::to_string).ok_or((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_key auth missing value_hash".into(),
-                ))?;
-            let supplied = headers
-                .get(header_name)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if supplied.is_empty() {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    format!("missing {header_name} header"),
-                ));
-            }
-            let supplied_hash = sha256_hex(supplied);
-            if !ct_eq(&supplied_hash, value_hash) {
-                return Err((StatusCode::UNAUTHORIZED, "bad api key".into()));
-            }
-            Ok(())
+                    format!("connection auth config has no '{name}'"),
+                ))
+            };
+            let verify = weft_broker_client::protocol::CallerVerifyRequest {
+                tenant: tenant.to_string(),
+                access_id: field("access_id")?,
+                service: field("service")?,
+                method: call.method.to_string(),
+                path: call.path.to_string(),
+                headers: call.headers.clone(),
+                query: call.query.clone(),
+                body_b64: {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(call.body)
+                },
+            };
+            let verdict: weft_broker_client::protocol::CallerVerified =
+                crate::broker_admin::forward_json(state, "/v1/caller/verify", &verify)
+                    .await
+                    .map_err(|(status, msg)| {
+                        // The broker's 401 IS the answer (flat, the reason in
+                        // its log); anything else is our problem, not the
+                        // caller's.
+                        if status == StatusCode::UNAUTHORIZED {
+                            (StatusCode::UNAUTHORIZED, "refused".to_string())
+                        } else {
+                            (StatusCode::INTERNAL_SERVER_ERROR, format!("caller verify: {msg}"))
+                        }
+                    })?;
+            Ok(Some(verdict.identity))
         }
         other => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1712,30 +1779,80 @@ fn apply_auth_gate(
     }
 }
 
-fn sha256_hex(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    let bytes = h.finalize();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes.iter() {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{:02x}", b);
-    }
-    out
+/// The parts of a caller's opening request the gate hands the broker.
+struct CallerRequestParts<'a> {
+    method: &'a str,
+    path: &'a str,
+    headers: &'a std::collections::BTreeMap<String, String>,
+    query: &'a std::collections::BTreeMap<String, String>,
+    body: &'a [u8],
 }
 
-/// Constant-time string equality. Avoids leaking key length / a
-/// timing oracle on the value_hash comparison.
-fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// One public-entry row of the tenant, as the route matcher sees it.
+#[derive(Debug)]
+pub(crate) struct RouteRow {
+    pub mount_path: String,
+    pub mount_methods: Vec<String>,
+    pub token: String,
+}
+
+/// The route a call resolved to: its row and the path's captures.
+pub(crate) type ResolvedRoute<'r> = (&'r RouteRow, std::collections::BTreeMap<String, String>);
+
+/// Pick the row serving `method` on `path` among the tenant's public
+/// entries, or the HTTP answer when none does: `404` for an unknown
+/// path, `405` naming the allowed methods for a known path called with
+/// the wrong verb. Pure over the rows (the SQL only narrows to the
+/// tenant); a stored pattern that no longer parses is skipped, loud in
+/// the log (its own register validated it, so this is corruption).
+pub(crate) fn resolve_route<'r>(
+    rows: &'r [RouteRow],
+    tenant: &str,
+    method: &str,
+    path: &str,
+) -> Result<ResolvedRoute<'r>, (StatusCode, String)> {
+    let candidates = rows.iter().filter_map(|row| {
+        let pattern = crate::task_kinds::register_signal::pattern_of_mount_path(&row.mount_path, tenant);
+        match weft_core::route::RoutePattern::parse(&pattern) {
+            Ok(pattern) => Some((
+                weft_core::route::RouteKey { pattern, methods: row.mount_methods.clone() },
+                row,
+            )),
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::signal",
+                    token = %row.token, mount_path = %row.mount_path, error = %e,
+                    "a stored route pattern no longer parses; the route is unreachable"
+                );
+                None
+            }
+        }
+    });
+    match weft_core::route::find_route(candidates, method, path) {
+        weft_core::route::RouteMatch::Found { route, params } => Ok((route, params)),
+        weft_core::route::RouteMatch::WrongMethod { allowed } => Err((
+            StatusCode::METHOD_NOT_ALLOWED,
+            format!("{method} is not served at this path; allowed: {}", allowed.join(", ")),
+        )),
+        weft_core::route::RouteMatch::NotFound => {
+            Err((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))
+        }
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
+}
+
+/// Split the called `/connect/{*path}` into the tenant segment and the
+/// path under the project (no leading slash). The tenant is always the
+/// first segment; a call with none is not a route anyone registered.
+pub(crate) fn split_tenant(called: &str) -> Result<(&str, &str), (StatusCode, String)> {
+    let called = called.trim_start_matches('/');
+    let (tenant, rest) = match called.split_once('/') {
+        Some((t, r)) => (t, r),
+        None => (called, ""),
+    };
+    if tenant.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "no live endpoint at this path".into()));
     }
-    diff == 0
+    Ok((tenant, rest))
 }
 
 // ----- Live caller connection handshake ------------------------------
@@ -1762,17 +1879,46 @@ const LIVE_DNS_POLL: std::time::Duration = std::time::Duration::from_millis(100)
 /// re-validated against the token's expiry.
 const LIVE_TOKEN_TTL_SECS: i64 = 120;
 
-/// `GET|POST /connect/{*path}`: the live caller connection control
-/// handshake. Authenticates the caller, ensures a worker pod is up and
-/// routable, starts a fresh execution pinned to that pod, mints a signed
-/// routing token, and points the caller at the gateway URL for the pod
-/// (HTTP: a `307` redirect; WebSocket: a `200` with the URL in the body).
-/// The dispatcher is NEVER in the byte path; the caller's actual traffic
+/// How long the worker outlives the ticket it was held for.
+///
+/// The hold has to reach past the ticket's own expiry, because a caller
+/// who is merely late deserves to be told so. Without this the pod is
+/// free to go the instant the ticket dies, and the late caller meets a
+/// dead socket and a gateway error about a host, which says nothing
+/// about what went wrong or what to do. With it they reach the worker,
+/// which reads the ticket, sees it has run out, and says to ask for a
+/// new one.
+///
+/// It is not a second chance: an expired ticket is refused either way.
+/// It buys the refusal a voice.
+const LIVE_LATE_CALLER_GRACE_SECS: i64 = 120;
+
+/// How long a pod is promised to a caller who has just been pointed at
+/// it: their ticket's whole life, plus the window in which a late
+/// arrival is told the ticket is spent.
+fn live_hold_until(now_unix: i64) -> i64 {
+    now_unix + LIVE_TOKEN_TTL_SECS + LIVE_LATE_CALLER_GRACE_SECS
+}
+
+/// `ANY /connect/{*path}`: the live caller connection control handshake.
+/// Matches the call against the tenant's routes (pattern + method),
+/// checks the caller against the route's auth, ensures a worker pod is up
+/// and routable, chooses the pod this caller will be served by, mints a
+/// signed routing token for it (carrying the color the birth will use),
+/// and points the caller at the gateway URL for that pod (HTTP: a `307`
+/// redirect; WebSocket: a `200` with the URL in the body). Nothing is
+/// admitted and no execution is born here: the execution is born when
+/// the caller actually arrives at the pod (`birth_on_arrival`), so a
+/// caller who never follows the redirect leaves nothing behind. The
+/// dispatcher is NEVER in the byte path; the caller's actual traffic
 /// flows caller -> gateway -> worker.
 pub async fn connect_live(
     State(state): State<DispatcherState>,
+    method: Method,
     headers: HeaderMap,
-    Path(mount_path): Path<String>,
+    Path(called_path): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    body: axum::body::Body,
 ) -> Result<Response, (StatusCode, String)> {
     if state.caller_token_secret.is_empty() || state.gateway_base_url.is_empty() {
         return Err((
@@ -1782,143 +1928,166 @@ pub async fn connect_live(
                 .into(),
         ));
     }
-    let normalized = if mount_path.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", mount_path)
-    };
+    let (tenant_segment, path) = split_tenant(&called_path)?;
+    let (tenant_segment, path) = (tenant_segment.to_string(), path.to_string());
+    let method_name = method.as_str().to_string();
 
-    // Resolve the live_connection signal row (kind + config + the trigger
-    // node + project), with auth fields for the gate.
-    let row = sqlx::query(
-        "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
-                s.port_snapshot, s.program_json, s.source_version, \
-                COALESCE(p.status, 'inactive') AS status \
+    // The tenant's public entries, matched in Rust: a route is a pattern
+    // (`chat/{room}`), never an equality key.
+    let rows = sqlx::query(
+        "SELECT s.token, s.mount_path, s.mount_methods \
          FROM signal s \
-         LEFT JOIN project p ON p.id::text = s.project_id \
-         WHERE s.mount_path = $1",
+         WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL",
     )
-    .bind(&normalized)
-    .fetch_optional(&state.pg_pool)
+    .bind(&tenant_segment)
+    .fetch_all(&state.pg_pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mount lookup: {e}")))?
-    .ok_or((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?
+    .into_iter()
+    .map(|r| {
+        Ok(RouteRow {
+            token: r.try_get("token").map_err(row_err)?,
+            mount_path: r.try_get("mount_path").map_err(row_err)?,
+            mount_methods: r.try_get("mount_methods").map_err(row_err)?,
+        })
+    })
+    .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
+    let (matched, params) = resolve_route(&rows, &tenant_segment, &method_name, &path)?;
+    let token = matched.token.clone();
 
-    let project_id: String = row.try_get("project_id").map_err(row_err)?;
-    let node_id: String = row.try_get("node_id").map_err(row_err)?;
-    let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
-    let status_str: String = row.try_get("status").map_err(row_err)?;
-    let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
-    let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
-    let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
-    let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
-    let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
-    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no original source version; activate it again")))?;
-    let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
-        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no armed code identity; activate it again")))?)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("armed program identity: {error}")))?;
+    let route = armed_route(&state, &token).await?;
+    let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = &route;
 
-    // The signal spec carries the kind tag + the live-caller config. The
-    // protocol is the kind itself (ApiEndpoint -> Http, LiveSocket -> Ws),
-    // recovered from the tag; a non-live-caller tag at this route is a bug.
-    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec parse: {e}")))?;
-    let protocol = weft_core::signal::protocol_for_tag(&spec.kind).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("endpoint at '{normalized}' is not a live connection ({})", spec.kind),
+    // What the caller sent, as the gate sees it. The body is read here
+    // ONLY when the gate needs it (a signing scheme covers the bytes); the
+    // 307 makes the caller resend it to the worker, which reads it there
+    // in every case.
+    let header_map: std::collections::BTreeMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect();
+    let query = weft_core::route::parse_query(raw_query.as_deref().unwrap_or(""));
+    let body_bytes = if auth_kind == "connection" {
+        let limit = live_config.max_inbound_bytes as usize;
+        axum::body::to_bytes(body, limit)
+            .await
+            .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")))?
+    } else {
+        axum::body::Bytes::new()
+    };
+    let caller = caller_gate(
+        &state,
+        auth_kind,
+        auth_config.as_ref(),
+        &tenant_segment,
+        &CallerRequestParts {
+            method: &method_name,
+            path: &path,
+            headers: &header_map,
+            query: &query,
+            body: &body_bytes,
+        },
+    )
+    .await?;
+
+    // What the gate approved, so the worker can hold the caller to it.
+    // Only when something was actually checked: an open route approves
+    // nobody, so there is nothing to be held to and no reason to stop a
+    // caller re-using their own redirect.
+    let approved = (auth_kind != "none").then(|| {
+        weft_core::caller_token::RequestFingerprint::of(
+            &method_name,
+            &path,
+            raw_query.as_deref().unwrap_or(""),
+            &body_bytes,
         )
-    })?;
-    // Validate the config body parses (fail loud on a malformed row); the
-    // body itself travels to the worker verbatim in `spec.config`.
-    serde_json::from_value::<weft_core::signal::LiveConnectionConfig>(spec.config.clone())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config parse: {e}")))?;
-
-    // Auth gate (reuse the shared gate; same as fire_public_entry).
-    apply_auth_gate(&auth_kind, auth_config.as_ref(), &headers)?;
+    });
 
     // Project must be Active to accept a live connection.
-    let project_uuid: uuid::Uuid = project_id
-        .parse()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad project id: {e}")))?;
-    if crate::project_store::project_status_from_str(&status_str)
-        .map(|s| s != crate::project_store::ProjectStatus::Active)
-        .unwrap_or(true)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "project is not active; cannot accept a live connection".into(),
-        ));
-    }
+    route.require_active()?;
 
     // Ensure at least one worker pod is up for the project (spawn + wait if
-    // none); this does NOT admit a slot, it only guarantees a routable pod
-    // exists. Admission happens atomically below as the execute-task insert.
+    // none), then reserve the pod this caller will be served by: the one
+    // with the most headroom that runs the armed image, held for as long
+    // as the ticket they are about to be handed. Nothing is admitted and
+    // nothing is born here: the execution is born when the caller arrives
+    // at that pod (`LiveArrival`), so a caller who never follows the
+    // redirect leaves nothing behind but a warm pod that outlives their
+    // ticket by a couple of minutes. A pod that saturates between now and
+    // the arrival refuses the birth there, and the caller retries.
     let tenant = state
         .tenant_router
-        .tenant_for_project(&project_id)
+        .tenant_for_project(project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    ensure_live_worker(&state, &project_id, tenant.as_str(), &program.binary_hash).await?;
-
-    // Prepare + ATOMICALLY admit the execution. `prepare_live_execution`
-    // builds the birth (ExecutionStarted + kicks + the pinned execute task)
-    // and hands it to `Journal::start_live_execution`, which in ONE
-    // transaction under a per-project lock picks the least-loaded under-cap
-    // pod, inserts the pinned task, and journals the birth: admission IS the
-    // task insert AND the journal write, so there is no admit/journal window
-    // and a failure anywhere leaves NOTHING (no cleanup needed on Err here).
-    // "All full" spawns another pod and retries inside.
-    let color = uuid::Uuid::new_v4();
-    let pod = prepare_live_execution(
+    ensure_live_worker(&state, project_id, tenant.as_str(), &program.binary_hash).await?;
+    let issued_at = crate::lease::now_unix();
+    let pod = reserve_live_pod(
         &state,
-        &project_id,
-        project_uuid,
-        &node_id,
-        &spec,
+        project_id,
         tenant.as_str(),
-        color,
-        port_snapshot.as_ref(),
-        &program,
-        &source_version,
+        &program.binary_hash,
+        live_hold_until(issued_at),
     )
     .await?;
 
     // Do not hand the caller a URL the gateway cannot route yet: the pod is
-    // admitted and DB-alive, but its per-pod DNS record may not have
-    // propagated. Wait until the record resolves (through the same cluster
-    // resolver the gateway uses). This is the ONE failure point past the
-    // admission, so it is the one place that tears the admitted execution
-    // down (atomically: task delete + cancel terminals in one transaction).
-    if let Err(e) = wait_for_pod_dns(&pod.pod_name, &pod.namespace).await {
-        teardown_unclaimed_live_execution(&state, color).await;
-        return Err(e);
-    }
+    // DB-alive, but its per-pod DNS record may not have propagated. Wait
+    // until the record resolves (through the same cluster resolver the
+    // gateway uses).
+    wait_for_pod_dns(&pod.pod_name, &pod.namespace).await?;
 
-    // Mint the signed routing token (pins to the chosen pod) and build the
-    // per-pod gateway URL. The pod subdomain is `<pod>.<ns>` prepended to
-    // the gateway host.
-    let token = weft_core::caller_token::mint(
+    // Mint the signed routing token: the pod pin, the color the birth will
+    // carry, and what the birth needs that the arriving request cannot
+    // supply (the route, the gate's verdict, the path captures). Then
+    // build the per-pod gateway URL (the pod subdomain is `<pod>.<ns>`
+    // prepended to the gateway host).
+    let color = uuid::Uuid::new_v4();
+    let routing = weft_core::caller_token::mint(
         &state.caller_token_secret,
-        color,
-        &project_id,
-        &pod.pod_name,
-        crate::lease::now_unix() + LIVE_TOKEN_TTL_SECS,
+        &weft_core::caller_token::CallerTokenClaims {
+            color,
+            project_id: project_id.clone(),
+            pod_name: pod.pod_name.clone(),
+            signal: token.clone(),
+            path: path.clone(),
+            params,
+            caller,
+            approved,
+            // The same instant the hold was computed from, so the
+            // ticket's life and the pod's promise cannot drift apart
+            // (the DNS wait above sits between the two).
+            exp: issued_at + LIVE_TOKEN_TTL_SECS,
+        },
     );
     let url = build_pod_gateway_url(
         &state.gateway_base_url,
         &pod.pod_name,
         &pod.namespace,
-        &mount_path,
-        &token,
+        &called_path,
+        raw_query.as_deref().unwrap_or(""),
+        &routing,
+    );
+    tracing::info!(
+        target: "weft_dispatcher::signal",
+        color = %color, node = %weft_core::project::plain_id(node_id), pod = %pod.pod_name,
+        "live handshake: caller pointed at the worker; the execution is born on arrival"
     );
 
     // Point the caller at the worker per protocol.
-    Ok(match handshake_response(protocol, url) {
+    Ok(match handshake_response(*protocol, url) {
+        // The body is for a HUMAN holding curl. Every client follows the
+        // `Location` header on its own, but a person who called without
+        // `-L` sees a blank answer and reads it as a failure, so the one
+        // line that costs nothing says what happened and what to add.
         HandshakeResponse::Redirect { location } => Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header(axum::http::header::LOCATION, location)
-            .body(axum::body::Body::empty())
+            .header(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(
+                "weft: this run is answered by a worker, named in the Location header.\n\
+                 Your client should follow it; curl needs -L.\n",
+            ))
             .expect("redirect response builds"),
         HandshakeResponse::ReturnUrl { url } => {
             let body = serde_json::json!({ "url": url, "protocol": "websocket" });
@@ -1931,27 +2100,170 @@ pub async fn connect_live(
     })
 }
 
-/// Resolve the project definition and ATOMICALLY start the live execution:
-/// `Journal::start_live_execution` picks the least-loaded under-cap pod,
-/// inserts the pinned execute task, and journals `ExecutionStarted` + the
-/// trigger kicks, all in ONE transaction. Returns the chosen pod. If every
-/// pod is at the cap, spawns another and retries (bounded). A failure
-/// anywhere leaves NOTHING journaled or queued, so the caller has nothing to
-/// clean up on `Err`.
-#[allow(clippy::too_many_arguments)]
-async fn prepare_live_execution(
+/// A public entry as its signal row arms it: the trigger, its spec, the
+/// gate's settings, and the program identity the arrival births under.
+/// Read at the handshake (to gate and to point the caller) and again at
+/// the arrival (to give birth), by the signal token the routing token
+/// carries between the two.
+pub(crate) struct ArmedRoute {
+    pub project_id: String,
+    pub node_id: String,
+    pub spec: weft_core::primitive::SignalSpec,
+    pub protocol: weft_core::signal::Protocol,
+    pub live_config: weft_core::signal::LiveConnectionConfig,
+    pub auth_kind: String,
+    pub auth_config: Option<Value>,
+    pub port_snapshot: Option<Value>,
+    pub program: weft_core::project::hash::ProgramIdentity,
+    pub source_version: String,
+    /// The project's lifecycle status at the read.
+    pub status: String,
+}
+
+impl ArmedRoute {
+    /// A live connection is accepted only while the project is Active.
+    pub(crate) fn require_active(&self) -> Result<(), (StatusCode, String)> {
+        if crate::project_store::project_status_from_str(&self.status)
+            .map(|s| s != crate::project_store::ProjectStatus::Active)
+            .unwrap_or(true)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "project is not active; cannot accept a live connection".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The armed route behind a signal token, or the HTTP answer when the
+/// row is missing or half-armed.
+pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<ArmedRoute, (StatusCode, String)> {
+    let row = sqlx::query(
+        "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
+                s.port_snapshot, s.program_json, s.source_version, \
+                COALESCE(p.status, 'inactive') AS status \
+         FROM signal s \
+         LEFT JOIN project p ON p.id::text = s.project_id \
+         WHERE s.token = $1",
+    )
+    .bind(token)
+    .fetch_optional(&state.pg_pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?
+    .ok_or((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))?;
+
+    let project_id: String = row.try_get("project_id").map_err(row_err)?;
+    let node_id: String = row.try_get("node_id").map_err(row_err)?;
+    let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
+    let status: String = row.try_get("status").map_err(row_err)?;
+    let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
+    let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
+    let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
+    let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
+    let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
+    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{}' has no original source version; activate it again", weft_core::project::plain_id(&node_id))))?;
+    let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
+        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{}' has no armed code identity; activate it again", weft_core::project::plain_id(&node_id))))?)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("armed program identity: {error}")))?;
+
+    // The signal spec carries the kind tag + the live-caller config. The
+    // protocol is the kind itself (Route -> Http, Socket -> Ws), recovered
+    // from the tag; a non-live-caller tag at this route is a bug.
+    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec parse: {e}")))?;
+    let protocol = weft_core::signal::protocol_for_tag(&spec.kind).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("endpoint of '{}' is not a live connection ({})", weft_core::project::plain_id(&node_id), spec.kind),
+        )
+    })?;
+    // Validate the config body parses (fail loud on a malformed row); the
+    // body itself travels to the worker verbatim in `spec.config`.
+    let live_config: weft_core::signal::LiveConnectionConfig =
+        serde_json::from_value(spec.config.clone())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config parse: {e}")))?;
+    Ok(ArmedRoute {
+        project_id, node_id, spec, protocol, live_config, auth_kind, auth_config,
+        port_snapshot, program, source_version, status,
+    })
+}
+
+/// The pod a live caller is pointed at, held for them until
+/// `held_until`: the least-loaded one with headroom that runs the armed
+/// image. The pick passes over a pod that is not alive, is draining, is
+/// memory-saturated, or was built from a different image than the one
+/// armed right now, so "nothing picked" can mean any of those.
+/// Whichever it was, one more pod helps, so spawn another and wait
+/// (bounded) for one to answer.
+///
+/// Picking and holding are one statement on purpose. A caller is about
+/// to be handed a ticket naming this exact pod, and nothing else in the
+/// system knows they are coming, so between choosing a pod and
+/// promising it the pod is free to decide it has nothing to do and shut
+/// down. Then the ticket names a machine that is leaving.
+async fn reserve_live_pod(
     state: &DispatcherState,
     project_id: &str,
-    project_uuid: uuid::Uuid,
-    node_id: &str,
-    spec: &weft_core::primitive::SignalSpec,
+    tenant: &str,
+    binary_hash: &str,
+    held_until: i64,
+) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
+    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
+    loop {
+        let picked = weft_task_store::worker_pod::reserve_pod_for_caller(
+            &state.pg_pool,
+            project_id,
+            weft_platform_traits::SATURATION_MEM_FRACTION,
+            Some(binary_hash),
+            held_until,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod pick: {e}")))?;
+        if let Some((pod_name, namespace)) = picked {
+            return Ok(weft_task_store::tasks::AdmittedPod { pod_name, namespace });
+        }
+        // No pod of this project can take the connection right now: spawn
+        // one built from the armed image and retry.
+        spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
+        if std::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no worker pod can take this connection: every pod of this project is \
+                 memory-saturated, draining, or built from a different program than the \
+                 one armed now, and a fresh one did not come up in time. Retrying helps \
+                 if it was memory pressure; if a new build just landed, ask for a new \
+                 connection."
+                    .into(),
+            ));
+        }
+        tokio::time::sleep(LIVE_SPAWN_POLL).await;
+    }
+}
+
+/// Give birth to the execution a live caller arrived for, on the pod they
+/// are standing at: resolve the program, compute the fire from the
+/// caller's request, and ATOMICALLY admit the pinned execute task and
+/// journal `ExecutionStarted` + the trigger kicks in one transaction
+/// (`Journal::start_live_execution`). A retry of the same arrival (the
+/// caller's client resent) finds the execution already admitted on the
+/// same pod. A failure anywhere leaves NOTHING journaled or queued.
+/// `Saturated` is the admit finding the pinned pod unusable since the
+/// handshake chose it: gone, draining, memory-saturated, or running a
+/// different program because a build landed in between. Nothing is born,
+/// and the caller is told which of those it could be.
+pub(crate) async fn birth_on_arrival(
+    state: &DispatcherState,
+    route: &ArmedRoute,
+    request: &weft_core::caller::LiveRequest,
     tenant: &str,
     color: uuid::Uuid,
-    port_snapshot: Option<&Value>,
-    program: &weft_core::project::hash::ProgramIdentity,
-    source_version: &str,
+    pod_name: &str,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
-    let definition_hash = &program.definition_hash;
+    let project_uuid: uuid::Uuid = route.project_id
+        .parse()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad project id: {e}")))?;
+    let definition_hash = &route.program.definition_hash;
     let project_json = state
         .projects
         .definition_for_hash(project_uuid, definition_hash)
@@ -1961,8 +2273,12 @@ async fn prepare_live_execution(
     let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
 
+    // The caller's request IS the trigger's wake payload: the trigger node
+    // reads it off `ctx.wake` and fans it onto its ports.
+    let payload = serde_json::to_value(request)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request serialize: {e}")))?;
     let crate::api::project::TriggerFire { kicks, subgraph } =
-        crate::api::project::compute_trigger_fire(&project_def, node_id, &Value::Null, port_snapshot)
+        crate::api::project::compute_trigger_fire(&project_def, &route.node_id, &payload, route.port_snapshot.as_ref())
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     let now = crate::lease::now_unix() as u64;
@@ -1970,65 +2286,62 @@ async fn prepare_live_execution(
     // boundary the engine holds the run to (see `TriggerFire`).
     let (start, kick_events) = crate::api::project::execution_birth_events(
         color,
-        project_id,
+        &route.project_id,
         weft_core::context::Phase::Fire,
-        node_id,
+        &route.node_id,
         &kicks,
         definition_hash,
-        Some(program),
+        Some(&route.program),
         Some(&subgraph),
         None,
-        Some(source_version),
+        Some(&route.source_version),
         now,
     );
-    let spec_json = serde_json::to_value(spec)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec serialize: {e}")))?;
-    // The pinned execute task, unpinned here: the admission picks the pod and
-    // pins it. `live_connection` carries the trigger's full signal spec so the
-    // worker recovers the protocol + connection knobs and expects a caller.
+    let live_start = weft_task_store::kinds::LiveConnectionStart {
+        spec: route.spec.clone(),
+        request: request.clone(),
+        // A real caller is standing at the pod, so the worker waits for
+        // its socket. Only a fired run serves its own body.
+        fired: None,
+    };
+    // The execute task, pinned to the pod the caller stands at.
+    // `live_connection` carries the trigger's full signal spec (so the
+    // worker recovers the protocol + connection knobs and expects a
+    // caller) and the caller's request (so the connection carries it).
     let task = crate::task_kinds::execute::execution_task_spec(
         weft_task_store::TaskKind::Execute,
-        project_id,
+        &route.project_id,
         color,
         definition_hash,
-        &program.binary_hash,
+        &route.program.binary_hash,
         Some(tenant),
-        None,
-        Some(spec_json),
+        Some(pod_name.to_string()),
+        Some(live_start),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
 
-    // Atomic admit-and-birth; if every worker is memory-saturated, nothing was
-    // written: spawn another pod and retry (bounded). The first attempt
-    // usually wins (ensure_live_worker already guaranteed a pod exists).
-    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
-    loop {
-        use weft_task_store::tasks::LiveAdmitOutcome;
-        match state
-            .journal
-            .start_live_execution(
-                &start,
-                &kick_events,
-                task.clone(),
-                weft_platform_traits::SATURATION_MEM_FRACTION,
-            )
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
-        {
-            LiveAdmitOutcome::Admitted(pod) | LiveAdmitOutcome::AlreadyAdmitted(pod) => {
-                return Ok(pod);
-            }
-            LiveAdmitOutcome::Saturated => {}
-        }
-        // Every worker is memory-saturated: spawn another and retry.
-        spawn_worker_pod(state, project_id, tenant, &program.binary_hash).await?;
-        if std::time::Instant::now() >= deadline {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "all worker pods are memory-saturated and none freed up; retry shortly".into(),
-            ));
-        }
-        tokio::time::sleep(LIVE_SPAWN_POLL).await;
+    use weft_task_store::tasks::LiveAdmitOutcome;
+    match state
+        .journal
+        .start_live_execution(
+            &start,
+            &kick_events,
+            task,
+            weft_platform_traits::SATURATION_MEM_FRACTION,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
+    {
+        LiveAdmitOutcome::Admitted(pod) | LiveAdmitOutcome::AlreadyAdmitted(pod) => Ok(pod),
+        LiveAdmitOutcome::Saturated => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "worker pod '{pod_name}' cannot take this connection: since you were pointed \
+                 at it, it went away, started draining, filled up, or a new build landed and \
+                 it still runs the old program. Retrying helps if it was memory pressure; if \
+                 a new build landed, ask for a new connection instead."
+            ),
+        )),
     }
 }
 
@@ -2045,12 +2358,20 @@ fn row_err(e: sqlx::Error) -> (StatusCode, String) {
 /// and forwards to the pod's internal DNS with the namespace segment
 /// stripped. The signed token rides the `wct` query param. `gateway_base`
 /// is `<scheme>://<host>[:port]`.
+///
+/// The caller's OWN query string rides along in front of it, verbatim, so
+/// the request the caller resends to the worker is the request it made:
+/// the query is the caller's data, like the headers and the body, and the
+/// worker is where all three are read (`?verbose=1` on a route reaches
+/// the program's `query` port). Only a `wct` the caller itself sent is
+/// dropped, so nobody can shadow the hop's own token.
 // SYNC: pod-in-host + ns-in-first-path-segment <-> deploy/k8s/gateway.yaml (Lua host/path rewrite)
 pub(crate) fn build_pod_gateway_url(
     gateway_base: &str,
     pod_name: &str,
     namespace: &str,
     mount_path: &str,
+    raw_query: &str,
     token: &str,
 ) -> String {
     // Split scheme from host so we can inject the pod label in front of
@@ -2061,14 +2382,20 @@ pub(crate) fn build_pod_gateway_url(
     };
     let host_port = host_port.trim_end_matches('/');
     let path = mount_path.trim_start_matches('/');
-    format!("{scheme}://{pod_name}.{host_port}/{namespace}/{path}?wct={token}")
+    let carried: Vec<&str> = raw_query
+        .split('&')
+        .filter(|kv| !kv.is_empty() && *kv != "wct" && !kv.starts_with("wct="))
+        .collect();
+    let carried = if carried.is_empty() { String::new() } else { format!("{}&", carried.join("&")) };
+    format!("{scheme}://{pod_name}.{host_port}/{namespace}/{path}?{carried}wct={token}")
 }
 
 /// Ensure at least one worker pod is alive/spawning for the project, spawning
-/// one and waiting (bounded) if none exist. Does NOT admit a connection; it
-/// only guarantees a routable pod exists so the atomic admit
-/// (`admit_live_execution`) has a candidate. Admission itself (which pod,
-/// memory-saturation check) is the task insert, done by the caller.
+/// one and waiting (bounded) if none exist. Nothing is admitted here: this
+/// only guarantees the handshake has a pod to choose from
+/// (`reserve_live_pod` picks it and promises it in the same statement).
+/// The admit happens later, when the caller actually arrives at that pod,
+/// inside `birth_on_arrival`.
 async fn ensure_live_worker(
     state: &DispatcherState,
     project_id: &str,
@@ -2157,39 +2484,6 @@ async fn spawn_worker_pod(
     Ok(())
 }
 
-/// Tear down a live execution whose setup failed AFTER admission (the DNS
-/// wait): `Journal::cancel_never_claimed_execution` deletes the still-pending
-/// execute task (the task row IS the slot, so deleting it frees the slot) and
-/// journals the cancel terminals, in ONE transaction, so "task deleted" and
-/// "cancel journaled" can never disagree. If a worker CLAIMED the task in the
-/// commit-but-Err race, it owns the run AND its own terminal, so nothing is
-/// cancelled. On error, nothing was torn down: the color still HAS its task
-/// row, which is exactly the state the orphan-task sweep reconciles, so the
-/// failure is loud but leaves only reclaimable state.
-async fn teardown_unclaimed_live_execution(state: &DispatcherState, color: uuid::Uuid) {
-    let teardown = async {
-        let program = crate::api::execution::program_for_cancel(state, color).await?;
-        state
-            .journal
-            .cancel_never_claimed_execution(
-                color,
-                program.as_deref(),
-                &weft_core::exec::CancelCause::Runtime {
-                    detail: "live-connection setup failed; no worker run was created".into(),
-                },
-            )
-            .await
-    };
-    if let Err(e) = teardown.await {
-        tracing::warn!(
-            target: "weft_dispatcher::signal",
-            color = %color, error = %e,
-            "failed to tear down a failed live setup; the execution keeps its task row, \
-             which the orphan sweep reconciles"
-        );
-    }
-}
-
 /// Per-pod connection FQDN the gateway dynamic-resolves a live caller to:
 /// `<pod>.weft-workers.<ns>.svc.cluster.local:<port>`. Built from the SAME
 /// pieces the gateway's host-rewrite Lua composes (headless Service name +
@@ -2243,9 +2537,12 @@ async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (Status
 
 /// Inspector proxy: read the listener's per-signal display info.
 /// Resolves (project_id, node_id) → signal row → token →
-/// listener `/display` call. Returns 503 if the listener happens
-/// to be reaped (caller is the inspector UI; we don't spin the
-/// listener up just to render its display).
+/// listener `/display` call. Every way of having nothing to show
+/// (no signal row, no live holder, a holder that does not know the
+/// token) is one 404: the caller is the graph's trigger panel, which
+/// draws 404 as "not running, activate it", the way an infra node
+/// draws its unprovisioned state. The rest is a failure it shows
+/// verbatim. Nothing is spun up just to render a display.
 pub async fn display_signal(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -2256,72 +2553,23 @@ pub async fn display_signal(
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
     authorize_project(&state, &caller.0, id).await?;
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
-    // Resolve the pod holding this signal; if none is live (reaped while
-    // idle), 503 rather than spinning a listener up just to render the
-    // inspector display.
+    let not_listening = || {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no listener holds the trigger '{}'; activate the project to register it", weft_core::project::plain_id(&node_id)),
+        )
+    };
     let handle = state
         .listeners
         .resolve_signal(&token, &state.pg_pool)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "listener not running for this signal".into()))?;
+        .ok_or_else(not_listening)?;
     let display = crate::listener::display_signal(&handle, &token)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?
+        .ok_or_else(not_listening)?;
     Ok(Json(display))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ActionBody {
-    pub kind: String,
-    #[serde(default)]
-    pub payload: Value,
-}
-
-/// Inspector proxy: invoke a kind-specific `/action` on the
-/// listener. Returns 503 if the listener is currently reaped:
-/// actions are user-initiated and only meaningful while the
-/// listener is alive (mid-cycle invariants exist on the Pod's
-/// in-memory state).
-pub async fn action_signal(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path((project_id, node_id)): Path<(String, String)>,
-    Json(body): Json<ActionBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let id = project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
-    authorize_project(&state, &caller.0, id).await?;
-    let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
-    // Resolve the pod holding this signal; 503 if reaped (actions are
-    // only meaningful against the live in-memory state of the holder).
-    let handle = state
-        .listeners
-        .resolve_signal(&token, &state.pg_pool)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "listener not running for this signal".into()))?;
-    let resp = crate::listener::action_signal(&handle, &token, &body.kind, &body.payload)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /action: {e}")))?;
-    if let Some(routing) = &resp.routing {
-        let auth_config = if routing.auth_config.is_null() {
-            None
-        } else {
-            Some(routing.auth_config.clone())
-        };
-        sqlx::query(
-            "UPDATE signal SET auth_kind = $1, auth_config = $2 WHERE token = $3",
-        )
-        .bind(routing.auth.kind_tag())
-        .bind(auth_config.as_ref())
-        .bind(&token)
-        .execute(&state.pg_pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("update auth: {e}")))?;
-    }
-    Ok(Json(resp.result))
 }
 
 async fn lookup_signal_token_for_node(
@@ -2339,90 +2587,64 @@ async fn lookup_signal_token_for_node(
         .fetch_optional(&state.pg_pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("token lookup: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, format!("no signal for node {node_id}")))?;
+        .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{}'", weft_core::project::plain_id(node_id))))?;
     row.try_get("token")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))
 }
 
-/// Project-management auth: caller must present a signal token whose
-/// scope includes this project. Distinct from per-signal fire auth
-/// (the api_key gate); inspector actions are project-administrative.
 #[cfg(test)]
-mod auth_gate_tests {
+mod route_lookup_tests {
     use super::*;
-    use axum::http::HeaderMap;
-    use serde_json::json;
 
-    #[test]
-    fn auth_none_passes_with_no_header() {
-        let headers = HeaderMap::new();
-        assert!(apply_auth_gate("none", None, &headers).is_ok());
+    fn row(mount_path: &str, methods: &[&str], token: &str) -> RouteRow {
+        RouteRow {
+            mount_path: mount_path.into(),
+            mount_methods: methods.iter().map(|m| m.to_string()).collect(),
+            token: token.into(),
+        }
     }
 
     #[test]
-    fn auth_api_key_rejects_missing_header() {
-        let cfg = json!({
-            "header_name": "X-Api-Key",
-            "value_hash": sha256_hex("secret"),
-        });
-        let headers = HeaderMap::new();
-        let err = apply_auth_gate("api_key", Some(&cfg), &headers).expect_err("missing");
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
-        assert!(err.1.contains("missing"));
+    fn the_tenant_is_the_first_segment() {
+        assert_eq!(split_tenant("alice/chat/room7").unwrap(), ("alice", "chat/room7"));
+        assert_eq!(split_tenant("alice").unwrap(), ("alice", ""));
+        assert_eq!(split_tenant("/alice/").unwrap(), ("alice", ""));
+        assert_eq!(split_tenant("").unwrap_err().0, StatusCode::NOT_FOUND);
     }
 
     #[test]
-    fn auth_api_key_rejects_wrong_value() {
-        let cfg = json!({
-            "header_name": "X-Api-Key",
-            "value_hash": sha256_hex("secret"),
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Api-Key", "wrong".parse().unwrap());
-        let err = apply_auth_gate("api_key", Some(&cfg), &headers).expect_err("wrong");
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    fn a_literal_route_beats_a_capture_and_params_come_back() {
+        let rows = vec![
+            row("/alice/users/{id}", &[], "by-id"),
+            row("/alice/users/me", &[], "me"),
+        ];
+        let (hit, params) = resolve_route(&rows, "alice", "GET", "users/me").unwrap();
+        assert_eq!(hit.token, "me");
+        assert!(params.is_empty());
+        let (hit, params) = resolve_route(&rows, "alice", "GET", "users/42").unwrap();
+        assert_eq!(hit.token, "by-id");
+        assert_eq!(params.get("id").map(String::as_str), Some("42"));
     }
 
     #[test]
-    fn auth_api_key_accepts_correct_value() {
-        let cfg = json!({
-            "header_name": "X-Api-Key",
-            "value_hash": sha256_hex("secret"),
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Api-Key", "secret".parse().unwrap());
-        assert!(apply_auth_gate("api_key", Some(&cfg), &headers).is_ok());
+    fn a_known_path_with_the_wrong_verb_is_405_naming_the_allowed_ones() {
+        let rows = vec![row("/alice/items", &["POST", "PUT"], "w"), row("/alice/items", &["DELETE"], "d")];
+        let err = resolve_route(&rows, "alice", "GET", "items").unwrap_err();
+        assert_eq!(err.0, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(err.1.contains("DELETE, POST, PUT"), "{}", err.1);
     }
 
     #[test]
-    fn auth_api_key_uses_configured_header_name() {
-        let cfg = json!({
-            "header_name": "Authorization-Token",
-            "value_hash": sha256_hex("xyz"),
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization-Token", "xyz".parse().unwrap());
-        assert!(apply_auth_gate("api_key", Some(&cfg), &headers).is_ok());
-        // Default X-Api-Key shouldn't match.
-        let mut headers2 = HeaderMap::new();
-        headers2.insert("X-Api-Key", "xyz".parse().unwrap());
-        assert!(apply_auth_gate("api_key", Some(&cfg), &headers2).is_err());
+    fn an_unknown_path_is_404_and_the_root_route_serves_the_empty_path() {
+        let rows = vec![row("/alice", &[], "root")];
+        assert_eq!(resolve_route(&rows, "alice", "GET", "nothing").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(resolve_route(&rows, "alice", "GET", "").unwrap().0.token, "root");
     }
 
     #[test]
-    fn unknown_auth_kind_errors() {
-        let headers = HeaderMap::new();
-        let err = apply_auth_gate("hmac", None, &headers).expect_err("unknown");
-        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn ct_eq_handles_lengths() {
-        assert!(ct_eq("abc", "abc"));
-        assert!(!ct_eq("abc", "abd"));
-        assert!(!ct_eq("abc", "abcd"));
-        assert!(!ct_eq("", "x"));
-        assert!(ct_eq("", ""));
+    fn a_corrupt_stored_pattern_is_skipped_not_fatal() {
+        let rows = vec![row("/alice/bad/{", &[], "bad"), row("/alice/good", &[], "good")];
+        assert_eq!(resolve_route(&rows, "alice", "GET", "good").unwrap().0.token, "good");
     }
 }
 
@@ -2441,7 +2663,11 @@ mod public_url_tests {
             color: None,
             node_id: "n".into(),
             is_resume: false,
-            spec_json: "{}".into(),
+            // A real row always names its kind, and the address depends
+            // on it: a held connection answers under `/connect/`, a
+            // plain public fire at the bare path. `form` is the plain
+            // one; the live case has its own test below.
+            spec_json: r#"{"kind":"form"}"#.into(),
             access_id: None,
             consumer_kind: None,
             tags: vec![],
@@ -2449,6 +2675,7 @@ mod public_url_tests {
             consumer_payload: None,
             surface_kind: surface.into(),
             mount_path: mount.map(String::from),
+            mount_methods: Vec::new(),
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
@@ -2466,6 +2693,17 @@ mod public_url_tests {
         );
     }
 
+    /// A row whose spec cannot be read gets NO address rather than the
+    /// bare-path guess. The two look equally real and only one of them
+    /// works, so handing out the wrong one sends somebody to debug a
+    /// route that was answering all along somewhere else.
+    #[test]
+    fn an_unreadable_spec_yields_no_address_rather_than_a_guess() {
+        let mut s = fresh("public_entry", Some("/chat"));
+        s.spec_json = "{".into();
+        assert_eq!(s.public_url("http://localhost:9999"), None);
+    }
+
     #[test]
     fn public_entry_with_path() {
         let s = fresh("public_entry", Some("/webhooks/stripe"));
@@ -2477,11 +2715,11 @@ mod public_url_tests {
 
     #[test]
     fn live_connection_url_carries_connect_prefix() {
-        // A live-connection kind (api_endpoint) is reachable ONLY via
+        // A live-connection kind (route) is reachable ONLY via
         // /connect/...; the displayed URL must carry that prefix, unlike a
         // plain public fire.
         let mut s = fresh("public_entry", Some("/alice/chat"));
-        s.spec_json = r#"{"kind":"api_endpoint","config":{},"consumer_kind":null}"#.into();
+        s.spec_json = r#"{"kind":"route","config":{},"consumer_kind":null}"#.into();
         assert_eq!(
             s.public_url("http://localhost:9999"),
             Some("http://localhost:9999/connect/alice/chat".into())
@@ -2550,6 +2788,7 @@ mod connect_url_tests {
             "wp-abc",
             "wft-project-t--p",
             "chat",
+            "",
             "v1.aaa.bbb",
         );
         assert_eq!(
@@ -2565,6 +2804,7 @@ mod connect_url_tests {
             "wp-1",
             "ns1",
             "",
+            "",
             "tok",
         );
         assert_eq!(url, "https://wp-1.live.example.com/ns1/?wct=tok");
@@ -2572,8 +2812,18 @@ mod connect_url_tests {
 
     #[test]
     fn defaults_scheme_when_missing() {
-        let url = build_pod_gateway_url("live.example.com", "p", "n", "x", "t");
+        let url = build_pod_gateway_url("live.example.com", "p", "n", "x", "", "t");
         assert_eq!(url, "https://p.live.example.com/n/x?wct=t");
+    }
+
+    /// The caller's own query rides to the worker, which is where the
+    /// program reads it; a `wct` the caller sent cannot shadow the hop's.
+    #[test]
+    fn the_callers_query_rides_along_and_cannot_shadow_the_token() {
+        let url = build_pod_gateway_url("https://gw", "p", "n", "users/42", "verbose=1&q=a%20b", "t");
+        assert_eq!(url, "https://p.gw/n/users/42?verbose=1&q=a%20b&wct=t");
+        let url = build_pod_gateway_url("https://gw", "p", "n", "x", "wct=fake&a=1", "t");
+        assert_eq!(url, "https://p.gw/n/x?a=1&wct=t");
     }
 }
 
@@ -2622,6 +2872,7 @@ mod can_cancel_tests {
             consumer_payload: None,
             surface_kind: "public_entry".into(),
             mount_path: None,
+            mount_methods: Vec::new(),
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
@@ -2720,6 +2971,7 @@ mod signal_file_scope_tests {
             consumer_payload: None,
             surface_kind: "task_callback".into(),
             mount_path: None,
+            mount_methods: Vec::new(),
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),

@@ -44,13 +44,11 @@
       "name": "content",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "Plain-text body: one paragraph per line."
     },
     {
       "name": "blocks",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Raw Notion block objects; overrides content when set."
     }
   ],

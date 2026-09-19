@@ -88,9 +88,10 @@ pub fn loop_termination_emission(group_id: &str, parent_frames: &LoopFrames) -> 
     derived(&LOOP_TERMINATION, &[group_id, &frames_key(parent_frames)])
 }
 
-/// Frames as a stable text key (`"3.0"` for `[3, 0]`, empty at root).
+/// Frames as a stable text key (`"3.0"` for `[3, 0]`, `"@auth"` for a
+/// call, empty at root).
 fn frames_key(frames: &LoopFrames) -> String {
-    frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".")
+    crate::frames::frames_text(frames)
 }
 
 fn derived(namespace: &Uuid, parts: &[&str]) -> Uuid {
@@ -113,7 +114,7 @@ const LOOP_TERMINATION: Uuid = Uuid::from_bytes([
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::LoopIteration;
+    use crate::frames::Frame;
 
     #[test]
     fn a_pulse_id_is_a_function_of_the_emission_and_the_wire() {
@@ -134,7 +135,7 @@ mod tests {
     #[test]
     fn derived_emissions_separate_by_every_part_and_by_kind() {
         let root: LoopFrames = Vec::new();
-        let inner: LoopFrames = vec![LoopIteration { index: 2 }];
+        let inner: LoopFrames = vec![Frame::Loop { index: 2 }];
         let sweep = terminal_sweep_emission("n", &root, 0);
         assert_eq!(sweep, terminal_sweep_emission("n", &root, 0));
         assert_ne!(sweep, terminal_sweep_emission("n", &root, 1), "a second firing sweeps apart");

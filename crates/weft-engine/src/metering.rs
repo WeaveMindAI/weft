@@ -36,7 +36,7 @@
 //! exits while money is still being written down.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -58,37 +58,24 @@ use weft_providers::{
 /// down. Incremented when a metered response ends (the resolve task is
 /// spawned), decremented when its record has landed (or loudly failed).
 pub struct PendingCostRecords {
-    count: AtomicUsize,
-    zero: tokio::sync::Notify,
+    inner: Arc<weft_core::in_flight::InFlight>,
 }
 
 impl PendingCostRecords {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { count: AtomicUsize::new(0), zero: tokio::sync::Notify::new() })
+        Arc::new(Self { inner: weft_core::in_flight::InFlight::new("cost record") })
     }
 
     pub fn count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
+        self.inner.count()
     }
 
     fn begin(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        self.inner.begin();
     }
 
-    /// Release one token. A release with none held is a bookkeeping bug
-    /// in a caller (one `end` too many): it is refused and logged rather
-    /// than let the count wrap to the maximum, which would keep every
-    /// `wait_zero` (the pod's exit gate) waiting for ever.
     fn end(&self) {
-        let before = self.count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1));
-        match before {
-            Ok(1) => self.zero.notify_waiters(),
-            Ok(_) => {}
-            Err(_) => tracing::error!(
-                target: "weft_engine::metering",
-                "a cost record token was released with none held; the release is ignored"
-            ),
-        }
+        self.inner.end();
     }
 
     /// Resolve once no cost records are in flight.
@@ -101,19 +88,7 @@ impl PendingCostRecords {
     /// being written holds one until it is enqueued. So this returns as
     /// long as the executions being waited on have ended.
     pub async fn wait_zero(&self) {
-        loop {
-            // Arm BEFORE checking, so an `end` between the check and the
-            // await cannot be missed: a `Notified` future is bound at
-            // CREATION (tokio guarantees it completes for any
-            // `notify_waiters` that fires after this line, even if the
-            // future is first polled later), so the check-then-park window
-            // is covered. Pinned by the wait_zero stress test below.
-            let notified = self.zero.notified();
-            if self.count() == 0 {
-                return;
-            }
-            notified.await;
-        }
+        self.inner.wait_zero().await;
     }
 }
 

@@ -150,11 +150,11 @@
         // dependencies), and the engine refuses a setup row without one.
         let subgraph = match phase {
             weft_core::context::Phase::TriggerSetup => Some(
-                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::trigger_ids(project))
+                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::trigger_places(project))
                     .expect("setup selection"),
             ),
             weft_core::context::Phase::InfraSetup => Some(
-                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::infra_ids(project))
+                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::infra_places(project))
                     .expect("setup selection"),
             ),
             weft_core::context::Phase::Fire => None,
@@ -185,7 +185,7 @@
                 .record_event(
                     &ExecEvent::NodeKicked {
                         color,
-                        node_id: node.to_string(),
+                        node_id: node.to_string(), frames: vec![],
                         firing,
                         payload: firing.then(|| json!({"fired": true})),
                         port_snapshot: None,
@@ -451,7 +451,7 @@
             .record_event(
                 &ExecEvent::NodeKicked {
                     color,
-                    node_id: "trig".into(),
+                    node_id: "trig".into(), frames: vec![],
                     firing: true,
                     payload: Some(json!({ "messageId": "m-7" })),
                     port_snapshot: Some(json!({ "endpointUrl": "http://bridge" })),

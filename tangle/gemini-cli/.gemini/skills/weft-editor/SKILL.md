@@ -1,22 +1,27 @@
 ---
 name: weft-editor
-description: The VS Code weft extension surface, the graph view and everything in it. Read when telling the user where to click or what they are looking at: toolbar, action bar, palette, context menus, editing gestures, groups and loops in the graph, run and replay, the inspector, connect flow, problems panel. Labels are verbatim from the extension.
+description: "Read when telling the user where to click or what they are looking at in VS Code: the toolbar, the action bar, the palette, context menus, editing gestures, groups and loops in the graph, run and replay, the inspector, the connect flow, the problems panel. Labels are verbatim from the extension, except an infra node's live card, whose buttons the running container names."
 ---
 
 # The editor surface
 
-Everything below is the VS Code extension as the user sees it, labels
-verbatim. `.weft` files open as the graph by default (a stray text tab is
-closed automatically); the "Source" button is the intentional text view. The
-extension talks to the dispatcher at `http://localhost:9999` (setting
-`weft.dispatcherUrl`).
+Everything below is the VS Code extension as the user sees it, and every
+quoted label is verbatim. When you tell the user where to click, you quote
+the label from this file. If you catch yourself naming a button, menu
+entry or toast that is not quoted here, stop and write: "Wait. Labels are
+verbatim." Then quote the one that is, or tell the user the extension has
+no such control.
+
+`.weft` files open as the graph by default (a stray text tab is closed
+automatically); the "Source" button is the text view. The extension talks
+to the dispatcher at `http://localhost:9999` (setting `weft.dispatcherUrl`).
 
 ## Where things live
 
 - **Activity bar, icon "Weft"**: two sidebar views.
   - **Projects**: one row per `.weft` file in the workspace (label = folder
     name). Click to pin and open its graph; inline buttons "Open in Editor"
-    and "Run"; title-bar "Refresh".
+    and "Run Project"; title-bar "Refresh".
   - **Executions**: runs of the pinned project, newest first (paged, "Load
     more (N more)" at the bottom). Row = status icon, entry node, time;
     tooltip = the color id. Inline "View in Graph" and "Delete"; title-bar
@@ -33,17 +38,17 @@ extension talks to the dispatcher at `http://localhost:9999` (setting
   dot colored by its type (String gray, Number blue, Boolean rose, files
   gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber,
   MustOverride red); a required input carries a `*`.
-- **The small square top-left of every box** is `_should_flow`, the port
-  that decides whether it runs: filled when something answers it, hollow
-  when nothing does.
+- **The small amber arrow top-left of every box** is `_should_flow`, the
+  port that decides whether it runs: filled when something answers it,
+  hollow when nothing does.
 - **Wires** are arrows colored by the source port's type.
-- **Groups** are large boxes ("GROUP" header) that hold child nodes;
-  collapsed they become a chip with the label and an expand button, and
-  their description line shows when collapsed. **Loops** render violet with
-  a rotate icon, their config knobs in a strip under the header, implicit
-  `index` and `done` ports on the rails, carry ports marked ↻.
-  **@include blocks** are violet with the filename; their "Open" button
-  navigates into that file and the toolbar grows a "Return · <file>" button.
+- **Groups** are large boxes ("GROUP" header) holding child nodes;
+  collapsed they become a chip with the label, an expand button, and the
+  description line. **Loops** render violet with a rotate icon, their
+  config knobs in a strip under the header, implicit `index` and `done`
+  ports on the rails, carry ports marked ↻. **@include blocks** are violet
+  with the filename; their "Open" button navigates into that file and the
+  toolbar grows a "Return · <file>" button.
 - **Access nodes** (TelegramAccess and friends) show a "Connect
   <Service>..." button in their body; one with a required, unpicked
   connection pins open (expanded, collapse disabled, "Pick a connection
@@ -53,61 +58,61 @@ extension talks to the dispatcher at `http://localhost:9999` (setting
   prints.
 - **Debug nodes** render their latest value inline; media nodes render the
   image, an audio/video player, or a download card.
-- **Status glows**: amber while running, cyan while waiting for input,
-  green when completed or skipped, red when failed.
+- **Status glows**: amber running, cyan waiting for input, green completed
+  or skipped, red failed.
 
 ## Toolbar and action bar
 
 Top-left floating toolbar: "Return · <file>" (inside an @include), "N new
-execution(s) · Catch up" (runs started while pinned), the pin pill ("Live ·
-<color>" following the newest run, "Pinned · <color>" locked to one; click
-to switch), and **"Source"** (opens the text beside the graph; click again
-to focus it).
+execution(s) · Catch up" (runs started while pinned), the [pin pill]
+("Live · <color>" following the newest run, "Pinned · <color>" locked to
+one; click to switch), and **"Source"** (opens the text beside the graph;
+click again to focus it).
 
 Top-right: **"Simplified view"** toggle. On: square, read-only nodes (toast
 "Switch to the builder view to edit the graph"), one dot per side, for
-reading and showing rather than building. Builder and simplified keep
-separate saved positions.
+reading and showing. Builder and simplified keep separate saved positions.
 
-Bottom-center action bar, contextual slots:
+Bottom-center action bar, contextual slots. [the pre-flight] runs before
+Run, Activate, or Resync is sent: a runtime validation through the warm
+parse-server, where an unpicked connection and cousins land on the bar's
+error banner (the complete list, each entry clickable to its file and
+line) and the verb is not sent, so a build that cannot run never starts.
 
 - **Infra slot** (when the project has infra): "Start Infra" / "Stop
   Infra" / "Upgrade Infra" (amber, when source changed since start) /
   terminate (trash). An eye toggle "Show infrastructure subgraph" dims
   everything except the infra closure.
 - **Run slot**: "Run Project" (or "Run 1 target" / "Run N targets" once
-  targets are set). Before Run, Activate, or Resync is sent, the editor
-  runs a runtime validation through the warm parse-server: an unpicked
-  connection and cousins land on the bar's error banner (the complete
-  list, each entry clickable to its file and line) and the verb is not
-  sent. Nothing is wasted on a build that cannot run. While working the
-  button becomes its own cancel: "Building...", "Cached, loading...",
-  "Provisioning infra...", "Running...". While following a live run it is
-  "Stop Execution".
+  targets are set). While working the button becomes its own cancel:
+  "Building...", "Cached, loading...", "Provisioning infra...",
+  "Running...". While following a live run it is "Stop Execution".
 - **Trigger slot** (when the source declares triggers): "Activate" /
   "Deactivate" / "Resync" (amber "Out of sync" when the project changed
-  since activation; Resync is gated by the same runtime pre-flight). An
-  eye toggle "Show trigger subgraph". Deactivating
+  since activation). An eye toggle "Show trigger subgraph". Deactivating
   opens the picker "Deactivate: how should triggers come down?": **Park**
   (submissions wait indefinitely), **Hibernate** (grace window, then
   refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
   do with running executions. Reactivating offers "Execute parked + keep
   suspensions", "Keep suspensions only", "Wipe all".
 
-Banners above the bar: a red one for a failed verb (click for full
-diagnostics), an amber one for infra drift ("Infrastructure has changed.
-Click Upgrade to apply."), an indigo "Graph locked while ..." while a verb
-owns the graph.
+Banners above the bar: red for a failed verb (click for full diagnostics),
+amber for infra drift ("Infrastructure has changed. Click Upgrade to
+apply."), indigo "Graph locked while ..." while a verb owns the graph.
 
 ## The in-graph palette (Ctrl+P or Cmd+P)
 
 "Search nodes and actions...". The **Actions** section: Undo (Ctrl+Z),
 Redo, Duplicate Selected, Delete Selected, Select All Nodes, Fit View, Auto
 Organize Layout. The **Nodes** section: every type in the project's catalog
-with a preview panel (description, input chips, output chips, tags). This
-is how nodes are added by hand.
+with a preview panel (description, input chips, output chips, tags).
 
 ## Editing in the builder view
+
+Every GUI edit is a structured edit applied through the compiler, so the
+text and the picture cannot drift, and Ctrl+Z undoes in either view.
+Simplified view refuses structure edits with "Simplified view is
+read-only (you can still move, expand, and collapse).".
 
 - **Add a node**: palette, or right-click the canvas "Add Node...
   (Ctrl+P)".
@@ -135,51 +140,52 @@ is how nodes are added by hand.
   and "Set as target" / "Unset target" (any node). On an infra node:
   "Stop this node" (scales to zero, keeps disks) and "Terminate this node"
   (destroys them), both behind a confirmation.
+- **An infra node's card**: while its container runs, the node's body shows
+  readouts of its live state and a button for each way out of a state it can
+  sit in. Those come from the RUNNING container, not from this file, so their
+  labels are the node's to name and you read them off the card in front of
+  you rather than quoting them from here. A secret it is showing you once
+  renders masked, with buttons to reveal and to copy.
 - **Rename**: double-click a node's label or a group's header.
 - **Groups and loops**: the expand/collapse toggle on the box; "Auto
   Organize Layout" in the palette reflows; positions persist under
   `layouts/` (never in the source).
-- Every GUI edit is a structured edit applied through the compiler, so the
-  text and the picture cannot drift, and Ctrl+Z undoes in either view.
-- Simplified view refuses structure edits with "Simplified view is
-  read-only (you can still move, expand, and collapse).".
 
 Keyboard: Ctrl+P palette, **Ctrl+Enter run**, Ctrl+Z/Y undo/redo, Ctrl+A
-select, Ctrl+D duplicate, Del delete, Esc closes the palette and drops a wire you are dragging. Zoom is Ctrl/Cmd+wheel
-(5% to 200%); the bottom-left controls carry zoom, fit, and lock.
+select, Ctrl+D duplicate, Del delete, Esc closes the palette and drops a
+wire you are dragging. Zoom is Ctrl/Cmd+wheel (5% to 200%); the
+bottom-left controls carry zoom, fit, and lock.
 
 ## Running and watching
 
 The Run button runs the pinned project's ordinary roots, or the selected
 work when a cut is set. Triggers need an explicit fire or supplied outputs.
-Each node glows as it fires, values travel the
-wires, and the Executions list gains the run. Click any node to open the
-**inspector**: status, duration, cost ("$0.0123 (own key)"), the exact
-inputs and outputs of that firing as JSON trees, closed ports shown as
-"(closed)", skip reasons in plain words ("its `_should_flow` said no", "the
-required input 'x' closed", "the scope 'x' it lives in did not run"),
-error boxes, bus and loop activity panels, and a firing navigator
-("‹ 2/5 iter 5/2 ›") for nodes that fired several times. The Copy button
-exports the whole inspection.
+The run lands in the Executions list. Clicking any node opens [the inspector]: status,
+duration, cost ("$0.0123 (own key)"), the exact inputs and outputs of that
+firing as one card per port (a long value expands, copies, and selects
+whole on a double-click), closed ports greyed out, skip reasons in plain
+words ("its `_should_flow` said no", "the required input 'x' closed",
+"the scope 'x' it lives in did not run"), error boxes, bus and loop activity
+panels, and a firing navigator ("‹ 2/5 iter 5/2 ›") for nodes that fired
+several times. The Copy button exports the whole inspection.
 
-Past runs: the Executions view, "View in Graph" replays the run in the
-graph with every value in place; the pin pill says which run is on screen,
-and "Catch up" jumps to the newest. From the terminal the same facts are
-`weft executions`, `weft events <color>`, `weft logs` (the `weft-running`
-skill).
+Past runs: in the Executions view, "View in Graph" replays the run in the
+graph with every value in place; the [pin pill] says which run is on
+screen, and "Catch up" jumps to the newest. From the terminal the same
+facts are `weft executions`, `weft events <color>`, `weft logs` (the
+`weft-running` skill).
 
 ## Diagnostics and AI edits
 
 As the user types (or as `nodes/` changes), the structural validation runs
 on a short debounce and the Problems panel fills with the same
 `line:column message` diagnostics the CLI prints. The panel is
-structural-only by design: runtime findings (an unpicked connection)
-never squiggle source, because their fix is not in the text; the action
-bar's pre-flight gate is where they are shown. A diagnostic may name
-another file than the one being edited (a node spliced in by `@include`
-keeps its own file's coordinates). The graph keeps showing
-the last good render with a problems pill ("N problems") until the source
-compiles again (hint on the pill: stale node copies cause most catalog
-errors, run `weft catalog update`). An AI chat extension can stream
-SEARCH/REPLACE edits into the open file and the graph updates as each
-block lands (setting `weft.ai.streamingEditsEnabled`).
+structural-only: runtime findings (an unpicked connection) never squiggle
+source, because their fix is not in the text; [the pre-flight] shows them.
+A diagnostic may name another file than the one being edited (a node
+spliced in by `@include` keeps its own file's coordinates). The graph
+keeps showing the last good render with a problems pill ("N problems")
+until the source compiles again (hint on the pill: stale node copies cause
+most catalog errors, run `weft catalog update`). An AI chat extension can
+stream SEARCH/REPLACE edits into the open file and the graph updates as
+each block lands (setting `weft.ai.streamingEditsEnabled`).

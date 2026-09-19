@@ -11,15 +11,16 @@
 //!      / `resume` are spawned in the background (per-task heartbeat
 //!      keeps the claim alive while they run). `cancel_execution`
 //!      runs inline against the pod-local cancel registry.
-//!   4. On shutdown: cancel every in-flight execution, await their
-//!      tokio tasks, mark the row done.
+//!   4. On shutdown: cancel every in-flight execution through the same
+//!      call a user's cancel makes, wait for those executions to write
+//!      their endings, settle the money, mark the row done.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -272,8 +273,16 @@ impl Drop for HeldColor {
 /// the execute path and read by the connection server's resolver. Uses a
 /// std (sync) mutex: the resolver trait is sync and the critical section
 /// is a map lookup, never held across an await.
-type LiveConfigMap =
-    Arc<std::sync::Mutex<HashMap<Color, (weft_core::caller::CallerRuntimeConfig, u64)>>>;
+/// What a live execution registers for the connection server before its
+/// caller attaches: the runtime config, the heartbeat interval, and the
+/// caller's opening request from the start record.
+struct LiveStart {
+    runtime: weft_core::caller::CallerRuntimeConfig,
+    heartbeat_secs: u64,
+    request: Arc<weft_core::caller::LiveRequest>,
+}
+
+type LiveConfigMap = Arc<std::sync::Mutex<HashMap<Color, Arc<LiveStart>>>>;
 
 /// Insertion-ordered cache bounded to `CAP` entries. On overflow it
 /// evicts the oldest-inserted hash. Not a true LRU (no per-get reorder):
@@ -361,7 +370,9 @@ pub async fn run_pod(
             cancel_registry.clone(),
             clients.clock.clone(),
             clients.journal.clone(),
+            clients.tasks.clone(),
             pod_name.clone(),
+            tenant_id.clone(),
             secret,
             connection_port,
         ),
@@ -403,6 +414,10 @@ pub async fn run_pod(
         pending_costs: pending_costs.clone(),
         open_charges: open_charges.clone(),
     });
+    // Every execution and resume this pod drives runs detached from the
+    // picker; this is the count of them, and the gate the shutdown below
+    // waits on.
+    let background = weft_core::in_flight::InFlight::new("worker execution");
     run_worker_picker(
         picker_tasks,
         ctx,
@@ -412,36 +427,89 @@ pub async fn run_pod(
         shutdown.clone(),
         idle_exit,
         WORKER_IDLE_EXIT,
+        background.clone(),
     )
     .await;
 
-    // Pod-wide shutdown: cancel every in-flight execution. The
-    // execution_driver checks the flag at every iteration top,
-    // finishes its in-flight node tokio tasks, and exits. The picker
-    // has already returned (run_worker_picker observes shutdown above).
-    let flags: Vec<_> = {
+    // Pod-wide shutdown: cancel every in-flight execution, through the
+    // SAME call the dispatcher's cancel task makes, so a shutdown and a
+    // user's cancel stop an execution the one way.
+    let colors: Vec<Color> = {
         let g = cancel_registry.lock().await;
-        g.values().cloned().collect()
+        g.keys().copied().collect()
     };
-    for f in flags {
-        f.cancel_because(weft_core::exec::CancelCause::Runtime {
-            detail: "the worker pod running this execution was shutting down".into(),
-        });
+    for color in colors {
+        cancel_color(
+            &cancel_registry,
+            color,
+            weft_core::exec::CancelCause::Runtime {
+                detail: "the worker pod running this execution was shutting down".into(),
+            },
+        )
+        .await;
     }
     shutdown.store(true, Ordering::Relaxed);
+    // Then WAIT for them. A cancel asks an execution to stop; it does
+    // not stop it. The driver checks the flag at the top of each
+    // iteration, lets its in-flight node tasks finish, folds the journal
+    // and writes the terminal row. Exiting before that leaves executions
+    // with no ending recorded and their task rows claimed until a lease
+    // lapses, which is the state this pod is shutting down BECAUSE of.
+    //
+    // No deadline: what is being waited on is the tail of work that has
+    // already been told to stop, and every node task is itself bounded
+    // by the cancellation it was just handed.
+    background.wait_zero().await;
     // Money bookkeeping outlives the executions: wait for every in-flight
     // cost resolution to land its record before the row is marked done.
     // Each resolve is internally bounded (request timeout + fixed ledger
     // budget), so this wait always ends.
     //
-    // A charge still open here is a call that spent and whose amount no
-    // response ever stated (a job submitted and never read back). The pod
-    // is going away, so nothing can arrive to price it: book it as the
-    // unknown it is, before the wait, so the row still lands.
+    // A charge still open once the executions have ended is a call that
+    // spent and whose amount no response ever stated (a job submitted and
+    // never read back). The pod is going away, so nothing can arrive to
+    // price it: book it as the unknown it is, before the wait, so the row
+    // still lands.
     open_charges.flush("the worker pod shut down before the job was read back");
     pending_costs.wait_zero().await;
     let _ = worker_pods.mark_done(&pod_name).await;
     Ok(())
+}
+
+/// Stop one execution running on this pod: the single place a cancel is
+/// applied, whether it came from a person (`weft stop`, the graph's
+/// Cancel), from a deactivate, or from the pod shutting itself down.
+///
+/// Firing the flag is the whole of it. The driver owns what happens
+/// next: it notices at the top of its next iteration, lets the node
+/// tasks it already started finish, closes the charges they opened, and
+/// writes the execution's terminal row.
+///
+/// An unknown color is not an error. The execution finished on its own
+/// between the dispatcher reading this pod's row and the cancel landing,
+/// and the run already has its natural ending.
+async fn cancel_color(
+    registry: &CancelRegistry,
+    color: Color,
+    cause: weft_core::exec::CancelCause,
+) {
+    let flag = registry.lock().await.get(&color).cloned();
+    match flag {
+        Some(f) => {
+            tracing::info!(
+                target: "weft_engine::run_pod",
+                color = %color,
+                cause = %cause,
+                "firing per-color cancel flag"
+            );
+            f.cancel_because(cause);
+        }
+        None => tracing::debug!(
+            target: "weft_engine::run_pod",
+            color = %color,
+            "cancel for unknown color (already terminal); no-op"
+        ),
+    }
 }
 
 /// Background heartbeat. Sets `shutdown` to true if the worker_pod
@@ -517,53 +585,212 @@ fn spawn_heartbeat(
 /// non-durable, so a best-effort spawn matches the design: the exchange
 /// is observable/replayable, not a resume-critical durability story.
 struct BrokerCallerJournal {
-    journal: Arc<dyn weft_journal::JournalClient>,
-    pod_name: String,
+    /// Rows go out through ONE writer task, in the order they were
+    /// handed over. Two spawned writes would race, and the pair that
+    /// races is exactly the pair whose order carries meaning: the window
+    /// holding a conversation's last messages, and the row saying the
+    /// caller hung up. A reader would see the goodbye before the words.
+    rows: tokio::sync::mpsc::UnboundedSender<weft_journal::ExecEvent>,
+    /// Why this conversation's journal stopped working, once it has.
+    /// The next thing the program tries to send the caller fails with
+    /// it, the same way a bus whose journal failed refuses the next
+    /// send: a run that finishes looking clean while its exchange is
+    /// missing from the record is the silent loss both exist to stop.
+    degraded: Arc<std::sync::Mutex<Option<String>>>,
+    /// What the journal keeps of this conversation: the same policy
+    /// type a bus carries, so the two cannot drift on where content
+    /// gets trimmed or on what "ephemeral" means.
+    policy: weft_core::stream_journal::JournalPolicy,
+    pending: std::sync::Mutex<PendingCallerWindow>,
+}
+
+/// Messages said since the last row went out.
+#[derive(Default)]
+struct PendingCallerWindow {
+    /// One connection is one execution, so the color is the same for
+    /// every message; kept from the first one rather than passed to the
+    /// flush.
+    color: Option<Color>,
+    messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
+    /// What the messages above already weigh, so a window closes on
+    /// size as well as on time (see `JOURNAL_ROW_BYTES`).
+    kept_bytes: usize,
+    /// The exchange is over: the ticker can stop.
+    closed: bool,
 }
 
 impl BrokerCallerJournal {
-    fn emit(&self, event: weft_journal::ExecEvent) {
-        let journal = self.journal.clone();
-        let pod = self.pod_name.clone();
+    /// Build the sink and start its window clock. The clock stops when
+    /// the exchange ends or when the connection drops the sink,
+    /// whichever comes first, so a conversation never leaves a task
+    /// behind.
+    fn start(
+        journal: Arc<dyn weft_journal::JournalClient>,
+        pod_name: String,
+        policy: weft_core::stream_journal::JournalPolicy,
+    ) -> Arc<Self> {
+        let (rows, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        let degraded: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        // The writer. One task, one row at a time, awaited: the queue IS
+        // the ordering. It ends when the sink drops and the channel
+        // closes, so a conversation never leaves a task behind.
+        let writer_degraded = degraded.clone();
         tokio::spawn(async move {
-            if let Err(e) = journal.record_event(&event, Some(&pod)).await {
-                tracing::warn!(
-                    target: "weft_engine::caller_conn",
-                    error = %e,
-                    "failed to journal caller event"
-                );
+            while let Some(event) = incoming.recv().await {
+                if let Err(e) = journal.record_event(&event, Some(&pod_name)).await {
+                    tracing::error!(
+                        target: "weft_engine::caller_conn",
+                        error = %e,
+                        "caller journal write failed; the exchange is no longer being recorded"
+                    );
+                    let mut slot = writer_degraded.lock().expect("caller journal degraded");
+                    // Keep the FIRST reason: it is the one that explains
+                    // the gap, and the ones after it are its echoes.
+                    slot.get_or_insert_with(|| format!("journal write failed: {e}"));
+                }
             }
         });
+        let sink = Arc::new(Self {
+            rows,
+            degraded,
+            policy,
+            pending: std::sync::Mutex::new(PendingCallerWindow::default()),
+        });
+        let weak = Arc::downgrade(&sink);
+        let window = policy.window;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(window);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(sink) = weak.upgrade() else { return };
+                if sink.closed() {
+                    return;
+                }
+                sink.flush();
+            }
+        });
+        sink
+    }
+
+    fn closed(&self) -> bool {
+        self.pending.lock().expect("caller journal buffer").closed
+    }
+
+    /// Hold one message for the open window. What the journal keeps of
+    /// it is decided here rather than at flush time, so an oversized
+    /// payload is cut once and the buffer never holds more than the
+    /// journal will.
+    fn hold(
+        &self,
+        color: Color,
+        offset: u64,
+        direction: weft_core::stream_journal::CallerDirection,
+        payload: &weft_core::bus::WirePayload,
+        terminal: bool,
+    ) {
+        let kept = weft_core::stream_journal::record(payload, &self.policy);
+        let weighs = kept.kept_bytes();
+        // A window closes on whichever comes first, its clock or its
+        // size: a chatty socket can otherwise put more in one second
+        // than one journal row may carry, and the row is then refused
+        // for ever. Flushed BEFORE this message joins, so it opens the
+        // next window rather than overflowing this one.
+        let full = {
+            let pending = self.pending.lock().expect("caller journal buffer");
+            self.policy.row_is_full(pending.kept_bytes, weighs)
+        };
+        if full {
+            self.flush();
+        }
+        let mut pending = self.pending.lock().expect("caller journal buffer");
+        pending.color.get_or_insert(color);
+        pending.kept_bytes += weighs;
+        pending.messages.push(weft_core::stream_journal::WindowedCallerMessage {
+            offset,
+            direction,
+            payload: kept.payload,
+            payload_byte_size: kept.byte_size,
+            trimmed: kept.trimmed,
+            terminal,
+            at_unix: crate::now_unix(),
+        });
+    }
+
+    /// Write the open window, if it holds anything.
+    fn flush(&self) {
+        let (color, messages) = {
+            let mut pending = self.pending.lock().expect("caller journal buffer");
+            if pending.messages.is_empty() {
+                return;
+            }
+            pending.kept_bytes = 0;
+            (pending.color, std::mem::take(&mut pending.messages))
+        };
+        let Some(color) = color else { return };
+        let Some(window) = weft_core::stream_journal::aggregate_caller_window(messages) else {
+            return;
+        };
+        self.emit(weft_journal::ExecEvent::CallerWindow {
+            color,
+            first_offset: window.first_offset,
+            last_offset: window.last_offset,
+            messages: window.messages,
+            totals: window.totals,
+            at_unix: window.last_at_unix,
+        });
+    }
+
+    /// A lifecycle row (connected, errored, disconnected) goes out on
+    /// its own, so the open window is written first: the row stream
+    /// must never say a thing happened before something it followed.
+    /// Both land on the one queue, in this order, and the writer keeps
+    /// them in it.
+    fn emit_after_flush(&self, event: weft_journal::ExecEvent) {
+        self.flush();
+        self.emit(event);
+    }
+
+    /// Hand one row to the writer. The send only fails once the writer
+    /// is gone, which happens when this sink is being dropped, so there
+    /// is nothing left to tell.
+    fn emit(&self, event: weft_journal::ExecEvent) {
+        let _ = self.rows.send(event);
     }
 }
 
-/// Project an `OutboundChunk`/`InboundMessage` into the journal payload
-/// plus its byte size, using the same tagged `WirePayload` vocabulary
-/// (and the same size derivation) as the bus's window rows, so the two
-/// journaled-event paths can never drift.
-fn caller_payload(value: serde_json::Value) -> (weft_core::bus::WirePayload, u64) {
-    let payload = weft_core::bus::WirePayload::Json(value);
-    let size = payload.byte_size();
-    (payload, size)
-}
-
-fn inbound_to_value(msg: &InboundMessage) -> serde_json::Value {
+/// Project an `InboundMessage` into the journal's payload vocabulary.
+/// Bytes stay bytes: what the journal keeps of them is one rule for
+/// every channel and it lives in `stream_journal`, not here, so a
+/// conversation and a bus cannot answer it differently.
+fn inbound_payload(msg: &InboundMessage) -> weft_core::bus::WirePayload {
     match msg {
-        InboundMessage::Json(v) => v.clone(),
-        InboundMessage::Text(s) => serde_json::Value::String(s.clone()),
-        InboundMessage::Bytes(b) => serde_json::json!({ "bytes": b.len() }),
+        InboundMessage::Json(v) => weft_core::bus::WirePayload::Json(v.clone()),
+        InboundMessage::Text(s) => {
+            weft_core::bus::WirePayload::Json(serde_json::Value::String(s.clone()))
+        }
+        InboundMessage::Bytes(b) => {
+            weft_core::bus::WirePayload::Bytes(bytes::Bytes::from(b.clone()))
+        }
     }
 }
 
-fn outbound_to_value(chunk: &OutboundChunk) -> serde_json::Value {
+fn outbound_payload(chunk: &OutboundChunk) -> weft_core::bus::WirePayload {
     match chunk {
-        OutboundChunk::Json(v) => v.clone(),
-        OutboundChunk::Text(s) => serde_json::Value::String(s.clone()),
-        OutboundChunk::Bytes(b) => serde_json::json!({ "bytes": b.len() }),
+        OutboundChunk::Json(v) => weft_core::bus::WirePayload::Json(v.clone()),
+        OutboundChunk::Text(s) => {
+            weft_core::bus::WirePayload::Json(serde_json::Value::String(s.clone()))
+        }
+        OutboundChunk::Bytes(b) => {
+            weft_core::bus::WirePayload::Bytes(bytes::Bytes::from(b.clone()))
+        }
     }
 }
 
 impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
+    fn degraded(&self) -> Option<String> {
+        self.degraded.lock().expect("caller journal degraded").clone()
+    }
     fn connected(&self, color: Color, offset: u64, protocol: weft_core::signal::Protocol) {
         self.emit(weft_journal::ExecEvent::CallerConnected {
             color,
@@ -573,14 +800,13 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         });
     }
     fn inbound(&self, color: Color, offset: u64, msg: &weft_core::caller::InboundMessage) {
-        let (payload, size) = caller_payload(inbound_to_value(msg));
-        self.emit(weft_journal::ExecEvent::CallerInbound {
+        self.hold(
             color,
             offset,
-            payload,
-            payload_byte_size: size,
-            at_unix: crate::now_unix(),
-        });
+            weft_core::stream_journal::CallerDirection::Inbound,
+            &inbound_payload(msg),
+            false,
+        );
     }
     fn outbound(
         &self,
@@ -589,18 +815,16 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         chunk: &weft_core::caller::OutboundChunk,
         terminal: bool,
     ) {
-        let (payload, size) = caller_payload(outbound_to_value(chunk));
-        self.emit(weft_journal::ExecEvent::CallerOutbound {
+        self.hold(
             color,
             offset,
-            payload,
-            payload_byte_size: size,
+            weft_core::stream_journal::CallerDirection::Outbound,
+            &outbound_payload(chunk),
             terminal,
-            at_unix: crate::now_unix(),
-        });
+        );
     }
     fn errored(&self, color: Color, offset: u64, message: &str) {
-        self.emit(weft_journal::ExecEvent::CallerErrored {
+        self.emit_after_flush(weft_journal::ExecEvent::CallerErrored {
             color,
             offset,
             message: message.to_string(),
@@ -608,12 +832,16 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         });
     }
     fn disconnected(&self, color: Color, offset: u64, reason: &str) {
-        self.emit(weft_journal::ExecEvent::CallerDisconnected {
+        // The exchange is over: write what is held, say so, and let the
+        // window clock stop. Nothing said after this can be lost,
+        // because nothing is said after this.
+        self.emit_after_flush(weft_journal::ExecEvent::CallerDisconnected {
             color,
             offset,
             reason: reason.to_string(),
             at_unix: crate::now_unix(),
         });
+        self.pending.lock().expect("caller journal buffer").closed = true;
     }
 }
 
@@ -628,25 +856,24 @@ struct LiveConfigResolver {
 }
 
 impl crate::caller_conn::ConnConfigResolver for LiveConfigResolver {
-    fn resolve(
-        &self,
-        color: Color,
-    ) -> Option<(
-        weft_core::caller::CallerRuntimeConfig,
-        u64,
-        Arc<dyn crate::caller_conn::CallerJournalSink>,
-    )> {
-        let (cfg, heartbeat) = self
+    fn resolve(&self, color: Color) -> Option<crate::caller_conn::ResolvedLiveStart> {
+        let start = self
             .live_configs
             .lock()
             .expect("live_configs poisoned")
             .get(&color)
             .cloned()?;
-        let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = Arc::new(BrokerCallerJournal {
-            journal: self.journal.clone(),
-            pod_name: self.pod_name.clone(),
-        });
-        Some((cfg, heartbeat, sink))
+        let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
+            self.journal.clone(),
+            self.pod_name.clone(),
+            start.runtime.journal,
+        );
+        Some(crate::caller_conn::ResolvedLiveStart {
+            config: start.runtime.clone(),
+            heartbeat_secs: start.heartbeat_secs,
+            request: start.request.clone(),
+            journal: sink,
+        })
     }
 }
 
@@ -681,7 +908,9 @@ fn spawn_connection_server(
     cancel_registry: CancelRegistry,
     clock: Arc<dyn weft_platform_traits::Clock>,
     journal: Arc<dyn weft_journal::JournalClient>,
+    tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     pod_name: String,
+    tenant_id: String,
     token_secret: Vec<u8>,
     port: u16,
 ) {
@@ -696,6 +925,8 @@ fn spawn_connection_server(
         }),
         clock,
         canceller: Arc::new(RegistryCanceller { cancel_registry }),
+        tasks,
+        tenant_id,
     };
     tokio::spawn(async move {
         if let Err(e) = crate::caller_conn::serve(state, port).await {
@@ -756,19 +987,24 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         };
 
         // Live-connection executions carry their trigger's `live_connection`
-        // config. Register the runtime config so the connection server can
-        // build the connection when the caller's socket attaches, then wait
-        // (bounded by the connect timeout) for the attach so `ctx.caller()`
-        // resolves. A no-show leaves `caller = None`; the run proceeds and
-        // any node that needs the caller fails loud via the handle's
-        // `ensure_connected()`.
+        // start record. Register the runtime config + the caller's request
+        // so the connection server can build the connection when the
+        // caller's socket attaches, then wait (bounded by the connect
+        // timeout) for the attach so `ctx.caller()` resolves. A no-show
+        // leaves `caller = None`; the run proceeds and any node that needs
+        // the caller fails loud via the handle's `ensure_connected()`. A
+        // malformed record is a dispatcher/worker mismatch: the execution
+        // fails rather than running as if nobody were on the line.
         let caller = match &payload.live_connection {
-            Some(spec_json) => attach_live_caller(ctx, color, spec_json).await,
+            Some(start) => attach_live_caller(ctx, color, start).await?,
             None => None,
         };
-        // Keep a clone so we can surface a run failure to the caller after
-        // the execution returns (the connection itself moves into the run).
-        let caller_for_error = caller.clone();
+        // Keep the connection so we can end the exchange with the caller
+        // after the execution returns (the run takes its own reference).
+        // Only a REAL caller needs this: a fired run's exchange is over
+        // the moment the program answers, with no socket left to tell.
+        let caller_after_run = caller.as_ref().and_then(RunCaller::live);
+        let caller = caller.map(|c| c.as_connection());
 
         let outcome = run_one_execution(
             project,
@@ -779,31 +1015,37 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             ctx.tenant_id.clone(),
             ctx.namespace.clone(),
             flag,
-            caller.map(|c| c as Arc<dyn weft_core::caller::CallerConnection>),
+            caller,
         )
         .await;
 
-        // A caller is attached and the run did not complete: tell it why
-        // (per the error mode) instead of leaving a silently dropped
-        // socket. A driver error, a failed node, a cancel, a stuck graph,
-        // and a color that was already settled before this task claimed
-        // it all end the same way for the caller: no answer is coming.
+        // A caller is attached and the run is over: the exchange ends
+        // now, never when the worker exits. A run that did not complete
+        // tells the caller why (per the error mode) instead of leaving a
+        // silently dropped socket: a driver error, a failed node, a
+        // cancel, a stuck graph, and a color that was already settled
+        // before this task claimed it all end the same way for the
+        // caller, no answer is coming. A run that completed (or stalled
+        // into a background job, which resumes without a caller) ends
+        // the exchange the way the program left it: a finished stream, a
+        // closed socket, or a loud "never answered" on a silent route.
         // Safe after the run returned: the outbound queue drops a push
         // once the caller was answered or closed, so a run that already
         // spoke its last word is not double-messaged.
-        if let Some(conn) = &caller_for_error {
-            let why = match &outcome {
-                Err(e) => Some(format!("execution failed: {e}")),
-                Ok(ExecutionOutcome::Failed { error }) => Some(format!("execution failed: {error}")),
-                Ok(ExecutionOutcome::Cancelled { cause }) => Some(format!("execution cancelled: {cause}")),
-                Ok(ExecutionOutcome::Stuck { report }) => Some(report.to_string()),
-                Ok(ExecutionOutcome::AlreadySettled) => Some(
-                    "execution already ended before this worker claimed it".to_string(),
-                ),
-                Ok(ExecutionOutcome::Completed) | Ok(ExecutionOutcome::Stalled) => None,
-            };
-            if let Some(why) = why {
-                conn.surface_error(&why).await;
+        if let Some(conn) = &caller_after_run {
+            match &outcome {
+                Err(e) => conn.surface_error(&format!("execution failed: {e}")).await,
+                Ok(ExecutionOutcome::Failed { error }) => {
+                    conn.surface_error(&format!("execution failed: {error}")).await
+                }
+                Ok(ExecutionOutcome::Cancelled { cause }) => {
+                    conn.surface_error(&format!("execution cancelled: {cause}")).await
+                }
+                Ok(ExecutionOutcome::Stuck { report }) => conn.surface_error(&report.to_string()).await,
+                Ok(ExecutionOutcome::AlreadySettled) => {
+                    conn.surface_error("execution already ended before this worker claimed it").await
+                }
+                Ok(ExecutionOutcome::Completed) | Ok(ExecutionOutcome::Stalled) => conn.run_ended().await,
             }
         }
 
@@ -820,55 +1062,104 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
     }
 }
 
-/// Register a live-connection execution's runtime config and wait for the
-/// caller's socket to attach. Returns the attached connection, or `None`
-/// if the trigger config is malformed (logged loud) or the caller never
-/// arrives within the connect timeout.
+/// Register a live-connection execution's runtime config + opening request
+/// and wait for the caller's socket to attach. Returns the attached
+/// connection, or `None` if the caller never arrives within the connect
+/// timeout. A start record the worker cannot read (a kind that is not a
+/// live caller, a config that does not parse) is an error: the dispatcher
+/// wrote it, so it is a version mismatch, not a run without a caller.
+/// The caller for this run, whoever it is: the real one waiting on a
+/// socket, or the stand-in a FIRED run serves its own body to.
+///
+/// Both are `CallerConnection`s, so the trigger and every node behind
+/// it run the same code either way. This is the one place that knows
+/// the difference, and it knows it from one field on the start record.
+enum RunCaller {
+    Live(Arc<crate::caller_conn::LiveCallerConnection>),
+    Fired(Arc<crate::fired_caller::FiredCaller>),
+}
+
+impl RunCaller {
+    fn as_connection(&self) -> Arc<dyn weft_core::caller::CallerConnection> {
+        match self {
+            Self::Live(c) => c.clone(),
+            Self::Fired(c) => c.clone(),
+        }
+    }
+
+    /// The real connection, for the end-of-run tidy-up that only a
+    /// socket needs. A fired run's exchange ends when the program
+    /// answers and there is nothing to close afterwards.
+    fn live(&self) -> Option<Arc<crate::caller_conn::LiveCallerConnection>> {
+        match self {
+            Self::Live(c) => Some(c.clone()),
+            Self::Fired(_) => None,
+        }
+    }
+}
+
 async fn attach_live_caller(
     ctx: &WorkerCtx,
     color: Color,
-    spec_json: &serde_json::Value,
-) -> Option<Arc<crate::caller_conn::LiveCallerConnection>> {
-    // The task carries the full signal spec: the protocol is the kind (tag),
-    // the connection knobs are the config body.
-    let spec: weft_core::primitive::SignalSpec = match serde_json::from_value(spec_json.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                target: "weft_engine::caller_conn",
-                color = %color, error = %e,
-                "live-caller spec on the execute task is malformed; running without a caller"
-            );
-            return None;
-        }
-    };
-    let Some(protocol) = weft_core::signal::protocol_for_tag(&spec.kind) else {
-        tracing::error!(
-            target: "weft_engine::caller_conn",
-            color = %color, kind = %spec.kind,
-            "execute task tagged a non-live-caller kind as live; running without a caller"
-        );
-        return None;
-    };
-    let cfg: weft_core::signal::LiveConnectionConfig = match serde_json::from_value(spec.config.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(
-                target: "weft_engine::caller_conn",
-                color = %color, error = %e,
-                "live-caller config on the execute task is malformed; running without a caller"
-            );
-            return None;
-        }
-    };
+    start: &weft_task_store::kinds::LiveConnectionStart,
+) -> Result<Option<RunCaller>> {
+    // The record carries the full signal spec: the protocol is the kind
+    // (tag), the connection knobs are the config body.
+    let protocol = weft_core::signal::protocol_for_tag(&start.spec.kind).with_context(|| {
+        format!(
+            "execute task for {color} tagged a non-live-caller kind '{}' as live",
+            start.spec.kind
+        )
+    })?;
+    let cfg: weft_core::signal::LiveConnectionConfig =
+        serde_json::from_value(start.spec.config.clone())
+            .with_context(|| format!("live-caller config on the execute task for {color}"))?;
     let runtime = weft_core::caller::CallerRuntimeConfig::from_config(&cfg, protocol);
     let connect_timeout = std::time::Duration::from_secs(runtime.connect_timeout_secs);
-    ctx.live_configs
-        .lock()
-        .expect("live_configs poisoned")
-        .insert(color, (runtime, cfg.heartbeat_interval_secs));
+    ctx.live_configs.lock().expect("live_configs poisoned").insert(
+        color,
+        Arc::new(LiveStart {
+            runtime,
+            heartbeat_secs: cfg.heartbeat_interval_secs,
+            request: Arc::new(start.request.clone()),
+        }),
+    );
+    // A FIRED run has no socket coming, so waiting for one would burn
+    // the whole connect timeout and then run with nobody there. Serve
+    // the body the author typed instead, and record the exchange the
+    // same way a real one is recorded.
+    if start.fired.is_some() {
+        if protocol != weft_core::signal::Protocol::Http {
+            anyhow::bail!(
+                "a Socket cannot be fired: its shape is a conversation over time, and there is \
+                 nothing honest to invent for the caller's next message. Point a real client at \
+                 it (`weft activate` prints the URL)"
+            );
+        }
+        let journal: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
+            ctx.clients.journal.clone(),
+            ctx.pod_name.clone(),
+            cfg.journal_policy(),
+        );
+        // The stand-in serves the REQUEST and records the answer, and
+        // that is all it can honestly do: a fired run's body, when the
+        // author typed one, is a field of the trigger's own wake
+        // payload, and the node reads it there. Serving it through here
+        // would mean impersonating a caller who never sent it, and the
+        // field name to do that would have to live in the language.
+        return Ok(Some(RunCaller::Fired(crate::fired_caller::FiredCaller::open(
+            color,
+            weft_core::caller::CallerRuntimeConfig::from_config(&cfg, protocol),
+            start.request.clone(),
+            journal,
+        ))));
+    }
     // Wait for the connection server to attach the socket for this color.
-    ctx.caller_registry.wait_for_attach(color, connect_timeout).await
+    Ok(ctx
+        .caller_registry
+        .wait_for_attach(color, connect_timeout)
+        .await
+        .map(RunCaller::Live))
 }
 
 /// Pod-local definition fetch: try the cache first; on miss, call
@@ -935,29 +1226,7 @@ impl WorkerTaskKind<WorkerCtx> for CancelExecutionKind {
             .color
             .parse()
             .map_err(|e| anyhow::anyhow!("bad color: {e}"))?;
-        let flag = ctx.cancel_registry.lock().await.get(&color).cloned();
-        match flag {
-            Some(f) => {
-                tracing::info!(
-                    target: "weft_engine::run_pod",
-                    color = %color,
-                    cause = %payload.cause,
-                    "firing per-color cancel flag"
-                );
-                f.cancel_because(payload.cause);
-            }
-            None => {
-                // Race: execution finished naturally between the
-                // dispatcher reading the worker_pod row and us
-                // claiming the cancel. UI sees natural terminal via
-                // SSE; cancel is a no-op.
-                tracing::debug!(
-                    target: "weft_engine::run_pod",
-                    color = %color,
-                    "cancel for unknown color (already terminal); no-op"
-                );
-            }
-        }
+        cancel_color(&ctx.cancel_registry, color, payload.cause).await;
         Ok(())
     }
 }

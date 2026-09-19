@@ -45,6 +45,9 @@ pub enum SkipReason {
     /// `_should_flow` closed: whatever decides whether this node runs
     /// never said yes.
     FlowClosed,
+    /// `_should_not_flow` got a value: this node runs when the thing it
+    /// watches did NOT happen, and it did.
+    DidFlow,
     /// A required input arrived closed, so nothing can drive the body.
     RequiredInputClosed { port: String },
     /// Every input this node could act on arrived closed (or could
@@ -63,6 +66,7 @@ impl std::fmt::Display for SkipReason {
         match self {
             Self::DidNotFlow => write!(f, "its `_should_flow` said no"),
             Self::FlowClosed => write!(f, "nothing ever answered its `_should_flow`"),
+            Self::DidFlow => write!(f, "its `_should_not_flow` saw a value"),
             Self::RequiredInputClosed { port } => {
                 write!(f, "the required input '{port}' closed")
             }
@@ -85,6 +89,35 @@ impl std::fmt::Display for SkipReason {
 // packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
 pub const SHOULD_FLOW_PORT: &str = "_should_flow";
 
+/// The same gate, read the other way round: this node runs when the
+/// thing wired here did NOT happen.
+///
+/// Why the language needs a second spelling at all. Acting on a value
+/// that arrived is free: wire it into `_should_flow`. Acting on one
+/// that did NOT is the shape nothing else can express, because every
+/// other node in the language SKIPS when its inputs close, so nothing
+/// downstream is left alive to notice the absence. A node that decides
+/// can announce its own "no" on a second port, which covers a decision;
+/// it cannot cover data that simply never came (a key missing from a
+/// request body, an optional input nobody filled). This is the one port
+/// that fires ON a closure, which is what makes that case writable.
+///
+/// A node has ONE gate: wiring both spellings is refused by the
+/// compiler, not silently combined.
+// SYNC: SHOULD_NOT_FLOW_PORT <-> packages/weft-graph/src/protocol.ts SHOULD_NOT_FLOW_PORT,
+// docs/src/language/syntax.md (reserved keys),
+// packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
+pub const SHOULD_NOT_FLOW_PORT: &str = "_should_not_flow";
+
+/// Is this port name the language's gate, either way round? Everything
+/// that treats the gate as "not the node's own data" (the input bag,
+/// the readiness walk, the editor's port list) asks this rather than
+/// comparing one name, so the inverted spelling is never mistaken for a
+/// port the node declared.
+pub fn is_gate_port(name: &str) -> bool {
+    name == SHOULD_FLOW_PORT || name == SHOULD_NOT_FLOW_PORT
+}
+
 /// Rule 0 of the skip decision: did `_should_flow` say no? The only
 /// rule that reads a VALUE, because this port IS the author's decision
 /// rather than data: a `false` means "do not run this", written on a
@@ -97,21 +130,44 @@ pub const SHOULD_FLOW_PORT: &str = "_should_flow";
 /// rules never see: with nothing wired there is nothing to close, but
 /// a `_should_flow: false` literal still turns the node off).
 pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> Option<SkipReason> {
-    match super::ready::resolve_port_value(group_pulses, SHOULD_FLOW_PORT) {
-        Some(pulse) if pulse.closed => Some(SkipReason::FlowClosed),
+    // The plain gate first. A node carries one or the other, never both
+    // (the compiler refuses that), so whichever one speaks decides.
+    let plain = match super::ready::resolve_port_value(group_pulses, SHOULD_FLOW_PORT) {
+        Some(pulse) if pulse.closed => Some(Some(SkipReason::FlowClosed)),
         Some(pulse) if *pulse.value == serde_json::Value::Bool(false) => {
-            Some(SkipReason::DidNotFlow)
+            Some(Some(SkipReason::DidNotFlow))
         }
         // A value arrived and it is not `false`: this node flows.
-        Some(_) => None,
+        Some(_) => Some(None),
         // Nothing on the wire: a literal in the braces still decides.
-        None => {
-            if node.port_literals.get(SHOULD_FLOW_PORT) == Some(&serde_json::Value::Bool(false)) {
-                Some(SkipReason::DidNotFlow)
-            } else {
-                None
-            }
-        }
+        None => match node.port_literals.get(SHOULD_FLOW_PORT) {
+            Some(serde_json::Value::Bool(false)) => Some(Some(SkipReason::DidNotFlow)),
+            Some(_) => Some(None),
+            None => None,
+        },
+    };
+    if let Some(verdict) = plain {
+        return verdict;
+    }
+
+    // The inverted gate, every answer the other way round. A CLOSURE is
+    // the yes here: the thing never happened, which is exactly what this
+    // node was written to act on. This is the only place in the language
+    // where a closure starts a node instead of stopping one.
+    match super::ready::resolve_port_value(group_pulses, SHOULD_NOT_FLOW_PORT) {
+        Some(pulse) if pulse.closed => None,
+        Some(pulse) if *pulse.value == serde_json::Value::Bool(false) => None,
+        // Something real arrived, so the absence this node waits for did
+        // not happen.
+        Some(_) => Some(SkipReason::DidFlow),
+        None => match node.port_literals.get(SHOULD_NOT_FLOW_PORT) {
+            Some(serde_json::Value::Bool(false)) => None,
+            // `_should_not_flow: true` written into the braces is the
+            // literal way to say "never run this", the mirror of
+            // `_should_flow: false`.
+            Some(_) => Some(SkipReason::DidFlow),
+            None => None,
+        },
     }
 }
 
@@ -181,7 +237,7 @@ pub fn check_should_skip(
     let wireable: Vec<&crate::project::InputDefinition> = node
         .inputs
         .iter()
-        .filter(|p| p.accepts.wire && p.name != SHOULD_FLOW_PORT)
+        .filter(|p| p.accepts.wire && !is_gate_port(&p.name))
         .collect();
     if !wireable.is_empty() {
         let all_dead = wireable.iter().all(|port| {

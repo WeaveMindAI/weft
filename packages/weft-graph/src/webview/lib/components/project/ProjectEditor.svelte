@@ -80,7 +80,7 @@
 		infraFeedByNode,
 		signalFeedByNode,
 		onOpenInclude = () => {},
-		execPrefix = '',
+		callPath = [],
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
@@ -90,7 +90,7 @@
 		onApplyTextEdit: (edit: import('../../../../protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		onOpenInclude?: (path: string, alias: string) => void;
-		execPrefix?: string;
+		callPath?: string[];
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		onRun?: (targets: string[]) => void;
 		specs?: import('../../../../run-spec').RunSpec[];
@@ -182,7 +182,7 @@
 		{infraFeedByNode}
 		{signalFeedByNode}
 		{onOpenInclude}
-		{execPrefix}
+		{callPath}
 		{fileContents}
 	/>
 </SvelteFlowProvider>

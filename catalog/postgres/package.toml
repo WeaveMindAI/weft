@@ -11,6 +11,7 @@ async-trait = "0.1"
 serde_json = "1"
 bytes = "1"
 tokio = "1"
+futures = "0.3"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
 tokio-postgres-rustls = "0.13"
 chrono = "0.4"

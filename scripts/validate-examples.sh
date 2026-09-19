@@ -19,9 +19,9 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 status=0
-for main in examples/*/main.weft; do
-  dir="$(dirname "$main")"
-  if ! out="$(cd "$dir" && cargo run --quiet --locked -p weft-cli -- validate < main.weft)"; then
+for main in examples/*/src/main.weft; do
+  dir="$(dirname "$(dirname "$main")")"
+  if ! out="$(cd "$dir" && cargo run --quiet --locked -p weft-cli -- validate --file src/main.weft < src/main.weft)"; then
     echo "FAIL $dir: weft validate itself errored" >&2
     status=1
     continue

@@ -127,12 +127,13 @@ if [ ${#DISCOVERED[@]} -eq 0 ]; then
   exit 1
 fi
 
-# Run order is alphabetical EXCEPT the heavy pooled-pod overlap scenarios go
-# LAST (they clone real pods + drive scale-down, the slowest and most
-# cluster-stateful), so a cheap breakage surfaces before we pay for them. This
-# is a substring match on names, so it keeps working as tests are added/renamed
-# without listing each test by hand.
-LAST_PATTERN='supervisor_pool|listener_scaledown|listener_move'
+# Run order is alphabetical EXCEPT the slowest go LAST, so a cheap breakage
+# surfaces before we pay for them: the pooled-pod overlap scenarios (they clone
+# real pods + drive scale-down, the most cluster-stateful) and `api_ticket`,
+# which sits through three real minutes because what it tests IS elapsed time.
+# This is a substring match on names, so it keeps working as tests are
+# added/renamed without listing each test by hand.
+LAST_PATTERN='supervisor_pool|listener_scaledown|listener_move|api_ticket'
 HEAVY=()
 LIGHT=()
 for t in "${DISCOVERED[@]}"; do

@@ -18,7 +18,7 @@
 // override and freeze it into source.
 
 import type { EditPortSig, RevertedPortSig } from '../../../protocol';
-import { SHOULD_FLOW_PORT, containsTypevar, parseWeftType } from '../../../protocol';
+import { isGatePort, containsTypevar, parseWeftType } from '../../../protocol';
 
 export interface HeaderPortLike {
 	name: string;
@@ -78,7 +78,7 @@ export function headerPortSigs(
 	const sigs: EditPortSig[] = [];
 	const reverted: RevertedPortSig[] = [];
 	for (const p of next) {
-		if (p.name === SHOULD_FLOW_PORT) continue;
+		if (isGatePort(p.name)) continue;
 		const prev = prevByName.get(p.name);
 		const typeChanged = !prev || prev.portType !== p.portType;
 		const requiredChanged = !prev || portRequired(prev) !== portRequired(p);
@@ -196,10 +196,11 @@ export function removedPortNames(
 	next: { name: string }[],
 ): string[] {
 	const kept = new Set(next.map((p) => p.name));
-	// `_should_flow` is language machinery, not a removable port: a
-	// producer rendering a filtered list must never make Rust sweep a
-	// real `n._should_flow = ...` wire (same guard headerPortSigs has).
+	// A gate, either spelling, is language machinery and not a removable
+	// port: a producer rendering a filtered list must never make Rust
+	// sweep a real `n._should_flow = ...` wire (same guard headerPortSigs
+	// has).
 	return previous
-		.filter((p) => p.name !== SHOULD_FLOW_PORT && !kept.has(p.name))
+		.filter((p) => !isGatePort(p.name) && !kept.has(p.name))
 		.map((p) => p.name);
 }

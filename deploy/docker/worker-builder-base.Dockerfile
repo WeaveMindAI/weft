@@ -48,7 +48,7 @@
 # lock, the toolchain pin, the stock worker crate and the stdlib
 # sources. The COPY paths below read from that staged layout.
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS toolchain
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -74,6 +74,12 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /weft
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
+
+# The compile stage: everything above, plus the sources, plus one cargo
+# invocation. Nothing here reaches the published image directly; the
+# final stage picks its output up through `COPY --from`, which is what
+# lets the unchanged half of it stay a cached layer (see below).
+FROM toolchain AS compile
 COPY crates ./crates
 
 # Precompile the stock worker into the shared `/weft/target`. Its crate
@@ -86,17 +92,21 @@ COPY crates ./crates
 # (same layout, same lock, same target dir) reuses them.
 #
 # The compile runs against a PERSISTENT cache mount and the result is
-# then copied into `/weft/target` as a real image layer. Two reasons
-# for that split:
-#   - the layer: per-project builds seed their compile cache from
+# then copied into `/weft/target` as real image layers. Three reasons
+# for that shape:
+#   - the layers: per-project builds seed their compile cache from
 #     `/weft/target`, so the precompiled rlibs must live in the image
-#     itself (a cache mount would be invisible to them);
+#     itself (a cache mount would be invisible to them, and to anyone
+#     who PULLS this base instead of building it);
 #   - the cache: successive base builds (every engine edit mints a new
 #     content-addressed tag) reuse the previous build's artifacts, so
 #     an engine edit recompiles only the crates it touched instead of
 #     the whole dependency tree from cold. Fingerprints stay valid
 #     across builds because the staging preserves source mtimes and
 #     the in-container paths (/weft, /work) never change.
+#   - the SPLIT into two layers, below: the dependency tree is most of
+#     the weight and almost none of the churn, so it is copied out
+#     separately and stays a cached layer while the lock holds.
 #
 # `{{target_cache_key}}` is substituted by the staging step
 # (`build::stage_builder_base_context`) with a hash of Cargo.lock +
@@ -128,6 +138,7 @@ COPY crates ./crates
 # mtimes, so the rlibs stay fresh for the files the project puts back.
 COPY .weft-warmup /work
 COPY project-nodes /weft/project-nodes
+COPY worker-builder-base-split.sh /usr/local/bin/weft-split-artifacts
 {{build_env_lines}}
 RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \
@@ -136,6 +147,35 @@ RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/r
     && CARGO_TARGET_DIR=/cache/target cargo build --release \
     && ( sh /work/weft-cache-gc.sh /cache/target/release 30 /work {{worker_binary}} \
          || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 ) \
-    && mkdir -p /weft/target \
-    && cp -a /cache/target/. /weft/target/ \
+    && sh /usr/local/bin/weft-split-artifacts /cache/target /out \
     && rm -rf /work /weft/project-nodes
+
+# The two halves, in the order that makes the big one stick.
+#
+# `COPY --from` keys its layer on the CONTENT of what it copies, not on
+# whether the stage that produced it re-ran, so the crates.io half is a
+# cache HIT on every build that did not move `Cargo.lock` or the
+# toolchain: an engine edit re-runs the compile above and still exports
+# only the weft half. That is the whole point of the split. Before it,
+# one `cp -a` of the entire target dir made one layer, so every engine
+# edit rewrote, recompressed and unpacked all of it (1.4 GB, about a
+# minute of the build on a developer's machine) to ship the 180 MB that
+# had actually changed.
+#
+# ORDER IS THE WHOLE TRICK, and it is easy to get wrong. Docker's cache
+# is a chain: the first step that misses makes every step after it miss
+# too, however unchanged its own content. So the steps run
+# most-stable-first, and the engine sources land LAST. Putting
+# `COPY crates` above these two (the obvious reading order) silently
+# undid the split: the sources are exactly what an engine edit changes,
+# so the dependency layer under them was re-exported every time even
+# though it was byte-identical.
+#
+# `COPY` also preserves each file's mtime, which is what keeps cargo's
+# freshness check working for a per-project build reading these
+# artifacts.
+FROM toolchain
+COPY --from=compile /out/vendor/ /weft/target/
+COPY --from=compile /out/weft/ /weft/target/
+COPY crates ./crates
+{{build_env_lines}}

@@ -101,10 +101,10 @@
 #                 they are built from has changed. For when an image is
 #                 corrupt or hand-modified; a plain run already rebuilds
 #                 whatever actually moved.
-#   --rebuild-cluster  allow the daemon to delete and recreate the kind
-#                 cluster when its shape changed. Every project's own
-#                 database lives inside the node and is destroyed with it,
-#                 so this is never done without the flag.
+#   --rebuild-cluster  delete and recreate the kind cluster even when its
+#                 shape did not change (a shape change rebuilds on its
+#                 own). Every project's own database lives inside the
+#                 node and is destroyed with it.
 #   --debug       build CLI with the debug profile
 #   --prefix PATH install CLI binary into PATH/bin (default ~/.local)
 #
@@ -143,7 +143,7 @@
 #                 BuildKit cache, the workspace target/ cargo
 #                 cache, ~/.local/share/weft (THE DATABASE'S FILES
 #                 under postgres-data/, manifest stamps, prebuilt
-#                 binaries, port-forward state), and the untracked
+#                 binaries), and the untracked
 #                 extension build artifacts. The next install pays a
 #                 full cold-rebuild cost. Can combine with --uninstall.
 #
@@ -404,10 +404,24 @@ remove_docker_images_by_id() { # label ids [note] [warn_reason]
 
 # Drop everything an engine change strands: the tagged build-plane
 # images (builder base + node-test image) on host docker and inside
-# the kind node, the BuildKit cache (the cargo layers of
-# worker/infra/test builds all bake the engine, so a bounded prune
-# would keep 20GB of dead weight), and the node-test cargo cache under
-# target/tmp. Worker images are deliberately NOT this sweep's to take:
+# the kind node, and the node-test cargo cache under target/tmp.
+#
+# NOT the BuildKit cache. This used to run an unbounded
+# `docker builder prune --force` here, on the theory that every cargo
+# layer bakes the engine and is dead weight after an engine edit. The
+# layers are; the CARGO CACHE MOUNTS are not, and the prune took those
+# with it. A cargo cache holds the crates.io half of the compile,
+# which no engine edit can invalidate, and cargo already refuses to
+# reuse its own stale artifacts by fingerprint. Wiping it meant every
+# install after an engine edit recompiled the dependency tree from
+# cold, in BOTH the system-image build and the builder-base build:
+# measured at 336 and 198 crates, 162 of them the same crate twice,
+# and roughly four minutes of an install that has about one minute of
+# real work in it. The 20 GB LRU bound the CLI section applies is what
+# keeps the dead layers from accumulating, and being least recently
+# used is exactly what makes them the ones it drops.
+#
+# Worker images are deliberately NOT this sweep's to take:
 # a running project keeps using its old-engine image until the user
 # resyncs it, so those go through `weft clean --images --all` (the
 # daemon-refresh step below), which keeps everything the dispatcher's
@@ -437,11 +451,6 @@ sweep_stale_build_plane() {
     # The daemon answered the probe above but not this listing: never
     # turn that into "nothing to remove".
     warn "could not list the stale build-plane images; they go on a later install"
-  fi
-  if docker builder prune --force >/dev/null 2>&1; then
-    ok "dropped the BuildKit cache (stale against the new engine)"
-  else
-    warn "could not prune the BuildKit cache; it still holds entries built against the old engine (prune it by hand: docker builder prune --force)"
   fi
   remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
     " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
@@ -476,15 +485,29 @@ sweep_stale_build_plane() {
   fi
 }
 
-# The installed version of the weft extension, queried through a live
-# IPC socket (so it reflects that VS Code window, not some global
-# registry). Empty if not installed. Shared by the install and the
-# uninstall side, so neither can claim work the other can disprove.
-installed_ext_version() {
-  local sock="$1"
-  VSCODE_IPC_HOOK_CLI="${sock}" code --list-extensions --show-versions 2>/dev/null \
-    | sed -n "s/^${ext_id//./\\.}@//p" | head -n1
+# One `code` call through a live IPC socket, with a deadline.
+#
+# Every `code` call here is answered by the extension host of the window
+# that owns the socket, and that host is somebody else's process: busy
+# with its own extensions, or wedged behind a socket a closed terminal
+# left connectable. A plain `--list-extensions` on a loaded remote
+# window has been measured at over a minute, printing nothing the whole
+# time, which reads as a hung install. So no call here is unbounded, and
+# the caller decides what a timeout means.
+#
+# Exit status is `code`'s own, or 124 when the deadline passed.
+code_ipc() {
+  local sock="$1" deadline="$2"
+  shift 2
+  VSCODE_IPC_HOOK_CLI="${sock}" timeout "${deadline}" code "$@"
 }
+
+# Nothing asks the window what it has installed any more: the answer
+# costs a round trip to its extension host (over a minute, measured, on
+# a loaded remote window) and both callers can get it cheaper. The
+# install side reads the stamp it wrote last time; the uninstall side
+# just tries the uninstall, which answers the same question by working
+# or not.
 
 # Print the path of a LIVE VS Code IPC socket under /run/user/$UID (closed
 # terminals leave dead sockets behind, so probe for one that answers). Used by
@@ -783,6 +806,12 @@ hint "installing from ${C_BOLD}${here}${C_RESET}"
 #       vsix `mv` target, the release job's manifest generation)
 release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/mvp-latest"
 prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
+# THE home of the `weft` binary on PATH, whichever path produced it:
+# downloaded prebuilt, or copied here out of target/ after a local
+# build. One home means `weft_bin` is always a link to one stable
+# place, so no build cache is ever load-bearing.
+installed_bin_dir="${HOME}/.local/share/weft/bin"
+installed_bin="${installed_bin_dir}/weft"
 prebuilt_commit=""
 prebuilt_vscode_version=""
 use_prebuilt_cli=0
@@ -1157,16 +1186,19 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    manual reload.
     if command -v code >/dev/null 2>&1; then
       if live_sock="$(pick_live_vscode_socket)"; then
-        if [[ -z "$(installed_ext_version "${live_sock}")" ]]; then
-          hint "VS Code extension: not installed; nothing to remove"
-        elif VSCODE_IPC_HOOK_CLI="${live_sock}" \
-            code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
+        # Asking first whether it is installed costs a round trip to
+        # the window's extension host; the uninstall answers the same
+        # question by working or not, and fails harmlessly when there
+        # is nothing there.
+        if code_ipc "${live_sock}" 180 --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
           ok "VS Code extension uninstalled"
+          rm -f "${HOME}/.local/share/weft/vscode-hashes/installed.sha"
         else
-          warn "could not uninstall the VS Code extension; remove it by hand: code --uninstall-extension ${ext_id}"
+          hint "VS Code extension: not installed, or the window was busy; if it is still there: code --uninstall-extension ${ext_id}"
         fi
-      elif code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
+      elif timeout 180 code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
         ok "VS Code extension uninstalled"
+        rm -f "${HOME}/.local/share/weft/vscode-hashes/installed.sha"
       else
         # With no live window this path also fires for "not
         # installed"; the hedge is honest here.
@@ -1176,12 +1208,18 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       hint "VS Code: 'code' not on PATH; skipping extension removal"
     fi
 
-    # 3. Drop the CLI symlink.
+    # 3. Drop the CLI symlink AND the binary it points at. The binary
+    #    is an installed piece, not work, so an uninstall that left it
+    #    behind would leave ~25MB the user has no reason to look for.
     if [[ -L "${weft_bin}" || -f "${weft_bin}" ]]; then
       rm -f "${weft_bin}"
       ok "removed ${C_DIM}${weft_bin}${C_RESET}"
     else
       hint "CLI symlink at ${weft_bin} already absent"
+    fi
+    if [[ -f "${installed_bin}" ]]; then
+      rm -f "${installed_bin}"
+      ok "removed ${C_DIM}${installed_bin}${C_RESET}"
     fi
 
     # 4. Hints for the manual cleanup we deliberately don't do.
@@ -1191,7 +1229,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
       printf "  %skind cluster%s %s'%s' (the running pods)%s\n" \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
-      printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects; manifest stamps, prebuilt binaries, port-forward state)%s\n' \
+      printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects; manifest stamps, prebuilt binaries)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
@@ -1485,16 +1523,21 @@ if [[ $build_cli -eq 1 ]]; then
   #     build adds entries; nothing prunes them).
   # (The anonymous-volume reap is NOT here: it runs on every install
   # regardless of flags, in its own section above.)
-  # The target/ bound is a cap, not a wipe: under the cap the
-  # incremental cache is untouched and rebuilds stay fast; over it we
-  # clean and pay one cold build now instead of filling the disk later.
+  # The target/ bound is a cap, not a wipe: under the cap nothing is
+  # touched and rebuilds stay fast. Over it, the incremental dirs go
+  # FIRST and the cap is re-measured, because they are the cheapest
+  # thing in there to lose (they only speed up rebuilding a crate you
+  # just edited, and they were the single biggest line item at 9.6G in
+  # a 22G tree) while deps/ is what makes a rebuild fast at all. Only
+  # if that is not enough does the whole tree go and the build runs
+  # cold.
   # The cap measures the WHOLE of target/ (debug + release + tmp); a
   # full debug build of this workspace with line-tables-only debuginfo
-  # plus the db-test and e2e binaries sits well under 40G, so the
-  # default only trips on real accumulation, never on a routine tree
-  # (a cap under the working size would wipe on every install).
+  # plus the db-test and e2e binaries sits well under the default, so
+  # it only trips on real accumulation, never on a routine tree (a cap
+  # under the working size would wipe on every install).
   # Override with WEFT_TARGET_CAP_GB.
-  target_cap_gb="${WEFT_TARGET_CAP_GB:-40}"
+  target_cap_gb="${WEFT_TARGET_CAP_GB:-15}"
   if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
     fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
     exit 1
@@ -1512,10 +1555,21 @@ if [[ $build_cli -eq 1 ]]; then
     if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
       warn "could not measure target/; skipping the size cap"
     elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
-      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); cleaning before the build"
-      remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
-        " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
-        "; the cap stays exceeded"
+      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); trimming before the build"
+      for inc in "${here}"/target/*/incremental; do
+        [[ -d "${inc}" ]] || continue
+        remove_dir_reporting "${inc}" "${C_DIM}${inc#"${here}"/}${C_RESET}" \
+          "" "; the cap may stay exceeded"
+      done
+      target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)"
+      target_gb=""
+      [[ "${target_kb}" =~ ^[0-9]+$ ]] && target_gb="$((target_kb / 1024 / 1024))"
+      if [[ "${target_gb}" =~ ^[0-9]+$ && "${target_gb}" -gt "${target_cap_gb}" ]]; then
+        warn "still ${target_gb}G after dropping the incremental caches; clearing target/"
+        remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
+          " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
+          "; the cap stays exceeded"
+      fi
     fi
   fi
   # Gate on daemon REACHABILITY, not binary presence: a --cli install
@@ -1539,7 +1593,7 @@ if [[ $build_cli -eq 1 ]]; then
     # recorded repo location must refresh even when the bytes are
     # already right, since this checkout may be a different clone than
     # the one that downloaded them).
-    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${prebuilt_dir}/weft" 0755; then
+    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${installed_bin}" 0755; then
       use_prebuilt_cli=0
       if command -v cargo >/dev/null 2>&1; then
         warn "prebuilt CLI download failed; building locally instead"
@@ -1558,7 +1612,7 @@ if [[ $build_cli -eq 1 ]]; then
     # own catalog / manifests / build context. Written BEFORE the
     # symlink lands on PATH: the other order could publish a weft that
     # cannot find its checkout. Loud on failure WITH the recovery.
-    # SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root)
+    # SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root), crates/weft-cli/src/commands/daemon.rs (record_repo_root)
     repo_root_file="${HOME}/.local/share/weft/repo-root"
     if ! { mkdir -p "$(dirname "${repo_root_file}")" \
         && printf '%s' "${here}" > "${repo_root_file}"; } 2>/dev/null; then
@@ -1566,9 +1620,9 @@ if [[ $build_cli -eq 1 ]]; then
       hint "fix the ownership (docker can leave root-owned entries there): ${C_BOLD}sudo chown -R \"\$(id -u):\$(id -g)\" ~/.local/share/weft${C_RESET}${C_DIM}, then re-run${C_RESET}"
       exit 1
     fi
-    chmod 0755 "${prebuilt_dir}/weft"
-    ln -sfn "${prebuilt_dir}/weft" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${prebuilt_dir}/weft${C_RESET}"
+    chmod 0755 "${installed_bin}"
+    ln -sfn "${installed_bin}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
 
   if [[ $use_prebuilt_cli -eq 0 ]]; then
@@ -1626,8 +1680,28 @@ if [[ $build_cli -eq 1 ]]; then
       fi
       hint "source changed during the build; building again"
     done
-    ln -sfn "${src}" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
+    # Copy the binary OUT of target/, then link PATH at the copy, the
+    # same shape the prebuilt path above uses. Linking straight into
+    # target/ made the build cache load-bearing: `rm -rf target` (or
+    # the size cap above firing) left `weft` as a dangling symlink
+    # with nothing saying why. The copy costs ~25MB and makes target/
+    # pure cache, safe to delete at any moment.
+    # Copy to a temp beside the target and rename over it, the same
+    # way download_verified lands the prebuilt. A `weft` that is still
+    # running (the extension in another VS Code window, a `weft run`
+    # in a terminal) holds the old file open, and overwriting it in
+    # place fails with "Text file busy"; a rename swaps the path while
+    # every running process keeps its old inode until it exits.
+    mkdir -p "${installed_bin_dir}"
+    installed_tmp="${installed_bin}.$$.build"
+    cp_err="$(cp "${src}" "${installed_tmp}" 2>&1 >/dev/null && chmod 0755 "${installed_tmp}" && mv -f "${installed_tmp}" "${installed_bin}" 2>&1 >/dev/null)" || {
+      rm -f "${installed_tmp}"
+      fail "could not install the built binary to ${installed_bin}"
+      printf '%s\n' "${cp_err}" >&2
+      exit 1
+    }
+    ln -sfn "${installed_bin}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
 
   # Engine-change sweep, on either path: the builder base and the
@@ -2014,34 +2088,44 @@ if [[ $build_vscode -eq 1 ]]; then
   # Auto-install via `code` IPC, using the shared live-socket probe (closed
   # terminals leave dead sockets in VSCODE_IPC_HOOK_CLI under WSL/remote-SSH).
 
-  # The installed version of the extension, queried through the SAME live
-  # socket we install through (so it reflects this VS Code window, not some
-  # global registry). Empty if not installed / no socket.
-  # Whether VS Code already runs these exact bytes: the version alone
-  # cannot say (it moves only on --bump, so most rebuilds keep it), so
-  # a content stamp remembers the sha of the last .vsix handed over,
-  # and `--force` makes VS Code take a same-version package.
+  # Whether VS Code already runs these exact bytes. The version alone
+  # cannot say (it moves only on --bump, so most rebuilds keep it), so a
+  # stamp remembers the sha of the last .vsix handed over. The sha is
+  # the whole key: the version lives inside the package, so two versions
+  # can never share one.
+  #
+  # Matching the stamp costs nothing, and that is the point. Both ways of
+  # asking VS Code itself are a round trip to somebody else's extension
+  # host, measured on a loaded remote window at over a minute to list the
+  # extensions and minutes to hand over a package it already has. Neither
+  # is worth paying to learn something a local file already knows.
+  #
+  # The stamp can be wrong in exactly one way: the extension was removed
+  # in VS Code without setup.sh. Then this says "nothing to install"
+  # while nothing is installed, and the fix is the line printed below.
+  # That is worth minutes of everybody's time on every other run.
   vsix_sha="$(sha256 "${vsix_path}" | cut -d' ' -f1)"
   installed_vsix_stamp="${HOME}/.local/share/weft/vscode-hashes/installed.sha"
   if ! command -v code >/dev/null 2>&1; then
     warn "'code' not on PATH"
     hint "install manually: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
+  elif [[ "$(cat "${installed_vsix_stamp}" 2>/dev/null)" == "${vsix_sha}" ]]; then
+    ok "VS Code already has ${C_DIM}v${current_ver}${C_RESET} with these exact bytes; nothing to install"
+    hint "if it is missing from VS Code, install it by hand: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
   elif ! live_sock="$(pick_live_vscode_socket)"; then
     warn "no live VS Code window found"
     hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
   else
-    installed_ver="$(installed_ext_version "${live_sock}")"
-    if [[ "${installed_ver}" == "${current_ver}" \
-       && "$(cat "${installed_vsix_stamp}" 2>/dev/null)" == "${vsix_sha}" ]]; then
-      ok "VS Code already running ${C_DIM}v${current_ver}${C_RESET} with these exact bytes; nothing to install"
-    elif VSCODE_IPC_HOOK_CLI="${live_sock}" \
-        code --install-extension "${vsix_path}" --force >/dev/null 2>&1; then
+    # Only now, on the path that installs anyway, and bounded: the
+    # window answers when its extension host gets to it.
+    step "handing v${current_ver} to VS Code (its extension host answers when it can)"
+    if code_ipc "${live_sock}" 180 --install-extension "${vsix_path}" --force >/dev/null 2>&1; then
       mkdir -p "$(dirname "${installed_vsix_stamp}")"
       printf '%s' "${vsix_sha}" > "${installed_vsix_stamp}"
-      ok "installed ${C_DIM}v${current_ver}${C_RESET} into VS Code (was ${C_DIM}v${installed_ver:-none}${C_RESET})"
+      ok "installed ${C_DIM}v${current_ver}${C_RESET} into VS Code"
       hint "reload to apply: ${C_BOLD}Developer: Reload Window${C_RESET} (host code), or reopen the graph panel (webview-only changes)"
     else
-      warn "code --install-extension failed via live socket"
+      warn "VS Code did not take the extension (it may have been busy)"
       hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
     fi
   fi

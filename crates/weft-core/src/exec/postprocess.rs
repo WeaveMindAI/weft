@@ -56,7 +56,7 @@ pub fn postprocess_output(
         )));
     };
 
-    let outgoing = edge_idx.get_outgoing(project, node_id);
+    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
 
     // What each wire DELIVERS, worked out BEFORE any pulse mutation. A
     // plain wire shares the emitted value (one `Arc` per port, however
@@ -121,11 +121,12 @@ pub fn postprocess_output(
             continue;
         }
         let target_handle = d.edge.target_handle.as_deref().unwrap_or("default");
+        let Some(landing_frames) = frames_across(project, d.edge, frames) else { continue };
         let earlier_value_pending = pulses.get(&d.edge.target).is_some_and(|ps| {
             ps.iter().any(|p| {
                 p.status.is_pending()
                     && p.color == color
-                    && &p.frames == frames
+                    && p.frames == landing_frames
                     && p.target_port == target_handle
                     && !p.closed
                     && !same_value(&p.value, value)
@@ -187,6 +188,36 @@ struct Delivery<'a> {
 ///   same wire replayed (a journal row applied twice); one pulse,
 ///   never two. The id names the wire end to end, so two output ports
 ///   of one emission into one input port are two ids.
+/// The frames a pulse carries across `edge`, given the frames its
+/// source fired at, or `None` when the edge is not taken at these
+/// frames. Every wire carries the source's frames unchanged, except
+/// the two that cross a call boundary: leaving a call site's In
+/// boundary pushes the site's call frame (the shared body fires one
+/// frame deeper), and reaching a call site's Out boundary pops it, and
+/// only the site the top frame names takes the wire (a body's Out is
+/// wired to every site that calls it; the frame says whose result this
+/// is). THE one place frames change on a wire, shared by values and
+/// closures, so the live engine and the journal fold agree.
+pub fn frames_across(project: &ProjectDefinition, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
+    use crate::frames::Frame;
+    use crate::project::boundary_types::{CALL_IN, CALL_OUT};
+    let node = |id: &str| project.nodes.iter().find(|n| n.id == id);
+    if let Some(source) = node(&edge.source).filter(|n| n.node_type == CALL_IN) {
+        let site = source.group_boundary.as_ref().expect("a call site's In carries its site").group_id.clone();
+        let mut out = frames.clone();
+        out.push(Frame::Call { site });
+        return Some(out);
+    }
+    if let Some(target) = node(&edge.target).filter(|n| n.node_type == CALL_OUT) {
+        let site = &target.group_boundary.as_ref().expect("a call site's Out carries its site").group_id;
+        return match frames.last() {
+            Some(Frame::Call { site: top }) if top == site => Some(frames[..frames.len() - 1].to_vec()),
+            _ => None,
+        };
+    }
+    Some(frames.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_value_on_edge(
     project: &ProjectDefinition,
@@ -200,6 +231,8 @@ fn emit_value_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
+    let Some(frames) = frames_across(project, edge, frames) else { return };
+    let frames = &frames;
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
     let id = pulse_id(emission_id, port, &edge.target, target_handle, false);
 
@@ -277,7 +310,7 @@ pub fn close_unmentioned_downstream(
              was mutated between dispatch and termination",
         )));
     };
-    let outgoing = edge_idx.get_outgoing(project, node_id);
+    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
     for port in &node.outputs {
         let is_generator = port.is_generator();
         if closed.contains(&port.name) || (mentioned.contains(&port.name) && !is_generator) {
@@ -329,7 +362,7 @@ pub fn emit_port_closure(
             )));
         }
     }
-    let outgoing = edge_idx.get_outgoing(project, node_id);
+    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
     emit_closure_on_outgoing(
         project, node_id, port_name, emission_id, color, frames, failure, &outgoing, pulses, emissions,
     );
@@ -381,6 +414,8 @@ fn emit_closure_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
+    let Some(frames) = frames_across(project, edge, frames) else { return };
+    let frames = &frames;
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
     let generator_target = super::ready::edge_targets_generator(project, edge);
     let id = pulse_id(emission_id, port_name, &edge.target, target_handle, true);
@@ -648,6 +683,7 @@ mod fan_in_tests {
             scope: Vec::new(),
             group_boundary: None,
             requires_infra: false,
+            fires_with: Default::default(),
             images: Vec::new(),
             published_service: None,
             span: None,
@@ -658,6 +694,7 @@ mod fan_in_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
         serde_json::to_value(n).unwrap()

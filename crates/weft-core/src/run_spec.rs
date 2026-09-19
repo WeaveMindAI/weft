@@ -9,8 +9,8 @@ use serde::de::{Error, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::frames::LoopFrames;
-use crate::project::selection::{RunSelection, SelectionBounds};
+use crate::frames::{Located, LoopFrames};
+use crate::project::selection::{source_place, RunSelection, SelectionBounds};
 use crate::project::ProjectDefinition;
 use crate::weft_type::WeftType;
 use crate::Color;
@@ -34,11 +34,16 @@ pub fn validate_fire_bake(node: &str, program: &crate::project::hash::ProgramIde
     if bakes.iter().any(|bake| bake.program == *program && bake.captured.iter().any(|id| id == node)) {
         return Ok(());
     }
+    // A bake is per code, so ANY edit to the graph leaves the last one
+    // behind. That is the cause every single time somebody reads this,
+    // so it leads; the hashes are for the rare case where it is not.
     let older = bakes.iter().filter(|bake| bake.captured.iter().any(|id| id == node))
         .max_by_key(|bake| bake.at_unix)
-        .map(|bake| format!(" The previous bake used graph {} and binary {}.", bake.program.definition_hash, bake.program.binary_hash))
+        .map(|bake| format!(" (the last one was made for graph {} and binary {})", bake.program.definition_hash, bake.program.binary_hash))
         .unwrap_or_default();
-    Err(Refusal::error(format!("trigger '{node}' has no successful bake for this code.{older} `weft bake` prepares it without listening; `weft activate` prepares it and listens")))
+    Err(Refusal::error(format!(
+        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it without listening, `weft activate` does it and listens"
+    )))
 }
 
 /// The example file, run request, and editor value share one contract.
@@ -194,7 +199,11 @@ pub struct Expected {
     pub wires: Vec<ExpectedWire>,
 }
 
-/// One ordered output item or closure at a node and loop position.
+/// One ordered output item or closure at a node and loop position, as
+/// an example file shows it: `node` is the address a person types
+/// (`one.strip`, through the site for a node in an included file) and
+/// `frames` holds the loop positions only. `ExpectedWire::spell` makes
+/// one from the journal's `OutputWire`.
 // SYNC: ExpectedWire <-> packages/weft-graph/src/run-spec.ts ExpectedWire
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,13 +221,61 @@ pub struct ExpectedWire {
     pub value: Value,
 }
 
+/// One ordered output item or closure as the journal holds it: the
+/// node's compiled id under its full frame stack (call and loop
+/// frames). What seeding reads; `ExpectedWire::spell` is what a person
+/// reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutputWire {
+    pub node: String,
+    pub frames: LoopFrames,
+    pub port: String,
+    pub ordinal: u64,
+    pub closed: bool,
+    pub error: Option<String>,
+    pub value: Value,
+}
+
+impl OutputWire {
+    /// The node at the call this output belongs to.
+    pub fn place(&self) -> Located {
+        Located::at(&self.node, &self.frames)
+    }
+}
+
+impl ExpectedWire {
+    /// The wire as an example file spells it: the node's address
+    /// through its sites, the loop positions kept, the call frames
+    /// folded into the address.
+    pub fn spell(project: &ProjectDefinition, wire: &OutputWire) -> Self {
+        let place = wire.place();
+        Self {
+            node: crate::project::address_of(project, &place.id, &place.path),
+            port: wire.port.clone(),
+            frames: wire.frames.iter().filter(|frame| frame.loop_index().is_some()).cloned().collect(),
+            ordinal: wire.ordinal,
+            closed: wire.closed,
+            error: wire.error.clone(),
+            value: wire.value.clone(),
+        }
+    }
+}
+
 impl RunSpec {
     /// Explicit starting values addressed to runtime entry nodes.
-    pub fn starting_inputs(&self, project: &ProjectDefinition) -> PortValues {
+    /// The backups keyed by the place that reads them: a start spelled
+    /// from the top (`triage.up`, or a group or a call site) resolves
+    /// to its node (a group's or site's In boundary) under the calls
+    /// the spelling walked.
+    pub fn starting_inputs(&self, project: &ProjectDefinition) -> BTreeMap<Located, BTreeMap<String, Value>> {
         self.from.iter().chain(self.group.iter().map(|(id, ports)| (id, ports)))
-            .map(|(id, ports)| (if project.groups.iter().any(|group| &group.id == id) {
-                crate::project::boundary_in_id(id)
-            } else { id.clone() }, ports.clone())).collect()
+            .map(|(spelled, ports)| {
+                let (id, path) = crate::project::resolve_address(project, spelled);
+                let id = if project.groups.iter().any(|group| group.id == id) {
+                    crate::project::boundary_in_id(&id)
+                } else { id };
+                (Located::new(id, path), ports.clone())
+            }).collect()
     }
 
     /// A whole-graph run: what a plain `weft run` sends.
@@ -241,6 +298,11 @@ impl RunSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KickPlan {
     pub node: String,
+    /// The frames the kick fires under: one call frame per site on the
+    /// node's call path, for a root inside an included file reached
+    /// through a site (`--from triage.up`); empty at the top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: crate::frames::LoopFrames,
     /// The trigger fired by hand: its payload is the event.
     pub firing: bool,
     pub payload: Option<Value>,
@@ -258,14 +320,17 @@ pub struct KickPlan {
 
 impl KickPlan {
     /// The shared root intent for both listener fires and authored runs.
-    pub fn for_selection(project: &ProjectDefinition, selection: &RunSelection, fire: Option<(&str, &Value)>, port_snapshot: Option<&Value>) -> Vec<Self> {
+    pub fn for_selection(project: &ProjectDefinition, selection: &RunSelection, fire: Option<(&Located, &Value)>, port_snapshot: Option<&Value>) -> Vec<Self> {
         let mut roots: BTreeSet<_> = selection.roots(project).into_iter().collect();
-        roots.extend(project.nodes.iter().filter(|node| node.features.is_trigger && selection.nodes.contains(&node.id))
-            .map(|node| node.id.clone()));
-        roots.into_iter().map(|node| {
-            let event = fire.filter(|(id, _)| *id == node);
+        roots.extend(selection.nodes.iter().filter(|place| project.nodes.iter().any(|node| node.id == place.id && node.features.is_trigger)).cloned());
+        // A root is kicked at its place: under the call frames of the
+        // sites that reach it, none at the top.
+        roots.into_iter().map(|place| {
+            let event = fire.filter(|(at, _)| *at == &place);
             Self {
-                node, firing: event.is_some(), payload: event.map(|(_, value)| value.clone()),
+                frames: place.frames(),
+                node: place.id,
+                firing: event.is_some(), payload: event.map(|(_, value)| value.clone()),
                 port_snapshot: event.and(port_snapshot).cloned(),
             }
         }).collect()
@@ -279,6 +344,10 @@ impl KickPlan {
 pub struct ProvidedEmission {
     pub source_node: String,
     pub source_port: String,
+    /// The frames the value is emitted under: the call the source is
+    /// spelled through (`--emit triage.up=...`), empty at the top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: crate::frames::LoopFrames,
     pub value: Value,
     /// The `(node, port)` pairs inside the scope the value reaches.
     pub consumers: Vec<(String, String)>,
@@ -299,6 +368,9 @@ pub struct Resolved {
 // SYNC: CrossingPort <-> packages/weft-graph/src/run-spec.ts CrossingPort
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossingPort {
+    /// The receiving node, spelled the way the program reads it
+    /// (`one.strip` for a node of an included file under the site
+    /// `one`), the same key a `from` entry uses.
     pub node: String,
     pub port: String,
     pub source_node: String,
@@ -341,19 +413,24 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
     }).map_err(Refusal::error)?;
     let starting_inputs = spec.starting_inputs(project);
     selection.input = starting_inputs.clone();
+    // Emits are spelled from the top too (`triage.up`); the rows they
+    // become carry the source's id and its call frames.
+    let emits: BTreeMap<Located, BTreeMap<String, Value>> = spec.emit.iter()
+        .map(|(spelled, ports)| { let (id, path) = crate::project::resolve_address(project, spelled); (Located::new(id, path), ports.clone()) }).collect();
     let mut refusal = Refusal::default();
     let mut warnings = Vec::new();
-    for (is_input, supplied) in [(true, &starting_inputs), (false, &spec.emit)] {
-        for (id, ports) in supplied {
-            let Some(node) = project.nodes.iter().find(|n| &n.id == id) else {
-                refusal.errors.push(format!("unknown node '{id}'"));
+    for (is_input, supplied) in [(true, &starting_inputs), (false, &emits)] {
+        for (place, ports) in supplied {
+            let spelled = crate::project::address_of(project, &place.id, &place.path);
+            let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else {
+                refusal.errors.push(format!("unknown node '{spelled}'"));
                 continue;
             };
-            if is_input && !ports.is_empty() && !selection.nodes.contains(id) {
-                refusal.errors.push(format!("supplied start '{id}' is outside the selected run"));
+            if is_input && !ports.is_empty() && !selection.nodes.contains(place) {
+                refusal.errors.push(format!("supplied start '{spelled}' is outside the selected run"));
             }
             if is_input && node.features.is_trigger {
-                refusal.errors.push(format!("trigger '{id}' cannot be a from start; use --fire with a prepared trigger or --emit to supply its outputs"));
+                refusal.errors.push(format!("trigger '{spelled}' cannot be a from start; use --fire with a prepared trigger or --emit to supply its outputs"));
             }
             for (port, value) in ports {
                 let declared = if is_input {
@@ -363,51 +440,74 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
                 };
                 match declared {
                     None if is_input => {
-                        warnings.push(format!("ignored supplied input '{id}.{port}': this input port does not exist in the current program"));
-                        selection.input.get_mut(id).expect("starting input map exists").remove(port);
+                        warnings.push(format!("ignored supplied input '{spelled}.{port}': this input port does not exist in the current program"));
+                        selection.input.get_mut(place).expect("starting input map exists").remove(port);
                     }
-                    None => refusal.errors.push(format!("unknown output port '{id}.{port}'")),
+                    None => refusal.errors.push(format!("unknown output port '{spelled}.{port}'")),
                     // The language's flow gate accepts any value: false stops,
                     // other values permit flow. Its generic type is intentional.
-                    Some(_) if is_input && port == crate::exec::skip::SHOULD_FLOW_PORT => {},
+                    Some(_) if is_input && crate::exec::skip::is_gate_port(port) => {},
                     Some(ty) => if let Err(error) = validate_supplied_value(ty, value) {
-                        refusal.errors.push(format!("{id}.{port}: {error}"));
+                        refusal.errors.push(format!("{spelled}.{port}: {error}"));
                     },
                 }
             }
         }
     }
-    if let Some((fire, _)) = &spec.fire {
+    let fire = spec.fire.as_ref().map(|(spelled, value)| {
+        let (id, path) = crate::project::resolve_address(project, spelled);
+        (Located::new(id, path), value)
+    });
+    if let Some((fire, payload)) = &fire {
         if !selection.nodes.contains(fire) {
-            refusal.errors.push(format!("fired trigger '{fire}' is outside the selected run"));
+            refusal.errors.push(format!("fired trigger '{}' is outside the selected run", crate::project::address_of(project, &fire.id, &fire.path)));
+        }
+        // What the trigger wakes with is declared (`firesWith`), so a
+        // payload that does not match is refused HERE, before anything
+        // is built or started, and the refusal prints the shape it
+        // wanted. The engine holds every firing to the same contract;
+        // this is the same check, early, where the author is still
+        // looking at the command they typed.
+        if let Some(node) = project.nodes.iter().find(|n| n.id == fire.id) {
+            if let Err(why) = crate::node::check_fire_payload(&node.fires_with, Some(payload)) {
+                refusal.errors.push(format!(
+                    "--fire {}: {why}",
+                    crate::project::address_of(project, &fire.id, &fire.path)
+                ));
+            }
         }
     }
     if !refusal.is_empty() { return Err(refusal); }
     if selection.nodes.is_empty() && selection.suppliers.is_empty() {
         return Err(Refusal::error("this selection is empty; choose starts and endpoints on a connected path"));
     }
-    let crossings = project.edges.iter().filter(|edge| selection.edges.contains(&edge.id)
-        && selection.nodes.contains(&edge.target) && !selection.nodes.contains(&edge.source))
-        .map(|edge| {
-            let port = edge.target_handle.as_deref().unwrap_or("default");
-            CrossingPort {
-                node: edge.target.clone(), port: port.into(), source_node: edge.source.clone(),
-                source_port: edge.source_handle.as_deref().unwrap_or("default").into(),
-                required: project.nodes.iter().find(|n| n.id == edge.target)
-                    .and_then(|n| n.inputs.iter().find(|p| p.name == port)).is_some_and(|p| p.required),
-                supplied: selection.input.get(&edge.target).is_some_and(|ports| ports.contains_key(port))
-                    || selection.suppliers.contains(&edge.source),
-            }
-        }).collect::<Vec<_>>();
-    let kicks = KickPlan::for_selection(project, &selection, spec.fire.as_ref().map(|(id, value)| (id.as_str(), value)), None);
+    let crossings = selection.nodes.iter().flat_map(|place| {
+        let selection = &selection;
+        project.edges.iter().filter(move |edge| edge.target == place.id)
+            .filter_map(move |edge| source_place(project, place, edge).map(|source| (edge, source)))
+            .filter(move |(edge, source)| selection.has_edge(project, place, edge, false) && !selection.nodes.contains(source))
+            .map(move |(edge, source)| {
+                let port = edge.target_handle.as_deref().unwrap_or("default");
+                CrossingPort {
+                    node: crate::project::address_of(project, &place.id, &place.path), port: port.into(),
+                    source_node: crate::project::address_of(project, &source.id, &source.path),
+                    source_port: edge.source_handle.as_deref().unwrap_or("default").into(),
+                    required: project.nodes.iter().find(|n| n.id == place.id)
+                        .and_then(|n| n.inputs.iter().find(|p| p.name == port)).is_some_and(|p| p.required),
+                    supplied: selection.input.get(place).is_some_and(|ports| ports.contains_key(port))
+                        || selection.suppliers.contains(&source),
+                }
+            })
+    }).collect::<Vec<_>>();
+    let kicks = KickPlan::for_selection(project, &selection, fire.as_ref().map(|(at, value)| (at, *value)), None);
     let mut provided = Vec::new();
-    for (node, ports) in &spec.emit {
+    for (place, ports) in &emits {
         for (port, value) in ports {
             provided.push(ProvidedEmission {
-                source_node: node.clone(), source_port: port.clone(), value: value.clone(),
-                consumers: project.edges.iter().filter(|edge| edge.source == *node
+                source_node: place.id.clone(), source_port: port.clone(), frames: place.frames(), value: value.clone(),
+                consumers: project.edges.iter().filter(|edge| edge.source == place.id
                     && edge.source_handle.as_deref().unwrap_or("default") == port
-                    && selection.edges.contains(&edge.id))
+                    && selection.has_edge(project, place, edge, true))
                     .map(|edge| (edge.target.clone(), edge.target_handle.as_deref().unwrap_or("default").into())).collect(),
             });
         }
@@ -423,26 +523,31 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
     // captured), and a producer whose only consumer was that wire is
     // not in the run at all, so the wire is named whether or not its
     // producer survived the carve.
-    let fired = spec.fire.as_ref().map(|(id, _)| id.as_str());
-    for trigger in project.nodes.iter().filter(|node| node.features.is_trigger && selection.nodes.contains(&node.id)) {
-        if fired == Some(trigger.id.as_str()) {
+    let fired = fire.as_ref().map(|(at, _)| at);
+    let spell = |place: &Located| crate::project::address_of(project, &place.id, &place.path);
+    let triggers: Vec<Located> = selection.nodes.iter()
+        .filter(|place| project.nodes.iter().any(|node| node.id == place.id && node.features.is_trigger)).cloned().collect();
+    for trigger in &triggers {
+        if fired == Some(trigger) {
             let undelivered: Vec<String> = project.edges.iter()
-                .filter(|edge| edge.target == trigger.id && !selection.edges.contains(&edge.id))
+                .filter(|edge| edge.target == trigger.id && !selection.has_edge(project, trigger, edge, false))
                 .map(|edge| format!("{}.{}", edge.source, edge.source_handle.as_deref().unwrap_or("default")))
                 .collect();
             if !undelivered.is_empty() {
                 warnings.push(format!(
                     "{} not delivered to trigger '{}': a fired trigger reads the inputs its bake captured; change them with weft bake.",
-                    undelivered.join(", "), trigger.id
+                    undelivered.join(", "), spell(trigger)
                 ));
             }
             continue;
         }
-        let downstream: Vec<String> = RunSelection::downstream_nodes(project, std::slice::from_ref(&trigger.id)).into_iter()
-            .filter(|id| id != &trigger.id && selection.nodes.contains(id))
-            .collect();
+        // A group's boundaries spell as the group: a set names it once.
+        let downstream: Vec<String> = RunSelection::downstream(project, std::slice::from_ref(trigger)).into_iter()
+            .filter(|place| place != trigger && selection.nodes.contains(place))
+            .map(|place| spell(&place))
+            .collect::<BTreeSet<_>>().into_iter().collect();
         let why = match fired {
-            Some(fired) => format!("only '{fired}' fires in this run"),
+            Some(fired) => format!("only '{}' fires in this run", spell(fired)),
             None => "a run started by hand fires no trigger".to_string(),
         };
         let cost = if downstream.is_empty() { String::new() } else {
@@ -450,7 +555,7 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
         };
         warnings.push(format!(
             "trigger '{}' does not fire: {why}, so it closes its outputs{cost}. `--fire {}=<payload>` replays a wake.",
-            trigger.id, trigger.id
+            spell(trigger), spell(trigger)
         ));
     }
     for crossing in &crossings {
@@ -500,7 +605,12 @@ mod tests {
                 _ => { other.implementations.insert("T".into(), "changed".into()); }
             }
             let refusal = validate_fire_bake("trigger", &other, &[bake.clone()]).unwrap_err().to_string();
-            assert!(refusal.contains("previous bake used graph"));
+            // The cause leads (every reader of this got here by editing
+            // the graph); the hashes stay, for the rare case where it
+            // was something else.
+            assert!(refusal.contains("the code changed since"), "{refusal}");
+            assert!(refusal.contains("weft bake"), "it names the fix: {refusal}");
+            assert!(refusal.contains("made for graph"), "{refusal}");
         }
         let roundtrip: BakeSummary = serde_json::from_value(serde_json::to_value(&bake).unwrap()).unwrap();
         assert_eq!(roundtrip.program, program);
@@ -533,7 +643,7 @@ mod tests {
             let spec = RunSpec { from: BTreeMap::from([("a".into(),
                 BTreeMap::from([("_should_flow".into(), value.clone())]))]), ..RunSpec::whole("x") };
             let resolved = resolve_spec(&spec, &project).unwrap();
-            assert_eq!(resolved.selection.input["a"]["_should_flow"], value);
+            assert_eq!(resolved.selection.input[&Located::top("a")]["_should_flow"], value);
         }
     }
 
@@ -541,13 +651,13 @@ mod tests {
     fn crossing_is_a_warning_and_backup_does_not_widen_selection() {
         let mut spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
         let resolved = resolve_spec(&spec, &program()).unwrap();
-        assert!(!resolved.selection.nodes.contains("a"));
+        assert!(!resolved.selection.nodes.contains(&Located::top("a")));
         assert_eq!(resolved.crossings.len(), 1);
         assert!(!resolved.crossings[0].supplied);
         spec.from.insert("b".into(), BTreeMap::from([("in".into(), json!("backup"))]));
         let resolved = resolve_spec(&spec, &program()).unwrap();
         assert!(resolved.crossings[0].supplied);
-        assert!(!resolved.selection.nodes.contains("a"));
+        assert!(!resolved.selection.nodes.contains(&Located::top("a")));
         assert!(resolved.provided.is_empty(), "input backups are not source emissions");
     }
 
@@ -636,8 +746,8 @@ mod tests {
             ("missing".into(), json!("old value")), ("in".into(), json!("backup"))
         ]))]), ..RunSpec::whole("x") };
         let resolved = resolve_spec(&spec, &program()).unwrap();
-        assert_eq!(resolved.selection.nodes, BTreeSet::from(["b".into(), "c".into()]));
-        assert_eq!(resolved.selection.input["b"], BTreeMap::from([("in".into(), json!("backup"))]));
+        assert_eq!(resolved.selection.nodes, BTreeSet::from([Located::top("b"), Located::top("c")]));
+        assert_eq!(resolved.selection.input[&Located::top("b")], BTreeMap::from([("in".into(), json!("backup"))]));
         assert!(resolved.warnings.iter().any(|warning| warning.contains("ignored supplied input 'b.missing'")));
         assert!(spec.from["b"].contains_key("missing"), "resolution does not rewrite the saved example");
     }
@@ -679,7 +789,7 @@ mod tests {
         project.nodes[1].features.is_trigger = true;
         let spec = RunSpec { fire: Some(("b".into(), json!({}))), ..RunSpec::whole("x") };
         let resolved = resolve_spec(&spec, &project).unwrap();
-        assert!(!resolved.selection.nodes.contains("a"), "{:?}", resolved.selection.nodes);
+        assert!(!resolved.selection.nodes.contains(&Located::top("a")), "{:?}", resolved.selection.nodes);
         assert!(resolved.warnings.iter().any(|w| w.contains("a.out not delivered to trigger 'b'") && w.contains("weft bake")),
             "{:?}", resolved.warnings);
     }
@@ -701,9 +811,9 @@ mod tests {
     #[test]
     fn inclusive_and_exclusive_cuts_preserve_the_authored_path() {
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), target: vec!["c".into()], ..RunSpec::whole("x") };
-        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from(["b".into(), "c".into()]));
+        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from([Located::top("b"), Located::top("c")]));
         let spec = RunSpec { before: vec!["c".into()], ..spec };
-        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from(["b".into()]));
+        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from([Located::top("b")]));
         assert!(resolve_spec(&spec, &program()).unwrap().warnings.iter().all(|w| !w.contains("continues to the end")));
     }
 }

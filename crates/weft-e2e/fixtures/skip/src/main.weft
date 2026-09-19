@@ -1,0 +1,48 @@
+# Branching: a node whose `_should_flow` says no does not run, and the
+# nodes behind it close in turn. ExecPython emits both the value and the
+# permission inline, so the whole branch lives in one file.
+#
+# The rig asserts: `blocked` was skipped (it was told not to run) and so
+# was `out` behind it, while the execution itself completed. This is the
+# core "one branch turns the other off" behavior of the language.
+
+source = ExecPython() -> (value: String, allowed: Boolean, missing: String) {
+  code: "return {'value': 'never-delivered', 'allowed': False}"
+}
+
+blocked = Cast -> (value: String) {
+  value: source.value
+  _should_flow: source.allowed
+}
+
+out = Debug
+out.data = blocked.value
+
+# The same decision read the other way round. `source` declares
+# `missing` and never emits it, so that port CLOSES, and a closure is
+# what runs a node
+# gated on `_should_not_flow`. This is the one port in the language
+# that starts a node on a closure: every other node skips when its
+# inputs close, so acting on a thing that is not there would otherwise
+# leave nothing alive to notice.
+#
+# `Text` carries a written value, so the node has something to say
+# once its gate lets it run: the gate decides WHETHER it runs, never
+# what it says.
+instead = Text {
+  value: "the picture never came"
+  _should_not_flow: source.missing
+}
+
+told = Debug
+told.data = instead.value
+
+# And the mirror: `allowed` DID arrive (as `false`, which is a value),
+# so a node gated on its absence stays off.
+never = Text {
+  value: "unreachable"
+  _should_not_flow: source.value
+}
+
+quiet = Debug
+quiet.data = never.value

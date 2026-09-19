@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(stock_hash, stock.content_hash, "the ref computed without staging names the staged build");
         let dir = tempfile::tempdir().unwrap();
         let mut project = weft_compiler::project::Project::init(dir.path(), "a-different-project").unwrap();
-        std::fs::write(dir.path().join("main.weft"), "answer = Text { value: \"different graph\" }\n").unwrap();
+        std::fs::write(project.main_weft(), "answer = Text { value: \"different graph\" }\n").unwrap();
         let (definition, catalog) = weft_compiler::hash::load_enriched_project(&project).unwrap();
         let root = weft_compiler::build::resolve_weft_root().unwrap();
         let hash = |project: &weft_compiler::project::Project, catalog: &weft_catalog::FsCatalog| {

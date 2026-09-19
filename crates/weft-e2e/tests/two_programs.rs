@@ -1,7 +1,7 @@
 //! A trigger fire runs its own program and leaves the other alone.
 //!
 //! Two triggers in one file share an upstream node (see
-//! fixtures/two_programs/main.weft). Firing one journals the fire's
+//! fixtures/two_programs/src/main.weft). Firing one journals the fire's
 //! subgraph on `ExecutionStarted`, so the shared node's pulse into the
 //! other program is absorbed without a trace and the run completes,
 //! while every node the fired trigger reaches runs, a leaf nothing

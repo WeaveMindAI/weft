@@ -1,0 +1,28 @@
+{
+  "type": "TickBus",
+  "label": "Tick Bus",
+  "description": "Demo node standing in for a streaming producer (an LLM stream): opens a bus, sends three text deltas, closes it. Starts when `start` arrives.",
+  "tags": [
+    "bus",
+    "demo",
+    "stream"
+  ],
+  "icon": "Waves",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "start",
+      "type": "String",
+      "required": true,
+      "description": "Any value; what starts the producer (a route's path)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "ticks",
+      "type": "Bus",
+      "description": "Three `delta` messages: t1, t2, t3, then the bus closes."
+    }
+  ],
+  "requires_infra": false
+}

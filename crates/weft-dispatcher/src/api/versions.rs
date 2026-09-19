@@ -18,6 +18,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use weft_core::run_spec::{resolve_spec, Refusal, Resolved, RunSpec};
+use weft_core::frames::Located;
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
 use weft_core::Color;
 
@@ -180,9 +181,35 @@ pub(crate) async fn record_trigger_run(state: &DispatcherState, color: Color) ->
     if state.versions.run(color).await?.is_some() { return Ok(()); }
     let rows = state.journal.events_log(color).await?;
     if let Some(run) = trigger_run_from_birth(color, &rows)? {
-        state.versions.insert_run(&run).await?;
+        if let Err(error) = state.versions.insert_run(&run).await {
+            return orphaned_run_is_recorded_nowhere(color, error);
+        }
     }
     Ok(())
+}
+
+/// A run whose tree is gone (its project removed, or its version pruned,
+/// between the birth reaching the journal and the bridge reading it) has
+/// nothing left to be recorded in, and its history stays readable in the
+/// journal. That is not a failure: the bridge retries a failed row until
+/// it passes, so treating it as one parked the bridge on that row for
+/// good, with every event of every project behind it, and every
+/// activation waiting on those events with it. Any other failure (the
+/// database) stays an error, so the bridge retries it as designed.
+fn orphaned_run_is_recorded_nowhere(color: Color, error: anyhow::Error) -> anyhow::Result<()> {
+    match error.downcast_ref::<crate::versions::VersionMissing>() {
+        Some(missing) => {
+            tracing::info!(
+                target: "weft_dispatcher::journal_bridge",
+                %color,
+                project = %missing.project,
+                version = %missing.version,
+                "a fire's tree row has nowhere to go (its project or version is gone); its journal stays, nothing to record"
+            );
+            Ok(())
+        }
+        None => Err(error),
+    }
 }
 
 fn trigger_run_from_birth(color: Color, rows: &[weft_journal::ExecEvent]) -> anyhow::Result<Option<RunRow>> {
@@ -466,8 +493,8 @@ async fn settled_colors(
 /// The seed run folded, with its program: what the stale set reads.
 struct SeededFrom {
     color: Color,
-    outcomes: BTreeMap<String, SeedOutcome>,
-    outputs: Vec<weft_core::run_spec::ExpectedWire>,
+    outcomes: BTreeMap<Located, SeedOutcome>,
+    outputs: Vec<weft_core::run_spec::OutputWire>,
 }
 
 async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -> Result<SeededFrom, ApiError> {
@@ -476,12 +503,12 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
     let definition = sources[&run.color].project().as_ref();
     let snapshot = sources[&run.color].snapshot();
     let outputs = sources[&run.color].output_wires().map_err(|e| internal("seed outputs", e))?;
-    let live_nodes: BTreeSet<_> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
-        .map(|wire| wire.node.as_str()).collect();
+    let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
+        .map(|wire| wire.place()).collect();
     let mut identities = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
-    for node in inheritable_nodes(definition, snapshot) {
-        let origin = snapshot.inherited_origins.get(&node).copied().unwrap_or(run.color);
+    for place in inheritable_nodes(definition, snapshot) {
+        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.color);
         let (original, graph) = if origin == run.color { (snapshot, definition) } else {
             let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
             (source.snapshot(), source.project().as_ref())
@@ -493,20 +520,23 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
         let mut used_backups = BTreeMap::new();
         let mut backup_origins = BTreeMap::new();
         let mut absent_ports = BTreeSet::new();
-        let declaration = graph.nodes.iter().find(|n| n.id == node).ok_or_else(|| internal("seed node", &node))?;
-        for record in original.executions.get(&node).into_iter().flatten() {
+        let declaration = graph.nodes.iter().find(|n| n.id == place.id).ok_or_else(|| internal("seed node", &place.id))?;
+        for record in original.executions.get(&place.id).into_iter().flatten()
+            .filter(|record| Located::at(&place.id, &record.frames) == place)
+        {
             for port in &record.received.backup_ports {
-                let value = original.selection.as_ref().and_then(|selection| selection.input.get(&node))
-                    .and_then(|ports| ports.get(port)).ok_or_else(|| internal("seed backup", format!("{origin}: {node}.{port} has no recorded backup")))?;
+                let value = original.selection.as_ref().and_then(|selection| selection.input.get(&place))
+                    .and_then(|ports| ports.get(port)).ok_or_else(|| internal("seed backup", format!("{origin}: {place}.{port} has no recorded backup")))?;
                 used_backups.insert(port.clone(), value.clone());
                 backup_origins.insert(port.clone(), record.received.inherited_ports.get(port).copied().unwrap_or(origin));
             }
             absent_ports.extend(declaration.inputs.iter().filter(|port| !record.received.input.contains_key(&port.name)).map(|port| port.name.clone()));
         }
-        let boundary_ports = original.selection.as_ref().and_then(|selection| selection.boundary_ports.get(&node)).cloned().unwrap_or_default();
-        outcomes.insert(node.clone(), SeedOutcome { origin, slice_hash: identities[&origin][&node].clone(), used_backups, backup_origins, absent_ports, boundary_ports,
-            emitted_live_handle: live_nodes.contains(node.as_str()),
-            fire: original.kicked.iter().find(|(location, kick)| location.node_id == node && kick.firing)
+        let boundary_ports = original.selection.as_ref().and_then(|selection| selection.boundary_ports.get(&place)).cloned().unwrap_or_default();
+        let slice_hash = identities[&origin].get(&place).ok_or_else(|| internal("seed identity", format!("run {origin} has no slice for {place}")))?.clone();
+        outcomes.insert(place.clone(), SeedOutcome { origin, slice_hash, used_backups, backup_origins, absent_ports, boundary_ports,
+            emitted_live_handle: live_nodes.contains(&place),
+            fire: original.kicked.iter().find(|(location, kick)| Located::at(&location.node_id, &location.frames) == place && kick.firing)
                 .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
         });
     }
@@ -593,17 +623,45 @@ pub async fn run(
     let bakes = if spec.fire.is_some() {
         state.journal.trigger_bakes(&project_id).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
+    // A fired CALLER trigger (a Route) gets a stand-in caller: there is
+    // no socket coming, so the run serves the body the author typed and
+    // the program's answer goes to the journal. Without it a route's
+    // program is unrunnable offline, because the trigger and every
+    // Reply behind it ask for a caller that is not there.
+    //
+    // The trigger's signal spec comes from its BAKE, the same capture
+    // the port snapshot below comes from, so the dispatcher needs no
+    // knowledge of what a Route is: whether this trigger speaks to a
+    // caller at all is `protocol_for_tag` on the signal kind, which is
+    // the language's own vocabulary.
+    let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
     for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
-        weft_core::run_spec::validate_fire_bake(&kick.node, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
+        // A bake captures a trigger under its address (`one.door` for the
+        // `door` an include site `one` reaches), so the kick's raw id is
+        // spelled back through its call frames before the lookup.
+        let call_path: Vec<String> = weft_core::frames::call_path(&kick.frames).into_iter().map(str::to_string).collect();
+        let address = weft_core::project::address_of(&project, &kick.node, &call_path);
+        weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
             .map_err(|refusal| refused(&refusal))?;
         let capture = bakes.iter().find(|bake| bake.program == program)
-            .and_then(|bake| bake.captured.get(&kick.node))
+            .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
         kick.port_snapshot = Some(capture.ports.clone());
+        if weft_core::signal::protocol_for_tag(&capture.spec.kind).is_some() {
+            let payload = spec
+                .fire
+                .as_ref()
+                .map(|(_, payload)| payload.clone())
+                .unwrap_or(serde_json::Value::Null);
+            fired_caller = Some(
+                stand_in_caller(&capture.spec, &payload, &address)
+                    .map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?,
+            );
+        }
     }
 
     // Infra pre-flight, scoped to what THIS run executes.
-    let bound: Option<HashSet<String>> = Some(resolved.selection.nodes.iter().cloned().collect());
+    let bound: Option<HashSet<String>> = Some(resolved.selection.nodes.iter().map(|place| place.id.clone()).collect());
     let missing = crate::api::project::missing_infra_nodes(&state, &project_id, &project, bound.as_ref()).await?;
     if !missing.is_empty() {
         return Err((
@@ -648,11 +706,19 @@ pub async fn run(
     // re-runs, chosen because it is stable, not because it is first in
     // any graph order. A seeded run that inherited every node it
     // selected kicks nothing and re-runs nothing; it says so.
-    let entry_node = kicks
-        .first()
-        .map(|k| k.node.clone())
+    // Named the way the program reads them (`one.strip` for a node of
+    // an included file under the site `one`).
+    let spell = |place: &Located| weft_core::project::address_of(&project, &place.id, &place.path);
+    // Among the kicks, the first ordinary root in the program's own
+    // order (a trigger that does not fire is kicked too, and it is a
+    // poor name for a run started by hand).
+    let order = |node: &str| project.nodes.iter().position(|n| n.id == node).unwrap_or(usize::MAX);
+    let is_trigger = |node: &str| project.nodes.iter().any(|n| n.id == node && n.features.is_trigger);
+    let entry_node = kicks.iter()
+        .min_by_key(|k| (!k.firing, is_trigger(&k.node), k.frames.len(), order(&k.node)))
+        .map(|k| spell(&Located::at(&k.node, &k.frames)))
         .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| n.clone())))
-        .or_else(|| stale.iter().next().cloned())
+        .or_else(|| stale.iter().next().map(spell))
         .unwrap_or_else(|| "everything inherited".into());
     // Recording the run and starting it happen under the project's
     // transition lock, together.
@@ -675,7 +741,8 @@ pub async fn run(
     // so holds a pooled connection while it runs. Everything expensive
     // this handler does, the seed fold above and the response below,
     // stays outside it.
-    let stale_vec: Vec<String> = stale.iter().cloned().collect();
+    // A group's boundaries spell as the group, so a set dedupes them.
+    let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
     let (version, moved) = with_tree_lock(&state, &project_id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
@@ -712,6 +779,7 @@ pub async fn run(
             seed.clone(),
             None,
             Some(&version.version),
+            fired_caller.clone(),
         )
         .await?;
         // Head moves LAST, and a lost race is reported, never refused.
@@ -756,11 +824,8 @@ pub async fn run(
         ));
     }
 
-    let in_run = &resolved.selection.nodes;
-    let (inherited, ran): (Vec<String>, Vec<String>) = match &seed {
-        Some(seed) => (seed.origins.keys().cloned().collect(), in_run.iter().cloned().collect()),
-        None => (Vec::new(), in_run.iter().cloned().collect()),
-    };
+    let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
+    let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
     Ok(Json(VersionRunResponse {
         color,
         version: version.version,
@@ -771,15 +836,84 @@ pub async fn run(
     }))
 }
 
+/// What a fired caller trigger serves: the request the author typed,
+/// standing in for the socket nobody opened.
+///
+/// The payload is what the trigger's `firesWith` declares and the run
+/// spec already held it to, so the request is read straight out of it.
+/// Fields this type has no place for are left alone rather than
+/// refused: they are the trigger's, declared by it, checked against its
+/// own contract, and the node reads them off its wake.
+///
+/// Every fired caller trigger gets a stand-in, whether or not the
+/// payload carries anything to say. The difference matters more than it
+/// looks: NO stand-in means the trigger itself fails, asking to be
+/// triggered through a Route, which is the node the author is already
+/// looking at.
+fn stand_in_caller(
+    spec: &weft_core::primitive::SignalSpec,
+    payload: &serde_json::Value,
+    address: &str,
+) -> Result<weft_task_store::kinds::LiveConnectionStart, String> {
+    // Refused HERE, at the command, rather than only in the worker that
+    // would serve it: the engine keeps its own floor, but by then the
+    // person has already waited for an execution to start just to be
+    // told the thing they asked for cannot happen.
+    if weft_core::signal::live_connection::protocol_for_tag(&spec.kind)
+        == Some(weft_core::signal::Protocol::Websocket)
+    {
+        return Err(format!(
+            "--fire {address}: a Socket cannot be fired. Its shape is a conversation over \
+             time, and there is nothing honest to invent for the caller's next message. \
+             Point a real client at it (`weft activate` prints the URL)"
+        ));
+    }
+    // The payload travels WHOLE. The request is read out of it, and
+    // whatever else the trigger declared (a `body`, for the triggers
+    // that can carry one) stays where the author put it and reaches the
+    // node as its wake. Nothing is lifted out on the way: a body cut out
+    // here and served back through the ordinary request call would mean
+    // this tier holding a caller trigger's field name to make the
+    // impersonation work.
+    let request: weft_core::caller::LiveRequest =
+        serde_json::from_value(payload.clone()).map_err(|e| {
+            format!(
+                "--fire {address}: this trigger answers a caller, so its payload is the \
+                 request to serve: {e}"
+            )
+        })?;
+    Ok(weft_task_store::kinds::LiveConnectionStart {
+        spec: spec.clone(),
+        request,
+        fired: Some(weft_task_store::kinds::FiredExchange {}),
+    })
+}
+
 fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, color: Color, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
     let mut events = Vec::new();
     // Seed suppliers carry their original events. Only authored emits create
     // new supplied facts, including closures for an explicit empty port map,
     // and only the emits the cut kept (`--before` can drop one).
-    for (source, ports) in spec.emit.iter().filter(|(source, _)| resolved.selection.suppliers.contains(*source)) {
-        let node = project.nodes.iter().find(|node| &node.id == source).expect("resolved source exists");
+    // The resolver already turned each emit into the source's id and
+    // the frames it emits under; one row set per source.
+    let mut by_source: std::collections::BTreeMap<&str, (weft_core::frames::LoopFrames, std::collections::BTreeMap<&str, &Value>)> = Default::default();
+    for emission in resolved.provided.iter().filter(|e| resolved.selection.suppliers.contains(&Located::at(&e.source_node, &e.frames))) {
+        let entry = by_source.entry(emission.source_node.as_str()).or_insert_with(|| (emission.frames.clone(), Default::default()));
+        entry.1.insert(emission.source_port.as_str(), &emission.value);
+    }
+    // An emit with an empty port map still closes every output.
+    for spelled in spec.emit.keys() {
+        let (source, path) = weft_core::project::resolve_address(project, spelled);
+        let place = Located::new(source, path);
+        if resolved.selection.suppliers.contains(&place) {
+            by_source.entry(project.nodes.iter().find(|n| n.id == place.id).map(|n| n.id.as_str()).expect("resolved source exists"))
+                .or_insert_with(|| (place.frames(), Default::default()));
+        }
+    }
+    for (source, (frames, ports)) in by_source {
+        let node = project.nodes.iter().find(|node| node.id == source).expect("resolved source exists");
         for port in &node.outputs {
-            let supplied = ports.get(&port.name);
+            let supplied = ports.get(port.name.as_str()).copied();
             let generator = matches!(port.port_type, weft_core::weft_type::WeftType::Generator(_));
             let values: Vec<&Value> = match supplied {
                 Some(value) if generator => value.as_array().expect("resolved stream is a list").iter().collect(),
@@ -789,14 +923,14 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
             for (index, value) in values.into_iter().enumerate() {
                 events.push(weft_journal::ExecEvent::PortEmitted {
                     color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied\0{source}\0{}\0{index}", port.name).as_bytes()),
-                    node_id: source.clone(), frames: vec![], port: port.name.clone(), value: Arc::new(value.clone()),
+                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), value: Arc::new(value.clone()),
                     provided: true, at_unix,
                 });
             }
             if generator || supplied.is_none() {
                 events.push(weft_journal::ExecEvent::PortClosed {
                     color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied-end\0{source}\0{}", port.name).as_bytes()),
-                    node_id: source.clone(), frames: vec![], port: port.name.clone(), provided: true, at_unix,
+                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), provided: true, at_unix,
                 });
             }
         }
@@ -819,12 +953,12 @@ pub async fn trigger_bakes(
 /// A seeded run kicks its stale roots and every explicitly fired trigger.
 fn seeded_kicks(
     resolved: &Resolved,
-    stale: &BTreeSet<String>,
+    stale: &BTreeSet<Located>,
 ) -> Vec<Kick> {
     resolved
         .kicks
         .iter()
-        .filter(|k| k.firing || stale.contains(&k.node))
+        .filter(|k| k.firing || stale.contains(&Located::at(&k.node, &k.frames)))
         .cloned()
         .collect()
 }
@@ -861,6 +995,11 @@ pub struct RunSummary {
     pub status: String,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+    /// For a cancelled run, who or what stopped it (see
+    /// `ExecutionSummary::cancel_cause`).
+    pub cancel_cause: Option<weft_core::exec::CancelCause>,
+    /// Node firings the run skipped (see `ExecutionSummary::skipped_nodes`).
+    pub skipped_nodes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -910,9 +1049,9 @@ pub async fn tree(
         .map_err(|e| internal("execution summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
     for r in runs {
-        let (mut status, started_at, completed_at) = match summaries.get(&r.color) {
-            Some(s) => (s.status.clone(), s.started_at, s.completed_at),
-            None => ("unknown".to_string(), r.created_at, None),
+        let (mut status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.color) {
+            Some(s) => (s.status.clone(), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
+            None => ("unknown".to_string(), r.created_at, None, None, 0),
         };
         if status == "running" && suspended.contains(&r.color) {
             status = "waiting_for_input".to_string();
@@ -928,6 +1067,8 @@ pub async fn tree(
             status,
             started_at,
             completed_at,
+            cancel_cause,
+            skipped_nodes,
         });
     }
     Ok(Json(TreeResponse { head, versions: version_summaries, runs: run_summaries }))
@@ -1357,7 +1498,7 @@ mod fire_snapshot_tests {
         let wake = serde_json::json!({"message": "original"});
         let (birth, mut kicks) = crate::api::project::execution_birth_events(
             color, &project.to_string(), weft_core::context::Phase::Fire, "trigger",
-            &[Kick { node: "trigger".into(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
+            &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
             "original-graph", None, None, None, Some("original-source"), 42,
         );
         let mut rows = vec![birth];
@@ -1368,14 +1509,14 @@ mod fire_snapshot_tests {
         assert_eq!(run.created_at, 42);
         assert_eq!(run.spec.unwrap().fire, Some(("trigger".into(), wake)));
         rows.push(weft_journal::ExecEvent::NodeKicked {
-            color, node_id: "other-trigger".into(), firing: true,
+            color, node_id: "other-trigger".into(), frames: vec![], firing: true,
             payload: None, port_snapshot: None, at_unix: 42,
         });
         assert!(trigger_run_from_birth(color, &rows).unwrap_err().to_string().contains("more than one trigger"));
     }
 
     fn plan(node: &str, firing: bool) -> Kick {
-        Kick { node: node.to_string(), firing, payload: None, port_snapshot: None }
+        Kick { node: node.to_string(), frames: Vec::new(), firing, payload: None, port_snapshot: None }
     }
 
     /// A fired trigger replays the ports it registered at activation,
@@ -1407,7 +1548,7 @@ mod fire_snapshot_tests {
         fired.port_snapshot = Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" }));
         let resolved = Resolved {
             selection: weft_core::project::selection::RunSelection {
-                nodes: ["ask".to_string()].into_iter().collect(),
+                nodes: [Located::top("ask")].into_iter().collect(),
                 ..Default::default()
             },
             kicks: vec![fired],
@@ -1415,7 +1556,7 @@ mod fire_snapshot_tests {
             crossings: vec![],
             warnings: vec![],
         };
-        let stale: BTreeSet<String> = ["ask".to_string()].into_iter().collect();
+        let stale: BTreeSet<Located> = [Located::top("ask")].into_iter().collect();
         let kicks = seeded_kicks(&resolved, &stale);
         assert_eq!(kicks[0].port_snapshot, Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" })));
     }
@@ -1448,4 +1589,92 @@ mod fire_snapshot_tests {
         assert!(resolved.kicks.iter().any(|k| k.node == "tick" && k.firing));
     }
 
+}
+
+#[cfg(test)]
+mod orphaned_run_tests {
+    use super::orphaned_run_is_recorded_nowhere;
+    use crate::versions::VersionMissing;
+
+    /// A run whose version is gone is recorded nowhere and that is fine;
+    /// any other failure keeps the bridge retrying the row.
+    #[test]
+    fn only_a_missing_version_is_forgiven() {
+        let color = uuid::Uuid::new_v4();
+        let missing = VersionMissing { project: uuid::Uuid::new_v4(), version: "v7".into() };
+        orphaned_run_is_recorded_nowhere(color, missing.into()).expect("nothing to record in is not a failure");
+        let storage = anyhow::anyhow!("connection reset by peer");
+        let err = orphaned_run_is_recorded_nowhere(color, storage).expect_err("a storage failure retries");
+        assert!(err.to_string().contains("connection reset"));
+    }
+}
+
+#[cfg(test)]
+mod stand_in_caller_tests {
+    use super::stand_in_caller;
+    use serde_json::json;
+
+    fn route_spec() -> weft_core::primitive::SignalSpec {
+        serde_json::from_value(json!({ "kind": "route", "config": {} }))
+            .expect("a minimal signal spec")
+    }
+
+    /// A GET has no body, so the natural spelling of firing one has no
+    /// `body` key. That must still attach a caller: without one the
+    /// Route node itself fails, telling the author to trigger it
+    /// through a Route, which is the node they are already firing.
+    #[test]
+    fn a_get_with_no_body_still_gets_a_caller() {
+        let start = stand_in_caller(
+            &route_spec(),
+            &json!({ "method": "GET", "path": "cards" }),
+            "list.door",
+        )
+        .expect("a request with no body is a request");
+        assert_eq!(start.request.method, "GET");
+        assert!(start.fired.is_some(), "no body key is still a caller, never a missing one");
+    }
+
+    /// A socket is a conversation over time and there is nothing
+    /// honest to invent for the caller's next message, so firing one is
+    /// refused. At the command, not after an execution has started:
+    /// the worker keeps its own floor, but waiting for a run just to be
+    /// told no is a worse way to hear it.
+    #[test]
+    fn firing_a_socket_is_refused_at_the_command() {
+        let socket: weft_core::primitive::SignalSpec =
+            serde_json::from_value(json!({ "kind": "socket", "config": {} }))
+                .expect("a minimal signal spec");
+        let why = stand_in_caller(&socket, &json!({ "path": "chat" }), "chat.door")
+            .expect_err("a socket cannot be fired");
+        assert!(why.contains("Socket cannot be fired"), "{why}");
+        // And it says what to do instead, which is the whole point of
+        // refusing early.
+        assert!(why.contains("weft activate"), "{why}");
+    }
+
+    /// The request is READ from the payload, never carved out of it.
+    ///
+    /// A `body` the author typed is the trigger's own declared field:
+    /// it stays in the payload, reaches the node as its wake, and the
+    /// node reads it from there. Cutting it out here and feeding it
+    /// back through the ordinary request call would mean this tier
+    /// holding a caller trigger's field name.
+    #[test]
+    fn the_payload_is_read_not_carved_up() {
+        let payload = json!({ "method": "POST", "path": "hello", "body": { "name": "ada" } });
+        let start = stand_in_caller(&route_spec(), &payload, "hello").expect("a post with a body");
+        assert_eq!(start.request.path, "hello");
+        assert_eq!(start.request.method, "POST");
+        assert!(start.fired.is_some(), "a fired run has a stand-in");
+    }
+
+    /// A payload that is not a request at all is refused naming the
+    /// trigger, rather than starting a run that fails inside the node.
+    #[test]
+    fn a_payload_that_is_not_a_request_is_refused_by_name() {
+        let why = stand_in_caller(&route_spec(), &json!({ "method": 7 }), "list.door")
+            .expect_err("a method that is not a string is not a request");
+        assert!(why.contains("list.door") && why.contains("request to serve"), "{why}");
+    }
 }

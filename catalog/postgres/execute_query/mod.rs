@@ -27,84 +27,17 @@ use serde_json::{json, Value};
 
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, placeholders, query_json, script_json, steps_json, Statement};
+use super::postgres::{
+    connect, plan, ports_read, query_json, refuse_shadowed_columns, refuse_unanswered_ports,
+    script_json, steps_json, Plan,
+    Statement,
+};
 
 #[derive(NodeManifest)]
 pub struct PostgresExecuteQueryNode;
 
 #[cfg(feature = "node-tests")]
 mod tests;
-
-/// How one firing runs, decided from the query text alone, BEFORE
-/// any connection is opened: a query that cannot run is refused
-/// without a dial, and the refusal names the placeholder at fault.
-#[derive(Debug, PartialEq)]
-pub enum Plan {
-    /// One statement: `names[i]` is the port that `$(i + 1)` in `sql`
-    /// reads, so the values bind in that order and a refusal from the
-    /// driver (which only ever says "parameter 3") can be repeated
-    /// back to the author in their own words.
-    Query { sql: String, names: Vec<String> },
-    /// Several statements naming no port: sent whole, verbatim,
-    /// through the simple protocol.
-    Script { sql: String },
-    /// Several statements, at least one naming a port: each runs on
-    /// its own with the ports it names, in one transaction.
-    Steps(Vec<Statement>),
-}
-
-/// A driver error with the port name spliced in wherever it names a
-/// parameter by position. `$1` is weft's numbering, not the author's:
-/// on its own, "error serializing parameter 1" points at a thing that
-/// does not appear anywhere in their source.
-fn name_the_ports(error: weft::error::WeftError, names: &[String]) -> weft::error::WeftError {
-    let text = error.to_string();
-    let Some(rest) = text.split("parameter ").nth(1) else {
-        return error;
-    };
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    let Some(name) = digits.parse::<usize>().ok().and_then(|n| names.get(n.wrapping_sub(1))) else {
-        return error;
-    };
-    weft::error::node_error(format!("{text} (parameter {digits} is the `{name}` port, `${name}`)"))
-}
-
-/// What one firing runs, decided from the query text alone. Pure, and
-/// BEFORE any connection is opened, so a query that cannot run is
-/// refused without a dial.
-pub fn plan(query: &str) -> WeftResult<Plan> {
-    let mut parsed = placeholders(query)?;
-    if parsed.statements.len() == 1 {
-        let Statement { sql, names } = parsed.statements.remove(0);
-        return Ok(Plan::Query { sql, names });
-    }
-    if parsed.names().is_empty() {
-        // The scanner's own copy of the text, so one function decides
-        // what reaches the server on both paths.
-        return Ok(Plan::Script { sql: parsed.verbatim });
-    }
-    Ok(Plan::Steps(parsed.statements))
-}
-
-/// The ports a plan reads, first appearance first, each once: what
-/// the wired ports have to match both ways.
-fn ports_read(plan: &Plan) -> Vec<String> {
-    match plan {
-        Plan::Query { names, .. } => names.clone(),
-        Plan::Script { .. } => Vec::new(),
-        Plan::Steps(steps) => {
-            let mut out: Vec<String> = Vec::new();
-            for s in steps {
-                for n in &s.names {
-                    if !out.contains(n) {
-                        out.push(n.clone());
-                    }
-                }
-            }
-            out
-        }
-    }
-}
 
 #[async_trait]
 impl Node for PostgresExecuteQueryNode {
@@ -140,7 +73,7 @@ impl Node for PostgresExecuteQueryNode {
                         .iter()
                         .find(|(name, _)| *name == n.as_str())
                         .map(|(_, v)| v.clone())
-                        .expect("for_holes proved every named port arrived")
+                        .expect("for_holes answered every hole the plan names")
                 })
                 .collect()
         };
@@ -148,10 +81,8 @@ impl Node for PostgresExecuteQueryNode {
         let conn = ctx.open(&account).await?;
         let mut client = connect(&ctx, &conn).await?;
         let rows = match plan {
-            Plan::Query { sql, names } => query_json(&client, &sql, &bind(&names))
-                .await
-                .map_err(|e| name_the_ports(e, &names))?,
-            Plan::Script { sql } => script_json(&client, &sql).await?,
+            Plan::Query { sql, names } => query_json(&client, &sql, &names, &bind(&names)).await?,
+            Plan::Script { head, last } => script_json(&client, &head, &last).await?,
             Plan::Steps(steps) => {
                 let bound: Vec<(Statement, Vec<Value>)> =
                     steps.into_iter().map(|s| { let v = bind(&s.names); (s, v) }).collect();
@@ -163,6 +94,11 @@ impl Node for PostgresExecuteQueryNode {
         // query that answered no rows leaves them unmentioned, which
         // closes them.
         let first = rows.first().cloned().unwrap_or(Value::Null);
+        // A column named like one of this node's own ports would be
+        // overwritten by the node a line below, silently.
+        refuse_shadowed_columns(&first, &["rows", "count"])?;
+        // ...and a port the author declared that no column answers.
+        refuse_unanswered_ports(&first, ctx.declared_outputs(), &["rows", "count"])?;
         let output = ctx.fan_declared(&first).set("rows", json!(rows)).set("count", count);
         ctx.pulse_downstream(output).await
     }

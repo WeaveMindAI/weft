@@ -122,7 +122,7 @@
 
     fn birth(color: Color, project: &ProjectDefinition, subgraph: Option<&[&str]>, seed: Option<Seed>) -> ExecEvent {
         let mut selection = match subgraph {
-            Some(nodes) => weft_core::project::selection::RunSelection::restricted(project, nodes.iter().map(|node| (*node).into()).collect()).unwrap(),
+            Some(nodes) => weft_core::project::selection::RunSelection::restricted(project, nodes.iter().map(|node| weft_core::frames::Located::top(*node)).collect()).unwrap(),
             None => weft_core::project::selection::RunSelection::whole(project),
         };
         if let Some(seed) = &seed {
@@ -143,11 +143,11 @@
     }
 
     fn kick(color: Color, node: &str, payload: Option<serde_json::Value>) -> ExecEvent {
-        ExecEvent::NodeKicked { color, node_id: node.into(), firing: false, payload, port_snapshot: None, at_unix: 0 }
+        ExecEvent::NodeKicked { color, node_id: node.into(), frames: vec![], firing: false, payload, port_snapshot: None, at_unix: 0 }
     }
 
     fn seed(parent: Color, kept: &[&str]) -> Seed {
-        Seed { parent, origins: kept.iter().map(|node| ((*node).into(), parent)).collect() }
+        Seed { parent, origins: kept.iter().map(|node| (weft_core::frames::Located::top(*node), parent)).collect() }
     }
 
     fn started_nodes(events: &[ExecEvent]) -> Vec<String> {
@@ -233,7 +233,7 @@
             ancestors,
             vec![program.clone()],
             vec![birth(grandchild, &program, None, Some(Seed { parent: child,
-                origins: [("a".into(), parent), ("b".into(), child)].into_iter().collect() }))],
+                origins: [(weft_core::frames::Located::top("a"), parent), (weft_core::frames::Located::top("b"), child)].into_iter().collect() }))],
         )
         .await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
@@ -333,7 +333,7 @@
         let child = uuid::Uuid::new_v4();
         let mut start = birth(child, &program, Some(&["b", "c"]), None);
         let ExecEvent::ExecutionStarted { subgraph: Some(selection), .. } = &mut start else { unreachable!() };
-        selection.input.insert("b".into(), [("value".into(), json!("by hand"))].into());
+        selection.input.insert(weft_core::frames::Located::top("b"), [("value".into(), json!("by hand"))].into());
         let rows = vec![start, kick(child, "b", None)];
         let (outcome, child_rows) = drive_seeded(program, cat(&ran, &seen), child, Vec::new(), Vec::new(), rows).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");

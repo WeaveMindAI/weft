@@ -1,14 +1,13 @@
 //! `weft new <name>`: scaffold a new project directory with
-//! weft.toml, main.weft, nodes/, .weft/, and an initialized git
+//! weft.toml, src/main.weft, nodes/, .weft/, and an initialized git
 //! repo. With `--assistant <name>`, also install the Tangle
-//! assistant persona for that AI coding assistant, via symlinks
-//! into the weft checkout (see `AssistantSpec`). The choice is
+//! assistant persona for that AI coding assistant, copied out of
+//! the weft checkout (see `AssistantSpec`). The choice is
 //! remembered, so later `weft new` calls install the same
 //! assistants without repeating the flag; `--assistant none`
 //! clears it, and `--assistant agents` is the fallback for an
 //! assistant weft has no template for.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,15 +21,15 @@ use super::Ctx;
 /// name. Adding an assistant is one more row here (plus the template
 /// directory itself); nothing else in `weft new` is assistant-specific.
 #[derive(Debug)]
-struct AssistantSpec {
+pub struct AssistantSpec {
     /// Directory under `tangle/` in the weft checkout.
-    dir: &'static str,
+    pub dir: &'static str,
     /// Shorthand accepted as the `--assistant` value (`cc` for
     /// `claude-code`, `kc` for `kilo-code`).
-    shorthand: &'static str,
+    pub shorthand: &'static str,
     /// `(name in the project, path inside the template dir)` pairs, each
-    /// installed as a symlink.
-    links: &'static [(&'static str, &'static str)],
+    /// copied into the project.
+    pub links: &'static [(&'static str, &'static str)],
 }
 
 /// Every assistant weft ships a Tangle template for. Each row's `links` are
@@ -40,7 +39,7 @@ struct AssistantSpec {
 /// directories are independent copies on purpose (see `tangle/README.md`):
 /// a wording that works better on one assistant belongs only in that
 /// assistant's copy.
-const ASSISTANTS: &[AssistantSpec] = &[
+pub const ASSISTANTS: &[AssistantSpec] = &[
     AssistantSpec {
         dir: "claude-code",
         shorthand: "cc",
@@ -110,7 +109,7 @@ const ASSISTANTS: &[AssistantSpec] = &[
 /// own persona file rather than treating it as an alternative, so shipping
 /// both would put Tangle in the context twice, at double the tokens, with
 /// two copies free to disagree.
-const FALLBACK: AssistantSpec = AssistantSpec {
+pub const FALLBACK: AssistantSpec = AssistantSpec {
     dir: "fallback",
     shorthand: "agents",
     links: &[("AGENTS.md", "AGENTS.md"), (".agents", ".agents")],
@@ -131,7 +130,7 @@ fn assistants_record_path() -> Option<PathBuf> {
 /// unknown name fails the whole command, because a typo'd
 /// `--assistant cluade-code` that silently produced a Tangle-less project
 /// is the bad outcome.
-fn resolve_assistants(values: &[String]) -> anyhow::Result<Vec<&'static AssistantSpec>> {
+pub fn resolve_assistants(values: &[String]) -> anyhow::Result<Vec<&'static AssistantSpec>> {
     let mut resolved: Vec<&'static AssistantSpec> = Vec::new();
     for value in values {
         let found = std::iter::once(&FALLBACK)
@@ -263,24 +262,13 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
     let project = weft_compiler::project::Project::init(&root, &name)
         .map_err(|e| anyhow::anyhow!("init: {e}"))?;
 
-    // The Tangle symlinks point into this machine's weft checkout
-    // (absolute paths), so they are machine-local: a teammate cloning the
-    // project would get dangling links. Keep them out of the repo, one
-    // entry per link name across every installed assistant.
-    let mut gitignore = String::from("target/\n.weft/\nnode_modules/\n");
-    if !installed.is_empty() {
-        gitignore.push_str("# tangle: symlinked from the local weft checkout\n");
-        let mut link_names: BTreeSet<&str> = BTreeSet::new();
-        for spec in &installed {
-            for (link, _) in spec.links {
-                link_names.insert(link);
-            }
-        }
-        for link in link_names {
-            gitignore.push_str(link);
-            gitignore.push('\n');
-        }
-    }
+    // Tangle is copied in, so its files are ordinary project files and
+    // belong in the repo: clone the project on another machine and the
+    // persona is there, with no weft checkout to point at.
+    // `.env` auto-loads next to a project and is where a key the
+    // project MINTS lands (`weft connect --set-env`), so it holds
+    // secrets by the time anybody would commit it.
+    let gitignore = String::from("target/\n.weft/\nnode_modules/\n.env\n");
 
     // Initialize git. Best-effort: skip quietly if git is missing.
     let git_init = Command::new("git").arg("init").current_dir(&root).status();
@@ -310,12 +298,12 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
     if !installed.is_empty() {
         if explicit {
             println!(
-                "tangle ({}) installed via symlinks: open the project in that assistant and it is there",
+                "tangle ({}) installed: open the project in that assistant and it is there",
                 shown.join(", ")
             );
         } else {
             println!(
-                "tangle ({}) installed via symlinks (remembered from your last choice; \
+                "tangle ({}) installed (remembered from your last choice; \
                  --assistant <name> changes it, --assistant none stops it)",
                 shown.join(", ")
             );
@@ -342,28 +330,57 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
     Ok(())
 }
 
-/// Symlink every selected Tangle persona from the weft checkout into a fresh
-/// project. All template sources and destinations are checked before any link
-/// is written, so a bad later assistant cannot leave an earlier one half
-/// installed.
+/// The one file every Tangle template puts inside the assistant's own
+/// directory. A project HAS Tangle for an assistant when this file is
+/// there under one of that assistant's names, which is how
+/// `weft tangle update` knows what to refresh: nothing but an install
+/// writes it, so a `.github/` an assistant made for itself is not
+/// mistaken for a persona.
+const WITNESS: &str = "skills/weft-running/SKILL.md";
+
+/// Names an assistant writes into its own directory that are not ours
+/// to ship: dependency trees, lockfiles and scratch state that the
+/// checkout picks up from being used as a project itself. The templates
+/// track none of these.
+const TEMPLATE_EXCLUDE: &[&str] = &[
+    ".git",
+    ".gitignore",
+    "target",
+    "node_modules",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "yarn.lock",
+    "agent-manager.json",
+    "worktrees",
+];
+
+/// True when `root` already holds Tangle for `spec`.
+pub fn tangle_installed(root: &Path, spec: &AssistantSpec) -> bool {
+    spec.links
+        .iter()
+        .any(|(name, _)| root.join(name).join(WITNESS).is_file())
+}
+
+/// Copy every selected Tangle persona out of the weft checkout into
+/// `root`, replacing what the template owns and leaving alone anything
+/// the assistant itself put there. Every template is checked before a
+/// byte is written, so a bad later assistant cannot leave an earlier one
+/// half installed.
 ///
-/// Symlinks, deliberately: the point of the flag is that a `git pull` of the
-/// checkout refreshes Tangle in every project that asked for it, with no
-/// per-project copy to drift stale. The targets are absolute, because the
-/// project can live anywhere relative to the checkout and
-/// `weft_repo_root()` already handles a moved checkout (recorded install
-/// root, env override, cwd walk-up). The tradeoff is stated in the
-/// project's `.gitignore`: the links are machine-local and stay out of the
-/// repo.
-///
-/// Unlike `seed_base_catalog` (which COPIES the stdlib so a project is
-/// self-contained), this is an intentional reach back into the
-/// installation, the one place a running project depends on the checkout
-/// staying put.
-fn install_tangle(root: &Path, assistants: &[&AssistantSpec]) -> anyhow::Result<()> {
+/// Copies, not symlinks: an assistant reads a project's instructions as
+/// untrusted input, and Kilo refuses outright to read an agent file that
+/// resolves outside the project, so a link into the checkout loads
+/// nothing and says nothing. A copy is also what makes Tangle survive a
+/// clone, which is why the generated `.gitignore` no longer hides it.
+/// The cost is that a project's Tangle is the version that installed it;
+/// `weft tangle update` is how it catches up, the same way
+/// `weft catalog update` re-seeds the stdlib.
+pub fn install_tangle(root: &Path, assistants: &[&AssistantSpec]) -> anyhow::Result<()> {
     let repo = weft_catalog::weft_repo_root()
         .map_err(|e| anyhow::anyhow!("locating the weft checkout for tangle: {e}"))?;
-    let mut links = Vec::new();
+    let mut pairs = Vec::new();
 
     for spec in assistants {
         let template = repo.join("tangle").join(spec.dir);
@@ -378,51 +395,91 @@ fn install_tangle(root: &Path, assistants: &[&AssistantSpec]) -> anyhow::Result<
         }
 
         for (link_name, rel) in spec.links {
-            let target = template.join(rel);
-            // metadata follows links: a dangling source in the template must
-            // not become a dangling link in the new project.
-            if let Err(error) = std::fs::metadata(&target) {
+            let source = template.join(rel);
+            // metadata follows links: a dangling source in the template
+            // must not become a half-written entry in the project.
+            if let Err(error) = std::fs::metadata(&source) {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     anyhow::bail!(
                         "the tangle template for {} is incomplete in this weft checkout ({} is missing); \
                          git pull the checkout, or create the project without --assistant {}",
                         spec.dir,
-                        target.display(),
+                        source.display(),
                         spec.dir
                     );
                 }
-                return Err(error).with_context(|| format!("inspect {}", target.display()));
+                return Err(error).with_context(|| format!("inspect {}", source.display()));
             }
-
-            let link = root.join(link_name);
-            ensure_link_available(&link, spec)?;
-            links.push((link, target));
+            pairs.push((root.join(link_name), source));
         }
     }
 
-    for (link, target) in links {
-        std::os::unix::fs::symlink(&target, &link).with_context(|| {
-            format!("symlink {} -> {}", link.display(), target.display())
-        })?;
+    for (dest, source) in pairs {
+        merge_template(&source, &dest)?;
     }
     Ok(())
 }
 
-fn ensure_link_available(link: &Path, spec: &AssistantSpec) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(link) {
-        Ok(_) => anyhow::bail!(
-            "{} already exists; tangle ({}) not installed over it",
-            link.display(),
-            spec.dir
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("inspect {}", link.display())),
+/// Put the template at `source` into `dest`, entry by entry. A file
+/// replaces whatever is at `dest`; a directory keeps everything the
+/// template does not name (an assistant's own `worktrees/`, its
+/// installed `node_modules/`) and replaces everything it does.
+///
+/// An earlier weft installed these as symlinks into the checkout, so a
+/// `dest` that IS a link is removed rather than written through: that
+/// would edit the checkout itself and leave the project still pointing
+/// at it.
+fn merge_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    let linked = std::fs::symlink_metadata(dest)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if linked {
+        std::fs::remove_file(dest)
+            .with_context(|| format!("remove the old tangle link at {}", dest.display()))?;
+    }
+    if !source.is_dir() {
+        return replace_with_template(source, dest);
+    }
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("read the tangle template at {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("read the tangle template at {}", source.display()))?;
+        let name = entry.file_name();
+        if TEMPLATE_EXCLUDE.contains(&&*name.to_string_lossy()) {
+            continue;
+        }
+        replace_with_template(&entry.path(), &dest.join(&name))?;
+    }
+    Ok(())
+}
+
+/// Throw away whatever is at `dest` and write the template's copy of it,
+/// so a file the template dropped since the last install does not linger
+/// in the project claiming to be part of Tangle.
+fn replace_with_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(dest)
+            .with_context(|| format!("replace {}", dest.display()))?,
+        Ok(_) => {
+            std::fs::remove_file(dest).with_context(|| format!("replace {}", dest.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dest.display())),
+    }
+    if source.is_dir() {
+        weft_compiler::build::copy_dir_filtered(source, dest, TEMPLATE_EXCLUDE)
+            .map_err(|e| anyhow::anyhow!("copy {} into {}: {e}", source.display(), dest.display()))
+    } else {
+        std::fs::copy(source, dest)
+            .with_context(|| format!("copy {} into {}", source.display(), dest.display()))?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_link_available, resolve_assistants, ASSISTANTS, FALLBACK};
+    use super::{merge_template, resolve_assistants, tangle_installed, ASSISTANTS, FALLBACK, WITNESS};
 
     #[test]
     fn resolves_kilo_code_and_its_shorthand() {
@@ -496,12 +553,83 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_replace_a_dangling_tangle_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let link = temp.path().join("kilo.json");
-        std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
+    fn every_template_carries_the_witness_under_one_of_its_own_names() {
+        // `weft tangle update` finds what a project has by looking for
+        // WITNESS under each of an assistant's names. A template that
+        // stopped shipping it would go silently un-refreshable.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("checkout root")
+            .to_path_buf();
+        for spec in std::iter::once(&FALLBACK).chain(ASSISTANTS.iter()) {
+            let template = repo.join("tangle").join(spec.dir);
+            let found = spec
+                .links
+                .iter()
+                .any(|(_, rel)| template.join(rel).join(WITNESS).is_file());
+            assert!(found, "{} ships no {WITNESS} under any of its names", spec.dir);
+        }
+    }
 
-        let error = ensure_link_available(&link, &ASSISTANTS[1]).unwrap_err();
-        assert!(error.to_string().contains("not installed over it"));
+    #[test]
+    fn a_refresh_replaces_what_tangle_owns_and_keeps_what_the_assistant_made() {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template");
+        std::fs::create_dir_all(template.join("agent")).unwrap();
+        std::fs::write(template.join("agent/tangle.md"), "new").unwrap();
+        std::fs::write(template.join("node_modules"), "never copied").unwrap();
+
+        // A project whose last install left a stale agent behind, and
+        // whose assistant keeps its own scratch state in the same tree.
+        let dest = temp.path().join("project/.kilo");
+        std::fs::create_dir_all(dest.join("agent")).unwrap();
+        std::fs::create_dir_all(dest.join("worktrees")).unwrap();
+        std::fs::write(dest.join("agent/tangle.md"), "old").unwrap();
+        std::fs::write(dest.join("agent/dropped.md"), "gone after this").unwrap();
+        std::fs::write(dest.join("worktrees/mine"), "the assistant's").unwrap();
+
+        merge_template(&template, &dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dest.join("agent/tangle.md")).unwrap(), "new");
+        assert!(!dest.join("agent/dropped.md").exists(), "a dropped template file goes");
+        assert!(!dest.join("node_modules").exists(), "an assistant's own tree never travels");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("worktrees/mine")).unwrap(),
+            "the assistant's",
+            "what the assistant put there survives a refresh"
+        );
+    }
+
+    #[test]
+    fn a_refresh_turns_an_older_install_s_symlink_into_real_files() {
+        // Before copies, these were symlinks into the weft checkout.
+        // Writing through one would edit the checkout and leave the
+        // project still pointing at it.
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template");
+        std::fs::create_dir_all(template.join("agent")).unwrap();
+        std::fs::write(template.join("agent/tangle.md"), "new").unwrap();
+
+        let dest = temp.path().join(".kilo");
+        std::os::unix::fs::symlink(&template, &dest).unwrap();
+        merge_template(&template, &dest).unwrap();
+
+        assert!(!std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(dest.join("agent/tangle.md")).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_project_is_only_seen_as_installed_when_the_witness_is_there() {
+        // An assistant that made its own `.kilo/` (Kilo does) must not
+        // read as a project that has Tangle.
+        let temp = tempfile::tempdir().unwrap();
+        let kilo = &ASSISTANTS[1];
+        std::fs::create_dir_all(temp.path().join(".kilo/worktrees")).unwrap();
+        assert!(!tangle_installed(temp.path(), kilo));
+
+        std::fs::create_dir_all(temp.path().join(".kilo").join(WITNESS).parent().unwrap()).unwrap();
+        std::fs::write(temp.path().join(".kilo").join(WITNESS), "skill").unwrap();
+        assert!(tangle_installed(temp.path(), kilo));
     }
 }

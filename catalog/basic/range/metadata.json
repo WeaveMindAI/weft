@@ -6,9 +6,9 @@
   "icon": "Hash",
   "color": "#64748b",
   "inputs": [
-    { "name": "from", "type": "Number", "required": false, "default": 0 },
+    { "name": "from", "type": "Number", "default": 0 },
     { "name": "to", "type": "Number", "required": true },
-    { "name": "step", "type": "Number", "required": false, "default": 1 }
+    { "name": "step", "type": "Number", "default": 1 }
   ],
   "outputs": [
     { "name": "values", "type": "Generator[Number]" }

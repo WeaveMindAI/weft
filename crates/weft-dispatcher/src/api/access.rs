@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, DoorsStatus,
-    GrantSummary, MintAppRequest, MintAppResponse, SharedDoorPick, StartedOAuth,
+    GrantSummary, MintAppRequest, MintAppResponse, SharedCredentialsAnswer, SharedCredentialsQuery,
+    SharedDoorPick, StartedOAuth,
 };
 use weft_core::storage::Tenanted;
 
@@ -136,10 +137,44 @@ pub async fn list_grants(
     caller: CallerTenant,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<GrantSummary>>, ApiError> {
-    weft_access_store::list_grants(&state.pg_pool, &caller.0 .0, q.service.as_deref())
+    let mut grants = weft_access_store::list_grants(&state.pg_pool, &caller.0 .0, q.service.as_deref())
         .await
-        .map(Json)
-        .map_err(access_err)
+        .map_err(access_err)?;
+    // A runtime-owned row is a connection only while the key behind it
+    // exists, and only the broker holds the shared-credentials file.
+    let services = runtime_owned_services(&grants);
+    if !services.is_empty() {
+        let answer: SharedCredentialsAnswer = crate::broker_admin::forward_json(
+            &state,
+            "/v1/access/admin/shared-credentials",
+            &SharedCredentialsQuery { services },
+        )
+        .await?;
+        stamp_runtime_credentials(&mut grants, &answer.available);
+    }
+    Ok(Json(grants))
+}
+
+/// The services the runtime-owned rows of a listing resolve through,
+/// each once.
+fn runtime_owned_services(grants: &[GrantSummary]) -> Vec<String> {
+    let mut services: Vec<String> = grants
+        .iter()
+        .filter(|g| g.owner == weft_core::CredentialOwner::Ours)
+        .map(|g| g.service.clone())
+        .collect();
+    services.sort();
+    services.dedup();
+    services
+}
+
+/// Mark each runtime-owned row with whether the broker holds a
+/// credential for its service; stored-credential rows are left as the
+/// store answered them.
+fn stamp_runtime_credentials(grants: &mut [GrantSummary], available: &[String]) {
+    for grant in grants.iter_mut().filter(|g| g.owner == weft_core::CredentialOwner::Ours) {
+        grant.has_credential = available.contains(&grant.service);
+    }
 }
 
 /// DELETE /access/grants/{id}
@@ -321,7 +356,7 @@ pub async fn picker_begin(
     // caller is about to fetch. The editor asks for this address and
     // then opens it in the person's browser, so it has to be the
     // address the editor itself reached: one install answers on several
-    // at once (a loopback port-forward, a tunnel name, an ingress host),
+    // at once (the operator's loopback, a tunnel name, an ingress host),
     // and a configured constant is wrong for every caller arriving at
     // one of the others, invisibly until the page will not load.
     let url = format!(
@@ -504,6 +539,47 @@ pub async fn granted(
     )
     .await
     .map(Json)
+}
+
+#[cfg(test)]
+mod credential_stamp_tests {
+    use super::{runtime_owned_services, stamp_runtime_credentials};
+    use weft_core::access::spec::Door;
+    use weft_core::access::wire::GrantSummary;
+    use weft_core::CredentialOwner;
+
+    fn row(service: &str, owner: CredentialOwner, has_credential: bool) -> GrantSummary {
+        GrantSummary {
+            id: uuid::Uuid::new_v4(),
+            service: service.into(),
+            project_id: None,
+            identity: None,
+            label: None,
+            scopes: vec![],
+            permissions_verified: false,
+            owner,
+            door: Door::Shared,
+            expires_at: None,
+            value_names: vec![],
+            has_credential,
+        }
+    }
+
+    /// Only runtime-owned rows are asked about, each service once, and
+    /// only they are stamped: a stored credential stays as the store
+    /// answered it whatever the broker says.
+    #[test]
+    fn runtime_owned_rows_follow_the_brokers_answer_and_stored_ones_do_not() {
+        let mut grants = vec![
+            row("openrouter", CredentialOwner::Ours, false),
+            row("openrouter", CredentialOwner::Ours, false),
+            row("exa", CredentialOwner::Ours, false),
+            row("slack", CredentialOwner::TheirOwn, true),
+        ];
+        assert_eq!(runtime_owned_services(&grants), ["exa", "openrouter"]);
+        stamp_runtime_credentials(&mut grants, &["openrouter".to_string()]);
+        assert_eq!(grants.iter().map(|g| g.has_credential).collect::<Vec<_>>(), [true, true, false, true]);
+    }
 }
 
 #[cfg(test)]

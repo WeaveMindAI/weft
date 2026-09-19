@@ -100,7 +100,7 @@
       }
     },
     "reserved-key": {
-      "match": "\\b(_label|_tags|_should_flow)\\b(?=\\s*:)",
+      "match": "\\b(_label|_tags|_should_flow|_should_not_flow)\\b(?=\\s*:)",
       "captures": {
         "1": {
           "name": "keyword.other.reserved.weft"

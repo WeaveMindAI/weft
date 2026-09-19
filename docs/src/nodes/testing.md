@@ -115,7 +115,8 @@ whole run.
 | `rig.execution_tags()` / `rig.stops()` | what `ctx.tag_execution` and `ctx.stop_tagged` asked for (nothing is stopped: a fake run has no siblings) |
 | `rig.store_file(filename, mime, bytes)` | seed a stored file, get its value for a file input |
 | `rig.output_type(port, type)` | declare a port's resolved type, for ports whose type the compiler normally works out from the `.weft` source |
-| `rig.bus(&outcome.outputs["port"])` | the live bus behind an emitted marker |
+| `rig.seed_bus(opts)` | mint a bus, for driving a node's bus INPUT: it hands back the writer and the marker you pass in |
+| `rig.bus(&outcome.outputs["port"])` | read the bus a node EMITTED, behind its marker |
 | `rig.run_provision_infra(node, inputs)` | run an infra node's provision body and get the spec |
 
 A `Generator[T]` input takes its value as a plain JSON **array**. The rig
@@ -148,8 +149,20 @@ records belong to that run alone and are reported with the result.
 - `rig.connect()` opens the grant as a real connection for the **test's own**
   setup and teardown: create a resource before running the node, delete what
   the node created after.
-- `rig.bus(opts)` is a real bus as a writer plus a marker, for driving a
-  node's bus input.
+- `rig.seed_bus(opts)` is a real bus as a writer plus a marker, for driving a
+  node's bus input. (`rig.bus(marker)` is the other direction: it reads the
+  bus a node emitted.)
+
+### A basic test runs inside a runtime
+
+Basic tests take a plain `fn`, fake tests take an async one, and the runner
+drives both inside tokio. So never build a runtime inside a basic test:
+`Runtime::new().block_on(...)` there panics with "Cannot start a runtime from
+within a runtime". Anything async, a bus included, goes on the fake tier.
+
+A fake test that never finishes fails by name after 30 seconds rather than
+stalling the suite, and the message names the usual cause: a cursor reading a
+bus nothing closes.
 
 ### Live tests spend real money
 

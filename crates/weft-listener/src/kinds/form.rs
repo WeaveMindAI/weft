@@ -5,9 +5,7 @@
 //! Resume forms (HumanQuery style) take the resume path generically
 //! in `kinds::process`; entry forms (HumanTrigger) route to `Entry`.
 
-use std::sync::Arc;
 
-use dashmap::DashMap;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use anyhow::Result;
@@ -29,12 +27,7 @@ impl KindHandler for FormHandler {
         Form::TAG
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::TaskCallback,
             auth: SignalAuth::None,
@@ -152,11 +145,9 @@ mod tests {
     #[test]
     fn form_yields_task_callback() {
         let spec = form_spec();
-        let cache = Arc::new(DashMap::new());
-        let r = FormHandler.compute_routing("tok", &spec, &cache).expect("routing ok");
+        let r = FormHandler.compute_routing(&spec).expect("routing ok");
         assert!(matches!(r.surface, SignalSurface::TaskCallback));
         assert!(matches!(r.auth, weft_core::primitive::SignalAuth::None));
-        assert!(cache.is_empty(), "form mints no plaintext");
     }
 
     #[test]
@@ -222,13 +213,4 @@ mod tests {
         assert_eq!(rendered["title"], serde_json::json!("Ask"));
     }
 
-    #[test]
-    fn no_actions_defined() {
-        let sig = registered(form_spec());
-        let cache = Arc::new(DashMap::new());
-        let err = FormHandler
-            .handle_action("tok", "regenerate_api_key", Value::Null, &sig, &cache)
-            .expect_err("no actions");
-        assert!(err.to_string().contains("no action"));
-    }
 }

@@ -253,6 +253,11 @@ pub struct SettledRun {
     /// The dispatcher the run was observed through, kept so the replay can
     /// be re-read (see `replay`).
     disp: Dispatcher,
+    /// The program the run is read through, when the test gave one: a
+    /// node in an assertion is then spelled the way the source reads
+    /// (`triage.up`), and resolves to the compiled id and the call it
+    /// runs under. Without one, a name is the compiled id.
+    pub(crate) definition: Option<weft_core::ProjectDefinition>,
 }
 
 impl SettledRun {
@@ -267,6 +272,7 @@ impl SettledRun {
             status,
             replay,
             disp: disp.clone(),
+            definition: None,
         })
     }
 
@@ -284,7 +290,30 @@ impl SettledRun {
             status,
             replay,
             disp: disp.clone(),
+            definition: None,
         })
+    }
+
+    /// Read this run through `definition`: see [`Self::definition`].
+    pub fn reading(mut self, definition: weft_core::ProjectDefinition) -> Self {
+        self.definition = Some(definition);
+        self
+    }
+
+    /// Where a spelled node lives: its compiled id and the call path
+    /// its rows carry. Through the program when one was given, else the
+    /// name is the id.
+    pub fn locate(&self, spelled: &str) -> (String, Vec<String>) {
+        match &self.definition {
+            Some(definition) => weft_core::project::resolve_address(definition, spelled),
+            None => (spelled.to_string(), Vec::new()),
+        }
+    }
+
+    /// Every event of the run about the spelled node, under its call.
+    pub fn events_of<'a>(&'a self, spelled: &str) -> impl Iterator<Item = &'a crate::event::Event> + 'a {
+        let (id, path) = self.locate(spelled);
+        self.replay.events.iter().filter(move |e| e.is_node_at(&id, &path))
     }
 
     /// Re-fetch the replay until `present` holds for it, updating

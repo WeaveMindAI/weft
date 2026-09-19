@@ -117,6 +117,30 @@ pub struct GrantSummary {
     /// warning (shown once per connection created through it).
     pub door: Door,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether a credential stands behind the row right now. A
+    /// `TheirOwn` row stores its own material, so always. An `Ours`
+    /// row resolves to the runtime's own key at run time, which lives
+    /// in the broker's shared-credentials file and can be gone (the
+    /// file changed, the secret was emptied) while the row stays: the
+    /// dispatcher asks the broker when it lists, and a picked row with
+    /// nothing behind it is shown as not connected.
+    #[serde(default)]
+    pub has_credential: bool,
+}
+
+/// Which services the runtime holds its own credential for, asked by
+/// the dispatcher when it lists connections (an `Ours` row is only a
+/// connection while the key behind it exists).
+// SYNC: SharedCredentialsQuery <-> crates/weft-broker/src/access_admin.rs shared_credentials
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SharedCredentialsQuery {
+    pub services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SharedCredentialsAnswer {
+    /// The subset of the asked services a runtime credential exists for.
+    pub available: Vec<String>,
 }
 
 /// A ONE-REQUEST connect: the acquisitions needing no browser (`static`
@@ -292,6 +316,7 @@ mod wire_tests {
             owner: CredentialOwner::Ours,
             door: Door::Shared,
             expires_at: None,
+            has_credential: true,
         };
         let back: GrantSummary =
             serde_json::from_value(serde_json::to_value(&grant).unwrap()).unwrap();

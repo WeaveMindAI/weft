@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use weft_core::exec::boundary::{BoundaryDispatch, BoundaryOutcome};
+use weft_core::frames::Located;
 use weft_core::exec::NodeExecutionStatus;
 use weft_core::primitive::LoopInstanceKey;
 use weft_core::project::boundary_in_id;
@@ -280,19 +281,6 @@ impl ExecutionProjector {
                     project_id,
                 }]
             }
-            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, .. } => {
-                let mut out = vec![DispatcherEvent::PortTypeMismatch {
-                    color, at_unix,
-                    node: node_id.clone(),
-                    frames: frames.clone(),
-                    port: port.clone(),
-                    expected: expected.clone(),
-                    actual: actual.clone(),
-                    project_id: project_id.clone(),
-                }];
-                out.extend(sniff_emissions(color, &project_id, &effects));
-                out
-            }
             ExecEvent::NodeSuspended { node_id, frames, token, .. } => {
                 vec![DispatcherEvent::NodeSuspended {
                     color, at_unix,
@@ -501,20 +489,13 @@ impl ExecutionProjector {
                     protocol: protocol.clone(), at_unix,
                 }]
             }
-            ExecEvent::CallerInbound { offset, payload, payload_byte_size, .. } => {
-                vec![DispatcherEvent::CallerInbound {
-                    color, project_id, offset: *offset,
-                    payload: payload.clone(),
-                    payload_byte_size: *payload_byte_size,
-                    at_unix,
-                }]
-            }
-            ExecEvent::CallerOutbound { offset, payload, payload_byte_size, terminal, .. } => {
-                vec![DispatcherEvent::CallerOutbound {
-                    color, project_id, offset: *offset,
-                    payload: payload.clone(),
-                    payload_byte_size: *payload_byte_size,
-                    terminal: *terminal,
+            ExecEvent::CallerWindow { first_offset, last_offset, messages, totals, .. } => {
+                vec![DispatcherEvent::CallerWindow {
+                    color, project_id,
+                    first_offset: *first_offset,
+                    last_offset: *last_offset,
+                    messages: messages.clone(),
+                    totals: totals.clone(),
                     at_unix,
                 }]
             }
@@ -602,12 +583,12 @@ fn inherited_events(
                 }
                 for mut event in events {
                     match &mut event {
-                        DispatcherEvent::NodeStarted { color, node, inherited_from, .. }
-                        | DispatcherEvent::NodeSuspended { color, node, inherited_from, .. }
-                        | DispatcherEvent::NodeResumed { color, node, inherited_from, .. }
-                        | DispatcherEvent::NodeCompleted { color, node, inherited_from, .. }
-                        | DispatcherEvent::NodeSkipped { color, node, inherited_from, .. } => {
-                            if seed.origins.get(node) != Some(&ancestor.color) { continue; }
+                        DispatcherEvent::NodeStarted { color, node, frames, inherited_from, .. }
+                        | DispatcherEvent::NodeSuspended { color, node, frames, inherited_from, .. }
+                        | DispatcherEvent::NodeResumed { color, node, frames, inherited_from, .. }
+                        | DispatcherEvent::NodeCompleted { color, node, frames, inherited_from, .. }
+                        | DispatcherEvent::NodeSkipped { color, node, frames, inherited_from, .. } => {
+                            if seed.origins.get(&Located::at(node.as_str(), frames)) != Some(&ancestor.color) { continue; }
                             *color = child;
                             *inherited_from = Some(ancestor.color);
                             out.push(event);
@@ -615,16 +596,16 @@ fn inherited_events(
                         DispatcherEvent::JournalCorruption { reason, .. } => anyhow::bail!(
                             "original run {} cannot be projected: {reason}", ancestor.color,
                         ),
-                        DispatcherEvent::LoopInstantiated { color, group_id, .. }
-                        | DispatcherEvent::LoopIterationLaunched { color, group_id, .. }
-                        | DispatcherEvent::LoopOutFired { color, group_id, .. }
-                        | DispatcherEvent::LoopTerminated { color, group_id, .. } => {
-                            if seed.origins.get(&boundary_in_id(group_id)) != Some(&ancestor.color) { continue; }
+                        DispatcherEvent::LoopInstantiated { color, group_id, parent_frames, .. }
+                        | DispatcherEvent::LoopIterationLaunched { color, group_id, parent_frames, .. }
+                        | DispatcherEvent::LoopOutFired { color, group_id, parent_frames, .. }
+                        | DispatcherEvent::LoopTerminated { color, group_id, parent_frames, .. } => {
+                            if seed.origins.get(&Located::at(boundary_in_id(group_id), parent_frames)) != Some(&ancestor.color) { continue; }
                             *color = child;
                             out.push(event);
                         }
-                        DispatcherEvent::CostReported { color, node_id, inherited_from, .. } => {
-                            if seed.origins.get(node_id) != Some(&ancestor.color) { continue; }
+                        DispatcherEvent::CostReported { color, node_id, frames, inherited_from, .. } => {
+                            if seed.origins.get(&Located::at(node_id.as_str(), frames)) != Some(&ancestor.color) { continue; }
                             *color = child;
                             *inherited_from = Some(ancestor.color);
                             out.push(event);
@@ -655,8 +636,7 @@ fn needs_program(ev: &ExecEvent) -> bool {
             | ExecEvent::BusWindow { .. }
             | ExecEvent::BusClosed { .. }
             | ExecEvent::CallerConnected { .. }
-            | ExecEvent::CallerInbound { .. }
-            | ExecEvent::CallerOutbound { .. }
+            | ExecEvent::CallerWindow { .. }
             | ExecEvent::CallerErrored { .. }
             | ExecEvent::CallerDisconnected { .. }
     )
@@ -849,7 +829,7 @@ pub async fn execution_logs(
 fn inherited_logs(chain: &SeedChain, seed: &weft_journal::Seed) -> Vec<crate::journal::LogEntry> {
     chain.ancestors.iter().flat_map(|ancestor| ancestor.rows.iter().filter_map(|event| {
         let mut line = crate::journal::LogEntry::from_event(event)?;
-        if seed.origins.get(line.node.as_ref()?) != Some(&ancestor.color) { return None; }
+        if seed.origins.get(&Located::at(line.node.as_deref()?, &line.frames)) != Some(&ancestor.color) { return None; }
         line.inherited_from = Some(ancestor.color);
         Some(line)
     })).collect()
@@ -1046,7 +1026,7 @@ mod tests {
                 seed: None,
                 at_unix: 0,
             },
-            ExecEvent::NodeKicked { color: color(), node_id: "src".into(), firing: true, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeKicked { color: color(), node_id: "src".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             started("src", 1),
             emitted("src", "out", json!(9)),
             emitted("src", "flow", json!(flow)),
@@ -1101,7 +1081,7 @@ mod tests {
         }] };
         let child = uuid::Uuid::new_v4();
         let seed = weft_journal::events::Seed {
-            parent: color(), origins: [("src".into(), color())].into(),
+            parent: color(), origins: [(Located::top("src"), color())].into(),
         };
         let events: Vec<Value> = inherited_events(&chain, &chain.materialize().unwrap(), &seed, child, "p").unwrap()
             .into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
@@ -1134,14 +1114,14 @@ mod tests {
         if let ExecEvent::ExecutionStarted { color: c, seed, .. } = &mut birth {
             *c = middle;
             *seed = Some(weft_journal::events::Seed {
-                parent: color(), origins: [("src".into(), color())].into(),
+                parent: color(), origins: [(Located::top("src"), color())].into(),
             });
         }
         let chain = SeedChain { ancestors: vec![
             weft_journal::seed::Ancestor { color: color(), project: program(), rows: run_rows(true) },
             weft_journal::seed::Ancestor { color: middle, project: program(), rows: vec![birth] },
         ] };
-        let seed = weft_journal::events::Seed { parent: middle, origins: [("g__in".into(), middle)].into() };
+        let seed = weft_journal::events::Seed { parent: middle, origins: [(Located::top("g__in"), middle)].into() };
         let events: Vec<Value> = inherited_events(&chain, &chain.materialize().unwrap(), &seed, child, "p").unwrap()
             .into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
         assert_eq!(kinds(&events), vec![("node_started".into(), "g__in".into()), ("node_completed".into(), "g__in".into())]);
@@ -1197,7 +1177,7 @@ mod tests {
         assert_eq!(by("node_started", "sink")["input"], json!({ "in": 10 }));
         assert_eq!(by("node_started", "sink")["closed_ports"], json!([]));
         let done = events.iter().find(|e| e["kind"] == "execution_completed").unwrap();
-        assert_eq!(done["outputs"], json!({ "src": { "out": 9, "flow": true }, "inner": { "out": 10 }, "g__in": { "x": 9 }, "g__out": { "y": 10 } }));
+        assert_eq!(done["outputs"], json!({ "src": { "out": 9, "flow": true }, "inner": { "out": 10 } }), "boundaries are not a person's nodes");
     }
 
     /// A gated-off group paints its boundary skipped with the reason,

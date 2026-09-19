@@ -27,7 +27,6 @@
     {
       "name": "durationSecs",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0.5,
@@ -49,7 +48,6 @@
     {
       "name": "promptInfluence",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0,

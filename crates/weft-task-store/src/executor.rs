@@ -491,6 +491,7 @@ pub async fn run_worker_picker<Ctx>(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     idle_exit: Arc<dyn IdleExit>,
     idle_window: Duration,
+    background: Arc<weft_core::in_flight::InFlight>,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
@@ -507,7 +508,7 @@ pub async fn run_worker_picker<Ctx>(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        match try_worker_one(&store, &ctx, &registry, &pod_name, &project_id).await {
+        match try_worker_one(&store, &ctx, &registry, &pod_name, &project_id, &background).await {
             Ok(true) => {
                 idle_since = None;
                 continue;
@@ -566,6 +567,7 @@ async fn try_worker_one<Ctx>(
     registry: &WorkerTaskRegistry<Ctx>,
     pod_name: &str,
     project_id: &str,
+    background: &Arc<weft_core::in_flight::InFlight>,
 ) -> Result<bool>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -608,7 +610,14 @@ where
         let ctx_inner = ctx.clone();
         let handler_inner = handler.clone();
         let kind_inner = kind.clone();
+        // Held for the whole of the detached run, so the pod's shutdown
+        // can wait for what it just cancelled to write its ending down.
+        // A guard rather than a manual pair: this future is dropped
+        // wholesale if the runtime goes away, and a leaked token would
+        // hold the exit gate shut for ever.
+        let token = background.token();
         tokio::spawn(async move {
+            let _token = token;
             let lease = LeaseSignal::new();
             let heartbeat = spawn_claim_heartbeat(
                 store_inner.clone(),
@@ -784,6 +793,9 @@ mod idle_exit_tests {
             shutdown,
             idle_exit,
             window,
+            // Nothing runs in the background here: this picker claims
+            // no work, which is the whole point of an idle-exit test.
+            weft_core::in_flight::InFlight::new("worker execution"),
         )
     }
 

@@ -58,8 +58,9 @@ fn listener_only(caller: &crate::auth::CallerIdentity) -> Result<(), ApiError> {
 /// The public address the provider posts a topic's events to. `None`
 /// = this weft is not reachable from the internet; the caller turns
 /// that into the teaching error.
-/// A local-dev install publishes a loopback base URL (the operator's
-/// port-forward); a provider on the internet cannot reach it, so for
+/// A local-dev install publishes a loopback base URL (a port the kind
+/// node maps to the operator's machine); a provider on the internet
+/// cannot reach it, so for
 /// subscriptions it counts as "no public address" and meets the
 /// teaching error instead of a subscribe that can never deliver.
 pub fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> Option<String> {
@@ -251,6 +252,14 @@ async fn verify_and_route(
     // is signed on the schemes that sign, and answering an unsigned
     // challenge would let anyone confirm this endpoint exists.
     let (verified_client_ids, subscription) = match &webhook.verify {
+        // Refused at recipe validation (a provider never presents one of
+        // our keys), so a recorded recipe cannot carry it.
+        VerifyKind::ApiKeys { .. } => {
+            return Err(refused(
+                &req.service,
+                VerifyError::NotConfigured("push scheme (api_keys gates callers, never pushes)"),
+            ));
+        }
         VerifyKind::Hmac { .. } | VerifyKind::Signature { .. } => {
             // The app whose material verifies IS the receiving app;
             // try each configured one (usually exactly one).
@@ -263,7 +272,7 @@ async fn verify_and_route(
                     ..Default::default()
                 };
                 match verify_push(&webhook.verify, &push, &secrets, now) {
-                    Ok(()) => {
+                    Ok(_) => {
                         matched = Some(app.app.client_id.clone());
                         break;
                     }
@@ -318,6 +327,10 @@ async fn verify_and_route(
             (Vec::new(), Some(sub))
         }
         VerifyKind::Oidc { issuers, jwks_url } => {
+            // A push recipe names its addresses literally (validated at
+            // load), so the templates resolve against nothing.
+            let issuers: Vec<String> = issuers.iter().map(|t| t.0.clone()).collect();
+            let jwks_url = jwks_url.0.as_str();
             let token = bearer_token(&req.headers)
                 .ok_or_else(|| refused(&req.service, VerifyError::MissingHeader("Authorization".into())))?;
             // The audience defaults to the receiver's own address,
@@ -331,7 +344,7 @@ async fn verify_and_route(
                 .and_then(|e| e.audience.clone())
                 .or_else(|| receiver_url(state, &req.service, &req.topic))
                 .ok_or_else(|| refused(&req.service, VerifyError::NotConfigured("push audience")))?;
-            let claims = verify_identity_token(token, &audience, issuers, jwks_url)
+            let claims = verify_identity_token(token, &audience, &issuers, jwks_url)
                 .await
                 .map_err(|e| refused(&req.service, e))?;
             check_identity_claims(
@@ -571,6 +584,22 @@ async fn verify_identity_token(
     issuers: &[String],
     jwks_url: &str,
 ) -> Result<IdentityClaims, VerifyError> {
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&[audience]);
+    validation.set_issuer(issuers);
+    decode_jwt(token, &validation, jwks_url).await
+}
+
+/// Decode and verify one JWT against the keys published at `jwks_url`
+/// (the key named by the token's `kid`), under `validation`. The one
+/// signature-plus-keys step both the push path (`verify_identity_token`)
+/// and the caller path (`caller_auth`) share; what each demands of the
+/// claims is theirs.
+pub(crate) async fn decode_jwt<T: serde::de::DeserializeOwned>(
+    token: &str,
+    validation: &jsonwebtoken::Validation,
+    jwks_url: &str,
+) -> Result<T, VerifyError> {
     let header = jsonwebtoken::decode_header(token)
         .map_err(|e| VerifyError::BadIdentityToken(format!("unreadable header: {e}")))?;
     let kid = header
@@ -585,11 +614,7 @@ async fn verify_identity_token(
         .ok_or_else(|| VerifyError::BadIdentityToken("unknown signing key".into()))?;
     let key = jsonwebtoken::DecodingKey::from_jwk(jwk)
         .map_err(|e| VerifyError::BadIdentityToken(format!("unusable key: {e}")))?;
-
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[audience]);
-    validation.set_issuer(issuers);
-    let data = jsonwebtoken::decode::<IdentityClaims>(token, &key, &validation)
+    let data = jsonwebtoken::decode::<T>(token, &key, validation)
         .map_err(|e| VerifyError::BadIdentityToken(format!("{e}")))?;
     Ok(data.claims)
 }

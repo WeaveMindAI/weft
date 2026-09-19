@@ -168,6 +168,43 @@ spec:
           headers:replace(":path", rest)
         end
 ---
+# Browser callers. The dispatcher answers `/connect/...` with a 307 to
+# this gateway, and a browser following that redirect refuses the reply
+# unless THIS hop carries CORS headers too; the dispatcher's permissive
+# policy (`permissive_cors` in crates/weft-dispatcher/src/api/mod.rs)
+# covers only its own answer. Permissive is right on both hops for the
+# same reason: a route's auth is per route (ApiKeyAuth, JwtAuth,
+# HmacAuth), so the caller's origin says nothing about whether it may
+# call. Envoy answers the preflight (OPTIONS) itself and never forwards
+# it to the worker, which would otherwise treat it as a call.
+# SYNC: allowMethods <-> crates/weft-core/src/route.rs (HTTP_METHODS)
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: weft-live-cors
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: weft-live-route
+  cors:
+    allowOrigins:
+      - "*"
+    allowMethods:
+      - GET
+      - HEAD
+      - POST
+      - PUT
+      - PATCH
+      - DELETE
+      - OPTIONS
+    allowHeaders:
+      - "*"
+    exposeHeaders:
+      - "*"
+    maxAge: 24h
+---
 # NO IDLE TIMEOUT on the client (caller -> gateway) connection. A live
 # caller connection (a WebSocket, or an HTTP stream the worker holds open
 # while the workflow thinks: LLM calls, human-in-the-loop pauses) can sit
@@ -243,3 +280,63 @@ spec:
 # true`), NOT via a CR (`EnvoyGateway` is the config file's kind, not a
 # cluster resource). The CLI daemon patches that ConfigMap + restarts the
 # controller in `ensure_envoy_gateway`, so it is not applied here.
+---
+# A caller who VANISHES, and the one thing that notices.
+#
+# Every timeout above is off on purpose so a healthy feed that stays quiet
+# for hours is never cut. That leaves one way to leave unaccounted for. A
+# tab closed or a page navigated away sends a goodbye, which Envoy sees at
+# once and passes upstream (its own stats show this working: connections
+# destroyed remotely, active requests and all). A caller that VANISHES (a
+# lid closed, a network gone, a phone that left the building) sends
+# NOTHING, and nothing arriving is exactly what a healthy quiet feed looks
+# like. Envoy then holds that connection, and the worker's run behind it,
+# until the kernel gives up on its own about fifteen minutes later. On a
+# page anyone can open that is one wedged run per abandoned tab, for ever.
+#
+# TCP_USER_TIMEOUT says instead: data unacknowledged this long means the
+# far side is gone, fail the connection. Every packet a live machine
+# receives is acknowledged by its operating system without anybody asking,
+# so a caller who is still there resets this constantly and is never
+# touched however long they stay. Only a connection whose bytes go
+# nowhere reaches it. That is why this is not a ceiling on the
+# conversation: it is a ceiling on SILENCE.
+#
+# `level: 6` is IPPROTO_TCP and `name: 18` is TCP_USER_TIMEOUT (Linux;
+# Envoy takes the raw pair because it has no named field for it). The
+# value is milliseconds: 30000 here, matching the worker's own bound on
+# its own accepted sockets. `STATE_PREBIND` sets it on the listening
+# socket, so every connection it accepts inherits it.
+#
+# SYNC: 30s <-> crates/weft-engine/src/caller_conn.rs (CALLER_DEAD_AFTER)
+#
+# Keepalive is deliberately NOT used: the kernel skips its probes entirely
+# while any data is in flight (`tp->packets_out`), and a live feed's own
+# filler bytes guarantee that for ever, so it would be inert on exactly
+# the connections this protects.
+#
+# Needs `extensionApis.enableEnvoyPatchPolicy: true` in the controller's
+# ConfigMap, which the CLI daemon sets alongside the Backend API.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: weft-live-bound-a-vanished-caller
+  namespace: envoy-gateway-system
+spec:
+  type: JSONPatch
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: weft-live-gateway
+  jsonPatches:
+    - type: "type.googleapis.com/envoy.config.listener.v3.Listener"
+      # The xDS listener this Gateway's HTTP port serves on.
+      name: envoy-gateway-system/weft-live-gateway/http
+      operation:
+        op: add
+        path: /socket_options
+        value:
+          - level: 6
+            name: 18
+            int_value: 30000
+            state: STATE_PREBIND

@@ -1,0 +1,25 @@
+# Streaming with zero custom Rust: a bus producer (a fixture node standing in
+# for an LLM stream) feeds a Stream node behind a route, once framed as
+# server-sent events and once as ndjson. The rig reads each response whole and
+# asserts the content type and the exact frames.
+
+sse = Route { path: "__E2E_PATH__/sse", method: "GET" }
+ticks = TickBus
+ticks.start = sse.path
+events = Stream { format: "sse" }
+events.bus = ticks.ticks
+
+lines = Route { path: "__E2E_PATH__/lines", method: "GET" }
+ticks2 = TickBus
+ticks2.start = lines.path
+rows = Stream { format: "ndjson", headers: { "x-run": "e2e" } }
+rows.bus = ticks2.ticks
+
+# A feed that says one thing and then goes quiet. The rig reads the
+# first event, hangs up, and asserts the run is cancelled: a caller who
+# left is found without the program writing anything.
+quiet = Route { path: "__E2E_PATH__/quiet", method: "GET" }
+silence = QuietBus
+silence.start = quiet.path
+feed = Stream { format: "sse" }
+feed.bus = silence.feed

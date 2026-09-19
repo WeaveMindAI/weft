@@ -70,10 +70,10 @@
 //!   the log entry and it reaches the journal via the window rows.
 //!   The in-RAM log only trims `Message` entries that are BOTH past
 //!   the window AND already shipped to the journal, so durability is
-//!   never traded for the RAM bound. Oversized payloads ARE allowed
-//!   but a module-level warn threshold
-//!   (`JOURNALED_PAYLOAD_WARN_BYTES`) logs loud at send time so the
-//!   author sees the cost.
+//!   never traded for the RAM bound. A payload of any size travels
+//!   the bus untouched; what the journal KEEPS of it is decided in
+//!   one place for every channel in the language
+//!   ([`crate::stream_journal`]), which trims rather than warns.
 //! - **Ephemeral**: send stores the payload in an `EphemeralStore`
 //!   sliding window keyed by offset; the log entry carries
 //!   `payload: None` plus `payload_byte_size`, and the in-RAM log is
@@ -354,17 +354,29 @@ pub enum BusEntryKind {
     Closed,
 }
 
-/// One message inside a journal window row: the full detail a
-/// journaled bus persists per message (boundaries, senders, payloads
-/// all kept; only the ROW granularity is windowed).
+/// One message inside a journal window row: who sent it, when, and
+/// what it said as far as the journal keeps it. Only the ROW
+/// granularity is windowed; every message of a journaled bus gets its
+/// own line here.
 // SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowedBusMessage {
     pub offset: u64,
     pub from: String,
     pub msg_kind: String,
-    pub payload: WirePayload,
+    /// What was said, when the journal keeps it at all: absent for a
+    /// payload of raw bytes. A message bigger than the policy allows is
+    /// still here, cut down, and `trimmed` says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<WirePayload>,
+    /// The message's TRUE size, whatever was kept of it.
     pub payload_byte_size: u64,
+    /// The payload here is a cut-down copy of a message too big to
+    /// write down whole. Always alongside a payload: something is
+    /// always kept, down to the first few thousand characters of the
+    /// value written out as text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trimmed: bool,
     pub at_unix: u64,
 }
 
@@ -386,8 +398,8 @@ pub struct BusWindowTotal {
 pub struct BusWindowAggregate {
     pub first_offset: u64,
     pub last_offset: u64,
-    /// Per-message detail; empty when `include_payloads` was false
-    /// (an ephemeral bus journals metadata only).
+    /// Per-message detail; empty for an ephemeral bus, which journals
+    /// the totals and nothing else.
     pub messages: Vec<WindowedBusMessage>,
     pub totals: Vec<BusWindowTotal>,
     /// Append time (unix seconds) of the LAST entry in the window: the
@@ -397,11 +409,15 @@ pub struct BusWindowAggregate {
 }
 
 /// Fold one window's MESSAGE entries into the aggregate a journal row
-/// carries. Pure; the pump owns the windowing clock, this owns the
-/// shape. Non-message entries are the caller's bug (membership rows
-/// are journaled individually, never windowed). Returns `None` on an
-/// empty window (nothing to write).
-pub fn aggregate_window(entries: &[BusEntry], include_payloads: bool) -> Option<BusWindowAggregate> {
+/// carries, keeping of each payload what `policy` allows. Pure; the
+/// pump owns the windowing clock, this owns the shape. Non-message
+/// entries are the caller's bug (membership rows are journaled
+/// individually, never windowed). Returns `None` on an empty window
+/// (nothing to write).
+pub fn aggregate_window(
+    entries: &[BusEntry],
+    policy: &crate::stream_journal::JournalPolicy,
+) -> Option<BusWindowAggregate> {
     let mut messages = Vec::new();
     let mut totals: Vec<BusWindowTotal> = Vec::new();
     let mut first_offset: Option<u64> = None;
@@ -427,15 +443,22 @@ pub fn aggregate_window(entries: &[BusEntry], include_payloads: bool) -> Option<
                 bytes: *payload_byte_size,
             }),
         }
-        if include_payloads {
+        if !policy.ephemeral {
+            // What the journal keeps of a message is decided in one
+            // place for every channel in the language, so a bus message
+            // too big to write down is cut exactly as a caller's is,
+            // and raw bytes are counted rather than copied.
+            let entry_payload = payload
+                .as_ref()
+                .expect("a journaled bus's retained Message always carries its payload");
+            let kept = crate::stream_journal::record(entry_payload, policy);
             messages.push(WindowedBusMessage {
                 offset: entry.offset,
                 from: from.clone(),
                 msg_kind: msg_kind.clone(),
-                payload: payload
-                    .clone()
-                    .expect("a journaled bus's retained Message always carries its payload"),
+                payload: kept.payload,
                 payload_byte_size: *payload_byte_size,
+                trimmed: kept.trimmed,
                 at_unix: entry.at_unix,
             });
         }
@@ -489,19 +512,15 @@ pub struct BusOptions {
     pub meta: Value,
 }
 
-/// Default journal aggregation window. One second keeps a chat bus
-/// visually per-message while collapsing frame-rate streams ~50x.
-pub const DEFAULT_JOURNAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// Default journal aggregation window. Every channel in the language
+/// starts from the same one, so it lives with the rest of the recording
+/// rules rather than here.
+pub use crate::stream_journal::DEFAULT_JOURNAL_WINDOW;
 
 /// Default in-RAM window for a bus (both modes). 64 entries fits the
 /// common consumer-lags-a-few-messages case without growing RAM
 /// unboundedly on a long stream. Override via `BusOptions::window`.
 pub const DEFAULT_BUS_WINDOW: usize = 64;
-
-/// Default warn threshold for journaled payload size. Sends above this
-/// log a `warn!` so the author sees the cost; the send still proceeds.
-/// 1MB is generous for chat-shaped payloads, loud for image / video.
-pub const JOURNALED_PAYLOAD_WARN_BYTES: u64 = 1_048_576;
 
 /// Why a `send` did not land. Returned (not swallowed) so a dropped
 /// message is a value the caller must handle, never a silent no-op.
@@ -1365,15 +1384,6 @@ impl BusHandle {
             self.inner.trim_journaled_window(&mut log);
         }
         drop(log);
-        if !self.inner.ephemeral && payload_byte_size > JOURNALED_PAYLOAD_WARN_BYTES {
-            tracing::warn!(
-                target: "weft_core::bus",
-                bus_id = %self.inner.id,
-                bytes = payload_byte_size,
-                threshold = JOURNALED_PAYLOAD_WARN_BYTES,
-                "journaled bus received an oversized payload; consider ephemeral mode"
-            );
-        }
         Ok(())
     }
 
@@ -1991,19 +2001,62 @@ mod tests {
         let entries =
             vec![entry(3, "mic", "audio", 10), entry(4, "mic", "audio", 20), entry(6, "b", "x", 5)];
 
-        let journaled = aggregate_window(&entries, true).unwrap();
+        let kept = crate::stream_journal::JournalPolicy::default();
+        let metadata_only =
+            crate::stream_journal::JournalPolicy { ephemeral: true, ..Default::default() };
+
+        let journaled = aggregate_window(&entries, &kept).unwrap();
         assert_eq!((journaled.first_offset, journaled.last_offset), (3, 6));
         assert_eq!(journaled.last_at_unix, 7, "stamped from the last entry's append time");
         assert_eq!(journaled.messages.len(), 3);
-        assert_eq!(journaled.messages[1].payload, WirePayload::Json(json!(4)));
+        assert_eq!(journaled.messages[1].payload, Some(WirePayload::Json(json!(4))));
+        assert!(!journaled.messages[1].trimmed, "a small message is kept whole");
         assert_eq!(journaled.totals.len(), 2);
         assert_eq!((journaled.totals[0].count, journaled.totals[0].bytes), (2, 30));
 
-        let ephemeral = aggregate_window(&entries, false).unwrap();
+        let ephemeral = aggregate_window(&entries, &metadata_only).unwrap();
         assert!(ephemeral.messages.is_empty(), "no payloads for an ephemeral window");
         assert_eq!(ephemeral.totals, journaled.totals);
         assert_eq!(ephemeral.last_at_unix, 7, "the stamp rides even without payloads");
-        assert!(aggregate_window(&[], true).is_none(), "an empty window writes nothing");
+        assert!(aggregate_window(&[], &kept).is_none(), "an empty window writes nothing");
+    }
+
+    /// The journal never writes down a message bigger than its limit,
+    /// on a bus exactly as on a caller conversation: the row keeps a
+    /// cut-down copy, says it was cut, and still reports the true size.
+    /// Raw bytes are counted and never copied.
+    #[test]
+    fn a_bus_message_too_big_to_keep_is_written_down_cut_short() {
+        let entry = |offset: u64, payload: WirePayload, bytes: u64| BusEntry {
+            offset,
+            at_unix: 7,
+            kind: BusEntryKind::Message {
+                from: "mic".into(),
+                msg_kind: "audio".into(),
+                payload: Some(payload),
+                payload_byte_size: bytes,
+            },
+        };
+        let huge = "x".repeat(crate::stream_journal::JOURNAL_TRIM_BYTES * 2);
+        let entries = vec![
+            entry(1, WirePayload::Json(json!({ "text": huge })), 400_000),
+            entry(2, WirePayload::Bytes(bytes::Bytes::from(vec![7u8; 16])), 16),
+        ];
+
+        let window =
+            aggregate_window(&entries, &crate::stream_journal::JournalPolicy::default()).unwrap();
+        let big = &window.messages[0];
+        assert!(big.trimmed, "the row says the copy is cut short");
+        assert_eq!(big.payload_byte_size, 400_000, "the true size is still reported");
+        let kept = big.payload.as_ref().expect("a cut copy is still a copy").byte_size();
+        assert!(
+            kept as usize <= crate::stream_journal::JOURNAL_TRIM_BYTES,
+            "nothing bigger than the limit reaches the journal, got {kept} bytes"
+        );
+
+        let binary = &window.messages[1];
+        assert_eq!(binary.payload, None, "raw bytes are counted, never written down");
+        assert_eq!(binary.payload_byte_size, 16);
     }
 
     /// A byte payload's wire form is tagged base64 and round-trips.

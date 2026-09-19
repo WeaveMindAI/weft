@@ -37,13 +37,11 @@
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "New text"
     },
     {
       "name": "blocks",
       "type": "List[JsonDict]",
-      "required": false,
       "label": "New blocks",
       "description": "Replacement Block Kit blocks. Text and/or blocks must be provided."
     }

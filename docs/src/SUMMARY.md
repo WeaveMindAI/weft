@@ -21,6 +21,7 @@
 - [Loops](language/loops.md)
 - [Live channels: streams and buses](language/live-channels.md)
 - [Triggers](language/triggers.md)
+- [Building an API](language/building-an-api.md)
 - [Files and reuse](language/files-and-reuse.md)
 - [What the compiler refuses](language/diagnostics.md)
 
@@ -67,6 +68,7 @@
 
 - [Sequential Diffusion Programming](thinking/sdp.md)
 - [Design principles](thinking/design-principles.md)
+- [The three fronts](thinking/how-we-decide.md)
 - [Why we hunt em dashes](thinking/em-dashes.md)
 - [The commandments of plumbing](thinking/plumbing.md)
 - [Things people say to me](thinking/objections.md)

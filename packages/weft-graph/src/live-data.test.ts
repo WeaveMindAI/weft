@@ -27,26 +27,32 @@ describe('isLiveDataItem', () => {
 });
 
 describe('signalDisplayToLiveItems', () => {
-  it('renders a public-entry path (root when empty, leading slash normalized)', () => {
+  it('renders a public-entry route (root when empty, leading slash normalized, methods in front)', () => {
     expect(signalDisplayToLiveItems({ surface: { kind: 'public_entry', path: '' } })[0]).toEqual({
       type: 'text',
-      label: 'Path',
+      label: 'Route',
       data: '/',
     });
     expect(signalDisplayToLiveItems({ surface: { kind: 'public_entry', path: '/hook' } })[0]).toEqual(
-      { type: 'text', label: 'Path', data: '/hook' },
+      { type: 'text', label: 'Route', data: '/hook' },
     );
+    expect(
+      signalDisplayToLiveItems({
+        surface: { kind: 'public_entry', path: 'chat/{room}', methods: ['POST'] },
+      })[0],
+    ).toEqual({ type: 'text', label: 'Route', data: 'POST /chat/{room}' });
   });
 
-  it('renders auth mode on a public entry (none vs api_key header)', () => {
+  it('renders auth mode on a public entry (open vs gated by a connection)', () => {
     const entry = { kind: 'public_entry', path: '/hook' };
     const none = signalDisplayToLiveItems({ surface: entry, auth: { kind: 'none' } });
-    expect(none).toContainEqual({ type: 'text', label: 'Auth', data: 'public (no key)' });
-    const keyed = signalDisplayToLiveItems({
-      surface: entry,
-      auth: { kind: 'api_key', header_name: 'X-My-Key' },
+    expect(none).toContainEqual({ type: 'text', label: 'Auth', data: 'open (anyone with the URL)' });
+    const gated = signalDisplayToLiveItems({ surface: entry, auth: { kind: 'connection' } });
+    expect(gated).toContainEqual({
+      type: 'text',
+      label: 'Auth',
+      data: 'gated by the wired auth connection',
     });
-    expect(keyed).toContainEqual({ type: 'text', label: 'Auth header', data: 'X-My-Key' });
   });
 
   it('emits nothing without a public entry (internal/task-callback routing is not news)', () => {
@@ -56,7 +62,7 @@ describe('signalDisplayToLiveItems', () => {
       signalDisplayToLiveItems({ surface: { kind: 'internal' }, auth: { kind: 'none' } }),
     ).toEqual([]);
     expect(
-      signalDisplayToLiveItems({ surface: { kind: 'task_callback' }, auth: { kind: 'api_key' } }),
+      signalDisplayToLiveItems({ surface: { kind: 'task_callback' }, auth: { kind: 'connection' } }),
     ).toEqual([]);
   });
 });

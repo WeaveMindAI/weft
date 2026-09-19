@@ -4,7 +4,7 @@
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
 	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf } from "../../types";
-	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
+	import { getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
 	import { toast } from "svelte-sonner";
@@ -18,8 +18,9 @@
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
+	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { portDeleteAction } from "../../projection/header-ports";
-	import { fieldForInput, fieldForSpecField, inputRendersField, inputsOf, nextPortLiterals, outputsOf, shouldFlowField } from "../../utils/input-field";
+	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -30,7 +31,7 @@
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, SHOULD_FLOW_PORT } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -65,6 +66,13 @@
 			fileContents?: Record<string, FileContent>;
 			includePath?: string;
 			onUpdate?: (updates: NodeDataUpdates) => void;
+			/// Flip the gate between `_should_flow` and
+			/// `_should_not_flow`. Its own hook rather than a
+			/// `NodeDataUpdates` field: the gesture moves a wire, which
+			/// the config classifier has no shape for. Absent on a
+			/// read-only view, which hides the gesture instead of
+			/// offering a dead one.
+			onToggleGate?: () => void;
 			onSaveFileRef?: (path: string, content: string) => void;
 			onOpenInclude?: (path: string, alias: string) => void;
 			infraNodeStatus?: string;
@@ -72,7 +80,6 @@
 			infraFailureMessage?: string;
 			debugData?: unknown;
 			executions?: NodeExecution[];
-			executionCount?: number;
 			/// One IRC-style scrollable log per bus this node took part
 			/// in (live + replay, identical shape). Empty `[]` for
 			/// nodes that never touched a bus. Populated by ProjectEditorInner
@@ -142,6 +149,11 @@
 			.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
 			.join(' ');
 	});
+
+	// What the node is called where its type would be named: the included
+	// file's name for an include (its type is the opaque block, which has no
+	// catalog entry and no name a person wrote), the type's label otherwise.
+	const typeName = $derived(isInclude ? includeName : typeConfig.label);
 
 	const executions = $derived(data.executions ?? []);
 	const latestExecution = $derived(executions[executions.length - 1]);
@@ -225,7 +237,7 @@
 			});
 			if (!rendered) continue;
 			result.push(
-				input.name === SHOULD_FLOW_PORT ? shouldFlowField('node') : fieldForInput(input),
+				isGatePort(input.name) ? gateField(input.name, 'node') : fieldForInput(input),
 			);
 		}
 		return result;
@@ -439,7 +451,7 @@
 	 *  on the edge rail. `inputs` stays the COMPLETE list (edits
 	 *  round-trip the full set). */
 	const wireableInputs = $derived(inputs.filter(
-		(p: PortDefinition) => acceptsWire(p) && p.name !== SHOULD_FLOW_PORT
+		(p: PortDefinition) => acceptsWire(p) && !isGatePort(p.name)
 	));
 	const outputs = $derived(outputsOf(data.outputs));
 
@@ -484,12 +496,22 @@
 	);
 	const canAddPorts = $derived(canAddInputPorts || canAddOutputPorts);
 	// `_should_flow` decides whether the node runs at all, so it docks in
-	// the top-left corner as a square instead of sitting in the port rail
+	// the top-left corner as an arrow instead of sitting in the port rail
 	// among the node's own inputs. Filled means something answers it: a
 	// wire, or a literal written straight into the braces.
+	// Either spelling of the gate counts as answered: the dock draws one
+	// port, and which one it IS is `flowInverted` below.
 	const flowConnected = $derived(
-		edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === SHOULD_FLOW_PORT)
+		edgesState.current.some((e: Edge) => e.target === id && isGatePort(e.targetHandle ?? ''))
 			|| data.portLiterals?.[SHOULD_FLOW_PORT] !== undefined
+			|| data.portLiterals?.[SHOULD_NOT_FLOW_PORT] !== undefined
+	);
+	/// Which way round this node's gate reads. A node carries one or the
+	/// other (the compiler refuses both), so finding the inverted one
+	/// anywhere is the answer.
+	const flowInverted = $derived(
+		edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === SHOULD_NOT_FLOW_PORT)
+			|| data.portLiterals?.[SHOULD_NOT_FLOW_PORT] !== undefined
 	);
 	// Simplified view draws a dot only when an edge attaches to it (the live
 	// edges there are the merged __simp_* ones, flow wires included).
@@ -589,14 +611,24 @@
 	});
 
 	/// FieldStrip display override: for a file-backed field, the store
-	/// value is the resolved file content (or a read status), never the
-	/// `@file` marker that config holds. `undefined` for normal fields.
+	/// value is the resolved file content (or a loading status), never
+	/// the `@file` marker that config holds. `undefined` for normal
+	/// fields. A read error is not a value: `fileNotice` replaces the
+	/// control with it.
 	function fileDisplayOverride(key: string): string | undefined {
 		const fs = fileFieldState(key);
 		if (!fs) return undefined;
 		if (fs.content !== undefined) return fs.content;
-		if (fs.error !== undefined) return `cannot read ${fs.path}: ${fs.error}`;
 		return `loading ${fs.path}...`;
+	}
+
+	/// The failure to show IN PLACE OF a file-backed field's control when
+	/// its file could not be read: what was looked for and why it failed,
+	/// as an error block, so nobody edits an error message as content.
+	function fileNotice(key: string): string | undefined {
+		const fs = fileFieldState(key);
+		if (!fs || fs.error === undefined) return undefined;
+		return `cannot read ${fs.path}: ${fs.error}`;
 	}
 
 	/// File-backed fields whose content isn't loaded (loading / read
@@ -839,17 +871,21 @@
 				valueNames: string[];
 				owner: string;
 				service: string;
+				hasCredential: boolean;
 			}
 		>
 	>({});
 
-	/// Which access inputs to watch: every Access-typed input declaring
-	/// `requiresScopes` or `requiresValues`, plus every remote_select's
-	/// authenticating input (its sources filter on the granted set).
+	/// Which access inputs to watch: every access picker (its picked
+	/// row can have no key behind it), every Access-typed input
+	/// declaring `requiresScopes` or `requiresValues`, plus every
+	/// remote_select's authenticating input (its sources filter on the
+	/// granted set).
 	const watchedAccessInputs = $derived.by(() => {
 		const names = new Set<string>();
 		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
+			if (i.widget?.kind === 'access') names.add(i.name);
 			if (i.requiresScopes && i.requiresScopes.length > 0) names.add(i.name);
 			if (i.requiresValues && i.requiresValues.length > 0) names.add(i.name);
 			if (i.widget?.kind === 'remote_select' && i.widget.access) names.add(i.widget.access);
@@ -894,6 +930,7 @@
 					valueNames: string[];
 					owner: string;
 					service: string;
+					hasCredential: boolean;
 				}
 			> = {};
 			let failure: string | null = null;
@@ -908,6 +945,7 @@
 							valueNames: grant.value_names ?? [],
 							owner: grant.owner,
 							service: ref.service,
+							hasCredential: grant.has_credential,
 						};
 				} catch (e) {
 					failure = e instanceof Error ? e.message : String(e);
@@ -992,6 +1030,19 @@
 		return out;
 	});
 
+	/// The live KEY check: a picked runtime-owned connection whose key
+	/// is gone from the shared-credentials file. The row is picked, so
+	/// the node is not pinned open, but nothing can authenticate with
+	/// it; this is what makes that visible.
+	const credentialShortfalls = $derived.by(() => {
+		const out: string[] = [];
+		for (const [name, grant] of Object.entries(tracedGrants)) {
+			if (grant.hasCredential) continue;
+			out.push(`'${name}' is picked, but no key stands behind it: add an api_key entry for '${grant.service}' to the shared-credentials file, or connect your own on the access node.`);
+		}
+		return out;
+	});
+
 	/** A remote_select's picked parent values (`dependsOn` drill-down):
 	 *  each parent's stored id. A pick stores the bare id, so this is a
 	 *  read, not an unwrap. */
@@ -1007,11 +1058,11 @@
 	function fieldDisplayValue(field: FieldDefinition): string {
 		const fs = fileFieldState(field.key);
 		if (fs) {
-			// File-backed: show resolved content (editable). While loading or on
-			// a read error, show a status (read-only); never the marker as a
-			// value, never a silent fall back to inline content.
+			// File-backed: show resolved content (editable). While loading,
+			// show a status (read-only); never the marker as a value, never a
+			// silent fall back to inline content. A read error never reaches
+			// here: `fileNotice` replaces the editor with it.
 			if (fs.content !== undefined) return fieldEditor.display(field.key, fs.content);
-			if (fs.error !== undefined) return `cannot read ${fs.path}: ${fs.error}`;
 			return `loading ${fs.path}...`;
 		}
 		// The EFFECTIVE value: the set value, else the input's declared
@@ -1390,8 +1441,16 @@
 				<span class="break-all">{data.bodyFeed.error}</span>
 			</div>
 		{:else if data.bodyFeed.state === 'absent'}
+			<!-- The feed's source is not there: no listener holds this
+			     trigger, or the infra is not provisioned. One quiet line
+			     naming the button that brings it back, never the red
+			     error box (nothing is broken, nothing is running). -->
 			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
-				Not running. Start it from the action bar.
+				{#if nodeIsTrigger({ nodeType: data.nodeType, features: data.features })}
+					Nothing is listening for this trigger. Activate the project from the action bar.
+				{:else}
+					Not running. Start it from the action bar.
+				{/if}
 			</div>
 		{:else if data.bodyFeed.items.length > 0}
 			<div class="space-y-2">
@@ -1475,10 +1534,16 @@
 {/snippet}
 
 <!-- Flow dock: `_should_flow` decides whether this node runs at all, so it
-     sits apart from the node's own inputs, as a square in the top-left
+     sits apart from the node's own inputs, as an arrow in the top-left
      corner. Filled means something answers it. -->
 {#snippet flowDock()}
-	<FlowDock top={18} subject="node" connected={flowConnected} />
+	<FlowDock
+		top={18}
+		subject="node"
+		connected={flowConnected}
+		inverted={flowInverted}
+		onToggle={data.onToggleGate}
+	/>
 {/snippet}
 
 {#if data.simplified}
@@ -1528,7 +1593,7 @@
 			{#if displayedStatus}
 				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			{/if}
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
 		</div>
 		<!-- Bare node: the content column is fixed to the square's inner width (the
 		     square side minus the 8px padding each side) so the node measures as a
@@ -1542,7 +1607,7 @@
 				<Icon size={26} color={typeConfig.color} />
 			{/if}
 			<span class="text-[9px] font-semibold tracking-wide uppercase text-center leading-tight opacity-70 max-w-full truncate" style="color: {typeConfig.color};">
-				{isInclude ? includeName : typeConfig.label}
+				{typeName}
 			</span>
 			<!-- Editable node label (double-click to rename), all nodes. Defaults to
 			     the SAME label the builder view shows when none is set. -->
@@ -1654,7 +1719,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -1711,7 +1776,10 @@
 		{/if}
 		
 		<!-- Ports Section -->
-		<div class="mt-2 flex justify-between text-[10px] text-zinc-500 w-full">
+		<!-- Two half-width columns with a gap between them: a long port name
+		     truncates inside its half instead of running into the other
+		     side's names. -->
+		<div class="mt-2 flex justify-between gap-2 text-[10px] text-zinc-500 w-full">
 			<!-- Input Ports (wireable inputs only; config-exposure inputs
 			     live in the body as fields, never on the edge rail) -->
 			<div class="space-y-1 min-w-0 flex-1">
@@ -1739,7 +1807,7 @@
 						<span class="truncate">{input.name}</span>
 						{#if inputDeleteAction}
 							<button
-								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 ml-auto text-xs leading-none"
+								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 								onclick={(e) => { e.stopPropagation(); removeInputPort(input.name); }}
 								title={inputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 							>×</button>
@@ -1795,7 +1863,7 @@
 					/>
 					{#if outputDeleteAction}
 						<button
-							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 mr-auto text-xs leading-none"
+							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 							onclick={(e) => { e.stopPropagation(); removeOutputPort(output.name); }}
 							title={outputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 						>×</button>
@@ -1817,8 +1885,8 @@
 							/>
 						</div>
 					{:else}
-						<button 
-							class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors justify-end"
+						<button
+							class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors"
 							onclick={(e) => { e.stopPropagation(); addingOutputPort = true; }}
 						>
 							<span>output</span>
@@ -1870,6 +1938,13 @@
 			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">{shortfall}</div>
 		{/each}
 
+		<!-- Live key check: a picked runtime-owned connection with no
+		     key behind it any more (the shared-credentials file lost
+		     it). Picked is not connected until the key is back. -->
+		{#each credentialShortfalls as shortfall}
+			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">{shortfall}</div>
+		{/each}
+
 		<!-- The live checks went dark: the grant fetch failed, so the
 		     absence of a shortfall banner proves nothing. Muted, not
 		     alarming; the resolve-time backstop still holds. -->
@@ -1900,6 +1975,7 @@
 					heights={textareaHeights}
 					onHeightChange={handleTextareaResize}
 					displayValueOf={fileDisplayOverride}
+					noticeOf={fileNotice}
 					readonlyKeys={readonlyFieldKeys}
 					{headerBadge}
 					{renderCustom}
@@ -1958,7 +2034,15 @@
 							<label for={`${id}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium">{field.label}</label>
 							{@render headerBadge(field)}
 						</div>
-						{#if field.type === "code"}
+						{#if field.type === "code" && fileNotice(field.key) !== undefined}
+							<!-- The file behind this field could not be read: the
+							     failure stands where the editor would, and nothing
+							     is editable (an error is not content). -->
+							<div
+								role="alert"
+								class="text-[10px] px-2 py-1.5 rounded border border-rose-200 bg-rose-50 text-rose-700 font-mono whitespace-pre-wrap break-all nodrag nopan"
+							>{fileNotice(field.key)}</div>
+						{:else if field.type === "code"}
 							<!-- Code editor field - any node can use this by setting field.type = 'code' -->
 							<div class="nodrag nopan" onclick={(e) => e.stopPropagation()}
 							onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
@@ -2208,6 +2292,10 @@
 		border-radius: 0.375rem;
 		background-color: rgba(96, 165, 250, 0.08);
 	}
+	/* The status glow rings (`.node-running-glow` and friends) are defined
+	   once in `app.css`; this component only picks which class goes on
+	   (`glowClass`). */
+
 	/* Debug node data display - single resizable box */
 	.debug-data-container {
 		margin: 0;
@@ -2303,17 +2391,7 @@
 		to { transform: rotate(360deg); }
 	}
 
-	/* Widen resize line hit area: make the element itself thicker (transparent)
-	   while keeping the visible border thin. The element IS the drag target. */
-	:global(.node-resize-line.svelte-flow__resize-control.line.left),
-	:global(.node-resize-line.svelte-flow__resize-control.line.right) {
-		width: 12px !important;
-		background: transparent;
-	}
-	:global(.node-resize-line.svelte-flow__resize-control.line.top),
-	:global(.node-resize-line.svelte-flow__resize-control.line.bottom) {
-		height: 12px !important;
-		background: transparent;
-	}
+	/* The resize lines get their wider grab zone from `app.css`, which
+	   already widens every `.svelte-flow__resize-control.line`. */
 
 </style>

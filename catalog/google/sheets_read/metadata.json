@@ -14,7 +14,6 @@
     {
       "name": "account",
       "type": "Access", "accepts": ["wire"],
-      "required": false,
       "description": "A Google account. Leave it unconnected to read sheets shared by link."
     },
     {

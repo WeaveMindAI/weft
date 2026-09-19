@@ -1,0 +1,13 @@
+# One anonymous group: a timer a wake resolves, and an access node that
+# holds a connection. Nothing wires the access node, so a run aimed at
+# `out` never touches it.
+Group(text: String) -> (out: String) {
+  hold = Wait { seconds: 3600 }
+  hold.value = self.text
+
+  # An access node whose connection this project mints itself, so a
+  # test can pick one without a third party.
+  key = ApiKeyAuth
+
+  self.out = hold.value
+}

@@ -1,0 +1,13 @@
+# A live HTTP route answered through the ctx: an outside caller POSTs to the
+# route, the responder reads the request off the caller handle, streams
+# progress chunks, then responds with a final JSON body that echoes what was
+# sent and how it was called. The rig POSTs and asserts the echo. This is the
+# ctx-path coverage; the zero-Rust path (Reply / Stream / Close) has its own
+# fixtures (api_reply, api_stream, socket_loop).
+
+route = Route -> (message: String) { path: "__E2E_PATH__", method: "POST" }
+responder = LiveHttpResponder
+out = Debug
+
+responder.message = route.message
+out.data = responder.done

@@ -1,0 +1,175 @@
+{
+  "type": "Socket",
+  "label": "Socket",
+  "description": "Turn this program into a WebSocket endpoint. A caller opening a socket at the path starts a fresh execution: the opening request comes out on the fixed ports, and every message the caller sends is one item of the `inbound` stream, so a Loop over it runs once per message. Answer with Reply per message and Close at the end, or hold the conversation through the ctx in a custom node. One connection is one run; two callers never share a run.",
+  "tags": [
+    "api",
+    "websocket",
+    "trigger",
+    "socket",
+    "chat"
+  ],
+  "icon": "Radio",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "path",
+      "type": "String",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Path",
+      "description": "The route under the project's live URL: literal segments and `{name}` captures (`chat/{room}`). Required, and never empty: a trigger with no address would answer at the project's own address, where every other one that forgot would answer too. Must not start with '/'."
+    },
+    {
+      "name": "dataType",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "json",
+          "text",
+          "bytes"
+        ]
+      },
+      "default": "json",
+      "label": "Message shape",
+      "description": "What each message is, both ways: `json` (declare `inbound: Generator[JsonDict]`; declare `Generator[Image]` and a message that is a `data:` URL or base64 is stored on the way in), `text` (a String per message, `Generator[String]`), or `bytes` (each binary frame stored as a file, its stored-file value per message, `Generator[File]`)."
+    },
+    {
+      "name": "auth",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "description": "Who may open a socket here: wire an auth access node (ApiKeyAuth, JwtAuth, HmacAuth). Unwired, the socket is open to anyone with the URL. The gateway checks the opening request before a run starts and the established identity comes out on `caller`."
+    },
+    {
+      "name": "outlivesCaller",
+      "type": "Boolean",
+      "label": "May outlive the caller",
+      "description": "Who owns the run, which decides what a caller leaving means. Off (default): the run is the caller's, so their leaving cancels it, and a node that hits a long durable wait holds the worker briefly and is then killed rather than parked. On: the run is its own, so the caller leaving does not touch it and a long wait parks properly and resumes later, making it a background job. Be deliberate about it: the caller leaving is what ends a tied run, so switching this on removes that ending and whatever the run is still doing must end by itself. Work that finishes on its own is fine; anything that watches, subscribes or loops until something changes is not, and then you say what ends it, with `maxSessionSecs` here or a TagRun and StopTagged pair in the graph."
+    },
+    {
+      "name": "defaultHoldSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1
+      },
+      "label": "Hold seconds before giving up on a wait",
+      "description": "For a caller-tied run: how long a node's wait holds the worker (keeping the connection alive) before giving up. Per-wait overrides win over this. Never unbounded."
+    },
+    {
+      "name": "maxSessionSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Give up on one connection after this long",
+      "description": "A ceiling on one whole connection, off by default and with no default on purpose: it ends a connection on the clock whatever the caller is doing, so it would cut a live session short. A socket carries the protocol's own ping, which the other side answers, so a caller who leaves is found without this. Leave it alone unless you want a hard limit on how long one session may last."
+    },
+    {
+      "name": "callerSilenceSecs",
+      "type": "Number",
+      "default": 30,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Call the caller gone after this much silence",
+      "description": "How long the caller's machine may leave what the worker sent it unacknowledged before the connection is called dead, in seconds. This is NOT a ceiling on the session: a machine that is still there acknowledges every packet by itself, whatever the person is doing, so a caller who stays resets this constantly and a socket held open for hours is never touched. It bounds SILENCE, which is the only way to tell a caller who vanished (a closed laptop, a dropped network) from one who is simply quiet. Raise it for a client on a link that genuinely goes silent for longer, like a device that sleeps its radio between messages; lower it to notice a departure sooner. `0` leaves the machine's own default, which is about fifteen minutes."
+    },
+    {
+      "name": "journalEphemeral",
+      "type": "Boolean",
+      "label": "Keep the conversation out of the journal",
+      "description": "What the journal keeps of what was said. Off (default): every message both ways is recorded, so the inspector replays the conversation. Messages are gathered a second at a time rather than written down one by one, anything over 100 KB is recorded trimmed, and raw bytes are never recorded whatever this says. On: only the sizes and the counts are kept, never the content. Turn it on for a socket carrying something you would rather not have written down, or one whose traffic is high enough that the sizes tell you what you need; remember you are also giving up seeing what was said when you debug."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "path",
+      "type": "String",
+      "description": "The path as called under the project (no leading slash)."
+    },
+    {
+      "name": "params",
+      "type": "Dict[String, String]",
+      "description": "The `{name}` captures of the route's path, by name."
+    },
+    {
+      "name": "query",
+      "type": "Dict[String, String]",
+      "description": "The opening request's query parameters, by name."
+    },
+    {
+      "name": "headers",
+      "type": "Dict[String, String]",
+      "description": "The opening request's headers, by lowercase name."
+    },
+    {
+      "name": "caller",
+      "type": "JsonDict | Null",
+      "description": "Who the auth gate established: a JWT's claims, `{\"key\": <index>}` for an API key, `{}` for an HMAC. Null when the socket has no `auth`."
+    },
+    {
+      "name": "inbound",
+      "type": "Generator[MustOverride]",
+      "description": "One item per message the caller sends, in order; the stream ends when the caller disconnects. Declare the item type to match `dataType` (`-> (inbound: Generator[JsonDict])`, `Generator[String]`, `Generator[File]`). Wire it into a Loop's `over` to run the body once per message. A second reader of the same socket uses the ctx in a custom node (inbound is broadcast there)."
+    }
+  ],
+  "requires_infra": false,
+  "claimsRoute": {
+    "pathField": "path"
+  },
+  "firesWith": {
+    "method?": "String",
+    "path": "String",
+    "params?": "Dict[String, String]",
+    "query?": "Dict[String, String]",
+    "headers?": "List[List[String]]",
+    "caller?": "JsonDict"
+  },
+  "features": {
+    "isTrigger": true,
+    "canAddOutputPorts": true
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "path",
+        "regex": "^/"
+      },
+      "then": {
+        "message": "Socket '{id}' path starts with '/'. The gateway prefixes the route automatically; drop the leading slash.",
+        "level": "structural",
+        "severity": "warning",
+        "field": "path"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "run_reaches",
+          "direction": "downstream",
+          "types": [
+            "Reply",
+            "Stream",
+            "Close"
+          ]
+        }
+      },
+      "then": {
+        "message": "Socket '{id}' starts a run that never answers its caller: no Reply, Stream or Close is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in); a custom node answering through the ctx is the one case to ignore this.",
+        "level": "structural",
+        "severity": "warning"
+      }
+    }
+  ]
+}

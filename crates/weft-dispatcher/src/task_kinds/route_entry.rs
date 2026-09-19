@@ -143,7 +143,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             // pulses into that program's consumers, which park forever and
             // end the run Stuck.
             let Some(source_version) = signal.source_version.as_deref() else {
-                return park_fire(state, task, &payload, &format!("trigger '{}' has no original source version; activate it again", signal.node_id)).await;
+                return park_fire(state, task, &payload, &format!("trigger '{}' has no original source version; activate it again", weft_core::project::plain_id(&signal.node_id))).await;
             };
             let (start, kick_events) = crate::api::project::execution_birth_events(
                 color,

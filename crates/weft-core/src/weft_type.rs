@@ -1240,13 +1240,23 @@ impl WeftType {
         if value.is_null() {
             return Err("null has no cast".into());
         }
-        // A file-valued type (a bare Image/Media/...) never casts: a
-        // file value is a marker, not convertible data. Containers and
-        // records HOLDING files recurse below; their file-typed leaves
-        // only pass through when the value already is a marker (the
-        // compatibility fast path), so nothing invents a file.
+        // A file-valued type (a bare Image/Media/...) never converts: a
+        // file value is a marker, not convertible data, and a marker of
+        // the right kind already passed the compatibility fast path
+        // above. What is left is a marker of another kind (a blob
+        // claimed as an image) or no marker at all; each is named.
+        // Containers and records HOLDING files recurse below.
+        if self.is_file_valued() {
+            return Err(match Self::infer(value) {
+                found if found.is_file_valued() => format!("the value is a stored {found}, not {self}"),
+                _ => format!(
+                    "no cast into {self}: a stored file is its marker object \
+                     (`__weft_image__`, `__weft_video__`, `__weft_audio__` or `__weft_blob__` \
+                     holding key, mimeType, sizeBytes and filename), and this value is not one"
+                ),
+            });
+        }
         if self.is_unresolved()
-            || self.is_file_valued()
             || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Generator(_))
         {
             return Err(format!("no cast into {self}"));
@@ -1483,6 +1493,10 @@ impl WeftType {
                 WeftType::Primitive(WeftPrimitive::Number),
             ) => true,
             (s, WeftType::Record(_) | WeftType::Named { .. }) => object_shaped(s),
+            // A stored file that went through a database comes back as
+            // a plain object holding its marker; the cast checks the
+            // marker (and that its kind is the target's) at run time.
+            (s, t) if t.is_file_valued() => object_shaped(s),
             // Container targets from container sources lean on the
             // runtime cast's recursion (List[String] -> List[Number]).
             (WeftType::List(s_inner), WeftType::List(t_inner)) => {
@@ -1660,31 +1674,23 @@ impl WeftType {
     /// Does this DECLARED type accept `value` at run time? The one
     /// runtime gate semantics: the engine's output-type check and the
     /// firing-input readiness check both route here.
-    /// A type carrying a declared shape (a `Named` or a `Record`
-    /// anywhere) is checked by [`Self::validate_value`], its contract:
-    /// inference can never produce a nominal name, so the infer path
-    /// would refuse every legitimate value. Everything else keeps the
-    /// structural infer-and-compare gate.
+    ///
+    /// The declared type is the question and the value is only held
+    /// against it ([`Self::validate_value`]): a `JsonDict` port takes
+    /// any object, whatever keys it carries, and only a port declared
+    /// as a file reads the file marker. Guessing the value's type from
+    /// its shape first and comparing the guess would refuse a plain
+    /// dict that happens to carry a marker, and could never accept a
+    /// nominal name, since inference produces none. A type still
+    /// carrying an unresolved leaf (a bare `T`, or one nested in a
+    /// union or container) has nothing to hold the value against, so
+    /// it keeps the structural infer-and-compare gate, which accepts
+    /// anything the leaf could stand for.
     pub fn accepts_runtime_value(&self, value: &serde_json::Value) -> bool {
-        if self.contains_declared_shape() && !self.contains_unresolved_leaf() {
-            self.validate_value(value).is_ok()
-        } else {
-            // A type still carrying an unresolved leaf (a TypeVar nested
-            // in a union/container) keeps the permissive structural gate:
-            // validate_at refuses unresolved leaves outright, which would
-            // flip `A | T` from accept-anything to accept-only-A.
+        if self.contains_unresolved_leaf() {
             Self::is_compatible(&Self::infer(value), self)
-        }
-    }
-
-    /// True when a `Named` or `Record` sits anywhere in this type.
-    fn contains_declared_shape(&self) -> bool {
-        match self {
-            WeftType::Named { .. } | WeftType::Record(_) => true,
-            WeftType::List(inner) => inner.contains_declared_shape(),
-            WeftType::Dict(k, v) => k.contains_declared_shape() || v.contains_declared_shape(),
-            WeftType::Union(members) => members.iter().any(|m| m.contains_declared_shape()),
-            _ => false,
+        } else {
+            self.validate_value(value).is_ok()
         }
     }
 
@@ -2187,3 +2193,38 @@ impl<'de> Deserialize<'de> for WeftType {
 #[cfg(test)]
 #[path = "tests/weft_type_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod nested_shape_tests {
+    use super::WeftType;
+
+    /// A record shape can sit anywhere a type can, at any depth: inside
+    /// a list, inside a dict's value, inside another record, inside a
+    /// list of lists. So "a list of things that each have an id" is
+    /// written with the id still in it, and none of the shape is lost
+    /// to a bare `List[JsonDict]`.
+    #[test]
+    fn a_record_shape_nests_anywhere_a_type_goes() {
+        let round_trips = |written: &str, expected: &str| {
+            let ty = WeftType::parse(written)
+                .unwrap_or_else(|| panic!("`{written}` should parse"));
+            assert_eq!(ty.to_string(), expected, "written as `{written}`");
+        };
+        round_trips("List[{ id: String }]", "List[{id: String}]");
+        round_trips(
+            "List[{ id: String, tags: List[String] }]",
+            "List[{id: String, tags: List[String]}]",
+        );
+        round_trips(
+            "{ items: List[{ id: String, meta: { n: Number } }] }",
+            "{items: List[{id: String, meta: {n: Number}}]}",
+        );
+        round_trips("Dict[String, List[{ id: String }]]", "Dict[String, List[{id: String}]]");
+        round_trips("List[List[{ id: String }]]", "List[List[{id: String}]]");
+        // And the optional marker survives the nesting.
+        round_trips("List[{ id: String, note?: String }]", "List[{id: String, note?: String}]");
+    }
+}
+
+
+

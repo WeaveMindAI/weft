@@ -58,6 +58,9 @@
       "description": "The whole parsed entry (id, title, link, summary, published, author)."
     }
   ],
+  "firesWith": {
+    "item": "{ id: String, title?: String, link?: String, summary?: String, published?: String }"
+  },
   "features": {
     "isTrigger": true
   }

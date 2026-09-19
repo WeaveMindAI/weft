@@ -132,6 +132,14 @@ pub const SIGNAL_PLACEMENT_DOMAIN: &str = "weft_signal_placement";
 /// REJECT instantly; this lock only stops two verbs from both winning
 /// the flip. Never held across a build, a drain, or user code.
 pub const PROJECT_TRANSITION_DOMAIN: &str = "weft_project_transition";
+/// Serializes a tenant's signal registrations from the route overlap
+/// check to the signal row's insert, cluster-wide, keyed by tenant id.
+/// The check reads the tenant's mounted routes and the insert writes
+/// one; two routes of one activation register concurrently, and
+/// without this each checked before the other had written, so two
+/// routes that claim the same call both armed (the e2e `api_overlap`
+/// shape). Held on the lock pool, so a waiter pins no work connection.
+pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
 
 /// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
 /// `key`, TRY-locking. Returns `Ok(None)` immediately if another holder

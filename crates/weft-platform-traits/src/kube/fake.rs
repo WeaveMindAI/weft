@@ -47,6 +47,15 @@ pub enum KubeCall {
         namespace: String,
         pod_name: String,
     },
+    PodPhase {
+        namespace: String,
+        pod_name: String,
+    },
+    PodLogs {
+        namespace: String,
+        pod_name: String,
+        container: String,
+    },
     ApplyYaml {
         manifest: String,
     },
@@ -268,17 +277,35 @@ impl KubeReader for FakeKube {
     }
 
     async fn pod_phase(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        Ok(self
-            .inner
-            .lock()
-            .pod_phases
-            .get(&(namespace.to_string(), pod_name.to_string()))
-            .cloned())
+        let mut inner = self.inner.lock();
+        // Recorded like every other call. Reading is a call: whether the
+        // node-test executor polled at all, how often, and against which
+        // pod are exactly the things a test of it would assert, and with
+        // no record there is nothing to assert against.
+        inner.calls.push(KubeCall::PodPhase {
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+        });
+        Ok(inner.pod_phases.get(&(namespace.to_string(), pod_name.to_string())).cloned())
     }
 
-    async fn pod_logs(&self, namespace: &str, pod_name: &str, _container: &str) -> Result<String> {
-        self.inner
-            .lock()
+    async fn node_ports(&self) -> Result<Vec<super::NodePortHolder>> {
+        // An untouched cluster. Nothing on the weft side picks these
+        // numbers (the apiserver allocates them), so the only reader is
+        // `weft infra list-doors` asking what is serving, and no test
+        // fakes that ledger yet. A test that needs one seeds a field
+        // here the way the other answers are seeded.
+        Ok(Vec::new())
+    }
+
+    async fn pod_logs(&self, namespace: &str, pod_name: &str, container: &str) -> Result<String> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(KubeCall::PodLogs {
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            container: container.to_string(),
+        });
+        inner
             .pod_logs
             .get(&(namespace.to_string(), pod_name.to_string()))
             .cloned()
@@ -304,13 +331,19 @@ impl KubeWriter for FakeKube {
         });
         // Mirror the effect onto the in-memory workloads so a
         // subsequent list_replica_state reflects the scale.
+        //
+        // `desired` only. What is READY is the cluster's answer, arriving
+        // whenever it arrives, and a fake that decides it has an opinion
+        // about convergence. It used to zero `ready` on a scale to zero
+        // and leave it alone otherwise, which is not a rule kubernetes
+        // has: scaling 3 to 1 then read as "1 wanted, 3 ready" for ever,
+        // a state no real cluster settles into. A test that wants a
+        // settled workload seeds `ready` itself, the way it seeds every
+        // other answer here.
         if let Some(ws) = inner.workloads.get_mut(namespace) {
             for w in ws.iter_mut() {
                 if w.name == name && w.kind == kind {
                     w.desired = replicas as i64;
-                    if replicas == 0 {
-                        w.ready = 0;
-                    }
                 }
             }
         }
@@ -542,18 +575,25 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
+    /// A scale sets what is WANTED. What is ready is the cluster's
+    /// answer and arrives when it arrives, so the fake does not invent
+    /// one: a test that wants a settled workload seeds it, and a test
+    /// about draining wants exactly the unsettled state in between.
     #[tokio::test]
-    async fn scale_updates_workload_state() {
+    async fn scale_sets_what_is_wanted_and_does_not_invent_what_is_ready() {
         let k = FakeKube::new();
         k.set_workloads("ns", vec![workload("inst-a", "inst", "u", 3, 3)]);
         let w: &dyn KubeWriter = &*k;
-        w.scale_workload("ns", WorkloadKind::Deployment, "inst-a", 0)
+        w.scale_workload("ns", WorkloadKind::Deployment, "inst-a", 1)
             .await
             .unwrap();
         let r: &dyn KubeReader = &*k;
         let ws = r.list_replica_state("ns", "").await.unwrap();
-        assert_eq!(ws[0].desired, 0);
-        assert_eq!(ws[0].ready, 0);
+        assert_eq!(ws[0].desired, 1);
+        assert_eq!(ws[0].ready, 3, "still three running: nothing has converged yet");
+        k.set_workloads("ns", vec![workload("inst-a", "inst", "u", 1, 1)]);
+        let ws = r.list_replica_state("ns", "").await.unwrap();
+        assert_eq!(ws[0].ready, 1, "and the test says when it has");
     }
 
     #[tokio::test]

@@ -106,8 +106,8 @@ pub struct DispatcherState {
     /// frees the project's `project/`-scoped runtime files from the object
     /// store. Canonical doc on the `ProjectReclaimer` trait in `placement.rs`.
     pub project_reclaimer: Arc<dyn crate::placement::ProjectReclaimer>,
-    /// The STABLE base URL users hit for this dispatcher (the local
-    /// port-forward in local dev, the ingress host on a real
+    /// The STABLE base URL users hit for this dispatcher (the host's
+    /// loopback port in local dev, the ingress host on a real
     /// cluster). Architecture-4: the dispatcher hosts every external
     /// URL; the listener has no public surface.
     pub public_base_url: String,

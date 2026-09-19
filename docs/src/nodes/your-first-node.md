@@ -23,6 +23,10 @@ The smallest node in the standard library, near enough in full.
 }
 ```
 
+`"required": true` is there because `Text` cannot run without a string. For
+every key you can write, and when each one earns its place, go and read
+[metadata.json](metadata.md).
+
 ## `mod.rs`
 
 ```rust

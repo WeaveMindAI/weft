@@ -29,7 +29,6 @@
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Initial text"
     }
   ],

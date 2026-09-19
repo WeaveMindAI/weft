@@ -37,7 +37,6 @@
     {
       "name": "source",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -90,6 +89,9 @@
       "description": "The row's property values."
     }
   ],
+  "firesWith": {
+    "item": "{ id: String, url?: String, properties?: JsonDict }"
+  },
   "features": {
     "isTrigger": true
   }

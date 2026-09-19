@@ -14,9 +14,9 @@ dispatched to subagents, and the big knowledge sits in skills that load only
 when the work calls for them.
 
 The central loop, in one paragraph: the user asks for something (vibe level
-is enough). Tangle shapes it as a graph, scouts the project's catalog
-(`nodes/` on disk) directly or through `catalog-scout`, and writes the weft
-code. A missing capability is a dispatch: Tangle designs the node's typed
+is enough). Tangle shapes it as a graph, scouts the project's catalog with
+`weft describe-nodes` (the listing, then each candidate's wiring view), and
+writes the weft code. A missing capability is a dispatch: Tangle designs the node's typed
 contract and sends a `node-smith` specialist (several in parallel when
 several nodes are missing), which researches the real API documentation on
 the web, writes the node and extensive tests (live-tier tests included),
@@ -58,6 +58,7 @@ commands are the expert's hand on the same loop.
 | `CLAUDE.md` | every session, automatically | the orchestrator persona: the loop, ground truth discipline, autonomy, hard rules |
 | `.claude/skills/weft-language/` | on demand, before writing weft | the language surface: syntax, types, groups, loops, the pulse model, every error slug |
 | `.claude/skills/weft-catalog/` | on demand, before picking nodes | reading `metadata.json`, node families, the recurring wiring patterns |
+| `.claude/skills/weft-gaps/` | on demand, when no node can honestly deliver what is needed | the tracker search, the issue templates and their exact field ids, and the pre-filled issue URL handed to the user |
 | `.claude/skills/weft-models/` | on demand, before wiring an LLM call | reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
 | `.claude/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.claude/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
@@ -65,16 +66,18 @@ commands are the expert's hand on the same loop.
 | `.claude/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |
 | `.claude/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, the browser extension, a public URL |
 | `.claude/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
+| `.claude/skills/weft-frontend/` | on demand, when the user wants a page, app, or site | the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes as its API, the signal doors for human steps, sharing one Postgres, the build |
+| `.claude/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |
 | `.claude/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.claude/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
 | `.claude/commands/` | `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
 | `.claude/hooks/validate_weft.py` | after every Edit/Write | the compiler answers every edit: fast validate on the touched source, structural errors fed back to the model automatically |
-| `.claude/agents/catalog-scout.md` | when dispatched | research only: sweeps the catalog, reports exact node specs |
 | `.claude/agents/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |
 | `.claude/agents/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
 | `.claude/agents/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.claude/agents/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
-| `.claude/settings.json` | every session | permissions: the working loop runs unimpeded; only the genuinely destructive asks (live-tier tests, deactivations that wipe, terminate, rm, clean, forget). Also `claudeMdExcludes`: the user's personal `~/.claude/CLAUDE.md` and `~/.claude/rules/` are excluded, so Tangle is the only persona that loads and the project is isolated from the user's other assistant setup. Commands and agents are `weft-`-named or project-scoped, so personal same-named ones are unlikely; agents resolve project-over-user, so Tangle's specialists always win. |
+| `.claude/agents/frontend-builder.md` | when dispatched | builds and proves the project's frontend under `front/`, unsupervised: the pages, the server-held api token, the client that calls the program's own routes and signals, on the default stack unless the user named their own |
+| `.claude/settings.json` | every session | permissions: an allow list for every `weft` verb Tangle runs, and no ask list. Whether a call is put in front of you is your permission mode's decision: automatic means Tangle activates, resyncs, deactivates and starts or stops infra on its own, manual means it asks in prose. The daemon's lifecycle (`weft daemon start`, `stop`, `restart`) is left off the list: that is a reinstall of weft, never Tangle's move. Also `claudeMdExcludes`: the user's personal `~/.claude/CLAUDE.md` and `~/.claude/rules/` are excluded, so Tangle is the only persona that loads and the project is isolated from the user's other assistant setup. Commands and agents are `weft-`-named or project-scoped, so personal same-named ones are unlikely; agents resolve project-over-user, so Tangle's specialists always win. |
 
 The design rests on two disciplines. Ground truth: the catalog is on disk
 in the project (`nodes/base_catalog/`), so the persona's central rule is to
@@ -95,15 +98,13 @@ The intended distribution is built into the CLI:
 weft new <project> --assistant claude-code     # shorthand: --assistant cc
 ```
 
-That symlinks `CLAUDE.md` and `.claude/` from the local weft checkout's
-`tangle/claude-code/` into the project, so a later `git pull` +
-`./setup.sh` of the checkout refreshes Tangle in every such project at once,
-no per-project copy to drift stale. The flag's value names the assistant
+That copies `CLAUDE.md` and `.claude/` out of the local weft checkout's
+`tangle/claude-code/` into the project. The flag's value names the assistant
 (repeatable for several), and the choice is remembered: later `weft new`
 runs install it with no flag, until `--assistant <name>` changes it or
-`--assistant none` stops it. The links are absolute and machine-local:
-`weft new` gitignores them, because a teammate cloning the project would
-only get dangling pointers into a checkout they do not have.
+`--assistant none` stops it. The files are the project's own from then
+on, so they are committed with it and a teammate cloning the project gets
+Tangle with no weft checkout to point at.
 
 Opening the project in Claude Code then loads `CLAUDE.md` automatically; the
 skills, commands, and agents load from `.claude/`. The manual path still
@@ -113,8 +114,10 @@ works for a project that already exists:
 cp -r tangle/claude-code/{CLAUDE.md,.claude} <project>/
 ```
 
-A copied install does not follow checkout updates: re-copy after a weft
-update, or replace the copy with symlinks by hand. `VERSION` marks the
+A project holds the version of Tangle that installed it. `weft tangle
+update` inside the project re-copies it from the checkout, replacing every
+file Tangle owns and leaving anything the assistant wrote beside them
+alone. `VERSION` marks the
 template release; it is meant to track a tag of this repository, and the
 installer can exclude this README from the copy.
 

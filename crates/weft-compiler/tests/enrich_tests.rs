@@ -28,10 +28,11 @@ out.data = greeting.value
 
     let debug = project.nodes.iter().find(|n| n.id == "out").unwrap();
     assert_eq!(debug.node_type, "Debug");
-    // Its own `data`, plus `_should_flow`, which every node carries.
+    // Its own `data`, plus both spellings of the gate, which every node
+    // carries (an author uses one of them; wiring both is refused).
     assert_eq!(
         debug.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-        vec!["data", "_should_flow"]
+        vec!["data", "_should_flow", "_should_not_flow"]
     );
 }
 
@@ -549,12 +550,12 @@ out.data = pick.value
     let created: Vec<&str> = pick
         .inputs
         .iter()
-        .filter(|p| p.name != "_should_flow")
+        .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
         .map(|p| p.name.as_str())
         .collect();
     assert_eq!(created, vec!["zebra", "apple"], "written order, not alphabetical");
     assert!(
-        pick.inputs.iter().all(|p| p.name == "_should_flow" || !p.required),
+        pick.inputs.iter().all(|p| weft_core::exec::skip::is_gate_port(&p.name) || !p.required),
         "FirstInOrder's created inputs are optional by nature: a cut branch must not skip it"
     );
 }
@@ -731,5 +732,177 @@ out = Debug { data: g.y }
         project.edges.iter().any(|e| e.target == "g__in"
             && e.target_handle.as_deref() == Some("_should_flow")),
         "the guard wire lands on the In boundary"
+    );
+}
+
+/// A node whose folder holds a `metadata.json` and no `mod.rs` yet is
+/// left out of the catalog: a program that never names it enriches as
+/// if the folder were not there, and one that names it is told the
+/// node is not ready and where it lives, instead of "unknown node type".
+#[test]
+fn a_program_naming_a_node_without_its_code_is_told_it_is_not_ready() {
+    let root = tempfile::tempdir().expect("temp root");
+    let folder = root.path().join("nodes/resizer");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    std::fs::write(
+        folder.join("metadata.json"),
+        r#"{"type": "Resizer", "label": "Resizer", "description": "Shrinks a picture.", "inputs": [{"name": "value", "type": "String"}], "outputs": []}"#,
+    )
+    .expect("write");
+    let stdlib = stdlib_root().expect("stdlib root");
+    let cat = FsCatalog::discover_roots_with_policy(&[stdlib.as_path(), &root.path().join("nodes")], weft_catalog::DiscoverPolicy::Strict)
+        .expect("a pending node is no error");
+
+    let mut clean = compile("greeting = Text { value: \"hi\" }\nout = Debug\nout.data = greeting.value\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut clean, &cat).expect("a program that never names the pending node enriches");
+
+    let mut names_it = compile("greeting = Text { value: \"hi\" }\nshrink = Resizer\nshrink.value = greeting.value\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    let error = enrich(&mut names_it, &cat).expect_err("the pending node is refused").to_string();
+    assert!(error.contains("node type 'Resizer' is not ready yet"), "{error}");
+    assert!(error.contains("no mod.rs yet") && error.contains(&folder.display().to_string()), "{error}");
+}
+
+/// The editor's parse leaves an `@include` opaque: its file's nodes are not
+/// in the graph. So the project-level questions the action bar asks, can
+/// this be activated, does its infra have to be up, cannot be answered by
+/// looking at the graph's nodes. The include node carries which node types
+/// its file holds, and enrich settles what they mean against the catalog.
+///
+/// Without this, a project whose only trigger lives in an included file
+/// showed no Activate button, and one whose only infra node did showed no
+/// infra controls and let Run start with nothing provisioned.
+#[test]
+fn enrich_settles_what_an_include_holds() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("front.weft"),
+        "Group(who: Access) -> (out: JsonDict) {\n  \
+           door = Route { path: \"hi\", method: \"GET\", auth: self.who }\n  \
+           self.out = door.body\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("store.weft"),
+        "Group() -> (conn: Access) {\n  db = PostgresDatabase\n  self.conn = db.account\n}\n",
+    )
+    .unwrap();
+
+    let source = "f = @include(\"front.weft\")\ns = @include(\"store.weft\")\n";
+    let mut project = compile_with_mode(
+        source,
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Interface,
+        None,
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+
+    let f = project.nodes.iter().find(|n| n.id == "f").unwrap();
+    let fc = f.include_contents.as_ref().expect("contents");
+    assert!(fc.has_trigger, "Route inside makes the project activatable");
+    assert!(!fc.requires_infra, "and it needs no infra");
+
+    let s = project.nodes.iter().find(|n| n.id == "s").unwrap();
+    let sc = s.include_contents.as_ref().expect("contents");
+    assert!(sc.requires_infra, "PostgresDatabase inside means infra must come up");
+    assert!(!sc.has_trigger, "and it is no trigger");
+
+    // The include node itself is NEITHER, on purpose: those two flags
+    // drive real per-node work (a provisioned infra slot with its own live
+    // row, a trigger's mount URL), and the alias is not the node that does
+    // it. Setting them here would conjure a phantom infra slot named `s`.
+    for n in [f, s] {
+        assert!(!n.requires_infra, "{} is not itself an infra node", n.id);
+        assert!(!n.features.is_trigger, "{} is not itself a trigger", n.id);
+    }
+}
+
+/// An include is gated like anything else, so the editor's parse has
+/// to give its node the gate ports too. Without them the interface
+/// parse knows only the included group's declared ports, and
+/// `f._should_flow = x` comes back underlined on a program the real
+/// build compiles clean.
+#[test]
+fn an_include_carries_the_gate_ports_in_the_editors_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("front.weft"),
+        "Group() -> (out: String) {\n  p = Text { value: \"x\" }\n  self.out = p.value\n}\n",
+    )
+    .unwrap();
+    let source = "gate = Text { value: \"go\" }\n\
+                  f = @include(\"front.weft\")\n\
+                  f._should_flow = gate.value\n";
+    let (parsed, diags) = weft_compiler::parse_only(
+        source,
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        &catalog(),
+        None,
+    );
+    let f = parsed.nodes.iter().find(|n| n.id == "f").expect("the include node");
+    for gate in ["_should_flow", "_should_not_flow"] {
+        assert!(f.inputs.iter().any(|p| p.name == gate), "{gate} is on the include node");
+    }
+    assert!(
+        !diags.iter().any(|d| d.message.contains("_should_flow")),
+        "nothing is underlined on a program the build accepts: {diags:?}"
+    );
+}
+
+/// Navigating INTO an included file parses that file alone. Its nodes must
+/// come out under the same ids the build gives them, because the editor's
+/// live pollers ask the dispatcher about a node by id: a trigger's mount
+/// URL and an infra node's live rows are looked up under the id the
+/// compiled program registered, which for an included file is the file's
+/// path (`@lib:front.door`), never the call-site alias (`f.door`, and a
+/// file included twice has two aliases and one body).
+#[test]
+fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
+    use weft_catalog::stdlib_root;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("weft.toml"), "[project]\nname = \"p\"\n").unwrap();
+    std::fs::create_dir(dir.path().join("lib")).unwrap();
+    let front = "Group(who: Access) -> (out: JsonDict) {\n  \
+        door = Route { path: \"hi\", method: \"GET\", auth: self.who }\n  \
+        self.out = door.body\n}\n";
+    std::fs::write(dir.path().join("lib/front.weft"), front).unwrap();
+    std::fs::write(dir.path().join("main.weft"), "f = @include(\"lib/front.weft\")\n").unwrap();
+
+    // What the BUILD registers, which is what the dispatcher's signal row
+    // and the inspector's poll key on.
+    let built = weft_compiler::weft_compiler::compile(
+        "f = @include(\"lib/front.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile");
+    assert!(
+        built.nodes.iter().any(|n| n.id == "@lib:front.door"),
+        "the build spells it by the file's path: {:?}",
+        built.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>()
+    );
+
+    // What the EDITOR parses when a person clicks into the file. Same id,
+    // because the file's path is its identity at parse and at build alike.
+    let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib");
+    let lib = dir.path().join("lib");
+    let source_id = weft_compiler::source_name::file_id(
+        Some(dir.path()),
+        Some(&dir.path().join("lib/front.weft")),
+    );
+    let (parsed, _diags) = weft_compiler::parse_only(
+        front,
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()).anchored_at(Some(&lib)),
+        &cat,
+        Some(&source_id),
+    );
+    assert!(
+        parsed.nodes.iter().any(|n| n.id == "@lib:front.door"),
+        "the editor's parse agrees, so the live pollers ask about the right node: {:?}",
+        parsed.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>()
     );
 }

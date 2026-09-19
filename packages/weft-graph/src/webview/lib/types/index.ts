@@ -10,7 +10,7 @@ import type {
 	CallerInspectorEvent,
 	CorruptionSite,
 	LoopInspectorEvent,
-	LoopIteration,
+	Frame,
 	NodeExecutionStatus,
 	NodeFeaturesWire as NodeFeatures,
 } from '../../../protocol';
@@ -450,17 +450,11 @@ export interface NodeExecution {
 	costIds?: string[];
 	logs: unknown[];
 	color: string;
-	frames: LoopIteration[];
+	frames: Frame[];
 	/// Frame stack serialized as JSON, used to correlate completion
 	/// events to the right running row when several firings run
 	/// in parallel. `[]` at root (outside any loop).
 	framesKey: string;
-	/// Non-terminal per-port warnings raised on this firing. The only
-	/// source is a runtime output-type mismatch: the node tried to emit a
-	/// value whose type is incompatible with the port's declared type, so
-	/// the engine closed the port instead. The node did NOT fail.
-	// SYNC: PortWarning <-> crates/weft-core/src/exec/execution.rs PortWarning
-	portWarnings?: PortWarning[];
 	/// The run this firing was taken from (a seeded run reused it).
 	inheritedFrom?: string;
 	/// Input ports whose value a person provided (a scoped run).
@@ -468,17 +462,6 @@ export interface NodeExecution {
 	// SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent
 	backupPorts?: string[];
 	inheritedPorts?: Record<string, string>;
-}
-
-/// A non-terminal, per-port problem on a single firing (output-type
-/// mismatch). See `NodeExecution.portWarnings`.
-// SYNC: PortWarning <-> crates/weft-core/src/exec/execution.rs PortWarning
-export interface PortWarning {
-	port: string;
-	/// The port's declared type (what the node promised to emit).
-	expected: string;
-	/// The inferred type of the value the node actually tried to emit.
-	actual: string;
 }
 
 /** Node executions keyed by node ID. */
@@ -502,9 +485,10 @@ export interface ExecutionTerminal {
  */
 export interface ExecutionState {
 	isRunning: boolean;
-	/** The node set the followed run is held to; `null` for the whole
-	 *  graph, `undefined` before the run's birth arrived. A node outside
-	 *  it is "not in this run": dimmed, no status badge. */
+	/** The places the followed run is held to (`locatedKey`s); `null`
+	 *  for the whole graph, `undefined` before the run's birth arrived. A
+	 *  node outside it, at the call on screen, is "not in this run":
+	 *  dimmed, no status badge. */
 	scope?: string[] | null;
 	/** The run this one was seeded from and what it re-ran, or `null`
 	 *  for a run from nothing. */
@@ -750,4 +734,23 @@ export function containerHasConfigStrip(
  *  differentiation; for structural checks prefer `isContainerNodeType`). */
 export function isLoopNodeType(nodeType: unknown): boolean {
 	return containerKindOf(nodeType) === 'Loop';
+}
+
+/** The opaque `@include` block: a node carrying only the included file's
+ *  interface ports, whose body lives in that file. No catalog entry by
+ *  design. */
+// SYNC: INCLUDE_NODE_TYPE <-> crates/weft-compiler/src/weft_compiler.rs INCLUDE_NODE_TYPE
+export const INCLUDE_NODE_TYPE = 'IncludedGroup';
+
+export function isIncludeNodeType(nodeType: unknown): boolean {
+	return nodeType === INCLUDE_NODE_TYPE;
+}
+
+/** A box whose own execution is its boundary pair: a container (its
+ *  `__in` / `__out` fire at this level around its members) or an include
+ *  (the call site's `__in` / `__out` fire at this level around the body,
+ *  which runs one call frame deeper). Both are painted from the pair the
+ *  same way. */
+export function isBoundaryBoxNodeType(nodeType: unknown): boolean {
+	return isContainerNodeType(nodeType) || isIncludeNodeType(nodeType);
 }

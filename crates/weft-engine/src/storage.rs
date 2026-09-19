@@ -74,9 +74,10 @@ pub trait WorkerStorageOps: Send + Sync {
     /// A temporary link to `key`: internet-reachable when the install
     /// serves one, else signed for the cluster's own address.
     async fn presign(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
-    /// A temporary INTERNET-reachable URL for `key`, or `None` when the
-    /// deployment cannot serve one (callers fall back to inline bytes).
-    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>>;
+    /// A temporary URL for `key` that `reach` can open, or `None` when
+    /// the deployment cannot serve one (an internet asker falls back to
+    /// inline bytes).
+    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>>;
 }
 
 /// Map a broker HTTP failure to a node-facing error. A transport failure
@@ -563,7 +564,7 @@ impl WorkerStorageOps for WorkerStorage {
         let resp = self
             .authed(self.http.post(self.url("/v1/storage/presign")), color)
             .await?
-            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs })
+            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs, reach: weft_core::storage::LinkReach::Internet })
             .send()
             .await
             .map_err(|e| http_err("presign", e))?;
@@ -574,11 +575,11 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(out.url)
     }
 
-    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
+    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
         let resp = self
             .authed(self.http.post(self.url("/v1/storage/public-link")), color)
             .await?
-            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs })
+            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs, reach })
             .send()
             .await
             .map_err(|e| http_err("public-link", e))?;
@@ -798,14 +799,18 @@ mod fake {
             Ok(format!("https://fake-bucket/runtime/{key}?sig=fake"))
         }
 
-        async fn public_link(&self, _color: Color, key: &str, _ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
+        async fn public_link(&self, _color: Color, key: &str, _ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
             self.enforce_wall(key)?;
             if !self.files.lock().contains_key(key) {
                 return Err(WeftError::NodeExecution(format!("storage file not found: {key}")));
             }
-            // The fake deployment serves no public links: callers
-            // exercise the inline fallback.
-            Ok(None)
+            // The fake deployment serves no internet links (callers
+            // exercise the inline fallback); a caller of the fake install
+            // gets a stable address.
+            Ok(match reach {
+                weft_core::storage::LinkReach::Internet => None,
+                weft_core::storage::LinkReach::Caller => Some(format!("http://fake-install/public/files/{key}")),
+            })
         }
     }
 }

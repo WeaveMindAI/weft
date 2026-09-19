@@ -13,11 +13,11 @@
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
-import { runWeftJson, projectDirOf } from './cli';
+import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
-import { exampleNameProblem, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
+import { exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
@@ -40,7 +40,7 @@ export class GraphViewController {
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
   /// execution-id prefix so sub-graph journal values render). `openInclude`
-  /// pushes; Return pops. The bottom is the project's main.weft.
+  /// pushes; Return pops. The bottom is the project's `src/main.weft`.
   private navStack: { doc: vscode.TextDocument; alias: string }[] = [];
   /// Set when the next parse is for a freshly-swapped file (navigation),
   /// so the webview treats its parseResult as a fresh mount (rebuild +
@@ -76,6 +76,7 @@ export class GraphViewController {
   private navHandler: ((focusedGroup: string | null) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
+  private followClearHandler: (() => void) | undefined;
   private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
@@ -96,6 +97,14 @@ export class GraphViewController {
   /// open + after every action + on file-change debounce + on
   /// user-clicked Refresh.
   private cliStatusHandler: (() => Promise<void>) | undefined;
+  /// The version-tree verbs (branch, checkpoint), which print one JSON
+  /// line and are NOT action-bar verbs: they have no `ActionVerb` tag,
+  /// so routing them through `cliVerbHandler` throws before the CLI is
+  /// even spawned and the click does nothing. Extension.ts installs the
+  /// same runner its own tree commands use.
+  private treeVerbHandler:
+    | ((args: string[]) => Promise<unknown>)
+    | undefined;
   /// Called whenever the webview signals `ready` (initial mount,
   /// or iframe rebuild after a column move). Lets extension.ts
   /// re-push state that's owned outside graphView (action bar
@@ -114,10 +123,6 @@ export class GraphViewController {
   /// body-panel button goes (the container behind `/infra`, or the
   /// listener holding a signal), which is a fact of the node.
   private infraNodeIds: Set<string> = new Set();
-  /// The subset whose container serves `/live`, so only those are
-  /// polled. Never used for routing: whether a poller runs is not the
-  /// same question as what kind of node this is.
-  private infraLiveNodeIds: Set<string> = new Set();
   // Same shape, for trigger nodes' signal display info (mount URL,
   // freshly-minted api keys, etc). Keyed by nodeId. Polls
   // `/projects/{id}/signals/{node_id}/display` and posts
@@ -181,7 +186,7 @@ export class GraphViewController {
    *  still showing the old project's banner and nothing else would ever
    *  clear it. A version of `null` is how the webview is told there is no
    *  followed run here. */
-  private forgetExecVersion(): void {
+  forgetExecVersion(): void {
     if (!this.lastExecVersion) return;
     const color = this.lastExecVersion.color;
     this.lastExecVersion = undefined;
@@ -198,6 +203,7 @@ export class GraphViewController {
   private execVersionFor: string | undefined;
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
+  setFollowClearHandler(fn: () => void): void { this.followClearHandler = fn; }
   setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
@@ -248,6 +254,10 @@ export class GraphViewController {
 
   setCliStatusHandler(fn: () => Promise<void>): void {
     this.cliStatusHandler = fn;
+  }
+
+  setTreeVerbHandler(fn: (args: string[]) => Promise<unknown>): void {
+    this.treeVerbHandler = fn;
   }
 
   /** Public so execFollower can push events into the panel. */
@@ -385,7 +395,7 @@ export class GraphViewController {
           // graph), not an include navigation (navigateInto sets watchedDoc to
           // its target before this fires, so that case sees no change here).
           const isDifferentDoc = ed.document !== this.watchedDoc;
-          // Drop any include back-stack so the Return button / execPrefix don't
+          // Drop any include back-stack so the Return button / call path don't
           // dangle against an unrelated graph.
           if (isDifferentDoc && this.navStack.length > 0) {
             this.navStack = [];
@@ -442,7 +452,7 @@ export class GraphViewController {
   /// only reports edits to a TextDocument VS Code still holds; once the
   /// source tab is closed, VS Code detaches that document at a moment
   /// nothing here controls, and a detached document's text is frozen. An
-  /// agent writing `main.weft` while only the graph is open then changes
+  /// agent writing `src/main.weft` while only the graph is open then changes
   /// nothing the change event can see, and the graph shows the old program
   /// until the source tab is opened by hand. This watcher is the other ear:
   /// a write on disk re-latches a live document (liveDoc re-opens the file
@@ -483,11 +493,17 @@ export class GraphViewController {
   /// change under `nodes/`, re-run the full catalog refresh (palette +
   /// parse), debounced so a multi-file save fires once.
   ///
-  /// Rebound when the panel follows a .weft in a different project, so
-  /// the watcher always points at the watched doc's own `nodes/`.
+  /// Rebound when the panel follows a .weft in a different project.
   private watchNodesDir(doc: vscode.TextDocument): void {
     this.nodesWatcher?.dispose();
-    const root = projectDirOf(doc);
+    // The PROJECT root, never the document's own directory: `nodes/`
+    // sits beside `weft.toml`, and a program lives in `src/`, so
+    // watching the doc's folder watched `src/nodes/**`, which does not
+    // exist. Nothing ever fired, the warm parse server kept the catalog
+    // it built at spawn, and a node package written after the window
+    // opened stayed unknown until the window was reloaded.
+    const root = findProjectRoot(doc.uri.fsPath);
+    if (!root) return;
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(root, 'nodes/**'),
     );
@@ -513,11 +529,25 @@ export class GraphViewController {
   private watchReferencedFiles(response: ParseResponse): void {
     const doc = this.watchedDoc;
     if (!doc) return;
+    // Two anchors, the compiler's (`weft_compiler::file_reader`): an
+    // `@include` path is relative to the file that writes it, while a
+    // `@file` / `@asset` path is relative to the PROJECT ROOT wherever
+    // it is written, so a navigated-in included file reads the same
+    // asset the program does. Outside any project the doc's own dir
+    // stands in for both.
     const baseDir = nodePath.dirname(doc.uri.fsPath);
+    const rootDir = findProjectRoot(doc.uri.fsPath) ?? baseDir;
     // relative path (marker form) -> absolute, for the two kinds.
     const fileRel = new Set<string>();
     const includeRel = new Set<string>();
-    for (const n of response.project.nodes as Array<{ fileRefs?: Record<string, { path: string; type: string }>; includePath?: string }>) {
+    // Include paths already expressed from the project root, which is how
+    // a nested `@include` can be named at all.
+    const includeRootRel = new Set<string>();
+    for (const n of response.project.nodes as Array<{
+      fileRefs?: Record<string, { path: string; type: string }>;
+      includePath?: string;
+      includeContents?: { files?: string[] };
+    }>) {
       // Only TEXT refs: a media ref's bytes are never read as text content
       // (they'd ship an image as garbage, and the editor's content-save path
       // would clobber the media file).
@@ -527,26 +557,40 @@ export class GraphViewController {
         }
       }
       if (n.includePath) includeRel.add(n.includePath);
+      // Files reached THROUGH that include, nested ones too, each already
+      // relative to the project root (an `@include` path is relative to
+      // the file that wrote it, so a nested one is meaningless against
+      // this file's directory). Without these, editing a deeply included
+      // file left the graph showing the old parse.
+      for (const rel of n.includeContents?.files ?? []) includeRootRel.add(rel);
     }
     // Record the resolution base + @file set so saveFileRef and the watcher
     // reship from the same source of truth.
-    this.fileBaseDir = baseDir;
+    this.fileBaseDir = rootDir;
     this.fileRelPaths = fileRel;
     // Ship current @file contents now (every parse), keyed by relative path.
-    void this.shipFileContents(baseDir, fileRel);
+    void this.shipFileContents(rootDir, fileRel);
 
     // Key on ABSOLUTE resolved paths, not the relative marker strings: two
     // files in different dirs can reference the same relative path, and a
     // relative-only key would skip the rebuild on navigation, leaving the
     // watchers bound to the previous file's dir (silent file -> graph break).
-    const absFile = [...fileRel].map((r) => nodePath.resolve(baseDir, r)).sort();
-    const absInclude = [...includeRel].map((r) => nodePath.resolve(baseDir, r)).sort();
+    const absFile = [...fileRel].map((r) => nodePath.resolve(rootDir, r)).sort();
+    // Two anchors, one set: a top-level `@include` is written relative to
+    // this file, while the files reached through it come back relative to
+    // the project root. Both watch the same way.
+    const absInclude = [
+      ...new Set([
+        ...[...includeRel].map((r) => nodePath.resolve(baseDir, r)),
+        ...[...includeRootRel].map((r) => nodePath.resolve(rootDir, r)),
+      ]),
+    ].sort();
     const key = JSON.stringify([absFile, absInclude]);
     if (key === this.watchedRefPaths) return; // set unchanged: keep watchers
     this.watchedRefPaths = key;
     this.refWatcher?.dispose();
     this.refWatcher = undefined;
-    if (fileRel.size === 0 && includeRel.size === 0) return;
+    if (absFile.length === 0 && absInclude.length === 0) return;
     const disposables: vscode.Disposable[] = [];
     for (const abs of absFile) {
       const w = vscode.workspace.createFileSystemWatcher(abs);
@@ -555,8 +599,8 @@ export class GraphViewController {
       const onChange = () => this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
       disposables.push(w, w.onDidChange(onChange), w.onDidCreate(onChange), w.onDidDelete(onChange));
     }
-    for (const rel of includeRel) {
-      const w = vscode.workspace.createFileSystemWatcher(nodePath.resolve(baseDir, rel));
+    for (const abs of absInclude) {
+      const w = vscode.workspace.createFileSystemWatcher(abs);
       // A dependency change: the watched doc's TEXT is untouched, so the
       // debounce's render-current skip must not apply (the render is stale
       // through the include, not the text).
@@ -776,11 +820,10 @@ export class GraphViewController {
     const projectId = response.project.id;
     if (!projectId) {
       this.stopAllLivePollers();
-      // Nothing is parsed any more, so neither set describes anything.
-      // Leaving them behind would route this project's buttons by the
+      // Nothing is parsed any more, so the set describes nothing.
+      // Leaving it behind would route this project's buttons by the
       // last project's answers.
       this.infraNodeIds = new Set();
-      this.infraLiveNodeIds = new Set();
       return;
     }
     const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
@@ -799,8 +842,6 @@ export class GraphViewController {
         })
         .map((n) => n.id),
     );
-    this.infraLiveNodeIds = infraNodeIds;
-
     // Stop pollers for nodes no longer in the project (or no longer
     // requires_infra).
     for (const [id, timer] of this.liveTimers.entries()) {
@@ -898,12 +939,14 @@ export class GraphViewController {
         const items = signalDisplayToLiveItems(body);
         this.post({ kind: 'signalDisplay', nodeId, state: 'ok', items });
       } catch (err) {
-        // 404 = the signal is not registered (the project is not
-        // activated, or its trigger setup failed and never registered).
-        // A distinct RESTING state, never collapsed into a healthy
-        // empty list; stale items from a previous activation clear.
-        // Anything else (listener down, BAD_GATEWAY) is a real
-        // failure; surface it.
+        // 404 = nothing is listening for this trigger: the project is
+        // not activated, its trigger setup never registered, or the
+        // listener that held it is gone or has forgotten it (the
+        // dispatcher folds all of those into one 404). A distinct
+        // RESTING state, never collapsed into a healthy empty list;
+        // stale items from a previous activation clear. Anything else
+        // (the dispatcher unreachable, BAD_GATEWAY) is a real failure;
+        // surface it.
         if (err instanceof HttpError && err.status === 404) {
           this.post({ kind: 'signalDisplay', nodeId, state: 'absent' });
           return;
@@ -950,35 +993,23 @@ export class GraphViewController {
       );
       if (!choice || !choice.value) return;
     }
-    // The button came off one of two feeds: an infra node's press goes
-    // to the container behind `/live`, a trigger's to the listener
-    // holding its signal. Which one is a fact of the parsed node, not
-    // of whether a poller happens to be running for it.
-    const isInfra = this.infraNodeIds.has(nodeId);
+    // A button belongs to an infra node's own container, reached
+    // behind `/live`. Triggers used to have one too, for regenerating
+    // a key the listener minted; that whole mechanism is gone (a key
+    // now lives on a connection), so a signal has no action to press
+    // and the dispatcher no longer offers a door for one.
+    if (!this.infraNodeIds.has(nodeId)) return;
     try {
       await this.client.post(
-        isInfra
-          ? `/projects/${projectId}/infra/nodes/${nodeId}/action`
-          : `/projects/${projectId}/signals/${nodeId}/action`,
+        `/projects/${projectId}/infra/nodes/${nodeId}/action`,
         { kind: actionKind, payload: payload ?? null },
       );
       // Force-refresh the node's poller so what the press changed (a
-      // new plaintext key, a fresh QR code) shows up immediately.
-      if (isInfra) {
-        const timer = this.liveTimers.get(nodeId);
-        if (timer) {
-          clearInterval(timer);
-          this.liveTimers.set(nodeId, this.startLivePoller(projectId, nodeId));
-        }
-      } else {
-        const timer = this.signalDisplayTimers.get(nodeId);
-        if (timer) {
-          clearInterval(timer);
-          this.signalDisplayTimers.set(
-            nodeId,
-            this.startSignalDisplayPoller(projectId, nodeId),
-          );
-        }
+      // fresh QR code, a new address) shows up immediately.
+      const timer = this.liveTimers.get(nodeId);
+      if (timer) {
+        clearInterval(timer);
+        this.liveTimers.set(nodeId, this.startLivePoller(projectId, nodeId));
       }
     } catch (err) {
       // 409 means the signal's queue already has the maximum
@@ -1086,6 +1117,20 @@ export class GraphViewController {
     void this.refreshActionAvailability();
   }
 
+  /// Put the files on disk onto another version. A tree verb, not an
+  /// action-bar verb: it runs outside the bar's pump and reports its own
+  /// failure, the same way the sidebar's "branch here" does.
+  private async branchTo(reference: string): Promise<void> {
+    if (!this.treeVerbHandler) return;
+    const out = await this.treeVerbHandler(['branch', reference]);
+    if (out) {
+      void vscode.window.showInformationMessage(
+        `Weft: branched to ${reference.slice(0, 8)}; the files on disk are that version now.`,
+      );
+    }
+    void this.refreshActionAvailability();
+  }
+
   /// Run `weft status --json` via the host. Pulls the latest drift
   /// bits + project status + per-node infra status into the
   /// host's ActionBarStore, which broadcasts to the webview.
@@ -1169,7 +1214,7 @@ export class GraphViewController {
         void this.dispatchVerb('run', [msg.name]);
         break;
       case 'branchTo':
-        void this.dispatchVerb('branch', [msg.reference]);
+        void this.branchTo(msg.reference);
         break;
       case 'infraStart':
         void this.dispatchVerb('infra', ['start']);
@@ -1252,6 +1297,9 @@ export class GraphViewController {
         break;
       case 'followCatchUp':
         this.followCatchUpHandler?.();
+        break;
+      case 'followClear':
+        this.followClearHandler?.();
         break;
       case 'openSource':
         this.openSourceHandler?.(msg.location);
@@ -1404,11 +1452,14 @@ export class GraphViewController {
 
   /// The file-drop field's asset pick. Locally a PICKED file is referenced IN
   /// PLACE: the native dialog returns the real path, written into the
-  /// `@file(...)` ref as project-relative when under the root, absolute
-  /// otherwise (out-of-project refs are legal locally; the build's asset sync
-  /// reads them from wherever they are). A DRAG-DROPPED file arrives as bytes
-  /// (the browser hides its OS path), so it is stored as a project file under
-  /// `assets/` instead, never overwriting an existing different file.
+  /// `@file(...)` ref relative to the PROJECT ROOT when the pick is inside
+  /// the project (a marker's path is root-relative wherever it is written,
+  /// so the spelling is the same from `src/main.weft` and from any module),
+  /// absolute otherwise (out-of-project refs are legal locally; the build's
+  /// asset sync reads them from wherever they are). A DRAG-DROPPED file
+  /// arrives as bytes (the browser hides its OS path), so it is stored as a
+  /// project file under the root `assets/` instead, never overwriting an
+  /// existing different file, and referenced the same way.
   private async runPickAsset(
     requestId: number,
     accept: string | undefined,
@@ -1422,10 +1473,19 @@ export class GraphViewController {
         this.post({ kind: 'assetPicked', requestId, error: 'no project root (save the project first)' });
         return;
       }
+      // Inside the project a ref is spelled from the root, so it travels
+      // with the project; outside, the absolute path is the only honest
+      // spelling: the file is read from where it sits and uploaded at
+      // compile, never copied onto the disk a second time.
+      const refFor = (absolute: string): string => {
+        const fromRoot = nodePath.relative(root, absolute);
+        const inProject = !fromRoot.startsWith('..') && !nodePath.isAbsolute(fromRoot);
+        return inProject ? fromRoot.split(nodePath.sep).join('/') : absolute;
+      };
       if (dropped) {
         const paths: string[] = [];
         for (const file of dropped) {
-          paths.push(await this.storeDroppedFile(root, file));
+          paths.push(refFor(await this.storeDroppedFile(root, file)));
         }
         this.post({ kind: 'assetPicked', requestId, paths });
         return;
@@ -1434,14 +1494,7 @@ export class GraphViewController {
         canSelectMany: multiple,
         filters: dialogFiltersForAccept(accept),
       });
-      // A pick outside the project is referenced by its absolute path; one
-      // inside is referenced relative to the project, so the ref travels
-      // with the project.
-      const paths = (picked ?? []).map((uri) => {
-        const rel = nodePath.relative(root, uri.fsPath);
-        const inProject = !rel.startsWith('..') && !nodePath.isAbsolute(rel);
-        return inProject ? rel.split(nodePath.sep).join('/') : uri.fsPath;
-      });
+      const paths = (picked ?? []).map((uri) => refFor(uri.fsPath));
       this.post({ kind: 'assetPicked', requestId, paths });
     } catch (e) {
       this.post({
@@ -1452,8 +1505,8 @@ export class GraphViewController {
     }
   }
 
-  /// Store one dropped file under the project's `assets/`, and hand back
-  /// the path a ref writes. The browser hides a dropped file's OS path, so
+  /// Store one dropped file under the project's root `assets/`, and hand
+  /// back its absolute path. The browser hides a dropped file's OS path, so
   /// its bytes are what travels; a name collision takes a numeric suffix
   /// rather than clobbering a different file that happens to share a name.
   private async storeDroppedFile(
@@ -1471,7 +1524,7 @@ export class GraphViewController {
         await vscode.workspace.fs.stat(vscode.Uri.file(full));
       } catch {
         await vscode.workspace.fs.writeFile(vscode.Uri.file(full), bytes);
-        return `assets/${candidate}`;
+        return full;
       }
       const dot = leaf.lastIndexOf('.');
       candidate = dot > 0 ? `${leaf.slice(0, dot)}-${n}${leaf.slice(dot)}` : `${leaf}-${n}`;
@@ -1895,13 +1948,22 @@ export class GraphViewController {
   private async saveFileRef(relPath: string, content: string): Promise<void> {
     const doc = this.watchedDoc;
     if (!doc) return;
-    // `@file` paths resolve against the file's own dir (same base the compiler
-    // and watcher use), not the project root: a navigated-in component edits
-    // its own relative paths. The result must stay inside the project root.
+    // `@file` paths resolve against the PROJECT ROOT wherever they are
+    // written (the compiler's rule, and the anchor `watchReferencedFiles`
+    // reads them from), so an included file deep in `src/` writes the
+    // same asset it displays. The result must stay inside the root.
     const baseDir = nodePath.dirname(doc.uri.fsPath);
     const root = findProjectRoot(doc.uri.fsPath) ?? baseDir;
-    const resolved = nodePath.resolve(baseDir, relPath);
-    const relToRoot = nodePath.relative(root, resolved);
+    // ONE derivation of the target, so the value checked is the value
+    // written. Built from the document's own URI so it keeps that scheme
+    // (a remote SSH session's `vscode-remote`), which `Uri.file` would
+    // drop: the joined path is the walk from the doc's dir to the asset.
+    const target = vscode.Uri.joinPath(
+      doc.uri,
+      '..',
+      nodePath.relative(baseDir, nodePath.resolve(root, relPath)),
+    );
+    const relToRoot = nodePath.relative(root, target.fsPath);
     if (relToRoot.startsWith('..') || nodePath.isAbsolute(relToRoot)) {
       console.error('[weft] refusing saveFileRef: path escapes project root', relPath);
       return;
@@ -1909,28 +1971,33 @@ export class GraphViewController {
     // Serialized full-text write (open-doc-aware, recomputes range after any
     // predecessor) via the shared writer. No graph reparse: config is
     // unchanged; reship the resolved content for display once the write lands.
-    await this.writeDocumentText(vscode.Uri.file(resolved), content);
+    await this.writeDocumentText(target, content);
     void this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
   }
 
   /// Navigate into an `@include`d file: open its graph in this panel and
-  /// push the current doc onto the back-stack. The path is project-root
-  /// relative (the compiler's resolution root); escaping paths are refused.
-  /// One view = one file, so this swaps the watched doc rather than inlining.
+  /// push the current doc onto the back-stack. The path is relative to the
+  /// INCLUDING file's directory, the same base the compiler resolves it
+  /// against (`DiskFileReader::resolve_and_read`); it must stay inside the
+  /// project root, as there. One view = one file, so this swaps the watched
+  /// doc rather than inlining.
   private async navigateInto(relPath: string, alias: string): Promise<void> {
     const current = this.watchedDoc;
     if (!current) return;
     const root = findProjectRoot(current.uri.fsPath);
     if (!root) return;
-    const resolved = nodePath.resolve(root, relPath);
-    const rel = nodePath.relative(root, resolved);
+    // ONE derivation of the file to open, so the value checked is the
+    // value opened. Built from the current document's URI so a remote
+    // session keeps its scheme; `Uri.file` would point at the local disk.
+    const targetUri = vscode.Uri.joinPath(current.uri, '..', relPath);
+    const rel = nodePath.relative(root, targetUri.fsPath);
     if (rel.startsWith('..') || nodePath.isAbsolute(rel)) {
       console.error('[weft] refusing openInclude: path escapes project root', relPath);
       return;
     }
     let target: vscode.TextDocument;
     try {
-      target = await vscode.workspace.openTextDocument(vscode.Uri.file(resolved));
+      target = await vscode.workspace.openTextDocument(targetUri);
     } catch (e) {
       void vscode.window.showErrorMessage(`Weft: cannot open included file ${relPath}: ${e}`);
       return;
@@ -1939,7 +2006,7 @@ export class GraphViewController {
     this.freshMount = true;
     // Send navState BEFORE the parse it depends on: open() posts parseResult
     // (freshMount), which remounts the editor and looks up execution values via
-    // execPrefix. navState (computed from the now-updated navStack) must arrive
+    // the call path. navState (computed from the now-updated navStack) must arrive
     // first so that lookup uses the correct prefix on the first render.
     this.sendNavState();
     await this.open(target, undefined, true);
@@ -2113,26 +2180,27 @@ export class GraphViewController {
     await this.open(previous.doc, undefined, true);
   }
 
-  /// Push the current navigation depth, file name, and execution-id prefix to
-  /// the webview. The prefix is the dotted alias chain descended through
-  /// (e.g. `c.` or `c.inner.`), so sub-graph journal values (keyed by the
-  /// fully-qualified id) line up with this file's bare node ids.
+  /// Push the current navigation depth, file name, and call path to the
+  /// webview. The call path is the chain of call sites descended through
+  /// (each the site's own id, `c` then `C.inner`), so the webview shows
+  /// the rows of the one call on screen. The executions view is told the
+  /// same place as a group address (`c.inner`).
   private sendNavState(): void {
     const fileName = this.watchedDoc?.uri.fsPath.split(/[\\/]/).pop() ?? '';
-    const execPrefix = this.navStack.map((f) => `${f.alias}.`).join('');
+    const callPath = this.navStack.map((f) => f.alias);
     void this.panel?.webview.postMessage({
       kind: 'navState',
       depth: this.navStack.length,
       fileName,
-      execPrefix,
+      callPath,
     });
-    this.navHandler?.(this.navStack.length === 0 ? null : this.navStack.map((f) => f.alias).join('.'));
+    this.navHandler?.(groupOfCallPath(callPath));
   }
 
   /** Fetch every node type available in the current project scope
    *  (stdlib + project-local `nodes/`) and ship the catalog to the
    *  webview so the command palette can list them all, even types
-   *  the current `main.weft` doesn't reference yet. */
+   *  the current `src/main.weft` doesn't reference yet. */
 
   private async sendGlobalCatalog(): Promise<void> {
     if (!this.watchedDoc) return;
@@ -2140,7 +2208,7 @@ export class GraphViewController {
       const response = await runWeftJson<{
         catalog: Record<string, unknown>;
         warnings?: string[];
-      }>(['describe-nodes'], projectDirOf(this.watchedDoc));
+      }>(['describe-nodes'], docDirOf(this.watchedDoc));
       this.post({
         kind: 'catalogAll',
         catalog: response.catalog as Record<string, CatalogEntry>,
@@ -2184,6 +2252,13 @@ export class GraphViewController {
     this.selfWatcher = undefined;
     this.refWatcher?.dispose();
     this.refWatcher = undefined;
+    // And forget WHAT was watched. The key is how `watchReferencedFiles`
+    // decides it has nothing to do; leaving the old one behind meant
+    // that after a close and reopen it saw the same set, returned early,
+    // and never rebuilt the watchers. Editing a backing file or an
+    // included program outside the editor then stopped updating the
+    // graph, in silence, until the panel was opened on something else.
+    this.watchedRefPaths = '';
     this.stopAllLivePollers();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];

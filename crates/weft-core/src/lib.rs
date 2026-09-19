@@ -20,6 +20,8 @@ pub mod exec;
 pub mod frames;
 #[cfg(feature = "runtime")]
 pub mod generator;
+#[cfg(feature = "runtime")]
+pub mod in_flight;
 pub mod infra;
 #[cfg(feature = "runtime")]
 pub mod liveness;
@@ -31,6 +33,7 @@ pub mod node_test;
 pub mod primitive;
 pub mod project;
 pub mod pulse;
+pub mod route;
 pub mod run_spec;
 pub mod running_policy;
 #[cfg(feature = "runtime")]
@@ -46,6 +49,10 @@ pub mod signed_token;
 // them, so the WASM parse build compiles them too); only its byte-stream
 // aliases are runtime-gated, inside the module.
 pub mod storage;
+// What every channel's messages look like once written down: the one
+// trim rule and the one meaning of "ephemeral" a bus and a live caller
+// conversation both answer to.
+pub mod stream_journal;
 pub mod tag;
 pub mod wait;
 pub mod weft_type;
@@ -150,7 +157,7 @@ pub use infra::{
     ProvisionContextError, Resources, ScalingPolicy, StopBehavior, TerminateBehavior, Toleration,
     Unit, UnitHealth, UnitKind, UpgradeBehavior, Volume, VolumeKind,
 };
-pub use frames::{LoopFrames, LoopIteration};
+pub use frames::{Frame, LoopFrames};
 pub use node::{
     Condition, InputSpec, MetadataCatalog, PortSpec, PortsFromConfig, PortTemplate,
     NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, OutputSpec, RuleDiagnostic, RuleSeverity,

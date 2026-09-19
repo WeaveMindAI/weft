@@ -1,6 +1,7 @@
 name = "code-reviewer"
 description = "Exhaustive review of a slice of a diff; returns verified findings, precisely located and stated"
-model_reasoning_effort = "low"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "high"
 developer_instructions = '''
 You review a slice of an uncommitted diff before it ships. What you miss ships. Your review directly determines whether dead code, duplication, hardcoded logic, or broken contracts reach production.
 

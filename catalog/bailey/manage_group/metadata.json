@@ -34,24 +34,20 @@
     },
     {
       "name": "groupId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "name",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "description",
       "type": "String",
-      "widget": { "kind": "textarea" },
-      "required": false
+      "widget": { "kind": "textarea" }
     },
     {
       "name": "participants",
-      "type": "List[String]",
-      "required": false
+      "type": "List[String]"
     }
   ],
   "outputs": [

@@ -80,7 +80,7 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
 
     // Now make the run itself fail: `src` is text, and a Cast to Number
     // fails loudly on a value that does not fit.
-    let main = project.read_file("main.weft")?;
+    let main = project.read_file("src/main.weft")?;
     project.set_main(&main.replace("mid = Cast -> (value: String)", "mid = Cast -> (value: Number)"))?;
 
     let stdout = project.weft(&["run", "chain", "--json"]).await?;

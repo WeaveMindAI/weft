@@ -32,7 +32,7 @@ use crate::Color;
 /// rides the dispatcher's `RegisterRequest`, not the spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalSpec {
-    /// Kind tag (e.g. `"api_endpoint"`, `"timer"`). Matched against the
+    /// Kind tag (e.g. `"route"`, `"timer"`). Matched against the
     /// inventory of `SignalKind` impls; unknown tags fail validation.
     pub kind: String,
     /// Kind-specific configuration. Each kind owns its shape.
@@ -126,13 +126,20 @@ impl From<&crate::access::Access> for AccessRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalSurface {
-    /// Author-controlled HTTP entrypoint. Mounted at the dispatcher
-    /// root: external callers POST to `<dispatcher_base>/<path>`.
-    /// `path = ""` means root `/`. Path uniqueness enforced
-    /// project-wide at register time (UNIQUE on signal.mount_path).
-    /// Used by the live-caller kinds (ApiEndpoint, LiveSocket) and any
-    /// future public-form-like kind.
-    PublicEntry { path: String },
+    /// Author-controlled HTTP entrypoint. Mounted under the tenant at
+    /// the dispatcher root: external callers reach it at
+    /// `<dispatcher_base>/connect/<tenant>/<path>` (a live route) or
+    /// `POST <dispatcher_base>/<tenant>/<path>` (a plain public fire).
+    /// `path` is a route pattern (`chat/{room}`); `""` means the root.
+    /// `methods` lists the HTTP methods served, uppercase; empty = any.
+    /// Two routes of one tenant may not overlap (same shape, a shared
+    /// method), checked at register time. Used by the live-caller kinds
+    /// (Route, Socket) and any future public-form-like kind.
+    PublicEntry {
+        path: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        methods: Vec<String>,
+    },
     /// Per-task callback. Mounted at `/signal/<token>` where the
     /// dispatcher mints the UUID at register time. Used by
     /// task-style signals (HumanQuery, future task-callback kinds)
@@ -150,23 +157,21 @@ pub enum SignalSurface {
 /// of `SignalSurface`: any surface kind can pick any auth kind.
 ///
 /// Marker enum: it identifies the gate to run. The kind-specific
-/// configuration (header name, value hash, future per-scheme bits)
-/// lives in the `auth_config` JSON blob alongside, parsed by the
-/// dispatcher's gate at fire time. New auth kinds: add a variant
-/// here, add a match arm in `apply_auth_gate`, decide what shape
-/// goes in `auth_config`.
+/// configuration lives in the `auth_config` JSON blob alongside,
+/// parsed by the dispatcher's gate at connect time. New auth kinds:
+/// add a variant here, add a match arm in the dispatcher's
+/// `caller_gate`, decide what shape goes in `auth_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalAuth {
     /// Open. Anyone with the URL can fire. Suitable for raw
     /// webhooks where the URL itself is the secret.
     None,
-    /// HTTP header carries an opaque key the caller must match.
-    /// `auth_config` shape: `{ header_name, value_hash }` (sha256
-    /// hex of the plaintext). Plaintext is never persisted on the
-    /// signal row; it lives in the listener's in-RAM
-    /// `secret_cache` until the listener pod restarts.
-    ApiKey,
+    /// The caller is verified against a stored connection (the
+    /// service recipe's `verify` block says how). `auth_config`
+    /// shape: `{ access_id, service }`. No secret is ever on the
+    /// row: the broker holds the connection and answers the check.
+    Connection,
 }
 
 impl SignalAuth {
@@ -174,7 +179,7 @@ impl SignalAuth {
     pub fn kind_tag(&self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::ApiKey => "api_key",
+            Self::Connection => "connection",
         }
     }
 }
@@ -192,21 +197,47 @@ impl SignalSurface {
 
 /// Listener-computed routing + auth metadata returned from
 /// `/register`. The dispatcher copies these fields onto the
-/// signal row; any plaintext secret the kind mints stays in the
-/// listener's per-pod secret cache and is served via `/display`,
-/// never crossing the wire as a structured field.
+/// signal row.
 ///
 /// `auth_config` is a kind-specific JSON blob the dispatcher's
 /// auth gate parses according to `auth.kind_tag()`. For
-/// `ApiKey` the blob is `{header_name, value_hash}` (sha256 hex).
+/// `Connection` the blob is `{access_id, service}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalRouting {
     pub surface: SignalSurface,
     pub auth: SignalAuth,
-    /// Hash + any other dispatcher-readable bits the gate needs.
-    /// Plaintext secrets NEVER appear here.
+    /// What the gate needs to run the check. Plaintext secrets
+    /// NEVER appear here.
     #[serde(default)]
     pub auth_config: Value,
+}
+
+#[cfg(feature = "runtime")]
+impl SignalRouting {
+    /// The routing a public-entry kind computes from its auth policy:
+    /// the ONE mapping from [`crate::signal::PublicEntryAuth`] onto the
+    /// row's `(auth_kind, auth_config)`, so every kind exposed on a
+    /// public URL gates callers the same way.
+    pub fn public_entry(
+        surface: SignalSurface,
+        auth: &crate::signal::PublicEntryAuth,
+    ) -> Self {
+        match auth {
+            crate::signal::PublicEntryAuth::None => Self {
+                surface,
+                auth: SignalAuth::None,
+                auth_config: Value::Null,
+            },
+            crate::signal::PublicEntryAuth::Connection { access_id, service } => Self {
+                surface,
+                auth: SignalAuth::Connection,
+                auth_config: serde_json::json!({
+                    "access_id": access_id,
+                    "service": service,
+                }),
+            },
+        }
+    }
 }
 
 // ----- Execution snapshot ---------------------------------------------
@@ -226,7 +257,7 @@ pub struct ExecutionSnapshot {
     pub program: Option<crate::project::hash::ProgramIdentity>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
-    pub inherited_origins: std::collections::BTreeMap<String, Color>,
+    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, Color>,
     pub pulses: crate::pulse::PulseTable,
     pub executions: crate::exec::NodeExecutionTable,
     pub suspensions: HashMap<String, SuspensionInfo>,
@@ -298,8 +329,8 @@ pub enum CorruptionSite {
     /// program has no such node or port, or a wire cannot read the
     /// value).
     PortEmitted,
-    /// `ExecEvent::PortClosed` / `ExecEvent::PortTypeMismatch` names
-    /// a port the program does not declare.
+    /// `ExecEvent::PortClosed` names a port the program does not
+    /// declare.
     PortClosed,
     /// `ExecEvent::PulsesConsumed` fold path (`parse_absorbed_ids` on
     /// `pulse_ids`).

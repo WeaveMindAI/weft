@@ -18,12 +18,13 @@
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import type { LoopIteration } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { locatedKey, type Frame } from "../../../../protocol";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
-	import { groupOfPrefix, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
+	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
 	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
-	import { SHOULD_FLOW_PORT } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -86,7 +87,7 @@
 		infraFeedByNode,
 		signalFeedByNode,
 		onOpenInclude = () => {},
-		execPrefix = '',
+		callPath = [],
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
@@ -107,10 +108,13 @@
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		// Navigate into an @include'd file; host opens it + pushes a back-stack.
 		onOpenInclude?: (path: string, alias: string) => void;
-		// Dotted alias chain (e.g. `c.`) prepended to node ids for execution
-		// value lookup when navigated into an included file. The Return
-		// button itself lives in the GraphToolbar (App level), not here.
-		execPrefix?: string;
+		// The call sites descended through to reach this file, outermost
+		// first. An included file's nodes carry the file's own id in the
+		// journal whatever site called them, so the ids match this view as
+		// they are; which call a row belongs to is its call frames, and only
+		// the rows under this path are shown. The Return button itself lives
+		// in the GraphToolbar (App level), not here.
+		callPath?: string[];
 		// Resolved content of @file targets, keyed by the marker's relative
 		// path. The display value for file-backed fields (config holds only
 		// the `@file(...)` marker, never the resolved content).
@@ -179,8 +183,8 @@
 
 	// VS Code embedding: dashboard chrome (right sidebar, code
 	// panel, mobile notice, export dialog) is removed. The text
-	// editor is the .weft tab in column 2; the activity-bar
-	// Inspector handles node inspection.
+	// editor is the .weft tab in column 2; node inspection is the
+	// magnifier on each node card, which opens ExecutionInspector.
 
 	// ── The projection engine ──────────────────────────────────────────────
 	// The visible graph is a pure function of (truth, pendingOps, layoutCode),
@@ -302,7 +306,7 @@
 			node.position.x, node.position.y,
 			w, h,
 			cfg?.expanded as boolean | undefined ?? undefined,
-			cfg?.configCollapsed as boolean | undefined ?? undefined,
+			cfg?.configOpen as boolean | undefined ?? undefined,
 			verb);
 	}
 
@@ -561,12 +565,13 @@
 		onOpenInclude(path, alias);
 	}
 
-	/** Map a local node id to its execution-journal key. When navigated into
-	 *  an included file, journal events are keyed by the fully-qualified id
-	 *  (e.g. `c.strip`) while this view's nodes are bare (`strip`), so prepend
-	 *  the accumulated alias prefix. No-op at the top level (empty prefix). */
+	/** A node's execution-journal key: its id, in every view. An included
+	 *  file's nodes are journaled under the file's own id (`C.strip`), which
+	 *  is the id this view gives them, so no prefix is added; which CALL a
+	 *  row belongs to is its call frames, split in `readOverlayCtx`
+	 *  (`rowsByCallPath`). */
 	function execKey(localId: string): string {
-		return execPrefix + localId;
+		return localId;
 	}
 
 	/** Whose key a group's members spent, folded for the group's synthetic
@@ -580,6 +585,71 @@
 		);
 		if (origins.size === 0) return undefined;
 		return origins.size === 1 ? [...origins][0] : 'mixed';
+	}
+
+	/// Flip a node's gate between `_should_flow` and `_should_not_flow`.
+	///
+	/// Both spellings are ordinary ports, so the flip is the ops that
+	/// already exist: a wire moves with removeEdge + addEdge, a written
+	/// value with removeConfig + setConfig. Nothing new on the wire and
+	/// nothing new in Rust, which is also why it undoes like any other
+	/// edit.
+	///
+	/// Deliberately NOT routed through `createNodeUpdateHandler`: that
+	/// path classifies config updates for one node, and this gesture is
+	/// two ops that may touch an edge, which is a different shape.
+	function createGateToggleHandler(nodeId: string) {
+		return async () => {
+			// A node's written values are an open bag on the canvas type,
+			// so read it as one rather than indexing the empty shape.
+			const literals = (nodes.find((n) => n.id === nodeId)?.data?.portLiterals ?? {}) as Record<
+				string,
+				unknown
+			>;
+			const from =
+				edges.some((e) => e.target === nodeId && e.targetHandle === SHOULD_NOT_FLOW_PORT)
+				|| literals[SHOULD_NOT_FLOW_PORT] !== undefined
+					? SHOULD_NOT_FLOW_PORT
+					: SHOULD_FLOW_PORT;
+			const to = from === SHOULD_FLOW_PORT ? SHOULD_NOT_FLOW_PORT : SHOULD_FLOW_PORT;
+			const wire = edges.find((e) => e.target === nodeId && e.targetHandle === from);
+			const ops: import('../../../../protocol').EditOp[] = [];
+			if (wire) {
+				const scopeGroup = (wire as { data?: { scopeGroup?: string | null } }).data?.scopeGroup ?? null;
+				ops.push({
+					op: 'removeEdge',
+					source: wire.source,
+					sourcePort: wire.sourceHandle ?? 'default',
+					target: nodeId,
+					targetPort: from,
+					scopeGroup,
+				});
+				ops.push({
+					op: 'addEdge',
+					source: wire.source,
+					sourcePort: wire.sourceHandle ?? 'default',
+					target: nodeId,
+					targetPort: to,
+					scopeGroup,
+				});
+			}
+			const literal = literals[from];
+			if (literal !== undefined) {
+				ops.push({ op: 'removeConfig', node: nodeId, key: from });
+				// The written forms mirror each other: `_should_flow: false`
+				// and `_should_not_flow: true` both mean "never run this".
+				ops.push({
+					op: 'setConfig',
+					node: nodeId,
+					key: to,
+					value: String(literal) === 'false' ? 'true' : 'false',
+				});
+			}
+			// Nothing drives the gate, so there is nothing to flip and no
+			// edit to record: an empty op list would still cost a reparse.
+			if (ops.length === 0) return;
+			await onApplyEdits(ops);
+		};
 	}
 
 	function createNodeUpdateHandler(nodeId: string) {
@@ -810,15 +880,15 @@
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
-						: key === 'configCollapsed' ? layoutEntry?.configCollapsed
+						: key === 'configOpen' ? layoutEntry?.configOpen
 						: layoutEntry?.expanded;
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
-					if (['width', 'height', 'expanded', 'configCollapsed'].includes(key)) {
+					if (['width', 'height', 'expanded', 'configOpen'].includes(key)) {
 						// Only a CHANGED layout key needs a layout write: a field edit
 						// re-sends the full config including unchanged dims, and treating
 						// mere presence as a change churns the layout file + history on a
-						// keystroke. `configCollapsed` (the loop config strip) is a layout
+						// keystroke. `configOpen` (the loop config strip) is a layout
 						// key too, so it rides the same changed-not-present gate.
 						if (value !== persistedDim(key)) needsLayout = true;
 					}
@@ -885,8 +955,8 @@
 						// even when two containers share a local label in different scopes.
 						// A container's signature IS its whole surface, so the full
 						// list is written.
-						const inputs = toPortSigs(nextInputs);
-						const outputs = toPortSigs(nextOutputs);
+						const inputs = toPortSigs(nextInputs, 'input');
+						const outputs = toPortSigs(nextOutputs, 'output');
 						if (kind === 'Loop') {
 							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
 						} else {
@@ -1070,7 +1140,10 @@
 	// 'IncludedGroup' is the opaque @include block: no catalog entry by
 	// design (its ports come from the included file's Group header), so it
 	// must be allowed through the catalog filter explicitly.
-	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
+	// A container's own name lives in `containerKindOf`, so it is asked
+	// rather than spelled again here.
+	const isSpecialNodeType = (nodeType: string): boolean =>
+		isContainerNodeType(nodeType) || nodeType === 'Annotation' || nodeType === INCLUDE_NODE_TYPE;
 
 	// `liveNodes` is the CURRENTLY-rendered xyflow array, read only for last-render
 	// measured sizes (the simplified containment floor). It is passed explicitly
@@ -1078,7 +1151,7 @@
 	// the `let nodes = $state.raw(buildNodes(...))` initializer, where reading
 	// `nodes` would hit its temporal dead zone (the "Loading graph..." crash). At
 	// init there is nothing measured yet, so the caller passes `[]`.
-	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configCollapsed?: boolean }>, liveNodes: Node[] = []): Node[] {
+	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configOpen?: boolean }>, liveNodes: Node[] = []): Node[] {
 		// Pure merge step: overlay each node's layout entry (width/height/expanded)
 		// onto its config UP FRONT, so the structural parse (which carries none of
 		// this view-state) plus the layout file produce one merged node list. The
@@ -1093,7 +1166,7 @@
 				if (e.w !== undefined) cfg.width = e.w;
 				if (e.h !== undefined) cfg.height = e.h;
 				if (e.expanded !== undefined) cfg.expanded = e.expanded;
-				if (e.configCollapsed !== undefined) cfg.configCollapsed = e.configCollapsed;
+				if (e.configOpen !== undefined) cfg.configOpen = e.configOpen;
 				return { ...n, config: cfg };
 			}) as typeof projectNodes;
 		}
@@ -1134,7 +1207,7 @@
 		// Unknown node types are already handled by the parser as opaque blocks
 		// (they never reach project.nodes), so we only need to filter for known types.
 		const validNodes = projectNodes.filter(n =>
-			SPECIAL_NODE_TYPES.has(n.nodeType) || NODE_TYPE_CONFIG[n.nodeType]
+			isSpecialNodeType(n.nodeType) || NODE_TYPE_CONFIG[n.nodeType]
 		);
 
 		// xyflow requires parent nodes to appear before children in the array.
@@ -1378,6 +1451,7 @@
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
+					onToggleGate: createGateToggleHandler(n.id),
 					onSaveFileRef: saveFileRef,
 					onOpenInclude: openInclude,
 				},
@@ -1619,7 +1693,10 @@
 	// calling it in an effect's tracked region registers all of them.
 	type OverlayCtx = {
 		nodeOutputs: Record<string, unknown>;
-		nodeExecutions: Record<string, import('../../types').NodeExecution[]>;
+		/// The followed run's rows around this view's call path: `here` by
+		/// node id for the rows at this level, `inside` by include site for
+		/// everything that ran under one (see `rowsByCallPath`).
+		rows: RowsByCallPath<import('../../types').NodeExecution>;
 		busLogByBus: Record<string, import('../../../../protocol').BusInspectorEvent[]>;
 		busesByNode: Record<string, string[]>;
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
@@ -1646,7 +1723,7 @@
 		/// The followed run's node set (`null` = whole graph, `undefined`
 		/// = no run or its birth has not arrived).
 		runScope: ReadonlySet<string> | null | undefined;
-		execPrefix: string;
+		callPath: string[];
 		projectNodes: import('../../types').NodeInstance[];
 	};
 
@@ -1671,7 +1748,7 @@
 		}
 		return {
 			nodeOutputs: state?.nodeOutputs || {},
-			nodeExecutions: state?.nodeExecutions || {},
+			rows: rowsByCallPath(state?.nodeExecutions || {}, callPath),
 			busLogByBus: state?.busLogByBus || {},
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
@@ -1689,13 +1766,13 @@
 			runScope: executionState?.scope === undefined ? undefined
 				: executionState.scope === null ? null
 				: new Set(executionState.scope),
-			// Touch execPrefix in the tracked region so a navigation that only
-			// changes the exec-id prefix re-decorates (decorate reads it via
-			// execKey). Untrack the projection: the STRUCTURAL effect already
-			// owns repaint-on-projection-change, so reading fold here too would
+			// Read in the tracked region so a navigation that only changes the
+			// call path re-decorates (the rows above are filtered by it).
+			// Untrack the projection: the STRUCTURAL effect already owns
+			// repaint-on-projection-change, so reading fold here too would
 			// make every keystroke run BOTH effects (a redundant second full
 			// decorate pass on the hottest path).
-			execPrefix,
+			callPath,
 			projectNodes: untrack(() => fold.project.nodes),
 		};
 	}
@@ -1707,16 +1784,17 @@
 	 *  paths cannot drift. */
 	/// Is a row at `frames` inside the iteration at `iteration`: the same
 	/// frame stack, or one that extends it (a nested loop's own frames).
-	function withinFrames(frames: LoopIteration[], iteration: LoopIteration[]): boolean {
+	function withinFrames(frames: Frame[], iteration: Frame[]): boolean {
 		return frames.length >= iteration.length
-			&& iteration.every((f, i) => frames[i].index === f.index);
+			&& iteration.every((f, i) => JSON.stringify(frames[i]) === JSON.stringify(f));
 	}
 
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
-			nodeOutputs, nodeExecutions, busLogByBus, busesByNode, busMetaByBus,
+			nodeOutputs, busLogByBus, busesByNode, busMetaByBus,
 			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
 		} = ctx;
+		const nodeExecutions = ctx.rows.here;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
 		let subgraphNodeIds: Set<string> | null = null;
@@ -1773,20 +1851,30 @@
 
 					let executions: import('../../types').NodeExecution[];
 
-					if (isContainerNodeType(nodeType)) {
+					if (isBoundaryBoxNodeType(nodeType)) {
 						const groupId = n.id;
 
-						// Boundary passthrough executions (one id derivation: host-bridge)
+						// The boundary pair that stands for this box at this level
+						// (one id derivation: host-bridge). A container's halves fire
+						// here around its members; an include's are its call site's
+						// halves, which fire here in the caller's frames, while the
+						// body runs one call frame deeper.
 						const inExecs = nodeExecutions[execKey(boundaryInId(groupId))] || [];
 						const outExecs = nodeExecutions[execKey(boundaryOutId(groupId))] || [];
 
-						// Collect internal node executions via scope field (against the
-						// CURRENT projected nodes, not the stale initial prop).
+						// Everything that ran inside the box: its members at this level
+						// (via scope, against the CURRENT projected nodes, not the stale
+						// initial prop), and every row that ran under a call site that is
+						// the box itself or one of its members, however deep the calls
+						// below go (`ctx.rows.inside` is keyed by the site at this level).
 						const internalExecs: import('../../types').NodeExecution[] = [];
+						if (isIncludeNodeType(nodeType)) {
+							internalExecs.push(...(ctx.rows.inside[groupId] ?? []));
+						}
 						for (const projNode of ctx.projectNodes) {
-							if (projNode.scope?.includes(groupId) && nodeExecutions[execKey(projNode.id)]) {
-								internalExecs.push(...nodeExecutions[execKey(projNode.id)]);
-							}
+							if (!projNode.scope?.includes(groupId)) continue;
+							internalExecs.push(...(nodeExecutions[execKey(projNode.id)] ?? []));
+							internalExecs.push(...(ctx.rows.inside[projNode.id] ?? []));
 						}
 
 						// Pair the __out boundary execution to its __in by
@@ -1860,8 +1948,11 @@
 					// A node outside the followed run's scope is "not in this run":
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
+					// A scope names places, which are compiled nodes: a box (a
+					// container, an include) is never one, its In boundary is.
+					const placeId = isBoundaryBoxNodeType(nodeType) ? boundaryInId(n.id) : n.id;
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(execKey(n.id)) && executions.length === 0;
+						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && executions.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
 					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
@@ -1870,7 +1961,8 @@
 					// is what `GroupNode`'s own styling keys off, and the class
 					// it gained instead (`node-inherited`) is defined nowhere.
 					const nodeClass = notInRun ? 'run-dimmed'
-						: execStatus === 'running' || execStatus === 'waiting_for_input' ? 'node-running'
+						: execStatus === 'running' ? 'node-running'
+						: execStatus === 'waiting_for_input' ? 'node-waiting'
 						: execStatus === 'failed' ? 'node-failed'
 						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
 						: '';
@@ -1935,7 +2027,6 @@
 							runTarget: ctx.runTargets.has(n.id),
 							debugData,
 							executions,
-							executionCount: executions.length,
 							busLogs,
 							loopEvents,
 							journalCorruptions,
@@ -2118,7 +2209,7 @@
 	let specDialogOpen = $state(false);
 	/// The group the user stands in (an include's alias chain), so the
 	/// dialog and the Run menu put it first.
-	const focusedGroup = $derived(groupOfPrefix(execPrefix));
+	const focusedGroup = $derived(groupOfCallPath(callPath));
 	const menuSpecs = $derived(orderSpecsForMenu(specs, focusedGroup));
 	function openSpecDialog(initial: RunSpec): void {
 		specDialogInitial = initial;
@@ -3074,7 +3165,7 @@
 				next = renameLayoutSubtree(next, m.oldKey, m.newKey);
 				if (m.dx !== 0 || m.dy !== 0) {
 					const e = parseLayoutCode(next)[m.newKey];
-					if (e) next = updateLayoutEntry(next, m.newKey, e.x + m.dx, e.y + m.dy, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null);
+					if (e) next = updateLayoutEntry(next, m.newKey, e.x + m.dx, e.y + m.dy, e.w, e.h, e.expanded ?? null, e.configOpen ?? null);
 				}
 			}
 			return next;
@@ -3527,15 +3618,22 @@
 		};
 	}
 
+	/// The node under the pointer: the INNERMOST one, which is the one
+	/// the person is pointing at.
+	///
+	/// Walking every node and taking the first whose box contains the
+	/// point gives the wrong answer inside an expanded group, because a
+	/// group is drawn before the nodes inside it and its box contains
+	/// all of them. Right-clicking a node inside a group then acted on
+	/// the GROUP: Duplicate copied the whole group, Delete deleted it.
+	/// `elementsFromPoint` returns what is actually stacked under the
+	/// pointer, innermost first, so the first node in that list is the
+	/// one on top.
 	function findNodeAtPosition(clientX: number, clientY: number): string | null {
-		const nodeElements = document.querySelectorAll('.svelte-flow__node');
-		for (const nodeEl of nodeElements) {
-			const rect = nodeEl.getBoundingClientRect();
-			if (clientX >= rect.left && clientX <= rect.right && 
-				clientY >= rect.top && clientY <= rect.bottom) {
-				const nodeId = nodeEl.getAttribute('data-id');
-				if (nodeId) return nodeId;
-			}
+		for (const el of document.elementsFromPoint(clientX, clientY)) {
+			const nodeEl = el.closest('.svelte-flow__node');
+			const nodeId = nodeEl?.getAttribute('data-id');
+			if (nodeId) return nodeId;
 		}
 		return null;
 	}
@@ -3639,8 +3737,8 @@
 					// GHOST inputs (they re-derive from the copied carry list on
 					// apply). Then copy the source config AFTER the ports exist.
 					// (Children are NOT deep-copied: the shell duplicates.)
-					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy));
-					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs));
+					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy), 'input');
+					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs), 'output');
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
 							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
@@ -3725,11 +3823,18 @@
 	// narrower local type once dropped it silently). toPortSigs writes a
 	// CONTAINER signature, which is its whole surface: the rendered type
 	// IS the spelling there, and declaredType deliberately plays no part.
-	function toPortSigs(ports: HeaderPortLike[]): import('../../../../protocol').EditPortSig[] {
+	function toPortSigs(ports: HeaderPortLike[], side: 'input' | 'output'): import('../../../../protocol').EditPortSig[] {
 		// portRequired: the ONE missing-value polarity (Rust's serde
 		// default: not required); rendered ports always carry the flag,
-		// so this only matters for a hand-built port object.
-		return (ports ?? []).map(p => ({ name: p.name, required: portRequired(p), portType: p.portType }));
+		// so this only matters for a hand-built port object. An OUTPUT
+		// has no optionality at all (the language has no `?` on one, and
+		// the edit server refuses a sig asking for it), so its flag is
+		// never read: whatever a port object says, the sig says `true`.
+		return (ports ?? []).map(p => ({
+			name: p.name,
+			required: side === 'output' || portRequired(p),
+			portType: p.portType,
+		}));
 	}
 
 	/// Flush every pending debounced edit. Called before the host kicks off
@@ -4087,7 +4192,7 @@
 						</button>
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', execKey(targetNodeId))); }}
+							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', addressOf(callPath, targetNodeId))); }}
 						>
 							<span class="text-muted-foreground text-xs">▶</span>
 							<span>Run from here…</span>
@@ -4095,7 +4200,7 @@
 						{#if isContainerNodeType(nodeToEdit.data.nodeType) || nodeToEdit.data.includePath}
 							<button
 								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', execKey(targetNodeId))); }}
+								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', addressOf(callPath, targetNodeId))); }}
 							>
 								<span class="text-muted-foreground text-xs">▶</span>
 								<span>Run this group…</span>

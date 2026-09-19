@@ -2,7 +2,8 @@
 
 A test is plain Rust that prepares a fixture, drives it through the dispatcher's
 public API exactly as the outside world sees it, and asserts. The rig brings the
-cluster up on current code itself (`ensure::up()` runs `./setup.sh`), so you only
+cluster up on current code itself (`ensure::up()` runs `./setup.sh --cli --daemon`,
+which skips the VS Code extension build the rig has no use for), so you only
 ever touch the two sanctioned commands below. Gated behind the `e2e` feature (off
 by default), so `cargo test --workspace` compiles but runs none of it.
 
@@ -14,17 +15,19 @@ failure, leaving the cluster in that state for inspection:
 ```bash
 scripts/run-e2e.sh                # whole suite
 scripts/run-e2e.sh live_chat      # one test, by file name
+scripts/run-e2e.sh --from live_chat   # resume the suite at that test
 ```
 
-Need a subset or a flag? Add it to `run-e2e.sh`. Do NOT hand-write a `cargo test`
+Need another subset or flag? Add it to `run-e2e.sh`. Do NOT hand-write a `cargo test`
 invocation. First run is slow (cluster bring-up + per-fixture worker-image
 compiles); that is expected, never shortcut it.
 
 ## Credentials, and what the runner provides for you
 
-Everything a local machine can serve, the runner provisions itself and tears
-down when the suite passes: the store's Postgres (a port-forward of the
-cluster's own), and an S3 endpoint (the daemon's SeaweedFS container). You set
+Everything a local machine can serve, the runner provisions itself: the store's
+Postgres (a port-forward of the cluster's own, which it closes when the run
+ends), and an S3 endpoint (the daemon's SeaweedFS container, whose bucket stays
+across runs because it belongs to the daemon rather than to the suite). You set
 nothing for those.
 
 What is left is the genuinely external services, which come from the
@@ -40,6 +43,7 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 | Telegram | `WEFT_E2E_TELEGRAM_TOKEN`, `_CHAT_ID` |
 | Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
 | ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
+| JWT issuer (Auth0 or any OAuth issuer with a client-credentials grant) | `WEFT_E2E_JWT_ISSUER` (with its trailing slash, as the `iss` claim spells it), `_AUDIENCE`, `_CLIENT_ID`, `_CLIENT_SECRET`; the test mints its own token on every run, so nothing expires |
 
 A test whose variables are absent **skips** rather than fails, through
 `env_or_skip` / `env_group_or_skip`, so a partial `.env` still gets you a
@@ -92,13 +96,13 @@ async fn my_scenario() -> anyhow::Result<()> {
 ```
 
 A **fixture** is `fixtures/<name>/` with a `weft.toml` (any id; the rig rewrites
-it) + a `main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`. For
-a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
-`main.weft` and call `project.substitute_in_main(...)` before building.
+it) + a `src/main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`.
+For a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
+`src/main.weft` and call `project.substitute_in_main(...)` before building.
 
 To write the `.weft` graph itself, see the language reference under
 `../../docs/src/language/` (and `../../docs/src/nodes/` for custom nodes). Get the project
-right there; a malformed `main.weft` fails at build, not as a test assertion.
+right there; a malformed `src/main.weft` fails at build, not as a test assertion.
 
 **If a test needs something the toolkit doesn't have, extend the toolkit
 (`src/`), not the test.** Keep test bodies about WHAT they assert; the HOW (HTTP,
@@ -112,8 +116,8 @@ SQL, kubectl) lives in the toolkit so it stays DRY and reviewable.
 | `project::Project` | Fixture -> isolated project: `prepare`, `build`, `activate`, `weft(args)`, `substitute_in_main`, `finish`. |
 | `run` | `run_and_settle`, `start`, `wait_for_triggered_execution`, `SettledRun::observe`. |
 | `assert` (`SettledRun`) | `completed`, `failed_with`, `assert_input/output/skipped`, `assert_loop_iterations`. |
-| `signal` | Discover + fire signals: `SignalScope`, `fire_webhook`, `fire_token`. |
-| `live` | Live caller: `open_ws`, `http_post`. |
+| `signal` | Discover + fire signals: `SignalScope`, `fire_token`. |
+| `live` | Live caller: `open_ws`, `http_post`, `http_request`, `browser_post_json`. |
 | `human` | Human-in-the-loop: `wait_for_form_by_node`, `answer_form`. |
 | `fakes` | Servers the system dials OUT to: `SseFake`, `PollFake`, `SocketFake`, `BytesFake`. |
 | `infra` | Infra lifecycle: `start_and_wait_running`, `call_endpoint`, `terminate_and_wait_gone`. |

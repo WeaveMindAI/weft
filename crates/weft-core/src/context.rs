@@ -173,7 +173,7 @@ impl ExecutionContext {
     /// Set up a persistent wake signal that fires fresh executions.
     ///
     /// Use when the node is a trigger declaring "while I'm active,
-    /// the listener should watch for X" (ApiEndpoint, HumanTrigger form,
+    /// the listener should watch for X" (Route, HumanTrigger form,
     /// cron, SseSubscribe). Returns synchronously with the
     /// user-facing URL (if the kind mints one) and the worker keeps
     /// executing. Each subsequent fire spawns a brand new execution
@@ -319,6 +319,22 @@ impl ExecutionContext {
         self.handle.declared_output_ports().get(port).cloned()
     }
 
+    /// Every output port THIS instance declares, with its resolved
+    /// type: the metadata's ports plus the ones the weft source added
+    /// (`-> (user_id: String)`) on a node that accepts them. For a
+    /// node whose behavior is "fan what I received onto whatever ports
+    /// the author declared" (a route reading a body, a call reading a
+    /// reply) and that needs the names, not just one type.
+    pub fn declared_outputs(&self) -> &std::collections::HashMap<String, WeftType> {
+        self.handle.declared_output_ports()
+    }
+
+    /// Every input port THIS instance declares, with its resolved
+    /// type (see `ContextHandle::declared_input_ports`).
+    pub fn declared_inputs(&self) -> &std::collections::HashMap<String, WeftType> {
+        self.handle.declared_input_ports()
+    }
+
     /// Close an output port mid-firing. The downstream subgraph attached
     /// to `port` receives a CLOSURE pulse (structural "nothing's coming")
     /// at the firing's own frame stack, same shape as the
@@ -459,7 +475,9 @@ impl ExecutionContext {
     /// (the key encodes its prefix), so a downstream node can `get` a
     /// stored-file value without knowing which scope produced it; the box
     /// still enforces the wall (own color, own project, granted
-    /// shared names).
+    /// shared names). `copy` is both: it reads the key's own scope and
+    /// writes the handle's, which is how a file crosses from one scope
+    /// to another.
     pub fn storage(&self, scope: crate::storage::StorageScope) -> StorageHandle {
         StorageHandle {
             handle: self.handle.clone(),
@@ -700,9 +718,9 @@ impl ExecutionContext {
     }
 
     /// The live HTTP caller, attached and connected, for nodes that only
-    /// make sense behind an HTTP trigger (ApiEndpoint). One call folds
-    /// the whole chain: caller present, protocol is HTTP, connection
-    /// barrier passed. A node that may serve BOTH protocols branches on
+    /// make sense behind an HTTP trigger (Route). One call folds the
+    /// whole chain: caller present, protocol is HTTP, connection barrier
+    /// passed. A node that may serve BOTH protocols branches on
     /// [`Self::caller`] instead.
     pub async fn http_caller(&self) -> WeftResult<crate::caller::HttpCaller> {
         match self.caller() {
@@ -712,19 +730,19 @@ impl ExecutionContext {
             }
             Some(crate::caller::CallerHandle::Websocket(_)) => Err(WeftError::Input(
                 "this node answers an HTTP caller, but the execution is attached to a \
-                 WebSocket caller; trigger it through an ApiEndpoint node"
+                 WebSocket caller; trigger it through a Route node"
                     .into(),
             )),
             None => Err(WeftError::Input(
                 "this node answers an HTTP caller, but no live caller is attached; \
-                 trigger it through an ApiEndpoint node"
+                 trigger it through a Route node"
                     .into(),
             )),
         }
     }
 
     /// The live WebSocket caller, attached and connected, for nodes that
-    /// only make sense behind a WebSocket trigger (LiveSocket). Same
+    /// only make sense behind a WebSocket trigger (Socket). Same
     /// contract as [`Self::http_caller`], for the other protocol.
     pub async fn ws_caller(&self) -> WeftResult<crate::caller::WsCaller> {
         match self.caller() {
@@ -734,15 +752,50 @@ impl ExecutionContext {
             }
             Some(crate::caller::CallerHandle::Http(_)) => Err(WeftError::Input(
                 "this node talks to a WebSocket caller, but the execution is attached to \
-                 an HTTP caller; trigger it through a LiveSocket node"
+                 an HTTP caller; trigger it through a Socket node"
                     .into(),
             )),
             None => Err(WeftError::Input(
                 "this node talks to a WebSocket caller, but no live caller is attached; \
-                 trigger it through a LiveSocket node"
+                 trigger it through a Socket node"
                     .into(),
             )),
         }
+    }
+
+    /// The live caller, attached and connected, whichever protocol it
+    /// speaks: for a node that answers both a Route and a Socket the
+    /// same way (a reply, a stream, a close) and branches on the
+    /// [`crate::caller::CallerHandle`] variant only where the two wires
+    /// differ. Fails loud when this run has no live caller.
+    pub async fn live_caller(&self) -> WeftResult<crate::caller::CallerHandle> {
+        match self.caller() {
+            Some(h) => {
+                h.ensure_connected().await?;
+                Ok(h)
+            }
+            None => Err(WeftError::Input(
+                "this node talks to a live caller, but no live caller is attached; \
+                 trigger it through a Route or Socket node"
+                    .into(),
+            )),
+        }
+    }
+
+    /// What the caller sent to open the exchange (method, path, route
+    /// parameters, query, headers, the gate's identity), for either
+    /// protocol, without waiting on the connect barrier: the handshake
+    /// is known the moment the run starts. Fails loud when this run has
+    /// no live caller.
+    pub fn caller_request(&self) -> WeftResult<Arc<crate::caller::LiveRequest>> {
+        self.handle
+            .caller_connection()
+            .map(|c| c.handshake())
+            .ok_or_else(|| WeftError::Input(
+                "this node reads the caller's request, but no live caller is attached; \
+                 trigger it through a Route or Socket node"
+                    .into(),
+            ))
     }
 
     // ----- Plain outbound HTTP ---------------------------------------
@@ -1024,6 +1077,29 @@ impl ValueBag {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
     }
 
+    /// Add a declared input port the bag was not built with. The
+    /// production bag reads every port off the compiled node, so only
+    /// the node-test rig needs this: a case declaring a created port
+    /// (`rig.input_type("photo", ...)`) and then NOT delivering on it
+    /// is exactly the "declared, stayed silent" shape, and without
+    /// this the bag could not tell it from a port nobody wrote.
+    pub fn declare_port(&mut self, name: String) {
+        if let Some(order) = self.order.as_mut() {
+            if !order.contains(&name) {
+                order.push(name);
+            }
+        }
+    }
+
+    /// Does the node DECLARE this input, whatever this firing
+    /// delivered on it? The port list behind the bag is every input the
+    /// node has, in written order, so a name in it that is missing from
+    /// the values is a port that stayed silent. A bag with no port list
+    /// behind it (a wake or nested bag) declares nothing.
+    pub fn declares(&self, name: &str) -> bool {
+        self.order.as_ref().is_some_and(|order| order.iter().any(|port| port == name))
+    }
+
     /// The values behind the named holes of a text, in hole order.
     ///
     /// A node whose input ports ARE its parameters (a SQL query
@@ -1036,10 +1112,24 @@ impl ValueBag {
     /// back the way that text spells a hole, and `declare` is the
     /// header the refusal tells them to write.
     ///
-    /// A hole with no port is an error rather than a null: a
+    /// A hole naming no port at all is an error rather than a null: a
     /// placeholder reading nothing is a bug to name, not a value to
     /// invent. A port with no hole is an error too: a wired value the
     /// text never reads is a typo waiting to be found in production.
+    ///
+    /// A hole naming a port the node DECLARED, which this firing
+    /// delivered nothing on, reads as `null`. That is the author
+    /// writing `photo?: File` and sending a card with no picture: they
+    /// said the value may be absent, so absent is an answer, not a
+    /// mistake. The hole's own text decides what null means there (a
+    /// SQL parameter binds SQL NULL against any column), exactly as if
+    /// a null had arrived on the wire, which is how `opt` already
+    /// reads the two.
+    ///
+    /// Nothing tracks optionality here and nothing needs to: a
+    /// REQUIRED port that delivered nothing skips the whole firing
+    /// before a body ever runs (see `exec::skip`), so a declared port
+    /// that is absent while the node runs was always an optional one.
     pub fn for_holes(
         &self,
         holes: &[String],
@@ -1047,20 +1137,29 @@ impl ValueBag {
         spell: impl Fn(&str) -> String,
         declare: impl Fn(&str) -> String,
     ) -> WeftResult<Vec<&Value>> {
+        const ABSENT: &Value = &Value::Null;
         let ports: std::collections::BTreeMap<&String, &Value> = self.custom().collect();
         let arrived: Vec<&str> = ports.keys().map(|k| k.as_str()).collect();
         let mut values = Vec::with_capacity(holes.len());
         for hole in holes {
-            let Some(value) = ports.get(hole) else {
-                return Err(self.err(format!(
-                    "the {what} reads `{}` but no `{hole}` input carried a value; declare the \
-                     port on the node (`{}`) and wire it. Ports that arrived: [{}]",
-                    spell(hole),
-                    declare(hole),
-                    arrived.join(", ")
-                )));
-            };
-            values.push(*value);
+            if let Some(value) = ports.get(hole) {
+                values.push(*value);
+                continue;
+            }
+            // Declared but silent this firing: the author said it may be
+            // absent, so the hole reads null. Only a hole naming no port
+            // at all is the author's mistake.
+            if self.declares(hole) {
+                values.push(ABSENT);
+                continue;
+            }
+            return Err(self.err(format!(
+                "the {what} reads `{}` but the node has no `{hole}` input; declare the port on \
+                 the node (`{}`) and wire it. Ports that arrived: [{}]",
+                spell(hole),
+                declare(hole),
+                arrived.join(", ")
+            )));
         }
         for port in ports.keys() {
             if !holes.iter().any(|h| h == *port) {
@@ -1220,6 +1319,7 @@ pub fn node_input_bag(
     // a node's own data never carries it (an ExecPython would otherwise
     // find a `_should_flow` variable it never declared).
     delivered.remove(crate::exec::skip::SHOULD_FLOW_PORT);
+    delivered.remove(crate::exec::skip::SHOULD_NOT_FLOW_PORT);
 
     let spec_names = node
         .inputs
@@ -1231,7 +1331,7 @@ pub fn node_input_bag(
         .inputs
         .iter()
         .map(|i| i.name.clone())
-        .filter(|name| name != crate::exec::skip::SHOULD_FLOW_PORT)
+        .filter(|name| !crate::exec::skip::is_gate_port(name))
         .collect();
     let mut bag = ValueBag::inputs(delivered, spec_names, order);
     bag.access_ports = access_ports;
@@ -1540,6 +1640,35 @@ impl StorageHandle {
             .await
     }
 
+    /// Copy a file into this handle's scope and return the NEW
+    /// stored-file value to emit downstream. The bytes stream from the
+    /// source straight into the new key (never buffered whole), and
+    /// the copy keeps the source's mime type, filename and size. The
+    /// source is untouched: a run-scoped original is still swept when
+    /// its run ends, which is the point when the handle's scope is
+    /// `Project`: the copy is the one later runs can read, because an
+    /// execution file is walled to the run that made it. A url-backed
+    /// handle is fetched and stored like [`Self::put_from_url`]. See
+    /// [`Self::put`] for what `keep` means.
+    pub async fn copy(
+        &self,
+        file: &crate::storage::FileHandle,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        let (meta, stream) = self.get(file).await?;
+        self.handle
+            .storage_put(
+                &self.scope,
+                self.identity.as_deref(),
+                stream,
+                &meta.mime_type,
+                &meta.filename,
+                keep,
+                Some(meta.size_bytes),
+            )
+            .await
+    }
+
     /// Stream a file's bytes. Takes the file's parsed HANDLE (the typed
     /// address `ctx.inputs.get::<FileHandle>` / a generated inputs field
     /// hands back; a raw value in hand parses via
@@ -1665,9 +1794,32 @@ impl StorageHandle {
         file: &crate::storage::FileHandle,
         ttl_secs: Option<u64>,
     ) -> WeftResult<Option<String>> {
+        self.link_for(file, ttl_secs, crate::storage::LinkReach::Internet).await
+    }
+
+    /// Mint a temporary URL a CALLER of this install can fetch this
+    /// file from: the internet address when the install has one, else
+    /// its own stable base (a local install's loopback, which is where
+    /// the browser that called a route reached it). What a route's
+    /// answer carries in place of a stored file. `None` only when the
+    /// install has no base at all.
+    pub async fn caller_link(
+        &self,
+        file: &crate::storage::FileHandle,
+        ttl_secs: Option<u64>,
+    ) -> WeftResult<Option<String>> {
+        self.link_for(file, ttl_secs, crate::storage::LinkReach::Caller).await
+    }
+
+    async fn link_for(
+        &self,
+        file: &crate::storage::FileHandle,
+        ttl_secs: Option<u64>,
+        reach: crate::storage::LinkReach,
+    ) -> WeftResult<Option<String>> {
         match file {
             crate::storage::FileHandle::Key(key) => {
-                self.handle.storage_public_link(key, ttl_secs).await
+                self.handle.storage_public_link(key, ttl_secs, reach).await
             }
             crate::storage::FileHandle::Url { url, .. } => Ok(Some(url.clone())),
         }
@@ -1900,6 +2052,14 @@ pub trait ContextHandle: Send + Sync {
     /// the engine.
     fn declared_output_ports(&self) -> &HashMap<String, WeftType>;
 
+    /// The input port names this node declares, with their resolved
+    /// types: the metadata's ports plus the ones the weft source added
+    /// (`ExecPython(photo: Image)`) on a node that accepts them. The
+    /// bag holds what ARRIVED; this is what was DECLARED, so a node
+    /// that binds every port by name (a script) can tell an input
+    /// that received nothing from one that was never declared.
+    fn declared_input_ports(&self) -> &HashMap<String, WeftType>;
+
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
     /// own frame stack. Each port can be emitted AT MOST ONCE per
@@ -2034,10 +2194,10 @@ pub trait ContextHandle: Send + Sync {
     /// `key` directly from the box. `None` TTL = service default.
     async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
 
-    /// Mint a temporary INTERNET-reachable URL for `key`, or `None`
-    /// when there is no publicly addressable store and no public
-    /// relay behind this storage; callers fall back to inline bytes.
-    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>>;
+    /// Mint a temporary URL for `key` that `reach` can open, or `None`
+    /// when no address serves that reach (for the internet: no public
+    /// store and no public relay; callers fall back to inline bytes).
+    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>, reach: crate::storage::LinkReach) -> WeftResult<Option<String>>;
 
     /// The wake event's payload for this firing. `Some(value)` only
     /// when the engine dispatched this node as the FIRING TRIGGER of
@@ -2114,6 +2274,31 @@ mod value_bag_tests {
     fn inputs_bag(values: serde_json::Value) -> ValueBag {
         let order = values.as_object().unwrap().keys().cloned().collect();
         ValueBag::inputs(values.as_object().unwrap().clone(), Default::default(), order)
+    }
+
+    /// A hole naming a port the node declared, which stayed silent this
+    /// firing, reads null: `photo?: File` on a card sent with no
+    /// picture. A hole naming no port at all still names the author's
+    /// mistake, and says which mistake it is.
+    #[test]
+    fn a_declared_port_that_stayed_silent_reads_null_in_a_hole() {
+        let bag = ValueBag::inputs(
+            json!({ "name": "ada" }).as_object().unwrap().clone(),
+            Default::default(),
+            vec!["name".into(), "photo".into()],
+        );
+        let holes = vec!["name".to_string(), "photo".to_string()];
+        let values = bag
+            .for_holes(&holes, "query", |n| format!("${n}"), |n| format!("Q({n}: String)"))
+            .expect("a declared but silent port is an answer, not a refusal");
+        assert_eq!(values, vec![&json!("ada"), &Value::Null]);
+
+        let undeclared = vec!["name".to_string(), "nowhere".to_string()];
+        let err = bag
+            .for_holes(&undeclared, "query", |n| format!("${n}"), |n| format!("Q({n}: String)"))
+            .expect_err("a hole naming no port at all is refused")
+            .to_string();
+        assert!(err.contains("has no `nowhere` input"), "{err}");
     }
 
     /// The bag walks its inputs in the order the node declares them,
@@ -2208,6 +2393,7 @@ mod value_bag_tests {
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -2221,7 +2407,7 @@ mod value_bag_tests {
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
         async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
         async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
-        async fn storage_public_link(&self, _: &str, _: Option<u64>) -> WeftResult<Option<String>> { unreachable!() }
+        async fn storage_public_link(&self, _: &str, _: Option<u64>, _: crate::storage::LinkReach) -> WeftResult<Option<String>> { unreachable!() }
         fn wake_payload(&self) -> Option<&Value> { None }
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
     }
@@ -2234,6 +2420,18 @@ mod value_bag_tests {
         /// A storage that cannot sign: `link_file_inputs` must fail
         /// the firing rather than hand the body an unlinked marker.
         presign_fails: bool,
+        /// Every put that reached the runtime boundary. Pins what
+        /// `copy` hands the runtime.
+        puts: std::sync::Mutex<Vec<RecordedPut>>,
+    }
+
+    /// One put as the runtime boundary saw it.
+    struct RecordedPut {
+        scope: crate::storage::StorageScope,
+        mime: String,
+        filename: String,
+        declared_size: Option<u64>,
+        bytes: bytes::Bytes,
     }
     #[async_trait::async_trait]
     impl ContextHandle for StorageProbeHandle {
@@ -2251,12 +2449,29 @@ mod value_bag_tests {
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
-        async fn storage_put(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put(&self, scope: &crate::storage::StorageScope, _: Option<&str>, data: crate::storage::ByteStream, mime: &str, filename: &str, _: Option<crate::storage::KeepTtl>, declared_size: Option<u64>) -> WeftResult<Value> {
+            let bytes = crate::storage::collect_stream(data).await.unwrap();
+            self.puts.lock().unwrap().push(RecordedPut {
+                scope: scope.clone(),
+                mime: mime.to_string(),
+                filename: filename.to_string(),
+                declared_size,
+                bytes: bytes.clone(),
+            });
+            Ok(crate::storage::StoredFile {
+                key: "project/p1/copy1".into(),
+                mime_type: mime.into(),
+                size_bytes: bytes.len() as u64,
+                filename: filename.into(),
+            }
+            .to_value())
+        }
         async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
         async fn storage_get(&self, key: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
             let meta = crate::storage::StoredFileMeta {
@@ -2281,7 +2496,7 @@ mod value_bag_tests {
             }
             Ok(format!("https://signed/{key}?ttl={}", ttl_secs.unwrap_or(0)))
         }
-        async fn storage_public_link(&self, _: &str, _: Option<u64>) -> WeftResult<Option<String>> {
+        async fn storage_public_link(&self, _: &str, _: Option<u64>, _: crate::storage::LinkReach) -> WeftResult<Option<String>> {
             Ok(self.public_link.clone())
         }
         fn wake_payload(&self) -> Option<&Value> { None }
@@ -2310,7 +2525,7 @@ mod value_bag_tests {
             crate::Color::nil(),
             LoopFrames::default(),
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
-            Arc::new(StorageProbeHandle { public_link: None, presign_fails: true }),
+            Arc::new(StorageProbeHandle { public_link: None, presign_fails: true, puts: Default::default() }),
         );
         let note_ty = WeftType::parse("String").unwrap();
         ctx.link_file_inputs([("note", &note_ty)].into_iter()).await.expect("no file, no signer needed");
@@ -2324,6 +2539,42 @@ mod value_bag_tests {
         assert!(err.to_string().contains(&file.filename), "{err}");
         let photo: Value = ctx.inputs.get("photo").unwrap();
         assert_eq!(photo, file.to_value(), "the marker is left as it was");
+    }
+
+    /// `copy` reads the source through the key-addressed get and puts
+    /// the stream under the HANDLE's scope with the source's own mime,
+    /// filename and size, so the runtime sees one put it can size up
+    /// front and the copy describes itself exactly like the original.
+    #[tokio::test]
+    async fn copy_puts_the_source_stream_under_the_handles_scope() {
+        let handle = Arc::new(StorageProbeHandle { public_link: None, presign_fails: false, puts: Default::default() });
+        let ctx = ExecutionContext::new(
+            "exec-1".into(),
+            "project-1".into(),
+            "node-1".into(),
+            "TestNode".into(),
+            None,
+            crate::Color::nil(),
+            LoopFrames::default(),
+            inputs_bag(json!({})),
+            handle.clone(),
+        );
+        let source = crate::storage::FileHandle::Key("exec/c1/img1".into());
+        let copied = ctx
+            .storage(crate::storage::StorageScope::Project)
+            .copy(&source, None)
+            .await
+            .expect("copy");
+        let copied = crate::storage::StoredFile::from_value(&copied).unwrap();
+        assert_eq!(copied.key, "project/p1/copy1", "the emitted reference is the runtime's new key");
+        let puts = handle.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1, "one put");
+        let put = &puts[0];
+        assert_eq!(put.scope, crate::storage::StorageScope::Project);
+        assert_eq!(put.mime, "image/png");
+        assert_eq!(put.filename, "p.png");
+        assert_eq!(put.declared_size, Some(3), "the source's size is declared up front");
+        assert_eq!(&put.bytes[..], b"png");
     }
 
     /// it does not; `Inline` always embeds.
@@ -2344,7 +2595,7 @@ mod value_bag_tests {
             crate::Color::nil(),
             LoopFrames::default(),
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
-            Arc::new(StorageProbeHandle { public_link: None, presign_fails: false }),
+            Arc::new(StorageProbeHandle { public_link: None, presign_fails: false, puts: Default::default() }),
         );
         let photo_ty = WeftType::parse("Image").unwrap();
         let note_ty = WeftType::parse("String").unwrap();
@@ -2385,7 +2636,7 @@ mod value_bag_tests {
                 crate::Color::nil(),
                 LoopFrames::default(),
                 inputs_bag(json!({})),
-                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string), presign_fails: false }),
+                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string), presign_fails: false, puts: Default::default() }),
             )
         };
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Square, Zap, Database, Loader2, ChevronDown } from '@lucide/svelte';
+	import { Play, Square, Zap, Database, Loader2, ChevronUp } from '@lucide/svelte';
 	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
 	import type {
 		ActionBarState,
@@ -240,6 +240,24 @@
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
+			case 'drain_wait': {
+				// The bar would otherwise keep saying "Deactivating
+				// triggers..." for as long as the running executions
+				// take, which is the exact stretch this event exists to
+				// explain. The cap is shown when the person set one, so
+				// a long wait reads as the wait they asked for.
+				const cap =
+					typeof detail?.capSeconds === 'number' ? ` (up to ${detail.capSeconds}s)` : '';
+				return `Waiting for running executions${cap}...`;
+			}
+			case 'warning': {
+				// Something the person should know that is not a failure:
+				// the verb carries on and still ends `complete`. Swallowing
+				// it left the bar showing the generic verb label and the
+				// message nowhere at all.
+				const message = typeof detail?.message === 'string' ? detail.message : '';
+				return message ? `Careful: ${message}` : 'Careful...';
+			}
 			case 'infra_wait': {
 				// The heartbeat of an unbounded wait (fires for start,
 				// stop, and terminate alike): show which verb waits and
@@ -313,6 +331,10 @@
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'pending'; message: string }
 		| { kind: 'stop_execution' }
+		// The one-click Run that fires every root. Off (slot absent) in a
+		// project whose triggers are the entry point: the trigger
+		// lifecycle is the button there, and the spec menu rides on THAT
+		// button (see `specMenuHost`) so the chevron is never stranded.
 		| { kind: 'run'; enabled: boolean };
 
 	type TriggerSlotState =
@@ -398,36 +420,48 @@
 		if (isExecRunning) {
 			return { kind: 'stop_execution' };
 		}
-		// No execution in flight: only show Run when the trigger
-		// slot is hidden. Whenever the trigger slot is visible
+		// No execution in flight: the one-click Run only when the
+		// trigger slot is hidden. Whenever the trigger slot is visible
 		// (source has triggers, or backend still has them active /
 		// deactivating / preserved), the trigger lifecycle is the
-		// right entry point and Run would conflict. The exception is
-		// an aimed run that walks through no trigger (a hand-fired
-		// maintenance branch): that run is an ordinary one-shot, so
-		// the button comes back beside the trigger lifecycle.
-		if (triggerSlotVisible && !runTargetsAvoidTriggers) {
-			return { kind: 'absent' };
-		}
-		// Source-derived gate: Run is only legal once the infra it
-		// would touch is Running. An aimed run consults only ITS
-		// subgraph's infra nodes (per-node status); the ordinary run
-		// touches everything, so the whole-graph rollup gates it. This
-		// is defense-in-depth on top of the dispatcher's own scoped
-		// pre-flight: the dispatcher gate fails when the project is
-		// unregistered (status fetch errors out), so we re-derive from
-		// the parsed graph + last-known per-node/rollup state.
+		// right entry point and a bare Run would conflict. The
+		// exception is an aimed run that walks through no trigger (a
+		// hand-fired maintenance branch): that run is an ordinary
+		// one-shot, so the button comes back beside the trigger
+		// lifecycle. The spec menu is there either way: a saved
+		// example runs the project from its own starting values.
+		if (triggerSlotVisible && !runTargetsAvoidTriggers) return { kind: 'absent' };
+		return { kind: 'run', enabled: runEnabled };
+	});
+
+	// Source-derived gate: Run is only legal once the infra it
+	// would touch is Running. An aimed run consults only ITS
+	// subgraph's infra nodes (per-node status); the ordinary run
+	// touches everything, so the whole-graph rollup gates it. This
+	// is defense-in-depth on top of the dispatcher's own scoped
+	// pre-flight: the dispatcher gate fails when the project is
+	// unregistered (status fetch errors out), so we re-derive from
+	// the parsed graph + last-known per-node/rollup state. The spec
+	// menu shares the gate: a saved example runs as an ordinary
+	// one-shot from its own starting values.
+	const runEnabled = $derived.by(() => {
 		const infraReady = (runTargetCount ?? 0) > 0
 			? runTargetsInfraReady
 			: !hasInfra || backend.infraRollup === 'running';
-		return {
-			kind: 'run',
-			enabled:
-				!verbsBlocked
-				&& nodeCount > 0
-				&& infraReady
-				&& isVerbAvailable('run'),
-		};
+		return !verbsBlocked && nodeCount > 0 && infraReady && isVerbAvailable('run');
+	});
+
+	// Where the spec menu chevron lives. It is glued to the right of
+	// the project's main button: Run when the one-click Run is up,
+	// otherwise the trigger lifecycle button (Activate / Reactivate /
+	// Deactivate). During a spinner state (building, activating...)
+	// there is no button to glue to and every verb is blocked, so the
+	// menu is hidden rather than stranded beside the spinner.
+	const specMenuHost = $derived.by((): 'run' | 'trigger' | 'none' => {
+		if (middleSlot.kind === 'run') return 'run';
+		if (middleSlot.kind !== 'absent') return 'none';
+		const k = triggerSlot.kind;
+		return k === 'inactive_fresh' || k === 'reactivate' || k === 'active' ? 'trigger' : 'none';
 	});
 
 	const triggerSlot = $derived.by((): TriggerSlotState => {
@@ -750,18 +784,30 @@
 				<Play class="w-3.5 h-3.5" />
 				<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
 			</button>
-			<!-- The Run menu: the project's specs, "Run this group" when the
-			     user stands inside one, and the dialog for a one-off. -->
+			{@render specMenu('bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 border-l-zinc-700')}
+		</div>
+	{/if}
+{/snippet}
+
+<!-- The spec menu chevron and its dropdown: the project's specs, "Run
+     this group" when the user stands inside one, and the dialog for a
+     one-off. Glued to the right edge of its host button (the host drops
+     its right rounding, the chevron its left one), painted in the
+     host's colors. The bar sits at the bottom of the screen, so the
+     menu opens UPWARD and the chevron points up while closed, down
+     while open (it is then the thing to click to close it). Must be
+     rendered inside a `relative` wrapper with its host. -->
+{#snippet specMenu(hostCss: string)}
 			<button
-				class="{btn} {btnDisabled} px-1.5 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-l-none border-l border-l-zinc-700"
+				class="{btn} {btnDisabled} px-1.5 rounded-l-none border-l {hostCss}"
 				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
-				disabled={!slot.enabled}
-				title="Run a spec"
+				disabled={!runEnabled}
+				title={specMenuOpen ? 'Close' : 'Run a saved example, this group, or a one-off'}
 			>
-				<ChevronDown class="w-3.5 h-3.5" />
+				<ChevronUp class="w-3.5 h-3.5 transition-transform {specMenuOpen ? 'rotate-180' : ''}" />
 			</button>
 			{#if specMenuOpen}
-				<div class="absolute right-0 top-full mt-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
+				<div class="absolute right-0 bottom-full mb-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
 					{#if focusedGroup}
 						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-medium" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(specForAction('group', focusedGroup)); }}>
 							Run this group ({focusedGroup})…
@@ -782,8 +828,6 @@
 					</button>
 				</div>
 			{/if}
-		</div>
-	{/if}
 {/snippet}
 
 {#snippet triggerSlotButton(slot: TriggerSlotState)}
@@ -799,18 +843,23 @@
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message)}
 	{:else if slot.kind === 'active'}
-		<button
-			class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700"
-			onclick={onDeactivate}
-			disabled={!slot.canDeactivate}
-		>
-			<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
-			<span class={labelCss}>Deactivate</span>
-			<span class="flex h-2 w-2 relative ml-1">
-				<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-				<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-			</span>
-		</button>
+		<div class="relative flex items-stretch">
+			<button
+				class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+				onclick={onDeactivate}
+				disabled={!slot.canDeactivate}
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+				<span class={labelCss}>Deactivate</span>
+				<span class="flex h-2 w-2 relative ml-1">
+					<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+					<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+				</span>
+			</button>
+			{#if specMenuHost === 'trigger'}
+				{@render specMenu('bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 border-l-emerald-500')}
+			{/if}
+		</div>
 	{:else if slot.kind === 'activating'}
 		{@render workingButton(
 			'Activating...',
@@ -838,25 +887,35 @@
 			<span class="px-2 py-1 rounded-md bg-zinc-100 text-zinc-600 border border-zinc-200 text-[11px] font-medium capitalize">
 				{slot.mode}
 			</span>
-			<button
-				class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-				onclick={onReactivate}
-				disabled={!slot.enabled}
-				title="Reactivate; choose how to handle preserved state"
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-				<span class={labelCss}>Reactivate</span>
-			</button>
+			<div class="relative flex items-stretch">
+				<button
+					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+					onclick={onReactivate}
+					disabled={!slot.enabled}
+					title="Reactivate; choose how to handle preserved state"
+				>
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+					<span class={labelCss}>Reactivate</span>
+				</button>
+				{#if specMenuHost === 'trigger'}
+					{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
+				{/if}
+			</div>
 		</div>
 	{:else}
-		<button
-			class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-			onclick={onActivate}
-			disabled={!slot.enabled}
-		>
-			<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-			<span class={labelCss}>Activate</span>
-		</button>
+		<div class="relative flex items-stretch">
+			<button
+				class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+				onclick={onActivate}
+				disabled={!slot.enabled}
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+				<span class={labelCss}>Activate</span>
+			</button>
+			{#if specMenuHost === 'trigger'}
+				{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
+			{/if}
+		</div>
 	{/if}
 {/snippet}
 

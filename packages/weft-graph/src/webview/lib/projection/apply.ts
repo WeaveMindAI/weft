@@ -16,7 +16,7 @@
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
 import { isContainerNodeType, isLoopNodeType, containerKindOf } from '../types';
 import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
-import { SHOULD_FLOW_PORT } from '../../../protocol';
+import { isGatePort } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
 
@@ -420,10 +420,10 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       // ops.
       const input = node.inputs?.find((p) => p.name === op.key);
       const isContainer = isContainerNodeType(node.nodeType);
-      if (isContainer && input === undefined && op.key !== SHOULD_FLOW_PORT) {
+      if (isContainer && input === undefined && !isGatePort(op.key)) {
         throw new Error(`'${op.node}' has no input port '${op.key}'`);
       }
-      const portHomed = isContainer || input !== undefined || op.key === SHOULD_FLOW_PORT;
+      const portHomed = isContainer || input !== undefined || isGatePort(op.key);
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});

@@ -190,6 +190,53 @@ impl KubeReader for KubectlClient {
         Ok(if phase.is_empty() { None } else { Some(phase) })
     }
 
+    async fn node_ports(&self) -> Result<Vec<super::NodePortHolder>> {
+        // One line per port that HAS a node port, which the jsonpath
+        // form cannot do: it prints an empty field for the ports
+        // without one and gives no way to tell which Service a number
+        // belonged to.
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "svc",
+                "-A",
+                "-o",
+                "go-template={{range .items}}{{$ns := .metadata.namespace}}\
+{{$n := .metadata.name}}{{range .spec.ports}}{{if .nodePort}}{{$ns}} {{$n}} \
+{{.nodePort}}{{\"\\n\"}}{{end}}{{end}}{{end}}",
+            ])
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kubectl get svc -A failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let mut holders = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(namespace), Some(service), Some(port)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            // A port kubectl printed that is not a number is the
+            // output shape having changed under us, which is worth
+            // failing on: silently skipping it would let a door pick a
+            // port somebody already holds.
+            let port: u16 = port.parse().map_err(|_| {
+                anyhow::anyhow!("kubectl printed a node port that is not a number: {line:?}")
+            })?;
+            holders.push(super::NodePortHolder {
+                namespace: namespace.to_string(),
+                service: service.to_string(),
+                port,
+            });
+        }
+        Ok(holders)
+    }
+
     async fn pod_logs(&self, namespace: &str, pod_name: &str, container: &str) -> Result<String> {
         let out = Command::new("kubectl")
             .args(["-n", namespace, "logs", pod_name, "-c", container])

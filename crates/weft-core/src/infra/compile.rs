@@ -34,12 +34,20 @@ pub struct CompileContext<'a> {
     /// hash mixes it in and HashMap order would randomize).
     /// `Image::Upstream(...)` references bypass this map.
     pub local_image_tags: &'a std::collections::BTreeMap<String, String>,
+
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
-    #[error("infra spec for node '{node}': no image declared with local name '{name}'; \
-             add it to NodeMetadata.images and provide a Dockerfile")]
+    /// The tag map the apply runs with has no entry for a local image
+    /// the spec names. The map is filled by `weft infra start` (which
+    /// builds the node's images and registers their tags), so on a
+    /// project whose infra was never started it is empty whatever the
+    /// node's metadata declares; the message says so, since the first
+    /// reading of it ("the metadata is wrong") sends a person to a
+    /// file that is fine.
+    #[error("infra node '{node}' has no image built yet for '{name}': run `weft infra start`, \
+             which builds the node's images and registers them, before activating or running")]
     MissingLocalImage { node: String, name: String },
     #[error("infra spec for node '{node}': endpoint '{endpoint}' references unit '{unit}' \
              but no such Unit was declared")]
@@ -138,7 +146,7 @@ fn check_name(
 ) -> Result<(), CompileError> {
     if name.len() > DNS_1123_LABEL_MAX {
         return Err(CompileError::NameTooLong {
-            node: ctx.node_id.to_string(),
+            node: crate::project::plain_id(ctx.node_id),
             name: name.to_string(),
             len: name.len(),
             limit: DNS_1123_LABEL_MAX,
@@ -148,7 +156,7 @@ fn check_name(
     }
     if !is_dns1123_label(name) {
         return Err(CompileError::NameInvalid {
-            node: ctx.node_id.to_string(),
+            node: crate::project::plain_id(ctx.node_id),
             name: name.to_string(),
             details: details.into(),
             source_kind,
@@ -204,7 +212,7 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
         check_name(&entry.name, ctx, entry.details.clone(), entry.source_kind)?;
         if !seen.insert((entry.kind, entry.name.clone())) {
             return Err(CompileError::DuplicateName {
-                node: ctx.node_id.to_string(),
+                node: crate::project::plain_id(ctx.node_id),
                 name: entry.name.clone(),
                 source_kind: entry.source_kind,
                 k8s_kind: entry.kind.display(),
@@ -220,7 +228,7 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
     for unit in &spec.units {
         if !unit.on_upgrade.is_default() && !matches!(unit.kind, UnitKind::Deployment) {
             return Err(CompileError::UpgradeBehaviorOnNonDeployment {
-                node: ctx.node_id.to_string(),
+                node: crate::project::plain_id(ctx.node_id),
                 unit: unit.name.clone(),
                 unit_kind: K8sKind::from_unit_kind(unit.kind).display(),
             });
@@ -231,7 +239,7 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
         if let Some(auto) = &unit.scaling.autoscale {
             if auto.metrics.is_empty() {
                 return Err(CompileError::AutoscaleWithoutMetrics {
-                    node: ctx.node_id.to_string(),
+                    node: crate::project::plain_id(ctx.node_id),
                     unit: unit.name.clone(),
                 });
             }
@@ -455,8 +463,11 @@ fn compile_pod_template(
                 "weft.dev/unit": unit.name,
                 "weft.dev/tenant": ctx.tenant_id,
                 "weft.dev/project": ctx.project_id,
-                "weft.dev/node": ctx.node_id,
+                super::NODE_LABEL: super::node_label_value(ctx.node_id),
                 "weft.dev/role": "infra",
+            },
+            "annotations": {
+                super::NODE_ID_ANNOTATION: ctx.node_id,
             }
         },
         "spec": pod_spec,
@@ -533,7 +544,7 @@ fn resolve_image(
         Image::Upstream { reference } => Ok(reference.clone()),
         Image::Local { name } => tags.get(name).cloned().ok_or_else(|| {
             CompileError::MissingLocalImage {
-                node: node_id.to_string(),
+                node: crate::project::plain_id(node_id),
                 name: name.clone(),
             }
         }),
@@ -842,18 +853,24 @@ fn compile_service(ep: &super::types::Endpoint, spec: &InfraSpec, ctx: &CompileC
         Protocol::Udp => "UDP",
         Protocol::Sctp => "SCTP",
     };
-    let service_type = match &ep.expose {
+    // A `SameNetwork` endpoint IS the door: the node's own spec is the
+    // whole declaration, so it becomes a NodePort right here and
+    // nothing outside this compile opens or closes one.
+    //
+    // The NUMBER is the apiserver's: it allocates one from the range
+    // the cluster was given, guarantees it is unique, and keeps it
+    // across re-applies. Naming one here would need a cluster-wide
+    // view of what is taken, which is exactly what the component
+    // applying this is scoped not to have.
+    let service_type = match ep.expose {
+        Expose::SameNetwork => "NodePort",
         Expose::ClusterInternal | Expose::TenantPublic { .. } => "ClusterIP",
-        Expose::NodePort { .. } => "NodePort",
     };
     let mut port_obj = Map::new();
     port_obj.insert("name".into(), json!(ep.name));
     port_obj.insert("port".into(), json!(port_number));
     port_obj.insert("targetPort".into(), json!(port_number));
     port_obj.insert("protocol".into(), json!(proto_str));
-    if let Expose::NodePort { port } = ep.expose {
-        port_obj.insert("nodePort".into(), json!(port));
-    }
     json!({
         "apiVersion": "v1",
         "kind": "Service",
@@ -908,6 +925,14 @@ fn service_name(ep: &super::types::Endpoint, ctx: &CompileContext<'_>) -> String
     format!("{}-{}", ctx.instance_id, ep.name)
 }
 
+/// The Service one endpoint's door is served by. Same name the
+/// compiler emits, so the caller that has to find a door's port in the
+/// cluster asks for the object the compiler made.
+pub fn door_service_name(instance_id: &str, endpoint: &str) -> String {
+    format!("{instance_id}-{endpoint}")
+}
+
+
 /// Resolve an endpoint to its (port-number, protocol). Returns None
 /// when the spec is invalid; `validate_endpoint` catches this before
 /// `compile_service` so the .expect() is safe.
@@ -931,7 +956,7 @@ fn validate_endpoint(
         .iter()
         .find(|u| u.name == ep.unit)
         .ok_or_else(|| CompileError::EndpointUnitMissing {
-            node: ctx.node_id.to_string(),
+            node: crate::project::plain_id(ctx.node_id),
             endpoint: ep.name.clone(),
             unit: ep.unit.clone(),
         })?;
@@ -940,7 +965,7 @@ fn validate_endpoint(
         .iter()
         .find(|c| c.name == ep.container)
         .ok_or_else(|| CompileError::EndpointContainerMissing {
-            node: ctx.node_id.to_string(),
+            node: crate::project::plain_id(ctx.node_id),
             endpoint: ep.name.clone(),
             unit: ep.unit.clone(),
             container: ep.container.clone(),
@@ -950,7 +975,7 @@ fn validate_endpoint(
         .iter()
         .find(|p| p.name == ep.port)
         .ok_or_else(|| CompileError::EndpointPortMissing {
-            node: ctx.node_id.to_string(),
+            node: crate::project::plain_id(ctx.node_id),
             endpoint: ep.name.clone(),
             unit: ep.unit.clone(),
             container: ep.container.clone(),
@@ -958,6 +983,7 @@ fn validate_endpoint(
         })?;
     Ok(())
 }
+
 
 // -----------------------------------------------------------------
 // HPA
@@ -1078,7 +1104,7 @@ fn compile_network_policy(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
             IngressRule::FromNode { node_id } => json!({
                 "from": [{
                     "podSelector": {
-                        "matchLabels": { "weft.dev/node": node_id }
+                        "matchLabels": { super::NODE_LABEL: super::node_label_value(node_id) }
                     }
                 }]
             }),
@@ -1102,6 +1128,52 @@ fn compile_network_policy(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
         });
     }
 
+    // A door's traffic arrives from off the pod network: kube-proxy
+    // sends it on from the node, so the source is an address and no
+    // `podSelector` rule can ever match it. Without a rule of its own
+    // the default-deny baseline drops every connection through the
+    // door, silently, and the door looks broken rather than closed.
+    //
+    // The rule is scoped to the door's own PORT, never widened to the
+    // whole pod: the endpoints this node keeps to itself stay as
+    // unreachable as they were.
+    //
+    // On that one port the rule is `0.0.0.0/0`, and that really does
+    // mean everybody who can route to the pod, including pods in other
+    // tenants' namespaces, which the default-deny baseline would
+    // otherwise keep out. Two things have to hold at once and only an
+    // address rule can hold both: traffic from the machine arrives
+    // SNATed to the node's address (kube-proxy, so there is no pod to
+    // select), and it is the ONLY way a person's own frontend reaches
+    // their database. Narrowing this to the project's namespace would
+    // close the door it exists to open.
+    //
+    // What keeps the blast radius small today is the node port
+    // binding: on a local install every mapped port listens on
+    // 127.0.0.1, so the machine is the whole audience. A deployed
+    // cluster has no such binding, which is why this rule is on the
+    // "Cloud deployment" list in TODO.md: the shape that fits there is
+    // the door carrying who may use it, with a same-namespace default.
+    for ep in &spec.endpoints {
+        if !matches!(ep.expose, Expose::SameNetwork) {
+            continue;
+        }
+        let Some((port_number, protocol)) = resolve_endpoint_port(spec, ep) else {
+            continue;
+        };
+        ingress_rules.push(json!({
+            "from": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+            "ports": [{
+                "port": port_number,
+                "protocol": match protocol {
+                    Protocol::Tcp => "TCP",
+                    Protocol::Udp => "UDP",
+                    Protocol::Sctp => "SCTP",
+                },
+            }],
+        }));
+    }
+
     let mut egress_rules = Vec::new();
     for rule in &spec.access.egress {
         egress_rules.push(match rule {
@@ -1111,7 +1183,7 @@ fn compile_network_policy(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
             EgressRule::ToNode { node_id } => json!({
                 "to": [{
                     "podSelector": {
-                        "matchLabels": { "weft.dev/node": node_id }
+                        "matchLabels": { super::NODE_LABEL: super::node_label_value(node_id) }
                     }
                 }]
             }),
@@ -1330,6 +1402,12 @@ fn manifest_metadata_mut(manifest: &mut Value) -> Option<&mut serde_json::Map<St
 }
 
 fn stamp_labels_into(md: &mut serde_json::Map<String, Value>, ctx: &CompileContext<'_>) {
+    // The node's id as a person reads it goes on an annotation; the
+    // label carries the value a selector can hold (see `node_label_value`).
+    let annotations = md.entry("annotations".to_string()).or_insert_with(|| json!({}));
+    if let Some(ann) = annotations.as_object_mut() {
+        ann.insert(super::NODE_ID_ANNOTATION.into(), json!(ctx.node_id));
+    }
     let labels = md.entry("labels".to_string()).or_insert_with(|| json!({}));
     let Some(lbls) = labels.as_object_mut() else {
         return;
@@ -1337,7 +1415,7 @@ fn stamp_labels_into(md: &mut serde_json::Map<String, Value>, ctx: &CompileConte
     lbls.insert("weft.dev/role".into(), json!("infra"));
     lbls.insert("weft.dev/tenant".into(), json!(ctx.tenant_id));
     lbls.insert("weft.dev/project".into(), json!(ctx.project_id));
-    lbls.insert("weft.dev/node".into(), json!(ctx.node_id));
+    lbls.insert(super::NODE_LABEL.into(), json!(super::node_label_value(ctx.node_id)));
     lbls.insert("weft.dev/instance".into(), json!(ctx.instance_id));
 }
 
@@ -1346,35 +1424,27 @@ mod tests {
     use super::*;
     use super::super::types::*;
 
-    fn ctx() -> CompileContext<'static> {
-        // We need 'static lifetimes for the simple test; we leak the
-        use std::collections::BTreeMap;
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<BTreeMap<String, String>> = OnceLock::new();
-        let empty = EMPTY.get_or_init(BTreeMap::new);
+    pub(super) fn ctx() -> CompileContext<'static> {
+        ctx_with(std::collections::BTreeMap::new())
+    }
+
+    /// The test contexts all want `'static`, so the resolved tag map is
+    /// leaked. One builder, so a new context field is added once.
+    fn ctx_with(tags: std::collections::BTreeMap<String, String>) -> CompileContext<'static> {
         CompileContext {
             tenant_id: "tenantA",
             project_id: "projB",
             node_id: "nodeC",
             instance_id: "inst1",
             namespace: "wft-project-tenantA-projB",
-            local_image_tags: empty,
+            local_image_tags: Box::leak(Box::new(tags)),
         }
     }
 
     fn ctx_with_tags(
         tags: std::collections::BTreeMap<String, String>,
     ) -> CompileContext<'static> {
-        let leaked: &'static std::collections::BTreeMap<String, String> =
-            Box::leak(Box::new(tags));
-        CompileContext {
-            tenant_id: "tenantA",
-            project_id: "projB",
-            node_id: "nodeC",
-            instance_id: "inst1",
-            namespace: "wft-project-tenantA-projB",
-            local_image_tags: leaked,
-        }
+        ctx_with(tags)
     }
 
     #[test]
@@ -1524,7 +1594,62 @@ mod tests {
             assert_eq!(labels["weft.dev/instance"], "inst1");
             assert_eq!(labels["weft.dev/project"], "projB");
             assert_eq!(labels["weft.dev/tenant"], "tenantA");
-            assert_eq!(labels["weft.dev/node"], "nodeC");
+            assert_eq!(labels["weft.dev/node"], super::super::node_label_value("nodeC"));
+            assert_eq!(m["metadata"]["annotations"]["weft.dev/node-id"], "nodeC");
+        }
+    }
+
+    /// A node inside an included file has an id (`@src:setup.store`) a
+    /// label cannot hold. Every object still carries it, on the
+    /// annotation, and every label and selector carries the value that
+    /// stands for it, so the network rule between two nodes matches the
+    /// pods it means. Before this the apply died on the label.
+    #[test]
+    fn an_included_files_node_id_is_legal_on_every_object_it_owns() {
+        let ctx = CompileContext { node_id: "@src:setup.store", ..ctx() };
+        let spec = InfraSpec {
+            units: vec![Unit {
+                name: "u".into(),
+                kind: UnitKind::Deployment,
+                containers: vec![Container::new("c", Image::Upstream { reference: "x:1".into() })],
+                ..Default::default()
+            }],
+            access: super::super::types::NetworkAccess {
+                ingress: vec![IngressRule::FromNode { node_id: "@src:setup.api".into() }],
+                egress: vec![EgressRule::ToNode { node_id: "@src:setup.api".into() }],
+            },
+            ..Default::default()
+        };
+        let out = compile(&spec, &ctx).expect("compile ok");
+        let legal = |s: &str| s.len() <= 63 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        let mut selectors = 0;
+        for m in &out {
+            assert_eq!(m["metadata"]["annotations"]["weft.dev/node-id"], "@src:setup.store");
+            let text = m.to_string();
+            for (path, value) in walk_strings(m, String::new()) {
+                if path.contains("labels") || path.contains("matchLabels") {
+                    assert!(legal(&value), "{path} = {value:?} in {text}");
+                }
+                if path.contains("matchLabels") && path.ends_with("weft.dev/node") {
+                    assert_eq!(value, super::super::node_label_value("@src:setup.api"));
+                    selectors += 1;
+                }
+            }
+            if let Some(labels) = m["metadata"]["labels"].as_object() {
+                assert_eq!(labels["weft.dev/node"], super::super::node_label_value("@src:setup.store"));
+            }
+        }
+        assert_eq!(selectors, 2, "the ingress and the egress rule each select by the label value");
+    }
+
+    /// Every string leaf of a JSON value with its path, for asserting
+    /// over whole manifests.
+    fn walk_strings(value: &Value, path: String) -> Vec<(String, String)> {
+        match value {
+            Value::String(s) => vec![(path, s.clone())],
+            Value::Array(items) => items.iter().enumerate().flat_map(|(i, v)| walk_strings(v, format!("{path}[{i}]"))).collect(),
+            Value::Object(map) => map.iter().flat_map(|(k, v)| walk_strings(v, format!("{path}/{k}"))).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -1817,4 +1942,113 @@ mod tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+    use super::super::types::*;
+    use super::tests::ctx;
+
+    /// One node with two endpoints: `sql` the author would let you
+    /// reach, `credential` (which hands out the password) never.
+    fn two_endpoint_spec() -> InfraSpec {
+        InfraSpec {
+            units: vec![Unit {
+                name: "db".into(),
+                kind: UnitKind::StatefulSet,
+                containers: vec![Container {
+                    ports: vec![
+                        ContainerPort { name: "sql".into(), port: 5432, protocol: Protocol::Tcp },
+                        ContainerPort { name: "http".into(), port: 8099, protocol: Protocol::Tcp },
+                    ],
+                    ..Container::new("pg", Image::Upstream { reference: "postgres:17".into() })
+                }],
+                ..Default::default()
+            }],
+            endpoints: vec![
+                Endpoint {
+                    name: "sql".into(),
+                    unit: "db".into(),
+                    container: "pg".into(),
+                    port: "sql".into(),
+                    expose: Expose::SameNetwork,
+                },
+                Endpoint {
+                    name: "credential".into(),
+                    unit: "db".into(),
+                    container: "pg".into(),
+                    port: "http".into(),
+                    expose: Expose::ClusterInternal,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn service_named<'a>(out: &'a [Value], name: &str) -> &'a Value {
+        out.iter()
+            .find(|m| m["kind"] == "Service" && m["metadata"]["name"].as_str().unwrap().ends_with(name))
+            .expect("service is emitted")
+    }
+
+    /// An endpoint the author marked `SameNetwork` IS the door: the
+    /// node's own spec is the whole declaration, and nothing outside it
+    /// opens or closes one.
+    #[test]
+    fn a_same_network_endpoint_is_the_door() {
+        let out = compile(&two_endpoint_spec(), &ctx()).expect("compile ok");
+        assert_eq!(service_named(&out, "sql")["spec"]["type"], "NodePort");
+    }
+
+    /// The door: a NodePort, and a rule letting that ONE port in.
+    /// Without the rule the default-deny baseline drops every connection
+    /// through the door, and a person sees a port that accepts and then
+    /// hangs.
+    #[test]
+    fn an_open_endpoint_becomes_a_node_port_and_is_let_through() {
+        let out = compile(&two_endpoint_spec(), &ctx()).expect("compile ok");
+
+        let sql = service_named(&out, "sql");
+        assert_eq!(sql["spec"]["type"], "NodePort");
+        // No number: the apiserver allocates one from the range the
+        // cluster was given, and keeps it across re-applies.
+        assert!(sql["spec"]["ports"][0].get("nodePort").is_none(), "{sql}");
+
+        // The endpoint nobody opened is untouched.
+        let cred = service_named(&out, "credential");
+        assert_eq!(cred["spec"]["type"], "ClusterIP");
+        assert!(cred["spec"]["ports"][0].get("nodePort").is_none());
+
+        let policy = out.iter().find(|m| m["kind"] == "NetworkPolicy").expect("policy");
+        let rules = policy["spec"]["ingress"].as_array().unwrap();
+        let opened = rules
+            .iter()
+            .find(|r| r.get("ports").is_some())
+            .expect("the door has a rule of its own");
+        assert_eq!(opened["ports"][0]["port"], 5432, "the door's port, and only it");
+        assert_eq!(opened["ports"][0]["protocol"], "TCP");
+        assert_eq!(opened["from"][0]["ipBlock"]["cidr"], "0.0.0.0/0");
+    }
+
+    /// An endpoint the author left `ClusterInternal` stays unreachable,
+    /// whatever else the spec says. This is the one that matters: the
+    /// endpoint that hands out the database's password is exactly the
+    /// thing a door must never reach, and nothing outside the node's own
+    /// spec can change that.
+    #[test]
+    fn an_endpoint_the_node_keeps_to_itself_is_never_reachable() {
+        let out = compile(&two_endpoint_spec(), &ctx()).expect("compile ok");
+        let cred = service_named(&out, "credential");
+        assert_eq!(cred["spec"]["type"], "ClusterIP");
+        assert!(cred["spec"]["ports"][0].get("nodePort").is_none(), "{cred}");
+
+        // And the port-scoped rule lets in the door's port ALONE, so the
+        // endpoint next to it is not reachable by being in the same Pod.
+        let policy = out.iter().find(|m| m["kind"] == "NetworkPolicy").expect("policy");
+        let rules = policy["spec"]["ingress"].as_array().unwrap();
+        let opened: Vec<_> = rules.iter().filter(|r| r.get("ports").is_some()).collect();
+        assert_eq!(opened.len(), 1, "one door, one rule: {policy}");
+        assert_eq!(opened[0]["ports"][0]["port"], 5432, "the door's port, and only it");
+    }
 }

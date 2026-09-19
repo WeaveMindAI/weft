@@ -61,6 +61,32 @@ pub struct VerifySecrets {
     /// The issuer identity a signed identity token must carry
     /// (the account configured to push).
     pub expected_email: Option<String>,
+    /// The keys a caller may present, for the shared-key scheme.
+    pub api_keys: Option<Vec<String>>,
+}
+
+/// The material a scheme reads off a CONNECTION's stored values, by
+/// the fixed names the scheme vocabulary reserves
+/// (`signing_secret`, `public_key`, `keys`, `audience`). Pure: the
+/// broker hands the connection's values in, the scheme's secrets come
+/// out. A key list is keys separated by commas or line breaks (the
+/// paste field is one line; a key never contains either), blanks
+/// dropped.
+pub fn secrets_from_values(values: &BTreeMap<String, String>) -> VerifySecrets {
+    use super::events::{API_KEYS, AUDIENCE, PUBLIC_KEY, SIGNING_SECRET};
+    VerifySecrets {
+        signing_secret: values.get(SIGNING_SECRET).cloned(),
+        public_key: values.get(PUBLIC_KEY).cloned(),
+        audience: values.get(AUDIENCE).cloned(),
+        api_keys: values.get(API_KEYS).map(|raw| {
+            raw.split([',', '\n', '\r'])
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        }),
+        ..Default::default()
+    }
 }
 
 /// Why a push was refused. Never echoed to the caller in detail (a
@@ -96,7 +122,10 @@ pub struct PushParts<'a> {
     pub method: &'a str,
 }
 
-/// Run the scheme a service declares against one raw push.
+/// Run the scheme a service declares against one raw push. Answers
+/// the IDENTITY the scheme established: which key matched (`{"key":
+/// 3}`) for the shared-key scheme, and an empty object for the
+/// schemes that prove origin without naming anyone.
 ///
 /// Pure. The signed-identity scheme needs the issuer's published
 /// keys, so it is not decided here; see [`needs_issuer_keys`].
@@ -105,7 +134,8 @@ pub fn verify_push(
     push: &PushParts<'_>,
     secrets: &VerifySecrets,
     now_unix: i64,
-) -> Result<(), VerifyError> {
+) -> Result<serde_json::Value, VerifyError> {
+    let anonymous = serde_json::json!({});
     match kind {
         VerifyKind::Hmac {
             signature_header,
@@ -169,7 +199,7 @@ pub fn verify_push(
                 .iter()
                 .any(|c| constant_time_eq(c.as_bytes(), expected.as_bytes()))
             {
-                Ok(())
+                Ok(anonymous)
             } else {
                 Err(VerifyError::BadSignature)
             }
@@ -213,7 +243,8 @@ pub fn verify_push(
                         .map_err(|_| VerifyError::BadSignature)?;
                     verifier
                         .verify(&message, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
-                        .map_err(|_| VerifyError::BadSignature)
+                        .map_err(|_| VerifyError::BadSignature)?;
+                    Ok(anonymous)
                 }
                 SignatureScheme::EcdsaP256 => {
                     let der = base64::engine::general_purpose::STANDARD
@@ -229,7 +260,8 @@ pub fn verify_push(
                         })?;
                     let sig = p256::ecdsa::Signature::from_der(&signature)
                         .map_err(|_| VerifyError::BadSignature)?;
-                    verifier.verify(&message, &sig).map_err(|_| VerifyError::BadSignature)
+                    verifier.verify(&message, &sig).map_err(|_| VerifyError::BadSignature)?;
+                    Ok(anonymous)
                 }
             }
         }
@@ -247,9 +279,34 @@ pub fn verify_push(
                 .as_deref()
                 .ok_or_else(|| VerifyError::MissingHeader("subscription token".into()))?;
             if constant_time_eq(presented.as_bytes(), minted.as_bytes()) {
-                Ok(())
+                Ok(anonymous)
             } else {
                 Err(VerifyError::BadSignature)
+            }
+        }
+        VerifyKind::ApiKeys { header: key_header, bearer } => {
+            let keys = secrets
+                .api_keys
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .ok_or(VerifyError::NotConfigured("api key list"))?;
+            // The key rides its own header, or the bearer slot when the
+            // scheme allows it; the header wins when both are present.
+            let presented = header(push.headers, key_header)
+                .map(str::trim)
+                .or_else(|| if *bearer { bearer_token(push.headers) } else { None })
+                .ok_or_else(|| VerifyError::MissingHeader(key_header.clone()))?;
+            // Every key is compared (no early exit on the first match)
+            // so the time taken says nothing about which key matched.
+            let mut matched: Option<usize> = None;
+            for (i, key) in keys.iter().enumerate() {
+                if constant_time_eq(presented.as_bytes(), key.as_bytes()) && matched.is_none() {
+                    matched = Some(i);
+                }
+            }
+            match matched {
+                Some(i) => Ok(serde_json::json!({ "key": i })),
+                None => Err(VerifyError::BadSignature),
             }
         }
         VerifyKind::Oidc { .. } => Err(VerifyError::NotConfigured(
@@ -906,5 +963,86 @@ mod tests {
         assert_eq!(bearer_token(&BTreeMap::new()), None);
         let basic = BTreeMap::from([("Authorization".to_string(), "Basic zzz".to_string())]);
         assert_eq!(bearer_token(&basic), None);
+    }
+
+    fn api_keys_kind() -> VerifyKind {
+        VerifyKind::ApiKeys { header: "X-Api-Key".into(), bearer: true }
+    }
+
+    fn key_secrets(keys: &[&str]) -> VerifySecrets {
+        VerifySecrets {
+            api_keys: Some(keys.iter().map(|k| k.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// A key on its header or in the bearer slot verifies and names its
+    /// position; a wrong key, a missing key, and an empty list refuse.
+    #[test]
+    fn a_shared_key_verifies_and_names_which_one() {
+        let keys = key_secrets(&["first", "second"]);
+        let on_header = BTreeMap::from([("x-api-key".to_string(), "second".to_string())]);
+        assert_eq!(
+            verify_push(&api_keys_kind(), &parts(b"", &on_header), &keys, 0).unwrap(),
+            serde_json::json!({ "key": 1 })
+        );
+        let as_bearer = BTreeMap::from([("Authorization".to_string(), "Bearer first".to_string())]);
+        assert_eq!(
+            verify_push(&api_keys_kind(), &parts(b"", &as_bearer), &keys, 0).unwrap(),
+            serde_json::json!({ "key": 0 })
+        );
+        let wrong = BTreeMap::from([("x-api-key".to_string(), "third".to_string())]);
+        assert_eq!(
+            verify_push(&api_keys_kind(), &parts(b"", &wrong), &keys, 0),
+            Err(VerifyError::BadSignature)
+        );
+        assert!(matches!(
+            verify_push(&api_keys_kind(), &parts(b"", &BTreeMap::new()), &keys, 0),
+            Err(VerifyError::MissingHeader(_))
+        ));
+        assert!(matches!(
+            verify_push(&api_keys_kind(), &parts(b"", &on_header), &key_secrets(&[]), 0),
+            Err(VerifyError::NotConfigured(_))
+        ));
+        // Bearer disabled: only the header is read.
+        let no_bearer = VerifyKind::ApiKeys { header: "X-Api-Key".into(), bearer: false };
+        assert!(matches!(
+            verify_push(&no_bearer, &parts(b"", &as_bearer), &keys, 0),
+            Err(VerifyError::MissingHeader(_))
+        ));
+    }
+
+    /// The connection's stored values feed the schemes by fixed names,
+    /// and the key list splits one per line.
+    #[test]
+    fn secrets_come_off_the_connection_by_fixed_names() {
+        let values = BTreeMap::from([
+            ("signing_secret".to_string(), "s".to_string()),
+            ("keys".to_string(), " k1 , k2\nk3\n".to_string()),
+            ("audience".to_string(), "aud".to_string()),
+        ]);
+        let secrets = secrets_from_values(&values);
+        assert_eq!(secrets.signing_secret.as_deref(), Some("s"));
+        assert_eq!(
+            secrets.api_keys,
+            Some(vec!["k1".to_string(), "k2".to_string(), "k3".to_string()])
+        );
+        assert_eq!(secrets.audience.as_deref(), Some("aud"));
+        assert!(secrets.public_key.is_none());
+    }
+
+    /// The origin-proving schemes answer an empty identity; the wire
+    /// callers rely on the shape being an object either way.
+    #[test]
+    fn origin_schemes_answer_an_anonymous_identity() {
+        let secret = "topsecret";
+        let now = 1_700_000_000;
+        let body = b"{}";
+        let headers = BTreeMap::from([
+            ("X-Slack-Request-Timestamp".to_string(), now.to_string()),
+            ("X-Slack-Signature".to_string(), slack_signature(secret, now, body)),
+        ]);
+        let identity = verify_push(&slack_kind(), &parts(body, &headers), &secrets(secret), now).unwrap();
+        assert_eq!(identity, serde_json::json!({}));
     }
 }

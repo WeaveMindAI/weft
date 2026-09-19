@@ -1,0 +1,36 @@
+# Trims a text, shouts it with a node that lives beside this file, and
+# counts its letters with a loop of its own.
+Group(text: String) -> (out: String, count: Number) {
+  strip = ExecPython(text: String) -> (out: String) {
+    code: "return {'out': text.strip()}"
+  }
+  strip.text = self.text
+
+  loud = Shout
+  loud.text = strip.out
+
+  letters = ExecPython(text: String) -> (items: List[String]) {
+    code: "return {'items': list(text)}"
+  }
+  letters.text = strip.out
+
+  each = Loop(items: List[String]) -> (marks: List[Number | Null]) {
+    parallel: false
+    over: ["items"]
+
+    mark = ExecPython(c: String) -> (n: Number) {
+      code: "return {'n': 1}"
+    }
+    mark.c = self.items
+    self.marks = mark.n
+  }
+  each.items = letters.items
+
+  tally = ExecPython(marks: List[Number | Null]) -> (count: Number) {
+    code: "return {'count': len([m for m in marks if m is not None])}"
+  }
+  tally.marks = each.marks
+
+  self.out = loud.loud
+  self.count = tally.count
+}

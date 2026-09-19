@@ -93,18 +93,16 @@ impl SettledRun {
     /// never completed (it was skipped, failed, or did not run). For a node that
     /// fires multiple times (a loop body), use [`SettledRun::node_outputs`].
     pub fn output_of(&self, node: &str) -> Option<Value> {
-        self.replay
-            .by_kind("node_completed")
-            .find(|e| e.is_node(node))
+        self.events_of(node)
+            .find(|e| e.kind() == "node_completed")
             .and_then(|e| e.field("output").cloned())
     }
 
     /// Every output value a node produced across all its firings, in event
     /// order (one per `node_completed`). For loop bodies and repeated fires.
     pub fn node_outputs(&self, node: &str) -> Vec<Value> {
-        self.replay
-            .by_kind("node_completed")
-            .filter(|e| e.is_node(node))
+        self.events_of(node)
+            .filter(|e| e.kind() == "node_completed")
             .filter_map(|e| e.field("output").cloned())
             .collect()
     }
@@ -174,9 +172,77 @@ impl SettledRun {
             None => bail!(
                 "node '{node}' never completed (skipped/failed/absent); cannot assert output. \
                  Replay node events: {:?}",
-                self.replay.for_node(node).map(|e| e.kind()).collect::<Vec<_>>()
+                self.events_of(node).map(|e| e.kind()).collect::<Vec<_>>()
             ),
         }
+    }
+
+/// The VALUE inside a journalled caller payload.
+///
+/// Both directions of an exchange are recorded in the same tagged wire
+/// vocabulary the bus uses (`{"kind": "json", "data": ...}`), so a test
+/// reading a body straight off the event would be asserting about the
+/// envelope. Bytes ride it as base64 text under the same `data`, which
+/// is the honest thing to hand back for a `bytes` route.
+fn wire_value(payload: &Value) -> Value {
+        payload.get("data").cloned().unwrap_or_else(|| payload.clone())
+    }
+
+    /// Every message of the conversation that went `direction`, in
+    /// order, paired with whether it was the last thing the program
+    /// said.
+    ///
+    /// The journal does not write one row per message: it folds a
+    /// window of the conversation into a single `caller_window` row
+    /// carrying the messages it covered, so a socket at fifty messages
+    /// a second is one write rather than fifty. The rows arrive in
+    /// window order and each row's `messages` are in order within it,
+    /// so walking them in sequence rebuilds the conversation.
+    ///
+    /// A message the journal did not keep (an ephemeral exchange, raw
+    /// bytes) still has a row, carrying only its size. It has no
+    /// payload, so it is not returned here; a test that wants to see
+    /// those reads the rows itself.
+    fn caller_messages(&self, direction: &str) -> Vec<(Value, bool)> {
+        self.replay
+            .by_kind("caller_window")
+            .filter_map(|e| e.field("messages").and_then(Value::as_array))
+            .flatten()
+            .filter(|m| m.get("direction").and_then(Value::as_str) == Some(direction))
+            .filter_map(|m| {
+                let payload = m.get("payload").map(Self::wire_value)?;
+                let terminal = m.get("terminal").and_then(Value::as_bool).unwrap_or(false);
+                Some((payload, terminal))
+            })
+            .collect()
+    }
+
+    /// What the program ANSWERED its caller, as the journal recorded
+    /// it: every outbound chunk in order, with the terminal one last.
+    ///
+    /// A route's answer never lands on a node's ports (it goes to the
+    /// person on the other end), so no node assertion can see it. This
+    /// is how a test checks what a caller actually received, and it
+    /// reads the same rows whether the caller was a real socket or the
+    /// stand-in a fired run serves.
+    pub fn caller_answers(&self) -> Vec<Value> {
+        self.caller_messages("outbound").into_iter().map(|(payload, _)| payload).collect()
+    }
+
+    /// The exchange ended, and this is what went out last. `None` when
+    /// the program never answered at all, which is itself the thing a
+    /// route test usually wants to catch.
+    pub fn caller_final_answer(&self) -> Option<Value> {
+        self.caller_messages("outbound")
+            .into_iter()
+            .filter(|(_, terminal)| *terminal)
+            .map(|(payload, _)| payload)
+            .next_back()
+    }
+
+    /// What the caller SENT, as the journal recorded it.
+    pub fn caller_requests(&self) -> Vec<Value> {
+        self.caller_messages("inbound").into_iter().map(|(payload, _)| payload).collect()
     }
 
     /// The assembled INPUT a node received on its first firing
@@ -185,9 +251,8 @@ impl SettledRun {
     /// X": Debug has no output, so `output_of` is empty, but its input carries
     /// the delivered value. Returns `None` if the node never started.
     pub fn input_of(&self, node: &str) -> Option<Value> {
-        self.replay
-            .by_kind("node_started")
-            .find(|e| e.is_node(node))
+        self.events_of(node)
+            .find(|e| e.kind() == "node_started")
             .and_then(|e| e.field("input").cloned())
     }
 
@@ -197,7 +262,7 @@ impl SettledRun {
         let input = self.input_of(node).ok_or_else(|| {
             anyhow::anyhow!(
                 "node '{node}' never started; cannot assert its input. Its events: {:?}",
-                self.replay.for_node(node).map(|e| e.kind()).collect::<Vec<_>>()
+                self.events_of(node).map(|e| e.kind()).collect::<Vec<_>>()
             )
         })?;
         let got = input.get(port);
@@ -214,23 +279,17 @@ impl SettledRun {
 
     /// True if the node was skipped (null-propagation: a required input closed).
     pub fn node_skipped(&self, node: &str) -> bool {
-        self.replay
-            .by_kind("node_skipped")
-            .any(|e| e.is_node(node))
+        self.events_of(node).any(|e| e.kind() == "node_skipped")
     }
 
     /// True if the node ran to completion at least once.
     pub fn node_completed(&self, node: &str) -> bool {
-        self.replay
-            .by_kind("node_completed")
-            .any(|e| e.is_node(node))
+        self.events_of(node).any(|e| e.kind() == "node_completed")
     }
 
     /// True if the node was started at least once.
     pub fn node_started(&self, node: &str) -> bool {
-        self.replay
-            .by_kind("node_started")
-            .any(|e| e.is_node(node))
+        self.events_of(node).any(|e| e.kind() == "node_started")
     }
 
     /// Assert a node was SKIPPED via null-propagation: a `node_skipped` event
@@ -244,7 +303,7 @@ impl SettledRun {
             bail!(
                 "expected node '{node}' to be skipped, but no node_skipped event for it. \
                  Its events: {:?}",
-                self.replay.for_node(node).map(|e| e.kind()).collect::<Vec<_>>()
+                self.events_of(node).map(|e| e.kind()).collect::<Vec<_>>()
             );
         }
         if self.node_completed(node) {
@@ -260,9 +319,8 @@ impl SettledRun {
     /// assertion must surface, never read past.
     pub fn assert_skip_reason(&self, node: &str, reason_kind: &str) -> Result<&Self> {
         let reasons: Vec<String> = self
-            .replay
-            .by_kind("node_skipped")
-            .filter(|e| e.is_node(node))
+            .events_of(node)
+            .filter(|e| e.kind() == "node_skipped")
             .map(|e| {
                 e.field("reason")
                     .and_then(|r| r.get("kind"))
@@ -295,7 +353,7 @@ impl SettledRun {
     /// first out-of-scope node, so deeper nodes stay blank rather than
     /// painting the whole graph "skipped".
     pub fn assert_untouched(&self, node: &str) -> Result<&Self> {
-        let kinds: Vec<&str> = self.replay.for_node(node).map(|e| e.kind()).collect();
+        let kinds: Vec<&str> = self.events_of(node).map(|e| e.kind()).collect();
         if !kinds.is_empty() {
             bail!("expected node '{node}' to have no events at all, got: {kinds:?}");
         }
@@ -313,7 +371,7 @@ impl SettledRun {
             bail!(
                 "expected node '{node}' to run to completion, but it did not. \
                  Its events: {:?}",
-                self.replay.for_node(node).map(|e| e.kind()).collect::<Vec<_>>()
+                self.events_of(node).map(|e| e.kind()).collect::<Vec<_>>()
             );
         }
         Ok(self)

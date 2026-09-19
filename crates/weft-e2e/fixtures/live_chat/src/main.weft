@@ -1,0 +1,18 @@
+# A live two-way WebSocket held through the ctx: an outside caller opens a
+# socket at the route; the echo nodes hold the conversation, replying to each
+# message with {echo, turn}. The rig opens the socket, sends two messages, and
+# asserts the echoes come back. TWO echoes read the same connection: inbound
+# is broadcast to every ctx reader (no node steals messages from another), so
+# every message the caller sends must come back twice, once from each echo.
+# The zero-Rust socket path (a Loop over `inbound`) is the socket_loop fixture.
+
+sock = Socket { path: "__E2E_PATH__" }
+echo = LiveWsEcho
+echo2 = LiveWsEcho
+out = Debug
+out2 = Debug
+
+echo.path = sock.path
+echo2.path = sock.path
+out.data = echo.done
+out2.data = echo2.done

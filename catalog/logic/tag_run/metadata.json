@@ -15,7 +15,6 @@
     {
       "name": "tags",
       "type": "List[String]",
-      "required": false,
       "description": "Tags as one list, for when they come from a node that already built the list. Wired inputs of your own are tags too; the two add up."
     }
   ],

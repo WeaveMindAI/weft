@@ -86,8 +86,15 @@ fn emitted_test_crate_has_the_expected_shape() {
     let registry = std::fs::read_to_string(dir.path().join("src/registry.rs")).unwrap();
     assert!(registry.contains("\"SlackSendMessage\""), "{registry}");
 
-    assert!(dir.path().join("Cargo.lock").is_file(), "workspace lock seeded");
-    assert!(dir.path().join("rust-toolchain.toml").is_file(), "toolchain pinned");
+    // A local crate is a MEMBER of the shared test workspace: the lock,
+    // the toolchain pin and the dev profile live at the workspace root
+    // (`emit_test_workspace`), never in the member.
+    assert!(!dir.path().join("Cargo.lock").exists(), "a member carries no lock of its own");
+    assert!(!dir.path().join("rust-toolchain.toml").exists(), "a member carries no toolchain pin");
+    assert!(
+        !std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap().contains("[workspace]"),
+        "a member declares no workspace of its own"
+    );
 
     let lib_rs = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("src/lib.rs")).unwrap();
     assert!(
@@ -123,13 +130,23 @@ fn container_mode_includes_are_mount_rooted() {
         dir.path(),
         &catalog,
         "slack",
-        &EmitPaths::Container { nodes_root: project_dir.path().join("nodes") },
+        &EmitPaths::Container { project_root: project_dir.path().to_path_buf() },
     )
     .expect("emit");
     let lib_rs = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("src/lib.rs")).unwrap();
     assert!(
-        lib_rs.contains("/weft/project-nodes/slack/send_message/mod.rs"),
+        lib_rs.contains("/weft/project-nodes/nodes/slack/send_message/mod.rs"),
         "container includes are mount-rooted:\n{lib_rs}"
+    );
+    // The container crate builds alone inside its image, so it is its
+    // own workspace with its own toolchain pin, and it carries the
+    // cache sweep the image's `cargo build` RUN calls after linking.
+    let root_toml = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+    assert!(root_toml.contains("[workspace]"), "{root_toml}");
+    assert!(dir.path().join("rust-toolchain.toml").is_file(), "toolchain pinned");
+    assert!(
+        dir.path().join(weft_compiler::worker_image::CACHE_GC_SCRIPT_NAME).is_file(),
+        "the cache sweep rides in the test crate like it does in the worker crate"
     );
 }
 
@@ -285,6 +302,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         group_boundary: None,
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         header_span: None,
@@ -294,6 +312,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         source_file: None,
     };
     let project = ProjectDefinition {

@@ -7,7 +7,7 @@ import type { FieldDefinition, PortDefinition } from '../types';
 import type { Widget } from '../../../protocol';
 import type { SpecField } from './port-specs';
 import { acceptsLiteral, ownValue } from '../types';
-import { SHOULD_FLOW_PORT } from '../../../protocol';
+import { SHOULD_NOT_FLOW_PORT, isGatePort } from '../../../protocol';
 
 /// A node's rendered input list, read off its data. Every parse and
 /// every projection path fills the list (the wire type is a required
@@ -50,19 +50,32 @@ export function fieldForInput(input: PortDefinition): FieldDefinition {
 	return field;
 }
 
-/// The field for `_should_flow`, the port that decides whether a node
-/// runs. Every node has it, and it is answered by a wire, so it gets no
-/// field of its own: the corner dock on the node is where it lives. The
-/// one exception is a value written straight into the source, which has
-/// to be visible to be changed or removed, and this is that field. One
+/// The field for the gate, the port that decides whether a node runs.
+/// Every node has it, and it is answered by a wire, so it gets no field
+/// of its own: the corner dock on the node is where it lives. The one
+/// exception is a value written straight into the source, which has to
+/// be visible to be changed or removed, and this is that field. One
 /// definition, so a node and a container show the same control.
-export function shouldFlowField(subject: 'node' | 'container'): FieldDefinition {
+///
+/// The gate has TWO spellings and a node carries one of them, so the
+/// field is built for the port that is actually written: the key, the
+/// label and the checkbox's meaning all follow `port`. Ticking
+/// `_should_flow` means "run this"; ticking `_should_not_flow` means
+/// "never run this" (a value on the inverted gate is what skips it).
+/// Building the wrong one would write the second spelling onto a node
+/// that already has the first, which the compiler refuses.
+export function gateField(port: string, subject: 'node' | 'container'): FieldDefinition {
+	const inside = subject === 'container' ? 'inside it ' : '';
+	const description =
+		port === SHOULD_NOT_FLOW_PORT
+			? `This ${subject} runs when the thing wired here did NOT happen. On means "never run this", and everything ${inside}downstream closes in turn.`
+			: `Whether this ${subject} runs. Off skips it, and everything ${inside}downstream closes in turn.`;
 	return {
-		key: SHOULD_FLOW_PORT,
-		label: SHOULD_FLOW_PORT,
+		key: port,
+		label: port,
 		type: 'checkbox',
 		portDriven: true,
-		description: `Whether this ${subject} runs. Off skips it, and everything ${subject === 'container' ? 'inside it ' : ''}downstream closes in turn.`,
+		description,
 	};
 }
 
@@ -77,7 +90,7 @@ export function inputRendersField(
 	if (input.synthesizedFromCarry) return false; // carry ghost: not editable
 	if (!acceptsLiteral(input)) return false;
 	if (opts.wired) return false;
-	if (input.name === SHOULD_FLOW_PORT) return opts.hasWrittenValue;
+	if (isGatePort(input.name)) return opts.hasWrittenValue;
 	return true;
 }
 

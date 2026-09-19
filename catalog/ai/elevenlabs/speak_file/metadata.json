@@ -87,7 +87,6 @@
     {
       "name": "stability",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0,
@@ -99,7 +98,6 @@
     {
       "name": "similarityBoost",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0,
@@ -111,7 +109,6 @@
     {
       "name": "speed",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0.7,

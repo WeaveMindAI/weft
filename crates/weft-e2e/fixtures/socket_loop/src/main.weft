@@ -1,0 +1,25 @@
+# A socket conversation with zero custom Rust: every message the caller sends
+# is one iteration of a Loop over the trigger's `inbound` stream, answered by a
+# Reply; a second socket path closes the moment it opens, with a code and a
+# reason, through Close. The rig holds the conversation on the first and reads
+# the close frame on the second.
+
+sock = Socket -> (inbound: Generator[JsonDict]) { path: "__E2E_PATH__/chat" }
+turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
+  parallel: false
+  over: ["msg"]
+  echo = ExecPython(msg: JsonDict) -> (body: JsonDict) {
+    code: "return {'body': {'echo': msg['text'], 'len': len(msg['text'])}}"
+  }
+  echo.msg = self.msg
+  say = Reply
+  say.body = echo.body
+  self.results = say.done
+}
+turn.msg = sock.inbound
+
+door = Socket { path: "__E2E_PATH__/closed" }
+knock = ExecPython(path: String) -> (ok: Boolean) { code: "return {'ok': True}" }
+knock.path = door.path
+shut = Close { code: 4002, reason: "closed on open" }
+shut._should_flow = knock.ok

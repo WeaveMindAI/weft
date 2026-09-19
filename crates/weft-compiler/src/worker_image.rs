@@ -118,7 +118,7 @@ pub const WEFT_MOUNT: &str = "/weft";
 /// In-container path to the project's `nodes/` directory. The build
 /// context stages `project-nodes/` here; every node's `#[path]` shim
 /// and every `{{catalog_path}}` substitution resolves under it (e.g.
-/// `/weft/project-nodes/basic/exec_python/mod.rs`). This is the only
+/// `/weft/project-nodes/nodes/base_catalog/basic/exec_python/mod.rs`). This is the only
 /// place node source comes from: the project owns all its nodes.
 pub const NODES_MOUNT: &str = "/weft/project-nodes";
 
@@ -421,19 +421,19 @@ fn collect_build_env(
 }
 
 /// Compute the in-container path for a node's source dir. The docker
-/// build stages the project's `nodes/` under `NODES_MOUNT`; the node's
-/// in-container path is its on-disk location relative to `nodes/`.
+/// build stages every referenced node under `NODES_MOUNT` at its
+/// project-relative path (`nodes/...`, or `src/...` for a node beside
+/// the code); the node's in-container path is that same path.
 fn node_catalog_path(
     node_type: &str,
     source_dir: &Path,
     project_root: &Path,
 ) -> CompileResult<String> {
-    let nodes_root = project_root.join("nodes");
-    let rel = source_dir.strip_prefix(&nodes_root).map_err(|_| {
+    let rel = source_dir.strip_prefix(project_root).map_err(|_| {
         CompileError::Build(format!(
-            "node '{node_type}' source dir {} is not under project nodes root {}",
+            "node '{node_type}' source dir {} is not under the project root {}",
             source_dir.display(),
-            nodes_root.display()
+            project_root.display()
         ))
     })?;
     Ok(format!("{NODES_MOUNT}/{}", rel.display()))

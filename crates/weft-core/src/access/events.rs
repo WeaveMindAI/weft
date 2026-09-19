@@ -257,14 +257,119 @@ pub enum VerifyKind {
     TokenEcho,
     /// A signed OIDC identity token in the push's Authorization
     /// header, verified against the named issuer's published keys and
-    /// our expected audience (the queue-relay shape).
+    /// our expected audience (the queue-relay shape). The two
+    /// addresses are templates over the connection's stored values
+    /// (`"{jwks_url}"`) when the scheme verifies CALLERS of a route
+    /// through an auth connection, and plain literals when it verifies
+    /// a provider's pushes (there is no connection to read at push
+    /// time, so a push recipe must spell them out).
     Oidc {
         /// The `iss` values the token may carry.
-        issuers: Vec<String>,
+        issuers: Vec<super::spec::Template>,
         /// Where the issuer publishes its signing keys (JWKS).
-        jwks_url: String,
+        jwks_url: super::spec::Template,
+    },
+    /// A shared key presented on every request, compared in constant
+    /// time against the set the connection stores (one per line in its
+    /// `keys` value). The identity is the matched key's position, so a
+    /// program can tell its callers apart without ever seeing a key.
+    /// Only meaningful for callers of a route (a provider never pushes
+    /// with one of our keys), so a push recipe may not declare it.
+    ApiKeys {
+        /// The header the key rides in.
+        #[serde(default = "default_api_key_header", skip_serializing_if = "is_default_api_key_header")]
+        header: String,
+        /// Also accept the key as `Authorization: Bearer <key>`.
+        #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
+        bearer: bool,
     },
 }
+
+fn default_api_key_header() -> String {
+    "X-Api-Key".to_string()
+}
+
+fn is_default_api_key_header(h: &String) -> bool {
+    h == "X-Api-Key"
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl VerifyKind {
+    /// The scheme's wire tag (`hmac`, `oidc`, ...), for messages.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            VerifyKind::Hmac { .. } => "hmac",
+            VerifyKind::Signature { .. } => "signature",
+            VerifyKind::TokenEcho => "token_echo",
+            VerifyKind::Oidc { .. } => "oidc",
+            VerifyKind::ApiKeys { .. } => "api_keys",
+        }
+    }
+
+    /// The stored value names the scheme READS off a connection when
+    /// it verifies callers: the material it keys on (`signing_secret`,
+    /// `public_key`, `keys`) plus every placeholder its templates name.
+    /// A recipe's paste page must declare each of them, checked at
+    /// metadata load.
+    pub fn required_value_names(&self) -> Result<Vec<String>, String> {
+        Ok(match self {
+            VerifyKind::Hmac { .. } => vec![SIGNING_SECRET.to_string()],
+            VerifyKind::Signature { .. } => vec![PUBLIC_KEY.to_string()],
+            VerifyKind::ApiKeys { .. } => vec![API_KEYS.to_string()],
+            VerifyKind::TokenEcho => Vec::new(),
+            VerifyKind::Oidc { issuers, jwks_url } => {
+                let mut names = jwks_url.placeholders()?;
+                for issuer in issuers {
+                    for name in issuer.placeholders()? {
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+                names
+            }
+        })
+    }
+
+    /// The scheme with its templates resolved against a connection's
+    /// stored values: what the verifier runs. A literal recipe resolves
+    /// to itself; a placeholder the connection does not store is a loud
+    /// error naming it.
+    pub fn resolved(&self, values: &BTreeMap<String, String>) -> Result<VerifyKind, String> {
+        Ok(match self {
+            VerifyKind::Oidc { issuers, jwks_url } => VerifyKind::Oidc {
+                issuers: issuers
+                    .iter()
+                    .map(|t| t.resolve(values).map(super::spec::Template::new))
+                    .collect::<Result<Vec<_>, _>>()?,
+                jwks_url: super::spec::Template::new(jwks_url.resolve(values)?),
+            },
+            other => other.clone(),
+        })
+    }
+
+    /// Does the scheme interpolate any stored value? A push recipe has
+    /// no connection to read, so its scheme must be fully literal.
+    pub fn has_placeholders(&self) -> Result<bool, String> {
+        match self {
+            VerifyKind::Oidc { .. } => Ok(!self.required_value_names()?.is_empty()),
+            _ => Ok(false),
+        }
+    }
+}
+
+/// The stored value name an HMAC scheme keys on.
+pub const SIGNING_SECRET: &str = "signing_secret";
+/// The stored value name a public-key scheme verifies against.
+pub const PUBLIC_KEY: &str = "public_key";
+/// The stored value name holding a caller's accepted keys, one per line.
+pub const API_KEYS: &str = "keys";
+/// The optional stored value name an identity-token scheme checks the
+/// token's audience against; absent = the audience is not checked.
+pub const AUDIENCE: &str = "audience";
 
 /// How a digest or signature is written into its header, shared by
 /// the HMAC and the public-key schemes.
@@ -739,12 +844,30 @@ impl WebhookRecipe {
                         "service '{service}' declares an oidc verify naming no issuers"
                     ));
                 }
-                if !jwks_url.starts_with("https://") {
+                // A push has no connection to read, so the addresses
+                // must be spelled out here.
+                if self.verify.has_placeholders()? {
+                    return Err(format!(
+                        "service '{service}' declares an oidc push verify with a \
+                         placeholder; a push recipe names its issuers and jwks_url \
+                         literally (placeholders are for the `verify` block of an \
+                         access recipe, which reads the connection)"
+                    ));
+                }
+                if !jwks_url.0.starts_with("https://") {
                     return Err(format!(
                         "service '{service}' declares an oidc verify whose jwks_url is not \
                          https; signing keys must come over TLS"
                     ));
                 }
+            }
+            VerifyKind::ApiKeys { .. } => {
+                return Err(format!(
+                    "service '{service}' declares an api_keys push verify; a provider \
+                     never presents one of our keys, so a push is verified by hmac, \
+                     signature, token_echo or oidc (api_keys is for the `verify` block \
+                     of an access recipe, which gates callers of a route)"
+                ));
             }
             VerifyKind::TokenEcho => {}
         }

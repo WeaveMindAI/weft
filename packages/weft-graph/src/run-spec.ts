@@ -68,6 +68,11 @@ export function parseRunSpec(value: unknown): RunSpec {
     if (value === undefined) return;
     for (const frame of array(value, where)) {
       const item = object(frame, where);
+      // An iteration frame or a call frame, nothing else.
+      if ('site' in item) {
+        if (typeof item.site !== 'string' || item.site.length === 0) throw new Error(`${where}: invalid call site`);
+        continue;
+      }
       if (!Number.isInteger(item.index) || Number(item.index) < 0 || Number(item.index) > 0xffffffff) throw new Error(`${where}: invalid iteration index`);
     }
   };
@@ -147,6 +152,8 @@ export interface Expected {
 }
 
 // SYNC: ExpectedWire <-> crates/weft-core/src/run_spec.rs ExpectedWire
+// `node` is the address a person types (`one.strip`, through the site
+// for a node in an included file); `frames` holds loop positions only.
 export interface ExpectedWire {
   ordinal?: number;
   closed?: boolean;
@@ -172,6 +179,9 @@ export interface BakeSummary {
   at_unix: number;
 }
 
+/// Every entry is a place: a `locatedKey` (`one/Clean.strip` for a node
+/// of an included file under the site `one`, the bare id at the top),
+/// since a body reached through two sites is two places of a run.
 // SYNC: RunSelection <-> crates/weft-core/src/project/selection.rs RunSelection
 export interface RunSelection {
   nodes: string[];
@@ -186,13 +196,15 @@ export interface RunSelection {
 // SYNC: Resolved, CrossingPort, Refusal <-> crates/weft-core/src/run_spec.rs Resolved, CrossingPort, Refusal
 export interface Resolved {
   selection: RunSelection;
-  kicks: Array<{ node: string; firing: boolean; payload: JsonValue | null; port_snapshot?: JsonValue }>;
-  provided: Array<{ source_node: string; source_port: string; value: JsonValue; consumers: Array<[string, string]> }>;
+  kicks: Array<{ node: string; frames?: Frame[]; firing: boolean; payload: JsonValue | null; port_snapshot?: JsonValue }>;
+  provided: Array<{ source_node: string; source_port: string; frames?: Frame[]; value: JsonValue; consumers: Array<[string, string]> }>;
   crossings: CrossingPort[];
   warnings: string[];
 }
 
 export interface CrossingPort {
+  /// The receiving node as the program spells it (`one.strip`), the
+  /// same key a `from` entry uses.
   node: string;
   port: string;
   source_node: string;
@@ -246,11 +258,27 @@ export function specSummary(spec: RunSpec): string {
   return parts.length === 0 ? 'whole graph' : parts.join(', ');
 }
 
-/// The group the user is standing in, read off the include navigation
-/// prefix (`c.inner.` is the group `c.inner`); `null` at the top level.
-export function groupOfPrefix(execPrefix: string): string | null {
-  const trimmed = execPrefix.endsWith('.') ? execPrefix.slice(0, -1) : execPrefix;
-  return trimmed.length === 0 ? null : trimmed;
+/// A node or group addressed the way the source reads, through the
+/// call sites descended into: `addressOf(['c'], 'C.inner')` is
+/// `c.inner`, and `addressOf(['c', 'C.inner'], 'Inner.deep')` is
+/// `c.inner.deep`. Each site id after the first is scoped under the
+/// body it sits in (`C.inner`), and the id being addressed under the
+/// body the view shows (`Inner.deep`), so the body prefix comes off
+/// each: what is left is the chain of names a person wrote. This is
+/// the spelling `weft run --group` and `weft events --node` take.
+export function addressOf(callPath: readonly string[], id: string): string {
+  const local = (scoped: string) => scoped.slice(scoped.indexOf('.') + 1);
+  if (callPath.length === 0) return id;
+  return [callPath[0], ...callPath.slice(1).map(local), local(id)].join('.');
+}
+
+/// The group the user is standing in, addressed through the call sites
+/// descended into (`['c', 'C.inner']` is the group `c.inner`); `null`
+/// at the top level.
+export function groupOfCallPath(callPath: readonly string[]): string | null {
+  if (callPath.length === 0) return null;
+  const last = callPath[callPath.length - 1];
+  return addressOf(callPath.slice(0, -1), last);
 }
 
 /// Whether a spec is scoped to `group` or to something inside it.
@@ -305,3 +333,4 @@ export function exampleNameProblem(name: string): string | undefined {
   }
   return 'an example needs a name (a word, not a path or a directory)';
 }
+import type { Frame } from './protocol';

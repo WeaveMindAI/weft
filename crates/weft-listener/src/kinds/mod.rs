@@ -6,9 +6,12 @@
 //!   - parses the spec's opaque `config` blob into the kind's typed
 //!     struct from `weft_core::signal`.
 //!   - owns its own background task (timer schedule, SSE connect),
-//!     `process`, `render`, `compute_routing`, and any /action
-//!     handlers.
+//!     `process`, `render` and `compute_routing`.
 //!   - registers itself with the inventory at the bottom of the file.
+//!
+//! Not every file here is a kind: `event_source.rs` is shared machinery
+//! (backoff, payload coercion) that several kinds lean on and registers
+//! nothing.
 //!
 //! Adding a new kind = create `kinds/<name>.rs` (handler) + matching
 //! file in `weft_core::signal`. The framework discovers it via the
@@ -43,9 +46,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec};
 
@@ -54,7 +55,7 @@ use parking_lot::Mutex;
 use crate::config::ListenerConfig;
 use crate::event_context::FireContext;
 use crate::fire_sink::FireSignalSink;
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use crate::protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent};
 use crate::registry::{RegisteredSignal, Registry, ServingState, TaskGuard, Transport};
 
 /// Everything a kind's background task is spawned with, bundled: the
@@ -99,12 +100,7 @@ pub trait KindHandler: Send + Sync {
     /// spec's config blob fails to deserialize into the kind's typed
     /// shape; the caller surfaces that as a 400 to whoever submitted
     /// the register.
-    fn compute_routing(
-        &self,
-        token: &str,
-        spec: &SignalSpec,
-        secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting>;
+    fn compute_routing(&self, spec: &SignalSpec) -> Result<SignalRouting>;
 
     /// True for kinds whose fires can arrive as BROAD account-routed
     /// pushes (matched by connection + topic rather than by an exact
@@ -123,12 +119,17 @@ pub trait KindHandler: Send + Sync {
     /// schema (Timer: `{"next_fire_at_unix_ms": <abs unix>}` for After,
     /// `{}` for Cron/At since those are wall-clock-absolute).
     ///
-    /// **Persistence policy**: `signal_insert`'s UPSERT runs
-    /// `kind_state = EXCLUDED.kind_state` on conflict (entry-row
-    /// re-register on reactivate). Whatever this method returns
-    /// REPLACES the previously-persisted state. `prior` is that
-    /// previously-persisted state when the reused entry token already
-    /// has a row (None on first registration). Timer IGNORES it
+    /// **Persistence policy**: what this returns replaces the stored
+    /// state, as long as it is not OLDER than what is there. The write
+    /// carries a sequence number and the row keeps the higher one
+    /// (`signal_insert`), so a registration that started before a live
+    /// task's own update cannot land on top of it and undo it. In the
+    /// ordinary case (a re-register on reactivate, with no task
+    /// running) there is nothing newer and this simply replaces.
+    ///
+    /// `prior` is the previously-persisted state when the reused entry
+    /// token already has a row (None on first registration). Timer
+    /// IGNORES it
     /// (reactivate is a fresh schedule by design); a kind whose state
     /// is a feed cursor (poll_endpoint) returns it forward so a
     /// deactivate/activate cycle never re-primes and silently
@@ -163,6 +164,41 @@ pub trait KindHandler: Send + Sync {
         payload: Value,
     ) -> ProcessOutcome;
 
+    /// What this signal wakes with when a PERSON wakes it by hand
+    /// (`weft wake`), instead of waiting for whatever it waits for.
+    ///
+    /// `None`, the default, means this kind cannot be woken that way,
+    /// and it is the honest answer for almost every kind: a form is
+    /// waiting for an answer, a provider subscription for an event, and
+    /// there is nothing truthful to invent in their place. A timer is
+    /// the exception, because what it is waiting for IS the passage of
+    /// time and "now" is a real value for it.
+    ///
+    /// The payload has to be this kind's own, which is the whole reason
+    /// this is a method here rather than a branch in whoever handles the
+    /// request: a tier that does not own a kind's wake shape cannot mint
+    /// one without owning it by accident.
+    fn wake_by_hand(&self) -> Option<Value> {
+        None
+    }
+
+    /// Does this verified provider push address this signal, and what
+    /// payload does it wake with?
+    ///
+    /// Only for kinds fed by pushes the provider aims at an ACCOUNT
+    /// rather than at one subscription: the push names a connection and
+    /// a topic, and which of that connection's signals it feeds is the
+    /// kind's own question (its topic name, its subscription scope). A
+    /// kind whose fires address an exact token never answers here, which
+    /// is why the default is `None`.
+    ///
+    /// The signal's own filter is NOT this method's business: the
+    /// listener applies the one shared predicate gate to whatever comes
+    /// back, the same gate every other fire passes.
+    fn match_push(&self, _sig: &RegisteredSignal, _push: &PushEvent) -> Option<Value> {
+        None
+    }
+
     /// Render the consumer-facing payload for this signal. Returns
     /// `Ok(None)` for kinds with no consumer surface (Timer,
     /// SseSubscribe) and `Err` for malformed specs (so the caller
@@ -181,18 +217,6 @@ pub trait KindHandler: Send + Sync {
     ) {
     }
 
-    /// Handle a kind-specific /action (e.g. `regenerate_api_key`).
-    /// Default: no actions defined.
-    fn handle_action(
-        &self,
-        _token: &str,
-        action: &str,
-        _payload: Value,
-        _sig: &RegisteredSignal,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<(Value, Option<SignalRouting>)> {
-        anyhow::bail!("kind '{}' has no action '{}'", self.tag(), action)
-    }
 }
 
 inventory::collect!(&'static dyn KindHandler);
@@ -214,18 +238,16 @@ fn handler_or_err(tag: &str) -> Result<&'static dyn KindHandler> {
 
 // ----- Public listener entrypoints (HTTP-driven) ---------------------
 
-/// What the routing and kind_state come from. `Mint` is the register
-/// path: compute routing fresh (may mint a secret into the cache) and
-/// compute the initial kind_state, handing the kind the token's
-/// previously-persisted state (entry tokens are reused across
-/// reactivates) so cursor-bearing kinds carry it forward. `Restore`
-/// is the rehydrate / pod-move path: both values came back from the
-/// durable row, never recompute (a fresh `compute_routing` would mint
-/// a new API key and silently invalidate the user's existing one; a
-/// fresh `compute_initial_state` would reset a Timer's clock).
+/// What the routing and kind_state come from. `Fresh` is the register
+/// path: compute the routing and the initial kind_state from the spec,
+/// handing the kind the token's previously-persisted state (entry
+/// tokens are reused across reactivates) so cursor-bearing kinds carry
+/// it forward. `Restore` is the rehydrate / pod-move path: both values
+/// came back from the durable row, never recompute (the row is what
+/// the dispatcher routes by, and a fresh `compute_initial_state` would
+/// reset a Timer's clock).
 pub enum RoutingSource {
-    Mint {
-        secret_cache: Arc<DashMap<String, String>>,
+    Fresh {
         prior_kind_state: Option<Value>,
         /// The write-fence version the prior state was read at.
         prior_seq: i64,
@@ -290,10 +312,10 @@ pub async fn register_in_registry(
             spec.kind,
         );
     }
-    let fresh = matches!(source, RoutingSource::Mint { .. });
+    let fresh = matches!(source, RoutingSource::Fresh { .. });
     let (routing, kind_state_owned, state_seq) = match source {
-        RoutingSource::Mint { secret_cache, prior_kind_state, prior_seq } => {
-            let r = handler.compute_routing(&token, &spec, &secret_cache)?;
+        RoutingSource::Fresh { prior_kind_state, prior_seq } => {
+            let r = handler.compute_routing(&spec)?;
             let s = handler.compute_initial_state(&spec, prior_kind_state.as_ref())?;
             (r, s, prior_seq)
         }
@@ -386,6 +408,57 @@ pub async fn process(
     Ok(handler.process_entry(&signal, payload))
 }
 
+/// What a signal held here wakes with when a person wakes it by hand.
+///
+/// `Ok(None)` is a real answer: the kind cannot be woken that way, and
+/// whoever asked should say so rather than invent a payload. An unknown
+/// token is an error, because the caller resolved this pod as the holder
+/// and a token that is not here means the two disagree.
+pub fn wake_by_hand(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
+    let signal = registry
+        .get(token)
+        .ok_or_else(|| anyhow::anyhow!("unknown token: {token}"))?;
+    Ok(handler_or_err(&signal.spec.kind)?.wake_by_hand())
+}
+
+/// Which of `tokens` this verified provider push feeds, and with what.
+///
+/// Two gates, in this order. The KIND says whether the push addresses
+/// the signal at all and what payload it becomes, because that reads the
+/// kind's own settings. Then the signal's own filter runs, through the
+/// one shared gate every fire passes, so a filter means the same thing
+/// however the event reached us.
+///
+/// A token this pod no longer holds is skipped rather than reported: the
+/// signal moved during a scale-down and its new holder is asked in the
+/// same round, so answering "not held" here would only duplicate work
+/// the dispatcher already did when it resolved the holders.
+pub fn match_push(push: &PushEvent, tokens: &[String], registry: Arc<Registry>) -> Vec<MatchedPush> {
+    let mut matched = Vec::new();
+    for token in tokens {
+        let Some(signal) = registry.get(token) else { continue };
+        let Some(handler) = lookup(&signal.spec.kind) else {
+            tracing::warn!(
+                target: "weft_listener::kinds",
+                %token, kind = %signal.spec.kind,
+                "a registered signal has no handler; it cannot be fed by a push"
+            );
+            continue;
+        };
+        let Some(payload) = handler.match_push(&signal, push) else { continue };
+        if !weft_core::signal::predicate::matches(&signal.spec.match_predicates, &payload) {
+            tracing::debug!(
+                target: "weft_listener::kinds",
+                %token, kind = %signal.spec.kind,
+                "push did not match the signal's filter; not firing"
+            );
+            continue;
+        }
+        matched.push(MatchedPush { token: token.clone(), payload });
+    }
+    matched
+}
+
 /// Render the consumer-facing payload for a registered signal.
 pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
     let signal = registry
@@ -395,17 +468,11 @@ pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
     handler.render(token, &signal)
 }
 
-/// Display payload returned to the inspector. Pulls plaintext
-/// from `secret_cache` if the listener still holds one (which is
-/// only true for the same Pod that minted it; restart loses it),
-/// and the LIVE serving state for the kinds whose task reports one
-/// (which transport serves the signal, what it is doing right now).
-pub fn compute_display(
-    token: &str,
-    sig: &RegisteredSignal,
-    secret_cache: &Arc<DashMap<String, String>>,
-) -> Value {
-    let secret = secret_cache.get(token).map(|v| v.clone());
+/// Display payload returned to the inspector: the routing (surface +
+/// auth), the kind and its config, and the LIVE serving state for the
+/// kinds whose task reports one (which transport serves the signal,
+/// what it is doing right now).
+pub fn compute_display(sig: &RegisteredSignal) -> Value {
     let serving = {
         let s = sig.serving.lock();
         if s.status.is_empty() && s.transport.is_none() {
@@ -424,7 +491,6 @@ pub fn compute_display(
     serde_json::json!({
         "surface": sig.routing.surface,
         "auth": sig.routing.auth,
-        "secret": secret,
         "kind": sig.spec.kind,
         "config": sig.spec.config,
         "serving": serving,
@@ -451,107 +517,199 @@ pub async fn on_unregister(
     }
 }
 
-/// Dispatch an /action. Looks up the kind's handler and delegates.
-pub fn handle_action(
-    token: &str,
-    action_kind: &str,
-    payload: Value,
-    registry: &Arc<Registry>,
-    secret_cache: &Arc<DashMap<String, String>>,
-) -> Result<(Value, Option<SignalRouting>)> {
-    let sig = registry
-        .get(token)
-        .ok_or_else(|| anyhow::anyhow!("unknown token: {token}"))?;
-    let handler = handler_or_err(&sig.spec.kind)?;
-    handler.handle_action(token, action_kind, payload, &sig, secret_cache)
-}
-
-// ----- Helpers for kind impls ----------------------------------------
-
-/// Mint an opaque plaintext key. Kinds use this when generating an
-/// api-key gate (live-caller OptionalApiKey / regenerate_api_key).
-pub fn mint_api_key() -> String {
-    let bytes: [u8; 32] = rand::random();
-    hex::encode(bytes)
-}
-
-pub fn sha256_hex(s: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    hex::encode(h.finalize())
-}
-
-pub fn default_api_key_header() -> &'static str {
-    "X-Api-Key"
-}
-
-/// Map a `PublicEntryAuth` policy onto a `SignalRouting` for the given
-/// surface, minting and hashing a key when the policy requires one.
-/// Shared by every PublicEntry kind that uses the api-key gate (the
-/// live-caller kinds): the auth-to-routing mapping is ONE concept exposed
-/// at several surfaces, not a per-kind copy. On `OptionalApiKey` the
-/// plaintext is stashed in `secret_cache` under `token` (served via
-/// `/display` until the pod restarts) and only its sha256 hash crosses the
-/// wire on the row.
-pub fn public_entry_auth_to_routing(
-    token: &str,
-    surface: weft_core::primitive::SignalSurface,
-    auth: &weft_core::signal::PublicEntryAuth,
-    secret_cache: &Arc<DashMap<String, String>>,
-) -> SignalRouting {
-    use weft_core::primitive::SignalAuth;
-    use weft_core::signal::PublicEntryAuth;
-    match auth {
-        PublicEntryAuth::None => SignalRouting {
-            surface,
-            auth: SignalAuth::None,
-            auth_config: Value::Null,
-        },
-        PublicEntryAuth::OptionalApiKey => {
-            let plaintext = mint_api_key();
-            let hash = sha256_hex(&plaintext);
-            secret_cache.insert(token.to_string(), plaintext);
-            SignalRouting {
-                surface,
-                auth: SignalAuth::ApiKey,
-                auth_config: serde_json::json!({
-                    "header_name": default_api_key_header(),
-                    "value_hash": hash,
-                }),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Every kind shipped in weft-core must have a matching listener
-    /// handler. A mismatch surfaces at runtime as "unknown signal
-    /// kind"; guard at test time. Add the new tag here when shipping
-    /// a new kind.
+    /// handler, or activating a program that uses it fails at runtime
+    /// with "unknown signal kind".
+    ///
+    /// Read off weft-core's OWN inventory rather than a list written
+    /// here. A hand-kept list is a list of what somebody remembered:
+    /// this test used to hold one, so shipping a kind in core with no
+    /// handler here passed green and broke at activation, which is the
+    /// exact thing it exists to stop.
     #[test]
     fn every_core_kind_has_a_handler() {
-        let mut tags: Vec<&'static str> = inventory::iter::<&'static dyn KindHandler>
+        let mut handled: Vec<&'static str> = inventory::iter::<&'static dyn KindHandler>
             .into_iter()
             .map(|h| h.tag())
             .collect();
-        tags.sort_unstable();
+        handled.sort_unstable();
+        let mut shipped: Vec<&'static str> =
+            inventory::iter::<weft_core::signal::SignalKindEntry>
+                .into_iter()
+                .map(|entry| entry.tag)
+                .collect();
+        shipped.sort_unstable();
         assert_eq!(
-            tags,
-            vec![
-                "api_endpoint",
-                "form",
-                "live_socket",
-                "poll_endpoint",
-                "provider_events",
-                "socket_listen",
-                "sse_subscribe",
-                "stream_listen",
-                "timer",
-            ],
-            "listener handlers must cover every core kind; update this list when adding a kind"
+            handled, shipped,
+            "every signal kind weft-core ships needs a handler here, and a handler here \
+             needs a kind in core; whichever side is longer is the side that moved"
         );
+    }
+
+    // ----- Matching a provider push against what this pod holds ------
+    //
+    // These pin the tier boundary. The dispatcher hands over a verified
+    // push and a list of candidate tokens; every decision about WHICH of
+    // them it feeds is made here. If someone moves one of these
+    // decisions back into the dispatcher, the matching answer stops
+    // coming from `match_push` and these tests stop passing.
+
+    fn registered(kind: &str, config: Value, predicates: Vec<weft_core::signal::Predicate>) -> RegisteredSignal {
+        RegisteredSignal {
+            spec: SignalSpec {
+                kind: kind.to_string(),
+                config,
+                consumer_kind: None,
+                access: None,
+                match_predicates: predicates,
+            },
+            node_id: "n1".into(),
+            tenant_id: "t1".into(),
+            is_resume: false,
+            color: None,
+            placement_generation: 1,
+            task: None,
+            routing: SignalRouting {
+                surface: weft_core::primitive::SignalSurface::Internal,
+                auth: weft_core::primitive::SignalAuth::None,
+                auth_config: Value::Null,
+            },
+            serving: Arc::new(Mutex::new(ServingState::default())),
+        }
+    }
+
+    fn subscription(topic: &str, scope: &str) -> Value {
+        serde_json::json!({ "topic": topic, "scope": scope })
+    }
+
+    fn push(topic: &str, event: Value) -> PushEvent {
+        PushEvent { service: "slack".into(), topic: topic.into(), event }
+    }
+
+    fn holding(entries: &[(&str, RegisteredSignal)]) -> Arc<Registry> {
+        let registry = Arc::new(Registry::default());
+        for (token, sig) in entries {
+            registry.insert((*token).to_string(), sig.clone());
+        }
+        registry
+    }
+
+    #[test]
+    fn a_push_feeds_the_subscription_on_its_own_topic() {
+        let event = serde_json::json!({ "channel": "C1", "text": "hi" });
+        let registry = holding(&[(
+            "tok",
+            registered("provider_events", subscription("messages", "account"), vec![]),
+        )]);
+        let got = match_push(&push("messages", event.clone()), &["tok".into()], registry);
+        assert_eq!(got.len(), 1, "the topics agree, so it fires");
+        assert_eq!(got[0].token, "tok");
+        assert_eq!(got[0].payload, event, "and it wakes with the event as it arrived");
+    }
+
+    /// One connection can hold several topics whose field names
+    /// overlap, so a mailbox push must not wake a file watch.
+    #[test]
+    fn a_push_on_another_topic_feeds_nothing() {
+        let registry = holding(&[(
+            "tok",
+            registered("provider_events", subscription("files", "account"), vec![]),
+        )]);
+        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        assert!(got.is_empty());
+    }
+
+    /// An app-wide subscription means every install of the app, which a
+    /// push aimed at ONE account can never be. Serving it here would
+    /// half-serve it, so it is left to the dial-out socket.
+    #[test]
+    fn an_app_wide_subscription_is_not_served_by_an_account_push() {
+        let registry = holding(&[(
+            "tok",
+            registered("provider_events", subscription("messages", "app"), vec![]),
+        )]);
+        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        assert!(got.is_empty());
+    }
+
+    /// The signal's own filter runs on a pushed payload exactly as it
+    /// runs on one that arrived down a socket: a filter means the same
+    /// thing however the event reached us.
+    #[test]
+    fn the_signals_own_filter_still_decides() {
+        let only_c1 = vec![weft_core::signal::Predicate::eq("channel", "C1")];
+        let registry = holding(&[(
+            "tok",
+            registered("provider_events", subscription("messages", "account"), only_c1),
+        )]);
+        let wrong = serde_json::json!({ "channel": "C2" });
+        assert!(match_push(&push("messages", wrong), &["tok".into()], registry.clone()).is_empty());
+        let right = serde_json::json!({ "channel": "C1" });
+        assert_eq!(match_push(&push("messages", right), &["tok".into()], registry).len(), 1);
+    }
+
+    /// Every other kind answers "not mine" by default, so a push can
+    /// never wake a timer or a form that happens to hang off the same
+    /// connection.
+    #[test]
+    fn a_kind_that_is_not_fed_by_pushes_is_never_matched() {
+        let registry = holding(&[(
+            "tok",
+            registered("timer", serde_json::json!({ "topic": "messages" }), vec![]),
+        )]);
+        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        assert!(got.is_empty(), "a timer is not fed by a provider push, whatever its config says");
+    }
+
+    /// A timer is the one kind a person can wake by hand, because what
+    /// it waits for is the clock and "now" is true for it. The payload
+    /// is the kind's own, and it is the same two fields a real tick
+    /// carries, so the node cannot tell the two apart and does not have
+    /// to.
+    #[test]
+    fn a_timer_is_the_kind_that_can_be_woken_by_hand() {
+        let registry = holding(&[("tok", registered("timer", serde_json::json!({}), vec![]))]);
+        let payload = wake_by_hand("tok", registry)
+            .expect("the token is held here")
+            .expect("a timer can be woken");
+        assert!(payload["scheduledTime"].is_string(), "{payload}");
+        assert!(payload["actualTime"].is_string(), "{payload}");
+        assert_eq!(
+            payload["scheduledTime"], payload["actualTime"],
+            "a hand wake was aimed at this moment, so there is no gap to report"
+        );
+    }
+
+    /// Every other kind answers with nothing, and whoever asked refuses
+    /// rather than inventing what a form was waiting to hear.
+    #[test]
+    fn a_kind_with_no_truthful_stand_in_cannot_be_woken() {
+        for kind in ["form", "provider_events", "poll_endpoint", "route", "socket"] {
+            let registry = holding(&[("tok", registered(kind, serde_json::json!({}), vec![]))]);
+            let answer = wake_by_hand("tok", registry).expect("the token is held here");
+            assert!(answer.is_none(), "{kind} has nothing to wake with");
+        }
+    }
+
+    /// A token this pod does not hold is an error, not a quiet nothing:
+    /// whoever asked resolved this pod as the holder, so the two
+    /// disagreeing is worth saying out loud.
+    #[test]
+    fn waking_a_token_this_pod_does_not_hold_is_an_error() {
+        let why = wake_by_hand("gone", holding(&[])).expect_err("not held here");
+        assert!(format!("{why:#}").contains("gone"), "{why:#}");
+    }
+
+    /// A token that moved to another pod mid-push is simply not this
+    /// pod's answer to give; the dispatcher asked its new holder too.
+    #[test]
+    fn a_token_this_pod_no_longer_holds_is_skipped() {
+        let registry = holding(&[]);
+        let got = match_push(&push("messages", serde_json::json!({})), &["gone".into()], registry);
+        assert!(got.is_empty());
     }
 }

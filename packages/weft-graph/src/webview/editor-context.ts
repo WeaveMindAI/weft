@@ -32,9 +32,10 @@ export interface EditorContext {
   readonly activeFileName: string;
   /// Include-navigation depth: 0 at the entry file, >0 inside an included file.
   readonly navDepth: number;
-  /// The dotted alias chain of the current navigation (used to scope execution
-  /// values to the active subgraph). Empty at depth 0.
-  readonly execPrefix: string;
+  /// The call sites of the current navigation, outermost first (what
+  /// scopes execution values to the calls the view descended through).
+  /// Empty at depth 0.
+  readonly callPath: string[];
   /// Live + replayed execution state (per-node statuses + outputs + inspector
   /// logs). A replay panel writes a past run's end-state here via the host; the
   /// canvas already colors nodes from it.

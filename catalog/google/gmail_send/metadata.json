@@ -22,53 +22,45 @@
     {
       "name": "to",
       "type": "String | List[String]",
-      "required": false,
       "label": "To"
     },
     {
       "name": "cc",
       "type": "String | List[String]",
-      "required": false,
       "label": "Cc"
     },
     {
       "name": "bcc",
       "type": "String | List[String]",
-      "required": false,
       "label": "Bcc"
     },
     {
       "name": "subject",
       "type": "String",
-      "required": false,
       "label": "Subject"
     },
     {
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Text body"
     },
     {
       "name": "html",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "HTML body",
       "description": "Text and/or HTML; both together send a proper alternative pair."
     },
     {
       "name": "replyTo",
       "type": "String",
-      "required": false,
       "label": "Reply to message id",
       "description": "Send as a reply in this message's thread (the id a Gmail trigger or Get emits)."
     },
     {
       "name": "attachments",
       "type": "File | List[File]",
-      "required": false,
       "description": "Stored files to attach."
     }
   ],

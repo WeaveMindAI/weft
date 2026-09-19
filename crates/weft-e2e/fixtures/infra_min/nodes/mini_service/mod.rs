@@ -25,8 +25,9 @@ impl Node for MiniServiceNode {
     async fn provision_infra(
         &self,
         _ctx: InfraProvisionContext,
-        _input: ValueBag,
+        input: ValueBag,
     ) -> WeftResult<InfraSpec> {
+        let reachable: bool = input.get("reachable")?;
         Ok(InfraSpec {
             units: vec![Unit {
                 name: "svc".into(),
@@ -49,12 +50,21 @@ impl Node for MiniServiceNode {
                 .with_readiness(Probe::http("/health", PORT).with_initial_delay(2))],
                 ..Default::default()
             }],
+            // A door is part of what this node IS, and its author left
+            // the choice to whoever writes it into a program. Off, the
+            // endpoint answers only inside the cluster, as it always
+            // did; on, it gets an address on the machine the runtime
+            // runs on, and `weft infra list-doors` prints it.
             endpoints: vec![Endpoint {
                 name: "api".into(),
                 unit: "svc".into(),
                 container: "app".into(),
                 port: "http".into(),
-                expose: Expose::ClusterInternal,
+                expose: if reachable {
+                    Expose::SameNetwork
+                } else {
+                    Expose::ClusterInternal
+                },
             }],
             ..Default::default()
         })

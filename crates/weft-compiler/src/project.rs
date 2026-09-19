@@ -83,7 +83,25 @@ impl Project {
             .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
         let manifest: ProjectManifest = toml::from_str(&raw)
             .map_err(|e| CompileError::Project(format!("weft.toml parse: {e}")))?;
-        Ok(Self { root: root.to_path_buf(), manifest })
+        let project = Self { root: root.to_path_buf(), manifest };
+        // The program lives in `src/` (see `main_weft`). A project written
+        // before that held it at the root; it is refused here, at load,
+        // with the move spelled out, rather than failing later as a
+        // missing file. Two valid places for the entry would be the
+        // free-for-all the `src/` layout exists to end.
+        if !project.main_weft().exists() && root.join(ENTRY_FILE).exists() {
+            return Err(CompileError::Project(format!(
+                "{} holds its program at the root; weft reads it from {}. \
+                 Move it: `mkdir -p src && mv main.weft src/`, move any \
+                 file it includes with it (an `@include` path is relative \
+                 to the file; an `@file` / `@asset` path is relative to \
+                 the project root and needs no change), and move \
+                 `layouts/main.layout` to `layouts/src/main.layout`.",
+                root.display(),
+                Path::new(SRC_DIR).join(ENTRY_FILE).display(),
+            )));
+        }
+        Ok(project)
     }
 
     /// Create a new project with a fresh id and the minimal files.
@@ -100,7 +118,7 @@ impl Project {
         }
         std::fs::create_dir_all(root).map_err(CompileError::Io)?;
 
-        // The canonical starter files (weft.toml + main.weft). Defined ONCE in
+        // The canonical starter files (weft.toml + src/main.weft). Defined ONCE in
         // `scaffold_files` so every caller of `weft new` produces byte-identical
         // projects.
         for (rel, bytes) in scaffold_files(name, Uuid::new_v4())? {
@@ -111,7 +129,7 @@ impl Project {
             std::fs::write(path, bytes).map_err(CompileError::Io)?;
         }
 
-        std::fs::create_dir_all(root.join("nodes")).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(root.join(NODES_DIR)).map_err(CompileError::Io)?;
         std::fs::create_dir_all(root.join(".weft")).map_err(CompileError::Io)?;
 
         // Seed the standard library into `nodes/base_catalog/`. From
@@ -136,12 +154,26 @@ impl Project {
             .unwrap_or_else(|| "http://localhost:9999".into())
     }
 
+    /// The program's entry file, `src/main.weft`. Source lives under
+    /// `src/` like any other language's: `main.weft` is the entry, a
+    /// sibling `.weft` is a module (one group per file, pulled in by
+    /// `@include`), and a folder under `src/` is a package of them,
+    /// grouped by what the code is about. Everything else at the root
+    /// is not source: `nodes/` (dependencies), `assets/` (content
+    /// pulled in by `@file` / `@asset`), `examples/` (frozen runs),
+    /// `layouts/` (generated), `front/` (a frontend weft ignores).
     pub fn main_weft(&self) -> PathBuf {
-        self.root.join("main.weft")
+        self.src_dir().join(ENTRY_FILE)
+    }
+
+    /// The source folder, `src/`: what a marker's path in the program is
+    /// relative to.
+    pub fn src_dir(&self) -> PathBuf {
+        self.root.join(SRC_DIR)
     }
 
     pub fn nodes_dir(&self) -> PathBuf {
-        self.root.join("nodes")
+        self.root.join(NODES_DIR)
     }
 
     /// The managed stdlib mirror under `nodes/`. Seeded at `weft new`
@@ -224,7 +256,24 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
     )
 }
 
-/// The canonical starter files of a brand-new project (`weft.toml` + `main.weft`),
+/// The source folder and the entry file inside it (`src/main.weft`).
+pub const SRC_DIR: &str = "src";
+pub const ENTRY_FILE: &str = "main.weft";
+/// The shared node tree: the standard library under `base_catalog/`
+/// and any node several parts of the program use.
+pub const NODES_DIR: &str = "nodes";
+
+/// Where a project's nodes are looked for: `nodes/`, and beside the
+/// code under `src/`. A node used by one module sits next to that
+/// module's file (`src/billing/charge.weft` and `src/billing/stripe/`),
+/// and the catalog finds it by the same two marks it uses everywhere,
+/// a `metadata.json` (a node) or a `package.toml` (a package). Both
+/// trees form ONE catalog, so a type name is unique across them.
+pub fn node_roots(project_root: &Path) -> [PathBuf; 2] {
+    [project_root.join(NODES_DIR), project_root.join(SRC_DIR)]
+}
+
+/// The canonical starter files of a brand-new project (`weft.toml` + `src/main.weft`),
 /// as `(relative-path, bytes)`. This is the ONE definition of "what a new project
 /// contains" (minus the seeded catalog, which `seed_catalog_into_upload` adds):
 /// `Project::init` writes these to disk for `weft new`; a caller that instead
@@ -253,7 +302,7 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
          out.data = greeting.value\n";
     Ok(vec![
         ("weft.toml".to_string(), toml.into_bytes()),
-        ("main.weft".to_string(), main_weft.as_bytes().to_vec()),
+        (format!("{SRC_DIR}/{ENTRY_FILE}"), main_weft.as_bytes().to_vec()),
     ])
 }
 
@@ -370,11 +419,28 @@ mod find_tests {
     /// The scaffold source is therefore name-independent; per-project identity
     /// (and per-project storage uniqueness) rests on `weft.toml`, which bakes the
     /// minted project id. Regression guard against re-introducing the old header.
+    /// A project from before `src/` held its program at the root. It is
+    /// refused at load with the move spelled out, so the first command run
+    /// against it says what to do instead of failing on a missing file.
+    #[test]
+    fn a_program_at_the_root_is_refused_with_the_move_spelled_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname='old'\nid='00000000-0000-0000-0000-000000000001'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(dir.path().join("main.weft"), "out = Debug\n").unwrap();
+        let err = Project::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("mv main.weft src/"), "{err}");
+        assert!(err.contains("layouts/src/main.layout"), "{err}");
+        // Once moved, the same folder loads.
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::rename(dir.path().join("main.weft"), dir.path().join("src/main.weft")).unwrap();
+        assert!(Project::load(dir.path()).is_ok());
+    }
+
     #[test]
     fn scaffold_main_weft_has_no_project_header() {
         let main_of = |name: &str, id: Uuid| {
             let files = scaffold_files(name, id).unwrap();
-            String::from_utf8(files.iter().find(|(p, _)| p == "main.weft").unwrap().1.clone()).unwrap()
+            String::from_utf8(files.iter().find(|(p, _)| p == "src/main.weft").unwrap().1.clone()).unwrap()
         };
         let a = main_of("alpha", Uuid::new_v4());
         assert!(!a.contains("# Project:"), "scaffold main.weft must not carry a project header: {a:?}");

@@ -35,8 +35,14 @@ pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     follow_sse(&client, FollowTarget::Project(&project), print_event).await
 }
 
-pub async fn follow_color(client: &crate::client::DispatcherClient, color: &str) -> anyhow::Result<()> {
-    follow_sse(client, FollowTarget::Execution(color), print_event).await
+/// Follow one run to its end, each event printed the way the program
+/// reads (`one.strip`, `gate`) when the project's definition is at
+/// hand; ids otherwise.
+pub async fn follow_color(client: &crate::client::DispatcherClient, color: &str, definition: Option<&weft_core::ProjectDefinition>) -> anyhow::Result<()> {
+    follow_sse(client, FollowTarget::Execution(color), |event| match definition {
+        Some(definition) => if let Some(spelled) = super::executions::spell_node(event.clone(), definition) { print_event(&spelled) },
+        None => print_event(event),
+    }).await
 }
 
 fn print_event(event: &Value) {

@@ -26,7 +26,6 @@
     {
       "name": "timezone",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "select",
         "options": [
@@ -647,6 +646,10 @@
     }
   ],
   "requires_infra": false,
+  "firesWith": {
+    "scheduledTime": "String",
+    "actualTime": "String"
+  },
   "features": {
     "isTrigger": true
   }

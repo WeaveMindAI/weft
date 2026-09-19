@@ -1,0 +1,26 @@
+# What a port's declared type does to a value at run time, both halves.
+#
+# `plain` hands back a dict that happens to carry a stored-file marker on a
+# port declared JsonDict: the declared type is the question, a dict is a dict,
+# and it flows untouched. Guessing the value's type from its shape used to
+# refuse it as an Image, close the port, and mark the node completed anyway.
+#
+# `wrong` hands back a string on a port declared Number: the send fails, the
+# node fails with the port named, and the run ends failed. The port used to
+# close quietly with the node reported as completed and the caller left with
+# nothing. It is gated on `seen` so the two halves never race.
+
+plain = ExecPython() -> (data: JsonDict) {
+  code: "return {'data': {'__weft_image__': {'key': 'not/a/real/file', 'mimeType': 'image/png'}}}"
+}
+seen = ExecPython(data: JsonDict) -> (keys: String) {
+  code: "return {'keys': ','.join(sorted(data.keys()))}"
+}
+seen.data = plain.data
+
+wrong = ExecPython() -> (n: Number) {
+  code: "return {'n': 'forty-two'}"
+}
+wrong._should_flow = seen.keys
+after = Debug
+after.data = wrong.n

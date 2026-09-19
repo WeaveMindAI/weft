@@ -1,0 +1,14 @@
+# A picture posted to a route reaches a Python snippet as a plain dict
+# carrying a download link minted for that firing. The snippet fetches
+# the link, so the reply proves the link works end to end, and hands the
+# picture back on a file port, so the marker round-trips too.
+#
+#   POST look   { "photo": "<data url or base64 png>" }
+
+look = Route -> (photo: Image) { path: "__E2E_PATH__/look", method: "POST" }
+inspect = ExecPython(photo: Image) -> (body: JsonDict, same: Image) {
+  code: @file("assets/scripts/inspect.py")
+}
+inspect.photo = look.photo
+answer = Reply
+answer.body = inspect.body

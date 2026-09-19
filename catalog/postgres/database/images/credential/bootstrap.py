@@ -115,14 +115,22 @@ def reset_password() -> str | None:
     the refusal text when the database would not take it, so the
     caller sees exactly what psql said."""
     password = new_password()
-    # `psql` variables interpolate with quoting (`:'name'`), so the
-    # password never touches the SQL text itself.
+    # `psql` variables interpolate with quoting (`:'name'` quotes as a
+    # literal, `:"name"` as an identifier), so the password never touches
+    # the SQL text itself.
+    #
+    # The statement arrives on STDIN, not through `-c`. Variables are a
+    # psql feature, and psql only expands them while READING a script:
+    # text handed to `-c` goes to the server as it stands, so the server
+    # gets a literal `:"user"` and answers `syntax error at or near ":"`.
+    # That is what shipped, which is why the graph's reset button never
+    # worked.
     run = subprocess.run(
         [
             "psql", "-h", SOCKET_DIR, "-U", ADMIN_USER, "-d", "postgres",
             "-v", "ON_ERROR_STOP=1", "-v", f"user={ADMIN_USER}", "-v", f"password={password}",
-            "-c", "ALTER USER :\"user\" PASSWORD :'password'",
         ],
+        input="ALTER USER :\"user\" PASSWORD :'password';\n",
         capture_output=True,
         text=True,
     )
@@ -244,30 +252,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def live_items() -> list:
-    """What the node's card shows: whether a run can still read the
-    password, and the one button that makes it readable again."""
-    if stored_password() is None:
-        state = "not minted yet"
-    elif sealed():
-        state = "handed over to a connection"
-    else:
-        state = "readable; the next run stores it"
-    return [
-        {
+    """What the node's card shows: the password itself while it is still
+    readable, or the state it has moved on to, plus the one button that
+    makes it readable again.
+
+    The card is a legitimate first taker. The password is readable
+    exactly once, by whoever asks first, and then sealed; a person
+    looking at the graph is asking the same way a run does, so while it
+    is unsealed the card SHOWS it, masked, with a way to copy it. That
+    is how somebody outside the program (a frontend that needs its own
+    tables in this database, a `psql` session) gets in without anybody
+    digging in a container for it.
+
+    Once a run has taken it the value is gone from here for good, and
+    the way back is the button below: reset, and the fresh password is
+    readable, and shown, again."""
+    password = stored_password()
+    if password is None:
+        item = {
             "type": "text",
             "label": "Password",
-            "data": state,
-            "action": {
-                "label": "Reset password",
-                "actionKind": RESET_ACTION,
-                "confirm": (
-                    "Give the database a new password? Every connection holding the "
-                    "old one stops working; run `weft infra start` afterwards so this "
-                    "node publishes the new one."
-                ),
-            },
+            "data": "not minted yet",
         }
-    ]
+    elif sealed():
+        item = {
+            "type": "text",
+            "label": "Password",
+            "data": "handed over to a connection; reset to get a new one",
+        }
+    else:
+        # Rendered masked, with reveal and copy beside it.
+        item = {
+            "type": "secret",
+            "label": "Password",
+            "data": password,
+        }
+    item["action"] = {
+        "label": "Reset password",
+        "actionKind": RESET_ACTION,
+        "confirm": (
+            "Give the database a new password? Every connection holding the "
+            "old one stops working; run `weft infra start` afterwards so this "
+            "node publishes the new one."
+        ),
+    }
+    return [item]
 
 
 def serve() -> None:

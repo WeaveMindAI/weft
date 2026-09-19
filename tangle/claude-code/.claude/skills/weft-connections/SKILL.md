@@ -1,34 +1,93 @@
 ---
 name: weft-connections
-description: Connecting a weft project to outside services and putting people in the loop. Read when a user asks about connections, API keys, sign-ins, permissions, the browser extension, human tasks, or a public URL: the connect flow door by door, what the banners mean, tokens and scoping, and how HumanQuery tasks reach people.
+description: "Read when the user asks about connections, API keys, sign-ins, permissions, the browser extension, human tasks, or a public URL: the connect flow door by door, what each banner means, tokens and scoping, and how HumanQuery tasks reach people."
 ---
 
 # Connections and people
 
-## What a connection is
+A [connection] is an account hooked up to an outside service: an OAuth
+sign-in, a pasted API key, a mail server login, all one concept. The
+runtime's access store holds the secret; the project's source holds only a
+bare id, so a credential never reaches git history. What flows through
+the graph is an `Access` value, a sealed handle that resolves to the
+signed-in client when a node fires, never a secret.
 
-A **connection** is an account somebody hooked up to an outside service. It
-lives in the runtime's access store and holds everything secret; the
-project's source holds only a bare id, so a credential can never end up in
-git history. Every kind of credential is the same concept: an OAuth
-sign-in, a pasted API key, a mail server login. What flows through the
-graph is an `Access` value, a sealed handle that resolves to the signed-in
-client when a node fires; it is not a secret.
+An [access node] is any node whose metadata carries a `service` block: that
+block is what makes it the place a [connection] is picked (`TelegramAccess`
+is one). `--compact` strips the block, so you read it in the node's
+`metadata.json`. Do not go by the `access` tag in the listing, which several
+access nodes do not carry: a model provider holds a connection exactly the
+same way and is tagged by its service instead. One with
+a required, unpicked [connection] pins open in the graph (expanded,
+collapse disabled, "Pick a connection first") until one is picked; a
+`connection_optional` node never pins. A [door] is one way of adding a
+[connection]: **shared** (a credential this weft holds) or **own** (the
+user's own); the editor flow below has both in full.
 
-An **access node** (`TelegramAccess`, `SlackAccess`, `OpenRouterProvider`,
-`PostgresDatabase`, and so on) is where a connection is picked: expand the
-node in the graph and click its "Connect <Service>..." field.
+## Your part and the user's part
 
-## The connect flow, door by door
+You list stored connections and pick them. The user enters a new
+credential in their own terminal, and you hand them the exact command. If
+you catch yourself asking the user to paste a key into the chat, or typing
+one yourself, stop and write: "Wait. The key never passes through me."
+Then hand them the `weft connect` command below, with `--set-env` when the
+value is in their environment.
 
-The widget first lists existing connections ("identity / what it can do",
-with Change and Disconnect), then "+ Add a connection" with up to two
-doors. A door the service does not offer is hidden, never greyed out.
+## `weft connect`, the terminal flow
+
+Every Connect panel action exists as a CLI verb, so a user without VS
+Code is never stuck. `weft connect` with no arguments opens
+interactive menus: first the project's [access node]s (including nodes
+inside `@include`d files; each file is one target, and `--node` takes a
+bare id or `file.weft:node` when the id is ambiguous), then the [door]s: paste a key (hidden input), browser
+sign-in (URL printed, polled), the one-click shared app, `--mint` for a
+created own app. A pick is written into the `.weft` source through the
+compiler's structural edit, exactly as the editor writes it, so it
+survives and diffs like any edit.
+
+The flags you run:
+
+- `--list` works from anywhere: inside a project it lists that project's
+  [access node]s with their stored connections (the picked one marked);
+  outside a project, or in one with no [access node], every stored
+  [connection] across all services.
+- `--node <id> --grant <grant>` picks a stored [connection]; no secrets
+  travel. It edits the `.weft` source and prints the edit as an edit tool
+  would (`main.weft:15`, then `- old` and `+ new` lines). You read that
+  block and update your picture of the file: the node's braces now carry
+  the pick, and your next edit of that node builds on the printed line.
+  `--disconnect` prints the same block for the removal.
+- `--forget <id>` deletes a stored [connection] and clears every node in
+  the current project that pointed at it (under `--json` it reports
+  `{"forgot": ..., "cleared": [...]}`; declining reports
+  `{"forgot": null, "cleared": []}`). `--upgrade` manages the rest.
+- `--json` works with the flag-driven actions only; the interactive
+  walkthrough refuses it. Prompts print to stderr, and any non-interactive
+  run (stdin, stdout or stderr piped) with a prompt pending fails at once,
+  naming the flag to pass.
+
+The flags the user runs, in the command you hand them:
+
+- `--set name=value` fills an acquisition field; `--set-env NAME=ENV_VAR`
+  reads the value from an environment variable so a secret never rides
+  the command line. An explicitly empty `--set` or `--set-env` value is an
+  error, not a silent skip.
+- Any flag that shapes a new [connection] (`--set`, `--set-env`, `--paste`,
+  `--mint`, `--label`, `--permissions`, `--shared-app`) skips the
+  stored-connections menu and goes straight to connecting.
+
+## The editor flow, door by door
+
+The user expands the [access node] in the graph and clicks its
+"Connect <Service>..." field. The widget lists existing connections first
+("identity / what it can do", with Change and Disconnect), then
+"+ Add a connection" with up to two [door]s. A [door] the service does not offer is
+hidden, never greyed out.
 
 - **shared**: a credential this weft holds. Either "Sign in with <Service>"
   through a registered app (one click, the provider's consent page opens
   in the browser, the panel waits and updates on its own), or "Use ours
-  (uses your credits)" for key-based services: calls on that connection
+  (uses your credits)" for key-based services: calls on that [connection]
   spend the runtime's credits, and it says so.
 - **own**: the user brings or creates their own. One page: the permissions
   to ask for (checkboxes), an optional "Create it for me" mint button, a
@@ -40,74 +99,26 @@ After connecting, the field shows "Connected as <identity>". Some services
 grant per account, and the widget says so when a second connect would
 displace the first ("Upgrade this connection...").
 
-An access node with a required, unpicked connection pins open in the graph
-(expanded, collapse disabled, "Pick a connection first") until one is
-picked; a `connection_optional` node never pins.
-
-## The same flow in the terminal: `weft connect`
-
-Everything the Connect panel does exists as a CLI verb, so a user without
-VS Code is never stuck. `weft connect` with no arguments opens interactive
-menus: the project's access nodes (including nodes inside `@include`d
-files; each file is one target, and `--node` takes a bare id or
-`file.weft:node` when the id is ambiguous), then the doors: paste a key
-(hidden input), browser sign-in (URL printed, polled), the one-click
-shared app, `--mint` for a created own app. A pick is written into the
-`.weft` source through the compiler's structural edit, exactly as the
-editor writes it, so it survives and diffs like any edit.
-
-The scripted surface, which is yours:
-
-- `--list` works from anywhere: inside a project it lists that project's
-  access nodes with their stored connections (the picked one marked);
-  outside a project, or in one with no access node, it lists every stored
-  connection across all services.
-- `--node <id> --grant <grant>` picks a stored connection (no secrets
-  travel; this one is yours to run). It edits the `.weft` source and prints
-  the edit as an edit tool would (`main.weft:15`, then `- old` and `+ new`
-  lines), so read that block and update your picture of the file: the
-  node's braces now carry the pick, and your next edit of that node builds
-  on the printed line. `--disconnect` prints the same block for the removal.
-- `--set name=value` fills an acquisition field, and `--set-env
-  NAME=ENV_VAR` reads the value from an environment variable so a secret
-  never rides the command line. An explicitly empty `--set` or `--set-env`
-  value is an error, not a silent skip. Any flag that shapes a new
-  connection (`--set`, `--set-env`, `--paste`, `--mint`, `--label`,
-  `--permissions`, `--shared-app`) skips the stored-connections menu and
-  goes straight to connecting.
-- `--forget <id>` deletes a stored connection and also clears every node
-  in the current project that pointed at it (under `--json` it reports
-  `{"forgot": ..., "cleared": [...]}`; declining reports
-  `{"forgot": null, "cleared": []}`). `--upgrade` and `--disconnect`
-  manage the rest.
-- `--json` works with the flag-driven actions only; the interactive
-  walkthrough refuses it. Prompts print to stderr, and any non-interactive
-  run (any of stdin, stdout, stderr piped) with a prompt pending fails
-  immediately, naming the flag to pass, so a scripted run never hangs.
-
-The split for you: `--list` and picking a stored connection are yours.
-Entering a new credential is the user's to run in their own terminal,
-interactive by design, or with `--set-env` reading from their environment;
-you hand them the exact command instead of ever seeing the key.
-
 ## What the banners mean
 
-When a connection is picked, the consuming nodes check it live. A red line
-on a node body like "'<input>' needs permission <scope>; the picked
+Once a [connection] is picked, the consuming nodes check it live. A red
+line on a node body like "'<input>' needs permission <scope>; the picked
 connection does not hold it. Reconnect or upgrade it on the access node."
-means exactly what it says. When the provider verified which permissions the
-connection holds, a missing one is an error. When the provider only claims
-them, a missing one passes with a warning, because refusing would block
-every pasted key on every service that reports nothing.
+is literal. When the provider verified which permissions
+the [connection] holds, a missing one is an error. When the provider only
+claims them, a missing one passes with a warning, because refusing would
+block every pasted key on every service that reports nothing.
 
 A revoked or expired credential surfaces as a loud "needs reconnecting"
 error naming the fix, never a silent retry.
 
 ## People in the loop
 
-A `HumanQuery` node suspends the run and asks a person a form; a
-`HumanTrigger` is a form a person submits to start a run. The question
-reaches people through the **weft browser extension**:
+A node parks its run on a person's answer by registering a question and
+waiting for it, and any node can do that for its own service. `HumanQuery`
+is the general form node that asks one; `HumanTrigger` is a form a person
+submits to start a run instead. A parked question reaches people through the
+weft browser extension:
 
 1. Build it once: `./setup.sh --browser --no-sign` in the weft checkout
    (needs Node 20+ and pnpm; the default install skips it because signing
@@ -117,33 +128,33 @@ reaches people through the **weft browser extension**:
    temporary add-on from `about:debugging`, or the signed `.xpi` when
    signing was left on.
 3. Connect it: `weft token mint --name "my laptop"` prints a connect URL
-   exactly once, and the bare token on the line after it (the server
+   exactly once, and the bare [token] on the line after it (the server
    stores only a hash; lost means mint another and `weft token revoke`
    the old one). Paste the URL into the extension's popup.
 
-A token with no scope sees every task of the tenant. Handing one to
-somebody else: `weft token mint --name "reviewer" --projects <id> --tags
+A [token] with no scope sees every task of the tenant. To hand one to
+somebody else, `weft token mint --name "reviewer" --projects <id> --tags
 approvals` narrows it to projects and task tags. `weft token ls` and
 `weft token revoke <id>` manage them. The extension is one client of the
-token's doors, which list and fire any signal kind that renders for
-consumers; for building your own (a website, a bot, another extension),
-read the `weft-consumers` skill.
+HTTP doors a [token] opens, which list and fire any signal kind that
+renders for consumers; to build your own client (a website, a bot,
+another extension), read the `weft-consumers` skill.
 
 While a question waits, the node sits in its cyan waiting state in the
 graph, the worker has exited, and the wait costs one row in a table. The
-answer resumes the run from exactly where it stopped, seconds or weeks
-later.
+answer resumes the run from where it stopped, seconds or weeks later.
 
 ## A public address
 
-Webhook-style triggers (an `ApiEndpoint`, a Drive watch, a Slack app
-installed in other workspaces) need the runtime reachable from the
-internet: `weft daemon start --public-url` tunnels a public base and the
-trigger surfaces get real URLs (shown in the trigger node's live feed in
-the graph). Without it, polling triggers (Telegram, email, sheets, RSS,
-cron) and everything local still work. With a public address, the `url` on
-a file marker is a link under it, and a fetch answered `403` with the text
-`error code: 1010` is Cloudflare's Browser Integrity Check refusing the
-client (Python's `urllib` is one it refuses), never weft: the fix is a
-Cloudflare configuration rule on the user's side, and the book's public
-address page walks through it.
+A trigger the outside world pushes to, rather than one weft polls, needs the
+runtime reachable from the internet (a route is the plain case, and a
+service's own watch or event subscription is the other):
+`weft daemon start --public-url` tunnels a public base and the trigger surfaces
+get real URLs (shown in the trigger node's live feed in the graph).
+Without it, polling triggers (Telegram, email, sheets, RSS, cron) and
+everything local still work. With a public address, the `url` on a file
+marker is a link under it. A fetch answered `403` with the text
+`error code: 1010` is Cloudflare's Browser Integrity Check refusing the client
+(Python's `urllib` is one it refuses), never weft: the fix is a Cloudflare
+configuration rule on the user's side, and the book's public address page
+walks through it.

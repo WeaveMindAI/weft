@@ -2,7 +2,8 @@
 //! running in the tenant's k8s namespace.
 //!
 //! Endpoints (network-trusted; only reachable from `weft-system`):
-//!   POST /register, /unregister, /process, /render, /display, /action.
+//!   POST /register, /unregister, /process, /render, /display,
+//!   /rehydrate; GET /signals, /load, /health.
 //! Held-connection loops per stateful kind (Timer, SSE) enqueue a
 //! `FireSignal` task through the broker when their event fires; the
 //! dispatcher's task picker then runs the same `dispatch_listener_outcome`
@@ -40,11 +41,6 @@ pub struct ListenerState {
     /// Sink wrapping the broker task client; held-event kinds call
     /// this when their event fires.
     pub fire_sink: FireSignalSink,
-    /// Per-token plaintext secret cache. Populated when a kind's
-    /// register_spec mints a secret (api-key with generate=true);
-    /// surfaced via /display while the listener pod is alive. Pod
-    /// restart drops the cache; the user has to regenerate.
-    pub secret_cache: Arc<dashmap::DashMap<String, String>>,
     /// Broker task client + token source, kept on state so the
     /// `/rehydrate` HTTP handler can re-run the boot-time rebuild
     /// without main.rs having to wire a closure through axum.
@@ -95,7 +91,6 @@ impl ListenerState {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),
             fire_sink,
-            secret_cache: Arc::new(dashmap::DashMap::new()),
             tasks,
             token_source,
             mem_pressure: CgroupMemPressure::new(),

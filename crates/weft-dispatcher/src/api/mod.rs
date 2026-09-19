@@ -12,7 +12,7 @@
 //! catalog introspection are client-side (the CLI reads the project's
 //! `nodes/`), because the dispatcher has no access to those nodes.
 
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{extract::DefaultBodyLimit, routing::{any, get, post}, Router};
 use tower_http::cors::CorsLayer;
 
 use crate::state::DispatcherState;
@@ -108,6 +108,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/projects/{id}/infra/nodes/{node_id}/stop", post(infra::stop_node))
         .route("/projects/{id}/infra/nodes/{node_id}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
+        .route("/projects/{id}/infra/doors", get(infra::doors))
         .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
         .route("/projects/{id}/infra/nodes/{node_id}/live", get(infra::live))
         .route("/projects/{id}/infra/nodes/{node_id}/action", post(infra::action))
@@ -176,18 +177,11 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             get(node_tests::status),
         )
         // Inspector proxy: project-scoped read of signal display
-        // info (mount_path, plaintext key while listener still
+        // info (mount_path, auth, kind config while the listener still
         // holds it, etc). Project-token gated.
         .route(
             "/projects/{id}/signals/{node_id}/display",
             get(signal::display_signal),
-        )
-        // Inspector proxy: project-scoped action invocation. The
-        // listener's kind impl owns the action's payload schema.
-        // Project-token gated.
-        .route(
-            "/projects/{id}/signals/{node_id}/action",
-            post(signal::action_signal),
         )
         .layer(cors)
         .merge(outside_caller_routes())
@@ -231,19 +225,18 @@ fn outside_caller_routes() -> Router<DispatcherState> {
         // is the credential (see api/storage.rs public_file).
         .route("/public/files/{token}", get(storage::public_file))
         // Live caller connection handshake: an outside caller hits
-        // `/connect/<path>` to open a held connection. The handler
-        // authenticates, ensures a worker pod is up, starts a fresh
-        // execution pinned to it, and points the caller at the gateway
-        // URL for that pod (307 for HTTP, return-URL for WebSocket).
-        // GET + POST: a WS handshake is a GET; an HTTP live request may
-        // be any method, so accept both. `/connect/*` is more specific
-        // than the catch-all, so it never falls through to
+        // `/connect/<tenant>/<path>` to open a held connection. The
+        // handler matches the route (pattern + method), gates the
+        // caller, ensures a worker pod is up, starts a fresh execution
+        // pinned to it, and points the caller at the gateway URL for
+        // that pod (307 for HTTP, return-URL for WebSocket). ANY method:
+        // a WS handshake is a GET and a route serves whatever verbs it
+        // declared; the handler answers 405 itself. `/connect/*` is more
+        // specific than the catch-all, so it never falls through to
         // fire_public_entry.
         .route(
             "/connect/{*path}",
-            get(signal::connect_live)
-                .post(signal::connect_live)
-                .layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
+            any(signal::connect_live).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
         // The OAuth callback door: the provider redirects the user's
         // browser here after consent. No tenant bearer rides a
@@ -269,11 +262,11 @@ fn outside_caller_routes() -> Router<DispatcherState> {
         )
         // Catch-all PublicEntry route: external HTTP fires land
         // here when no more-specific route matches. The handler
-        // looks up the signal row by `mount_path`, applies the
-        // auth gate (api_key check, future schemes), then
-        // forwards to dispatch_listener_outcome. Public-entry
-        // signals fire via this route. Methods other than POST or
-        // unmatched paths fall to axum's default 404.
+        // looks up the signal row by `mount_path` (an open entry
+        // only; a connection-gated one is a live route served at
+        // `/connect/...`), then forwards to dispatch_listener_outcome.
+        // Public-entry signals fire via this route. Methods other than
+        // POST or unmatched paths fall to axum's default 404.
         .route(
             "/{*mount_path}",
             post(signal::fire_public_entry).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),

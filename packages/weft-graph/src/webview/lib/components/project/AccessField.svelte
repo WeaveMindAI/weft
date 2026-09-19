@@ -202,6 +202,7 @@
 	/// The "what it can do" column: the granted permissions' labels in
 	/// plain words, the service label for a permissionless credential.
 	function canDo(c: GrantSummary): string {
+		if (c.owner === 'ours' && !c.has_credential) return 'NO KEY BEHIND IT (the runtime\'s own key is not configured)';
 		if (c.owner === 'ours') return 'uses your credits';
 		if (c.scopes.length === 0) return 'full access of its credential';
 		const text = permissionSummary(c.scopes);
@@ -411,7 +412,7 @@
 						>
 							<span class="text-[10px] truncate">{c.identity ?? middleColumn(c)}</span>
 							<span class="text-[10px] text-muted-foreground truncate">{middleColumn(c)}</span>
-							<span class="text-[10px] text-muted-foreground truncate text-right">{canDo(c)}</span>
+							<span class="text-[10px] truncate text-right {c.has_credential ? 'text-muted-foreground' : 'text-red-500'}">{canDo(c)}</span>
 						</button>
 						<!-- Forgetting a connection is the user's to make: the row
 						     is theirs (a shared-door row only records that they

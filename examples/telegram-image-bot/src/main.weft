@@ -1,0 +1,103 @@
+# A Telegram bot that draws pictures, and charges a credit for each one.
+#
+# Somebody messages the bot. One credit comes off their balance if they
+# have one, a model turns their message into an image brief, fal draws it,
+# and the picture goes back to the chat. No credits, or no account at all,
+# and they get told so instead.
+#
+# The database is the project's own: `PostgresDatabase` brings up a
+# Postgres inside the project and hands out its access. To enroll a user
+# (and, the first time, create the table), right-click the `enroll` node,
+# target its output, and run: the "Add a user" form is the only trigger
+# on that path, so a Telegram message never fires it.
+
+telegram = TelegramAccess
+fal = FalAccess
+
+pg = PostgresDatabase { database: "imagebot" }
+
+ask = TelegramReceiveMessage { account: telegram.access }
+
+credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String) {
+  # Take one credit off this telegram account, or say why we cannot.
+  # The query reads the sender's id as `$telegram_id`.
+  debit = PostgresExecuteQuery(telegram_id: String) {
+    query: @file("assets/sql/spend_credit.sql")
+    account: self.db
+    telegram_id: self.telegramUser
+  }
+
+  # `refusal` says nothing when the credit was taken
+  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal: String) {
+    code: @file("assets/scripts/outcome.py")
+    rows: debit.rows
+  }
+
+  self.paid = read.paid
+  self.refusal = read.refusal
+}
+credit.db = pg.access
+credit.telegramUser = ask.user
+
+sorry = TelegramSendMessage {
+  account: telegram.access
+  chatId: ask.chatId
+  text: credit.refusal
+}
+
+brief = Group(request: String) -> (prompt: String) {
+  # Turn what they typed into an image prompt
+  write = LlmInference -> (response: String) {
+    prompt: self.request
+    provider: OpenRouterProvider { model: "anthropic/claude-sonnet-4.5" }.provider
+    params: LlmParams { systemPrompt: @file("assets/prompts/image_brief.md") }.params
+  }
+  self.prompt = write.response
+}
+brief.request = ask.text
+brief._should_flow = credit.paid
+
+picture = FalGenerateImage {
+  model: "fal-ai/flux/dev"
+  imageSize: "square_hd"
+  account: fal.access
+  prompt: brief.prompt
+}
+
+reply = TelegramSendMedia {
+  kind: "photo"
+  account: telegram.access
+  chatId: ask.chatId
+  file: picture.image
+  caption: brief.prompt
+}
+
+# ---- The enrollment door -------------------------------------------
+# Nothing here is reachable from the Telegram trigger, so it only runs
+# when you target `enroll` yourself.
+
+join = HumanTrigger {
+  title: "Add a user"
+  fields: [
+    { "kind": "text_input", "key": "telegramId", "label": "Telegram id" },
+    { "kind": "text_input", "key": "credits", "label": "Starting credits" }
+  ]
+}
+
+# Creating the table every time keeps the door self-sufficient: the
+# very first enrollment is also what builds the schema.
+table = PostgresExecuteQuery {
+  query: @file("assets/sql/create_users.sql")
+  account: pg.access
+}
+
+# Waits for the table (`_should_flow` on its rows), then writes the
+# form's two values, which the SQL reads as `$telegram_id` and
+# `$credits` (an empty credits field enrolls with 5).
+enroll = PostgresExecuteQuery(telegram_id: String, credits: String) {
+  _should_flow: table.rows
+  query: @file("assets/sql/add_user.sql")
+  account: pg.access
+  telegram_id: join.telegramId
+  credits: join.credits
+}

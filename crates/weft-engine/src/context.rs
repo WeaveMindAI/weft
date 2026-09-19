@@ -848,6 +848,12 @@ struct PumpBusState {
     entries: Vec<BusEntry>,
     /// When the open window must flush.
     deadline: tokio::time::Instant,
+    /// The most the messages buffered above can weigh once the journal
+    /// has trimmed each of them, so a window closes on size as well as
+    /// on time (see `JOURNAL_ROW_BYTES`). An upper bound rather than the
+    /// real figure, because what is kept is decided at flush and this
+    /// has to be known before one more message joins.
+    kept_bound: usize,
     /// One past the highest offset already ingested (buffered or
     /// written). `drain_journal_tail` re-serves from the bus's own
     /// `journaled_through` (only bumped at write), so this filter is
@@ -884,17 +890,37 @@ async fn drain_buses(
                 continue;
             }
             match &entry.kind {
-                BusEntryKind::Message { .. } => {
+                BusEntryKind::Message { payload_byte_size, .. } => {
+                    let policy = journal_policy(&inner);
+                    let weighs = policy.kept_at_most(*payload_byte_size);
                     let state = windows.entry(bus_id).or_insert_with(|| PumpBusState {
                         entries: Vec::new(),
                         deadline: tokio::time::Instant::now() + inner.journal_window(),
+                        kept_bound: 0,
                         buffered_through: entry.offset,
                     });
+                    // A window closes on whichever comes first, its
+                    // clock or its size. A busy second can otherwise put
+                    // more into one row than the journal will accept,
+                    // and a refused row is kept and retried for ever,
+                    // which wedges the bus over one second of traffic.
+                    // Written BEFORE this message joins, so it opens the
+                    // next window rather than overflowing this one.
+                    if policy.row_is_full(state.kept_bound, weighs)
+                        && matches!(
+                            write_open_window(&inner, color, &bus_id_str, journal, pod_name, state)
+                                .await,
+                            WindowWrite::Degraded
+                        )
+                    {
+                        break 'entries;
+                    }
                     if state.entries.is_empty() {
                         state.deadline =
                             tokio::time::Instant::now() + inner.journal_window();
                     }
                     state.buffered_through = entry.offset + 1;
+                    state.kept_bound += weighs;
                     state.entries.push(entry);
                 }
                 // Membership entries are journaled individually, in
@@ -977,8 +1003,7 @@ async fn write_open_window(
     pod_name: &str,
     state: &mut PumpBusState,
 ) -> WindowWrite {
-    let Some(aggregate) =
-        weft_core::bus::aggregate_window(&state.entries, !inner.ephemeral())
+    let Some(aggregate) = weft_core::bus::aggregate_window(&state.entries, &journal_policy(inner))
     else {
         return WindowWrite::UpToDate;
     };
@@ -1007,7 +1032,20 @@ async fn write_open_window(
     }
     inner.acknowledge_journaled_through(aggregate.last_offset + 1);
     state.entries.clear();
+    state.kept_bound = 0;
     WindowWrite::UpToDate
+}
+
+/// How this bus reaches the journal: its window, whether it keeps
+/// content at all, and the two size bounds. Built in ONE place so the
+/// pump's decision to close a window early and the fold's decision on
+/// what to keep cannot come from two different policies.
+fn journal_policy(inner: &Arc<BusInner>) -> weft_core::stream_journal::JournalPolicy {
+    weft_core::stream_journal::JournalPolicy {
+        window: inner.journal_window(),
+        ephemeral: inner.ephemeral(),
+        ..Default::default()
+    }
 }
 
 /// Project one membership `BusEntry` to its `ExecEvent` shape. Message
@@ -1117,13 +1155,11 @@ pub enum NodeTaskOutcome {
 pub enum EmitKind {
     /// A `pulse_downstream` call: emit values on every port in `output`.
     Values(NodeOutput),
-    /// A CLOSURE on `port`: a `close_port` call (`refused: None`), or
-    /// a `pulse_downstream` value the port's declared type refused
-    /// (`refused: Some`, the warning the record and the journal keep).
-    /// The downstream subgraph attached to that port at this frame
-    /// stack learns nothing's coming, exactly the same shape as the
+    /// A CLOSURE on `port`: a `close_port` call. The downstream
+    /// subgraph attached to that port at this frame stack learns
+    /// nothing's coming, exactly the same shape as the
     /// termination-time sweep for an unmentioned port.
-    Close { port: String, refused: Option<weft_core::exec::PortWarning> },
+    Close { port: String },
 }
 
 /// Round-trip timeout for control-plane tasks. Generous because
@@ -1232,6 +1268,11 @@ pub struct RunnerHandle {
     project_id: String,
     color: Color,
     node_id: String,
+    /// The node as a person reads it (`weft_core::project::plain_id`
+    /// of `node_id`): what every message this handle writes for a
+    /// person names the node by. The id itself is internal, and a
+    /// node inside an included file has one no person would write.
+    name: String,
     /// The node's catalog type, sent with runtime-key / cost-provision
     /// requests so the runtime's policy + audit trail name the exact
     /// node kind asking.
@@ -1345,9 +1386,10 @@ pub struct RunnerHandle {
     /// value reaches the loop driver and silently routes through the
     /// (post)process layer's no-such-port fallthrough), AND to validate
     /// the TYPE of each emitted value against the port's declared type
-    /// (an incompatible value is refused, the port closed, a
-    /// `PortTypeMismatch` recorded).
+    /// (an incompatible value fails the call, which fails the firing
+    /// unless the node's code catches it).
     declared_outputs: HashMap<String, WeftType>,
+    declared_inputs: HashMap<String, WeftType>,
     /// Wake event payload for this firing. `Some` only when this
     /// dispatch is the consumption of a `NodeKicked` for a firing
     /// trigger; `None` for every other dispatch (regular pulse-driven
@@ -1395,12 +1437,14 @@ impl RunnerHandle {
         waits: Arc<WaitTracker>,
         bus_coordinator: Arc<BusCoordinator>,
         declared_outputs: HashMap<String, WeftType>,
+        declared_inputs: HashMap<String, WeftType>,
         has_generator_input: bool,
     ) -> Self {
         Self {
             execution_id,
             project_id,
             color,
+            name: weft_core::project::plain_id(&node_id),
             node_id,
             node_type,
             node_frames,
@@ -1420,6 +1464,7 @@ impl RunnerHandle {
             waits,
             bus_coordinator,
             declared_outputs,
+            declared_inputs,
             wake_payload: None,
             caller_connection: None,
             opened_accesses: Mutex::new(Vec::new()),
@@ -1620,7 +1665,7 @@ impl RunnerHandle {
                     "node '{}' tried to emit on undeclared output port '{}'. \
                      Declare it in metadata.json's outputs list, or correct \
                      the port name in the node body.",
-                    self.node_id, port_name
+                    self.name, port_name
                 )));
             }
         }
@@ -1652,7 +1697,7 @@ impl RunnerHandle {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' yielded on stream port '{}' after closing it; a close \
                      ends the stream, nothing can follow it.",
-                    self.node_id, port_name
+                    self.name, port_name
                 )));
             }
             if claims.mentioned.contains(port_name) && !self.is_generator_output(port_name) {
@@ -1661,7 +1706,7 @@ impl RunnerHandle {
                      Each output port can be emitted or closed AT MOST ONCE per \
                      firing; release ports incrementally (e.g. a bus marker early, \
                      a `done` flag at the end) but never re-emit or re-close a port.",
-                    self.node_id, port_name
+                    self.name, port_name
                 )));
             }
         }
@@ -1886,10 +1931,7 @@ pub async fn ship_port_emissions(
     }
 }
 
-/// Ship a port a running firing closed: the body's own `close_port`
-/// (`refused: None`), or a value the port's declared type refused
-/// (`refused: Some`, which the fold also books as the record's
-/// warning).
+/// Ship a port a running firing closed with its own `close_port`.
 #[allow(clippy::too_many_arguments)]
 pub async fn ship_port_closed(
     journal: &dyn JournalClient,
@@ -1899,28 +1941,15 @@ pub async fn ship_port_closed(
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     port: &str,
-    refused: Option<&weft_core::exec::PortWarning>,
 ) {
-    let event = match refused {
-        Some(warning) => ExecEvent::PortTypeMismatch {
-            color,
-            emission_id,
-            node_id: node_id.to_string(),
-            frames: frames.clone(),
-            port: port.to_string(),
-            expected: warning.expected.clone(),
-            actual: warning.actual.clone(),
-            at_unix: now_unix(),
-        },
-        None => ExecEvent::PortClosed {
-            color,
-            emission_id,
-            node_id: node_id.to_string(),
-            frames: frames.clone(),
-            port: port.to_string(),
-            provided: false,
-            at_unix: now_unix(),
-        },
+    let event = ExecEvent::PortClosed {
+        color,
+        emission_id,
+        node_id: node_id.to_string(),
+        frames: frames.clone(),
+        port: port.to_string(),
+        provided: false,
+        at_unix: now_unix(),
     };
     record_from_pod(journal, event, pod_name).await;
 }
@@ -1968,7 +1997,7 @@ impl ContextHandle for RunnerHandle {
         // anyway: it stays warm and uses bus.recv() instead.
         if !self.lock_port_claims().mentioned.is_empty() {
             return Err(WeftError::NodeExecution(
-                weft_core::context::emitted_then_await_signal_error(&self.node_id),
+                weft_core::context::emitted_then_await_signal_error(&self.name),
             ));
         }
         // A stream CONSUMER cannot durably suspend either: the resume
@@ -1976,7 +2005,7 @@ impl ContextHandle for RunnerHandle {
         // pulls consumed were delivered live and cannot be replayed.
         if self.has_generator_input {
             return Err(WeftError::NodeExecution(
-                weft_core::context::stream_consumer_await_signal_error(&self.node_id),
+                weft_core::context::stream_consumer_await_signal_error(&self.name),
             ));
         }
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
@@ -2116,7 +2145,7 @@ impl ContextHandle for RunnerHandle {
         .map_err(|error| WeftError::NodeExecution(format!(
             "could not save result of '{name}' for node '{}': {error}. \
              The action may already have happened; inspect this run before repeating it.",
-            self.node_id,
+            self.name,
         )))
     }
 
@@ -2315,8 +2344,8 @@ impl ContextHandle for RunnerHandle {
         self.clients.storage.presign(self.color, key, ttl_secs).await
     }
 
-    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
-        self.clients.storage.public_link(self.color, key, ttl_secs).await
+    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
+        self.clients.storage.public_link(self.color, key, ttl_secs, reach).await
     }
 
     async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
@@ -2331,7 +2360,7 @@ impl ContextHandle for RunnerHandle {
                 "endpoint '{}' for node '{}' is not available; either the infra isn't running \
                  or the endpoint name is not declared. Check `weft infra status` and the node's \
                  InfraSpec.endpoints list.",
-                name, self.node_id
+                name, self.name
             ))
         })?;
         self.wait_until_routable_logging(&url, &format!("endpoint '{name}'")).await?;
@@ -2418,7 +2447,7 @@ impl ContextHandle for RunnerHandle {
             return Err(WeftError::Config(format!(
                 "node '{}' called ctx.register_signal more than once; \
                  entry triggers are one-per-node-per-TriggerSetup",
-                self.node_id
+                self.name
             )));
         }
         let reply = enqueue_register_signal_task(
@@ -2620,6 +2649,10 @@ impl ContextHandle for RunnerHandle {
         &self.declared_outputs
     }
 
+    fn declared_input_ports(&self) -> &HashMap<String, WeftType> {
+        &self.declared_inputs
+    }
+
     /// Fire downstream. Each output port the node mentions in
     /// `output` becomes a pulse on its outgoing edges; mentioned-but-
     /// already-emitted ports error loud (one-emission-per-port rule;
@@ -2638,36 +2671,49 @@ impl ContextHandle for RunnerHandle {
         // claims, no journaling, no sends: an error below must leave
         // the call a clean no-op (a partial mention would refuse a
         // later legitimate re-attempt as "touched twice"). Each value
-        // must be compatible with its port's DECLARED type (which
+        // must be one its port's DECLARED type accepts (the type
         // already reflects any narrowing the author applied in the
-        // node header). An incompatible value on a plain port is
-        // refused: the port is recorded as a non-terminal
-        // PortTypeMismatch and CLOSED (downstream sees null) instead
-        // of letting the wrong-typed value flow.
+        // node header), and a value that is not FAILS the call: what
+        // this firing sent before stays sent, this call sends nothing,
+        // and the node's code either catches the error or fails with
+        // it, which closes every port it never mentioned. The port is
+        // deliberately left OPEN by the failed call, for two reasons.
+        // Recovery: a node that catches this can try the port again
+        // with something else, and a port closed underneath it could
+        // not be retried. And closing it quietly instead used to read
+        // downstream as "nothing came", a node marked completed, and a
+        // caller with no answer and no error naming the cause. The
+        // close happens when the node finishes, not here.
         //
         // A GENERATOR port (asked via `as_generator`, so a nominal
         // alias behaves identically) checks each emission against the
-        // ELEMENT type, and a mistyped item FAILS the whole call
-        // instead of closing the port: closing would silently end a
-        // live stream mid-flight and read downstream as a clean
-        // finish, which is exactly the masked-truncation failure the
-        // typed stream exists to prevent.
+        // ELEMENT type.
         let mut kept = NodeOutput::new();
-        let mut mismatched: Vec<(String, Value)> = Vec::new();
         for (port, value) in output.outputs {
+            // A wire carries values, never bytes: a value over the cap
+            // fails the call outright, naming where the bytes belong.
+            weft_core::storage::check_wire_value(&self.node_id, &port, &value)
+                .map_err(WeftError::NodeExecution)?;
             match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
                 Some((_, Some(element))) if !type_accepts(element, &value) => {
                     return Err(WeftError::NodeExecution(format!(
                         "node '{}' yielded a value on stream port '{}' that the element \
                          type '{}' does not accept (got {})",
-                        self.node_id,
+                        self.name,
                         port,
                         element,
                         WeftType::infer(&value),
                     )));
                 }
                 Some((declared, None)) if !type_accepts(declared, &value) => {
-                    mismatched.push((port, value));
+                    return Err(WeftError::NodeExecution(format!(
+                        "node '{}' emitted a value on port '{}' that its declared type '{}' \
+                         does not accept (got {})",
+                        self.name,
+                        port,
+                        declared,
+                        WeftType::infer(&value),
+                    )));
                 }
                 _ => {
                     kept.outputs.insert(port, value);
@@ -2676,23 +2722,8 @@ impl ContextHandle for RunnerHandle {
         }
 
         // The call is now known to proceed: claim every touched port
-        // (the one-emission-per-port rule). A type-mismatched port is
-        // still "touched": it gets closed instead of emitted, so it
-        // must be claimed too, or a later legitimate emit on it would
-        // slip past.
+        // (the one-emission-per-port rule).
         self.mention_or_err(&ports)?;
-        for (port, value) in mismatched {
-            let declared = self
-                .declared_outputs
-                .get(&port)
-                .expect("classified above from this same map");
-            let refused = weft_core::exec::PortWarning {
-                port: port.clone(),
-                expected: declared.to_string(),
-                actual: WeftType::infer(&value).to_string(),
-            };
-            self.send_emission(EmitKind::Close { port, refused: Some(refused) }, None)?;
-        }
         if !wait_delivered {
             if !kept.outputs.is_empty() {
                 self.send_emission(EmitKind::Values(kept), None)?;
@@ -2700,16 +2731,14 @@ impl ContextHandle for RunnerHandle {
             return Ok(());
         }
         // Delivery-waiting emission that keeps no ports: NOTHING was
-        // emitted (empty output, or every value refused by its port's
-        // declared type). The caller's contract is "block until this
-        // was taken"; reporting success over a handoff that never
-        // happened would be a silent no-op, so fail loud instead.
+        // emitted (an empty output). The caller's contract is "block
+        // until this was taken"; reporting success over a handoff that
+        // never happened would be a silent no-op, so fail loud instead.
         if kept.outputs.is_empty() {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}' called yield_downstream but nothing was emitted (the output \
-                 was empty, or every value was refused by its port's declared type); \
-                 there is nothing whose delivery could be awaited",
-                self.node_id
+                 was empty); there is nothing whose delivery could be awaited",
+                self.name
             )));
         }
         let gate = DeliveryGate::new();
@@ -2723,14 +2752,14 @@ impl ContextHandle for RunnerHandle {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}' called set_max_buffered_items on '{port}', which is not a \
                  Generator output it declares",
-                self.node_id
+                self.name
             )));
         }
         if items == 0 {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}': set_max_buffered_items(0) on '{port}'; a cap of 0 could never \
                  accept even the first item",
-                self.node_id
+                self.name
             )));
         }
         // Clone-on-write into a fresh Arc: emissions snapshot the Arc
@@ -2764,7 +2793,7 @@ impl ContextHandle for RunnerHandle {
             if !claims.ended_streams.insert(port.clone()) {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' closed stream port '{}' twice; a stream ends once.",
-                    self.node_id, port
+                    self.name, port
                 )));
             }
             // Also recorded as a mention so the no-emission-before-a-
@@ -2773,14 +2802,14 @@ impl ContextHandle for RunnerHandle {
         } else {
             self.mention_or_err(std::slice::from_ref(&port))?;
         }
-        self.send_emission(EmitKind::Close { port, refused: None }, None)
+        self.send_emission(EmitKind::Close { port }, None)
     }
 
     fn create_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {
         let handle = self
             .bus_coordinator
             .new_bus(opts, self.firing_location())
-            .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.node_id)))?;
+            .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.name)))?;
         let marker = handle.marker();
         Ok((handle, marker))
     }
@@ -2791,7 +2820,7 @@ impl ContextHandle for RunnerHandle {
             .map_err(|e| {
                 WeftError::Input(format!(
                     "ctx.bus on node '{}': {e}",
-                    self.node_id
+                    self.name
                 ))
             })
     }
@@ -3112,6 +3141,7 @@ mod replay_tests {
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
             HashMap::new(),
+            HashMap::new(),
             false,
         )
         .with_awaited_sequence(seq)
@@ -3179,6 +3209,7 @@ mod replay_tests {
             std::sync::Arc::new(CancellationFlag::new()),
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
+            HashMap::new(),
             HashMap::new(),
             false,
         )
@@ -3444,6 +3475,7 @@ mod replay_tests {
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
             HashMap::new(),
+            HashMap::new(),
             false,
         ));
         ctx_over_arc(worker_handle).client(&scoped_access()).await.expect("worker opens");
@@ -3602,6 +3634,37 @@ mod replay_tests {
         assert!(err.to_string().contains("external URL"), "{err}");
         let err = storage.delete(&url_file).await.unwrap_err();
         assert!(err.to_string().contains("external URL"), "{err}");
+    }
+
+    /// `copy` streams a run's file into the handle's scope: the copy is
+    /// a NEW key under the project prefix, carries the source's bytes,
+    /// mime, filename and size, and the source stays where it was.
+    #[tokio::test]
+    async fn copy_streams_an_execution_file_into_the_project_scope() {
+        use weft_core::storage::{FileHandle, StorageScope, StoredFile};
+        let ctx = ctx_over(handle_with_sequence(vec![]));
+        let original = ctx
+            .storage(StorageScope::Execution)
+            .put(bytes::Bytes::from_static(b"PNG!"), "image/png", "upload.png", None)
+            .await
+            .expect("put");
+        let source = FileHandle::from_value(&original).unwrap();
+
+        let project = ctx.storage(StorageScope::Project);
+        let copied = StoredFile::from_value(&project.copy(&source, None).await.expect("copy")).unwrap();
+        let source_file = StoredFile::from_value(&original).unwrap();
+        assert_ne!(copied.key, source_file.key, "a copy is a new file");
+        assert!(source_file.key.contains("/exec/"), "{}", source_file.key);
+        assert!(copied.key.contains("/project/"), "the copy lives in the project scope: {}", copied.key);
+        assert_eq!(copied.mime_type, "image/png");
+        assert_eq!(copied.filename, "upload.png");
+        assert_eq!(copied.size_bytes, 4);
+
+        let (meta, bytes) = project.get_bytes(&FileHandle::Key(copied.key.clone())).await.expect("read the copy");
+        assert_eq!(&bytes[..], b"PNG!");
+        assert!(!meta.keep, "a project file carries no keep flag");
+        let (_, still_there) = project.get_bytes(&source).await.expect("the source is untouched");
+        assert_eq!(&still_there[..], b"PNG!");
     }
 
     use weft_journal::NoopJournal;
@@ -3901,9 +3964,11 @@ mod replay_tests {
             error_mode: ErrorMode::Surface,
             connect_timeout_secs: 5,
             max_inbound_bytes: 1024,
+            caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
             suspend: SuspendPolicy { can_suspend, default_hold_secs: 300 },
             inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
+            journal: weft_core::stream_journal::JournalPolicy::default(),
         }
     }
 
@@ -4622,11 +4687,11 @@ mod bus_pump_tests {
     /// fail, so this catches a frames-ignoring regression.
     #[test]
     fn parallel_loop_lanes_are_independent_participants() {
-        use weft_core::frames::LoopIteration;
+        use weft_core::frames::Frame;
         let (waits, coord) = coord_with_tracker();
         // Both lanes share a node id "worker" but differ in frame index.
-        let lane0 = FiringLocation::new("worker", vec![LoopIteration { index: 0 }]);
-        let lane1 = FiringLocation::new("worker", vec![LoopIteration { index: 1 }]);
+        let lane0 = FiringLocation::new("worker", vec![Frame::Loop { index: 0 }]);
+        let lane1 = FiringLocation::new("worker", vec![Frame::Loop { index: 1 }]);
         let bus0 = wait_src(&coord.new_bus(BusOptions::default(), lane0.clone()).unwrap());
         let bus1 = wait_src(&coord.new_bus(BusOptions::default(), lane1.clone()).unwrap());
         // Lane 0 parks (deadlocked). Lane 1 is an in-flight task still

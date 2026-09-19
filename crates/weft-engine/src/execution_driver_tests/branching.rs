@@ -13,7 +13,7 @@
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::WeftResult;
-    use weft_core::exec::skip::{SkipReason, SHOULD_FLOW_PORT};
+    use weft_core::exec::skip::{SkipReason, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
     use weft_core::node::{Node, NodeOutput};
     use weft_core::{ExecutionContext, NodeCatalog, ProjectDefinition};
     use weft_journal::ExecEvent;
@@ -59,16 +59,23 @@
 
     /// Emits a value and a permission, both fixed by the test.
     struct Source {
-        allowed: serde_json::Value,
+        /// `None` never mentions `allowed` at all, which is how a port
+        /// genuinely CLOSES: the firing ends without it, so the engine
+        /// tells everything downstream nothing is coming. Emitting a
+        /// null on it would not close it, it would fail the node, since
+        /// the port is declared `Boolean` and the declared type judges
+        /// every value.
+        allowed: Option<serde_json::Value>,
     }
     test_manifest!(Source, "Source");
     #[async_trait]
     impl Node for Source {
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-            ctx.pulse_downstream(
-                NodeOutput::new().set("value", json!("payload")).set("allowed", self.allowed.clone()),
-            )
-            .await
+            let mut out = NodeOutput::new().set("value", json!("payload"));
+            if let Some(allowed) = &self.allowed {
+                out = out.set("allowed", allowed.clone());
+            }
+            ctx.pulse_downstream(out).await
         }
     }
 
@@ -246,12 +253,84 @@
 
     /// The catalog these tests drive: a source with a fixed permission,
     /// and two pass-through nodes that record whether they ran.
-    fn branch_catalog(allowed: serde_json::Value, ran: &Ran) -> Arc<dyn NodeCatalog> {
+    fn branch_catalog(allowed: Option<serde_json::Value>, ran: &Ran) -> Arc<dyn NodeCatalog> {
         catalog(vec![
             ("Source", Box::new(Source { allowed })),
             ("Echo", Box::new(Echo { id: "guarded", ran: ran.clone() })),
             ("Behind", Box::new(Echo { id: "behind", ran: ran.clone() })),
         ])
+    }
+
+    /// The same graph with the gate wired the OTHER way round: the
+    /// guarded node's permission is `_should_not_flow`, so every answer
+    /// flips. Built by renaming the gate on the node and on the edge,
+    /// which is exactly what the editor's right-click toggle does.
+    fn inverted_gate_project() -> ProjectDefinition {
+        let mut project = guarded_project();
+        for node in &mut project.nodes {
+            for port in &mut node.inputs {
+                if port.name == SHOULD_FLOW_PORT {
+                    port.name = SHOULD_NOT_FLOW_PORT.to_string();
+                    port.port.name = SHOULD_NOT_FLOW_PORT.to_string();
+                }
+            }
+        }
+        for edge in &mut project.edges {
+            if edge.target_handle.as_deref() == Some(SHOULD_FLOW_PORT) {
+                edge.target_handle = Some(SHOULD_NOT_FLOW_PORT.to_string());
+            }
+        }
+        project
+    }
+
+    /// A CLOSURE on the inverted gate is the yes. This is the whole
+    /// point of the port: the thing it watches never happened, and that
+    /// is what the node was written to act on. Nothing else in the
+    /// language starts a node on a closure.
+    #[tokio::test]
+    async fn a_closed_inverted_gate_is_what_runs_the_node() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        // A null emission on `allowed` closes that port.
+        let (outcome, events) =
+            drive(inverted_gate_project(), branch_catalog(None, &ran), &["source"]).await;
+
+        assert!(
+            skip_reason(&events, "guarded").is_none(),
+            "a closure is the yes here, got {:?}",
+            skip_reason(&events, "guarded")
+        );
+        assert_eq!(*ran.lock().unwrap(), vec!["guarded", "behind"]);
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+    }
+
+    /// And a value arriving is the no, with its own reason so the
+    /// inspector can say which of the two gates decided.
+    #[tokio::test]
+    async fn a_value_on_the_inverted_gate_keeps_the_node_off() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (outcome, events) =
+            drive(inverted_gate_project(), branch_catalog(Some(json!(true)), &ran), &["source"]).await;
+
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "the thing it watches DID happen, so it stays off: {:?}",
+            ran.lock().unwrap()
+        );
+        assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::DidFlow));
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+    }
+
+    /// `false` is the one value that means the same on both gates: the
+    /// plain one reads it as no, and the inverted one reads it as yes,
+    /// which is the same sentence read from either end.
+    #[tokio::test]
+    async fn false_on_the_inverted_gate_runs_the_node() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (_, events) =
+            drive(inverted_gate_project(), branch_catalog(Some(json!(false)), &ran), &["source"]).await;
+
+        assert_eq!(*ran.lock().unwrap(), vec!["guarded", "behind"]);
+        assert!(skip_reason(&events, "guarded").is_none());
     }
 
     /// A guard that says no skips the node it guards, and the node
@@ -261,7 +340,7 @@
     async fn a_false_guard_skips_the_node_and_everything_behind_it() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) =
-            drive(guarded_project(), branch_catalog(json!(false), &ran), &["source"]).await;
+            drive(guarded_project(), branch_catalog(Some(json!(false)), &ran), &["source"]).await;
 
         assert!(
             ran.lock().unwrap().is_empty(),
@@ -286,7 +365,7 @@
     async fn a_true_guard_lets_the_chain_run() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) =
-            drive(guarded_project(), branch_catalog(json!(true), &ran), &["source"]).await;
+            drive(guarded_project(), branch_catalog(Some(json!(true)), &ran), &["source"]).await;
 
         assert_eq!(*ran.lock().unwrap(), vec!["guarded", "behind"]);
         assert!(skip_reason(&events, "guarded").is_none());
@@ -299,10 +378,13 @@
     #[tokio::test]
     async fn a_closed_guard_skips_with_its_own_reason() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
-        // A null emission on `allowed` closes that port: the source says
-        // "nothing is coming on this one".
+        // The source never mentions `allowed`, so that port closes when
+        // its firing ends: the structural "nothing is coming on this
+        // one". (A null would not close it, it would fail the source:
+        // the port is declared `Boolean` and its declared type judges
+        // every value.)
         let (_, events) =
-            drive(guarded_project(), branch_catalog(json!(null), &ran), &["source"]).await;
+            drive(guarded_project(), branch_catalog(None, &ran), &["source"]).await;
 
         assert!(ran.lock().unwrap().is_empty());
         assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::FlowClosed));
@@ -357,7 +439,7 @@
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) = drive_scoped(
             guarded_project(),
-            branch_catalog(json!(true), &ran),
+            branch_catalog(Some(json!(true)), &ran),
             &["source"],
             Some(&["source", "guarded"]),
             CancellationFlag::new_arc(),
@@ -461,7 +543,7 @@
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) = drive_fire(
             two_programs_project(),
-            branch_catalog(json!(true), &ran),
+            branch_catalog(Some(json!(true)), &ran),
             "my_trigger",
             &["my_trigger", "shared"],
             Some(&["my_trigger", "shared", "mine"]),
@@ -481,7 +563,7 @@
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, _) = drive_scoped(
             two_programs_project(),
-            branch_catalog(json!(true), &ran),
+            branch_catalog(Some(json!(true)), &ran),
             &["my_trigger", "shared"],
             None,
             CancellationFlag::new_arc(),
@@ -504,7 +586,7 @@
         use super::engine_test_rig::drive_settled;
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) =
-            drive_settled(guarded_project(), branch_catalog(json!(true), &ran), &["source"]).await;
+            drive_settled(guarded_project(), branch_catalog(Some(json!(true)), &ran), &["source"]).await;
         assert!(matches!(outcome, ExecutionOutcome::AlreadySettled), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "no body may run: {:?}", ran.lock().unwrap());
         let terminals = events
@@ -585,7 +667,7 @@
         }))
         .expect("diamond project");
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("Echo", Box::new(Echo { id: "a", ran: ran.clone() })),
             ("Orphan", Box::new(Echo { id: "orphan", ran: ran.clone() })),
             ("Behind", Box::new(Echo { id: "b", ran: ran.clone() })),
@@ -659,7 +741,7 @@
         }))
         .expect("two-wave diamond");
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("Echo", Box::new(Echo { id: "a", ran: ran.clone() })),
             ("Behind", Box::new(Echo { id: "b", ran: ran.clone() })),
         ]);
@@ -760,7 +842,7 @@
     async fn a_guarded_group_skips_every_node_nested_inside_it() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Echo { id: "deep", ran: ran.clone() })),
             ("after", Box::new(Echo { id: "after", ran: ran.clone() })),
         ]);
@@ -798,7 +880,7 @@
         outer_in.port_literals.remove(SHOULD_FLOW_PORT);
         let project_again = project.clone();
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Echo { id: "deep", ran: ran.clone() })),
             ("after", Box::new(Echo { id: "after", ran: ran.clone() })),
         ]);
@@ -872,7 +954,7 @@
 
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
         let (outcome, _) = drive(project, cat, &["source"]).await;
@@ -955,8 +1037,8 @@
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
-            ("Seed", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
         let (outcome, events) = drive(rooted_group_project(), cat, &["source"]).await;
@@ -977,8 +1059,8 @@
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(false) })),
-            ("Seed", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(false)) })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
         let (outcome, events) = drive(rooted_group_project(), cat, &["source"]).await;
@@ -997,6 +1079,92 @@
         let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "g".into() });
         assert_eq!(skip_reason(&events, "seed"), scope_skipped, "the root, which no wire feeds");
         assert_eq!(skip_reason(&events, "deep"), scope_skipped);
+    }
+
+    /// The same group with its gate wired the OTHER way round, built by
+    /// renaming the port and the edge, which is what the editor's flip
+    /// does.
+    fn inverted_rooted_group_project() -> ProjectDefinition {
+        let mut project = rooted_group_project();
+        for node in &mut project.nodes {
+            for port in &mut node.inputs {
+                if port.name == SHOULD_FLOW_PORT {
+                    port.name = SHOULD_NOT_FLOW_PORT.to_string();
+                    port.port.name = SHOULD_NOT_FLOW_PORT.to_string();
+                }
+            }
+        }
+        for edge in &mut project.edges {
+            if edge.target_handle.as_deref() == Some(SHOULD_FLOW_PORT) {
+                edge.target_handle = Some(SHOULD_NOT_FLOW_PORT.to_string());
+            }
+        }
+        project
+    }
+
+    /// A whole SCOPE gated on an absence. The thing the group watches
+    /// never arrived, so the group runs, and everything the launcher
+    /// owes it runs too: the body root nothing feeds is kicked at the
+    /// group's frames exactly as it is under the plain gate.
+    #[tokio::test]
+    async fn a_closed_inverted_group_gate_launches_the_whole_scope() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            // `allowed` is never mentioned, so the wire into the gate
+            // closes: the absence this group was written to act on.
+            ("Source", Box::new(Source { allowed: None })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
+            ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(inverted_rooted_group_project(), cat, &["source"]).await;
+
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["payload".to_string()],
+            "the body root ran and its value reached the member behind it"
+        );
+        let snap = fold(inverted_rooted_group_project(), &events);
+        let kick = snap
+            .kicked
+            .get(&FiringLocation::new("seed", vec![]))
+            .expect("the launch kicked the root of a scope an absence opened");
+        assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Completed);
+    }
+
+    /// And the mirror: the thing DID arrive, so the scope stays shut and
+    /// every member carries the scope's reason, the loose root included.
+    /// The cascade is the gate's, not the plain spelling's.
+    #[tokio::test]
+    async fn a_value_on_an_inverted_group_gate_skips_the_whole_scope() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
+            ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(inverted_rooted_group_project(), cat, &["source"]).await;
+
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
+        let (snap, boundaries) = fold_with_boundaries(inverted_rooted_group_project(), &events);
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Skipped);
+        assert_eq!(
+            snap.kicked.get(&FiringLocation::new("seed", vec![])).map(|k| k.scope_skipped.as_deref()),
+            Some(Some("g")),
+            "an inverted gate kicks its members into a skip the same way"
+        );
+        let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "g".into() });
+        assert_eq!(skip_reason(&events, "seed"), scope_skipped, "the root, which no wire feeds");
+        assert_eq!(skip_reason(&events, "deep"), scope_skipped);
+        assert_eq!(
+            boundary_skip_reason(&boundaries, "g__in"),
+            Some(SkipReason::DidFlow),
+            "the boundary's OWN reason says which gate decided"
+        );
     }
 
     /// `_should_flow` on a group from outside, when whatever decides it
@@ -1036,7 +1204,7 @@
         }))
         .expect("closed guard project");
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(false) })),
+            ("Source", Box::new(Source { allowed: Some(json!(false)) })),
             ("gate", Box::new(Echo { id: "gate", ran: ran.clone() })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
@@ -1093,7 +1261,7 @@
         }))
         .expect("closed input project");
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(false) })),
+            ("Source", Box::new(Source { allowed: Some(json!(false)) })),
             ("gate", Box::new(Echo { id: "gate", ran: ran.clone() })),
             ("reads_a", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
             ("reads_b", Box::new(Echo { id: "reads_b", ran: ran.clone() })),
@@ -1154,9 +1322,9 @@
         }))
         .expect("closed-only-input project");
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(false) })),
+            ("Source", Box::new(Source { allowed: Some(json!(false)) })),
             ("gate", Box::new(Echo { id: "gate", ran: ran.clone() })),
-            ("Seed", Box::new(Source { allowed: json!(true) })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
             ("reads_a", Box::new(Echo { id: "reads_a", ran: ran.clone() })),
         ]);
@@ -1238,7 +1406,7 @@
         .expect("loop root project");
         let cat = catalog(vec![
             ("Lister", Box::new(Lister)),
-            ("Seed", Box::new(Source { allowed: json!(true) })),
+            ("Seed", Box::new(Source { allowed: Some(json!(true)) })),
             ("tally", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
         let project_again = project.clone();
@@ -1251,7 +1419,7 @@
             .iter()
             .filter_map(|e| match e {
                 ExecEvent::NodeStarted { node_id, frames, .. } if node_id == "seed" => {
-                    Some(frames.iter().map(|f| f.index).collect())
+                    Some(weft_core::frames::loop_indices(frames))
                 }
                 _ => None,
             })
@@ -1352,7 +1520,7 @@
         outer_in.port_literals.remove(SHOULD_FLOW_PORT);
         let project_again = project.clone();
         let cat = catalog(vec![
-            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
             ("deep", Box::new(SelfStopper { cause: weft_core::exec::CancelCause::User })),
         ]);
         let (outcome, events) = drive(project, cat, &["source"]).await;

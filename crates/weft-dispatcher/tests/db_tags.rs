@@ -314,6 +314,7 @@ fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> Sign
         consumer_payload: None,
         surface_kind: "task_callback".to_string(),
         mount_path: None,
+        mount_methods: Vec::new(),
         auth_kind: "none".to_string(),
         auth_config: None,
         kind_state: json!({}),

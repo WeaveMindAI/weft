@@ -46,13 +46,20 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn fire_decomposes(rig: FakeRig) -> WeftResult<()> {
+    // A real update, with the fields Telegram always sends and this
+    // node never reads (`date`, `chat.type`, the sender's id and name).
+    // They are here on purpose: a trigger's declaration is exact, so a
+    // shape that named only the four keys the node uses would refuse
+    // every genuine message and fire on nothing.
     rig.wake(json!({ "item": {
         "update_id": 9,
         "message": {
             "message_id": 42,
+            "date": 1_700_000_000,
             "text": "hi bot",
-            "chat": { "id": 12345 },
-            "from": { "username": "ada" },
+            "chat": { "id": 12345, "type": "private", "first_name": "Ada" },
+            "from": { "id": 777, "is_bot": false, "first_name": "Ada", "username": "ada" },
+            "entities": [{ "offset": 0, "length": 2, "type": "bot_command" }],
         },
     }}));
     let outcome = rig

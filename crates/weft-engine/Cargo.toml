@@ -31,6 +31,8 @@ reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 weft-providers = { workspace = true }
 http = "1"
+# TCP_USER_TIMEOUT on accepted live-caller sockets (`caller_conn::serve`).
+socket2 = { workspace = true }
 # Stream adapters for put_from_url (TryStreamExt on the reqwest body),
 # and FutureExt::catch_unwind for the stress_test! macro in tests.
 futures = { workspace = true }
@@ -63,6 +65,9 @@ node-tests = ["dep:clap", "dep:tracing-subscriber"]
 [dev-dependencies]
 weft-core = { workspace = true, features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+# `oneshot` on the connection router: the arrival tests drive the real
+# router with a built request instead of binding a port.
+tower = { workspace = true }
 # `start_paused` for the bounded-drain test: the paused clock fires the
 # drain window the instant the silent peer yields no progress.
 tokio = { workspace = true, features = ["test-util"] }

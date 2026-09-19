@@ -9,6 +9,16 @@
   ],
   "icon": "Hash",
   "color": "#4A154B",
+  "firesWith": {
+    "type": "String",
+    "text?": "String",
+    "user?": "String",
+    "channel": "String",
+    "bot?": "String",
+    "thread?": "String",
+    "ts?": "String",
+    "workspace?": "String"
+  },
   "features": {
     "isTrigger": true
   },
@@ -56,7 +66,6 @@
     {
       "name": "keyword",
       "type": "String",
-      "required": false,
       "label": "Contains",
       "placeholder": "Only fire when the text contains this",
       "description": "Only fire on messages whose text contains this. Leave empty for every message."
@@ -64,7 +73,6 @@
     {
       "name": "pattern",
       "type": "String",
-      "required": false,
       "label": "Matches pattern",
       "placeholder": "A regular expression the text must match",
       "description": "Only fire on messages whose text matches this regular expression. Leave empty for no pattern filter."
@@ -72,7 +80,6 @@
     {
       "name": "fromUser",
       "type": "String",
-      "required": false,
       "label": "From user",
       "placeholder": "A Slack user id (U...)",
       "description": "Only fire on messages sent by this user id. Leave empty for anyone."

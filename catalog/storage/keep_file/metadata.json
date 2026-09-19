@@ -1,12 +1,15 @@
 {
   "type": "KeepFile",
   "label": "Keep File",
-  "description": "Mark a stored execution file to survive the end-of-run sweep, then pass the reference through unchanged. Put this at the end of a pipeline so only the file(s) you actually want survive; everything left un-kept is swept when the run ends. No effect on project/shared files (those are persistent already).",
+  "description": "Make a file this run stored outlive the run. A run's files are walled per run: they are swept when the run ends, and no other run can read them even before that. `scope: execution` (the default) only extends how long THIS run's file lives; it is still unreadable from any other run. `scope: project` copies the file into the project's storage and emits the NEW reference, which every later run of the project can read: this is how an upload received in one request is served by the next. Wire the emitted `file` into whatever stores or uses it later. For a file that is not in storage yet (a URL), use FetchToStorage instead.",
   "tags": [
     "storage",
     "keep",
     "persist",
-    "file"
+    "file",
+    "project",
+    "upload",
+    "persist across runs"
   ],
   "icon": "Pin",
   "color": "#8b5cf6",
@@ -15,7 +18,21 @@
       "name": "file",
       "type": "File",
       "required": true,
-      "description": "Stored execution file to keep (any type)."
+      "description": "Stored execution file (any type). With `scope: execution` it is the file that gets kept; with `scope: project` it is the file that gets copied, and it stays where it was."
+    },
+    {
+      "name": "scope",
+      "type": "String",
+      "default": "execution",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "execution",
+          "project"
+        ]
+      },
+      "label": "Keep as",
+      "description": "`execution`: flag this run's file to survive the end-of-run sweep for `ttl_days`; only this run can ever read it. `project`: copy it into the project scope so every later run can read it (persistent, no ttl)."
     },
     {
       "name": "ttl_days",
@@ -24,16 +41,15 @@
         "kind": "number",
         "min": 0
       },
-      "default": 30,
-      "label": "Keep for (days, 0 = forever)",
-      "description": "How long the kept file lives. Any access (download, read, presign) resets the clock. 0 means never expire."
+      "label": "Keep for (days, empty = 30, 0 = forever)",
+      "description": "How long the kept execution file lives. Any access (download, read, presign) resets the clock. Empty means the storage default of 30 days; 0 means never expire. Only with `scope: execution`: a project file outlives the run already, and the pair is refused."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
-      "description": "The same reference, now flagged to survive the run."
+      "description": "With `scope: execution`, the same reference, now flagged to survive the run. With `scope: project`, the reference to the NEW project-scoped copy (same filename, mime type and size); read this one from later runs."
     }
   ],
   "requires_infra": false

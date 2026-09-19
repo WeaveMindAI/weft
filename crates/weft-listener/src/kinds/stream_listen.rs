@@ -6,12 +6,10 @@
 //! protocol (what the frames mean) stays the author's concern.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine as _;
-use dashmap::DashMap;
 use futures_util::FutureExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -34,12 +32,7 @@ impl KindHandler for StreamListenHandler {
         StreamListen::TAG
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::Internal,
             auth: SignalAuth::None,

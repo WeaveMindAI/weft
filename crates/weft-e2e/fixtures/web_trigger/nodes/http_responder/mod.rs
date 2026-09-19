@@ -1,18 +1,20 @@
-//! LiveHttpResponder: demo node for an HTTP live connection. Reads the
-//! caller's request, streams a couple of progress chunks, then sends a
-//! final body and closes. Pairs with an `ApiEndpoint` trigger.
+//! LiveHttpResponder: demo node for an HTTP live connection driven through
+//! the ctx. Reads the caller's request off the handle, streams a couple of
+//! progress chunks, then sends a final body and closes. Pairs with a
+//! `Route` trigger, which also hands it the body key it declared so both
+//! paths to the same body are exercised at once.
 //!
-//! It is ctx-driven end to end: `ctx.http_caller()` gives the
-//! connected HTTP handle (failing loud on a non-HTTP run), and the
-//! handle's `request_parts` / `write` / `respond` are the only I/O. No
-//! reinvented plumbing; the connection layer owns framing,
-//! backpressure, heartbeat.
+//! It is ctx-driven end to end: `ctx.http_caller()` gives the connected
+//! HTTP handle (failing loud on a non-HTTP run), and the handle's
+//! `request_parts` / `write` / `respond` are the only I/O. No reinvented
+//! plumbing; the connection layer owns framing, backpressure, heartbeat.
 //!
 //! Flow:
 //!   1. `ctx.http_caller()` (caller present, HTTP, connected; the
 //!      barrier is bounded by the trigger-declared connect timeout).
-//!   2. Read the request body, stream two progress chunks, respond with a
-//!      final JSON body that echoes what the caller sent.
+//!   2. Read the request (method, path, the decoded body), stream two
+//!      progress chunks, respond with a final JSON body that echoes what
+//!      the caller sent and what the trigger delivered on its port.
 //!   3. Emit `done` on success.
 
 use async_trait::async_trait;
@@ -28,6 +30,7 @@ pub struct LiveHttpResponderNode;
 #[async_trait]
 impl Node for LiveHttpResponderNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let message: String = ctx.inputs.get("message")?;
         let http = ctx.http_caller().await?;
 
         // Read what the caller sent (decoded per the signal's data type).
@@ -41,12 +44,17 @@ impl Node for LiveHttpResponderNode {
         // Stream two progress chunks, then the final body. Streaming is a
         // free-for-all (other nodes could interleave); `respond` is the
         // once-only terminal.
-        http.write(OutboundChunk::Json(json!({ "stage": "received", "method": req.method })))
-            .await?;
+        http.write(OutboundChunk::Json(json!({
+            "stage": "received",
+            "method": req.request.method,
+            "path": req.request.path,
+        })))
+        .await?;
         http.write(OutboundChunk::Json(json!({ "stage": "working" }))).await?;
         http.respond(OutboundChunk::Json(json!({
             "stage": "done",
             "you_sent": echoed,
+            "port_said": message,
         })))
         .await?;
 

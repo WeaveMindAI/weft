@@ -57,6 +57,7 @@ pub struct InfraSpec {
     /// What stop/upgrade/terminate mean for this node.
     #[serde(default)]
     pub lifecycle: Lifecycle,
+
 }
 
 // =============================================================
@@ -689,8 +690,33 @@ pub enum Expose {
     /// ClusterIP + Ingress at `<tenant-host>/<path>`. IP-level
     /// restriction comes from `NetworkAccess.ingress` (e.g. FromCidrs).
     TenantPublic { path: String },
-    /// NodePort. Rare; useful for testing.
-    NodePort { port: u16 },
+    /// Open to the network the cluster runs on. This IS the door:
+    /// saying it here compiles to a NodePort Service plus the one
+    /// NetworkPolicy rule that lets that port through, and there is no
+    /// second switch anywhere else that opens or closes it.
+    ///
+    /// A node that wants the choice to be the user's makes it an input
+    /// and picks the variant itself: `PostgresDatabase`'s `reachable`
+    /// input sets its `sql` endpoint to `SameNetwork` when on and
+    /// [`Expose::ClusterInternal`] when off. Which endpoints may EVER
+    /// be reachable stays the node author's call.
+    ///
+    /// The line to hold when you write a node: an endpoint that HANDS
+    /// OUT a credential is never `SameNetwork`, however convenient it
+    /// would be. A `PostgresDatabase` marks the port Postgres itself
+    /// answers on, because getting there still costs you a password,
+    /// and leaves the little server that mints that password
+    /// `ClusterInternal` for ever.
+    ///
+    /// "The same network" is the machine on a local install: the door
+    /// binds to loopback, so nothing else on your LAN can reach it. In
+    /// a deployed cluster it is the cluster's own subnet, and that
+    /// includes pods in other namespaces, because the rule this
+    /// compiles to admits the port by address and no address rule can
+    /// tell one pod from another (see `compile_network_policy`). Never
+    /// the internet: no `Expose` reaches that except `TenantPublic`,
+    /// which is HTTP and goes through the ingress.
+    SameNetwork,
 }
 
 // =============================================================
@@ -727,8 +753,9 @@ fn default_egress() -> Vec<EgressRule> {
 pub enum IngressRule {
     /// Workers in this project.
     FromWorkers,
-    /// Another infra node in this project (compiled to a pod
-    /// selector matching `weft.dev/node=<node_id>`).
+    /// Another infra node in this project (compiled to a pod selector
+    /// matching `weft.dev/node=<node_label_value(node_id)>`, the
+    /// label-safe form of the id, never the id itself).
     FromNode { node_id: String },
     /// 0.0.0.0/0. Typically paired with `Expose::TenantPublic`.
     FromInternet,
@@ -742,7 +769,9 @@ pub enum IngressRule {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EgressRule {
     ToInternet,
-    /// Another infra node in this project (matches `weft.dev/node`).
+    /// Another infra node in this project (matches `weft.dev/node`
+    /// against `node_label_value(node_id)`, the label-safe form of the
+    /// id, never the id itself).
     ToNode { node_id: String },
     /// Specific destination CIDR list.
     ToCidrs(Vec<String>),

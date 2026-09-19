@@ -27,6 +27,10 @@ pub enum InfraAction {
     Stop,
     Terminate,
     Status,
+    /// The doors this project's infrastructure has. Read-only: a door
+    /// is part of what a node IS (its endpoint declares it), so there
+    /// is nothing here to open or close.
+    ListDoors,
     /// Cancel in-flight infra work (claimed lifecycle commands halt
     /// between kubectl steps; unclaimed ones cancel outright; the
     /// provisioning execution is interrupted). HALT, not rollback.
@@ -60,6 +64,17 @@ pub struct InfraOpts {
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
+    let action = match action {
+        InfraAction::NodeStop { node_id, force } => InfraAction::NodeStop { node_id: super::node_id_for(&ctx, &node_id)?, force },
+        InfraAction::NodeTerminate { node_id } => InfraAction::NodeTerminate { node_id: super::node_id_for(&ctx, &node_id)? },
+        InfraAction::Logs { node_id: Some(node_id), tail, follow } => {
+            InfraAction::Logs { node_id: Some(super::node_id_for(&ctx, &node_id)?), tail, follow }
+        }
+        other => other,
+    };
+    if matches!(action, InfraAction::ListDoors) {
+        return list_doors(&ctx).await;
+    }
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
@@ -74,7 +89,7 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
         InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
-        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
     };
     let ctx_inner = ctx.clone();
     ctx.with_progress(verb, |progress| async move {
@@ -104,7 +119,7 @@ async fn run_inner(
         InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
-        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
     };
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
@@ -123,7 +138,7 @@ async fn run_inner(
         InfraAction::NodeTerminate { node_id } => {
             infra_node_verb(ctx, progress, &node_id, "terminate", false).await?
         }
-        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
     }
     progress.complete(summary);
     Ok(())
@@ -183,7 +198,6 @@ async fn infra_sync(
     let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
     let image_tags =
         build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?;
-    let verb_label = action_verb_label(&action);
 
     // A START never deactivates: an active project's triggers stay
     // live while infra comes up (only executions that actually touch
@@ -198,7 +212,6 @@ async fn infra_sync(
     {
         Some(super::deactivate::prompt_trigger_deactivation(
             ctx.json(),
-            &format!("infra {verb_label}"),
             opts.mode.as_deref(),
             opts.grace,
             opts.running_policy.as_deref(),
@@ -248,20 +261,6 @@ async fn infra_sync(
     Ok(())
 }
 
-fn action_verb_label(a: &InfraAction) -> &'static str {
-    match a {
-        InfraAction::Start => "start",
-        InfraAction::Upgrade => "upgrade",
-        InfraAction::Stop => "stop",
-        InfraAction::Terminate => "terminate",
-        InfraAction::Status => "status",
-        InfraAction::Cancel => "cancel",
-        InfraAction::NodeStop { .. } => "node-stop",
-        InfraAction::NodeTerminate { .. } => "node-terminate",
-        InfraAction::Logs { .. } => "logs",
-    }
-}
-
 
 async fn infra_stop(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Result<()> {
     infra_destroy(ctx, progress, opts, "stop").await
@@ -287,7 +286,6 @@ async fn infra_destroy(
     let trigger_deactivation = if active {
         Some(super::deactivate::prompt_trigger_deactivation(
             ctx.json(),
-            &format!("infra {verb}"),
             opts.mode.as_deref(),
             opts.grace,
             opts.running_policy.as_deref(),
@@ -404,7 +402,9 @@ async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool)
     let (_client, project_id, _name) = super::resolve_project(ctx)?;
     let mut selector = format!("weft.dev/role=infra,weft.dev/project={project_id}");
     if let Some(node) = node_id {
-        selector.push_str(&format!(",weft.dev/node={node}"));
+        // The label carries the value that stands for the id, never
+        // the id (an included file's node has one no label can hold).
+        selector.push_str(&format!(",{}={}", weft_core::infra::NODE_LABEL, weft_core::infra::node_label_value(node)));
     }
     let found = super::daemon::kubectl(&[
         "get", "pods", "--all-namespaces", "-l", &selector,
@@ -447,6 +447,40 @@ async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool)
     Ok(())
 }
 
+/// The doors this project's infrastructure has, with the address each
+/// answers on.
+///
+/// Read-only, and only ever read: a door is part of what a node IS, so
+/// it is declared in the node's own spec and there is nothing here to
+/// open or close. This exists because the ADDRESS is not in the source:
+/// the port is the apiserver's to allocate, so the only way to know it
+/// is to ask the runtime what it handed out.
+async fn list_doors(ctx: &Ctx) -> Result<()> {
+    let (client, id, _) = super::resolve_project(ctx)?;
+    let body: serde_json::Value = client.get_json(&format!("/projects/{id}/infra/doors")).await?;
+    if ctx.json_out(&body)? {
+        return Ok(());
+    }
+    let doors = body.get("doors").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    if doors.is_empty() {
+        println!(
+            "no doors: nothing this project runs is reachable from this machine. A node \
+             opens one by declaring it on an endpoint of its own spec; `weft infra status` \
+             lists what is running."
+        );
+        return Ok(());
+    }
+    for door in doors {
+        println!(
+            "{}.{}  127.0.0.1:{}",
+            door["node"].as_str().unwrap_or(""),
+            door["endpoint"].as_str().unwrap_or(""),
+            door["port"].as_u64().unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
 async fn infra_status(ctx: &Ctx) -> Result<()> {
     let (client, id, name) = super::resolve_project(ctx)?;
     let resp: serde_json::Value = client
@@ -469,7 +503,9 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     }
     println!("infra for {name} ({id}):");
     for n in nodes {
-        let node = n.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+        // The spelled name, not the runtime's key (`@src:lib:db.store`
+        // for a node inside an included file).
+        let node = n.get("node").and_then(|v| v.as_str()).unwrap_or("?");
         let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let url = n
             .get("endpoint_url")

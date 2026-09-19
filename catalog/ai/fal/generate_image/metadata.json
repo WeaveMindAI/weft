@@ -82,13 +82,11 @@
     {
       "name": "seed",
       "type": "Number",
-      "required": false,
       "description": "Fixed seed for reproducible output."
     },
     {
       "name": "params",
       "type": "JsonDict",
-      "required": false,
       "description": "Model-specific extras merged into the request (guidance_scale, num_inference_steps, ...). Declared knobs win."
     }
   ],

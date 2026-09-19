@@ -1,0 +1,166 @@
+{
+  "type": "Close",
+  "label": "Close",
+  "description": "End the exchange with the caller of this run, and say why. Behind a Socket it sends the close frame with `code` and `reason`. Behind a Route, `reason` is the response body under `status` (a String, sent the way Reply sends one), and with no reason it is a bodiless response (`status` defaults to 204; after a Stream only the end of the response is left). Close needs nothing from upstream to work, so the `_should_flow` gate is usually its whole wiring: prefill `reason` and `status`, then wire any output port of the branch that should end here into `_should_flow`, whatever that port's type (the value is never read, only a `false` says no). Every field takes a wire as well as a literal, so a `reason` a node computed can be wired in like any other input. The shape for \"do this, and if it did not work, stop here\" is a Switch on the outcome whose failing case gates this node and whose passing case gates the rest. A branch that skipped closes its ports, so the Close behind it skips too.",
+  "tags": [
+    "api",
+    "http",
+    "websocket",
+    "close",
+    "end"
+  ],
+  "icon": "CircleX",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "code",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1000,
+        "max": 4999,
+        "step": 1
+      },
+      "label": "Close code (Socket, empty = 1000)",
+      "description": "The WebSocket close code, Socket only: empty is 1000 (a normal closure), 4000 to 4999 are yours to define. Refused behind a Route."
+    },
+    {
+      "name": "reason",
+      "type": "String",
+      "description": "Why the exchange ended, a short sentence for the caller: the close frame's reason behind a Socket, the response body behind a Route (refused after a Stream, which already sent the response)."
+    },
+    {
+      "name": "status",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 100,
+        "max": 599,
+        "step": 1
+      },
+      "label": "Status (Route, empty = 204, or 200 with a reason)",
+      "description": "The HTTP status, Route only: empty is 204 with no reason and 200 with one; 204 with a reason is refused (a 204 carries no body). After a Stream the status already went out. Refused behind a Socket."
+    },
+    {
+      "name": "headers",
+      "type": "Dict[String, String]",
+      "label": "Headers (Route)",
+      "description": "Extra response headers by name (Route only), so an ending carries its own: a 304 with its `etag`, a 429 with its `retry-after`. A content-type here overrides the one a reason's shape implies. After a Stream they are refused (that head already went out), and refused behind a Socket."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "Fires true once the exchange has been ended."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "run_reaches",
+          "direction": "upstream",
+          "types": [
+            "Route",
+            "Socket"
+          ]
+        }
+      },
+      "then": {
+        "message": "Close '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "level": "structural",
+        "severity": "warning"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "reason"
+          },
+          {
+            "kind": "config_equals",
+            "field": "status",
+            "equals": 204
+          }
+        ]
+      },
+      "then": {
+        "message": "Close '{id}' has a `reason` and `status: 204`: a 204 carries no body, so the message would never reach the caller. Pick a status that carries one (400, 403, 404, 409...), or drop `reason`.",
+        "level": "structural",
+        "severity": "error"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "code"
+          },
+          {
+            "kind": "run_reaches",
+            "direction": "upstream",
+            "types": [
+              "Route"
+            ]
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "run_reaches",
+              "direction": "upstream",
+              "types": [
+                "Socket"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Close '{id}' sets `code`, the WebSocket close code, but a Route starts the run that reaches it. Say how it ended with `status` (and `reason`) instead.",
+        "level": "structural",
+        "severity": "error"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "status"
+          },
+          {
+            "kind": "run_reaches",
+            "direction": "upstream",
+            "types": [
+              "Socket"
+            ]
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "run_reaches",
+              "direction": "upstream",
+              "types": [
+                "Route"
+              ]
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Close '{id}' sets `status`, an HTTP status, but a Socket starts the run that reaches it. A close frame carries `code` and `reason` instead.",
+        "level": "structural",
+        "severity": "error"
+      }
+    }
+  ]
+}

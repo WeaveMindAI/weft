@@ -1,31 +1,29 @@
 //! Live caller connection handler, shared by both live-caller kinds
-//! (`ApiEndpoint`, `LiveSocket`). A PASSIVE PublicEntry kind: the listener
-//! only registers the in-RAM entry and returns the routing shape (surface +
-//! auth gate). It owns NO background task (`spawn_task` returns `None`) and
-//! is NOT driven through `process_entry` (held connections are not the
-//! read-body-return model).
+//! (`Route`, `Socket`). A PASSIVE PublicEntry kind: the listener only
+//! registers the in-RAM entry and returns the routing shape (the route
+//! pattern + methods, and the auth gate: open, or a connection the caller
+//! is verified against). It owns NO background task (`spawn_task` returns
+//! `None`) and is NOT driven through `process_entry` (held connections are
+//! not the read-body-return model).
 //!
 //! The connection itself is held by the worker, routed there through the
 //! gateway by the dispatcher's control handshake; the listener's role is
-//! purely registration + the api-key gate. The two kinds differ only by
-//! protocol (which the dispatcher derives from the tag), so ONE handler impl
-//! serves both, registered once per tag.
-
-use std::sync::Arc;
+//! purely registration. The two kinds differ only by protocol (which the
+//! dispatcher derives from the tag), so ONE handler impl serves both,
+//! registered once per tag.
 
 use anyhow::Result;
-use dashmap::DashMap;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec, SignalSurface};
-use weft_core::signal::{ApiEndpoint, LiveConnectionConfig, LiveSocket, Signal};
+use weft_core::signal::{LiveConnectionConfig, Route, Signal, Socket};
 
 use async_trait::async_trait;
 
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::{public_entry_auth_to_routing, KindHandler, SpawnCtx};
+use super::{KindHandler, SpawnCtx};
 
 /// One handler instance per live-caller tag. The behavior is identical
 /// across tags; only `tag` differs (the dispatcher recovers the protocol
@@ -40,18 +38,12 @@ impl KindHandler for LiveCallerHandler {
         self.tag
     }
 
-    fn compute_routing(
-        &self,
-        token: &str,
-        spec: &SignalSpec,
-        secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, spec: &SignalSpec) -> Result<SignalRouting> {
         let parsed = parse(spec)?;
-        let surface = SignalSurface::PublicEntry { path: parsed.path };
-        // Auth is the shared api-key gate. Protocol + connection policies
-        // are NOT routing concerns; they ride the spec config the dispatcher
-        // parses at handshake time.
-        Ok(public_entry_auth_to_routing(token, surface, &parsed.auth, secret_cache))
+        let surface = SignalSurface::PublicEntry { path: parsed.path, methods: parsed.methods };
+        // Protocol + connection policies are NOT routing concerns; they
+        // ride the spec config the dispatcher parses at handshake time.
+        Ok(SignalRouting::public_entry(surface, &parsed.auth))
     }
 
     async fn spawn_task(
@@ -78,7 +70,7 @@ impl KindHandler for LiveCallerHandler {
             target: ProcessTarget::Drop {
                 reason: Some(
                     "live-caller kinds are driven by the dispatcher control \
-                     handshake, not the stateless fire path"
+                     handshake (/connect/...), not the stateless fire path"
                         .into(),
                 ),
             },
@@ -97,8 +89,8 @@ fn parse(spec: &SignalSpec) -> Result<LiveConnectionConfig> {
         .map_err(|e| anyhow::anyhow!("malformed live-caller spec: {e}"))
 }
 
-inventory::submit!(&LiveCallerHandler { tag: ApiEndpoint::TAG } as &dyn KindHandler);
-inventory::submit!(&LiveCallerHandler { tag: LiveSocket::TAG } as &dyn KindHandler);
+inventory::submit!(&LiveCallerHandler { tag: Route::TAG } as &dyn KindHandler);
+inventory::submit!(&LiveCallerHandler { tag: Socket::TAG } as &dyn KindHandler);
 
 #[cfg(test)]
 mod tests {
@@ -106,57 +98,66 @@ mod tests {
     use weft_core::primitive::{SignalAuth, SignalSurface};
     use weft_core::signal::PublicEntryAuth;
 
-    fn spec(path: &str, auth: PublicEntryAuth) -> SignalSpec {
-        weft_core::signal::to_spec(LiveSocket {
+    fn spec(path: &str, methods: &[&str], auth: PublicEntryAuth) -> SignalSpec {
+        weft_core::signal::to_spec(Route {
             common: LiveConnectionConfig {
                 path: path.into(),
+                methods: methods.iter().map(|m| m.to_string()).collect(),
                 auth,
                 suspend: Default::default(),
                 connect_timeout_secs: 30,
                 heartbeat_interval_secs: 25,
                 max_inbound_bytes: 1024,
                 max_session_secs: 0,
+                caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
                 data_type: Default::default(),
                 backpressure: Default::default(),
                 error_mode: Default::default(),
                 journal_mode: Default::default(),
+                journal_window_secs: None,
                 window: None,
             },
         })
     }
 
     fn handler() -> LiveCallerHandler {
-        LiveCallerHandler { tag: LiveSocket::TAG }
+        LiveCallerHandler { tag: Route::TAG }
     }
 
     #[test]
-    fn no_auth_yields_public_entry_with_path() {
-        let cache = Arc::new(DashMap::new());
+    fn an_open_route_yields_a_public_entry_with_pattern_and_methods() {
         let r = handler()
-            .compute_routing("tok", &spec("chat", PublicEntryAuth::None), &cache)
+            .compute_routing(&spec("chat/{room}", &["POST"], PublicEntryAuth::None))
             .expect("routing ok");
         assert!(matches!(
             r.surface,
-            SignalSurface::PublicEntry { ref path } if path == "chat"
+            SignalSurface::PublicEntry { ref path, ref methods }
+                if path == "chat/{room}" && methods == &["POST".to_string()]
         ));
         assert!(matches!(r.auth, SignalAuth::None));
-        assert!(cache.is_empty(), "no key minted");
+        assert!(r.auth_config.is_null());
     }
 
     #[test]
-    fn api_key_mints_key_via_shared_helper() {
-        let cache = Arc::new(DashMap::new());
+    fn a_gated_route_names_its_connection_and_nothing_secret() {
+        let auth = PublicEntryAuth::Connection {
+            access_id: "acc-1".into(),
+            service: "api_key_auth".into(),
+        };
         let r = handler()
-            .compute_routing("tok-1", &spec("chat", PublicEntryAuth::OptionalApiKey), &cache)
+            .compute_routing(&spec("chat", &[], auth))
             .expect("routing ok");
-        assert!(matches!(r.auth, SignalAuth::ApiKey));
-        assert!(cache.get("tok-1").is_some(), "plaintext stored in cache");
+        assert!(matches!(r.auth, SignalAuth::Connection));
+        assert_eq!(
+            r.auth_config,
+            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth" })
+        );
     }
 
     #[test]
     fn fire_path_drops_loud() {
         let sig = RegisteredSignal {
-            spec: spec("chat", PublicEntryAuth::None),
+            spec: spec("chat", &[], PublicEntryAuth::None),
             node_id: "n".into(),
             tenant_id: "t".into(),
             is_resume: false,
@@ -164,7 +165,7 @@ mod tests {
             placement_generation: 0,
             task: None,
             routing: SignalRouting {
-                surface: SignalSurface::PublicEntry { path: "chat".into() },
+                surface: SignalSurface::PublicEntry { path: "chat".into(), methods: Vec::new() },
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },

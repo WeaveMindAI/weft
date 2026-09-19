@@ -614,21 +614,38 @@ a race is expressible without a bus.
 Decide before the release: a native form added later changes how every
 program is written, so it is cheaper to know now whether it is coming.
 
-## Inverting a decision: is there still a hole?
+## Inverting a decision: SETTLED, `_should_not_flow`
 
-`_should_flow` reads BOTH shapes of "no": a `false` value and a closure
-(nothing ever answered). So "run this when the other branch did not" is
-already writable: the node that decides emits an optional port that says
-nothing on success, and whatever reads that port runs only in the other
-case. The README's bigger example does exactly that with its `refusal`.
+This section used to answer "run this when the other branch did not"
+with: the node that decides emits an optional port that says nothing on
+success, and the other branch hangs off that port. That answer was
+wrong, and it was wrong in a way worth writing down, because it cost a
+whole build session.
 
-What is still missing is the plain boolean flip. Holding a `true` and
-wanting to act on `false` means writing Python to invert it, since
-nothing in the catalog turns a boolean around. A `Not` node (boolean in,
-boolean out) would cover it and compose anywhere a boolean goes.
+It only covers absence that a node you wrote DECIDED on. It does not
+cover absence that is just data: a key missing from a request body, an
+optional input nobody filled. Nothing decided there, so there is no node
+to add a port to. And every other node in the language skips when its
+inputs close, so nothing downstream is left alive to notice. Following
+the old advice meant inventing a node whose whole job was to survive the
+closure and announce it, which is exactly the convoluted shape the
+advice was supposed to avoid.
 
-Decide whether that node is worth adding, or whether "emit nothing on
-the branch you do not want" is the one way it should be said.
+The language now carries a second spelling of the gate,
+`_should_not_flow`: the same decision read the other way round, where a
+CLOSED input is the yes. It is the one port in the language that fires
+on a closure, which is what makes "act on the thing that did not happen"
+writable at all. A node has one gate; wiring both spellings is a compile
+error (`two-gates`). In the editor it is the same triangle with a small
+circle where it meets the node, the way a negated input is drawn in a
+logic diagram, and right-clicking the gate toggles it.
+
+What is still open is the plain boolean flip: holding a `true` and
+wanting to act on `false` still means writing Python, since nothing in
+the catalog turns a boolean around. A `Not` node (boolean in, boolean
+out) would cover it and compose anywhere a boolean goes. That is a
+smaller question than this section used to be, and it is the only part
+of it left.
 
 ## Killing tagged NODES inside one execution
 
@@ -836,3 +853,131 @@ CLI already prints.
 sits beside it (a run is reachable through both today); how much of a
 long history to load before the view goes lazy; and whether a version's
 diff should open the file diff in the editor rather than a tooltip.
+
+## Cloud deployment, and a route's URL that reaches the internet
+
+Deployment beyond one machine is undesigned. What exists: a kind
+cluster per machine, set up by `./setup.sh`, and an opt-in Cloudflare
+quick tunnel (`--public-url`) whose nginx proxy allowlists exactly the
+provider-events receiver, the per-signal fire door, the file relay and
+the OAuth callback. A `k8s` backend exists in `weft daemon start` and
+demands `WEFT_GATEWAY_HOST`, `WEFT_GATEWAY_BASE_URL` and
+`WEFT_CALLER_TOKEN_SECRET`, and nothing has ever been deployed with it.
+
+**The concrete gap that surfaced it.** `Route` and `Socket` are reached
+through `/connect/<tenant>/<path>`, and the dispatcher answers by
+redirecting the caller to the worker's own address on the live gateway:
+`<pod>.<namespace>.<gateway host>`. Locally that host is
+`127-0-0-1.nip.io`, so the redirect only resolves on the same machine,
+and the public proxy does not forward `/connect/` at all. `weft activate`
+prints no URL, so nothing points this out: anyone who takes the tunnel
+address and appends `/connect/<tenant>/<path>`, the way every other
+minted link is built, gets a 404 from the proxy's catch-all. Decision for now: routes stay local-only; do not
+special-case the tunnel.
+
+**Rate limiting a public route belongs here.** A `Route` on the open
+internet has nothing in front of it: no per-caller ceiling, no burst
+cap, nothing that says one address is asking too often. Today the only
+way is counters in the author's own Postgres, which is exactly the
+plumbing the language is supposed to own, so a program that goes public
+either ships without a limit or hand-rolls one. It sits with the
+deployment questions rather than beside them: where the limit is
+enforced (the gateway, the dispatcher's entry, the worker), and what one
+caller even means, both fall out of how workers are reached from outside.
+
+**What has to be decided, together, before any of it is built.**
+- Where the control plane runs (dispatcher, broker, Postgres, the
+  object store) and who owns it: one shared multi-tenant install, or
+  one per customer.
+- Rate limiting: where a per-caller ceiling is enforced, and what
+  identifies a caller once a request has been through a tunnel or an
+  ingress and its source address is the proxy's.
+- How workers are reached from outside. The per-pod subdomain scheme
+  needs a wildcard DNS record and a wildcard certificate; a quick
+  tunnel offers one random hostname and no subdomains. The alternative
+  is the pod in the path (`/live/<pod>/<namespace>/<rest>`) so a single
+  hostname serves every worker, which changes the Envoy rewrite rule,
+  the redirect the dispatcher mints, the proxy allowlist and the
+  daemon's gateway variables.
+- What a URL handed to a third party is built from once there are
+  several public addresses (MEMORY.md has the rule for the local case:
+  the request's own host when the requester fetches, the configured
+  external base otherwise).
+- Secrets and identity: the caller-token HMAC, the broker's sealing
+  key, the tunnel token, the database credentials, all fixed dev values
+  today.
+- Images: workers, listeners and infra nodes are built on the machine
+  and loaded into kind; a cloud cluster needs a registry and a build
+  that publishes to it.
+- Upgrades and migrations against a database that is not disposable
+  (the `setup.sh cross-version upgrade path` entry above is the local
+  half of this).
+- Cost and isolation: what one tenant can consume, and what of another
+  tenant's a worker can reach (today: one project per pod, egress
+  denies private ranges).
+- Who may come through a door. A `SameNetwork` endpoint compiles to a
+  NodePort plus a NetworkPolicy rule admitting `0.0.0.0/0` on that one
+  port (`compile_network_policy` in `crates/weft-core/src/infra/compile.rs`),
+  which in-cluster means every pod in every other tenant's namespace.
+  It has to be an address rule locally: traffic from the machine
+  arrives SNATed to the node's address, so no pod selector can match
+  it, and that path is how a person's own frontend reaches their
+  database. What holds the line today is the loopback binding on every
+  mapped node port, which a real cluster does not have. The shape to
+  design: the door carries who may use it, defaulting to the project's
+  own namespace, with the machine admitted by address only where the
+  node ports are bound to loopback.
+
+## `[T]` instead of `List[T]`
+
+A list is the only type whose name you have to write out. A record is
+written as the shape itself, `{ id: String, qty: Number }`, with nothing
+in front of it, and nesting already works to any depth in any position:
+
+```weft
+type Orders = List[{ id: String, lines: List[{ sku: String, qty: Number }] }]
+```
+
+That line is legal today and says everything it needs to. `List` is the
+only word in it that carries no information: a bracket can only ever be
+a list, because every other bracketed type is spelled with its name in
+front (`Dict[String, Number]`, `Generator[String]`). So `[T]` would be
+unambiguous, and it is what Swift and TypeScript readers already expect.
+
+The decision that matters is not whether to add it, it is whether to
+carry two spellings. Two ways to write one type is how documentation
+starts rotting, so if `[T]` goes in, `List[T]` comes out in the same
+change: the parser stops accepting it, and the catalog, the fixtures,
+the docs and both highlighters move over. That sweep is mechanical and
+it is cheap now, while the catalog is this size.
+
+Decided: worth doing, deliberately deferred so it can be one clean pass
+of its own rather than a rename tangled into unrelated work. Until then
+`List[T]` is the spelling.
+
+## Trying a route without a cluster: BUILT
+
+`weft run --fire` on a Route runs the whole program, answer included,
+with no cluster and no activation. The payload is the request to serve:
+the envelope the trigger declares in its `firesWith`, plus a `body`.
+
+```bash
+weft run --fire 'hello={"method":"POST","path":"hello","body":{"name":"ada"}}'
+```
+
+A stand-in caller serves the body and records what the program answered,
+so the status, the headers and the body land in the journal the way a
+real exchange does. It implements the same `CallerConnection` the real
+one does, so the trigger, the Reply, the Stream and the Close all run
+their ordinary code and never learn the difference; a loop that
+exercised a different path from production would teach you about the
+fake instead of the program.
+
+`body` is deliberately outside the `firesWith` contract: a real listener
+never delivers one, because a real caller sends it over the wire, so
+declaring it would make every Route's contract describe something
+production never does. It is split off before the envelope is checked.
+
+A Socket still cannot be fired. Its shape is a conversation over time
+and there is nothing honest to invent for the caller's next message, so
+it says so and points at `weft activate`.

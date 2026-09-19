@@ -110,7 +110,7 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 /// Why a request-derived base rather than a configured one: a link a
 /// client is about to fetch has exactly one correct host, the one that
 /// client can already reach, and only the request knows it. The same
-/// install is reached at several addresses at once (a port-forward on
+/// install is reached at several addresses at once (a mapped port on
 /// the operator's loopback, a tunnel's public name, an ingress host),
 /// so any single configured value is wrong for every caller arriving
 /// at one of the others. Deriving it per request is right for all of

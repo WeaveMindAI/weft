@@ -7,11 +7,17 @@ import type { NodeExecutionStatus } from '../types';
 /// (its `_should_flow` said no, or a loop had nothing to iterate), and
 /// its members carry the same skip, so the card says skipped rather
 /// than "completed" for a set of rows that are all terminal.
+///
+/// A member parked on a human (or any suspension) holds the container
+/// with it: nothing inside is progressing, so the card says waiting,
+/// in the same cyan the parked node wears, rather than running. Only
+/// when some other member is actually running does running win.
 export function containerStatus(
 	inStatus: NodeExecutionStatus,
 	related: ReadonlyArray<{ status: NodeExecutionStatus }>,
 ): NodeExecutionStatus {
-	if (related.some((e) => e.status === 'running' || e.status === 'waiting_for_input')) return 'running';
+	if (related.some((e) => e.status === 'running')) return 'running';
+	if (related.some((e) => e.status === 'waiting_for_input')) return 'waiting_for_input';
 	if (related.some((e) => e.status === 'failed')) return 'failed';
 	if (inStatus === 'skipped') return 'skipped';
 	const allTerminal =

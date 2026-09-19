@@ -54,14 +54,12 @@
     {
       "name": "threadTs",
       "type": "String",
-      "required": false,
       "label": "Share in thread",
       "placeholder": "The parent message's ts"
     },
     {
       "name": "title",
       "type": "String",
-      "required": false,
       "label": "Title",
       "description": "Display name in Slack. Defaults to the stored file's name."
     },
@@ -69,7 +67,6 @@
       "name": "comment",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Comment",
       "description": "A message posted alongside the file."
     }

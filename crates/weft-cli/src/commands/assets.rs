@@ -19,13 +19,16 @@ use crate::client::DispatcherClient;
 /// file starts its expiry countdown. A text-typed `@asset` from a URL or a stored
 /// key is fetched here, at build, and cast to its declared type (the same
 /// cast a project-file `@file` gets at parse).
+///
+/// Hands back the publish's warnings (a version whose stored file is
+/// gone), for the caller to show; empty without `publish`.
 pub async fn resolve_project_assets(
     client: &DispatcherClient,
     project_root: &std::path::Path,
     definition: &mut weft_core::project::ProjectDefinition,
     sources: Option<&weft_core::project::hash::Manifest>,
     publish: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let refs = weft_compiler::file_ref::collect_asset_refs(definition);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
@@ -48,9 +51,12 @@ pub async fn resolve_project_assets(
         weft_compiler::file_ref::resolve_runtime_key_refs(&key_refs, &listing.files, &mut map)
             .map_err(|errs| anyhow::anyhow!("stored files of the wrong kind:\n  {}", errs.join("\n  ")))?;
     }
-    // Text values that live somewhere the parse could not read: fetched
-    // once per build, cast, and substituted like every other deferred ref.
-    let text_refs = weft_compiler::file_ref::collect_remote_text_refs(definition);
+    // Text values: read once per build (a URL fetched, a stored file
+    // downloaded, a disk path read from wherever it points, the project
+    // root or anywhere on the machine), cast, and substituted like every
+    // other deferred ref. Nothing is uploaded for a text asset: its value
+    // is inlined into the build, so no stored copy would be referenced.
+    let text_refs = weft_compiler::file_ref::collect_text_refs(definition);
     if !text_refs.is_empty() {
         let project = Some(definition.id.to_string());
         let http = reqwest::Client::new();
@@ -58,8 +64,12 @@ pub async fn resolve_project_assets(
         for r in &text_refs {
             let fetched: Result<Vec<u8>> = if weft_compiler::file_ref::is_url_ref(r) {
                 fetch_url_bytes(&http, &r.path).await
-            } else {
+            } else if weft_compiler::file_ref::is_runtime_key_ref(r) {
                 crate::commands::files::download_bytes(client, &r.path, &project).await
+            } else {
+                let path = std::path::Path::new(&r.path);
+                let full = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
+                std::fs::read(&full).with_context(|| format!("read {}", full.display()))
             };
             match fetched.and_then(|bytes| {
                 weft_compiler::file_ref::resolve_text_bytes(r, &bytes).map_err(anyhow::Error::msg)
@@ -76,18 +86,26 @@ pub async fn resolve_project_assets(
     }
     weft_compiler::file_ref::apply_asset_resolutions(definition, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
-    if !publish { return Ok(()); }
+    if !publish { return Ok(Vec::new()); }
     // Publish only after every reference resolved successfully. This includes
     // uploaded files selected by stored key, not just this build's disk refs.
-    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter()))?;
+    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter().filter(|r| weft_compiler::file_ref::is_runtime_key_ref(r))))?;
     if let Some(sources) = sources {
         let scope = weft_core::storage::key::KeyScope::Asset { project_id: definition.id.to_string() };
         for hash in sources.values().filter(|hash| !hash.is_empty()) {
             references.keys.push(weft_core::storage::key::scope_key(&scope, hash).map_err(anyhow::Error::msg)?);
         }
     }
-    client.post_with_body("/storage/assets/references", &serde_json::to_value(references)?)
-        .await.context("update project asset lifetimes")
+    let (status, text) = client.post_json_status("/storage/assets/references", &serde_json::to_value(references)?)
+        .await.context("update project asset lifetimes")?;
+    if !(200..300).contains(&status) {
+        // The build's own file is what is missing here (a version's is a
+        // warning, never a refusal): the upload just made did not land.
+        bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for this project",
+            if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() });
+    }
+    let published: weft_core::storage::AssetsPublished = serde_json::from_str(&text).context("parse the publish answer")?;
+    Ok(published.warnings)
 }
 
 fn asset_references<'a>(
@@ -97,6 +115,7 @@ fn asset_references<'a>(
     let mut references = weft_core::storage::AssetReferencesRequest {
         project: definition.id.to_string(),
         keys: weft_assets::referenced_asset_keys(definition)?,
+        kept: Vec::new(),
     };
     // A text-typed stored asset is read at build time and becomes plain text
     // in the definition. Its SOURCE still needs the file for future builds.
@@ -588,7 +607,7 @@ mod tests {
         assert_eq!(asset_references(&project, refs.iter()).unwrap().keys, vec![own]);
         let empty = asset_references(&project, std::iter::empty()).unwrap();
         assert_eq!(serde_json::to_value(empty).unwrap(), serde_json::json!({
-            "project": project.id.to_string(), "keys": []
+            "project": project.id.to_string(), "keys": [], "kept": []
         }));
     }
 }

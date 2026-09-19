@@ -1,7 +1,7 @@
 {
   "type": "ExecPython",
   "label": "Python",
-  "description": "Run a Python snippet. Declare the node's inputs and outputs inline: `ExecPython(x: Number) -> (result: String) { code: \"...\" }`. Inputs arrive as Python variables named after each port. A file input (Image, Audio, Video, Blob) arrives as its marker dict, and inside the snippet the marker carries a `url` the code can fetch (`inputs['photo']['__weft_image__']['url']`), minted for this firing. The Python code returns a dict keyed by output port name; a key set to None (or missing) emits no pulse on that port. Exceptions fail the node with the full traceback.",
+  "description": "Run a Python snippet. Declare the node's inputs and outputs inline: `ExecPython(x: Number) -> (result: String) { code: \"...\" }`. Every declared input is a Python variable of the same name; one that received nothing is `None`, so an optional input reads as `if problem is None`. A file input (Image, Audio, Video, Blob, File) arrives as a plain dict with `url` (a download link minted for this firing, never written to the journal, so do not look for it there), `filename`, `mimeType`, `sizeBytes` and `key`: read `photo['url']` and fetch it. Return a file on a file-typed output by returning that same dict. The code returns a dict keyed by output port name; a key set to None (or missing) emits no pulse on that port. Exceptions fail the node with the full traceback.",
   "tags": [
     "python",
     "script",
@@ -14,7 +14,10 @@
       "name": "code",
       "type": "String",
       "required": true,
-      "widget": { "kind": "code", "language": "python" },
+      "widget": {
+        "kind": "code",
+        "language": "python"
+      },
       "label": "Python code"
     }
   ],

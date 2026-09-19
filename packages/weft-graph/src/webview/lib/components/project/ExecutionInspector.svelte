@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { Search } from '@lucide/svelte';
 	import type { ExecutionTerminal, NodeExecution } from '../../types';
-	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../protocol';
+	import { frameText, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
 	import { parseFileValue } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
-	import JsonTree from './JsonTree.svelte';
+	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
+	import ValueCard from './ValueCard.svelte';
 	import FileCard from './FileCard.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
@@ -48,18 +49,10 @@
 	/// JSON so `JSON.stringify` cannot fail on the data path; a circular
 	/// reference would mean the wire was corrupted upstream, and the
 	/// user wants to see that loud rather than have it stringified.
-	function prettyPayload(value: unknown): string {
-		if (typeof value === 'string') return value;
-		return JSON.stringify(value);
-	}
-
-	function formatBusTime(atUnix: number): string {
-		const d = new Date(atUnix * 1000);
-		const hh = String(d.getHours()).padStart(2, '0');
-		const mm = String(d.getMinutes()).padStart(2, '0');
-		const ss = String(d.getSeconds()).padStart(2, '0');
-		return `${hh}:${mm}:${ss}`;
-	}
+	// The bus panel and the caller panel show the same kind of line and
+	// obey the same rules about saying what was really sent, so those
+	// rules live in one place (`utils/stream-log`) and both read them.
+	const formatBusTime = formatClockTime;
 
 	/// Short human label for a bus id ("bus #" + first 4 chars of the
 	/// uuid). The full id is just noise in the header; the first chars
@@ -81,13 +74,10 @@
 
 	/// Format one message-kind line for either the on-screen IRC panel
 	/// or the copy-text. A JSON payload renders its value (which may
-	/// legitimately be null); a binary payload renders its size (the
-	/// base64 itself is noise).
+	/// legitimately be null); a message the journal did not write down
+	/// renders its size instead, which is all there is to show.
 	function formatMessageBody(event: BusInspectorEvent & { kind: 'message' }): string {
-		if (event.payload.kind === 'bytes') {
-			return `sent ${event.msgKind} of ${event.payloadByteSize} bytes (binary)`;
-		}
-		return prettyPayload(event.payload.data);
+		return formatStreamBody(event.payload, event.payloadByteSize, event.trimmed, event.msgKind);
 	}
 
 	/// Format an ephemeral window's rollup line: what flew in one
@@ -131,8 +121,8 @@
 	/// within preserve arrival order.
 	function groupLoopEventsByInstance(
 		events: LoopInspectorEvent[],
-	): Array<{ key: string; parentFrames: LoopIteration[]; events: LoopInspectorEvent[] }> {
-		const byKey = new Map<string, { parentFrames: LoopIteration[]; events: LoopInspectorEvent[] }>();
+	): Array<{ key: string; parentFrames: Frame[]; events: LoopInspectorEvent[] }> {
+		const byKey = new Map<string, { parentFrames: Frame[]; events: LoopInspectorEvent[] }>();
 		for (const ev of events) {
 			const key = JSON.stringify(ev.parentFrames);
 			let bucket = byKey.get(key);
@@ -145,9 +135,48 @@
 		return Array.from(byKey.entries()).map(([key, v]) => ({ key, ...v }));
 	}
 
-	function parentFramesLabel(frames: LoopIteration[]): string {
+	/// Linearize the loop activity for the copy text, one section per
+	/// loop instance, mirroring the on-screen cards. `null` when this
+	/// firing had no loop (so the section is skipped entirely).
+	function formatLoopEventsForCopy(events: LoopInspectorEvent[]): string | null {
+		if (events.length === 0) return null;
+		return groupLoopEventsByInstance(events)
+			.map((inst) =>
+				[`[${parentFramesLabel(inst.parentFrames)}]`, ...inst.events.map(loopEventLine)].join('\n'),
+			)
+			.join('\n\n');
+	}
+
+	/// How an input port got its value when it did not travel a wire in
+	/// this run: a backup the run was started with, an output someone
+	/// supplied in place of the node upstream, or a value reused from
+	/// the seed run. `null` for an ordinary wired value. `short` cuts
+	/// the origin run's id to what the banner shows; the copy text
+	/// keeps the whole id.
+	function portOrigin(
+		firing: {
+			providedPorts?: string[];
+			backupPorts?: string[];
+			inheritedPorts?: Record<string, string>;
+		},
+		port: string,
+		short: boolean,
+	): string | null {
+		const origin = firing.inheritedPorts?.[port];
+		const how = firing.backupPorts?.includes(port)
+			? 'backup used'
+			: firing.providedPorts?.includes(port)
+				? 'supplied output'
+				: origin
+					? 'reused input'
+					: null;
+		if (!how) return null;
+		return origin ? `${how} from run ${short ? origin.slice(0, 8) : origin}` : how;
+	}
+
+	function parentFramesLabel(frames: Frame[]): string {
 		if (!frames || frames.length === 0) return 'root';
-		return frames.map((f) => `#${f.index}`).join(' / ');
+		return frames.map(frameText).join(' / ');
 	}
 
 	function loopEventLine(ev: LoopInspectorEvent): string {
@@ -263,9 +292,9 @@
 		if (!framesKey) return '';
 		// framesKey is JSON produced by the engine; a parse failure
 		// means the wire shape drifted, which the user wants to see.
-		const frames = JSON.parse(framesKey) as LoopIteration[];
+		const frames = JSON.parse(framesKey) as Frame[];
 		if (frames.length === 0) return '';
-		return 'iter ' + frames.map((f) => `${f.index}`).join('/');
+		return frames.map(frameText).join('/');
 	}
 </script>
 
@@ -295,21 +324,34 @@
 {#if selected}
 {@const inputJson = (selected.input !== null && selected.input !== undefined) ? JSON.stringify(selected.input, null, 2) : null}
 {@const outputJson = (selected.output !== null && selected.output !== undefined) ? JSON.stringify(selected.output, null, 2) : null}
-{@const detailsText = selected.error ?? (selected.status === 'completed' ? 'Completed successfully' : displayStatus(selected.status))}
+{@const inheritedText = selected.inheritedFrom
+	? `Inherited from run ${selected.inheritedFrom}: this firing was reused, not run again`
+	: ''}
+{@const statusText = selected.error ?? (selected.status === 'completed' ? 'Completed successfully' : displayStatus(selected.status))}
+{@const detailsText = [inheritedText, statusText].filter(Boolean).join('\n')}
+{@const portOriginsText = (selected.input && typeof selected.input === 'object' ? Object.keys(selected.input as Record<string, unknown>) : [])
+	.map((port) => [port, portOrigin(selected, port, false)] as const)
+	.filter(([, origin]) => origin)
+	.map(([port, origin]) => `${port}: ${origin}`)
+	.join('\n')}
 {@const closedPortsText = (selected.closedPorts && selected.closedPorts.length > 0)
 	? selected.closedPorts.map((p) => `${p}: (closed)`).join('\n')
 	: null}
-{@const inputSection = [inputJson, closedPortsText].filter(Boolean).join('\n') || '(none)'}
+{@const inputSection = [inputJson, portOriginsText, closedPortsText].filter(Boolean).join('\n') || '(none)'}
 {@const busSection = formatBusLogsForCopy(busLogs)}
+{@const loopSection = formatLoopEventsForCopy(loopEvents)}
+<!-- The copy text reads in the same order as the modal: values first,
+     then everything about how the firing went. -->
 {@const fullCopyText = [
 	`--- Input ---`, inputSection, ``,
-	`--- Details ---`, detailsText, ``,
 	`--- Output ---`, outputJson ?? '(none)', ``,
+	`--- Details ---`, detailsText, ``,
 	...(busSection ? [`--- Bus Communication ---`, busSection, ``] : []),
+	...(loopSection ? [`--- Loop Activity ---`, loopSection, ``] : []),
 	`Status: ${selected.status} | Duration: ${formatDuration(selected.startedAt, selected.completedAt)}${costLabel(selected) ? ` | Cost: ${costLabel(selected)}` : ''} | ${new Date(selected.startedAt).toLocaleString()} | ${selected.id}`,
 ].join('\n')}
 <Dialog.Root bind:open>
-	<Dialog.Content class="sm:max-w-[92vw] max-h-[85vh] overflow-hidden p-0 gap-0 [&>button:last-child]:hidden nodrag nopan flex flex-col">
+	<Dialog.Content class="sm:max-w-[92vw] w-[92vw] min-w-[min(48rem,94vw)] h-[85vh] max-h-[85vh] overflow-hidden p-0 gap-0 [&>button:last-child]:hidden nodrag nopan flex flex-col">
 		<div class="flex items-center justify-between px-4 py-2.5 border-b border-zinc-200 shrink-0">
 			<div class="flex items-center gap-3">
 				<span class="{selected.status === 'failed' ? 'text-red-600' : selected.status === 'completed' ? 'text-green-600' : 'text-zinc-500'}">{getStatusIcon(selected.status)}</span>
@@ -334,109 +376,98 @@
 			</div>
 		</div>
 
-		<div class="grid grid-cols-3 min-h-0 overflow-hidden flex-1">
-			<div class="flex flex-col min-h-0 border-r border-zinc-200">
+		<!-- Top half: what went in, left; what came out, right. Nothing
+		     else competes for that space, because reading the values is
+		     what the inspector is for. Everything else stacks below. -->
+		<div class="grid grid-cols-2 min-h-0 overflow-hidden flex-1 divide-x divide-zinc-200">
+			<div class="flex flex-col min-h-0">
 				<div class="flex items-center justify-between px-3 py-1.5 bg-zinc-50 border-b border-zinc-200 shrink-0">
-					<span class="text-[10px] font-medium text-zinc-400 uppercase tracking-wider">Input</span>
+					<span class="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">Input</span>
 					{#if inputJson}
 						<CopyButton text={inputJson} />
 					{/if}
 				</div>
-				<div class="overflow-auto flex-1 p-2">
+				<div class="overflow-auto flex-1 p-2.5 space-y-2 bg-zinc-50/40">
 					{#if selected.input && typeof selected.input === 'object' && Object.keys(selected.input as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.input as Record<string, unknown>) as [key, value]}
 							{@const file = parseFileValue(value)}
-							{@const provided = selected.providedPorts?.includes(key)}
-							{@const backup = selected.backupPorts?.includes(key)}
-							{@const origin = selected.inheritedPorts?.[key]}
-							{#if backup || provided || origin}
-								<div class="text-[10px] text-sky-700 px-1">{key}: {backup ? 'backup used' : provided ? 'supplied output' : 'reused input'}{origin ? ` from run ${origin}` : ''}</div>
-							{/if}
+							{@const note = portOrigin(selected, key, true) ?? undefined}
 							{#if file}
-								<FileCard label={key} {file} />
+								<FileCard label={key} {file} {note} />
 							{:else}
-								<JsonTree data={value} label={key} defaultExpanded={true} />
+								<ValueCard label={key} {value} {note} />
 							{/if}
 						{/each}
 					{:else if selected.input !== null && selected.input !== undefined && typeof selected.input !== 'object'}
-						<div class="p-1 text-[11px] font-mono text-zinc-700">{JSON.stringify(selected.input)}</div>
+						<ValueCard label="value" value={selected.input} />
 					{:else if !selected.closedPorts || selected.closedPorts.length === 0}
-						<div class="p-1 text-xs text-zinc-400 italic">No input data</div>
+						<div class="px-1 py-2 text-xs text-zinc-400 italic">No input data</div>
 					{/if}
-					{#if selected.closedPorts && selected.closedPorts.length > 0}
-						{#each selected.closedPorts as port}
-							<div class="p-1 text-[11px] font-mono text-zinc-500 italic">
-								<span class="text-zinc-400">{port}:</span> (closed)
-							</div>
-						{/each}
-					{/if}
-				</div>
-			</div>
-
-			<div class="flex flex-col min-h-0 border-r border-zinc-200">
-				<div class="flex items-center justify-between px-3 py-1.5 bg-zinc-50 border-b border-zinc-200 shrink-0">
-					<span class="text-[10px] font-medium text-zinc-400 uppercase tracking-wider">Details</span>
-					<CopyButton text={detailsText} />
-				</div>
-				<div class="overflow-auto flex-1 p-3 space-y-3">
-					{#if selected.inheritedFrom}
-						<div class="rounded border border-sky-200 bg-sky-50 p-2.5 text-[11px] text-sky-800">
-							Inherited from run {selected.inheritedFrom.slice(0, 8)}: this firing was reused, not run again.
-						</div>
-					{/if}
-					{#if selected.portWarnings && selected.portWarnings.length > 0}
-						<div class="rounded border border-amber-200 bg-amber-50 p-2.5">
-							<div class="text-[10px] font-semibold text-amber-700 mb-1">Output type mismatch</div>
-							{#each selected.portWarnings as w}
-								<div class="text-[11px] text-amber-700 font-mono break-words">
-									Port <span class="font-semibold">{w.port}</span> expected <span class="font-semibold">{w.expected}</span> but got <span class="font-semibold">{w.actual}</span>; the value was not sent and the port was closed.
-								</div>
-							{/each}
-						</div>
-					{/if}
-					{#if selected.error}
-						<div class="rounded border border-red-200 bg-red-50 p-2.5">
-							<div class="text-[10px] font-semibold text-red-700 mb-1">Error</div>
-							<pre class="text-[11px] text-red-600 whitespace-pre-wrap break-words font-mono">{selected.error}</pre>
-						</div>
-					{:else if selected.status === 'completed'}
-						<div class="text-[11px] text-green-600">Completed successfully</div>
-					{:else if selected.status === 'running' || selected.status === 'waiting_for_input'}
-						<div class="text-[11px] text-blue-600 animate-pulse">
-							{selected.status === 'waiting_for_input' ? 'Waiting for input...' : 'Running...'}
-						</div>
-					{:else if selected.status === 'skipped'}
-						<div class="text-[11px] text-zinc-500">Skipped: {skipReasonText(selected.skipReason)}</div>
-					{:else}
-						<div class="text-[11px] text-zinc-500">{displayStatus(selected.status)}</div>
-					{/if}
+					{#each selected.closedPorts ?? [] as port}
+						<ValueCard label={port} closed />
+					{/each}
 				</div>
 			</div>
 
 			<div class="flex flex-col min-h-0">
 				<div class="flex items-center justify-between px-3 py-1.5 bg-zinc-50 border-b border-zinc-200 shrink-0">
-					<span class="text-[10px] font-medium text-zinc-400 uppercase tracking-wider">Output</span>
+					<span class="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">Output</span>
 					{#if outputJson}
 						<CopyButton text={outputJson} />
 					{/if}
 				</div>
-				<div class="overflow-auto flex-1 p-2">
+				<div class="overflow-auto flex-1 p-2.5 space-y-2 bg-zinc-50/40">
 					{#if selected.output && typeof selected.output === 'object' && Object.keys(selected.output as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.output as Record<string, unknown>) as [key, value]}
 							{@const file = parseFileValue(value)}
 							{#if file}
 								<FileCard label={key} {file} />
 							{:else}
-								<JsonTree data={value} label={key} defaultExpanded={true} />
+								<ValueCard label={key} {value} />
 							{/if}
 						{/each}
 					{:else if selected.output !== null && selected.output !== undefined}
-						<div class="p-1 text-[11px] font-mono text-zinc-700">{JSON.stringify(selected.output)}</div>
+						<ValueCard label="value" value={selected.output} />
 					{:else}
-						<div class="p-1 text-xs text-zinc-400 italic">No output</div>
+						<div class="px-1 py-2 text-xs text-zinc-400 italic">No output</div>
 					{/if}
 				</div>
 			</div>
+		</div>
+
+		<!-- Everything that is NOT a value, stacked in reading order and
+		     bounded: details first, then whatever this firing had (a
+		     bus, a loop, corrupted rows). Capped and scrollable so a
+		     chatty bus can never squeeze the values out of the top. -->
+		<div class="shrink-0 max-h-[45%] overflow-auto border-t border-zinc-200 bg-white">
+		<!-- Details. A line, not a column: on a completed firing it says
+		     one word, and a third of the modal was being spent on it.
+		     It only grows when something went wrong, and then it is the
+		     first thing under the values. -->
+		<div class="px-4 py-2 space-y-2">
+			{#if selected.inheritedFrom}
+				<div class="rounded-md border border-sky-200 bg-sky-50 p-2.5 text-[11px] text-sky-800">
+					Inherited from run <span class="font-mono">{selected.inheritedFrom.slice(0, 8)}</span>: this firing was reused, not run again.
+				</div>
+			{/if}
+			{#if selected.error}
+				<div class="rounded-md border border-red-200 bg-red-50 p-2.5">
+					<div class="text-[10px] font-semibold text-red-700 mb-1">Error</div>
+					<pre class="m-0 text-[11px] text-red-600 whitespace-pre-wrap break-words font-mono max-h-48 overflow-auto">{selected.error}</pre>
+				</div>
+			{:else if selected.status === 'completed'}
+				<div class="flex items-center gap-1.5 text-[11px] text-green-600">
+					<span>{getStatusIcon('completed')}</span> Completed successfully
+				</div>
+			{:else if selected.status === 'running' || selected.status === 'waiting_for_input'}
+				<div class="text-[11px] text-blue-600 animate-pulse">
+					{selected.status === 'waiting_for_input' ? 'Waiting for input...' : 'Running...'}
+				</div>
+			{:else if selected.status === 'skipped'}
+				<div class="text-[11px] text-zinc-500">Skipped: {skipReasonText(selected.skipReason)}</div>
+			{:else}
+				<div class="text-[11px] text-zinc-500">{displayStatus(selected.status)}</div>
+			{/if}
 		</div>
 
 		<!-- Bus communication section. One scrollable IRC-style panel
@@ -445,7 +476,7 @@
 		     events come from the journal-projected `DispatcherEvent`
 		     stream the host feeds to the webview either way. -->
 		{#if busLogs.length > 0}
-			<div class="border-t border-zinc-200 bg-zinc-50/50 shrink-0">
+			<div class="border-t border-zinc-200 bg-zinc-50/50">
 				<div class="px-4 py-1.5 text-[10px] font-medium text-zinc-400 uppercase tracking-wider">
 					Bus Communication
 				</div>
@@ -487,7 +518,7 @@
 
 		{#if loopEvents.length > 0}
 			{@const loopInstances = groupLoopEventsByInstance(loopEvents)}
-			<div class="border-t border-zinc-200 bg-zinc-50/50 shrink-0">
+			<div class="border-t border-zinc-200 bg-zinc-50/50">
 				<div class="px-4 py-1.5 text-[10px] font-medium text-zinc-400 uppercase tracking-wider">
 					Loop Activity
 				</div>
@@ -532,6 +563,8 @@
 				{/if}
 			</div>
 		{/if}
+
+		</div>
 
 		<div class="flex items-center gap-4 px-4 py-1.5 border-t border-zinc-200 bg-zinc-50 text-[10px] text-zinc-500 shrink-0">
 			<span class="font-medium {selected.status === 'failed' ? 'text-red-600' : selected.status === 'completed' ? 'text-green-600' : ''}">{selected.status}</span>

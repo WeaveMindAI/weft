@@ -55,10 +55,38 @@ pub fn spawn_all(state: DispatcherState) {
 async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
     let mut orphans = state.projects.projects_with_orphan_definitions().await?;
     orphans.extend(state.versions.projects_with_orphan_versions().await?);
+    // Executions whose project is gone: the erase at removal is
+    // best-effort, so a transient failure there lands here.
+    for project in state.journal.projects_with_orphan_executions().await? {
+        match project.parse::<uuid::Uuid>() {
+            Ok(id) => orphans.push(id),
+            Err(e) => tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project, error = %e,
+                "an execution names a project id that is not an id; leaving it alone"
+            ),
+        }
+    }
     orphans.sort();
     orphans.dedup();
     let mut failed = 0usize;
     for project in orphans {
+        match state.journal.delete_project_executions(&project.to_string()).await {
+            Ok(0) => {}
+            Ok(erased) => tracing::info!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project, executions = erased,
+                "erased the executions of a project that is gone"
+            ),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    target: "weft_dispatcher::reaper",
+                    project_id = %project, error = %e,
+                    "could not erase this removed project's executions; the next sweep tries again"
+                );
+            }
+        }
         // Per project, because recovering from a failure on ONE is the
         // whole reason this loop exists. Propagating the first error
         // abandoned every project after it in id order, every hour, for

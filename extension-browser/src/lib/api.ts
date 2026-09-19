@@ -64,7 +64,7 @@ export interface PendingTask {
   /// sufficient routing).
   token: string;
   nodeId: string;
-  /// Wake-signal kind tag (e.g. `form`, `timer`, `api_endpoint`).
+  /// Wake-signal kind tag (e.g. `form`, `timer`, `route`).
   /// Useful for the extension to skip kinds it can't render.
   kind: string;
   /// Free-form consumer label (e.g. `human_in_the_loop`). Set by the

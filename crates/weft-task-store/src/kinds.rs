@@ -20,6 +20,12 @@ pub enum TaskKind {
     /// Dispatcher: register a wake signal with the listener and
     /// return its mint info to the worker that asked.
     RegisterSignal,
+    /// Dispatcher: a live caller arrived at the worker the handshake
+    /// pointed them to; give birth to the execution the routing token
+    /// promised, pinned to that worker. Producer = worker (via broker).
+    /// Nothing is born at the handshake, so a caller who never follows
+    /// the redirect leaves nothing behind.
+    LiveArrival,
     /// Dispatcher: spawn a worker Pod for the project's pool.
     SpawnPod,
     /// Dispatcher: fire a held-event signal that the listener
@@ -72,6 +78,7 @@ impl TaskKind {
         match self {
             Self::RouteEntry => "route_entry",
             Self::RegisterSignal => "register_signal",
+            Self::LiveArrival => "live_arrival",
             Self::SpawnPod => "spawn_pod",
             Self::FireSignal => "fire_signal",
             Self::Execute => "execute",
@@ -108,15 +115,86 @@ pub struct ExecutionPayload {
     /// the hash IS the lookup key.
     pub definition_hash: String,
     /// Present only for executions STARTED by a live-caller handshake (the
-    /// dispatcher's `/connect` endpoint). Opaque to this generic store:
-    /// carries the trigger's full signal spec JSON (kind tag + config body),
-    /// from which the worker recovers BOTH the wire protocol (the tag:
-    /// `api_endpoint` -> HTTP, `live_socket` -> WS) and the connection knobs
-    /// (the body) to build the `CallerConnection` runtime config and expect
-    /// a caller to attach for this color. `None` for every ordinary
-    /// pull-queue / resume execution.
+    /// dispatcher's `/connect` endpoint): the trigger's signal spec, from
+    /// which the worker recovers the wire protocol (the tag: `route` ->
+    /// HTTP, `socket` -> WS) and the connection knobs, plus what the
+    /// caller sent to open the exchange, which the worker puts on the
+    /// connection so nodes read it. `None` for every ordinary pull-queue
+    /// / resume execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_connection: Option<serde_json::Value>,
+    pub live_connection: Option<LiveConnectionStart>,
+}
+
+/// What a live-caller execution starts with: the trigger's full signal
+/// spec (kind tag + config body) and the caller's opening request, the
+/// gate's verdict from the handshake and the rest from the request as
+/// it arrived at the worker. ONE record, built at the birth, read once
+/// on the worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveConnectionStart {
+    pub spec: weft_core::primitive::SignalSpec,
+    pub request: weft_core::caller::LiveRequest,
+    /// Set when the run was FIRED rather than reached by a caller
+    /// (`weft run --fire` on a Route). `None` for every real caller,
+    /// which is every run that arrives through the gateway.
+    ///
+    /// The point is the loop. A route's program is unrunnable offline
+    /// without this, because the trigger and every Reply behind it ask
+    /// for the caller and a fired run has nobody there, so trying a
+    /// route meant a cluster, an activation and an image build before
+    /// you could see one value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired: Option<FiredExchange>,
+}
+
+/// The stand-in caller's side of a fired run: there is no socket
+/// coming, so the trigger serves the request the author typed and the
+/// program's answer goes to the journal instead of a wire.
+///
+/// It carries nothing. Its PRESENCE is the whole message: this run was
+/// fired, so serve a stand-in rather than failing for want of a caller.
+/// A bool would say the same thing and read worse at the call sites,
+/// where `fired: Some(..)` is the fact being tested.
+///
+/// It used to carry the body, lifted out of the fire payload so the
+/// stand-in could serve it back through the ordinary request call. That
+/// meant the language held a field name (`body`) to make the trick
+/// work, and a caller trigger's own vocabulary had leaked one level
+/// down. The body now stays in the payload, where the author put it,
+/// and the node reads it off its own wake when the request carries
+/// none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiredExchange {}
+
+/// Payload for `TaskKind::LiveArrival`. Producer = worker (the
+/// connection server, when a caller presents a routing token); consumer
+/// = the dispatcher's executor, which gives birth to the execution the
+/// token promised. The token carries what the handshake established (the
+/// route, the gate's verdict, the path and its captures); the rest is
+/// the request as it arrived at the worker, which is the request the
+/// caller sent to the dispatcher, resent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveArrivalPayload {
+    pub token: String,
+    pub method: String,
+    #[serde(default)]
+    pub query: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+/// The dedup key of the arrival task for `color`: one birth per token,
+/// so a caller's client that resent the request converges on one task.
+pub fn live_arrival_dedup_key(color: weft_core::Color) -> String {
+    format!("live-arrival:{color}")
+}
+
+/// What a `LiveArrival` task answers with: the color born and the pod
+/// it runs on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveArrivalResult {
+    pub color: String,
+    pub pod_name: String,
 }
 
 /// Payload for `TaskKind::FireSignal`. Producer = listener; consumer =
@@ -230,6 +308,30 @@ pub struct RecordLogPayload {
 }
 
 #[cfg(test)]
+mod live_arrival_wire_tests {
+    use super::*;
+
+    #[test]
+    fn the_arrival_payload_round_trips_and_the_key_is_per_color() {
+        let payload = LiveArrivalPayload {
+            token: "v1.x.y".into(),
+            method: "POST".into(),
+            query: [("verbose".to_string(), "1".to_string())].into_iter().collect(),
+            headers: vec![("content-type".into(), "application/json".into())],
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        let back: LiveArrivalPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back.method, "POST");
+        assert_eq!(back.query["verbose"], "1");
+        assert_eq!(back.headers.len(), 1);
+        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "method": "GET" })).unwrap();
+        assert!(bare.query.is_empty() && bare.headers.is_empty());
+        let color = weft_core::Color::from_u128(7);
+        assert_eq!(live_arrival_dedup_key(color), format!("live-arrival:{color}"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -276,7 +378,7 @@ mod tests {
             let payload = RecordCostPayload {
                 color: "c1".into(),
                 node_id: "ask".into(),
-                frames: vec![weft_core::LoopIteration { index: 2 }],
+                frames: vec![weft_core::frames::Frame::Loop { index: 2 }],
                 service: "openrouter".into(),
                 model: Some("m".into()),
                 amount_usd,
@@ -301,7 +403,85 @@ mod tests {
             assert_eq!(back.amount_usd, amount_usd);
             assert!(!back.billed);
             assert_eq!(back.origin, weft_core::CredentialOwner::TheirOwn);
-            assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 2 }]);
+            assert_eq!(back.frames, vec![weft_core::frames::Frame::Loop { index: 2 }]);
         }
     }
+
+    /// The live start record rides the execute payload whole: the spec
+    /// and the caller's opening request both survive the wire, and an
+    /// ordinary execution omits the field.
+    #[test]
+    fn live_connection_start_round_trips_on_the_execute_payload() {
+        let mut request = weft_core::caller::LiveRequest {
+            method: "POST".into(),
+            path: "chat/room7".into(),
+            ..Default::default()
+        };
+        request.params.insert("room".into(), "room7".into());
+        request.caller = Some(serde_json::json!({ "key": 1 }));
+        let payload = ExecutionPayload {
+            project_id: "p1".into(),
+            color: "c1".into(),
+            definition_hash: "h".into(),
+            live_connection: Some(LiveConnectionStart {
+                spec: weft_core::primitive::SignalSpec::of_kind(
+                    "route",
+                    serde_json::json!({ "path": "chat/{room}" }),
+                ),
+                request: request.clone(),
+                fired: None,
+            }),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["live_connection"]["spec"]["kind"], "route");
+        assert!(
+            json["live_connection"].get("fired").is_none(),
+            "a real caller carries no stand-in body, and an absent one costs no bytes on the wire"
+        );
+        assert_eq!(json["live_connection"]["request"]["params"]["room"], "room7");
+        let back: ExecutionPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back.live_connection.unwrap().request, request);
+
+        let plain = ExecutionPayload {
+            project_id: "p1".into(),
+            color: "c1".into(),
+            definition_hash: "h".into(),
+            live_connection: None,
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("live_connection").is_none(), "an ordinary execution omits it");
+    }
+
+    /// A fired run still reads as fired after the trip to the worker.
+    ///
+    /// This is the shape that broke, twice over. It was once an
+    /// `Option<Value>` holding the body, and a GET's body is null, so
+    /// `Some(Null)` went out on the wire as `null` and came back
+    /// `None`: the dispatcher said "here is a stand-in caller" and the
+    /// worker heard "no caller", waited for a socket nobody was going
+    /// to open, and the Route node failed telling the author to trigger
+    /// it through a Route. It now carries nothing at all, so the only
+    /// thing that can survive the trip is the one thing that matters.
+    #[test]
+    fn a_fired_run_survives_the_wire() {
+        let payload = ExecutionPayload {
+            project_id: "p1".into(),
+            color: "c1".into(),
+            definition_hash: "h".into(),
+            live_connection: Some(LiveConnectionStart {
+                spec: weft_core::primitive::SignalSpec::of_kind("route", serde_json::json!({})),
+                request: weft_core::caller::LiveRequest {
+                    method: "GET".into(),
+                    path: "cards".into(),
+                    ..Default::default()
+                },
+                fired: Some(FiredExchange {}),
+            }),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        let back: ExecutionPayload = serde_json::from_value(json).unwrap();
+        let start = back.live_connection.expect("the live connection survives");
+        assert!(start.fired.is_some(), "a fired run must still read as fired after the trip");
+    }
 }
+

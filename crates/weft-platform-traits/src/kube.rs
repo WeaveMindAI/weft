@@ -103,6 +103,14 @@ impl DeleteOpts {
     }
 }
 
+/// One node port and the Service that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePortHolder {
+    pub namespace: String,
+    pub service: String,
+    pub port: u16,
+}
+
 #[async_trait]
 pub trait KubeReader: Send + Sync {
     /// List Deployment + StatefulSet replica state in a namespace,
@@ -136,6 +144,17 @@ pub trait KubeReader: Send + Sync {
     /// node-test executor watches a run-to-completion pod through
     /// this.
     async fn pod_phase(&self, namespace: &str, pod_name: &str) -> Result<Option<String>>;
+
+    /// Every node port the cluster has handed out, with the Service
+    /// holding it. Cluster wide on purpose: a node port is unique
+    /// across the whole cluster, so a door picking one has to see
+    /// every Service, including the ones weft did not create.
+    ///
+    /// Read rather than remembered, because the apiserver is what
+    /// actually owns these numbers: it hands dynamic allocations out
+    /// of the same range a door picks from, and it refuses a Service
+    /// asking for a port already taken.
+    async fn node_ports(&self) -> Result<Vec<NodePortHolder>>;
 
     /// One named container's logs (full stdout+stderr as kubectl
     /// serves them). Named explicitly so a pod that grows a second
@@ -192,11 +211,11 @@ pub trait KubeWriter: Send + Sync {
     /// stays put.
     async fn delete_pods(&self, namespace: &str, selector: &str) -> Result<()>;
 
-    /// Apply a raw (multi-document) YAML manifest. The single-JSON
-    /// `apply` above is for one server-side-apply call; this one is
-    /// for the dispatcher's listener spawn which renders a
-    /// Deployment + Service together. Both routes converge on
-    /// `kubectl apply -f -` in the production impl.
+    /// Apply a raw (multi-document) YAML manifest. Use this one when
+    /// several resources are rendered together, as the dispatcher's
+    /// listener spawn renders a Deployment + Service; for a single
+    /// resource, `apply` takes the JSON directly. Both routes converge
+    /// on `kubectl apply -f -` in the production impl.
     async fn apply_yaml(&self, manifest: &str) -> Result<()>;
 
     /// Delete a (cluster-scoped) namespace and everything in it.

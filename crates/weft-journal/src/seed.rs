@@ -7,6 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use weft_core::frames::Located;
 use weft_core::primitive::ExecutionSnapshot;
 use weft_core::project::ProjectDefinition;
 use weft_core::Color;
@@ -65,8 +66,8 @@ impl SeedChain {
 /// Import from already reconstructed runs, so callers painting several
 /// ancestors do not reconstruct the same history once per ancestor.
 pub fn import_origins(fold: &mut Fold, seed: &Seed, sources: &BTreeMap<Color, Fold>, at_unix: u64) -> Result<FoldEffects> {
-    let mut by_origin: BTreeMap<Color, BTreeSet<String>> = BTreeMap::new();
-    for (node, origin) in &seed.origins { by_origin.entry(*origin).or_default().insert(node.clone()); }
+    let mut by_origin: BTreeMap<Color, BTreeSet<Located>> = BTreeMap::new();
+    for (place, origin) in &seed.origins { by_origin.entry(*origin).or_default().insert(place.clone()); }
     let mut effects = FoldEffects::default();
     for (origin, nodes) in by_origin {
         let source = sources.get(&origin).ok_or_else(|| anyhow::anyhow!("seed names origin {origin} outside its ancestor chain"))?;
@@ -166,7 +167,7 @@ mod tests {
     fn birth(color: Color, seed: Option<Seed>, from: &str) -> ExecEvent {
         let mut selection = RunSelection::carve(&program(), &SelectionBounds { from: vec![from.into()], ..Default::default() }).unwrap();
         if let Some(seed) = &seed {
-            selection.nodes.retain(|id| !seed.origins.contains_key(id));
+            selection.nodes.retain(|place| !seed.origins.contains_key(place));
             selection.suppliers.extend(seed.origins.keys().cloned());
         }
         ExecEvent::ExecutionStarted {
@@ -196,7 +197,7 @@ mod tests {
         let mut parent_rows = vec![birth(parent, None, "a")];
         parent_rows.extend(result(parent, "a", "A"));
         parent_rows.extend(result(parent, "b", "B"));
-        let rows = vec![birth(child, Some(Seed { parent, origins:BTreeMap::from([("a".into(),parent),("b".into(),parent)]) }), "c")];
+        let rows = vec![birth(child, Some(Seed { parent, origins:BTreeMap::from([(Located::top("a"), parent),(Located::top("b"), parent)]) }), "c")];
         let chain = chain(&rows, &HashMap::from([(parent,parent_rows)])).await.unwrap();
         assert!(matches!(chain.ancestors[0].rows[0], ExecEvent::ExecutionStarted { .. }));
         let snapshot = fold_seeded(child, program(), &chain, &rows).unwrap();
@@ -211,9 +212,9 @@ mod tests {
         let (a,b,c) = (color(1),color(2),color(3));
         let mut a_rows = vec![birth(a,None,"a")];
         a_rows.extend(result(a,"a","A"));
-        let mut b_rows = vec![birth(b,Some(Seed { parent:a, origins:BTreeMap::from([("a".into(),a)]) }),"b")];
+        let mut b_rows = vec![birth(b,Some(Seed { parent:a, origins:BTreeMap::from([(Located::top("a"), a)]) }),"b")];
         b_rows.extend(result(b,"b","B"));
-        let rows = vec![birth(c,Some(Seed { parent:b, origins:BTreeMap::from([("a".into(),a),("b".into(),b)]) }),"c")];
+        let rows = vec![birth(c,Some(Seed { parent:b, origins:BTreeMap::from([(Located::top("a"), a),(Located::top("b"), b)]) }),"c")];
         let chain = chain(&rows,&HashMap::from([(a,a_rows),(b,b_rows)])).await.unwrap();
         let snapshot = fold_seeded(c,program(),&chain,&rows).unwrap();
         assert_eq!(snapshot.executions["a"][0].inherited_from,Some(a));
@@ -243,7 +244,7 @@ mod tests {
         let mut parent_rows = vec![birth(parent,None,"a")];
         parent_rows.push(ExecEvent::NodeStarted {color:parent,node_id:"a".into(),frames:vec![],at_unix:1});
         parent_rows.push(ExecEvent::NodeFailed {color:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),at_unix:2});
-        let rows = vec![birth(color(2),Some(Seed {parent,origins:BTreeMap::from([("a".into(),parent)])}),"b")];
+        let rows = vec![birth(color(2),Some(Seed {parent,origins:BTreeMap::from([(Located::top("a"), parent)])}),"b")];
         let chain = chain(&rows,&HashMap::from([(parent,parent_rows)])).await.unwrap();
         assert!(fold_seeded(color(2),program(),&chain,&rows).err().unwrap().to_string().contains("no complete reusable result"));
     }

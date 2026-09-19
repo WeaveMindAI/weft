@@ -35,18 +35,20 @@ installs the same assistant with no flag at all, until you pass
 `--assistant <name>` to change it or `--assistant none` to stop. Claude Code
 is also available as `--assistant claude-code` (shorthand `cc`).
 
-Tangle is deliberately symlinked from your weft checkout rather than
-copied, so updating weft (`git pull` + `./setup.sh` in the checkout)
-refreshes Tangle in every such project at once. That is the one exception to
-"the project owns everything" below; the links are machine-local and
-already gitignored for you.
+Tangle is copied into the project, so those files are yours like the rest
+of it: they get committed, and someone who clones your project gets Tangle
+without needing a weft checkout. The price is that a project holds the
+Tangle that created it. If you want one on a newer version after updating
+weft, run `weft tangle update` in it, which re-copies every file Tangle
+owns and leaves anything your assistant wrote beside them alone.
 
 ## What got created
 
 ```
 hello/
   weft.toml      the project's name and its permanent id
-  main.weft      the program
+  src/
+    main.weft    the program
   nodes/         every node this project can use
   .weft/         build output and caches (already gitignored for you)
 ```
@@ -58,13 +60,14 @@ into the weft installation and upgrading weft cannot change what your program
 does. If you want the newer standard library later, `weft catalog update` re-syncs
 that mirror.
 
-Your own nodes go anywhere else under `nodes/`, never inside `base_catalog/`,
+Your own nodes go anywhere else under `nodes/`, or beside the code under
+`src/`, never inside `base_catalog/`,
 because `weft catalog update` wipes and recopies that folder and anything you
 edited in there goes with it.
 
 ## The program
 
-`main.weft` is three lines:
+`src/main.weft` is three lines:
 
 ```weft
 greeting = Text { value: "hello world" }
@@ -106,7 +109,7 @@ so whenever anything in weft says "per color", it means per execution.
 
 ## Change something
 
-Edit `main.weft`:
+Edit `src/main.weft`:
 
 ```weft
 greeting = Text { value: "hello world" }

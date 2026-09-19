@@ -30,7 +30,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn fire_fans(rig: FakeRig) -> WeftResult<()> {
-    rig.wake(json!({ "fileId": "F1", "channel": "C1", "user": "U1" }));
+    rig.wake(json!({ "type": "file_shared", "fileId": "F1", "channel": "C1", "user": "U1" }));
     let outcome = rig
         .run(&SlackOnFileSharedNode, json!({ "account": rig.access("slack") }))
         .await

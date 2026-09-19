@@ -111,6 +111,13 @@ goes dark. Two nodes turn that into a shape you can read:
 - `FirstInOrder` takes the branches back to one wire: it emits the first of its
   inputs that carried a value, in the order they are written, so the answer a
   person approved can sit above the automatic one and never be overtaken.
+- `All` is the AND a gate cannot hold: a gate takes one wire, and "delete it
+  only if the model said rude and said sure" has two answers. Wire both onto
+  an `All` and gate on what it emits. It says yes when every input arrived and
+  none of them is `false`, and closes its output otherwise, so a `_should_flow`
+  reads that closure as a no. It reads a value exactly the way a gate does,
+  and a branch that closed never arrives at all, which makes it the AND of
+  decisions and of arrivals at once.
 
 A `Group` or a `Loop` takes `_should_flow` too, so one line turns off a whole
 subgraph: it closes the group's outputs, which closes everything inside it,

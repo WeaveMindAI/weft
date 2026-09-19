@@ -560,12 +560,45 @@ export interface NodeDefinition {
   /// Set on an opaque `@include` node: the included `.weft` file path. The
   /// editor renders this as an expandable group that navigates into the file.
   includePath?: string;
+  /// Set on an opaque `@include` node: what the file behind it holds,
+  /// reached through its own includes too. The body is not in the graph
+  /// in an interface parse, so this is the only way to tell that a
+  /// project's only trigger (or only infra node) is inside an include.
+  // SYNC: includeContents <-> crates/weft-core/src/project.rs NodeDefinition.include_contents
+  includeContents?: IncludedContents;
   /// The file this node was written in; absent = the compiled source.
   /// The editor never edits by span (every EditOp addresses by id/key,
   /// and the Rust engine resolves the decl in the buffer it is editing,
   /// failing loudly on an id it cannot find), so this is not consumed
   /// by the editor; the Problems panel routes diagnostics by it.
   sourceFile?: string;
+}
+
+/// What an opaque `@include` node stands for: the roles its file plays,
+/// and every file reached to find out.
+///
+/// Kept apart from the node's own `requiresInfra` / `features.isTrigger`
+/// because those two drive real per-node work (an infra node gets a
+/// provisioned slot and a `/live` poller, a trigger gets a mount URL and
+/// a `/display` poller), and the include alias is not the node that does
+/// any of it. It only contains them.
+// SYNC: IncludedContents <-> crates/weft-core/src/project.rs IncludedContents
+export interface IncludedContents {
+  /// Some node inside requires infrastructure.
+  requiresInfra?: boolean;
+  /// Some node inside is a trigger, so the project can be activated.
+  hasTrigger?: boolean;
+  /// Every `.weft` file reached through this include, nested ones
+  /// included, each relative to the PROJECT ROOT. Root-relative and not
+  /// as written, because an `@include` path is relative to the file that
+  /// wrote it, so a nested one resolved against the top file's directory
+  /// would point at nothing. Watch these so editing a deeply included
+  /// file re-parses the graph.
+  files?: string[];
+  /// The node types found inside. The parser has no catalog, so it
+  /// records the types and the compiler's enrich pass settles the two
+  /// booleans above from them.
+  nodeTypes?: string[];
 }
 
 // SYNC: Edge <-> crates/weft-core/src/project.rs Edge
@@ -594,10 +627,13 @@ export interface GroupDefinition {
   /// On the Rust side `kind` + `loopConfig` are ONE flattened tagged
   /// enum (GroupKind), so a loop always carries its config and a
   /// payload missing `kind` fails Rust deserialization.
-  kind: 'group' | 'loop';
+  kind: 'group' | 'loop' | 'call' | 'body';
   /// Loop config fields (parallel/over/carry/max_iters/trim_on_mismatch).
-  /// Always present when `kind === 'loop'`, never for `group`.
+  /// Always present when `kind === 'loop'`, never for the others.
   loopConfig?: Record<string, unknown> | null;
+  /// For a `call`: the id of the shared `body` group (the included
+  /// file, compiled once) this site calls. Never for the others.
+  body?: string;
   /// Always null today: no group-like decl carries a user label in the
   /// language; the editor derives the display name from the id's local
   /// segment. The slot exists so a future label syntax needs no wire
@@ -935,6 +971,11 @@ export interface AccessSpecWire {
    *  reads inside; the blob rides to the server verbatim (the door
    *  probe records it so the events receiver can verify pushes). */
   events?: Record<string, unknown>;
+  /** How a CALLER presenting a connection of this service is checked
+   *  when a live route is gated by it (an auth access node's recipe).
+   *  The editor never reads inside; the blob rides to the server
+   *  verbatim and the broker runs it. */
+  verify?: Record<string, unknown>;
   /** All-or-nothing groups of optional fields, at least one of which a
    *  connect must fill (a mailbox's receiving vs sending servers). The
    *  connect refuses a half-filled or empty choice, naming the fix. */
@@ -965,6 +1006,10 @@ export interface GrantSummary {
   /** The NAMES of the values this connection stores (never the values).
    *  What the live `requiresValues` check compares against. */
   value_names?: string[];
+  /** Whether a credential stands behind the row right now: always for
+   *  a stored credential; for an 'ours' row, whether the runtime holds
+   *  the key it resolves to. False = picked, nothing behind it. */
+  has_credential: boolean;
 }
 
 /** The on-wire sentinel key tagging an Access value. */
@@ -1066,6 +1111,7 @@ export interface ParseResponse {
 export type SkipReason =
   | { kind: 'did_not_flow' }
   | { kind: 'flow_closed' }
+  | { kind: 'did_flow' }
   | { kind: 'required_input_closed'; port: string }
   | { kind: 'every_input_closed' }
   | { kind: 'one_of_group_closed'; ports: string[] }
@@ -1089,6 +1135,20 @@ export type CancelCause =
 // packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
 export const SHOULD_FLOW_PORT = '_should_flow';
 
+/// The same gate read the other way round: the node runs when the thing
+/// wired here did NOT happen (a closed input is the yes). A node uses
+/// one spelling or the other; wiring both is a compile error, so the
+/// editor draws ONE gate port and toggles which name it wires.
+// SYNC: SHOULD_NOT_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_NOT_FLOW_PORT,
+// docs/src/language/syntax.md (reserved keys),
+// packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
+export const SHOULD_NOT_FLOW_PORT = '_should_not_flow';
+
+/// Is this port name the language's gate, either way round?
+export function isGatePort(name: string): boolean {
+  return name === SHOULD_FLOW_PORT || name === SHOULD_NOT_FLOW_PORT;
+}
+
 export type NodeExecutionStatus =
   | 'running'
   | 'waiting_for_input'
@@ -1107,18 +1167,41 @@ export type NodeExecutionStatus =
 // it falls back to "(none)" for every node, even when the
 // execution actually moved data.
 
-/// Frame stack identifying which iteration of which (nested) loop this
-/// firing belongs to. Empty for firings outside any loop.
-// SYNC: LoopIteration <-> crates/weft-core/src/frames.rs LoopIteration
-export interface LoopIteration {
-  index: number;
+/// One level of the dynamic structure a firing is inside: an iteration
+/// of a loop (`{index}`), or a call of an included file through the site
+/// named (`{site}`, the site's own id: `auth`, or `Auth.billing.inner`
+/// for a site inside a body). A firing's frame stack is a list of these,
+/// outermost first; empty at the root. A loop body and an included file
+/// are each compiled once, and the stack is what tells two runs through
+/// the same nodes apart.
+// SYNC: Frame <-> crates/weft-core/src/frames.rs Frame
+export type Frame = { index: number } | { site: string };
+
+/// The call sites on a frame stack, outermost first: which use of which
+/// included file the firing belongs to, loop frames left out.
+export function callPathOf(frames: readonly Frame[]): string[] {
+  return frames.flatMap((f) => ('site' in f ? [f.site] : []));
+}
+
+/// One frame as text: `#3` for an iteration, `@auth` for a call.
+export function frameText(frame: Frame): string {
+  return 'index' in frame ? `#${frame.index}` : `@${frame.site}`;
+}
+
+/// The key of one place of a run: a node under the call sites that
+/// reach it, `one/Clean.strip`, or the bare id at the top. What a run's
+/// scope, a seed's origins and a run selection are keyed by.
+// SYNC: locatedKey <-> crates/weft-core/src/frames.rs Located
+export function locatedKey(id: string, callPath: readonly string[]): string {
+  return callPath.length === 0 ? id : `${callPath.join('/')}/${id}`;
 }
 
 /// Whose credential a measured call spent.
 // SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
 export type CredentialOwner = 'their-own' | 'ours';
 
-/// The parent run and the original run supplying each reused result.
+/// The parent run and the original run supplying each reused result,
+/// per place (a `locatedKey`).
 // SYNC: Seed <-> crates/weft-journal/src/events.rs Seed
 export interface Seed {
   parent: string;
@@ -1145,7 +1228,7 @@ export interface NodeExecEvent {
   /// `[{index:2}]` when inside iteration 2 of a single loop; nested
   /// loops extend the array. Used as part of the execution-card key so
   /// parallel iterations don't cross-correlate.
-  frames: LoopIteration[];
+  frames: Frame[];
   error?: string;
   input?: unknown;
   /// Wired input ports that arrived as CLOSURE markers for this firing
@@ -1195,7 +1278,7 @@ export type LoopInspectorEvent =
   | {
       kind: 'instantiated';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       /// Effective iteration cap; null for an uncapped loop (done- or
       /// stream-driven with no max_iters), whose count is unknowable
       /// up front.
@@ -1205,20 +1288,20 @@ export type LoopInspectorEvent =
   | {
       kind: 'iteration_launched';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       index: number;
     }
   | {
       kind: 'out_fired';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       index: number;
       doneVote?: boolean | null;
     }
   | {
       kind: 'terminated';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       reason: LoopTerminationReason;
     };
 
@@ -1252,8 +1335,13 @@ export type BusInspectorEvent =
       offset: number;
       from: string;
       msgKind: string;
-      payload: WirePayload;
+      /// Absent when the journal kept no copy of the message (raw
+      /// bytes are counted, never written down). Present, and cut
+      /// down, when `trimmed` is set: a message too big to keep whole
+      /// is never dropped, only shortened.
+      payload?: WirePayload;
       payloadByteSize: number;
+      trimmed?: boolean;
       atUnix: number;
     }
   /// One journal window of an EPHEMERAL bus: the payloads never reach
@@ -1275,22 +1363,35 @@ export type BusInspectorEvent =
 /// per execution (no busId; the execution color is the identity).
 /// `payload` is the same tagged `WirePayload` shape a bus window's
 /// messages carry.
-// SYNC: CallerInspectorEvent 'inbound'/'outbound' <-> crates/weft-journal/src/events.rs CallerInbound/CallerOutbound, crates/weft-dispatcher/src/events.rs CallerInbound/CallerOutbound, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'/'caller_outbound'
+/// Which way one message of the conversation went. A bus names its
+/// sender because it has any number; a conversation has two parties
+/// that never change, so the direction is the whole of who said it.
+// SYNC: CallerDirection <-> crates/weft-core/src/stream_journal.rs CallerDirection
+export type CallerDirection = 'inbound' | 'outbound';
+
+/// One message inside a caller window. `payload` is absent when the
+/// journal kept only the size (an ephemeral conversation, or raw
+/// bytes), and shorter than `payloadByteSize` when it was trimmed, so
+/// the inspector can say "412 KB, showing the first 100".
+export interface WindowedCallerMessage {
+  offset: number;
+  direction: CallerDirection;
+  payload?: WirePayload;
+  payloadByteSize: number;
+  trimmed?: boolean;
+  terminal?: boolean;
+  atUnix: number;
+}
+
+// SYNC: CallerInspectorEvent 'window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-dispatcher/src/events.rs CallerWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
 export type CallerInspectorEvent =
   | { kind: 'connected'; offset: number; protocol: string; atUnix: number }
   | {
-      kind: 'inbound';
-      offset: number;
-      payload: WirePayload;
-      payloadByteSize: number;
-      atUnix: number;
-    }
-  | {
-      kind: 'outbound';
-      offset: number;
-      payload: WirePayload;
-      payloadByteSize: number;
-      terminal: boolean;
+      kind: 'window';
+      firstOffset: number;
+      lastOffset: number;
+      messages: WindowedCallerMessage[];
+      totals: Array<{ direction: CallerDirection; count: number; bytes: number }>;
       atUnix: number;
     }
   | { kind: 'errored'; offset: number; message: string; atUnix: number }
@@ -1552,6 +1653,11 @@ export type CliPhase =
   /// Periodic heartbeat while an infra verb waits on the supervisor
   /// (unbounded: draining executions). Detail carries `elapsedSeconds`.
   | 'infra_wait'
+  /// The call about to be made will wait for the project's running
+  /// executions to finish before it lands. Detail carries `capSeconds`
+  /// when the person set a cap. Sent before the call, because the wait
+  /// happens on the dispatcher: without it the command looks hung.
+  | 'drain_wait'
   /// Something the person should know that is not a failure; the verb
   /// carries on and still ends `complete`. Detail carries `message`.
   | 'warning'
@@ -1752,10 +1858,13 @@ export type HostMessage =
   /// Navigation depth in the include back-stack. `depth > 0` means the user
   /// navigated into an included file; the webview shows a Return button.
   /// `fileName` is the current file's display name for the navigation bar.
-  /// `execPrefix` is the dotted alias chain descended through (e.g. `c.` or
-  /// `c.inner.`), prepended to node ids when looking up execution values so
-  /// the journal's qualified keys match the sub-graph's bare node ids.
-  | { kind: 'navState'; depth: number; fileName: string; execPrefix: string }
+  /// `callPath` is the chain of call sites descended through, outermost
+  /// first (`['c']`, or `['c', 'C.inner']`), each the site's own id. An
+  /// included file's nodes carry the file's id (`C.strip`) in the journal
+  /// whatever site called them; which call a row belongs to is the call
+  /// frames it carries, so the view keeps the rows whose call frames are
+  /// this path.
+  | { kind: 'navState'; depth: number; fileName: string; callPath: string[] }
   /// The run reached a terminal. A cancel carries WHY (`reason` is the
   /// text, `cause` the structured value), so a run stopped by a sibling
   /// through `ctx.stop_tagged` reads as that, never as a bare failure.
@@ -1763,15 +1872,21 @@ export type HostMessage =
   /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
   /// list; the webview accumulates the run's set.
   | { kind: 'execTags'; color: string; tags: string[] }
-  /// The run's scope, off its birth row: the node set it is held to
-  /// (`null` = the whole graph), so every other node paints as not in
-  /// this run, and the run it was seeded from with what it re-ran.
+  /// The run's scope, off its birth row: the places it is held to
+  /// (`locatedKey`s; `null` = the whole graph), so every other node
+  /// paints as not in this run, and the run it was seeded from with
+  /// what it re-ran.
   // SYNC: execScope <-> crates/weft-dispatcher/src/events.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
   | { kind: 'execScope'; color: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
   /// disk are (`null` when the disk matches no recorded version), so the
   /// graph can say "this run is from version X, your code differs".
   | { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null }
+  /// No run is on screen any more: the person stopped looking at one,
+  /// or the one they were looking at was deleted. Everything a run
+  /// painted (statuses, values, scope dimming, the version banner)
+  /// goes, and the canvas waits for the next run to start.
+  | { kind: 'execCleared' }
   /// The answer to a `resolveSpec` request.
   | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
   /// The project's `examples/*.json`, for the Run menu.
@@ -1787,20 +1902,19 @@ export type HostMessage =
   /// failures when the catalog loaded but some nodes were skipped.
   | { kind: 'catalogError'; error?: string; warnings?: string[] }
   | { kind: 'execEvent'; event: NodeExecEvent }
-  /// A non-terminal output-type mismatch on one firing: the node emitted a
-  /// value whose type is incompatible with the port's declared (possibly
-  /// narrowed) type, so the engine closed the port instead of forwarding
-  /// the value. Attaches a warning to the matching execution row WITHOUT
-  /// changing its state (the node did not fail). Kept separate from
-  /// `execEvent`, which is purely a state transition.
-  | { kind: 'execPortWarning'; nodeId: string; frames: LoopIteration[]; port: string; expected: string; actual: string }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can
   /// arrive via both the replay and the live stream, so the reducer dedups
   /// on it. `amountUsd` null = the meter could not resolve the figure (an
   /// honest unknown; nothing is added to the row's total). `origin` says
   /// whose key the call spent.
-  | { kind: 'execCost'; nodeId: string; frames: LoopIteration[]; costId: string; amountUsd: number | null; origin: CredentialOwner }
+  /// One metered call's cost. `service` is who was charged.
+  /// `inheritedFrom` is the run this cost was FIRST paid by, set when
+  /// this run was seeded from that one and reused its work: the money
+  /// is real but it was not spent again, so a total that adds it is
+  /// counting it twice.
+  // SYNC: execCost <-> extension-vscode/src/execFollower.ts DispatcherEvent 'cost_reported', crates/weft-dispatcher/src/events.rs CostReported
+  | { kind: 'execCost'; nodeId: string; frames: Frame[]; costId: string; service: string; inheritedFrom: string | null; amountUsd: number | null; origin: CredentialOwner }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,
@@ -2028,6 +2142,9 @@ export type WebviewMessage =
   | { kind: 'refreshStatus' }
   | { kind: 'followTogglePin' }
   | { kind: 'followCatchUp' }
+  /// Stop showing the followed run and go back to an empty, live
+  /// canvas: the next run to start is followed as usual.
+  | { kind: 'followClear' }
   /// Replay a PAST execution onto the canvas: the host loads that execution's
   /// recorded events and feeds them as the editor's execution state (so the
   /// graph shows that run's final node statuses + outputs). `color` is the

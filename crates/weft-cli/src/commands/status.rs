@@ -52,7 +52,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 // dispatcher accepts either as "not drifted".
                 use weft_compiler::codegen::NodeSet;
                 match resolved {
-                    Ok(()) => (
+                    Ok(_) => (
                         weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced).ok(),
                         weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full).ok(),
                         weft_compiler::hash::compute_definition_hash(&def).ok(),
@@ -146,7 +146,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         } else {
             println!("  infra:");
             for entry in infra {
-                let node = entry.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                // `node` is the spelling, `node_id` the runtime's key;
+                // a person reads the first one.
+                let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
                 let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let url = entry
                     .get("endpoint_url")

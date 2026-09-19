@@ -36,11 +36,11 @@ export function isLiveDataItem(v: unknown): v is LiveDataItem {
 /// trigger node body panel renders. The listener returns a free-form blob; the
 /// inspector knows a few standard fields:
 ///   - surface.kind      -> "public_entry" / "task_callback"
-///   - surface.path      -> for public_entry, the mount path
-///   - auth.kind         -> "none" / "api_key"
-///   - auth.header_name  -> for api_key
-///   - secret            -> plaintext, only while the listener still holds a
-///                          freshly-minted key
+///   - surface.path      -> for public_entry, the route pattern (`chat/{room}`)
+///   - surface.methods   -> for public_entry, the HTTP methods served (empty = any)
+///   - auth.kind         -> "none" / "connection" (a stored connection the
+///                          gateway checks callers against; the key material
+///                          lives on the connection, never here)
 export function signalDisplayToLiveItems(body: Record<string, unknown>): LiveDataItem[] {
   const items: LiveDataItem[] = [];
   const surface = body.surface as Record<string, unknown> | undefined;
@@ -49,48 +49,25 @@ export function signalDisplayToLiveItems(body: Record<string, unknown>): LiveDat
     // outside caller hits, and the auth that gates it. Task-callback
     // and internal signals (timers, provider pushes, bridge webhooks)
     // carry `auth: none` in their routing too, but there is no caller
-    // choosing a key, so "public (no key)" would be noise. No items:
-    // the renderer hides the panel entirely.
+    // to gate, so "open" would be noise. No items: the renderer hides
+    // the panel entirely.
     return items;
   }
   const path = typeof surface.path === 'string' ? surface.path : '';
+  const methods = Array.isArray(surface.methods)
+    ? surface.methods.filter((m): m is string => typeof m === 'string')
+    : [];
+  const route = path === '' ? '/' : `/${path.replace(/^\//, '')}`;
   items.push({
     type: 'text',
-    label: 'Path',
-    data: path === '' ? '/' : `/${path.replace(/^\//, '')}`,
+    label: 'Route',
+    data: methods.length === 0 ? route : `${methods.join('/')} ${route}`,
   });
   const auth = body.auth as Record<string, unknown> | undefined;
-  if (auth && auth.kind === 'api_key') {
-    const header = typeof auth.header_name === 'string' ? auth.header_name : 'X-Api-Key';
-    items.push({ type: 'text', label: 'Auth header', data: header });
+  if (auth && auth.kind === 'connection') {
+    items.push({ type: 'text', label: 'Auth', data: 'gated by the wired auth connection' });
   } else if (auth && auth.kind === 'none') {
-    items.push({ type: 'text', label: 'Auth', data: 'public (no key)' });
-  }
-  if (typeof body.secret === 'string' && body.secret.length > 0) {
-    items.push({
-      type: 'secret',
-      label: 'API key',
-      data: body.secret,
-      action: {
-        label: 'Regenerate',
-        actionKind: 'regenerate_api_key',
-        confirm: 'Regenerate the API key? The current key will stop working.',
-      },
-    });
-  } else if (auth && auth.kind === 'api_key') {
-    // Auth is api_key but the listener doesn't hold plaintext (pod restarted,
-    // original mint dropped). Show a placeholder with the regenerate button so
-    // the user can recover.
-    items.push({
-      type: 'text',
-      label: 'API key',
-      data: '(hidden by listener restart; click Regenerate to mint a new one)',
-      action: {
-        label: 'Regenerate',
-        actionKind: 'regenerate_api_key',
-        confirm: 'Mint a new API key? Replaces any current key.',
-      },
-    });
+    items.push({ type: 'text', label: 'Auth', data: 'open (anyone with the URL)' });
   }
   return items;
 }

@@ -121,7 +121,10 @@ back off the handle:
   an audio stream's sample rate and encoding, instead of every message
   repeating it.
 - **ephemeral**: keeps payloads out of the journal entirely, for bytes that are
-  transient by nature.
+  transient by nature. A route or a socket has the same switch, spelled
+  `journalEphemeral` on the trigger, and it means the same thing. For what is
+  kept either way, and where a big payload gets trimmed, go and read [what the
+  journal costs](../running/the-journal.md#what-the-journal-costs).
 - **window**: how many frames the bus keeps for a consumer that falls behind,
   64 by default. Raise it in the node that creates the bus.
 - **journal_window**: how coarsely the trail is recorded, one row per bus per

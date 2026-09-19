@@ -119,13 +119,18 @@ impl ConnectOpts {
 /// each file visited ONCE: a subgraph included in two places is still
 /// one source file, so one pick serves every inclusion.
 struct AccessTarget {
+    /// The project root the file sits under.
+    root: std::path::PathBuf,
     /// The file the node is written in; the pick is written HERE (the
     /// same per-file edit the editor makes when navigated into it).
     file: std::path::PathBuf,
     /// The same file relative to the project root, the name `--node
     /// file:id` qualification and every message use.
     rel_file: String,
-    /// The node's id within its file.
+    /// The node's id, as the compiler keys it: for a node inside an
+    /// included file that carries the file's path (`@src:sweep.key`).
+    /// It is the id the structural edit needs to write the pick, and
+    /// nothing else: what a person reads and types is [`Self::spellings`].
     node: String,
     node_type: String,
     input: String,
@@ -240,7 +245,9 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     let root = project.root.clone();
     let catalog = weft_compiler::build::build_project_catalog(&root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
-    let targets = access_targets(&root, &project.main_weft(), project.id(), &catalog)?;
+    let mut others: Vec<OtherNode> = Vec::new();
+    let targets =
+        access_targets(&root, &project.main_weft(), project.id(), &catalog, &mut others)?;
     if targets.is_empty() {
         if opts.list {
             // Nothing to scope the listing to; list the whole store.
@@ -251,7 +258,28 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
              recipe), so there is nothing to connect"
         );
     }
-    let target = choose_target(targets, opts.node.as_deref(), json)?;
+    // `--list` never prompts: with several access nodes and no
+    // `--node`, every node's connections are listed in turn.
+    if opts.list && opts.node.is_none() && targets.len() > 1 {
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        for (i, target) in targets.iter().enumerate() {
+            let grants = list_grants(&client, Some(&target.spec.service)).await?;
+            if json {
+                all.push(serde_json::json!({ "node": target.spelling(), "file": target.rel_file, "connections": grants }));
+            } else {
+                if i > 0 {
+                    println!();
+                }
+                println!("{}:", describe_target(target));
+                print_grants(target, target.spec.display_label(), &grants);
+            }
+        }
+        if json {
+            println!("{}", serde_json::json!({ "nodes": all }));
+        }
+        return Ok(());
+    }
+    let target = choose_target(targets, &others, opts.node.as_deref(), json)?;
     let service = target.spec.service.clone();
     let label = target.spec.display_label().to_string();
     let registry = catalog.type_registry();
@@ -269,7 +297,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "node": target.node, "picked": Value::Null })
+                serde_json::json!({ "node": target.spelling(), "picked": Value::Null })
             );
         }
         return Ok(());
@@ -280,7 +308,17 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     if opts.list {
         if json {
             // One JSON OBJECT per line, per the global --json contract.
-            println!("{}", serde_json::json!({ "connections": grants }));
+            // It names the node it listed for: a caller that passed
+            // `--node` still has to see which one answered, spelled the
+            // way the program spells it.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node": target.spelling(),
+                    "file": target.rel_file,
+                    "connections": grants,
+                })
+            );
         } else {
             print_grants(&target, &label, &grants);
         }
@@ -296,7 +334,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "node": target.node, "file": target.rel_file, "picked": g.id })
+                serde_json::json!({ "node": target.spelling(), "file": target.rel_file, "picked": g.id })
             );
         }
         return Ok(());
@@ -485,7 +523,15 @@ fn sweep_picks(
     let mut cleared = Vec::new();
     let client = ctx.client();
     let swept = (|| -> Result<()> {
-        let targets = access_targets(&project.root, &project.main_weft(), project.id(), catalog)?;
+        // The sweep only reads picks, so the non-connectable nodes it
+        // walks past are nobody's business here.
+        let targets = access_targets(
+            &project.root,
+            &project.main_weft(),
+            project.id(),
+            catalog,
+            &mut Vec::new(),
+        )?;
         for target in &targets {
             if target.picked.handle().is_some_and(|p| p.id == id) {
                 Connecting {
@@ -499,7 +545,7 @@ fn sweep_picks(
                     json,
                 }
                 .clear_pick()?;
-                cleared.push(target.node.clone());
+                cleared.push(target.spelling());
             }
         }
         Ok(())
@@ -524,11 +570,21 @@ fn sweep_failed(e: &anyhow::Error) {
 /// handle. Each FILE is parsed standalone and visited once: a subgraph
 /// included from two places is one source file, so its access node is
 /// one target and one pick serves every inclusion.
+/// A node that is NOT connectable, kept only so a refusal can tell
+/// "you typed a name that is not here" apart from "that node needs no
+/// connection". Nothing else reads it, which is why it carries the two
+/// fields a sentence needs and none of `AccessTarget`'s.
+struct OtherNode {
+    spellings: Vec<String>,
+    node_type: String,
+}
+
 fn access_targets(
     root: &std::path::Path,
     entry: &std::path::Path,
     project_id: uuid::Uuid,
     catalog: &weft_catalog::FsCatalog,
+    others: &mut Vec<OtherNode>,
 ) -> Result<Vec<AccessTarget>> {
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>> =
@@ -543,6 +599,7 @@ fn access_targets(
         project_id,
         catalog,
         &mut out,
+        others,
         &mut visited,
     )?;
     Ok(out)
@@ -560,6 +617,7 @@ fn collect_targets(
     project_id: uuid::Uuid,
     catalog: &weft_catalog::FsCatalog,
     out: &mut Vec<AccessTarget>,
+    others: &mut Vec<OtherNode>,
     visited: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
 ) -> Result<()> {
     let canonical = file
@@ -577,7 +635,7 @@ fn collect_targets(
     }
     let source = std::fs::read_to_string(&canonical)
         .with_context(|| format!("read {}", canonical.display()))?;
-    let source_id = weft_compiler::source_name::derive_id(Some(&canonical));
+    let source_id = weft_compiler::source_name::body_id(root, &canonical);
     let base = canonical
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -585,7 +643,7 @@ fn collect_targets(
     let (definition, diagnostics) = weft_compiler::parse_only(
         &source,
         project_id,
-        weft_compiler::CompileFs::disk(&base),
+        weft_compiler::CompileFs::disk(root).anchored_at(Some(&base)),
         catalog,
         Some(&source_id),
     );
@@ -613,10 +671,18 @@ fn collect_targets(
             includes.push((node.id.clone(), path.clone()));
             continue;
         }
+        let mut note_other = || {
+            others.push(OtherNode {
+                spellings: spellings_of(&node.id, &via.map(str::to_string).into_iter().collect::<Vec<_>>()),
+                node_type: node.node_type.clone(),
+            })
+        };
         let Some(meta) = weft_core::node::MetadataCatalog::lookup(catalog, &node.node_type) else {
+            note_other();
             continue;
         };
         let Some(spec) = meta.service.clone() else {
+            note_other();
             continue;
         };
         let input = meta
@@ -633,7 +699,13 @@ fn collect_targets(
         // The stored pick is an `{id, identity}` handle; anything else
         // in the field is unreadable and carried as such (listings say
         // so; picking or disconnecting overwrites it).
-        let picked = match node.config.get(&input) {
+        //
+        // Through `written_value`, never `config`: a constant written
+        // for an INPUT PORT has two homes in source and enrich moves it
+        // from one to the other (`normalize_port_literals`), so reading
+        // `config` alone answers None for every pick a project actually
+        // holds, and every node reads as unconnected.
+        let picked = match node.written_value(&input) {
             None | Some(Value::Null) => Pick::None,
             Some(v) => match parse_picked(v) {
                 Ok(h) => Pick::Handle(h),
@@ -642,6 +714,7 @@ fn collect_targets(
         };
         indices.push(out.len());
         out.push(AccessTarget {
+            root: root.to_path_buf(),
             file: canonical.clone(),
             rel_file: canonical
                 .strip_prefix(root)
@@ -665,6 +738,7 @@ fn collect_targets(
             project_id,
             catalog,
             out,
+            others,
             visited,
         )?;
     }
@@ -689,10 +763,44 @@ fn parse_picked(v: &Value) -> Result<PickedHandle> {
     Ok(PickedHandle { id, identity })
 }
 
+/// The node `id` the way the PROGRAM spells it, which is the only form
+/// a person is shown or asked to type. A node in the entry file is its
+/// own name. One inside an included file is named through the site that
+/// includes the file (`sweep.key`), once per site it is reached
+/// through, because the id it is keyed by carries the file's PATH and
+/// the language calls that spelling unspellable on purpose.
+fn spellings_of(id: &str, included_as: &[String]) -> Vec<String> {
+    let Some(local) = id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, tail)| tail.to_string())
+    else {
+        return vec![id.to_string()];
+    };
+    if included_as.is_empty() {
+        // No site above it (the file IS the entry, or a standalone
+        // parse): the file's own name carries it.
+        return vec![weft_core::project::plain_id(id)];
+    }
+    included_as.iter().map(|site| format!("{site}.{local}")).collect()
+}
+
+impl AccessTarget {
+    /// Every way a person may name this node (see [`spellings_of`]).
+    fn spellings(&self) -> Vec<String> {
+        spellings_of(&self.node, &self.included_as)
+    }
+
+    /// The one spelling to print when only one fits.
+    fn spelling(&self) -> String {
+        self.spellings().first().cloned().unwrap_or_else(|| self.node.clone())
+    }
+}
+
 /// A target's one-line description: node, type, and (for an included
 /// file's node) where it lives and through which aliases.
 fn describe_target(t: &AccessTarget) -> String {
-    let mut s = format!("{} ({})", t.node, t.node_type);
+    let mut s = format!("{} ({})", t.spellings().join(" or "), t.node_type);
     if !t.included_as.is_empty() {
         s.push_str(&format!(
             " in {}, included as {}",
@@ -705,6 +813,7 @@ fn describe_target(t: &AccessTarget) -> String {
 
 fn choose_target(
     mut targets: Vec<AccessTarget>,
+    others: &[OtherNode],
     node: Option<&str>,
     json: bool,
 ) -> Result<AccessTarget> {
@@ -712,21 +821,36 @@ fn choose_target(
         // Bare id, or root-relative-file-qualified `nodes/a/sub.weft:node`
         // when the same id exists in two files.
         let matches_name = |t: &AccessTarget| {
-            t.node == name
-                || name
-                    .split_once(':')
-                    .is_some_and(|(f, n)| t.node == n && t.rel_file == f)
+            t.spellings().iter().any(|s| s == name)
+                || name.split_once(':').is_some_and(|(f, n)| {
+                    t.rel_file == f && (t.spellings().iter().any(|s| s == n) || t.node == n)
+                })
         };
         let count = targets.iter().filter(|t| matches_name(t)).count();
         if count > 1 {
             let qualified: Vec<String> = targets
                 .iter()
                 .filter(|t| matches_name(t))
-                .map(|t| format!("{}:{}", t.rel_file, t.node))
+                .map(|t| format!("{}:{}", t.rel_file, t.spelling()))
                 .collect();
             bail!(
                 "'{name}' names an access node in more than one file; qualify it: {}",
                 qualified.join(", ")
+            );
+        }
+        // A node that IS in the program but takes no connection: say
+        // that, rather than listing the connectable ones, which reads
+        // as "you typed it wrong" when the real answer is "that one
+        // needs nothing from you".
+        if let Some(other) = others.iter().find(|o| {
+            o.spellings.iter().any(|s| s == name)
+                || name.split_once(':').is_some_and(|(_, n)| o.spellings.iter().any(|s| s == n))
+        }) {
+            bail!(
+                "'{name}' is a {} and takes no connection: nothing about it is yours to \
+                 pick, so there is nothing to connect here. `weft connect --list` shows the \
+                 nodes of this project that do take one",
+                other.node_type
             );
         }
         let known = targets
@@ -812,9 +936,21 @@ async fn print_all_grants(client: &DispatcherClient, json: bool) -> Result<()> {
             .clone()
             .or_else(|| g.label.clone())
             .unwrap_or_else(|| g.id.to_string());
-        println!("  [{}] {} - {}  (id {})", i + 1, g.service, who, g.id);
+        println!("  [{}] {} - {}  (id {}){}", i + 1, g.service, who, g.id, no_key_note(g));
     }
     Ok(())
+}
+
+/// The trailing note on a runtime-owned row whose key is gone: the
+/// row is not a working connection until the key is back.
+fn no_key_note(g: &GrantSummary) -> String {
+    if g.has_credential {
+        return String::new();
+    }
+    format!(
+        "  NO KEY BEHIND IT: add an api_key entry for '{}' to the shared-credentials file, or connect your own",
+        g.service
+    )
 }
 
 fn grant_by_number<'a>(grants: &'a [GrantSummary], raw: &str) -> Result<&'a GrantSummary> {
@@ -828,12 +964,12 @@ fn grant_by_number<'a>(grants: &'a [GrantSummary], raw: &str) -> Result<&'a Gran
 
 fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
     match &target.picked {
-        Pick::Handle(p) => println!("'{}' is connected as {}.", target.node, p.who()),
-        Pick::None => println!("'{}' has no connection picked.", target.node),
+        Pick::Handle(p) => println!("'{}' is connected as {}.", target.spelling(), p.who()),
+        Pick::None => println!("'{}' has no connection picked.", target.spelling()),
         Pick::Malformed(why) => println!(
             "'{}' holds a value `weft connect` cannot read ({why}); pick a connection \
              or --disconnect to replace it.",
-            target.node
+            target.spelling()
         ),
     }
     if grants.is_empty() {
@@ -847,7 +983,9 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
             .clone()
             .or_else(|| g.label.clone())
             .unwrap_or_else(|| g.id.to_string());
-        let can = if g.owner == CredentialOwner::Ours {
+        let can = if g.owner == CredentialOwner::Ours && !g.has_credential {
+            "runs on the runtime's own key, which is NOT configured".to_string()
+        } else if g.owner == CredentialOwner::Ours {
             "uses your credits".to_string()
         } else if g.scopes.is_empty() {
             "full access of its credential".to_string()
@@ -864,7 +1002,7 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
         } else {
             ""
         };
-        println!("  [{}] {who} - {can}  (id {}){picked}", i + 1, g.id);
+        println!("  [{}] {who} - {can}  (id {}){picked}{}", i + 1, g.id, no_key_note(g));
     }
 }
 
@@ -881,13 +1019,13 @@ impl Connecting<'_> {
             format!(
                 "the connection is stored as {}; attach it with `weft connect --node {} \
                  --grant {}`",
-                g.id, self.target.node, g.id
+                g.id, self.target.spelling(), g.id
             )
         })?;
         if !self.json {
             println!(
                 "'{}' now uses {}.",
-                self.target.node,
+                self.target.spelling(),
                 g.identity.clone().unwrap_or_else(|| g.id.to_string())
             );
         }
@@ -898,7 +1036,7 @@ impl Connecting<'_> {
     fn clear_pick(&self) -> Result<()> {
         self.write_pick(None)?;
         if !self.json {
-            println!("'{}' now has no connection picked.", self.target.node);
+            println!("'{}' now has no connection picked.", self.target.spelling());
         }
         Ok(())
     }
@@ -927,12 +1065,11 @@ impl Connecting<'_> {
                 form: None,
             },
         };
-        // The file's own filename-derived anon-root id, the same identity
-        // the editor edits it under when navigated into it.
-        let source_id = weft_compiler::source_name::derive_id(Some(file));
+        // The file's own anon-root id, the same identity the editor edits
+        // it under when navigated into it.
+        let source_id = weft_compiler::source_name::body_id(&self.target.root, file);
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
-            None,
             &source_id,
             &[op],
             self.registry.clone(),
@@ -1824,6 +1961,7 @@ mod tests {
             owner: CredentialOwner::TheirOwn,
             door: Door::Own,
             expires_at: None,
+            has_credential: true,
         }];
         assert_eq!(grant_by_number(&grants, "1").unwrap().id, uuid::Uuid::nil());
         assert!(grant_by_number(&grants, "0").is_err());
@@ -1865,5 +2003,53 @@ mod tests {
         let mut set = BTreeMap::new();
         let out = collect_field_values(&fields, &mut set, "--set", false, true).unwrap();
         assert!(out.is_empty());
+    }
+
+    fn sites(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A node inside an included file is keyed by the file's PATH, and
+    /// the language calls that spelling unspellable: a person names it
+    /// through the site that includes the file. `weft connect` used to
+    /// print the key and take nothing else, so the only thing that
+    /// worked was `@src:sweep.key`, which no other command accepts.
+    #[test]
+    fn an_included_files_node_is_named_through_its_site() {
+        let spelled = spellings_of("@src:sweep.key", &sites(&["sweep"]));
+        assert_eq!(spelled, vec!["sweep.key".to_string()]);
+        assert!(!spelled[0].contains('@'), "the compiler's id never reaches a person");
+    }
+
+    /// One file included twice is one node with two ways to name it,
+    /// and both have to work.
+    #[test]
+    fn a_file_included_twice_answers_to_either_site() {
+        assert_eq!(
+            spellings_of("@src:sweep.key", &sites(&["nightly", "manual"])),
+            vec!["nightly.key".to_string(), "manual.key".to_string()]
+        );
+    }
+
+    /// A node nested in a group inside that file keeps the whole tail.
+    #[test]
+    fn a_nested_node_keeps_the_rest_of_its_address() {
+        assert_eq!(
+            spellings_of("@src:sweep.inner.key", &sites(&["sweep"])),
+            vec!["sweep.inner.key".to_string()]
+        );
+    }
+
+    /// A node of the entry file is already written the way it is read.
+    #[test]
+    fn a_node_of_the_entry_file_is_its_own_name() {
+        assert_eq!(spellings_of("db", &[]), vec!["db".to_string()]);
+    }
+
+    /// Reached with no site above it, the file's own name carries it,
+    /// rather than the path the runtime keys it by.
+    #[test]
+    fn with_no_site_above_it_the_files_name_carries_it() {
+        assert_eq!(spellings_of("@src:lib:sweep.key", &[]), vec!["sweep.key".to_string()]);
     }
 }

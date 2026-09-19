@@ -17,6 +17,7 @@ pub mod handlers;
 pub mod lifecycle_writes;
 pub mod access_admin;
 pub mod app_provider;
+pub mod caller_auth;
 pub mod events;
 pub mod runtime_storage;
 pub mod runtime_store;
@@ -86,11 +87,22 @@ pub fn spawn_connect_sweep(state: Arc<BrokerState>) {
     });
 }
 
+/// The most one journal record may weigh. A record is one event; the
+/// heaviest event is an emission, one value per output port, each under
+/// `MAX_WIRE_VALUE_BYTES` (the engine refuses more at the node, which is
+/// the refusal a user sees). This bound is the contract check behind it:
+/// room for sixty-four such ports, so no run that obeyed the wire rule
+/// ever dies on its journal write.
+pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
+
 pub fn router(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(handlers::health))
         // Journal
-        .route("/v1/journal/record", post(handlers::journal_record))
+        .route(
+            "/v1/journal/record",
+            post(handlers::journal_record).layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RECORD_BODY_LIMIT)),
+        )
         .route("/v1/journal/fetch", post(handlers::journal_fetch))
         .route(
             "/v1/journal/has_terminal",
@@ -252,5 +264,6 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // Provider events: the listener's serving surface and the
         // receive-side verification the dispatcher forwards to.
         .merge(events::routes())
+        .merge(caller_auth::routes())
         .with_state(state)
 }

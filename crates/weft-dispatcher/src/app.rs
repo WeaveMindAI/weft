@@ -407,6 +407,7 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
             Arc::new(crate::task_kinds::RegisterSignalExecutor),
         )
         .register(TaskKind::RouteEntry, Arc::new(crate::task_kinds::RouteEntryExecutor))
+        .register(TaskKind::LiveArrival, Arc::new(crate::task_kinds::LiveArrivalExecutor))
         .register(TaskKind::FireSignal, Arc::new(crate::task_kinds::FireSignalExecutor))
         .register(TaskKind::RecordCost, Arc::new(crate::task_kinds::RecordCostExecutor))
         .register(TaskKind::RecordLog, Arc::new(crate::task_kinds::RecordLogExecutor))
@@ -554,6 +555,20 @@ async fn lease_renewer(state: DispatcherState) {
         // Same for pooled supervisor pods (the `supervisor_pod` registry lease,
         // distinct from the per-project `infra_owner` lease the supervisor
         // renews itself).
+        // Forget pods the cluster no longer has BEFORE renewing, or the
+        // renewal keeps a vanished pod's lease fresh and its projects
+        // leased to something that will never claim them.
+        if let Err(e) = state
+            .supervisors
+            .forget_vanished(state.kube.as_ref(), &pool, &pid)
+            .await
+        {
+            tracing::warn!(
+                target: "weft_dispatcher",
+                error = %e,
+                "could not check which supervisor pods the cluster still has"
+            );
+        }
         if let Err(e) = state.supervisors.renew_owned(&pool, &pid).await {
             tracing::warn!(
                 target: "weft_dispatcher",
@@ -589,9 +604,8 @@ async fn graceful_shutdown() {
 /// In a real cluster the URL must be the external ingress host; a loopback
 /// there is a deploy bug (no client could reach it), so we fail loud. Local-dev
 /// kind is the exception: the dispatcher still runs as a Pod (so `in_cluster` is
-/// true), but the operator's machine reaches the cluster ingress via a
-/// port-forward to `127.0.0.1:<port>`, so a loopback public URL is exactly
-/// correct. `KUBERNETES_SERVICE_HOST` cannot tell "real-cluster Pod" from
+/// true), but the kind node maps the cluster ingress to the operator's
+/// `127.0.0.1:<port>`, so a loopback public URL is exactly correct. `KUBERNETES_SERVICE_HOST` cannot tell "real-cluster Pod" from
 /// "local kind Pod"; only the operator's intent (`WEFT_LOCAL_DEV`) can, which
 /// makes loopback legal without weakening the strict check. Pure so the
 /// security-sensitive branching is unit-tested below.
@@ -609,7 +623,7 @@ pub(crate) fn resolve_public_base_url(
                     "WEFT_DISPATCHER_PUBLIC_BASE_URL='{v}' resolves to a loopback \
                      host in-cluster; set it on the dispatcher Deployment to the \
                      external ingress URL before deploying (or set WEFT_LOCAL_DEV=1 \
-                     if this really is a local kind cluster reached via port-forward)"
+                     if this really is a local kind cluster reached at the host's loopback)"
                 );
             }
             Ok(v.to_string())
@@ -651,8 +665,8 @@ mod resolve_public_base_url_tests {
         );
     }
 
-    // Local-dev kind (in_cluster AND local_dev): loopback is correct, reached
-    // via the daemon's ingress port-forward.
+    // Local-dev kind (in_cluster AND local_dev): loopback is correct, the
+    // kind node maps the ingress there.
     #[test]
     fn local_dev_accepts_loopback() {
         assert_eq!(

@@ -31,7 +31,9 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn fire_fans(rig: FakeRig) -> WeftResult<()> {
-    rig.wake(json!({ "text": "deploy now", "channel": "C1", "workspace": "T1", "user": "U1" }));
+    rig.wake(json!({
+        "type": "message", "text": "deploy now", "channel": "C1", "workspace": "T1", "user": "U1"
+    }));
     let outcome = rig
         .run(&SlackAppMessagesNode, json!({ "account": rig.access("slack") }))
         .await

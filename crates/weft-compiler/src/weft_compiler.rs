@@ -133,6 +133,11 @@ struct ParsedNode {
     /// of the included `.weft` file. The editor renders this node as an
     /// expandable group that navigates into the file.
     include_path: Option<String>,
+    /// Interface mode only, on an `@include` node: what the file behind it
+    /// holds, transitively through its own includes. The body is not in the
+    /// graph, so without this the editor cannot tell that a project's only
+    /// trigger or infra node lives inside an include.
+    include_contents: Option<weft_core::project::IncludedContents>,
     /// The file this node's spans live in, when a full-mode `@include`
     /// spliced it out of another file. None = the compiled source.
     source_file: Option<String>,
@@ -174,18 +179,28 @@ struct ParsedConnection {
 /// node types emitted by `flatten_group` (`Passthrough` for groups,
 /// `LoopIn` / `LoopOut` for loops), and whether `loop_config` ships
 /// onto the boundary nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupKind {
     Group,
     Loop,
+    /// One use of an included file (`alias = @include("x.weft")`): a
+    /// call site. It holds no members; its boundaries hand the caller's
+    /// values to the shared body under a call frame and take the
+    /// results back.
+    Call { body: String },
+    /// An included file's own group, compiled once and shared by every
+    /// site that calls it.
+    Body,
 }
 
 impl GroupKind {
     /// The word a diagnostic calls this container.
-    fn noun(self) -> &'static str {
+    fn noun(&self) -> &'static str {
         match self {
             GroupKind::Loop => "loop",
             GroupKind::Group => "group",
+            GroupKind::Call { .. } => "include",
+            GroupKind::Body => "included file",
         }
     }
 }
@@ -355,11 +370,12 @@ pub fn compile_lenient(
     errors.append(&mut state.errors);
     // Resolve `@include` declarations (Full inlines, Interface emits opaque
     // nodes), collecting errors.
-    resolve_includes(&mut state, &fs, include_mode, &mut Vec::new(), &mut errors);
+    let mut bodies = Bodies::default();
+    resolve_includes(&mut state, &fs, include_mode, &mut Vec::new(), &mut bodies, &mut errors);
 
     // Flatten the partial state into a project. flatten builds from whatever
     // the parser produced and never fails.
-    let mut project = flatten(state, project_id);
+    let mut project = flatten(state, bodies, project_id);
     // Flattening gives every literal one owning node, including group inputs
     // and include-call arguments. Resolve them once here, using each field's
     // recorded source file rather than whichever include was visited last.
@@ -393,13 +409,15 @@ fn edge_id(source: &str, source_handle: &str, target: &str, target_handle: &str)
 }
 
 /// The display label for a group's boundary Passthrough. Single definition of
-/// the shape, used at flatten.
+/// the shape, used at flatten. The group reads as a person reads it
+/// (`crate::source_name::display_name`), never as its id: an included
+/// file's body id is its path, which no surface shows.
 fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
     let suffix = match role {
         weft_core::project::GroupBoundaryRole::In => "in",
         weft_core::project::GroupBoundaryRole::Out => "out",
     };
-    format!("{group_id} ({suffix})")
+    format!("{} ({suffix})", crate::source_name::display_name(group_id))
 }
 
 /// Resolve every `@include("path")` in `state`. `Full` inlines each
@@ -407,11 +425,25 @@ fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -
 /// `state.groups`; `Interface` emits one opaque node per include carrying the
 /// group's ports. `in_progress` is the cycle-detection stack of canonical
 /// file paths currently being resolved.
+/// Every included file the compile has read, compiled ONCE each. A
+/// file's body is one group, id'd by the file's name (`auth.weft` is
+/// `Auth`), whatever site calls it and however many do; each site is a
+/// [`GroupKind::Call`] group of its own that names the body. Two files
+/// whose paths give the same id are refused: the path is the identity
+/// the editor and the journal address the body by.
+#[derive(Default)]
+struct Bodies {
+    groups: Vec<ParsedGroup>,
+    /// Body id -> the canonical path it was read from.
+    paths: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+
 fn resolve_includes(
     state: &mut ParseState,
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
+    bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
     let includes = std::mem::take(&mut state.includes);
@@ -420,13 +452,13 @@ fn resolve_includes(
             errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
         }
-        match resolve_one_include(&inc, fs, mode, in_progress) {
-            Ok(IncludeResult::Group(mut group)) => {
+        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
+            Ok(IncludeResult::Site(mut site)) => {
                 // Root-level fills need no stamping: an unstamped span
                 // already means "the compiled source", which is exactly
                 // where these are written.
-                apply_pending_literals(&inc, &mut group, errors);
-                state.groups.push(*group);
+                apply_pending_literals(&inc, &mut site, errors);
+                state.groups.push(*site);
             }
             Ok(IncludeResult::Node(mut node)) => {
                 apply_pending_literals_to_node(&inc, &mut node, errors);
@@ -437,7 +469,7 @@ fn resolve_includes(
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
     for group in &mut state.groups {
-        resolve_group_includes(group, fs, mode, in_progress, errors);
+        resolve_group_includes(group, fs, mode, in_progress, bodies, errors);
     }
 }
 
@@ -449,6 +481,7 @@ fn resolve_group_includes(
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
+    bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
     let includes = std::mem::take(&mut group.includes);
@@ -457,9 +490,15 @@ fn resolve_group_includes(
             errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
         }
-        match resolve_one_include(&inc, fs, mode, in_progress) {
-            Ok(IncludeResult::Group(mut g)) => {
+        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
+            Ok(IncludeResult::Site(mut g)) => {
                 apply_pending_literals(&inc, &mut g, errors);
+                // The site is written in THIS group's file (the body it
+                // calls carries its own): a diagnostic on the `@include`
+                // line names the file the line is in.
+                if g.source_file.is_none() {
+                    g.source_file = group.source_file.clone();
+                }
                 // The fills just landed with the INCLUDING file's spans
                 // (this group's file); the included group's own spans were
                 // already stamped with its file, so only the fresh
@@ -492,7 +531,7 @@ fn resolve_group_includes(
         }
     }
     for child in &mut group.child_groups {
-        resolve_group_includes(child, fs, mode, in_progress, errors);
+        resolve_group_includes(child, fs, mode, in_progress, bodies, errors);
     }
 }
 
@@ -523,7 +562,10 @@ fn apply_pending_literals_to_node(
 }
 
 enum IncludeResult {
-    Group(Box<ParsedGroup>),
+    /// Full mode: the call site, a [`GroupKind::Call`] group naming the
+    /// body the file compiled to (registered in [`Bodies`]).
+    Site(Box<ParsedGroup>),
+    /// Interface mode: the opaque node carrying the file's ports.
     Node(Box<ParsedNode>),
 }
 
@@ -564,11 +606,27 @@ fn stamp_source_file(group: &mut ParsedGroup, file: &str) {
     }
 }
 
+/// Whether a parsed file has the shape an `@include` requires: exactly one
+/// anonymous top-level Group and nothing else. The Group header is the
+/// file's interface and the file name is its identity, so a named group,
+/// several groups, a loose node, or a loose top-level connection are all
+/// refused. Only the group is ever consumed, so anything else would be
+/// silently dropped, which is why this has to be checked rather than
+/// assumed.
+fn is_one_anonymous_group(sub: &ParseState) -> bool {
+    sub.nodes.is_empty()
+        && sub.includes.is_empty()
+        && sub.connections.is_empty()
+        && sub.groups.len() == 1
+        && sub.groups[0].anonymous
+}
+
 fn resolve_one_include(
     inc: &ParsedInclude,
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
+    bodies: &mut Bodies,
 ) -> Result<IncludeResult, Vec<CompileError>> {
     // A problem with the INCLUDE ITSELF (unresolvable path, cycle, wrong
     // file shape) anchors on the `@include` line here; an error INSIDE
@@ -576,17 +634,20 @@ fn resolve_one_include(
     // editor jumps to the real line.
     let at_include = |message: String| vec![CompileError::at(inc.span, message)];
     // The caller has already gated `fs.base.is_none()` (an `@include` outside a
-    // project), so an anchor is present here.
+    // project), so an anchor is present here, and a root with it.
     let base = fs
         .base
         .expect("resolve_one_include called with no fs anchor");
+    let root = fs
+        .root
+        .expect("resolve_one_include called with no project root");
     // Resolve + read through the active backing (disk, in-memory map, DB rows):
     // it owns join, the trusted-tree containment check, and the read, and returns
     // the backing-agnostic identity used below for cycle detection and for
     // deriving the included file's own directory.
     let resolved = fs
         .reader
-        .resolve_and_read(base, std::path::Path::new(&inc.path))
+        .resolve_and_read(root, base, std::path::Path::new(&inc.path))
         .map_err(|e| at_include(format!("@include {e}")))?;
     let canonical = resolved.identity;
     if in_progress.contains(&canonical) {
@@ -595,16 +656,26 @@ fn resolve_one_include(
 
     let source = resolved.content;
     let included_dir = canonical.parent().map(|p| p.to_path_buf());
-    let included_fs = fs.descend(included_dir.as_deref());
+    let included_fs = fs.anchored_at(included_dir.as_deref());
 
-    // Parse the included file with the CALL-SITE ALIAS as its anon-root id, so
-    // its top-level group lowers directly to `{alias}` and its internals to
-    // `{alias}.*` (the final scoped ids), with NO post-parse rescope pass. The
-    // alias is already scoped (`c` at top level, `g.c` nested), so this is the
-    // SAME single-pass scoping the rest of the lowering uses; there is no second
-    // string-surgery rescoping engine. (`@file` markers still resolve against the
-    // included file's own directory.)
-    let mut sub = parse_checked(source.as_str(), &inc.alias)
+    // The file's identity is its PATH from the project root, as an id no
+    // program can spell (`lib/auth.weft` is `@lib:auth`): the same id
+    // the editor gives the file when it shows it on its own, and the id
+    // the journal's rows carry for its nodes beside the call frames. The
+    // file is parsed with that id as its anon-root id, so its group
+    // lowers to it and its internals to `@lib:auth.*` with no rescope
+    // pass, whichever site (and however many) calls it. Nobody reads the
+    // id: a person names the file's nodes through a site (`auth.check`).
+    let body_id = crate::source_name::body_id(root, &canonical);
+    if let Some(other) = bodies.paths.get(&body_id).filter(|p| **p != canonical) {
+        return Err(at_include(format!(
+            "@include(\"{}\"): the file takes the id `{body_id}` from its path, and {} already took it; \
+             the two paths differ only in characters a body id cannot hold, so rename one of them",
+            inc.path,
+            other.display()
+        )));
+    }
+    let mut sub = parse_checked(source.as_str(), &body_id)
         .map_err(|errs| {
             // The errors keep their own spans and name the included
             // file (a deeper include's stamp wins), so a click lands
@@ -614,18 +685,7 @@ fn resolve_one_include(
                 .collect::<Vec<_>>()
         })?;
 
-    // An included file must be exactly one anonymous top-level Group and
-    // nothing else: the Group header is the file's interface, and the file
-    // name is its identity (no top-level name). A named group, multiple groups,
-    // loose nodes, OR a loose top-level connection are rejected. (Only the group
-    // is consumed below; any other top-level content would be silently dropped,
-    // so the gate must catch it loudly.)
-    let single_anon = sub.nodes.is_empty()
-        && sub.includes.is_empty()
-        && sub.connections.is_empty()
-        && sub.groups.len() == 1
-        && sub.groups[0].anonymous;
-    if !single_anon {
+    if !is_one_anonymous_group(&sub) {
         return Err(at_include(format!(
             "@include(\"{}\"): an included file must be exactly one anonymous top-level Group, e.g. `Group(in: T) -> (out: U) {{ ... }}`",
             inc.path
@@ -658,41 +718,207 @@ fn resolve_one_include(
                 config_spans: Default::default(),
                 optional_ports: Default::default(),
                 include_path: Some(inc.path.clone()),
+                include_contents: Some(include_node_types_and_files(
+                    &group,
+                    root,
+                    &included_fs,
+                    in_progress,
+                    &canonical,
+                )),
                 source_file: None,
             };
             Ok(IncludeResult::Node(Box::new(node)))
         }
         IncludeMode::Full => {
-            // Everything spliced out of this file keeps ITS coordinates, so
-            // stamp its file identity onto every node/edge/group that does
-            // not already carry one (a nested include stamped its own file
-            // first). Diagnostics then name the right file.
-            stamp_source_file(&mut group, &canonical.to_string_lossy());
-            // Resolve the included group's OWN nested @includes first, against
-            // the included file's directory (not the parent's), so nested
-            // composition inlines fully. Cycle stack guards self-inclusion.
-            in_progress.push(canonical.clone());
-            let mut errs = Vec::new();
-            resolve_group_includes(&mut group, &included_fs, mode, in_progress, &mut errs);
-            in_progress.pop();
-            if !errs.is_empty() {
-                // Nested include errors already stamped with their own
-                // file keep it; an unstamped one is about THIS file's
-                // compiled source, which is the included file.
-                return Err(errs
-                    .into_iter()
-                    .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
-                    .collect());
+            // The body is compiled ONCE: the first site to reach the file
+            // registers it, every later site finds it registered and only
+            // adds its own call site.
+            if !bodies.paths.contains_key(&body_id) {
+                // The id is taken before the file's own includes resolve,
+                // so a file reached from inside them that lands on the same
+                // id is refused above instead of registering underneath.
+                bodies.paths.insert(body_id.clone(), canonical.clone());
+                // Everything read out of this file keeps ITS coordinates, so
+                // stamp its file identity onto every node/edge/group that
+                // does not already carry one (a nested include stamped its
+                // own file first). Diagnostics then name the right file.
+                stamp_source_file(&mut group, &canonical.to_string_lossy());
+                // Resolve the body's OWN nested @includes first, against the
+                // included file's directory (not the parent's). The cycle
+                // stack guards self-inclusion, through however many files.
+                in_progress.push(canonical.clone());
+                let mut errs = Vec::new();
+                resolve_group_includes(&mut group, &included_fs, mode, in_progress, bodies, &mut errs);
+                in_progress.pop();
+                if !errs.is_empty() {
+                    // The file did not compile, so it is not registered: a
+                    // later site of it reports the same errors instead of
+                    // finding an id with no body behind it.
+                    bodies.paths.remove(&body_id);
+                    // Nested include errors already stamped with their own
+                    // file keep it; an unstamped one is about THIS file's
+                    // compiled source, which is the included file.
+                    return Err(errs
+                        .into_iter()
+                        .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
+                        .collect());
+                }
+                // A body is a shared definition, not the root of a
+                // standalone component: clear the flag so it cannot trip
+                // the component-validation rule (which treats a top-level
+                // anonymous group as "this file IS a component").
+                group.anonymous = false;
+                group.kind = GroupKind::Body;
+                bodies.groups.push(group);
             }
-            // The group was parsed with the alias as its anon-root id, so its id
-            // is already `{alias}` and its internals `{alias}.*`: no rescope.
-            // Once spliced under a call-site alias it is a named member group of
-            // the parent, NOT a standalone-component root. Clear the flag so it
-            // can't trip the component-validation rule (which treats a top-level
-            // anonymous group as "this file IS a component").
-            group.anonymous = false;
-            Ok(IncludeResult::Group(Box::new(group)))
+            let body = bodies.groups.iter().find(|b| b.id == body_id).expect("registered just above");
+            // The site: the alias's group in THIS file, with the body's
+            // interface and nothing inside. Its values (a literal written on
+            // an alias port) land on it like on any container; the caller
+            // applies them next.
+            let site = ParsedGroup {
+                id: inc.alias.clone(),
+                kind: GroupKind::Call { body: body_id },
+                in_ports: body.in_ports.clone(),
+                out_ports: body.out_ports.clone(),
+                nodes: Vec::new(),
+                connections: Vec::new(),
+                child_groups: Vec::new(),
+                anonymous: false,
+                includes: Vec::new(),
+                loop_config: None,
+                loop_config_spans: Default::default(),
+                port_literals: Default::default(),
+                port_literal_spans: Default::default(),
+                span: Some(inc.span),
+                header_span: Some(inc.span),
+                // Written in the including file, whose spans carry no stamp.
+                source_file: None,
+                description: body.description.clone(),
+            };
+            Ok(IncludeResult::Site(Box::new(site)))
         }
+    }
+}
+
+/// The node types and file paths behind an interface-mode `@include`,
+/// reached through its own includes as well. Interface mode keeps only the
+/// group's ports, so the body's nodes never enter the graph and the editor
+/// would otherwise read an include as an empty box: a project whose only
+/// trigger or only infra node lives in one had no Activate button and no
+/// infra controls.
+///
+/// Types, not roles: `requires_infra` and `has_trigger` come back FALSE
+/// from here whatever the file holds, because deciding what a type means
+/// takes the catalog and the parser has none. `enrich` settles them from
+/// the types (`enrich::enrich_collecting`), so between parse and enrich
+/// those two booleans are not yet answers.
+///
+/// A nested file that cannot be read, cannot be parsed, or has a shape an
+/// `@include` refuses contributes nothing, and nothing is reported: this
+/// runs inside the editor's lenient parse, whose job is to keep drawing
+/// the graph through a broken dependency. The cost is real and worth
+/// naming: a DIRECTLY included broken file is reported (the `@include`
+/// line gets the error), while one reached only through another include
+/// is silent, because interface mode never loads nested bodies and so has
+/// no diagnostic channel here. Such a project fails at build with the
+/// file named.
+fn include_node_types_and_files(
+    group: &ParsedGroup,
+    root: &std::path::Path,
+    fs: &CompileFs,
+    in_progress: &[std::path::PathBuf],
+    canonical: &std::path::Path,
+) -> weft_core::project::IncludedContents {
+    // Canonicalized ONCE here and used for the whole walk, because the
+    // backing hands back canonicalized paths while `CompileFs` carries the
+    // root as it was spelled: a project reached through a symlink makes the
+    // two differ, and then neither the path-from-root nor the file's body
+    // id comes out right.
+    let canonical_root = root.canonicalize();
+    let root = canonical_root.as_deref().unwrap_or(root);
+    let mut contents = weft_core::project::IncludedContents::default();
+    push_root_relative(&mut contents.files, root, canonical);
+    // The cycle stack for this walk starts with the file we are already
+    // inside, so a file that includes itself (directly or through a chain)
+    // is visited once.
+    let mut seen: Vec<std::path::PathBuf> = in_progress.to_vec();
+    seen.push(canonical.to_path_buf());
+    collect_included_contents(group, root, fs, &mut seen, &mut contents);
+    contents.node_types.sort();
+    contents.node_types.dedup();
+    contents.files.sort();
+    contents.files.dedup();
+    contents
+}
+
+/// Record a file under `contents.files` as its path from the project root,
+/// the one spelling every reader of the field can resolve. `root` must be
+/// the canonical root (the caller canonicalizes once for the whole walk),
+/// because the paths coming in are canonicalized by the backing.
+///
+/// A file that does not sit under the root cannot have come from an
+/// `@include`, which refuses anything outside it, so it is dropped rather
+/// than written down under a spelling nobody can resolve.
+fn push_root_relative(files: &mut Vec<String>, root: &std::path::Path, path: &std::path::Path) {
+    if let Ok(rel) = path.strip_prefix(root) {
+        files.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+}
+
+/// Walk one parsed group: its own nodes' types, then down its child groups,
+/// then into each file it includes. `root` is the canonical project root.
+fn collect_included_contents(
+    group: &ParsedGroup,
+    root: &std::path::Path,
+    fs: &CompileFs,
+    seen: &mut Vec<std::path::PathBuf>,
+    contents: &mut weft_core::project::IncludedContents,
+) {
+    for node in &group.nodes {
+        contents.node_types.push(node.node_type.clone());
+    }
+    for child in &group.child_groups {
+        collect_included_contents(child, root, fs, seen, contents);
+    }
+    let (Some(base), Some(fs_root)) = (fs.base, fs.root) else {
+        return;
+    };
+    for inc in &group.includes {
+        let Ok(resolved) = fs.reader.resolve_and_read(fs_root, base, std::path::Path::new(&inc.path)) else {
+            continue;
+        };
+        if seen.contains(&resolved.identity) {
+            continue;
+        }
+        // The real resolution also refuses two paths whose body ids
+        // collide. That rule is not repeated here: this walk only unions
+        // node types and file paths, and two colliding files union to the
+        // same answer whether or not the clash is caught, so a third copy
+        // of the rule in a pass that cannot report it would change no
+        // outcome. The build refuses the project and names both files.
+        // Parsed under the id the file takes from its path, the same one
+        // the real resolution gives it, so the ids here are the ids the
+        // build will use. Passing the call-site alias instead would be a
+        // second spelling of the file's identity.
+        let body_id = crate::source_name::body_id(root, &resolved.identity);
+        let Ok(mut sub) = parse_checked(resolved.content.as_str(), &body_id) else {
+            continue;
+        };
+        // A file the build would refuse: counting its contents would
+        // describe a project that cannot exist. It is passed over here
+        // rather than reported, because this walk runs during the
+        // editor's parse and its whole job is to keep drawing.
+        if !is_one_anonymous_group(&sub) {
+            continue;
+        }
+        let nested = sub.groups.pop().expect("length checked");
+        push_root_relative(&mut contents.files, root, &resolved.identity);
+        seen.push(resolved.identity.clone());
+        // Anchored at the nested file's OWN directory: an `@include` path is
+        // relative to the file that writes it.
+        let nested_fs = fs.anchored_at(resolved.identity.parent());
+        collect_included_contents(&nested, root, &nested_fs, seen, contents);
     }
 }
 
@@ -1011,7 +1237,7 @@ fn apply_container_literal_fill(
     errors: &mut Vec<CompileError>,
 ) {
     let declared = group.in_ports.iter().any(|p| p.name == fill.port)
-        || fill.port == weft_core::exec::skip::SHOULD_FLOW_PORT;
+        || weft_core::exec::skip::is_gate_port(&fill.port);
     if !declared {
         errors.push(CompileError::at(
             fill.span,
@@ -1216,6 +1442,7 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
     "_label",
     weft_core::tag::TAGS_CONFIG_KEY,
     weft_core::exec::skip::SHOULD_FLOW_PORT,
+    weft_core::exec::skip::SHOULD_NOT_FLOW_PORT,
 ];
 
 /// The canonical list of type names the language reserves. The SINGLE
@@ -1322,9 +1549,12 @@ fn lower_port_sig(
                                 span,
                                 format!(
                                     "output port \"{}\" carries `?`, but an output has no \
-                                     optionality: a firing that emits nothing on it closes it. \
-                                     Remove the `?`",
-                                    p.name
+                                     optionality: absence is already how it works. A firing \
+                                     that emits nothing on \"{}\" CLOSES it, and everything \
+                                     wired behind it skips. Remove the `?` here; if a node \
+                                     behind it should run anyway, mark ITS input optional \
+                                     (`{}?: Type`) and it runs with nothing on that port",
+                                    p.name, p.name, p.name
                                 ),
                             ));
                         }
@@ -1511,6 +1741,7 @@ fn lower_node(
         config_spans: body_out.config_spans,
         optional_ports: body_out.optional_ports,
         include_path: None,
+        include_contents: None,
         source_file: None,
     })
 }
@@ -1754,6 +1985,7 @@ fn lower_inline_expr(
         config_spans: body_out.config_spans,
         optional_ports: body_out.optional_ports,
         include_path: None,
+        include_contents: None,
         source_file: None,
     });
     inline.connections.push(ParsedConnection {
@@ -2222,7 +2454,7 @@ fn lower_grouplike_body_in_scope(
                 let wired_flow = tmp_inline
                     .connections
                     .iter()
-                    .any(|c| c.target_port == weft_core::exec::skip::SHOULD_FLOW_PORT);
+                    .any(|c| weft_core::exec::skip::is_gate_port(&c.target_port));
                 if wired_flow {
                     group.nodes.extend(std::mem::take(&mut tmp_inline.nodes));
                     group.connections.extend(std::mem::take(&mut tmp_inline.connections));
@@ -2237,7 +2469,7 @@ fn lower_grouplike_body_in_scope(
                     ));
                 }
                 for (key, value) in tmp_body.config {
-                    if key == weft_core::exec::skip::SHOULD_FLOW_PORT {
+                    if weft_core::exec::skip::is_gate_port(key.as_str()) {
                         group.port_literal_spans
                             .insert(key.clone(), ConfigFieldSpan::inline(field_span));
                         group.port_literals.insert(key, value);
@@ -2288,7 +2520,7 @@ fn lower_grouplike_body_in_scope(
                     // `port_literal_spans` above; a loop-config span for
                     // it would show the editor a knob with no value.
                     if matches!(group.kind, GroupKind::Loop)
-                        && key != weft_core::exec::skip::SHOULD_FLOW_PORT
+                        && !weft_core::exec::skip::is_gate_port(key.as_str())
                     {
                         group.loop_config_spans.insert(key, span);
                     }
@@ -3014,7 +3246,7 @@ fn unescape(s: &str) -> String {
 
 // ─── Flattener ──────────────────────────────────────────────────────────────
 
-fn flatten(state: ParseState, project_id: Uuid) -> ProjectDefinition {
+fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefinition {
     let mut nodes: Vec<NodeDefinition> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -3041,6 +3273,13 @@ fn flatten(state: ParseState, project_id: Uuid) -> ProjectDefinition {
     // Flatten each group (recursively handles nested groups)
     for group in &state.groups {
         flatten_group(group, &mut nodes, &mut edges);
+    }
+
+    // Every included file's body, once, beside the program's own groups:
+    // a top-level scope of its own whose members run under a call frame.
+    for body in &bodies.groups {
+        collect_group_definitions(body, None, &mut groups);
+        flatten_group(body, &mut nodes, &mut edges);
     }
 
     // Deduplicate nodes by id, then edges. A node-id collision is already a loud
@@ -3107,7 +3346,11 @@ fn collect_group_definitions(
         .map(|p| PortDefinition {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
-            required: false,
+            // An output carries no optionality, so the wire says `true`
+            // (the field's contract). `false` here reached the editor,
+            // which wrote it back as an optional output when the group's
+            // signature was next rewritten, and the edit was refused.
+            required: true,
             description: None,
             synthesized_from_carry: false,
             declared_type: None,
@@ -3119,8 +3362,10 @@ fn collect_group_definitions(
     let node_ids: Vec<String> = group.nodes.iter().map(|n| n.id.clone()).collect();
     let child_group_ids: Vec<String> = group.child_groups.iter().map(|g| g.id.clone()).collect();
 
-    let kind = match group.kind {
+    let kind = match &group.kind {
         GroupKind::Group => weft_core::GroupKind::Group,
+        GroupKind::Call { body } => weft_core::GroupKind::Call { body: body.clone() },
+        GroupKind::Body => weft_core::GroupKind::Body,
         GroupKind::Loop => weft_core::GroupKind::Loop {
             loop_config: serde_json::Value::Object(
                 group
@@ -3181,9 +3426,14 @@ fn flatten_group(
         vec![]
     };
 
-    let (in_type, out_type) = match group.kind {
-        GroupKind::Group => ("Passthrough", "Passthrough"),
-        GroupKind::Loop => ("LoopIn", "LoopOut"),
+    let (in_type, out_type) = {
+        use weft_core::project::boundary_types as bt;
+        match &group.kind {
+            GroupKind::Group => (bt::PASSTHROUGH, bt::PASSTHROUGH),
+            GroupKind::Loop => (bt::LOOP_IN, bt::LOOP_OUT),
+            GroupKind::Call { .. } => (bt::CALL_IN, bt::CALL_OUT),
+            GroupKind::Body => (bt::INCLUDE_IN, bt::INCLUDE_OUT),
+        }
     };
 
     // Loop-only: parse `over` / `carry` to derive the boundary port shapes.
@@ -3202,12 +3452,12 @@ fn flatten_group(
     //     carry value for carry ports (T).
     //
     // For a Group, all four sides mirror the user's declared types.
-    let (loop_over, loop_carry): (Vec<String>, Vec<String>) = match group.kind {
+    let (loop_over, loop_carry): (Vec<String>, Vec<String>) = match &group.kind {
         GroupKind::Loop => (
             read_loop_port_list_vetted(group.loop_config.as_ref(), "over"),
             read_loop_port_list_vetted(group.loop_config.as_ref(), "carry"),
         ),
-        GroupKind::Group => (Vec::new(), Vec::new()),
+        GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body => (Vec::new(), Vec::new()),
     };
 
     let elem_type = |ty: &weft_core::weft_type::WeftType| -> weft_core::weft_type::WeftType {
@@ -3229,8 +3479,8 @@ fn flatten_group(
     // different for the ports it iterates or threads: with no list to
     // walk, or no seed to carry, there is no iteration to launch.
     let mut in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
-        let boundary_required = match group.kind {
-            GroupKind::Group => false,
+        let boundary_required = match &group.kind {
+            GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body => false,
             GroupKind::Loop => p.required && (loop_over.contains(&p.name) || loop_carry.contains(&p.name)),
         };
         InputDefinition::from_wire_port(PortDefinition {
@@ -3266,6 +3516,22 @@ fn flatten_group(
         synthesized_from_carry: false,
         declared_type: None,
     }));
+    // The same gate read the other way round, on the same boundary: a
+    // whole subgraph that runs when the thing wired here did NOT happen.
+    // Both spellings exist on every node, so they exist here too, or a
+    // group would be the one thing in the language that cannot be gated
+    // on an absence.
+    in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
+        name: weft_core::exec::skip::SHOULD_NOT_FLOW_PORT.to_string(),
+        port_type: weft_core::weft_type::WeftType::type_var("T__should_not_flow"),
+        required: false,
+        description: Some(
+            "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it."
+                .to_string(),
+        ),
+        synthesized_from_carry: false,
+        declared_type: None,
+    }));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
             elem_type(&p.port_type)
@@ -3275,7 +3541,8 @@ fn flatten_group(
         PortDefinition {
             name: p.name.clone(),
             port_type: ty.clone(),
-            required: false,
+            // An output: always `true` on the wire.
+            required: true,
             description: None,
             synthesized_from_carry: false,
             declared_type: None,
@@ -3290,7 +3557,7 @@ fn flatten_group(
         in_pt_outputs.push(PortDefinition {
             name: "index".to_string(),
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number),
-            required: false,
+            required: true,
             description: None,
             synthesized_from_carry: false,
             declared_type: None,
@@ -3302,7 +3569,7 @@ fn flatten_group(
     // engine reads it without a separate registry. parentId is kept so
     // the existing webview rendering doesn't break.
     let mut in_cfg = serde_json::json!({"parentId": group.id});
-    if let (GroupKind::Loop, Some(lc)) = (group.kind, &group.loop_config) {
+    if let (GroupKind::Loop, Some(lc)) = (&group.kind, &group.loop_config) {
         if let Some(obj) = in_cfg.as_object_mut() {
             for (k, v) in lc {
                 obj.insert(k.clone(), v.clone());
@@ -3335,6 +3602,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         // The group's header is where a diagnostic about either
@@ -3350,6 +3618,7 @@ fn flatten_group(
         port_literal_spans: group.port_literal_spans.clone(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         // The node's file covers its own spans (the loop config spans
         // above live in the group's file). Its port-literal spans may
         // each name a DIFFERENT file: an interface-port fill is written
@@ -3398,7 +3667,8 @@ fn flatten_group(
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
-        required: false,
+        // An output: always `true` on the wire.
+        required: true,
         description: None,
         synthesized_from_carry: false,
         declared_type: None,
@@ -3422,6 +3692,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         header_span: group.header_span,
@@ -3431,6 +3702,7 @@ fn flatten_group(
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         source_file: group.source_file.clone(),
     });
 
@@ -3451,6 +3723,33 @@ fn flatten_group(
         }
         if edge.source == group.id {
             edge.source = out_pt_id.clone();
+        }
+    }
+
+    // 5b. A call site's wires to its body: every input the site takes
+    // goes to the body's In, every output the body makes comes back to
+    // the site's Out. The body's In is wired from EVERY site that calls
+    // it and its Out to every site; the call frame a site's In pushes is
+    // what keeps the calls apart, and the frame is what picks the site a
+    // result returns to (`weft_core::exec::postprocess::frames_across`).
+    if let GroupKind::Call { body } = &group.kind {
+        let body_in = weft_core::project::boundary_in_id(body);
+        let body_out = weft_core::project::boundary_out_id(body);
+        let wire = |source: &str, port: &str, target: &str| Edge {
+            id: edge_id(source, port, target, port),
+            source: source.to_string(),
+            target: target.to_string(),
+            source_handle: Some(port.to_string()),
+            target_handle: Some(port.to_string()),
+            path: Vec::new(),
+            span: None,
+            source_file: None,
+        };
+        for p in &group.in_ports {
+            edges.push(wire(&in_pt_id, &p.name, &body_in));
+        }
+        for p in &group.out_ports {
+            edges.push(wire(&body_out, &p.name, &out_pt_id));
         }
     }
 
@@ -3509,6 +3808,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         group_boundary: None,
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: pn.span,
         header_span: pn.header_span,
@@ -3520,6 +3820,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: pn.include_path.clone(),
+        include_contents: pn.include_contents.clone(),
         source_file: pn.source_file.clone(),
     }
 }

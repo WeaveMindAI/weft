@@ -172,7 +172,7 @@
             .record_event(
                 &ExecEvent::NodeKicked {
                     color,
-                    node_id: "producer".into(),
+                    node_id: "producer".into(), frames: vec![],
                     firing: false,
                     payload: None,
                     port_snapshot: None,
@@ -225,7 +225,8 @@
                     for m in window {
                         let p = m
                             .payload
-                            .as_json()
+                            .as_ref()
+                            .and_then(|payload| payload.as_json())
                             .and_then(|v| v.get("i"))
                             .and_then(|v| v.as_i64())
                             .map(|i| i.to_string())
@@ -306,7 +307,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            color, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
 
         let clients = clients(journal.clone());
@@ -558,7 +559,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            color, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
         let clients = clients(journal.clone());
         tokio::time::timeout(
@@ -1046,7 +1047,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                color, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
             let fake_access_broker = crate::context::FakeAccessBroker::new();
             // Runtime-owned on purpose: only an `Ours` credential is
@@ -1302,7 +1303,7 @@
                 j.record_event(
                     &ExecEvent::NodeKicked {
                         color,
-                        node_id,
+                        node_id, frames: vec![],
                         firing: false,
                         payload: None,
                         port_snapshot: None,
@@ -2028,9 +2029,11 @@
             error_mode: ErrorMode::Surface,
             connect_timeout_secs: 5,
             max_inbound_bytes: 1_048_576,
+            caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
             suspend: SuspendPolicy { can_suspend, default_hold_secs: 60 },
             inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
+            journal: weft_core::stream_journal::JournalPolicy::default(),
         }
     }
 
@@ -2056,7 +2059,7 @@
             .unwrap();
         journal
             .record_event(
-                &ExecEvent::NodeKicked { color, node_id: entry.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                &ExecEvent::NodeKicked { color, node_id: entry.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 None,
             )
             .await
@@ -2315,7 +2318,9 @@
             ExecEvent::BusWindow { messages, .. } => messages
                 .iter()
                 .filter(|m| m.from == "caller_to_bus")
-                .filter_map(|m| m.payload.as_json().and_then(|v| v.get("i")).and_then(|v| v.as_i64()))
+                .filter_map(|m| {
+                    m.payload.as_ref().and_then(|p| p.as_json()).and_then(|v| v.get("i")).and_then(|v| v.as_i64())
+                })
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         }).collect();
@@ -2379,7 +2384,7 @@
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: n.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                color, node_id: n.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
         }
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
@@ -2419,8 +2424,8 @@
         // The node both wrote a chunk and terminated with the final body.
         use weft_core::caller::CallerCall;
         let calls = fake.calls();
-        assert!(calls.iter().any(|c| matches!(c, CallerCall::SendChunk(_))), "wrote a streaming chunk: {calls:?}");
-        assert!(calls.iter().any(|c| matches!(c, CallerCall::Terminate(_))), "sent the final body / terminated: {calls:?}");
+        assert!(calls.iter().any(|c| matches!(c, CallerCall::SendChunk { .. })), "wrote a streaming chunk: {calls:?}");
+        assert!(calls.iter().any(|c| matches!(c, CallerCall::Terminate { .. })), "sent the final body / terminated: {calls:?}");
     }
 
     /// Caller-tied (can_suspend = false): a node that sends to a
@@ -2608,7 +2613,7 @@
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         use weft_core::caller::CallerCall;
         assert!(
-            fake.calls().iter().any(|c| matches!(c, CallerCall::SendChunk(_))),
+            fake.calls().iter().any(|c| matches!(c, CallerCall::SendChunk { .. })),
             "the caller send happened even though the endpoint path ran too: {:?}", fake.calls()
         );
     }

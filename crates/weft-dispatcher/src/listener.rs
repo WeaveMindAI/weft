@@ -401,7 +401,12 @@ pub async fn register_signal(
     Ok((body.routing, body.kind_state))
 }
 
-pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Value> {
+/// The signal's display as its holder serves it, or `None` when the
+/// pod answers that it does not hold this token (its registry lost
+/// the entry; the durable row still names the pod). To the person
+/// looking at the trigger that is the same as no holder at all:
+/// nothing is listening until the project is activated again.
+pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
     let client = reqwest::Client::new();
     let url = format!("{}/display", handle.admin_url.trim_end_matches('/'));
     let resp = client
@@ -409,32 +414,14 @@ pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Valu
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     let resp = bail_unless_ok(resp, "/display").await?;
     let body: weft_listener::protocol::DisplayResponse = resp.json().await?;
-    Ok(body.display)
+    Ok(Some(body.display))
 }
 
-pub async fn action_signal(
-    handle: &ListenerHandle,
-    token: &str,
-    action_kind: &str,
-    payload: &Value,
-) -> Result<weft_listener::protocol::ActionResponse> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/action", handle.admin_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "token": token,
-            "kind": action_kind,
-            "payload": payload,
-        }))
-        .send()
-        .await?;
-    let resp = bail_unless_ok(resp, "/action").await?;
-    let body: weft_listener::protocol::ActionResponse = resp.json().await?;
-    Ok(body)
-}
 
 pub async fn process_signal(
     handle: &ListenerHandle,
@@ -450,6 +437,60 @@ pub async fn process_signal(
         .await?;
     let resp = bail_unless_ok(resp, "/process").await?;
     Ok(resp.json::<weft_listener::protocol::ProcessOutcome>().await?)
+}
+
+/// Ask one listener pod which of `tokens` a verified provider push
+/// feeds, and with what payload.
+///
+/// The dispatcher never answers this itself. It knows a push arrived,
+/// that the broker called it genuine, and which connections it names;
+/// which SIGNALS that comes to depends on a kind's own settings, and the
+/// kinds live in the listener. Batched per pod: one account-routed push
+/// can feed many subscriptions, and a call per candidate would make the
+/// provider wait on a round trip each.
+pub async fn match_push(
+    handle: &ListenerHandle,
+    push: &weft_listener::protocol::PushEvent,
+    tokens: &[String],
+) -> Result<Vec<weft_listener::protocol::MatchedPush>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/match_push", handle.admin_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&weft_listener::protocol::MatchPushRequest {
+            push: push.clone(),
+            tokens: tokens.to_vec(),
+        })
+        .send()
+        .await?;
+    let resp = bail_unless_ok(resp, "/match_push").await?;
+    Ok(resp
+        .json::<weft_listener::protocol::MatchPushResponse>()
+        .await?
+        .matched)
+}
+
+/// What one signal wakes with when a person wakes it by hand, or `None`
+/// when its kind cannot be woken that way.
+///
+/// The dispatcher owns whether a wake is allowed to happen (the project
+/// is live, the node really is waiting, the caller may touch it) and
+/// what to do with the answer. It does not own the answer: a wake
+/// payload is a kind's own shape, and minting one here would put a
+/// second tier in the business of knowing what a timer says.
+pub async fn wake_by_hand(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/wake_by_hand", handle.admin_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&weft_listener::protocol::WakeByHandRequest { token: token.to_string() })
+        .send()
+        .await?;
+    let resp = bail_unless_ok(resp, "/wake_by_hand").await?;
+    Ok(resp
+        .json::<weft_listener::protocol::WakeByHandResponse>()
+        .await?
+        .payload)
 }
 
 pub async fn render_signal(handle: &ListenerHandle, token: &str) -> Result<Value> {
@@ -663,13 +704,14 @@ impl ListenerPool {
             Option<String>,
             String,
             Option<String>,
+            Vec<String>,
             String,
             Option<Value>,
             Value,
             i64,
         )> = sqlx::query_as(
             "SELECT tenant_id, node_id, spec_json, is_resume, color, \
-                    surface_kind, mount_path, auth_kind, auth_config, kind_state, \
+                    surface_kind, mount_path, mount_methods, auth_kind, auth_config, kind_state, \
                     kind_state_seq \
              FROM signal WHERE token = $1",
         )
@@ -684,6 +726,7 @@ impl ListenerPool {
             color,
             surface_kind,
             mount_path,
+            mount_methods,
             auth_kind,
             auth_config,
             kind_state,
@@ -707,6 +750,7 @@ impl ListenerPool {
             weft_broker_client::protocol::routing_from_columns(
                 surface,
                 mount_path.as_deref(),
+                &mount_methods,
                 auth,
                 auth_config,
             )
@@ -1329,20 +1373,6 @@ impl ListenerPool {
         // duplicated.
         self.reap_idle(backend, pg_pool, pod_id).await
     }
-}
-
-/// Clear the placement holder on a set of signal tokens (set
-/// `signal.listener_pod = NULL`). Used after a bulk unregister so a
-/// later fire re-places the signal instead of routing to a stale pod.
-pub async fn clear_placement(pg_pool: &PgPool, tokens: &[String]) -> Result<()> {
-    if tokens.is_empty() {
-        return Ok(());
-    }
-    sqlx::query("UPDATE signal SET listener_pod = NULL WHERE token = ANY($1)")
-        .bind(tokens)
-        .execute(pg_pool)
-        .await?;
-    Ok(())
 }
 
 /// Generation for the first-ever placement of a token that has no

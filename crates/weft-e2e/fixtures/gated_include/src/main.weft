@@ -1,0 +1,21 @@
+# The shape an API builder writes: a route, and the work that answers it
+# hanging off the route through `_should_flow` alone. Nothing wires the
+# route's data into the work, so the fire's program has to take the
+# whole group (and the whole included file) along with the door.
+#
+#   POST grouped   answered from inside a plain group gated by the route
+#   POST included  answered from inside an included file gated by the route
+
+grouped = Route { path: "__E2E_PATH__/grouped", method: "POST" }
+work = Group() {
+  body = ExecPython() -> (body: JsonDict) {
+    code: "return {'body': {'where': 'group'}}"
+  }
+  answer = Reply
+  answer.body = body.body
+}
+work._should_flow = grouped.method
+
+included = Route { path: "__E2E_PATH__/included", method: "POST" }
+deep = @include("lib/deep.weft")
+deep._should_flow = included.method

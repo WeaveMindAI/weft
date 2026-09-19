@@ -1,0 +1,75 @@
+# Request-response with zero custom Rust: five routes under one project, each
+# answered by a Reply or a Close. The rig calls each and asserts status,
+# headers and body.
+#
+#   POST hello        a declared body key, a computed body, a 201 with a header
+#   GET  users/{id}   a path capture and the query; 200 for id 42, 404 otherwise
+#   POST say (text)   a text route: the whole body on one port, echoed as text
+#   DELETE gone       a bodiless answer through Close, ordered by a decision
+#   DELETE sweep/{w}  the "if it did not work, stop here" shape: a Switch on the
+#                     outcome, a Reply on one case, a Close with a reason on the other
+
+hello = Route -> (name: String) { path: "__E2E_PATH__/hello", method: "POST" }
+greet = ExecPython(name: String, path: String, headers: Dict[String, String]) -> (body: JsonDict) {
+  code: "return {'body': {'greeting': 'hello ' + name, 'path': path, 'agent': headers.get('user-agent', '')}}"
+}
+greet.name = hello.name
+greet.path = hello.path
+greet.headers = hello.headers
+answer = Reply { status: 201, headers: { "x-run": "e2e" } }
+answer.body = greet.body
+
+user = Route { path: "__E2E_PATH__/users/{id}", method: "GET" }
+lookup = ExecPython(params: Dict[String, String], query: Dict[String, String]) -> (body: JsonDict, status: Number) {
+  code: "uid = params['id']\nif uid == '42':\n    return {'body': {'id': uid, 'name': 'Ada', 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
+}
+lookup.params = user.params
+lookup.query = user.query
+found = Reply
+found.body = lookup.body
+found.status = lookup.status
+
+say = Route -> (line: String) { path: "__E2E_PATH__/say", method: "POST", dataType: "text" }
+shout = ExecPython(line: String) -> (out: String) { code: "return {'out': line.upper()}" }
+shout.line = say.line
+loud = Reply
+loud.body = shout.out
+
+gone = Route { path: "__E2E_PATH__/gone", method: "DELETE" }
+when_gone = ExecPython(method: String) -> (ok: Boolean) { code: "return {'ok': method == 'DELETE'}" }
+when_gone.method = gone.method
+bye = Close { status: 204 }
+bye._should_flow = when_gone.ok
+
+# The pattern the skills teach for "do this, and if it did not work, stop
+# here": a Switch on the outcome, the passing case gating the Reply and the
+# failing case gating a Close whose `reason` is the body under its `status`.
+sweep = Route { path: "__E2E_PATH__/sweep/{what}", method: "DELETE" }
+clear = ExecPython(params: Dict[String, String]) -> (removed: Number) {
+  code: "return {'removed': 3 if params['what'] == 'cards' else 0}"
+}
+clear.params = sweep.params
+outcome = Switch {
+  value: clear.removed
+  cases: [
+    { "kind": "gt", "value": 0, "port": "some" },
+    { "kind": "otherwise", "port": "none" }
+  ]
+}
+report = Reply
+report.body = clear.removed
+report._should_flow = outcome.some
+nothing = Close { status: 404, reason: "nothing to sweep" }
+nothing._should_flow = outcome.none
+
+# An ending that carries its own header: a 304 has no body, and the
+# caching header is the whole point of answering one. Before Close
+# took headers, this had to be a Reply with an empty body, or the
+# client had to reuse the tag it stored.
+fresh = Route { path: "__E2E_PATH__/cached", method: "GET" }
+tag = ExecPython(method: String) -> (head: Dict[String, String]) {
+  code: "return {'head': {'etag': 'v1', 'cache-control': 'max-age=60'}}"
+}
+tag.method = fresh.method
+unchanged = Close { status: 304 }
+unchanged.headers = tag.head

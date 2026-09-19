@@ -92,6 +92,38 @@ pub struct SyncResponse {
     pub nodes: Vec<InfraStatusEntry>,
 }
 
+/// What happens to the executions running right now, and how long we
+/// will wait on them: one answer, wherever in an infra verb the
+/// question comes up.
+///
+/// "What about the running executions" is ONE question a person
+/// answers once, in the picker, and the same answer governs the
+/// trigger side and the infra side. The verb does not get a say:
+/// somebody who asked to wait did not ask to wait for half of it.
+///
+/// `asked` is the picker's answer, present exactly when the picker was
+/// shown, which is when the project is active. When it was not shown
+/// there was nothing to ask about (nothing to park, hibernate or wipe),
+/// so the fallbacks stand in: what the client sent on the body, and
+/// failing that `unasked`, which is what the verb means on its own (a
+/// stop lets in-flight work finish, a terminate ends it).
+fn running_choice(
+    asked: Option<&weft_broker_client::protocol::DeactivateSpec>,
+    body_policy: Option<RunningPolicy>,
+    body_cap: Option<u64>,
+    unasked: RunningPolicy,
+) -> (RunningPolicy, u64) {
+    let policy = asked
+        .map(|spec| spec.running_policy)
+        .or(body_policy)
+        .unwrap_or(unasked);
+    let cap = asked
+        .and_then(|spec| spec.drain_timeout_secs)
+        .or(body_cap)
+        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+    (policy, cap)
+}
+
 /// Return shape for verbs that asynchronously enqueue a lifecycle
 /// command. The body intentionally does NOT contain `nodes`: the
 /// command hasn't been claimed yet, so any snapshot would be the
@@ -104,7 +136,12 @@ pub struct LifecycleCommandIssued {
 
 #[derive(Debug, Serialize)]
 pub struct InfraStatusEntry {
+    /// The runtime's key for the node (see `ProjectInfraEntry`): a
+    /// match key, never a label.
     pub node_id: String,
+    /// The same node the way the program spells it, for whoever prints
+    /// it at a person.
+    pub node: String,
     pub status: String,
     pub endpoint_url: Option<String>,
     pub failure_stage: Option<String>,
@@ -300,20 +337,27 @@ pub(super) async fn sync_inner(
     // cycle a running unit onto a new spec the sync stops first
     // (respecting each unit's on_stop) and BLOCKS until the stop
     // settles, exactly like it blocks on the InfraSetup below; the
-    // start half then recreates the down units. Stop drains in-flight
-    // infra executions (RunningPolicy::Wait) up to the caller's cap;
-    // the wait here adds a generous margin over that cap so a
+    // start half then recreates the down units. What happens to the
+    // executions running while it does is the person's answer, given in
+    // the same picker (an upgrade of an active project always shows it);
+    // `wait` lets them finish up to their cap, `cancel` ends them first.
+    // Only an upgrade of an INACTIVE project has no answer, and there a
+    // stop lets in-flight infra work finish, which is what stop means.
+    // The wait below adds a generous margin over the cap so a
     // legitimately slow drain is never misread as a wedged supervisor.
     if body.upgrade {
-        let drain_timeout_secs = body
-            .drain_timeout_secs
-            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+        let (running_policy, drain_timeout_secs) = running_choice(
+            body.trigger_deactivation.as_ref(),
+            body.running_policy,
+            body.drain_timeout_secs,
+            RunningPolicy::Wait,
+        );
         let command_id = issue_lifecycle_ensuring_supervisor(
             &state,
             &project_id,
             None,
             InfraLifecycleVerb::Stop,
-            RunningPolicy::Wait,
+            running_policy,
             false,
             drain_timeout_secs,
         )
@@ -391,10 +435,12 @@ pub(super) async fn sync_inner(
     //   6. UNDER the lock: teardown_project_namespace_if_no_infra,
     //      deleting the (now worker-less) namespace + its registry row
     //      when the project no longer has ANY infra state.
-    let running_policy = body.running_policy.unwrap_or(RunningPolicy::Wait);
-    let drain_timeout_secs = body
-        .drain_timeout_secs
-        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+    let (running_policy, drain_timeout_secs) = running_choice(
+        body.trigger_deactivation.as_ref(),
+        body.running_policy,
+        body.drain_timeout_secs,
+        RunningPolicy::Wait,
+    );
 
     // Advance the running-hash trio + infra image-tag map NOW: every reject gate
     // has passed and the upgrade stop leg (if any) succeeded, so from here the sync
@@ -580,11 +626,18 @@ async fn issue_destroy(
             format!("project is activating; cannot {}", verb.as_str()),
         ));
     }
-    // Verb-specific infra-side running policy. Stop lets in-flight
-    // executions finish (then scales to 0); Terminate cancels them
-    // before deleting resources. Distinct from the trigger-side
-    // running policy in `triggerDeactivation`, which the user picks.
-    let running_policy = match verb {
+    // What happens to the executions running right now is the person's
+    // answer, not the verb's. They gave it in the same picker a plain
+    // deactivate uses, and it means the same thing here: `wait` lets
+    // them finish (up to their cap) before the infra goes, `cancel` ends
+    // them first.
+    //
+    // The verb only decides when nobody was asked, which is exactly the
+    // case where the picker is not shown: the project is not active, so
+    // there is no door to open (nothing to park, hibernate or wipe). A
+    // stop then still lets whatever is in flight finish, and a terminate
+    // still ends it, which is what each word means on its own.
+    let unasked = match verb {
         InfraLifecycleVerb::Stop => RunningPolicy::Wait,
         InfraLifecycleVerb::Terminate => RunningPolicy::Cancel,
         // Apply is never routed through issue_destroy (it is issued as its
@@ -603,6 +656,12 @@ async fn issue_destroy(
             ));
         }
     };
+    let (running_policy, drain_timeout_secs) = running_choice(
+        body.trigger_deactivation.as_ref(),
+        None,
+        body.drain_timeout_secs,
+        unasked,
+    );
     let was_active = matches!(lifecycle.status, crate::project_store::ProjectStatus::Active);
     if was_active {
         let Some(deactivation) = body.trigger_deactivation.as_ref() else {
@@ -617,9 +676,6 @@ async fn issue_destroy(
         };
         crate::api::project::execute_trigger_deactivation(&state, id, deactivation).await?;
     }
-    let drain_timeout_secs = body
-        .drain_timeout_secs
-        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
         &project_id,
@@ -773,6 +829,74 @@ pub async fn status(
     Ok(Json(SyncResponse {
         nodes: read_infra_entries(&state, &project_id).await?,
     }))
+}
+
+/// One door serving right now, as `weft door --list` prints it.
+#[derive(serde::Serialize)]
+pub struct DoorEntry {
+    /// The node as the program spells it.
+    pub node: String,
+    pub endpoint: String,
+    /// The loopback port on the operator's machine. Not a URL: a door
+    /// carries whatever protocol the endpoint speaks, and most of them
+    /// are not HTTP.
+    pub port: u16,
+}
+
+#[derive(serde::Serialize)]
+pub struct DoorsResponse {
+    pub doors: Vec<DoorEntry>,
+}
+
+/// The doors this project has SERVING, read from the cluster rather
+/// than from a row of ours.
+///
+/// The apiserver owns these numbers: it is what allocated them and
+/// what refuses a duplicate, so it is the honest place to ask. A row
+/// would be a second copy, free to go stale the moment an apply
+/// changed one.
+pub async fn doors(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id_str): Path<String>,
+) -> Result<Json<DoorsResponse>, (StatusCode, String)> {
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    let project_id = id.to_string();
+    let rows = infra_node::list_for_project(&state.pg_pool, &project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
+    let held = state
+        .kube
+        .node_ports()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("read the cluster's node ports: {e}")))?;
+    let mut doors = Vec::new();
+    for row in rows {
+        for endpoint in row.endpoints.keys() {
+            // The Service the compiler emits for a door on this
+            // endpoint. Present means serving; absent means the node
+            // has no door there.
+            let name = weft_core::infra::door_service_name(&row.instance_id, endpoint);
+            // Namespace AND name: `node_ports` is cluster wide (a node
+            // port is), so a name on its own would answer with another
+            // tenant's Service. We are holding this project's namespace
+            // already, and the holder carries one, so there is no
+            // reason to key on the name alone.
+            let Some(holder) = held
+                .iter()
+                .find(|h| h.namespace == row.namespace && h.service == name)
+            else {
+                continue;
+            };
+            doors.push(DoorEntry {
+                node: weft_core::project::plain_id(&row.node_id),
+                endpoint: endpoint.clone(),
+                port: holder.port,
+            });
+        }
+    }
+    Ok(Json(DoorsResponse { doors }))
 }
 
 #[derive(serde::Serialize)]
@@ -992,6 +1116,7 @@ async fn read_infra_entries(
 
 fn row_to_entry(row: InfraNodeRow) -> InfraStatusEntry {
     InfraStatusEntry {
+        node: weft_core::project::plain_id(&row.node_id),
         node_id: row.node_id,
         status: row.status.as_str().to_string(),
         // Coarse UI hint: the first endpoint by name (BTreeMap, so
@@ -1581,6 +1706,55 @@ pub async fn delete_project(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn picked(policy: RunningPolicy, cap: Option<u64>) -> weft_broker_client::protocol::DeactivateSpec {
+        weft_broker_client::protocol::DeactivateSpec {
+            mode: weft_broker_client::protocol::DeactivationMode::Park,
+            grace_minutes: 15,
+            running_policy: policy,
+            drain_timeout_secs: cap,
+        }
+    }
+
+    /// The person's answer governs the infra side too. Terminate used
+    /// to cancel whatever the picker said, so somebody who asked to
+    /// wait watched their executions die anyway.
+    #[test]
+    fn the_picker_beats_the_verb() {
+        let (policy, _) = running_choice(
+            Some(&picked(RunningPolicy::Wait, None)),
+            None,
+            None,
+            RunningPolicy::Cancel,
+        );
+        assert_eq!(policy, RunningPolicy::Wait, "terminate still waits when asked to");
+        let (policy, _) = running_choice(
+            Some(&picked(RunningPolicy::Cancel, None)),
+            None,
+            None,
+            RunningPolicy::Wait,
+        );
+        assert_eq!(policy, RunningPolicy::Cancel, "and stop cancels when asked to");
+    }
+
+    /// The picker is only shown for an ACTIVE project: there is nothing
+    /// to park or wipe otherwise. With no answer the verb's own meaning
+    /// stands.
+    #[test]
+    fn with_no_picker_the_verb_decides() {
+        let (policy, cap) = running_choice(None, None, None, RunningPolicy::Cancel);
+        assert_eq!(policy, RunningPolicy::Cancel);
+        assert_eq!(cap, weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+    }
+
+    /// "Wait at most this long" is one answer, not one per tier.
+    #[test]
+    fn the_cap_comes_from_the_same_answer() {
+        let (_, cap) = running_choice(Some(&picked(RunningPolicy::Wait, Some(30))), None, Some(900), RunningPolicy::Wait);
+        assert_eq!(cap, 30, "the picker's cap, not the body's");
+        let (_, cap) = running_choice(None, None, Some(900), RunningPolicy::Wait);
+        assert_eq!(cap, 900, "and the body's when there was no picker");
+    }
 
     #[test]
     fn sync_request_defaults() {

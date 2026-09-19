@@ -2,10 +2,9 @@
 	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { isLoopNodeType, containerHasConfigStrip } from "../../types";
-	import { NODE_TYPE_CONFIG } from '../../nodes';
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
-	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx } from "../../constants/container-layout";
+	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx, expandedContainerMinPx } from "../../constants/container-layout";
 	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
@@ -14,9 +13,9 @@
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
-	import { SHOULD_FLOW_PORT } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from "../../../../protocol";
 	import FieldStrip from './FieldStrip.svelte';
-	import { LOOP_CONFIG_FIELDS, fieldForInput, nextPortLiterals, shouldFlowField } from '../../utils/input-field';
+	import { LOOP_CONFIG_FIELDS, fieldForInput, gateField, nextPortLiterals } from '../../utils/input-field';
 
 	// Group interface ports cannot take a body-set literal (see the rule
 	// enforced in enrichment's validate_required_ports). Pass an empty set to
@@ -34,13 +33,20 @@
 			simplified?: boolean;
 			config: Record<string, unknown>;
 			/// Body-set PORT values. A container's only entry today is
-			/// `_should_flow`, written as a literal in its braces.
+			/// its gate (`_should_flow` or `_should_not_flow`, whichever
+			/// spelling it carries), written as a literal in its braces.
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			onUpdate?: (updates: NodeDataUpdates) => void;
+			/// Flip the gate between `_should_flow` and
+			/// `_should_not_flow`. Its own hook rather than a
+			/// `NodeDataUpdates` field: the gesture moves a wire, which
+			/// the config classifier has no shape for. Absent on a
+			/// read-only view, which hides the gesture instead of
+			/// offering a dead one.
+			onToggleGate?: () => void;
 			executions?: NodeExecution[];
-			executionCount?: number;
 			/// Aggregated IRC logs over every node inside this group:
 			/// one entry per bus any member node touched. Empty `[]`
 			/// when no member node has used a bus.
@@ -72,12 +78,20 @@
 	const inputs = $derived((data.inputs ?? []) as PortDefinition[]);
 	const edgesState = useEdges();
 	// `_should_flow` decides whether the whole container runs, so it docks
-	// as a square in the top-left corner instead of joining the interface
+	// as an arrow in the top-left corner instead of joining the interface
 	// ports. Filled means something answers it: a wire, or a literal
 	// written in the braces.
 	const flowConnected = $derived(
-		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_FLOW_PORT)
+		edgesState.current.some((e) => e.target === id && isGatePort(e.targetHandle ?? ''))
 			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_FLOW_PORT] !== undefined
+			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
+	);
+	/// Which way round this container's gate reads. A container gates
+	/// everything inside it, so the inverted spelling means the whole
+	/// group runs when the thing wired here did not happen.
+	const flowInverted = $derived(
+		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_NOT_FLOW_PORT)
+			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
 	);
 	const outputs = $derived((data.outputs ?? []) as PortDefinition[]);
 	// Simplified view draws a dot only when an edge attaches to it: structure
@@ -125,7 +139,9 @@
 	// the header, ports, and the simplified square; the scoped style block restates
 	// the same hex (see the SYNC note on GROUP_COLOR/LOOP_COLOR in colors.ts).
 	const containerColor = $derived(isLoop ? LOOP_COLOR : GROUP_COLOR);
-	const configCollapsed = $derived((data.config?.configCollapsed as boolean) ?? false);
+	// The config strip starts collapsed; opening it is what the layout
+	// file records (`configOpen`), so a fresh loop shows the thin bar.
+	const configCollapsed = $derived(!((data.config?.configOpen as boolean) ?? false));
 
 	/// Field definitions for the loop config strip. over and carry no
 	/// longer live in the strip: their values are derived from the per-port
@@ -139,7 +155,7 @@
 	/// spells out.
 	const portFields: FieldDefinition[] = $derived(
 		Object.keys(portLiterals).map((key) => {
-			if (key === SHOULD_FLOW_PORT) return shouldFlowField('container');
+			if (isGatePort(key)) return gateField(key, 'container');
 			const port = inputs.find((p) => p.name === key);
 			return port
 				? fieldForInput(port)
@@ -174,12 +190,18 @@
 		const nextCollapsed = !configCollapsed;
 		const nextMinH = computeMinHeightFor(inputs.length, outputs.length, nextCollapsed);
 		data.onUpdate({
-			config: { ...data.config, configCollapsed: nextCollapsed, height: nextMinH },
+			config: { ...data.config, configOpen: !nextCollapsed, height: nextMinH },
 			resized: true,
 		});
 	}
 
 	const minExpandedHeight = $derived(computeMinHeight(inputs.length, outputs.length));
+	/// The smallest box this container draws at in the current view. The
+	/// same floor the layout engine sizes to (`expandedContainerMinPx`), set
+	/// inline on the envelope and on the resize handle; a CSS constant here
+	/// could only know one view's floor, and the builder's 250x200 drew a
+	/// simplified loop bigger than the box the engine had left for it.
+	const containerMin = $derived(expandedContainerMinPx(!!data.simplified));
 
 	/// The rendered strip's actual height, measured off the DOM: the
 	/// strip grows with its field list (one row per written port
@@ -397,20 +419,25 @@
 		// drawn inside the body would overlap the strip. `collapsed` is the
 		// config-strip state to compute FOR (may differ from current state
 		// when called from the toggle handler).
-		// Simplified view draws one interface dot per side and no config strip, so
-		// the per-port rows and the strip reserve no space (matching the layout
-		// engine's loopStripPx, which returns 0 when simplified). Counting them
-		// here would floor the box at a height with phantom empty bands.
-		const loopExtras = isLoop && !data.simplified;
-		const visibleInputs = numInputs + (loopExtras ? 1 : 0);
-		const visibleOutputs = numOutputs + (loopExtras ? 1 : 0);
-		const portsBlock = data.simplified ? 0 : Math.max(visibleInputs, visibleOutputs) * 30 + 24;
+		// Simplified view draws one interface dot per side and no config strip:
+		// the floor is the shared one the layout engine sizes to (the padding
+		// around one square), so a box the engine hands out is never pushed
+		// taller here and past its parent's bottom edge.
+		if (data.simplified) return expandedContainerMinPx(true).h;
+		const visibleInputs = numInputs + (isLoop ? 1 : 0);
+		const visibleOutputs = numOutputs + (isLoop ? 1 : 0);
+		const portsBlock = Math.max(visibleInputs, visibleOutputs) * 30 + 24;
 		const headerArea = 44;
-		const bodyMin = 220; // breathing room for at least a couple of child nodes
 		const configArea = hasConfigStrip
 			? (collapsed ? CONFIG_STRIP_BAR_PX : configStripOpenPx(stripFields.length))
 			: 0;
-		return headerArea + configArea + portsBlock + bodyMin;
+		// The chrome only (header, strip, port rows), floored at the
+		// container's own minimum. The layout engine fits the body to the
+		// children; a breathing-room allowance here used to re-grow the
+		// box right after a reflow had fitted it (closing the config strip
+		// left a band of empty space at the bottom until the loop was
+		// collapsed and reopened).
+		return Math.max(expandedContainerMinPx(false).h, headerArea + configArea + portsBlock);
 	}
 
 	function computeMinHeight(numInputs: number, numOutputs: number): number {
@@ -528,14 +555,20 @@
 </script>
 
 {#snippet flowDock(topPx: number)}
-	<FlowDock top={topPx} subject={isLoop ? 'loop' : 'group'} connected={flowConnected} />
+	<FlowDock
+		top={topPx}
+		subject={isLoop ? 'loop' : 'group'}
+		connected={flowConnected}
+		inverted={flowInverted}
+		onToggle={data.onToggleGate}
+	/>
 {/snippet}
 
 {#if isExpanded}
 <!-- ═══════════════ EXPANDED: container envelope ═══════════════ -->
 <NodeResizer
-	minWidth={250}
-	minHeight={Math.max(200, minExpandedHeight)}
+	minWidth={containerMin.w}
+	minHeight={Math.max(containerMin.h, minExpandedHeight)}
 	isVisible={selected && !data.simplified}
 	lineStyle="border-color: hsl(var(--primary)); border-width: 2px;"
 	handleStyle="background-color: hsl(var(--primary)); width: 10px; height: 10px; border-radius: 2px;"
@@ -546,7 +579,8 @@
 	{@render flowDock(14)}
 {/if}
 
-<div class="expanded-container" class:selected class:node-inherited-glow={inherited}>
+<div class="expanded-container" class:selected class:node-inherited-glow={inherited}
+	style="min-width: {containerMin.w}px; min-height: {containerMin.h}px;">
 	<div class="expanded-header">
 		<span class="header-icon">
 			{#if isLoopNodeType(data.nodeType)}
@@ -649,7 +683,7 @@
 					<span class="expanded-port-label">{input.name}</span>
 					{#if !isGhost}
 						<button
-							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 text-xs leading-none"
+							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 text-sm leading-none"
 							onclick={(e) => { e.stopPropagation(); removePort('input', input.name); }}
 							title="Remove port"
 						>×</button>
@@ -760,7 +794,7 @@
 			<div class="expanded-port-block expanded-port-block-right group" oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}>
 				<div class="expanded-port-label-row expanded-port-label-row-right">
 					<button
-						class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 text-xs leading-none"
+						class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 text-sm leading-none"
 						onclick={(e) => { e.stopPropagation(); removePort('output', output.name); }}
 						title="Remove port"
 					>×</button>
@@ -932,7 +966,10 @@
 		{/if}
 
 		<!-- Ports Section -->
-		<div class="mt-2 flex justify-between text-[10px] text-zinc-500 w-full">
+		<!-- Two half-width columns with a gap between them: a long port name
+		     truncates inside its half instead of running into the other
+		     side's names. -->
+		<div class="mt-2 flex justify-between gap-2 text-[10px] text-zinc-500 w-full">
 			<!-- Input Ports -->
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each inputs as input}
@@ -955,7 +992,7 @@
 						<span class="truncate" title={input.name}>{input.name}</span>
 						{#if !isGhost}
 							<button
-								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 ml-auto text-xs leading-none"
+								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 								onclick={(e) => { e.stopPropagation(); removePort('input', input.name); }}
 								title="Remove port"
 							>×</button>
@@ -985,8 +1022,12 @@
 				{/if}
 			</div>
 
-			<!-- Output Ports -->
-			<div class="space-y-1 text-right min-w-0 flex-1">
+			<!-- Output Ports. A flex column aligned to its end, like the
+			     node's: a button shrink-wraps its content whatever
+			     `display` it has, so in a plain block column the
+			     "output +" adder sat at the column's left edge, in the
+			     middle of the card. -->
+			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each outputs as output}
 					{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(output.portType), 'output')}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1000,7 +1041,7 @@
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}
 						/>
 						<button
-							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 mr-auto text-xs leading-none"
+							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 							onclick={(e) => { e.stopPropagation(); removePort('output', output.name); }}
 							title="Remove port"
 						>×</button>
@@ -1023,8 +1064,8 @@
 						/>
 					</div>
 				{:else}
-					<button 
-						class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors justify-end"
+					<button
+						class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors"
 						onclick={(e) => { e.stopPropagation(); addingOutputPort = true; }}
 					>
 						<span>output</span>
@@ -1058,8 +1099,8 @@
 		background: rgba(148, 163, 184, 0.06);
 		border: 2px dashed rgba(148, 163, 184, 0.4);
 		border-radius: 12px;
-		min-width: 250px;
-		min-height: 200px;
+		/* The floor (min-width / min-height) is inline: it differs per
+		   view and is the layout engine's own, see `containerMin`. */
 		position: relative;
 		pointer-events: none;
 	}
@@ -1146,6 +1187,10 @@
 
 	.expanded-side-right {
 		right: 6px;
+		/* Every block hugs the right edge on its own, the "output +"
+		   button included: a button never stretches like a div, so it
+		   is placed by the rail, never by its own justify-content. */
+		align-items: flex-end;
 	}
 
 	.expanded-port-block {
@@ -1269,6 +1314,11 @@
 
 	:global(.node-running) .collapsed-node {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(245, 158, 11, 0.4);
+	}
+	/* Holding: a member inside is parked on a human. The same cyan the
+	   parked node itself wears (`.node-waiting-glow` in app.css). */
+	:global(.node-waiting) .collapsed-node {
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(6, 182, 212, 0.45);
 	}
 	:global(.node-completed) .collapsed-node {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(16, 185, 129, 0.3);

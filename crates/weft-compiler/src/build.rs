@@ -1,13 +1,13 @@
 //! Compile pipeline orchestration.
 //!
-//! Given a project root (containing `weft.toml` + `main.weft`),
+//! Given a project root (containing `weft.toml` + `src/main.weft`),
 //! parse + enrich + validate + codegen the generated cargo crate
 //! to `.weft/target/build/`, then emit the multi-stage
 //! Dockerfile + stage the docker build context. The actual
 //! `cargo build` runs INSIDE that docker build, not on the host.
 //! The host only needs docker.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -81,7 +81,11 @@ impl StockProject {
     pub fn materialize() -> CompileResult<Self> {
         let dir = tempfile::tempdir().map_err(CompileError::Io)?;
         for (rel, bytes) in crate::project::scaffold_files("standard-worker", uuid::Uuid::nil())? {
-            std::fs::write(dir.path().join(rel), bytes).map_err(CompileError::Io)?;
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+            }
+            std::fs::write(path, bytes).map_err(CompileError::Io)?;
         }
         std::fs::create_dir_all(dir.path().join("nodes")).map_err(CompileError::Io)?;
         let stdlib = weft_catalog::stdlib_root().map_err(CompileError::Build)?;
@@ -246,25 +250,24 @@ fn stage_build_context(
 }
 
 /// `project-nodes/` = each referenced package root, placed under `dest`
-/// at its path relative to the project's `nodes/`, so the emitted
-/// `#[path]` includes resolve once the directory is COPYed to
-/// [`worker_image::NODES_MOUNT`]. The worker build context and the
-/// builder base (which precompiles the stock project's worker) stage
-/// the same way, so a package crate the base compiled is the same unit
-/// a project's build asks for.
+/// at its path relative to the project root (`nodes/...` or, for a node
+/// beside the code, `src/...`), so the emitted `#[path]` includes
+/// resolve once the directory is COPYed to [`worker_image::NODES_MOUNT`].
+/// The worker build context and the builder base (which precompiles the
+/// stock project's worker) stage the same way, so a package crate the
+/// base compiled is the same unit a project's build asks for.
 fn stage_project_nodes(
     project_root: &Path,
     catalog: &FsCatalog,
     referenced_nodes: &BTreeSet<String>,
     dest: &Path,
 ) -> CompileResult<()> {
-    let nodes_root = project_root.join("nodes");
     for root in catalog.package_roots_for(referenced_nodes) {
-        let rel = root.strip_prefix(&nodes_root).map_err(|_| {
+        let rel = root.strip_prefix(project_root).map_err(|_| {
             CompileError::Build(format!(
-                "package root {} is not under project nodes root {}",
+                "package root {} is not under the project root {}",
                 root.display(),
-                nodes_root.display()
+                project_root.display()
             ))
         })?;
         // The shared node-tree exclude (same set the source hash walks
@@ -316,7 +319,7 @@ pub fn build_test_artifact(
         &crate_root,
         catalog,
         package_name,
-        &codegen::EmitPaths::Container { nodes_root: project_root.join("nodes") },
+        &codegen::EmitPaths::Container { project_root: project_root.to_path_buf() },
     )?;
 
     let referenced: BTreeSet<String> = test_crate.node_types.iter().cloned().collect();
@@ -573,6 +576,10 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// <ctx>/
 ///   Dockerfile           (worker-builder-base.Dockerfile with its tokens
 ///                         substituted; build with -f THIS file)
+///   worker-builder-base-split.sh
+///                        (copied verbatim; the Dockerfile runs it to
+///                         split the compiled artifacts into its two
+///                         image layers)
 ///   rust-toolchain.toml
 ///   Cargo.toml           (workspace manifest scoped to the worker closure)
 ///   Cargo.lock
@@ -655,6 +662,18 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
         rendered = rendered.replace(token, &value);
     }
     std::fs::write(ctx.join("Dockerfile"), rendered).map_err(CompileError::Io)?;
+
+    // The artifact split the Dockerfile runs. Copied rather than
+    // rendered (it takes its paths as arguments), and covered by the
+    // base hash next to the Dockerfile, so editing it mints a new tag.
+    let split_name = std::path::Path::new(crate::hash::BUILDER_BASE_SPLIT_SCRIPT)
+        .file_name()
+        .expect("the split script constant names a file");
+    std::fs::copy(
+        weft_root.join(crate::hash::BUILDER_BASE_SPLIT_SCRIPT),
+        ctx.join(split_name),
+    )
+    .map_err(CompileError::Io)?;
     Ok(ctx.to_path_buf())
 }
 
@@ -692,7 +711,7 @@ fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
 /// host mtime keeps unchanged sources looking unchanged inside the
 /// container, so cargo only rebuilds the package whose node source
 /// genuinely changed (plus the worker relink).
-pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
+pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
     copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
 }
 
@@ -802,39 +821,147 @@ pub fn sanitize_crate_name(raw: &str) -> String {
     out
 }
 
-/// Emit + cargo-build one package's node-test binary on the host and
-/// return the built artifact's path. `build_root` is the caller's
-/// dedicated test-build directory (`.weft/target/test/` for a
-/// project): the emitted crates live under `crates/` and the shared
-/// cargo cache under a SIBLING `target/`, so no package name (not
-/// even "target") can ever land on top of the cache, and every
-/// package built under one `build_root` reuses it (the engine
-/// compiles once and stays cached across packages and runs). The
-/// artifact path is read from cargo's
-/// `--message-format=json-render-diagnostics` output, never guessed
-/// (a configured default target triple or profile would move it);
-/// the rendered diagnostics still stream to the terminal via stderr.
-pub fn build_node_test_binary(
-    catalog: &FsCatalog,
-    package: &str,
-    build_root: &Path,
-) -> CompileResult<PathBuf> {
-    let weft_root = resolve_weft_root()?;
-    let crate_root = build_root.join("crates").join(sanitize_crate_name(package));
-    let test_crate = codegen::emit_test_crate(
-        &crate_root,
-        catalog,
-        package,
-        &codegen::EmitPaths::Local { weft_root },
-    )
-    .map_err(|e| CompileError::Build(format!("emit test crate for '{package}': {e}")))?;
+/// Where a host node-test build puts its emitted crates and its cargo
+/// cache. The two are separate directories on purpose: the emitted
+/// crates belong to ONE project, while the cargo cache is the same
+/// compiled engine for every project on the machine and is shared
+/// between them (see [`TestBuildDirs::shared`]).
+pub struct TestBuildDirs {
+    /// This project's emitted test crates, one subdirectory per
+    /// package. Regenerated from scratch on every build.
+    pub crates_root: PathBuf,
+    /// Cargo's target dir. Machine-wide, so the engine and every
+    /// third-party dependency compiles once per machine rather than
+    /// once per project.
+    pub target_dir: PathBuf,
+}
 
-    let target_dir = build_root.join("target");
-    eprintln!("building tests for package '{package}'...");
+impl TestBuildDirs {
+    /// The layout under one root: `crates/` beside a SIBLING `target/`,
+    /// so no package name (not even "target") can land on top of the
+    /// cache. Used by callers that deliberately want a self-contained
+    /// tree, such as the workspace's own node-test sweep.
+    pub fn under(root: &Path) -> Self {
+        Self { crates_root: root.join("crates"), target_dir: root.join("target") }
+    }
+
+    /// The layout a project's `weft test-node` uses: this project's own
+    /// emitted crates, and the cargo cache SHARED by every project on
+    /// the machine.
+    ///
+    /// Nothing lands in the user's project directory. A per-project
+    /// cargo cache meant every project that ran node tests paid the
+    /// full compile of the engine and every third-party dependency
+    /// again, in its own folder, so a machine with six projects held
+    /// six copies of the same artifacts. Shared, that cost is paid
+    /// once. Cargo keeps each package's artifacts apart inside one
+    /// target dir by construction, so projects cannot corrupt each
+    /// other's builds.
+    pub fn shared(project_root: &Path, cache_root: &Path) -> Self {
+        Self {
+            crates_root: cache_root.join("projects").join(project_slug(project_root)),
+            target_dir: cache_root.join("target"),
+        }
+    }
+}
+
+/// A filesystem-safe, collision-resistant name for one project's slice
+/// of the shared cache: the directory name plus a hash of the full
+/// path, so two projects called `bot` in different folders never share
+/// a slice and the directory is still readable by a human.
+fn project_slug(project_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let name = project_root
+        .file_name()
+        .map(|n| sanitize_crate_name(&n.to_string_lossy()))
+        .unwrap_or_else(|| "project".to_string());
+    let digest = Sha256::digest(project_root.to_string_lossy().as_bytes());
+    let mut slug = name;
+    slug.push('-');
+    for b in digest.iter().take(6) {
+        slug.push_str(&format!("{b:02x}"));
+    }
+    slug
+}
+
+/// Every package a run will test, emitted as members of one cargo
+/// workspace, ready to build.
+///
+/// Emitting them ALL before building ANY is what makes the shared
+/// workspace pay off: cargo unifies features across a workspace's
+/// members, so a dependency two packages share is compiled once. Grown
+/// one member at a time instead, each addition widens the feature
+/// union and rebuilds what the previous member already built.
+pub struct TestWorkspace {
+    crates: BTreeMap<String, codegen::TestCrate>,
+    /// The workspace root cargo is invoked from.
+    root: PathBuf,
+    target_dir: PathBuf,
+}
+
+/// Emit every package's node-test crate into `dirs` as members of one
+/// workspace. `packages` is exactly what this run will test, so a
+/// package nobody targeted never joins the resolve and a broken
+/// sibling stays harmless.
+pub fn prepare_test_workspace(
+    catalog: &FsCatalog,
+    packages: &[String],
+    dirs: &TestBuildDirs,
+) -> CompileResult<TestWorkspace> {
+    let weft_root = resolve_weft_root()?;
+    let mut crates = BTreeMap::new();
+    let mut members = Vec::new();
+    for package in packages {
+        let member = sanitize_crate_name(package);
+        let crate_root = dirs.crates_root.join(&member);
+        let test_crate = codegen::emit_test_crate(
+            &crate_root,
+            catalog,
+            package,
+            &codegen::EmitPaths::Local { weft_root: weft_root.clone() },
+        )
+        .map_err(|e| CompileError::Build(format!("emit test crate for '{package}': {e}")))?;
+        crates.insert(package.clone(), test_crate);
+        members.push(member);
+    }
+    codegen::emit_test_workspace(&dirs.crates_root, &members)?;
+    Ok(TestWorkspace {
+        crates,
+        root: dirs.crates_root.clone(),
+        target_dir: dirs.target_dir.clone(),
+    })
+}
+
+/// Build EVERY prepared package in one cargo invocation and return
+/// each package's built binary.
+///
+/// One invocation, not one per package, because cargo's v2 resolver
+/// resolves features per invocation: built one at a time, two packages
+/// that share a dependency with different features each get their own
+/// copy of it (that is where ten copies of `sqlx-postgres` came from,
+/// and merging the crates into one workspace did not change it on its
+/// own). Built together, the resolver unifies them and compiles each
+/// dependency once.
+///
+/// The trade is that a package that fails to COMPILE fails the whole
+/// build rather than letting earlier packages report first. Cargo's
+/// diagnostics name the offending crate on stderr as they stream, so
+/// what broke is still on screen; nothing runs until the code compiles.
+///
+/// Artifact paths are read from cargo's
+/// `--message-format=json-render-diagnostics` output, never guessed (a
+/// configured default target triple or profile would move them).
+pub fn build_node_test_binaries(
+    workspace: &TestWorkspace,
+) -> CompileResult<BTreeMap<String, PathBuf>> {
+    if workspace.crates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    eprintln!("building tests for {} package(s)...", workspace.crates.len());
     let out = std::process::Command::new("cargo")
-        .args(["build", "--message-format=json-render-diagnostics"])
-        .current_dir(&test_crate.crate_root)
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .args(["build", "--workspace", "--message-format=json-render-diagnostics"])
+        .current_dir(&workspace.root)
+        .env("CARGO_TARGET_DIR", &workspace.target_dir)
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|e| {
@@ -844,9 +971,11 @@ pub fn build_node_test_binary(
             ))
         })?;
     if !out.status.success() {
-        return Err(CompileError::Build(format!(
-            "test build for package '{package}' failed (see cargo's output above)"
-        )));
+        return Err(CompileError::Build(
+            "the node-test build failed (see cargo's output above for which package \
+             and why)"
+                .to_string(),
+        ));
     }
     #[derive(Deserialize)]
     struct CargoMessage {
@@ -861,23 +990,72 @@ pub fn build_node_test_binary(
         name: String,
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Cargo names targets with `-`; the crate name uses `_`.
-    let want = test_crate.binary_name.replace('_', "-");
-    let executable = stdout
+    let artifacts: Vec<(String, PathBuf)> = stdout
         .lines()
         .filter_map(|l| serde_json::from_str::<CargoMessage>(l).ok())
         .filter(|m| m.reason == "compiler-artifact")
-        .find_map(|m| {
-            let name = m.target.as_ref()?.name.clone();
-            (name == test_crate.binary_name || name == want).then_some(m.executable)?
-        });
-    executable.ok_or_else(|| {
-        CompileError::Build(format!(
-            "cargo built package '{package}' but reported no executable named \
-             '{}'; the emitted test crate's binary target is missing",
-            test_crate.binary_name
-        ))
-    })
+        .filter_map(|m| Some((m.target?.name, m.executable?)))
+        .collect();
+    let mut built = BTreeMap::new();
+    for (package, test_crate) in &workspace.crates {
+        // Cargo names targets with `-`; the crate name uses `_`.
+        let want = test_crate.binary_name.replace('_', "-");
+        let found = artifacts
+            .iter()
+            .find(|(name, _)| *name == test_crate.binary_name || *name == want)
+            .map(|(_, path)| path.clone());
+        let Some(path) = found else {
+            return Err(CompileError::Build(format!(
+                "cargo built package '{package}' but reported no executable named \
+                 '{}'; the emitted test crate's binary target is missing",
+                test_crate.binary_name
+            )));
+        };
+        built.insert(package.clone(), path);
+    }
+    Ok(built)
+}
+
+/// Remove a test binary once its tests have run.
+///
+/// A test binary is an OUTPUT, not a cache: it is ~110MB, and keeping
+/// one per package held 3.2GB of the shared cache between runs for
+/// nothing. What makes the next run fast is the dependency cache
+/// beside it, which stays, so rebuilding this is a link step.
+///
+/// BOTH names have to go. Cargo writes the artifact into `deps/` as
+/// `<name>-<hash>` and hardlinks `<name>` beside it, so removing only
+/// the one cargo reported frees no space at all: the bytes are still
+/// there under the other name.
+///
+/// A failure to remove is not worth failing a green test run over, so
+/// it says so and carries on; the size cap is the backstop.
+pub fn drop_built_binary(binary: &Path) {
+    let mut paths = vec![binary.to_path_buf()];
+    // `deps/<stem>-<16 hex>`, matched exactly so a package whose name
+    // merely starts with another's cannot take its neighbour's
+    // artifact with it.
+    if let (Some(stem), Some(deps)) =
+        (binary.file_stem().and_then(|s| s.to_str()), binary.parent().map(|p| p.join("deps")))
+    {
+        if let Ok(entries) = std::fs::read_dir(&deps) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(hash) = name.strip_prefix(&format!("{stem}-")) else { continue };
+                if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    paths.push(entry.path());
+                }
+            }
+        }
+    }
+    for path in paths {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("note: could not remove {} ({e})", path.display());
+            }
+        }
+    }
 }
 
 /// Build the catalog for a project: discover every node under its
@@ -885,8 +1063,12 @@ pub fn build_node_test_binary(
 /// is cloned in at `weft new`), so the project is self-contained and
 /// nothing reaches into the weft installation at build time.
 pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
-    FsCatalog::discover(&project_root.join("nodes"))
-        .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
+    let roots = crate::project::node_roots(project_root);
+    FsCatalog::discover_roots_with_policy(
+        &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
+        weft_catalog::DiscoverPolicy::Strict,
+    )
+    .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
 }
 
 #[cfg(test)]
@@ -909,7 +1091,9 @@ mod tests {
         let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
         assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");
         assert!(crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME).is_file());
-        assert!(ctx.join("project-nodes/base_catalog/basic/format/mod.rs").is_file());
+        // Staged at its project-relative path: a node under `nodes/` and
+        // one beside the code under `src/` land side by side under the mount.
+        assert!(ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs").is_file());
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
         assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::LoopFrames;
+use weft_core::frames::{Located, LoopFrames};
 use weft_core::primitive::{LoopTerminationReason, SignalSpec};
 use weft_core::Color;
 
@@ -39,7 +39,9 @@ use weft_core::Color;
 #[serde(deny_unknown_fields)]
 pub struct Seed {
     pub parent: Color,
-    pub origins: BTreeMap<String, Color>,
+    /// Per place (a node under the calls that reach it): the run whose
+    /// result it keeps.
+    pub origins: BTreeMap<Located, Color>,
 }
 
 /// One event in the execution log. Append-only; events are never
@@ -102,6 +104,11 @@ pub enum ExecEvent {
     NodeKicked {
         color: Color,
         node_id: String,
+        /// The frames the kick fires under: empty for a root at the top;
+        /// the call frames of the site chain for a root inside an
+        /// included file that a cut named through its site.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: LoopFrames,
         /// This kick is the FIRING trigger of the execution. Explicit,
         /// never inferred from `payload` presence: a fire with an empty
         /// body journals `"payload": null`, indistinguishable from an
@@ -247,23 +254,6 @@ pub enum ExecEvent {
         port: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         provided: bool,
-        at_unix: u64,
-    },
-
-    /// A node tried to emit a value on `port` whose inferred type is not
-    /// compatible with the port's declared type. The engine refused the
-    /// value and closed the port instead (downstream sees null); this
-    /// row IS that closure. NON-terminal: the node keeps running and its
-    /// other ports emit normally. Folds into the matching
-    /// `NodeExecution.port_warnings`.
-    PortTypeMismatch {
-        color: Color,
-        emission_id: uuid::Uuid,
-        node_id: String,
-        frames: LoopFrames,
-        port: String,
-        expected: String,
-        actual: String,
         at_unix: u64,
     },
 
@@ -512,6 +502,7 @@ pub enum ExecEvent {
     /// `messages` are empty and the `totals` rollup is the whole
     /// journaled story. A quiet bus degenerates to one message per
     /// window, so slow traffic reads exactly as before.
+    // SYNC: BusWindow <-> crates/weft-dispatcher/src/events.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
     BusWindow {
         color: Color,
         bus_id: String,
@@ -549,26 +540,29 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
-    /// A message arrived FROM the caller (HTTP request body, WS inbound).
-    // SYNC: CallerInbound <-> crates/weft-dispatcher/src/events.rs CallerInbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'
-    CallerInbound {
+    /// What the conversation said during one window, in both
+    /// directions: the caller's messages (an HTTP request body, a
+    /// WebSocket frame) and the program's (an HTTP write or respond
+    /// chunk, a WebSocket send), each carrying which way it went.
+    ///
+    /// One row per window rather than one per message, the same shape
+    /// and the same clock as [`Self::BusWindow`], because a chatty
+    /// socket at fifty messages a second is fifty journal writes
+    /// otherwise. A quiet conversation degenerates to one message per
+    /// window, so a request and its answer read exactly as they did.
+    ///
+    /// A message whose content was not kept still appears in `messages`
+    /// carrying its size, so the row always says a message happened
+    /// even when it does not say what it was. What decides that lives
+    /// in one place for every channel in the language
+    /// ([`weft_core::stream_journal`]).
+    // SYNC: CallerWindow <-> crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+    CallerWindow {
         color: Color,
-        offset: u64,
-        payload: weft_core::bus::WirePayload,
-        payload_byte_size: u64,
-        at_unix: u64,
-    },
-
-    /// A message went TO the caller (HTTP write/respond chunk, WS send).
-    /// `terminal` marks the final outbound (HTTP respond/close, WS close)
-    /// so the inspector renders "* the response completed here".
-    // SYNC: CallerOutbound <-> crates/weft-dispatcher/src/events.rs CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'outbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_outbound'
-    CallerOutbound {
-        color: Color,
-        offset: u64,
-        payload: weft_core::bus::WirePayload,
-        payload_byte_size: u64,
-        terminal: bool,
+        first_offset: u64,
+        last_offset: u64,
+        messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
+        totals: Vec<weft_core::stream_journal::CallerWindowTotal>,
         at_unix: u64,
     },
 
@@ -632,7 +626,6 @@ impl ExecEvent {
             | Self::NodeCancelled { color, .. }
             | Self::PortEmitted { color, .. }
             | Self::PortClosed { color, .. }
-            | Self::PortTypeMismatch { color, .. }
             | Self::PulsesConsumed { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
@@ -654,8 +647,7 @@ impl ExecEvent {
             | Self::BusWindow { color, .. }
             | Self::BusClosed { color, .. }
             | Self::CallerConnected { color, .. }
-            | Self::CallerInbound { color, .. }
-            | Self::CallerOutbound { color, .. }
+            | Self::CallerWindow { color, .. }
             | Self::CallerErrored { color, .. }
             | Self::CallerDisconnected { color, .. } => *color,
         }
@@ -675,7 +667,6 @@ impl ExecEvent {
             | Self::NodeCancelled { at_unix, .. }
             | Self::PortEmitted { at_unix, .. }
             | Self::PortClosed { at_unix, .. }
-            | Self::PortTypeMismatch { at_unix, .. }
             | Self::PulsesConsumed { at_unix, .. }
             | Self::LoopInstantiated { at_unix, .. }
             | Self::LoopIterationLaunched { at_unix, .. }
@@ -697,8 +688,7 @@ impl ExecEvent {
             | Self::BusWindow { at_unix, .. }
             | Self::BusClosed { at_unix, .. }
             | Self::CallerConnected { at_unix, .. }
-            | Self::CallerInbound { at_unix, .. }
-            | Self::CallerOutbound { at_unix, .. }
+            | Self::CallerWindow { at_unix, .. }
             | Self::CallerErrored { at_unix, .. }
             | Self::CallerDisconnected { at_unix, .. } => *at_unix,
         }
@@ -717,7 +707,6 @@ impl ExecEvent {
             Self::NodeCancelled { .. } => "node_cancelled",
             Self::PortEmitted { .. } => "port_emitted",
             Self::PortClosed { .. } => "port_closed",
-            Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::PulsesConsumed { .. } => "pulses_consumed",
             Self::LoopInstantiated { .. } => "loop_instantiated",
             Self::LoopIterationLaunched { .. } => "loop_iteration_launched",
@@ -739,8 +728,7 @@ impl ExecEvent {
             Self::BusWindow { .. } => "bus_window",
             Self::BusClosed { .. } => "bus_closed",
             Self::CallerConnected { .. } => "caller_connected",
-            Self::CallerInbound { .. } => "caller_inbound",
-            Self::CallerOutbound { .. } => "caller_outbound",
+            Self::CallerWindow { .. } => "caller_window",
             Self::CallerErrored { .. } => "caller_errored",
             Self::CallerDisconnected { .. } => "caller_disconnected",
         }
@@ -770,7 +758,7 @@ mod wire_tests {
     /// SQL readers filter on.
     #[test]
     fn reshaped_rows_round_trip() {
-        let frames = vec![weft_core::frames::LoopIteration { index: 2 }];
+        let frames = vec![weft_core::frames::Frame::Loop { index: 2 }];
         let emission = Uuid::new_v4();
         let rows = vec![
             ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
@@ -796,16 +784,6 @@ mod wire_tests {
                 at_unix: 1,
             },
             ExecEvent::PortClosed { color: color(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), provided: false, at_unix: 1 },
-            ExecEvent::PortTypeMismatch {
-                color: color(),
-                emission_id: emission,
-                node_id: "n".into(),
-                frames: frames.clone(),
-                port: "out".into(),
-                expected: "String".into(),
-                actual: "Number".into(),
-                at_unix: 1,
-            },
             ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), at_unix: 1 },
             ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
             ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, at_unix: 1 },
@@ -895,10 +873,10 @@ mod wire_tests {
                 definition_hash: Some("h".into()),
                 program: None, source_version: Some("version".into()), node_test: false,
                 subgraph: Some(weft_core::project::selection::RunSelection {
-                    nodes: ["out".into(), "src".into()].into_iter().collect(),
+                    nodes: [Located::top("out"), Located::top("src")].into_iter().collect(),
                     ..Default::default()
                 }),
-                seed: Some(Seed { parent: color(), origins: BTreeMap::from([("source".into(), color())]) }),
+                seed: Some(Seed { parent: color(), origins: BTreeMap::from([(Located::top("source"), color())]) }),
                 at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
@@ -912,8 +890,8 @@ mod wire_tests {
                 seed: None,
                 at_unix: 7,
             },
-            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
-            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::LoopIteration { index: 2 }], at_unix: 1 },
+            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
+            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
             ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: vec![], at_unix: 1 },
             ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
             ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into() }, at_unix: 1 },
@@ -923,12 +901,11 @@ mod wire_tests {
             ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
             ExecEvent::PortEmitted { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), provided: true, at_unix: 1 },
             ExecEvent::PortClosed { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), provided: false, at_unix: 1 },
-            ExecEvent::PortTypeMismatch { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), expected: "String".into(), actual: "Number".into(), at_unix: 1 },
             ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
             ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
             ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
             ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: None, at_unix: 1 },
-            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::LoopIteration { index: 0 }], index: 3, at_unix: 1 },
+            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::Frame::Loop { index: 0 }], index: 3, at_unix: 1 },
             ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
             ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
             ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },
@@ -966,16 +943,72 @@ mod wire_tests {
             },
             ExecEvent::BusClosed { color: color(), bus_id: "b".into(), offset: 2, at_unix: 1 },
             ExecEvent::CallerConnected { color: color(), offset: 0, protocol: "websocket".into(), at_unix: 7 },
-            ExecEvent::CallerInbound { color: color(), offset: 1, payload: WirePayload::Json(json!({"q": "hi"})), payload_byte_size: 10, at_unix: 8 },
-            ExecEvent::CallerInbound { color: color(), offset: 2, payload: WirePayload::Json(Value::Null), payload_byte_size: 4, at_unix: 9 },
-            ExecEvent::CallerOutbound { color: color(), offset: 3, payload: WirePayload::Json(json!("chunk")), payload_byte_size: 5, terminal: true, at_unix: 10 },
+            ExecEvent::CallerWindow {
+                color: color(),
+                first_offset: 1,
+                last_offset: 4,
+                messages: vec![
+                    // Content kept, content dropped (ephemeral or raw
+                    // bytes), content cut short, and the program's
+                    // terminal answer: every shape one row carries.
+                    weft_core::stream_journal::WindowedCallerMessage {
+                        offset: 1,
+                        direction: weft_core::stream_journal::CallerDirection::Inbound,
+                        payload: Some(WirePayload::Json(json!({"q": "hi"}))),
+                        payload_byte_size: 10,
+                        trimmed: false,
+                        terminal: false,
+                        at_unix: 8,
+                    },
+                    weft_core::stream_journal::WindowedCallerMessage {
+                        offset: 2,
+                        direction: weft_core::stream_journal::CallerDirection::Inbound,
+                        payload: None,
+                        payload_byte_size: 4,
+                        trimmed: false,
+                        terminal: false,
+                        at_unix: 9,
+                    },
+                    weft_core::stream_journal::WindowedCallerMessage {
+                        offset: 3,
+                        direction: weft_core::stream_journal::CallerDirection::Inbound,
+                        payload: Some(WirePayload::Json(json!("the first hundred k of it"))),
+                        payload_byte_size: 400_000,
+                        trimmed: true,
+                        terminal: false,
+                        at_unix: 9,
+                    },
+                    weft_core::stream_journal::WindowedCallerMessage {
+                        offset: 4,
+                        direction: weft_core::stream_journal::CallerDirection::Outbound,
+                        payload: Some(WirePayload::Json(json!("chunk"))),
+                        payload_byte_size: 5,
+                        trimmed: false,
+                        terminal: true,
+                        at_unix: 10,
+                    },
+                ],
+                totals: vec![
+                    weft_core::stream_journal::CallerWindowTotal {
+                        direction: weft_core::stream_journal::CallerDirection::Inbound,
+                        count: 3,
+                        bytes: 400_014,
+                    },
+                    weft_core::stream_journal::CallerWindowTotal {
+                        direction: weft_core::stream_journal::CallerDirection::Outbound,
+                        count: 1,
+                        bytes: 5,
+                    },
+                ],
+                at_unix: 10,
+            },
             ExecEvent::CallerErrored { color: color(), offset: 4, message: "node blew up".into(), at_unix: 11 },
             ExecEvent::CallerDisconnected { color: color(), offset: 5, reason: "response complete".into(), at_unix: 12 },
         ];
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 36, "a variant has no row above: {kinds:?}");
+        assert_eq!(kinds.len(), 34, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
             let json = round_trip(row);

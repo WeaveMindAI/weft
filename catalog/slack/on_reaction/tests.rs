@@ -34,7 +34,9 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn fire_fans(rig: FakeRig) -> WeftResult<()> {
-    rig.wake(json!({ "channel": "C1", "ts": "1.2", "emoji": "eyes", "user": "U1" }));
+    rig.wake(json!({
+        "type": "reaction_added", "channel": "C1", "ts": "1.2", "emoji": "eyes", "user": "U1"
+    }));
     let outcome = rig
         .run(&SlackOnReactionNode, json!({ "account": rig.access("slack"), "direction": "added" }))
         .await

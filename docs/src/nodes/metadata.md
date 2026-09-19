@@ -29,6 +29,7 @@ setting that silently does nothing.
 | `service` | the whole [service recipe](../connections/writing-a-service.md), for access nodes |
 | `accessApps` | a public, secretless OAuth app this project ships |
 | `portsFromConfig` | where a node's ports come from, when they come from its own config |
+| `firesWith` | for a trigger, what a firing has to carry to start one |
 | `features` | boolean-ish flags |
 | `display` | what the editor renders inline on the node body |
 | `validate` | declarative validation rules |
@@ -133,6 +134,13 @@ per file.
 `remote_select` gets its own treatment in
 [Using a connection](../connections/using-a-connection.md#picking-a-resource).
 
+### `required`
+
+Write `"required": true` on an input the node cannot run without. Leave the
+key off everywhere else: absent already means optional, so `"required": false`
+says nothing and reads as though somebody meant something by it. Outputs never
+carry it at all (metadata load refuses one that does).
+
 ### `default`
 
 The value the runtime supplies when nothing else drives the input. Consulted
@@ -158,6 +166,79 @@ pulse, which closes it and skips what is downstream, whatever the metadata
 could have said. That is [the closure
 rule](../language/mental-model.md#the-closed-pulse). A `required` key on an
 output is refused at load, naming the removal.
+
+## `firesWith`
+
+A trigger starts an execution from outside: a listener wakes it, or somebody
+types `weft run --fire`. Whatever they hand it is the fire payload, and it is
+neither the node's inputs nor its outputs: it is the one thing that has to
+exist before the node's own logic can even begin.
+
+`firesWith` writes down the shape of that payload, as a flat object from field
+name to a weft type. It goes right before `features`.
+
+```json
+"firesWith": {
+  "scheduledTime": "String",
+  "actualTime": "String"
+},
+```
+
+A `?` on the end of a field NAME, not the type, marks it optional:
+
+```json
+"firesWith": {
+  "method": "String",
+  "caller?": "JsonDict"
+},
+```
+
+Only a node with `features.isTrigger` may declare it, and every trigger
+should. The engine checks a real firing against this shape before the node's
+body runs, and `weft run --fire` checks a hand-typed payload against it before
+building or starting anything. Either way, a listener whose fields moved, or a
+typo in a payload you typed yourself, is refused by naming the exact field
+that is wrong or missing, instead of failing somewhere inside the node.
+
+### It is the complete list, not a highlight of the useful bits
+
+A payload carrying a field you did not name is refused, exactly like one
+missing a field you did. So name every field that can arrive, not only the
+ones you put on ports, and put a `?` on the ones that only sometimes come.
+
+This is strict on purpose. A trigger's payload is the one value a node did not
+compute and cannot check for itself, and this is where it gets checked, once,
+before anything runs. Let an unnamed field through and what the node actually
+receives quietly stops being what the node says it receives, and the day that
+matters is the day some code reads a field nobody wrote down.
+
+The cost is that a provider adding a field stops that trigger until somebody
+adds the field here. That is one line in a JSON file, and the refusal names
+the field, so the fix is obvious and takes a minute. The alternative is a node
+whose declared shape and real shape drift apart silently, which is not one
+line and not a minute.
+
+If your trigger is fed by a connection's events, you do not have to guess the
+list: the service's recipe declares it, per topic, under
+`events.<topic>.fields` ([writing a
+service](../connections/writing-a-service.md)). A firing carries those names
+and no others, minus any the provider's event did not have, so that map is
+exactly what belongs here. `weft-compiler/tests/fires_with.rs` holds every
+shipped trigger to its topic's list, in both directions, so a field you forget
+fails there rather than in front of somebody's users.
+
+The type strings are ordinary weft types, and a field can be a record nested
+to any depth:
+
+```json
+"item": "List[{ id: String, tags: List[String] }]"
+```
+
+Two triggers in the catalog declare nothing, both for reasons no declaration
+could fix: `ReceiveEmail` opens its own IMAP session and reads the mail
+itself, so there is no payload field to name. `HumanTrigger`'s fields are the
+form fields somebody typed into that instance, which differ per node, so no
+static declaration could name them either.
 
 ## `features`
 

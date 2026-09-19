@@ -41,19 +41,16 @@
     {
       "name": "cc",
       "type": "String",
-      "required": false,
       "label": "Cc"
     },
     {
       "name": "bcc",
       "type": "String",
-      "required": false,
       "label": "Bcc"
     },
     {
       "name": "replyToMessageId",
       "type": "String",
-      "required": false,
       "description": "The Message-ID being answered (from ReceiveEmail's messageId output); sets the reply headers so mail clients thread it."
     }
   ],

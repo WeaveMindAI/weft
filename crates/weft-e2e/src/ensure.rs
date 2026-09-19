@@ -204,7 +204,7 @@ async fn run_setup(root: &Path) -> Result<()> {
 }
 
 /// Poll the dispatcher's `/health` until it answers `ok`. setup.sh already
-/// waits for rollouts, but the port-forward it (re)establishes can take a beat
+/// waits for rollouts, but a freshly rolled dispatcher pod can take a beat
 /// to accept connections, so we confirm reachability before any test proceeds.
 async fn wait_healthy() -> Result<()> {
     let disp = Dispatcher::from_env()?;
@@ -231,7 +231,8 @@ async fn wait_healthy() -> Result<()> {
 
 /// Confirm the `weft` CLI is on PATH and reports a daemon. Optional belt-and-
 /// suspenders a test can call; [`up`] already guarantees readiness via
-/// `/health`. Kept because the CLI's own view ("port-forward up") catches a
+/// `/health`. Kept because the CLI's own view (it reports "running" only
+/// when it reaches the API at the address it is configured with) catches a
 /// class of "API reachable but CLI misconfigured" mismatch the raw health
 /// check cannot.
 pub async fn cli_sees_daemon(root: &Path) -> Result<()> {

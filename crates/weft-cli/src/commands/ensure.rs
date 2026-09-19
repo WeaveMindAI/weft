@@ -285,8 +285,11 @@ pub async fn register_compiled(
     // asset sync publishes referenced files to the project's asset plane and
     // substitutes their stored-file values, so the hashes cover the resolved
     // content (a changed asset re-hashes exactly like a config change).
-    crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition, Some(&manifest), true)
-        .await?;
+    for warning in crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition, Some(&manifest), true)
+        .await?
+    {
+        progress.warn(&warning);
+    }
 
     // Plan the build from the already-compiled definition + catalog (no second
     // compile): the three hashes + the staged worker context + the infra image set,

@@ -89,7 +89,7 @@ The scope decides where the file lives **and how long**. [Storage](storage.md).
 
 ```rust
 ctx.await_signal(Form { .. }).await?     // park this firing; the worker exits
-ctx.register_signal(ApiEndpoint { .. }).await?   // a trigger's registration
+ctx.register_signal(Route { .. }).await?         // a trigger's registration
 ctx.run("name", || async { ... }).await? // run once, replay the result forever
 ```
 
@@ -100,7 +100,9 @@ ctx.run("name", || async { ... }).await? // run once, replay the result forever
 ```rust
 ctx.http_caller().await?      // fails loud if this run has no HTTP caller
 ctx.ws_caller().await?
+ctx.live_caller().await?      // either protocol, connected
 ctx.caller()                  // Option<CallerHandle>, the protocol-typed form
+ctx.caller_request()?         // what the caller sent to open the exchange
 ctx.is_api_call()
 ctx.is_websocket()
 ```

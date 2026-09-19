@@ -1,0 +1,84 @@
+{
+  "type": "PostgresWatchQuery",
+  "label": "Postgres: Watch query",
+  "description": "Keep a query's result live: run it now and again on a cadence, and each time the rows differ from the last time, send them as one message on the `rows` bus. A live counter, list or dashboard pipes that bus into a Stream behind a Route (`format: \"sse\"`) and the browser sees every change. The query's parameters are the node's own input ports, read by name in the SQL like Postgres: Query (`$user_id`). Give `channel` a name and the node also LISTENs on it: a `NOTIFY channel` from a trigger in the database re-runs the query the moment a row changes, instead of at the next tick. One statement only; a script cannot be watched. Declare an output port named after a column (`-> (count: Bus)`) and that column of the first row gets its own bus, so a live counter over `select count(*)` sends `7` instead of `[{\"count\": 7}]` for every consumer to unwrap. A tick whose query answered no rows says nothing on those ports and does not close them, because the next tick may well answer one. The node runs until the run ends (a caller leaving ends a route's run), and the bus closes with it.",
+  "tags": [
+    "postgres",
+    "database",
+    "sql",
+    "live",
+    "watch",
+    "bus"
+  ],
+  "icon": "Database",
+  "color": "#336791",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "required": true,
+      "requiresValues": [
+        "host",
+        "database",
+        "user",
+        "password"
+      ],
+      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "code",
+        "language": "sql"
+      },
+      "label": "SQL",
+      "placeholder": "SELECT id, caption FROM cards ORDER BY created_at DESC LIMIT 50",
+      "description": "The one statement to keep live. Each `$name` reads the input port of that name; declare the ports inline on the node and wire them."
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "default": 5,
+      "label": "Every (seconds)",
+      "description": "How often the query runs again, in seconds (at least 1). With `channel` set this is the backstop; without it, the whole cadence."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "label": "Notify channel",
+      "placeholder": "cards_changed",
+      "description": "A Postgres NOTIFY channel to LISTEN on: every notification re-runs the query at once. Leave empty to poll on the cadence alone. Raise it from the database side, for example `CREATE TRIGGER ... EXECUTE FUNCTION pg_notify('cards_changed', '')`."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "rows",
+      "type": "Bus",
+      "description": "The live result: one `rows` message per change, carrying the whole answered list keyed by column name (the first one right after the node starts). Closes when the run ends."
+    }
+  ],
+  "features": {
+    "canAddOutputPorts": true,
+    "canAddInputPorts": true
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "query",
+        "regex": "(?i)\\bas\\s+\"?rows\"?\\b"
+      },
+      "then": {
+        "message": "'{id}' aliases a column to `rows`, which is this node's own output (the whole result, on a bus). A column of that name has nowhere to go. Alias it to something else in the SQL and declare a port for that name.",
+        "level": "structural",
+        "severity": "error",
+        "field": "query"
+      }
+    }
+  ]
+}

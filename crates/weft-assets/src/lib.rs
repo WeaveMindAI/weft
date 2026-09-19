@@ -275,7 +275,12 @@ pub async fn sync_assets(
     for r in refs {
         match source.open(&r.path).and_then(hash_reader_peeking) {
             Ok((hash, size, head)) => {
-                match weft_core::storage::check_declared_kind(&r.ty, &head, &r.path) {
+                // The check reports only what is wrong with the bytes;
+                // the `@asset(...)` that declared them is this caller's
+                // to name, since this is the one place it is the source.
+                match weft_core::storage::check_declared_kind(&r.ty, &head)
+                    .map_err(|why| format!("@asset({:?}, {}): {why}", r.path, r.ty))
+                {
                     Ok(()) => {
                         let mime = weft_core::storage::sniff_mime(&head)
                             .unwrap_or_else(|| weft_core::storage::mime_from_filename(&r.path));

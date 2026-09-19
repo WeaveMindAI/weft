@@ -61,7 +61,7 @@
         { className: 'meta', begin: '@[A-Za-z_][A-Za-z0-9_]*' },
 
         // The four keys the language reserves.
-        { className: 'keyword', begin: '\\b(_label|_tags|_should_flow)\\b(?=\\s*:)' },
+        { className: 'keyword', begin: '\\b(_label|_tags|_should_flow|_should_not_flow)\\b(?=\\s*:)' },
 
         // A config field key, left of its colon.
         { className: 'attr', begin: '\\b' + IDENT + '\\b(?=\\s*:)' },

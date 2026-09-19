@@ -1,0 +1,38 @@
+# A sequential map loop over a LIST: the source emits [0, 1, 2, 3, 4]
+# as one List value, the loop iterates it (count known up front) and
+# doubles each element; the assembled List[Number | Null] flows to
+# Debug. The stream-driven loop shape has its own gate (stream_rows);
+# this fixture keeps the list-driven path covered end to end.
+#
+# The rig asserts: the loop launched 5 iterations and the final list is
+# [0,2,4,6,8].
+#
+# `factor` sits inside the loop with no wire into it: a node like that
+# starts with each iteration and nowhere else. Before the fix the run's
+# pre-run root list kicked it once more at the loop's own level, where
+# `step` waited for an `n` that never comes, and the run ended stuck
+# after every iteration had finished. The rig asserts `step` and
+# `factor` each fired exactly five times.
+
+src = ExecPython() -> (items: List[Number]) {
+  code: "return {'items': [0, 1, 2, 3, 4]}"
+}
+
+doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
+  parallel: false
+  over: ["values"]
+
+  factor = ExecPython() -> (by: Number) {
+    code: "return {'by': 2}"
+  }
+  step = ExecPython(n: Number, by: Number) -> (out: Number) {
+    code: "return {'out': n * by}"
+  }
+  step.n = self.values
+  step.by = factor.by
+  self.results = step.out
+}
+doubler.values = src.items
+
+out = Debug
+out.data = doubler.results

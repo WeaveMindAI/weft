@@ -481,7 +481,7 @@ async fn presign(
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
     let parsed = wall(&caller, &req.key)?;
-    let url = match public_link_url(&state, store, &parsed, req.ttl_secs).await? {
+    let url = match public_link_url(&state, store, &parsed, req.ttl_secs, weft_core::storage::LinkReach::Internet).await? {
         Some(url) => url,
         None => {
             store
@@ -505,7 +505,7 @@ async fn public_link(
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
     let parsed = wall(&caller, &req.key)?;
-    let url = public_link_url(&state, store, &parsed, req.ttl_secs).await?;
+    let url = public_link_url(&state, store, &parsed, req.ttl_secs, req.reach).await?;
     Ok(Json(weft_core::storage::PublicLinkResponse { url }))
 }
 
@@ -523,8 +523,9 @@ async fn public_link_url(
     store: &RuntimeStore,
     parsed: &key::ParsedKey,
     ttl_secs: Option<u64>,
+    reach: weft_core::storage::LinkReach,
 ) -> Result<Option<String>, ApiError> {
-    Ok(match link_route(state.object_store_public_internet, state.internet_base()) {
+    Ok(match link_route(state.object_store_public_internet, relay_base(state, reach)) {
         LinkRoute::DirectPresign => Some(store.presign(parsed, ttl_secs).await.map_err(map_err)?),
         LinkRoute::Relay(base) => {
             let token = store.mint_public_link(parsed, ttl_secs).await.map_err(map_err)?;
@@ -548,6 +549,18 @@ enum LinkRoute<'a> {
     /// for the cluster's own address, and an outside consumer gets the
     /// bytes inline.
     ClusterOnly,
+}
+
+/// The base a relay link is minted under for `reach`: the internet
+/// address for an internet asker; for a caller of the install, that
+/// address when there is one, else the install's own stable base
+/// (loopback included: a browser that called a local install's route
+/// reached it right there).
+fn relay_base(state: &BrokerState, reach: weft_core::storage::LinkReach) -> Option<&str> {
+    match reach {
+        weft_core::storage::LinkReach::Internet => state.internet_base(),
+        weft_core::storage::LinkReach::Caller => state.internet_base().or(state.public_base_url.as_deref()),
+    }
 }
 
 fn link_route(bucket_internet: bool, internet_base: Option<&str>) -> LinkRoute<'_> {
@@ -651,11 +664,12 @@ async fn admin_asset_references(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     Json(req): Json<Tenanted<weft_core::storage::AssetReferencesRequest>>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<weft_core::storage::AssetReferencesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    store(&state)?.set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys)
+    let missing = store(&state)?
+        .set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys, &req.inner.kept)
         .await.map_err(map_err)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(weft_core::storage::AssetReferencesResponse { missing }))
 }
 
 async fn admin_upload_parts(

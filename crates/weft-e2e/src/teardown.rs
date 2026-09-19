@@ -75,6 +75,14 @@ impl Teardown {
         self.registered = true;
     }
 
+    /// The test removed the project itself, so teardown has nothing
+    /// remote left to drop. For a test whose SUBJECT is the removal:
+    /// without this its `finish` would remove a project that is
+    /// already gone and fail on the second try.
+    pub fn mark_removed(&mut self) {
+        self.registered = false;
+    }
+
     /// Mark teardown DONE: the suite has removed the project (and local
     /// artifacts) on a passing test, so `Drop` must stay silent. Call as the last
     /// step of a suite's `finish`, AFTER the removal succeeded, so a removal
