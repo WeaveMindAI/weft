@@ -64,7 +64,6 @@
     {
       "name": "params",
       "type": "JsonDict",
-      "required": false,
       "description": "Model-specific extras merged into the request. Declared knobs win."
     }
   ],

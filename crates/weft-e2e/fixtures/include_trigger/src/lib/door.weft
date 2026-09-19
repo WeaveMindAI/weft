@@ -1,0 +1,11 @@
+# A route that lives inside an included file: it registers when the
+# including program activates, and answers under its site.
+Group() {
+  door = Route -> (text: String) { path: "__E2E_PATH__/door", method: "POST" }
+  door_body = ExecPython(text: String) -> (body: JsonDict) {
+    code: "return {'body': {'heard': text.upper(), 'where': 'inside'}}"
+  }
+  door_body.text = door.text
+  door_answer = Reply
+  door_answer.body = door_body.body
+}

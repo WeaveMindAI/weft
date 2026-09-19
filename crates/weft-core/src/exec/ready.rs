@@ -518,20 +518,19 @@ pub fn firing_input(
 }
 
 /// Runtime type enforcement on input ports: the single check point
-/// (see `check_input`). A mismatch on a required port is returned (the
-/// node fails loudly); a mismatch on an optional port nulls the port
-/// and the node proceeds.
+/// (see `check_input`). A mismatch is returned and the node fails
+/// loudly, on a required port and an optional one alike. The gate is
+/// not data: `_should_flow` takes any value and only a `false` says
+/// no (`check_flow_permission` is its one rule), so it is never held
+/// to a type here.
 fn check_bag(node: &NodeDefinition, obj: &mut InputBag) -> Vec<String> {
     let mut errors = Vec::new();
-    for port in &node.inputs {
+    for port in node.inputs.iter().filter(|p| !crate::exec::skip::is_gate_port(&p.name)) {
         let Some(value) = obj.get(&port.name) else {
             continue;
         };
         match check_input(port, value) {
             InputCheck::Ok => {}
-            InputCheck::NullIt => {
-                obj.insert(port.name.clone(), Arc::new(Value::Null));
-            }
             InputCheck::Fail(err) => {
                 tracing::error!(target: "weft::exec::ready", node = %node.id, "{err}");
                 errors.push(err);
@@ -560,7 +559,6 @@ fn widget_refusal(port: &crate::project::InputDefinition, value: &Value) -> Opti
 #[derive(Debug, PartialEq, Eq)]
 enum InputCheck {
     Ok,
-    NullIt,
     Fail(String),
 }
 
@@ -688,13 +686,10 @@ fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCh
     if value.is_null() && !port.required {
         return InputCheck::Ok;
     }
-    // A wrong-typed value on an optional port is upstream sending
-    // something this port cannot hold: the port degrades to nothing
-    // arrived and the node runs. On a required port there is nothing
-    // to run with.
-    if !port.required {
-        return InputCheck::NullIt;
-    }
+    // A wrong-typed value is upstream sending something this port
+    // cannot hold, and the firing fails whether the port is required
+    // or not. Dropping it on an optional port and running on the
+    // default used to hide a wiring bug as a node that ran on nothing.
     InputCheck::Fail(format!(
         "type mismatch on '{}': expected {}, got {}",
         port.name,
@@ -931,9 +926,16 @@ mod tests {
         }
     }
 
+    /// An optional port used to swallow a wrong-typed value as a null
+    /// and let the node run on its default; a wrong type is a wiring
+    /// bug on any port, and the firing fails.
     #[test]
-    fn mismatch_on_optional_nulls_it() {
-        assert_eq!(check_input(&port("String", false), &json!(42)), InputCheck::NullIt);
+    fn mismatch_on_optional_fails_too() {
+        match check_input(&port("String", false), &json!(42)) {
+            InputCheck::Fail(msg) => assert!(msg.contains("type mismatch"), "{msg}"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert_eq!(check_input(&port("String", false), &json!(null)), InputCheck::Ok, "a null on an optional port is nothing arrived");
     }
 
     /// A required nullable port used to swallow a wrong-typed value as
@@ -1013,6 +1015,7 @@ mod tests {
             group_boundary: None,
             requires_infra: false,
             images: Vec::new(),
+            fires_with: Default::default(),
             published_service: None,
             span: None,
             header_span: None,
@@ -1027,6 +1030,7 @@ mod tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         }
     }

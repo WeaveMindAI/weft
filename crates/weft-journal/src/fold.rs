@@ -42,7 +42,6 @@ use weft_core::exec::ready::{
 use weft_core::exec::skip::SkipReason;
 use weft_core::exec::{
     latest_firing, latest_firing_mut, next_firing_ordinal, NodeExecution, NodeExecutionStatus,
-    PortWarning,
 };
 use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{
@@ -412,22 +411,6 @@ impl Fold {
                 };
                 let _applied = self.close_port(record_id, node_id, frames, port, *emission_id, *at_unix, ev, &mut effects);
             }
-            ExecEvent::PortTypeMismatch { emission_id, node_id, frames, port, expected, actual, at_unix, .. } => {
-                let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::PortClosed, ev) else {
-                    return effects;
-                };
-                // The closure first: a row the program cannot place
-                // is skipped whole, warning included.
-                if self.close_port(record_id, node_id, frames, port, *emission_id, *at_unix, ev, &mut effects) {
-                    if let Some(record) = self.record_mut(node_id, record_id) {
-                        record.port_warnings.push(PortWarning {
-                            port: port.clone(),
-                            expected: expected.clone(),
-                            actual: actual.clone(),
-                        });
-                    }
-                }
-            }
             ExecEvent::PulsesConsumed { node_id, pulse_ids, .. } => {
                 // The take path's durability: REMOVE the consumed
                 // pulses from the table, as the live driver does
@@ -523,7 +506,6 @@ impl Fold {
                         completed_at: None,
                         cost_usd: 0.0,
                         logs: Vec::new(),
-                        port_warnings: Vec::new(),
                         mentioned_ports: Default::default(),
                         closed_output_ports: Default::default(),
                         color,
@@ -832,8 +814,7 @@ impl Fold {
             | ExecEvent::BusWindow { .. }
             | ExecEvent::BusClosed { .. }
             | ExecEvent::CallerConnected { .. }
-            | ExecEvent::CallerInbound { .. }
-            | ExecEvent::CallerOutbound { .. }
+            | ExecEvent::CallerWindow { .. }
             | ExecEvent::CallerErrored { .. }
             | ExecEvent::CallerDisconnected { .. } => {}
         }
@@ -1045,20 +1026,14 @@ impl Fold {
         ev: &ExecEvent,
         effects: &mut FoldEffects,
     ) -> bool {
-        let failure = match ev {
-            ExecEvent::PortTypeMismatch { port, expected, actual, .. } => Some(PortWarning {
-                port: port.clone(), expected: expected.clone(), actual: actual.clone(),
-            }.message()),
-            _ => None,
-        };
         match emit_port_closure(
             node_id, port, emission_id, self.snap.color, frames, &self.project,
-            &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, failure.as_deref(),
+            &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, None,
         ) {
             Ok(()) => {
                 self.remember_output(OutputEmission {
                     id: emission_id, node: node_id.into(), frames: frames.clone(),
-                    port: port.into(), value: None, error: failure, provided: false,
+                    port: port.into(), value: None, error: None, provided: false,
                 });
                 self.record_mut(node_id, record_id)
                     .expect("`firing_record_id` found this record and nothing removes records")
@@ -1255,8 +1230,7 @@ impl Fold {
 fn describe(ev: &ExecEvent) -> String {
     match ev {
         ExecEvent::PortEmitted { node_id, frames, port, .. }
-        | ExecEvent::PortClosed { node_id, frames, port, .. }
-        | ExecEvent::PortTypeMismatch { node_id, frames, port, .. } => {
+        | ExecEvent::PortClosed { node_id, frames, port, .. } => {
             format!("{} node={node_id} frames={frames:?} port={port}", ev.kind_str())
         }
         ExecEvent::NodeStarted { node_id, frames, .. }
@@ -2463,9 +2437,8 @@ mod tests {
             started("feed", vec![], 0),
             // A second start over a firing still open.
             started("feed", vec![], 0),
-            // A close on an undeclared port, and a refused value on one.
+            // A close on an undeclared port.
             ExecEvent::PortClosed { color: color(), emission_id: Uuid::new_v4(), node_id: "feed".into(), frames: vec![], port: "nope".into(), provided: false, at_unix: 0 },
-            ExecEvent::PortTypeMismatch { color: color(), emission_id: Uuid::new_v4(), node_id: "feed".into(), frames: vec![], port: "nope".into(), expected: "Number".into(), actual: "String".into(), at_unix: 0 },
             // A take naming a pulse the table does not hold.
             ExecEvent::PulsesConsumed { color: color(), node_id: "feed".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 0 },
             // Loop rows with no LoopIn firing / no instance.
@@ -2484,7 +2457,6 @@ mod tests {
                 CorruptionSite::NodeLifecycle,
                 CorruptionSite::NodeLifecycle,
                 CorruptionSite::PortClosed,
-                CorruptionSite::PortClosed,
                 CorruptionSite::PulsesConsumed,
                 CorruptionSite::LoopInstantiated,
                 CorruptionSite::LoopIterationLaunched,
@@ -2499,7 +2471,6 @@ mod tests {
         assert!(snap.corruptions[0].reason.contains("node_resumed"), "{:?}", snap.corruptions[0]);
         assert!(snap.corruptions[1].reason.contains("node_suspended"), "{:?}", snap.corruptions[1]);
         assert!(snap.corruptions[2].reason.contains("already open"), "{:?}", snap.corruptions[2]);
-        assert!(snap.executions["feed"][0].port_warnings.is_empty(), "a refused row books no warning");
         assert!(snap.loop_runtime.get(&lp_key()).is_none());
     }
 
@@ -2549,47 +2520,6 @@ mod tests {
         assert_ne!(closures[0].id, closures[1].id);
         assert_eq!(closures[0].status, PulseStatus::Absorbed);
         assert_eq!(closures[1].status, PulseStatus::Pending, "the second firing closes `a` again");
-    }
-
-    /// A refused value closes the port on the wires AND books the
-    /// warning on the record; a body's own close is a mention, so the
-    /// sweep leaves that port alone.
-    #[test]
-    fn a_refused_value_is_a_closure_and_a_warning() {
-        let project = project(
-            vec![
-                node("src", "T", &[], &[("out", "Number"), ("other", "Number")], &[], Value::Null, Value::Null),
-                node("a", "T", &[("in", "Number", true)], &[], &[], Value::Null, Value::Null),
-                node("b", "T", &[("in", "Number", true)], &[], &[], Value::Null, Value::Null),
-            ],
-            vec![edge("src", "out", "a", "in"), edge("src", "other", "b", "in")],
-        );
-        let refused = Uuid::new_v4();
-        let events = vec![
-            started("src", vec![], 0),
-            ExecEvent::PortTypeMismatch {
-                color: color(),
-                emission_id: refused,
-                node_id: "src".into(),
-                frames: vec![],
-                port: "out".into(),
-                expected: "Number".into(),
-                actual: "String".into(),
-                at_unix: 0,
-            },
-            completed("src", vec![], 1),
-        ];
-        let snap = fold_to_snapshot(color(), project, &events);
-        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        let rec = &snap.executions["src"][0];
-        assert_eq!(rec.port_warnings.len(), 1);
-        assert_eq!(rec.port_warnings[0].port, "out");
-        let a = pending(&snap, "a");
-        assert_eq!(a.len(), 1);
-        assert!(a[0].closed);
-        assert_eq!(a[0].close_error.as_deref(), Some("output 'out': expected Number, received String"));
-        assert_eq!(a[0].id, weft_core::exec::emission::pulse_id(refused, "out", "a", "in", true), "the mismatch row is the closure");
-        assert!(pending(&snap, "b")[0].closed, "the sweep closes the unmentioned port");
     }
 
     #[test]

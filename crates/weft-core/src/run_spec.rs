@@ -34,11 +34,16 @@ pub fn validate_fire_bake(node: &str, program: &crate::project::hash::ProgramIde
     if bakes.iter().any(|bake| bake.program == *program && bake.captured.iter().any(|id| id == node)) {
         return Ok(());
     }
+    // A bake is per code, so ANY edit to the graph leaves the last one
+    // behind. That is the cause every single time somebody reads this,
+    // so it leads; the hashes are for the rare case where it is not.
     let older = bakes.iter().filter(|bake| bake.captured.iter().any(|id| id == node))
         .max_by_key(|bake| bake.at_unix)
-        .map(|bake| format!(" The previous bake used graph {} and binary {}.", bake.program.definition_hash, bake.program.binary_hash))
+        .map(|bake| format!(" (the last one was made for graph {} and binary {})", bake.program.definition_hash, bake.program.binary_hash))
         .unwrap_or_default();
-    Err(Refusal::error(format!("trigger '{node}' has no successful bake for this code.{older} `weft bake` prepares it without listening; `weft activate` prepares it and listens")))
+    Err(Refusal::error(format!(
+        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it without listening, `weft activate` does it and listens"
+    )))
 }
 
 /// The example file, run request, and editor value share one contract.
@@ -441,7 +446,7 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
                     None => refusal.errors.push(format!("unknown output port '{spelled}.{port}'")),
                     // The language's flow gate accepts any value: false stops,
                     // other values permit flow. Its generic type is intentional.
-                    Some(_) if is_input && port == crate::exec::skip::SHOULD_FLOW_PORT => {},
+                    Some(_) if is_input && crate::exec::skip::is_gate_port(port) => {},
                     Some(ty) => if let Err(error) = validate_supplied_value(ty, value) {
                         refusal.errors.push(format!("{spelled}.{port}: {error}"));
                     },
@@ -453,9 +458,23 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
         let (id, path) = crate::project::resolve_address(project, spelled);
         (Located::new(id, path), value)
     });
-    if let Some((fire, _)) = &fire {
+    if let Some((fire, payload)) = &fire {
         if !selection.nodes.contains(fire) {
             refusal.errors.push(format!("fired trigger '{}' is outside the selected run", crate::project::address_of(project, &fire.id, &fire.path)));
+        }
+        // What the trigger wakes with is declared (`firesWith`), so a
+        // payload that does not match is refused HERE, before anything
+        // is built or started, and the refusal prints the shape it
+        // wanted. The engine holds every firing to the same contract;
+        // this is the same check, early, where the author is still
+        // looking at the command they typed.
+        if let Some(node) = project.nodes.iter().find(|n| n.id == fire.id) {
+            if let Err(why) = crate::node::check_fire_payload(&node.fires_with, Some(payload)) {
+                refusal.errors.push(format!(
+                    "--fire {}: {why}",
+                    crate::project::address_of(project, &fire.id, &fire.path)
+                ));
+            }
         }
     }
     if !refusal.is_empty() { return Err(refusal); }
@@ -586,7 +605,12 @@ mod tests {
                 _ => { other.implementations.insert("T".into(), "changed".into()); }
             }
             let refusal = validate_fire_bake("trigger", &other, &[bake.clone()]).unwrap_err().to_string();
-            assert!(refusal.contains("previous bake used graph"));
+            // The cause leads (every reader of this got here by editing
+            // the graph); the hashes stay, for the rare case where it
+            // was something else.
+            assert!(refusal.contains("the code changed since"), "{refusal}");
+            assert!(refusal.contains("weft bake"), "it names the fix: {refusal}");
+            assert!(refusal.contains("made for graph"), "{refusal}");
         }
         let roundtrip: BakeSummary = serde_json::from_value(serde_json::to_value(&bake).unwrap()).unwrap();
         assert_eq!(roundtrip.program, program);

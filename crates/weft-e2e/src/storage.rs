@@ -77,8 +77,8 @@ pub async fn list_prefix(
 /// Download a stored file's bytes by key: handshake for a presigned bucket URL,
 /// then stream the bytes directly from the storage bucket.
 ///
-/// The bucket (SeaweedFS) is reached over a port-forward in the local emulation.
-/// A freshly-(re)started forward, or the bucket pod still settling, can
+/// The bucket (SeaweedFS) is a docker container on the host in the local
+/// emulation, published on the loopback. A container still settling can
 /// transiently answer `502`/`503`/`504` or refuse the connection. That is a
 /// not-ready state, not a download failure, so we poll through those codes +
 /// transport errors until the bucket is serving (bounded). Any OTHER non-success

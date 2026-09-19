@@ -28,7 +28,13 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 fn config() -> serde_json::Value {
-    json!({ "database": "app", "storage": "10Gi", "version": "17" })
+    json!({ "database": "app", "storage": "10Gi", "version": "17", "reachable": false })
+}
+
+/// The same database, with the author saying something outside the
+/// program may connect to it.
+fn reachable_config() -> serde_json::Value {
+    json!({ "database": "app", "storage": "10Gi", "version": "17", "reachable": true })
 }
 
 /// The two addresses the node's own infrastructure answers on. The
@@ -115,12 +121,39 @@ async fn stable(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
+/// The rule every infra node lives by, on the node that has one of
+/// each: an endpoint that HANDS OUT a credential never leaves the
+/// cluster, whatever anybody asks for.
+///
+/// `sql` may be opened, because reaching Postgres there still costs a
+/// password, and that is what lets a frontend on this machine use the
+/// program's database instead of standing up a second one.
+/// `credential` is the little server that MINTS that password: a door
+/// onto it would hand the database to anything that could reach the
+/// port, so it stays inside for ever and no input can open it.
 async fn internal(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig.run_provision_infra(&PostgresDatabaseNode, config()).await.ok()?;
-    for endpoint in &outcome.infra_spec()?.endpoints {
+    // Nothing is reachable unless the author said so, and `reachable`
+    // defaults off: a database on a machine somebody else can type on
+    // is not something you get for not thinking about it.
+    let closed = rig.run_provision_infra(&PostgresDatabaseNode, config()).await.ok()?;
+    for endpoint in &closed.infra_spec()?.endpoints {
         assert!(
             matches!(endpoint.expose, weft::infra::Expose::ClusterInternal),
-            "'{}' must stay inside the project",
+            "'{}' is reachable on a database nobody asked to reach",
+            endpoint.name
+        );
+    }
+
+    // With it, exactly one endpoint opens. `credential` HANDS OUT the
+    // password, so reaching it would give the database away to
+    // anything that could reach the port; no input can open it.
+    let open = rig.run_provision_infra(&PostgresDatabaseNode, reachable_config()).await.ok()?;
+    for endpoint in &open.infra_spec()?.endpoints {
+        let want_reachable = endpoint.name == "sql";
+        assert_eq!(
+            matches!(endpoint.expose, weft::infra::Expose::SameNetwork),
+            want_reachable,
+            "'{}' has the wrong exposure: only 'sql' may ever be reachable",
             endpoint.name
         );
     }

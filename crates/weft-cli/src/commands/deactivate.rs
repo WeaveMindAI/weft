@@ -20,21 +20,25 @@ const DEFAULT_GRACE_MINUTES: u32 = 15;
 /// Resolve the trigger-deactivation choice (mode + grace + running
 /// policy) from explicit flags, falling back to interactive prompts
 /// on a human terminal. Off a terminal, or in `--json` mode, a missing
-/// `--mode` is an error (the caller must choose; a script never gets a
-/// wipe it did not ask for). A missing grace takes the default in `--json`
+/// `--mode` is `wipe`. A missing grace takes the default in `--json`
 /// mode; a terminal is asked (Enter accepts the default); off a terminal
 /// the grace prompt refuses, naming `--grace`.
+///
+/// `wipe` is the default rather than a refusal, and rather than one of
+/// the preserving modes, because those keep signals and suspended runs
+/// alive across the change: on a project somebody is still building,
+/// that is how a run ends up waiting on something nobody will ever
+/// answer. Starting fresh is the safe reading of "I just changed the
+/// program", and anybody who means to keep the in-flight work says so
+/// with `--mode hibernate` or `--mode park`. This was a refusal until
+/// the agents hit it on every `weft resync`, where a human never did.
 ///
 /// Returns a JSON object matching the wire
 /// `DeactivateSpec` shape (`mode`, `runningPolicy`, optional
 /// `graceMinutes`), ready to embed under `triggerDeactivation`
 /// in the request body or to POST verbatim to `/deactivate`.
-///
-/// `verb_label` is used in the JSON-mode error message so the user
-/// sees which verb is failing (e.g. "infra stop requires --mode").
 pub fn prompt_trigger_deactivation(
     json: bool,
-    verb_label: &str,
     mode: Option<&str>,
     grace: Option<u32>,
     running_policy: Option<&str>,
@@ -45,10 +49,7 @@ pub fn prompt_trigger_deactivation(
     let scripted = json || !crate::prompt::is_interactive();
     let mode = match mode {
         Some(m) => m.to_string(),
-        None if scripted => anyhow::bail!(
-            "{verb_label}: --mode required \
-             (one of: wipe, hibernate, park)"
-        ),
+        None if scripted => "wipe".to_string(),
         None => prompt_mode()?,
     };
     if !["wipe", "hibernate", "park"].contains(&mode.as_str()) {
@@ -147,7 +148,6 @@ async fn run_inner(
     // prompts.
     let deactivation = prompt_trigger_deactivation(
         ctx.json(),
-        "deactivate",
         mode.as_deref(),
         grace,
         running_policy.as_deref(),
@@ -178,6 +178,7 @@ async fn run_inner(
         .get("graceMinutes")
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
+    progress.drain_wait(&deactivation, drain_timeout);
     progress.dispatcher_call_start(&path);
     client.post_with_body(&path, &deactivation).await?;
     let mut done = serde_json::Map::new();
@@ -230,12 +231,18 @@ fn prompt_mode() -> anyhow::Result<String> {
 mod tests {
     use super::prompt_trigger_deactivation;
 
+    /// A script (and every agent) gets `wipe` with no flag: the
+    /// preserving modes carry signals and suspended runs across a
+    /// change to the program, which is how a run ends up waiting on
+    /// something nobody will answer. Keeping the in-flight work is the
+    /// thing you ask for.
     #[test]
-    fn scripts_must_choose_deactivation_without_getting_a_default_wipe() {
-        let error = prompt_trigger_deactivation(true, "deactivate", None, None, None, None)
-            .unwrap_err().to_string();
-        assert!(error.contains("--mode required"), "{error}");
-        let park = prompt_trigger_deactivation(true, "deactivate", Some("park"), None, None, None)
+    fn a_script_gets_a_fresh_start_unless_it_asks_to_keep_the_in_flight_work() {
+        let fresh = prompt_trigger_deactivation(true, None, None, None, None).unwrap();
+        assert_eq!(fresh["mode"], "wipe");
+        assert_eq!(fresh["runningPolicy"], "cancel", "waiting before a wipe is contradictory");
+
+        let park = prompt_trigger_deactivation(true, Some("park"), None, None, None)
             .unwrap();
         assert_eq!(park["mode"], "park");
         assert_eq!(park["runningPolicy"], "wait");

@@ -1,0 +1,28 @@
+{
+  "type": "QuietBus",
+  "label": "Quiet Bus",
+  "description": "Demo node standing in for a feed that goes quiet: opens a bus, sends one text delta, then waits for ever with the bus open. Starts when `start` arrives.",
+  "tags": [
+    "bus",
+    "demo",
+    "stream"
+  ],
+  "icon": "Waves",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "start",
+      "type": "String",
+      "required": true,
+      "description": "Any value; what starts the producer (a route's path)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "feed",
+      "type": "Bus",
+      "description": "One `delta` message, `first`, then silence with the bus open."
+    }
+  ],
+  "requires_infra": false
+}

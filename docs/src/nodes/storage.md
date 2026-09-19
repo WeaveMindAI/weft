@@ -99,7 +99,10 @@ the run, where a swept file shows up as "media expired". So:
   expose a `keep` boolean config input defaulting to off, and pass
   `keep.then_some(KeepTtl::Default)`, letting the user decide.
 
-The `KeepFile` node extends or pins an execution file's lifetime after the fact.
+The `KeepFile` node extends or pins an execution file's lifetime after the
+fact. Kept or not, an execution file stays walled to its run; with
+`scope: project` the node instead copies it into the project scope and emits
+the copy, the only form a later run can read.
 
 ## Files from the graph
 

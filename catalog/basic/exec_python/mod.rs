@@ -12,8 +12,10 @@
 //!
 //! - The `code` config field carries the Python source. Whatever
 //!   the user writes there is wrapped in a zero-arg closure whose
-//!   locals include every input port value by name. `return <dict>`
-//!   in the user code supplies the output pulses.
+//!   locals include every DECLARED input port by name: one that
+//!   received nothing is bound to `None`, so a script reads an
+//!   optional input with a plain `if problem is None`. `return
+//!   <dict>` in the user code supplies the output pulses.
 //!
 //! - Inputs are converted serde_json → Python via `json_to_py`. A
 //!   recursive walk over the JSON tree keeps types straightforward:
@@ -22,12 +24,26 @@
 //!   across the boundary; we round-trip through JSON twice per
 //!   call but the shape is simple and predictable.
 //!
+//! - A file arrives UNWRAPPED on a port DECLARED as one (the same
+//!   question the way out asks, so a dict that happens to carry a
+//!   marker key on a `JsonDict` port stays exactly as it is). On a
+//!   wire a file is the marker
+//!   `{"__weft_image__": {key, filename, mimeType, sizeBytes}}` (one
+//!   sentinel per kind); the engine adds a `url` minted for this
+//!   firing before the node runs. The script gets the inside of the
+//!   marker as a plain dict, so `photo["url"]` is the download link
+//!   and `photo["filename"]` the name, with no sentinel to unwrap.
+//!   The kind is not lost: a file returned on a file-typed output is
+//!   wrapped back into its marker from its mime type, and the engine
+//!   strips the link on the way out as it does for every node.
+//!
 //! - The return value must be a dict keyed by output port name.
 //!   A missing key OR a key set to `None` means "no pulse on
-//!   that port": downstream nodes receive a null pulse and the
-//!   normal skip propagation kicks in (this matches how the
-//!   user's weather example uses
-//!   `{"weather": None, "error": "..."}`).
+//!   that port": the port is left out of the node's output
+//!   entirely, nothing travels down it, and the normal skip
+//!   propagation kicks in (this is how the weather example's
+//!   `{"weather": None, "error": "..."}` closes one branch and
+//!   opens the other).
 //!
 //! - Python exceptions become node failures with the full traceback
 //!   in the message so the UI modal shows what actually went wrong
@@ -46,7 +62,9 @@ use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
 
 use weft::node::NodeOutput;
-use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::storage::media::{media_slots, substitute_media};
+use weft::weft_type::FileKind;
+use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
@@ -64,15 +82,26 @@ impl Node for ExecPythonNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let code: String = ctx.inputs.get("code")?;
 
-        // Bind every DATA input under its name in the Python namespace
-        // (including null values from skipped upstreams, which matches
-        // the "if this input was null, branch" pattern in user code).
-        // `custom()` is exactly the user's inline-declared ports: the
-        // node's own settings (`code`) never bind as variables.
-        let inputs: Vec<(String, Value)> = ctx
-            .inputs
-            .custom()
-            .map(|(k, v)| (k.clone(), v.clone()))
+        // Bind every DECLARED data input under its name in the Python
+        // namespace. The declared set is the user's inline port list
+        // (the node's own settings, `code`, never bind as variables);
+        // a port with nothing in the bag (a skipped upstream, an
+        // optional input nobody wired) binds as `None`, so the script
+        // never meets an undefined name. Stored files bind unwrapped.
+        let settings: std::collections::HashSet<&str> = ctx.inputs.declared().map(|(k, _)| k.as_str()).collect();
+        let names: std::collections::BTreeSet<&String> = ctx
+            .declared_inputs()
+            .keys()
+            .filter(|name| !settings.contains(name.as_str()))
+            .chain(ctx.inputs.custom().map(|(name, _)| name))
+            .collect();
+        let inputs: Vec<(String, Value)> = names
+            .into_iter()
+            .map(|name| {
+                let ty = ctx.declared_inputs().get(name);
+                let value = ctx.inputs.raw(name).map(|v| unwrap_files(v, ty)).unwrap_or(Value::Null);
+                (name.clone(), value)
+            })
             .collect();
 
         // PyO3 needs the GIL which it acquires on whatever sync
@@ -84,15 +113,86 @@ impl Node for ExecPythonNode {
 
         // Assemble NodeOutput. `None` / missing keys produce no
         // pulse, matching the Python contract where returning
-        // {"x": None} skips port x.
+        // {"x": None} skips port x. A file handed back on a
+        // file-typed port goes out as the marker the wire expects.
         let mut out = NodeOutput::new();
         for (port, value) in result {
-            if !matches!(value, Value::Null) {
-                out = out.set(port, value);
+            if matches!(value, Value::Null) {
+                continue;
             }
+            let value = match ctx.output_type(&port) {
+                Some(ty) if ty.references_file() => wrap_files(&value, &ty)?,
+                _ => value,
+            };
+            out = out.set(port, value);
         }
         ctx.pulse_downstream(out).await
     }
+}
+
+/// The inside of every stored-file marker sitting where the port's
+/// DECLARED type says a file goes: `{"__weft_image__": {...}}` becomes
+/// `{...}`. The type is the question, exactly as on the way out
+/// ([`wrap_files`]), so a dict that merely happens to carry a marker
+/// key on a port declared `JsonDict` flows whole. A port with no file
+/// anywhere in its type is copied untouched.
+fn unwrap_files(value: &Value, ty: Option<&WeftType>) -> Value {
+    let Some(ty) = ty.filter(|ty| ty.references_file()) else {
+        return value.clone();
+    };
+    let replacements = media_slots(value, ty)
+        .into_iter()
+        .filter_map(|slot| {
+            let obj = slot.as_object()?;
+            let kind = FileKind::from_marker_obj(obj)?;
+            let inner = obj.get(kind.marker_key())?.clone();
+            Some((slot.to_string(), inner))
+        })
+        .collect();
+    substitute_media(value, ty, &replacements)
+}
+
+/// The inverse of [`unwrap_files`] on an output typed as a file: every
+/// media slot of `ty` holding a bare file dict (the shape the script
+/// received, either handle) is wrapped back into the marker its mime
+/// type says. A slot already carrying a marker passes; anything else
+/// on a file slot is refused by name, so a script cannot put a string
+/// where a picture goes.
+fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
+    let mut replacements = std::collections::HashMap::new();
+    for slot in media_slots(value, ty) {
+        let Some(obj) = slot.as_object() else {
+            return Err(node_error(format!(
+                "ExecPython returned {} on a file port; return the dict the file arrived as",
+                weft::truncate_user_string(&slot.to_string(), 120)
+            )));
+        };
+        if FileKind::from_marker_obj(obj).is_some() {
+            continue;
+        }
+        // A file that lives at an external URL carries `url` where a
+        // stored file carries `key` (see `FileHandle::Url`), so it is
+        // not a `StoredFile` and never will be. The script was handed
+        // that payload and handed it straight back, so wrap it by the
+        // mime it declares rather than refusing a file this node
+        // unwrapped itself.
+        if obj.contains_key("url") {
+            let mime = obj
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            replacements.insert(
+                slot.to_string(),
+                WeftType::file_marker(FileKind::from_mime(mime), slot.clone()),
+            );
+            continue;
+        }
+        let file: StoredFile = serde_json::from_value(slot.clone()).map_err(|e| {
+            node_error(format!("ExecPython returned a dict on a file port that is not a stored file ({e}); return the dict the file arrived as"))
+        })?;
+        replacements.insert(slot.to_string(), file.to_value());
+    }
+    Ok(substitute_media(value, ty, &replacements))
 }
 
 /// Execute `code` with the given input bindings and return the

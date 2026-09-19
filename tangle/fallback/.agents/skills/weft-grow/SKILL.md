@@ -1,6 +1,6 @@
 ---
 name: weft-grow
-description: "COMMAND, not reference: Grow the program one stage at a time against a real input, seeded runs and frozen examples included. Run this when the user asks for this step by name, optionally naming the stage to grow or an example name to rerun. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Grow the program one stage at a time against a real input, seeded runs and frozen examples included. Run this when the user asks for this step by name, optionally naming the stage to grow or an example name to rerun. The sixteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Run one pass of Sequential Diffusion Programming: inspect the current stage on a real input, preserve an accepted result, then grow the next stage.

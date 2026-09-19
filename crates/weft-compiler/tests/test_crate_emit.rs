@@ -302,6 +302,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         group_boundary: None,
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         header_span: None,
@@ -311,6 +312,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         source_file: None,
     };
     let project = ProjectDefinition {

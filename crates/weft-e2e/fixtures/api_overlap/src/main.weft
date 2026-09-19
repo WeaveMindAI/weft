@@ -1,0 +1,9 @@
+# One route, activated twice under two projects at the same address. The
+# compiler answers the overlap INSIDE one file; this is the half only the
+# dispatcher can answer, because only it knows what the author's other
+# projects already serve. Activation must refuse the second, naming the
+# overlap, before any route is armed.
+
+a = Route { path: "__E2E_PATH__/chat/{a}", method: "POST" }
+ra = Reply
+ra.body = a.params

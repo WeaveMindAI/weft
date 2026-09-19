@@ -133,6 +133,11 @@ struct ParsedNode {
     /// of the included `.weft` file. The editor renders this node as an
     /// expandable group that navigates into the file.
     include_path: Option<String>,
+    /// Interface mode only, on an `@include` node: what the file behind it
+    /// holds, transitively through its own includes. The body is not in the
+    /// graph, so without this the editor cannot tell that a project's only
+    /// trigger or infra node lives inside an include.
+    include_contents: Option<weft_core::project::IncludedContents>,
     /// The file this node's spans live in, when a full-mode `@include`
     /// spliced it out of another file. None = the compiled source.
     source_file: Option<String>,
@@ -404,13 +409,15 @@ fn edge_id(source: &str, source_handle: &str, target: &str, target_handle: &str)
 }
 
 /// The display label for a group's boundary Passthrough. Single definition of
-/// the shape, used at flatten.
+/// the shape, used at flatten. The group reads as a person reads it
+/// (`crate::source_name::display_name`), never as its id: an included
+/// file's body id is its path, which no surface shows.
 fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
     let suffix = match role {
         weft_core::project::GroupBoundaryRole::In => "in",
         weft_core::project::GroupBoundaryRole::Out => "out",
     };
-    format!("{group_id} ({suffix})")
+    format!("{} ({suffix})", crate::source_name::display_name(group_id))
 }
 
 /// Resolve every `@include("path")` in `state`. `Full` inlines each
@@ -599,6 +606,21 @@ fn stamp_source_file(group: &mut ParsedGroup, file: &str) {
     }
 }
 
+/// Whether a parsed file has the shape an `@include` requires: exactly one
+/// anonymous top-level Group and nothing else. The Group header is the
+/// file's interface and the file name is its identity, so a named group,
+/// several groups, a loose node, or a loose top-level connection are all
+/// refused. Only the group is ever consumed, so anything else would be
+/// silently dropped, which is why this has to be checked rather than
+/// assumed.
+fn is_one_anonymous_group(sub: &ParseState) -> bool {
+    sub.nodes.is_empty()
+        && sub.includes.is_empty()
+        && sub.connections.is_empty()
+        && sub.groups.len() == 1
+        && sub.groups[0].anonymous
+}
+
 fn resolve_one_include(
     inc: &ParsedInclude,
     fs: &CompileFs,
@@ -663,18 +685,7 @@ fn resolve_one_include(
                 .collect::<Vec<_>>()
         })?;
 
-    // An included file must be exactly one anonymous top-level Group and
-    // nothing else: the Group header is the file's interface, and the file
-    // name is its identity (no top-level name). A named group, multiple groups,
-    // loose nodes, OR a loose top-level connection are rejected. (Only the group
-    // is consumed below; any other top-level content would be silently dropped,
-    // so the gate must catch it loudly.)
-    let single_anon = sub.nodes.is_empty()
-        && sub.includes.is_empty()
-        && sub.connections.is_empty()
-        && sub.groups.len() == 1
-        && sub.groups[0].anonymous;
-    if !single_anon {
+    if !is_one_anonymous_group(&sub) {
         return Err(at_include(format!(
             "@include(\"{}\"): an included file must be exactly one anonymous top-level Group, e.g. `Group(in: T) -> (out: U) {{ ... }}`",
             inc.path
@@ -707,6 +718,13 @@ fn resolve_one_include(
                 config_spans: Default::default(),
                 optional_ports: Default::default(),
                 include_path: Some(inc.path.clone()),
+                include_contents: Some(include_node_types_and_files(
+                    &group,
+                    root,
+                    &included_fs,
+                    in_progress,
+                    &canonical,
+                )),
                 source_file: None,
             };
             Ok(IncludeResult::Node(Box::new(node)))
@@ -780,6 +798,127 @@ fn resolve_one_include(
             };
             Ok(IncludeResult::Site(Box::new(site)))
         }
+    }
+}
+
+/// The node types and file paths behind an interface-mode `@include`,
+/// reached through its own includes as well. Interface mode keeps only the
+/// group's ports, so the body's nodes never enter the graph and the editor
+/// would otherwise read an include as an empty box: a project whose only
+/// trigger or only infra node lives in one had no Activate button and no
+/// infra controls.
+///
+/// Types, not roles: `requires_infra` and `has_trigger` come back FALSE
+/// from here whatever the file holds, because deciding what a type means
+/// takes the catalog and the parser has none. `enrich` settles them from
+/// the types (`enrich::enrich_collecting`), so between parse and enrich
+/// those two booleans are not yet answers.
+///
+/// A nested file that cannot be read, cannot be parsed, or has a shape an
+/// `@include` refuses contributes nothing, and nothing is reported: this
+/// runs inside the editor's lenient parse, whose job is to keep drawing
+/// the graph through a broken dependency. The cost is real and worth
+/// naming: a DIRECTLY included broken file is reported (the `@include`
+/// line gets the error), while one reached only through another include
+/// is silent, because interface mode never loads nested bodies and so has
+/// no diagnostic channel here. Such a project fails at build with the
+/// file named.
+fn include_node_types_and_files(
+    group: &ParsedGroup,
+    root: &std::path::Path,
+    fs: &CompileFs,
+    in_progress: &[std::path::PathBuf],
+    canonical: &std::path::Path,
+) -> weft_core::project::IncludedContents {
+    // Canonicalized ONCE here and used for the whole walk, because the
+    // backing hands back canonicalized paths while `CompileFs` carries the
+    // root as it was spelled: a project reached through a symlink makes the
+    // two differ, and then neither the path-from-root nor the file's body
+    // id comes out right.
+    let canonical_root = root.canonicalize();
+    let root = canonical_root.as_deref().unwrap_or(root);
+    let mut contents = weft_core::project::IncludedContents::default();
+    push_root_relative(&mut contents.files, root, canonical);
+    // The cycle stack for this walk starts with the file we are already
+    // inside, so a file that includes itself (directly or through a chain)
+    // is visited once.
+    let mut seen: Vec<std::path::PathBuf> = in_progress.to_vec();
+    seen.push(canonical.to_path_buf());
+    collect_included_contents(group, root, fs, &mut seen, &mut contents);
+    contents.node_types.sort();
+    contents.node_types.dedup();
+    contents.files.sort();
+    contents.files.dedup();
+    contents
+}
+
+/// Record a file under `contents.files` as its path from the project root,
+/// the one spelling every reader of the field can resolve. `root` must be
+/// the canonical root (the caller canonicalizes once for the whole walk),
+/// because the paths coming in are canonicalized by the backing.
+///
+/// A file that does not sit under the root cannot have come from an
+/// `@include`, which refuses anything outside it, so it is dropped rather
+/// than written down under a spelling nobody can resolve.
+fn push_root_relative(files: &mut Vec<String>, root: &std::path::Path, path: &std::path::Path) {
+    if let Ok(rel) = path.strip_prefix(root) {
+        files.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+}
+
+/// Walk one parsed group: its own nodes' types, then down its child groups,
+/// then into each file it includes. `root` is the canonical project root.
+fn collect_included_contents(
+    group: &ParsedGroup,
+    root: &std::path::Path,
+    fs: &CompileFs,
+    seen: &mut Vec<std::path::PathBuf>,
+    contents: &mut weft_core::project::IncludedContents,
+) {
+    for node in &group.nodes {
+        contents.node_types.push(node.node_type.clone());
+    }
+    for child in &group.child_groups {
+        collect_included_contents(child, root, fs, seen, contents);
+    }
+    let (Some(base), Some(fs_root)) = (fs.base, fs.root) else {
+        return;
+    };
+    for inc in &group.includes {
+        let Ok(resolved) = fs.reader.resolve_and_read(fs_root, base, std::path::Path::new(&inc.path)) else {
+            continue;
+        };
+        if seen.contains(&resolved.identity) {
+            continue;
+        }
+        // The real resolution also refuses two paths whose body ids
+        // collide. That rule is not repeated here: this walk only unions
+        // node types and file paths, and two colliding files union to the
+        // same answer whether or not the clash is caught, so a third copy
+        // of the rule in a pass that cannot report it would change no
+        // outcome. The build refuses the project and names both files.
+        // Parsed under the id the file takes from its path, the same one
+        // the real resolution gives it, so the ids here are the ids the
+        // build will use. Passing the call-site alias instead would be a
+        // second spelling of the file's identity.
+        let body_id = crate::source_name::body_id(root, &resolved.identity);
+        let Ok(mut sub) = parse_checked(resolved.content.as_str(), &body_id) else {
+            continue;
+        };
+        // A file the build would refuse: counting its contents would
+        // describe a project that cannot exist. It is passed over here
+        // rather than reported, because this walk runs during the
+        // editor's parse and its whole job is to keep drawing.
+        if !is_one_anonymous_group(&sub) {
+            continue;
+        }
+        let nested = sub.groups.pop().expect("length checked");
+        push_root_relative(&mut contents.files, root, &resolved.identity);
+        seen.push(resolved.identity.clone());
+        // Anchored at the nested file's OWN directory: an `@include` path is
+        // relative to the file that writes it.
+        let nested_fs = fs.anchored_at(resolved.identity.parent());
+        collect_included_contents(&nested, root, &nested_fs, seen, contents);
     }
 }
 
@@ -1098,7 +1237,7 @@ fn apply_container_literal_fill(
     errors: &mut Vec<CompileError>,
 ) {
     let declared = group.in_ports.iter().any(|p| p.name == fill.port)
-        || fill.port == weft_core::exec::skip::SHOULD_FLOW_PORT;
+        || weft_core::exec::skip::is_gate_port(&fill.port);
     if !declared {
         errors.push(CompileError::at(
             fill.span,
@@ -1303,6 +1442,7 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
     "_label",
     weft_core::tag::TAGS_CONFIG_KEY,
     weft_core::exec::skip::SHOULD_FLOW_PORT,
+    weft_core::exec::skip::SHOULD_NOT_FLOW_PORT,
 ];
 
 /// The canonical list of type names the language reserves. The SINGLE
@@ -1409,9 +1549,12 @@ fn lower_port_sig(
                                 span,
                                 format!(
                                     "output port \"{}\" carries `?`, but an output has no \
-                                     optionality: a firing that emits nothing on it closes it. \
-                                     Remove the `?`",
-                                    p.name
+                                     optionality: absence is already how it works. A firing \
+                                     that emits nothing on \"{}\" CLOSES it, and everything \
+                                     wired behind it skips. Remove the `?` here; if a node \
+                                     behind it should run anyway, mark ITS input optional \
+                                     (`{}?: Type`) and it runs with nothing on that port",
+                                    p.name, p.name, p.name
                                 ),
                             ));
                         }
@@ -1598,6 +1741,7 @@ fn lower_node(
         config_spans: body_out.config_spans,
         optional_ports: body_out.optional_ports,
         include_path: None,
+        include_contents: None,
         source_file: None,
     })
 }
@@ -1841,6 +1985,7 @@ fn lower_inline_expr(
         config_spans: body_out.config_spans,
         optional_ports: body_out.optional_ports,
         include_path: None,
+        include_contents: None,
         source_file: None,
     });
     inline.connections.push(ParsedConnection {
@@ -2309,7 +2454,7 @@ fn lower_grouplike_body_in_scope(
                 let wired_flow = tmp_inline
                     .connections
                     .iter()
-                    .any(|c| c.target_port == weft_core::exec::skip::SHOULD_FLOW_PORT);
+                    .any(|c| weft_core::exec::skip::is_gate_port(&c.target_port));
                 if wired_flow {
                     group.nodes.extend(std::mem::take(&mut tmp_inline.nodes));
                     group.connections.extend(std::mem::take(&mut tmp_inline.connections));
@@ -2324,7 +2469,7 @@ fn lower_grouplike_body_in_scope(
                     ));
                 }
                 for (key, value) in tmp_body.config {
-                    if key == weft_core::exec::skip::SHOULD_FLOW_PORT {
+                    if weft_core::exec::skip::is_gate_port(key.as_str()) {
                         group.port_literal_spans
                             .insert(key.clone(), ConfigFieldSpan::inline(field_span));
                         group.port_literals.insert(key, value);
@@ -2375,7 +2520,7 @@ fn lower_grouplike_body_in_scope(
                     // `port_literal_spans` above; a loop-config span for
                     // it would show the editor a knob with no value.
                     if matches!(group.kind, GroupKind::Loop)
-                        && key != weft_core::exec::skip::SHOULD_FLOW_PORT
+                        && !weft_core::exec::skip::is_gate_port(key.as_str())
                     {
                         group.loop_config_spans.insert(key, span);
                     }
@@ -3371,6 +3516,22 @@ fn flatten_group(
         synthesized_from_carry: false,
         declared_type: None,
     }));
+    // The same gate read the other way round, on the same boundary: a
+    // whole subgraph that runs when the thing wired here did NOT happen.
+    // Both spellings exist on every node, so they exist here too, or a
+    // group would be the one thing in the language that cannot be gated
+    // on an absence.
+    in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
+        name: weft_core::exec::skip::SHOULD_NOT_FLOW_PORT.to_string(),
+        port_type: weft_core::weft_type::WeftType::type_var("T__should_not_flow"),
+        required: false,
+        description: Some(
+            "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it."
+                .to_string(),
+        ),
+        synthesized_from_carry: false,
+        declared_type: None,
+    }));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
             elem_type(&p.port_type)
@@ -3441,6 +3602,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         // The group's header is where a diagnostic about either
@@ -3456,6 +3618,7 @@ fn flatten_group(
         port_literal_spans: group.port_literal_spans.clone(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         // The node's file covers its own spans (the loop config spans
         // above live in the group's file). Its port-literal spans may
         // each name a DIFFERENT file: an interface-port fill is written
@@ -3529,6 +3692,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: None,
         header_span: group.header_span,
@@ -3538,6 +3702,7 @@ fn flatten_group(
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        include_contents: None,
         source_file: group.source_file.clone(),
     });
 
@@ -3643,6 +3808,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         group_boundary: None,
         requires_infra: false,
         images: Vec::new(),
+        fires_with: Default::default(),
         published_service: None,
         span: pn.span,
         header_span: pn.header_span,
@@ -3654,6 +3820,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: pn.include_path.clone(),
+        include_contents: pn.include_contents.clone(),
         source_file: pn.source_file.clone(),
     }
 }

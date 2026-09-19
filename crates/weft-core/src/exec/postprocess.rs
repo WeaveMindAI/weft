@@ -683,6 +683,7 @@ mod fan_in_tests {
             scope: Vec::new(),
             group_boundary: None,
             requires_infra: false,
+            fires_with: Default::default(),
             images: Vec::new(),
             published_service: None,
             span: None,
@@ -693,6 +694,7 @@ mod fan_in_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
         serde_json::to_value(n).unwrap()

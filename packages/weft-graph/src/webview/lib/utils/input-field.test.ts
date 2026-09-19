@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { fieldForInput, clampToRange, hasUnpickedAccess, inputRendersField, nextPortLiterals, shouldFlowField } from './input-field';
-import { SHOULD_FLOW_PORT } from '../../../protocol';
+import { fieldForInput, clampToRange, gateField, hasUnpickedAccess, inputRendersField, nextPortLiterals } from './input-field';
+import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from '../../../protocol';
 import { acceptsLiteral, acceptsWire } from '../types';
 import type { PortDefinition } from '../types';
 
@@ -160,9 +160,21 @@ describe('inputRendersField', () => {
 	});
 
 	it('draws the same control for a node and a container', () => {
-		expect(shouldFlowField('node').type).toBe('checkbox');
-		expect(shouldFlowField('node').portDriven).toBe(true);
-		expect(shouldFlowField('container').description).toContain('inside it');
+		expect(gateField(SHOULD_FLOW_PORT, 'node').type).toBe('checkbox');
+		expect(gateField(SHOULD_FLOW_PORT, 'node').portDriven).toBe(true);
+		expect(gateField(SHOULD_FLOW_PORT, 'container').description).toContain('inside it');
+	});
+
+	/// The inverted spelling gets its OWN field: keying it to
+	/// `_should_flow` would read the wrong literal (so the box shows the
+	/// opposite of the truth) and a tick would write the second gate onto
+	/// a node that already has one, which the compiler refuses.
+	it('builds the field for the gate spelling the node actually carries', () => {
+		const inverted = gateField(SHOULD_NOT_FLOW_PORT, 'node');
+		expect(inverted.key).toBe(SHOULD_NOT_FLOW_PORT);
+		expect(inverted.label).toBe(SHOULD_NOT_FLOW_PORT);
+		expect(inverted.type).toBe('checkbox');
+		expect(inverted.description).not.toBe(gateField(SHOULD_FLOW_PORT, 'node').description);
 	});
 });
 

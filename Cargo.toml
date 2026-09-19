@@ -102,6 +102,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # IANA time zones, for a cron schedule that means "nine in Paris".
 chrono-tz = "0.10"
 bytes = "1"
+# Socket options the standard library does not expose. Used for
+# TCP_USER_TIMEOUT on accepted live-caller connections, which is what
+# bounds a caller who vanished without saying so.
+socket2 = "0.6"
 regex = "1"
 inventory = "0.3"
 url = "2"

@@ -298,11 +298,13 @@ pub async fn task_enqueue_dedup(
     match caller.role {
         Role::Worker => {
             // Workers enqueue control-plane work for the dispatcher
-            // to handle: register a wake signal, provision infra,
+            // to handle: register a wake signal, give birth to the
+            // execution a live caller arrived for, provision infra,
             // and durable side-effect records (cost + log) that must
             // survive the worker pod dying.
             if ![
                 TaskKind::RegisterSignal.as_str(),
+                TaskKind::LiveArrival.as_str(),
                 TaskKind::RecordCost.as_str(),
                 TaskKind::RecordLog.as_str(),
             ]

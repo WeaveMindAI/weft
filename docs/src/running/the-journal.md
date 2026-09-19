@@ -94,6 +94,28 @@ journals no payloads: it keeps them in memory for the consumers reading it,
 and its window row carries only a count and a byte total per sender per
 message kind, plus the window's offset range.
 
+**A caller conversation**, an HTTP route or a socket, works exactly the same
+way and by the same rules, because it is the same code deciding. One row per
+second holds every message of that second in both directions, the caller's
+and the program's, so a socket at fifty messages a second is one row rather
+than fifty. Connecting, erroring and disconnecting cost a row each. Set
+`journalEphemeral` on the trigger and only the sizes and counts are kept.
+
+Three things are true of both, and of anything else the language grows that
+carries a stream of messages:
+
+- Content over **100 KB** is recorded trimmed, never whole. The trim keeps the
+  shape and cuts the long text fields, so a row still reads as what it was
+  about, and the true size travels beside it. Nothing is refused for being
+  big; what a channel carries and what the journal keeps of it are separate
+  questions.
+- **Raw bytes are never written down**, whatever the setting says. The size is
+  the whole of what is worth keeping: the content would be a third bigger as
+  text and unreadable to whoever is looking at it.
+- **Ephemeral means metadata only**, and the content then lives only in that
+  channel's own in-memory window. Once the window rolls past, it is gone;
+  there is no copy in the database to fall back on.
+
 **Streams** write one emitted and one consumed row per item, so a stream of
 ten million items writes twenty million rows. We are building the same
 windowing for streams; for where that stands, go and read [the

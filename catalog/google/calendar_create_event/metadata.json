@@ -47,19 +47,16 @@
       "name": "description",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Description"
     },
     {
       "name": "location",
       "type": "String",
-      "required": false,
       "label": "Location"
     },
     {
       "name": "attendees",
       "type": "List[String]",
-      "required": false,
       "description": "Attendee email addresses; they receive invitations."
     }
   ],

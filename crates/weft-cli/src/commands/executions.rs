@@ -5,22 +5,48 @@
 use super::{local_time, Ctx};
 use crate::commands::daemon::ClusterBackend;
 
+/// A value put into a query string. A node id is the author's own
+/// spelling, so it can hold anything they typed; only the handful of
+/// characters that would end the value or start another parameter have
+/// to move, and everything else stays readable in a log line.
+fn query_escaped(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '&' => "%26".to_string(),
+            '=' => "%3D".to_string(),
+            '#' => "%23".to_string(),
+            '+' => "%2B".to_string(),
+            '%' => "%25".to_string(),
+            ' ' => "%20".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 /// One page of the dispatcher's execution listing. The body is
 /// `{"executions": [...], "total": N}`; anything else is a broken
 /// contract and fails loudly rather than reading as "no executions".
 async fn executions_page(
     client: &crate::client::DispatcherClient,
-    limit: u32,
-    offset: u64,
-    project: Option<&str>,
-    phase: Option<&str>,
+    filter: &ListFilter,
 ) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
-    let mut path = format!("/executions?limit={limit}&offset={offset}");
-    if let Some(p) = project {
+    let mut path =
+        format!("/executions?limit={}&offset={}", filter.limit, filter.offset);
+    if let Some(p) = &filter.project {
         path.push_str(&format!("&project_id={p}"));
     }
-    if let Some(p) = phase {
-        path.push_str(&format!("&phase={p}"));
+    if let Some(p) = filter.phase {
+        path.push_str(&format!("&phase={}", p.as_str()));
+    }
+    if let Some(node) = &filter.node {
+        path.push_str(&format!("&entry_node={}", query_escaped(node)));
+    }
+    if let Some(since) = filter.since {
+        path.push_str(&format!("&started_after={since}"));
+    }
+    if let Some(status) = &filter.status {
+        path.push_str(&format!("&status={status}"));
     }
     let resp: serde_json::Value = client.get_json(&path).await?;
     let rows = resp
@@ -37,15 +63,26 @@ async fn executions_page(
     Ok((rows, total))
 }
 
-pub async fn list(
-    ctx: Ctx,
-    limit: u32,
-    project: Option<String>,
-    phase: Option<weft_core::context::Phase>,
-) -> anyhow::Result<()> {
+/// What `weft executions` narrows the listing to. One struct rather
+/// than six positional arguments, so adding the next filter does not
+/// re-thread every call site.
+#[derive(Debug, Clone)]
+pub struct ListFilter {
+    pub limit: u32,
+    pub offset: u32,
+    pub project: Option<String>,
+    pub phase: Option<weft_core::context::Phase>,
+    /// The node whose firing started the run.
+    pub node: Option<String>,
+    /// Unix second: only runs that started at or after it.
+    pub since: Option<u64>,
+    /// How the run ended: completed, failed, cancelled, or running.
+    pub status: Option<String>,
+}
+
+pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
     let client = ctx.client();
-    let (arr, total) =
-        executions_page(&client, limit, 0, project.as_deref(), phase.map(|p| p.as_str())).await?;
+    let (arr, total) = executions_page(&client, &filter).await?;
     if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
         return Ok(());
     }
@@ -84,8 +121,9 @@ pub async fn list(
     if (arr.len() as u64) < total {
         println!(
             "showing {} of {total} (one page; the dispatcher caps how many a page can hold, \
-             so read the rest through the API)",
-            arr.len()
+             so walk the rest with --offset {}, or narrow with --node / --since)",
+            arr.len(),
+            filter.offset as u64 + arr.len() as u64
         );
     }
     Ok(())
@@ -201,13 +239,46 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
     };
     let node = row_node(row).unwrap_or("");
     let mut line = format!("{at} {kind:<23} {node}");
-    let Some(fields) = row.as_object() else {
-        return line;
-    };
-    for (key, value) in fields {
-        // An absent value and an empty one say the same nothing: a
-        // `frames=[]` on every root-level firing is noise in the column
-        // the reader is scanning.
+    if silent_completion(row) {
+        // An empty output is dropped by the tail below, exactly like
+        // every other empty field, which left this line identical to a
+        // node that emitted plenty. It is not: every port closed, so
+        // everything downstream of it skipped, and whoever is reading
+        // this is usually reading it because a value never arrived.
+        line.push_str("  output=(nothing emitted)");
+    }
+    for (key, value) in printed_fields(row) {
+        line.push_str(&format!("  {key}={}", field_text(value, full)));
+    }
+    line
+}
+
+/// A firing that completed without emitting on any port. The run is not
+/// wrong (a node may decide it has nothing to say) but the consequence
+/// is total: every output closes and the whole branch behind it skips.
+/// The row carries `output` as null or an empty object depending on the
+/// path that built it, and both mean the same nothing here.
+fn silent_completion(row: &serde_json::Value) -> bool {
+    if row.get("kind").and_then(|v| v.as_str()) != Some("node_completed") {
+        return false;
+    }
+    match row.get("output") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// The fields one row shows in its generic tail: everything it carries
+/// except the columns printed in their own place, and except the ones
+/// saying nothing (an absent value and an empty one say the same
+/// nothing, and a `frames=[]` on every root-level firing is noise in
+/// the column the reader is scanning).
+///
+/// One reader, so what a line prints and what counts as cut can never
+/// disagree.
+fn printed_fields(row: &serde_json::Value) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+    row.as_object().into_iter().flatten().filter(|(key, value)| {
         let empty = match value {
             serde_json::Value::Null => true,
             serde_json::Value::Array(items) => items.is_empty(),
@@ -215,12 +286,18 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
             serde_json::Value::String(text) => text.is_empty(),
             _ => false,
         };
-        if COLUMNS.contains(&key.as_str()) || empty {
-            continue;
-        }
-        line.push_str(&format!("  {key}={}", field_text(value, full)));
-    }
-    line
+        !COLUMNS.contains(&key.as_str()) && !empty
+    })
+}
+
+/// Whether the compact line for this row had to cut a value short.
+///
+/// The cut is silent, and the value it cuts is often the exact thing
+/// being chased (a reply body, a model's answer). So the reader is told
+/// `--full` exists at the one moment it would help, instead of
+/// abandoning the journal for `curl`.
+pub fn any_value_cut(row: &serde_json::Value) -> bool {
+    printed_fields(row).any(|(_, value)| field_text(value, true).chars().count() > SUMMARY_CHARS)
 }
 
 /// One field of a replay row as the line shows it: a string bare (an
@@ -284,6 +361,9 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
     }
     for row in &kept {
         println!("{}", event_line(row, filter.full));
+    }
+    if !filter.full && kept.iter().any(any_value_cut) {
+        println!("(some values were cut to fit; `--full` prints them whole, `--json` for a tool)");
     }
     Ok(())
 }
@@ -466,15 +546,24 @@ pub async fn clean(
     let mut count = 0usize;
     let mut swept = 0usize;
     loop {
-        let mut offset = 0u64;
+        let mut offset = 0u32;
         let mut deleted_this_pass = 0usize;
         loop {
-            let (rows, total) =
-                executions_page(&client, 200, offset, project.as_deref(), None).await?;
+            // The sweep wants every run, so it narrows by project only.
+            let page = ListFilter {
+                limit: 200,
+                offset,
+                project: project.clone(),
+                phase: None,
+                node: None,
+                since: None,
+                status: None,
+            };
+            let (rows, total) = executions_page(&client, &page).await?;
             if rows.is_empty() {
                 break;
             }
-            let fetched = rows.len() as u64;
+            let fetched = rows.len() as u32;
             for row in rows {
                 let Some(color) = row.get("color").and_then(|v| v.as_str()) else { continue };
                 let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -503,7 +592,7 @@ pub async fn clean(
                 }
             }
             offset += fetched;
-            if offset >= total {
+            if u64::from(offset) >= total {
                 break;
             }
         }
@@ -1026,6 +1115,46 @@ mod tests {
     /// The compact line cuts a long value at the summary width on a
     /// character boundary; `full` prints it whole; and everything the
     /// row carries reaches the line, including the fields only one
+    /// A node that completed without emitting says so on its own line.
+    ///
+    /// The generic tail drops empty fields, which is right for almost
+    /// everything and wrong for exactly this: a firing that emitted
+    /// nothing closed every one of its ports, so the whole branch behind
+    /// it skipped. Without the words, the line is indistinguishable from
+    /// a node that emitted plenty, and the person reading is usually
+    /// reading BECAUSE a value never arrived.
+    #[test]
+    fn a_completion_that_emitted_nothing_says_so() {
+        for output in [json!({}), json!(null)] {
+            let row = json!({
+                "kind": "node_completed", "node": "pick",
+                "at_unix": 1_756_838_207u64, "output": output,
+            });
+            let line = event_line(&row, false);
+            assert!(line.contains("(nothing emitted)"), "{line}");
+        }
+        // Absent entirely is the same nothing.
+        let bare = json!({ "kind": "node_completed", "node": "pick", "at_unix": 1_756_838_207u64 });
+        assert!(event_line(&bare, false).contains("(nothing emitted)"));
+
+        // A node that emitted is untouched, and says nothing about silence.
+        let spoke = json!({
+            "kind": "node_completed", "node": "pick",
+            "at_unix": 1_756_838_207u64, "output": {"value": 1},
+        });
+        let line = event_line(&spoke, false);
+        assert!(!line.contains("nothing emitted"), "{line}");
+        assert!(line.contains("output="), "{line}");
+
+        // Only completions: a skip carries its own reason and says why
+        // already, so the words would be noise on top of a better line.
+        let skipped = json!({
+            "kind": "node_skipped", "node": "pick",
+            "at_unix": 1_756_838_207u64, "reason": {"kind": "did_not_flow"},
+        });
+        assert!(!event_line(&skipped, false).contains("nothing emitted"));
+    }
+
     /// kind has.
     #[test]
     fn event_line_summarises_and_expands() {
@@ -1094,5 +1223,30 @@ mod tests {
             busy.report("stale worker image(s)"),
             "removed 1 stale worker image(s), 1 already reclaimed, 3 still in use (kept)"
         );
+    }
+}
+
+#[cfg(test)]
+mod cut_notice_tests {
+    use serde_json::json;
+
+    use super::any_value_cut;
+
+    /// The cut is silent, and the value it cuts is usually the one
+    /// being chased. The line telling the reader `--full` exists has to
+    /// appear exactly when something was cut, and not otherwise: a
+    /// notice on every run is noise nobody reads.
+    #[test]
+    fn a_row_says_whether_it_lost_anything() {
+        let long = json!({ "kind": "node_completed", "output": { "text": "x".repeat(400) } });
+        assert!(any_value_cut(&long));
+
+        let short = json!({ "kind": "node_completed", "output": { "text": "ok" } });
+        assert!(!any_value_cut(&short));
+
+        // A long value in a column printed in its own place is not part
+        // of the tail, so it cannot be what was cut.
+        let column = json!({ "kind": "node_completed", "node": "n".repeat(400) });
+        assert!(!any_value_cut(&column));
     }
 }

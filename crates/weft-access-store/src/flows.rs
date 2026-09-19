@@ -93,6 +93,10 @@ pub async fn list_grants(
                     door: door_of(&door)?,
                     expires_at,
                     value_names,
+                    // A stored credential is one; a runtime-owned row's
+                    // is the broker's to confirm (the dispatcher's
+                    // listing asks it and overwrites this).
+                    has_credential: owner_of(&owner)? == CredentialOwner::TheirOwn,
                 })
             },
         )
@@ -525,6 +529,9 @@ async fn insert_grant(
             door: grant.door,
             expires_at: grant.expires_at,
             value_names: grant.values.keys().cloned().collect(),
+            // A connect that just completed was gated on its credential
+            // existing (the broker refuses a shared-key connect without one).
+            has_credential: true,
         },
     })
 }
@@ -1203,6 +1210,7 @@ async fn finish_connect(
             door,
             expires_at,
             value_names: values.keys().cloned().collect(),
+            has_credential: true,
         },
     })
 }

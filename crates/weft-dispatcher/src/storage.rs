@@ -216,8 +216,8 @@ pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
 /// [`LinkBase::for_request`], built from that request's own host, so
 /// the link comes back on whichever of this install's addresses the
 /// caller is already using. There is deliberately no default: one
-/// install answers on several addresses at once (a loopback
-/// port-forward, a tunnel's public name, an ingress host), so a link
+/// install answers on several addresses at once (the operator's
+/// loopback, a tunnel's public name, an ingress host), so a link
 /// built from a configured constant is wrong for every client that
 /// arrived at one of the others, and that failure is invisible until
 /// someone clicks the link.
@@ -231,7 +231,7 @@ pub async fn download_link(
         state,
         "/v1/storage/admin/download-link",
         "download-link",
-        &PresignRequest { key: key.to_string(), ttl_secs },
+        &PresignRequest { key: key.to_string(), ttl_secs, reach: weft_core::storage::LinkReach::default() },
     )
     .await?;
     Ok(PresignResult {

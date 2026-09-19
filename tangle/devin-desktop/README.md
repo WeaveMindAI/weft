@@ -18,7 +18,7 @@ workspace rule file at 12,000 characters, and Tangle is about 30,000, so a
 single file would be silently truncated. The split falls on section
 boundaries, so each file is whole ideas rather than a cut sentence.
 
-**No subagent file format exists here**, so the six specialists are skills
+**No subagent file format exists here**, so the five specialists are skills
 Tangle loads and becomes, exactly as in the Cline copy, with the same honest
 note at the top of each about what that costs.
 
@@ -38,7 +38,7 @@ workflow on its own.
 
 ## What is here
 
-Tangle is one persona plus fifteen skills, six specialists and six commands.
+Tangle is one persona plus sixteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

@@ -15,7 +15,6 @@
     {
       "name": "history",
       "type": "ChatHistory",
-      "required": false,
       "accepts": ["wire"],
       "description": "The conversation so far. Unwired, this message starts a new history."
     },
@@ -33,19 +32,16 @@
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "The message text."
     },
     {
       "name": "media",
       "type": "Media | List[Media]",
-      "required": false,
       "description": "Media attached to this message: one stored image, audio clip, or video, or a list of them."
     },
     {
       "name": "toolCallId",
       "type": "String",
-      "required": false,
       "description": "For role 'tool' only: the id of the tool call this message answers (from an LLM node's toolCalls output)."
     },
     {

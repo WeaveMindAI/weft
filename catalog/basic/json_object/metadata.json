@@ -1,0 +1,28 @@
+{
+  "type": "JsonObject",
+  "label": "Build an object",
+  "description": "Put values together into one object. Every input you wire onto it becomes a key of the same name, so `job: open.id` beside `status: \"running\"` is `{\"job\": \"...\", \"status\": \"running\"}`, and the keys come out in the order you wrote them. This is what a route's reply body wants, and what a request body wants on the way out: assembling one used to need a script whose whole job was `return {...}`. Nesting is this node inside this node: wire a `JsonObject`'s `object` onto a key of another. Its keys are required like any other port, so a branch that closed skips this node instead of quietly handing on a half-built object. A part that is genuinely optional is written `key?:`, and then it is left out of the object when nothing arrives rather than set to null, which makes a shape with optional parts one node instead of a branch per combination.",
+  "tags": [
+    "json",
+    "object",
+    "dict",
+    "build",
+    "body",
+    "payload",
+    "record"
+  ],
+  "icon": "Braces",
+  "color": "#0ea5e9",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "object",
+      "type": "JsonDict",
+      "description": "The object built from the wired inputs, keyed by input name, in written order. Wire it wherever a body or a payload is wanted; a port declaring a record type accepts it once the shape agrees."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true
+  },
+  "requires_infra": false
+}

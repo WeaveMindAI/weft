@@ -100,6 +100,26 @@ too, at the same moment. A group can hold a source of its own, a fixed
 `Text` or a node that reads the clock, and it fires once per start of the
 group: once for a plain group, once per iteration for a loop body.
 
+## A group that hands nothing back
+
+The arrow is optional. A group whose job ENDS inside it, writing the row,
+sending the message, uploading the file, has nothing to hand its caller, so
+it takes inputs and stops there:
+
+```weft
+archive = Group(db: Access, ready: Number) {
+  # Write the finished order to the warehouse
+  ...
+}
+```
+
+It still works like any other group. Its `_should_flow` still turns the whole
+thing off, and the compiler still builds the same two boundary nodes, the
+outgoing one simply carrying nothing.
+
+A loop has the same shape with its own name, the side-effect loop, over in
+[Loops](./loops.md).
+
 ## The description line
 
 The first line inside a group body, if it is a plain comment, is the group's

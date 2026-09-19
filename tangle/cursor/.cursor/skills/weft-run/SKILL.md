@@ -1,6 +1,6 @@
 ---
 name: weft-run
-description: "COMMAND, not reference: Build and run the weft program, then report what came out. Run this when the user asks for this step by name, optionally naming node ids to target. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Build and run the weft program, then report what came out. Run this when the user asks for this step by name, optionally naming node ids to target. The sixteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Run this project's program and report what actually came out.

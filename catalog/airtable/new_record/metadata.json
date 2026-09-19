@@ -116,6 +116,9 @@
       "description": "The new record's fields keyed by column name."
     }
   ],
+  "firesWith": {
+    "item": "{ id: String, createdTime?: String, fields?: JsonDict }"
+  },
   "features": {
     "isTrigger": true
   }

@@ -7,6 +7,11 @@
 //!   POST /process      run kind-specific logic for one fire,
 //!                      return a `ProcessOutcome` (value + target)
 //!                      for the dispatcher to journal on
+//!   POST /match_push   which of the offered signals a verified
+//!                      provider push feeds, and with what payload
+//!   POST /wake_by_hand what one signal wakes with when a person
+//!                      wakes it instead of waiting, or nothing when
+//!                      its kind cannot be woken that way
 //!   POST /render       render the consumer-facing payload for one
 //!                      token. Pure over the spec; called once at
 //!                      register time and the result cached on the
@@ -27,8 +32,9 @@ use serde_json::Value;
 
 use crate::kinds;
 use crate::protocol::{
-    ActionRequest, ActionResponse, DisplayRequest, DisplayResponse, ProcessOutcome,
-    ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest,
+    DisplayRequest, DisplayResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome,
+    ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest, WakeByHandRequest,
+    WakeByHandResponse,
 };
 use crate::ListenerState;
 
@@ -39,9 +45,10 @@ pub fn router(state: ListenerState) -> Router {
         .route("/register", post(register))
         .route("/unregister", post(unregister))
         .route("/process", post(process))
+        .route("/match_push", post(match_push))
+        .route("/wake_by_hand", post(wake_by_hand))
         .route("/render", post(render))
         .route("/display", post(display))
-        .route("/action", post(action))
         .route("/signals", get(list_signals))
         .route("/rehydrate", post(rehydrate_handler))
         .with_state(state)
@@ -107,11 +114,7 @@ async fn register(
         },
         match req.source {
             crate::protocol::RegisterSource::Fresh { prior_kind_state, prior_seq } => {
-                kinds::RoutingSource::Mint {
-                    secret_cache: state.secret_cache.clone(),
-                    prior_kind_state,
-                    prior_seq,
-                }
+                kinds::RoutingSource::Fresh { prior_kind_state, prior_seq }
             }
             crate::protocol::RegisterSource::Restore { routing, kind_state, seq } => {
                 kinds::RoutingSource::Restore { routing, kind_state, seq }
@@ -138,23 +141,8 @@ async fn display(
         .registry
         .get(&req.token)
         .ok_or((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)))?;
-    let display = kinds::compute_display(&req.token, &sig, &state.secret_cache);
+    let display = kinds::compute_display(&sig);
     Ok(Json(DisplayResponse { display }))
-}
-
-async fn action(
-    State(state): State<ListenerState>,
-    Json(req): Json<ActionRequest>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let (result, routing) = kinds::handle_action(
-        &req.token,
-        &req.kind,
-        req.payload,
-        &state.registry,
-        &state.secret_cache,
-    )
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(ActionResponse { result, routing }))
 }
 
 async fn unregister(
@@ -182,6 +170,34 @@ async fn process(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(outcome))
+}
+
+/// Which of the offered signals a verified provider push feeds.
+///
+/// The dispatcher has already done its half: taken the push at the
+/// public door, had the broker verify it, and narrowed the candidates to
+/// the signals hanging off the connections the broker named. This is the
+/// other half, and it is here because it reads a kind's own settings.
+async fn match_push(
+    State(state): State<ListenerState>,
+    Json(req): Json<MatchPushRequest>,
+) -> Json<MatchPushResponse> {
+    let matched = kinds::match_push(&req.push, &req.tokens, state.registry.clone());
+    Json(MatchPushResponse { matched })
+}
+
+/// What a signal wakes with when a person wakes it by hand.
+///
+/// The asking tier owns "may this be woken and by whom"; the payload is
+/// the KIND's, and minting one anywhere else would mean a second tier
+/// holding a kind's wake shape.
+async fn wake_by_hand(
+    State(state): State<ListenerState>,
+    Json(req): Json<WakeByHandRequest>,
+) -> Result<Json<WakeByHandResponse>, (StatusCode, String)> {
+    let payload = kinds::wake_by_hand(&req.token, state.registry.clone())
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(Json(WakeByHandResponse { payload }))
 }
 
 async fn list_signals(
@@ -215,8 +231,18 @@ async fn render(
     State(state): State<ListenerState>,
     Json(req): Json<RenderRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Two different failures, two different statuses. "This pod does not
+    // hold that token" is a 404 and means the caller should re-resolve
+    // the holder. "The spec is malformed" is a 400 and means the
+    // registration is wrong. They used to share the 404, so a form whose
+    // schema would not serialize was reported to the user as
+    // `/render returned 404 Not Found`, which reads as "no such signal":
+    // the one diagnosis that sends somebody looking in the wrong place.
+    if state.registry.get(&req.token).is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)));
+    }
     let rendered = kinds::render(&req.token, state.registry.clone())
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(rendered.unwrap_or(Value::Null)))
 }
 

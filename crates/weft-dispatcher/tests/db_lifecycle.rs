@@ -126,6 +126,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         consumer_payload: None,
         surface_kind: "task_callback".to_string(),
         mount_path: None,
+        mount_methods: Vec::new(),
         auth_kind: "none".to_string(),
         auth_config: None,
         kind_state: json!({}),
@@ -542,6 +543,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let kick = weft_journal::ExecEvent::NodeKicked {
         color,
         node_id: "entry".into(),
+        frames: Vec::new(),
         firing: true,
         payload: None,
         port_snapshot: None,
@@ -1424,4 +1426,398 @@ async fn a_failed_dispatch_restamps_its_head_in_place(pool: PgPool) {
         queue,
         "both refused restamps left the queue exactly as it was"
     );
+}
+
+/// A supervisor pod that is gone from the cluster while still owning
+/// projects used to be invisible to every sweep: `renew_owned` kept its
+/// lease fresh for as long as the dispatcher ran, and `reap_idle` only
+/// ever considers pods owning NOTHING. So its projects stayed leased to
+/// a pod that could never claim them, and every `weft infra start` on
+/// one waited for ever on an apply nothing would execute.
+///
+/// It is not a rare shape: `setup.sh` rebuilds the kind node whenever
+/// the cluster's shape changes, which destroys every supervisor at once
+/// and leaves the rows behind. That is how this was found.
+#[sqlx::test]
+async fn a_supervisor_the_cluster_no_longer_has_is_forgotten_and_its_projects_released(
+    pool: PgPool,
+) {
+    let (_journal, projects) = setup(&pool).await;
+    let sup = weft_dispatcher::supervisor_pool::SupervisorPool::new("weft-system".into());
+    let project = seed_claimable_project(&pool, &projects).await;
+
+    seed_supervisor_pod(&pool, "sup-gone", "disp-1", true).await;
+    seed_supervisor_pod(&pool, "sup-live", "disp-1", true).await;
+    sqlx::query(
+        "INSERT INTO infra_owner \
+         (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
+         VALUES ($1, 'sup-gone', 'weft-system', $2, $3)",
+    )
+    .bind(project.to_string())
+    .bind(TENANT)
+    .bind(weft_dispatcher::lease::now_unix() + 60)
+    .execute(&pool)
+    .await
+    .expect("seed infra_owner");
+
+    // The cluster answers with one of the two Deployments.
+    let kube = weft_platform_traits::FakeKube::new();
+    kube.set_workloads(
+        "weft-system",
+        vec![weft_platform_traits::WorkloadReplicaState {
+            kind: weft_platform_traits::WorkloadKind::Deployment,
+            name: "sup-live".into(),
+            namespace: "weft-system".into(),
+            desired: 1,
+            ready: 1,
+            // The label the pool's selector reads; the fake honours it
+            // the way kubectl's `-l` does.
+            labels: [("weft.dev/role".to_string(), "infra-supervisor".to_string())]
+                .into_iter()
+                .collect(),
+        }],
+    );
+
+    let forgotten = sup
+        .forget_vanished(kube.as_ref(), &pool, "disp-1")
+        .await
+        .expect("forget");
+    assert_eq!(forgotten, 1);
+    assert!(!supervisor_pod_exists(&pool, "sup-gone").await, "the vanished pod is forgotten");
+    assert!(supervisor_pod_exists(&pool, "sup-live").await, "the live one is untouched");
+
+    // Ownership is a lease, not the infrastructure: releasing it moves
+    // who is responsible so a live supervisor adopts the project, and
+    // touches nothing that is running.
+    let owners: Vec<(String,)> =
+        sqlx::query_as("SELECT supervisor_pod FROM infra_owner WHERE project_id = $1")
+            .bind(project.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("query infra_owner");
+    assert!(owners.is_empty(), "the project is free to be claimed again: {owners:?}");
+
+    // Idempotent: a second sweep with nothing vanished changes nothing.
+    assert_eq!(sup.forget_vanished(kube.as_ref(), &pool, "disp-1").await.expect("again"), 0);
+}
+
+/// Journal a fresh execution for `project`, the way production does
+/// (the `execution_color` index row rides the same transaction).
+async fn start_execution(journal: &PostgresJournal, project: Uuid) -> weft_core::Color {
+    let color = weft_core::Color::new_v4();
+    journal
+        .record_event(&weft_journal::ExecEvent::ExecutionStarted {
+            color,
+            project_id: project.to_string(),
+            entry_node: "start".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: Some("def-1".into()),
+            program: None,
+            node_test: false,
+            source_version: None,
+            subgraph: None,
+            seed: None,
+            at_unix: 1,
+        })
+        .await
+        .expect("ExecutionStarted");
+    color
+}
+
+async fn count(pool: &PgPool, sql: &str, color: weft_core::Color) -> i64 {
+    sqlx::query_scalar::<_, i64>(sql)
+        .bind(color.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// Everywhere one execution lives, so a table dropped from the erase
+/// list cannot ship quietly.
+async fn footprint(pool: &PgPool, color: weft_core::Color) -> i64 {
+    count(pool, "SELECT COUNT(*) FROM exec_event WHERE color = $1", color).await
+        + count(pool, "SELECT COUNT(*) FROM execution_color WHERE color = $1", color).await
+        + count(pool, "SELECT COUNT(*) FROM execution_tag WHERE color = $1", color).await
+        + count(pool, "SELECT COUNT(*) FROM trigger_setup WHERE color = $1", color).await
+        + count(pool, "SELECT COUNT(*) FROM signal WHERE color = $1 AND is_resume = TRUE", color)
+            .await
+}
+
+/// Removing a project frees the space its history took: every table an
+/// execution touches loses its rows, for every execution of that
+/// project and no other's.
+///
+/// This is the test the erase list needs, because a table left out of
+/// it fails silently. The rows are simply still there, on a path
+/// nobody runs twice, reachable by nothing.
+///
+/// The entry signal is the control: an execution's erase takes its
+/// RESUME tokens (they only mean anything inside that run) and leaves
+/// the project's registered entry points alone, which removal deals
+/// with separately.
+#[sqlx::test]
+async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let doomed = Uuid::new_v4();
+    let neighbour = Uuid::new_v4();
+    seed_project(&projects, doomed, "bin-A").await;
+    seed_project(&projects, neighbour, "bin-A").await;
+
+    let first = start_execution(&journal, doomed).await;
+    let second = start_execution(&journal, doomed).await;
+    let survivor = start_execution(&journal, neighbour).await;
+
+    // Everything else a run leaves behind, on the first colour.
+    let mut tx = pool.begin().await.unwrap();
+    weft_journal::tags::tag_execution_in(&mut tx, first, &["user_7".to_string()], 10, None)
+        .await
+        .expect("tag");
+    tx.commit().await.unwrap();
+    sqlx::query("INSERT INTO trigger_setup (project_id, color) VALUES ($1, $2)")
+        .bind(doomed.to_string())
+        .bind(first.to_string())
+        .execute(&pool)
+        .await
+        .expect("trigger_setup");
+    for (token, color, is_resume) in [
+        ("resume-tok", Some(first), true),
+        ("entry-tok", None, false),
+    ] {
+        sqlx::query(
+            "INSERT INTO signal \
+             (token, tenant_id, project_id, color, node_id, is_resume, spec_json, created_at) \
+             VALUES ($1, $2, $3, $4, 'wait', $5, '{}', 1)",
+        )
+        .bind(token)
+        .bind(TENANT)
+        .bind(doomed.to_string())
+        .bind(color.map(|c| c.to_string()))
+        .bind(is_resume)
+        .execute(&pool)
+        .await
+        .expect("signal");
+    }
+    assert!(footprint(&pool, first).await > 0, "the run left something behind to erase");
+
+    let erased = journal
+        .delete_project_executions(&doomed.to_string())
+        .await
+        .expect("erase the project's executions");
+    assert_eq!(erased, 2, "both of the project's executions");
+
+    assert_eq!(footprint(&pool, first).await, 0, "nothing of the first run is left");
+    assert_eq!(footprint(&pool, second).await, 0, "nothing of the second run is left");
+    assert!(footprint(&pool, survivor).await > 0, "the neighbour project is untouched");
+    let entry: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM signal WHERE token = 'entry-tok'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(entry, 1, "an entry signal is not an execution's to take");
+}
+
+/// The erase at removal is best-effort, because the project row is
+/// already gone by then and failing the answer would say the removal
+/// did not happen when it did. This is the retry path: executions
+/// whose project no longer exists are findable, and stop being
+/// findable once they are erased.
+#[sqlx::test]
+async fn executions_of_a_gone_project_can_be_found_again(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let gone = Uuid::new_v4();
+    let living = Uuid::new_v4();
+    seed_project(&projects, gone, "bin-A").await;
+    seed_project(&projects, living, "bin-A").await;
+    let orphan = start_execution(&journal, gone).await;
+    start_execution(&journal, living).await;
+
+    // While both projects exist there is nothing to sweep.
+    assert!(
+        journal.projects_with_orphan_executions().await.expect("sweep").is_empty(),
+        "an execution whose project is still there is not an orphan"
+    );
+
+    projects.remove(gone).await.expect("remove the project row");
+    let orphaned = journal.projects_with_orphan_executions().await.expect("sweep");
+    assert_eq!(orphaned, vec![gone.to_string()], "the gone project's executions are findable");
+
+    journal.delete_project_executions(&gone.to_string()).await.expect("erase");
+    assert_eq!(footprint(&pool, orphan).await, 0);
+    assert!(
+        journal.projects_with_orphan_executions().await.expect("sweep again").is_empty(),
+        "once erased there is nothing left to come back for"
+    );
+}
+
+/// Register an alive worker pod for `project`, the way a spawned worker
+/// does once it boots.
+async fn seed_worker_pod(pool: &PgPool, pod_name: &str, project: Uuid, binary_hash: &str) {
+    let now = weft_dispatcher::lease::now_unix();
+    sqlx::query(
+        "INSERT INTO worker_pod \
+         (pod_name, project_id, namespace, status, owner_dispatcher, \
+          last_heartbeat_unix, created_at_unix, binary_hash) \
+         VALUES ($1, $2, 'weft-workers', 'alive', 'disp-1', $3, $3, $4)",
+    )
+    .bind(pod_name)
+    .bind(project.to_string())
+    .bind(now)
+    .bind(binary_hash)
+    .execute(pool)
+    .await
+    .expect("seed worker_pod");
+}
+
+async fn pod_status(pool: &PgPool, pod_name: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status FROM worker_pod WHERE pod_name = $1")
+        .bind(pod_name)
+        .fetch_one(pool)
+        .await
+        .expect("worker_pod status")
+}
+
+/// A worker promised to a caller who has not arrived yet does not shut
+/// itself down, and goes as soon as the promise runs out.
+///
+/// This is the whole of what keeps a slow caller's ticket good. Nothing
+/// is queued when a caller is handed a ticket, by design, so every
+/// other query says the pod has no work and a pod with no work exits in
+/// half a minute. Before the promise existed, a caller on a bad
+/// connection followed a redirect to a machine that had already gone,
+/// holding a ticket that was still perfectly valid for another minute
+/// and a half.
+#[sqlx::test]
+async fn a_worker_promised_to_a_caller_does_not_shut_itself_down(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_worker_pod(&pool, "wp-live", project, "bin-A").await;
+    let store = weft_task_store::PostgresWorkerPodClient::new(pool.clone());
+
+    // With nothing promised and nothing queued, the pod is free to go.
+    // That is the behaviour the promise has to override, so prove it
+    // first: otherwise the test below passes on a pod that could never
+    // have exited anyway.
+    assert!(
+        weft_task_store::worker_pod::mark_done_if_idle(&pool, "wp-live").await.expect("cas"),
+        "an idle pod with nothing promised shuts itself down"
+    );
+
+    // A second pod, this time reserved for a caller.
+    seed_worker_pod(&pool, "wp-held", project, "bin-A").await;
+    let now = weft_dispatcher::lease::now_unix();
+    let reserved = weft_task_store::worker_pod::reserve_pod_for_caller(
+        &pool,
+        &project.to_string(),
+        weft_platform_traits::SATURATION_MEM_FRACTION,
+        Some("bin-A"),
+        now + 240,
+    )
+    .await
+    .expect("reserve")
+    .expect("a pod is available to reserve");
+    assert_eq!(reserved.0, "wp-held", "the only pod still alive is the one reserved");
+
+    assert!(
+        !weft_task_store::worker_pod::mark_done_if_idle(&pool, "wp-held").await.expect("cas"),
+        "a pod promised to a caller stays up"
+    );
+    assert_eq!(pod_status(&pool, "wp-held").await, "alive");
+
+    // The promise expires by itself: nothing clears it, and the next
+    // time the pod asks, it goes.
+    sqlx::query("UPDATE worker_pod SET held_until_unix = $2 WHERE pod_name = $1")
+        .bind("wp-held")
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .expect("age the promise");
+    assert!(
+        weft_task_store::worker_pod::mark_done_if_idle(&pool, "wp-held").await.expect("cas"),
+        "once the promise has run out the pod is free to go"
+    );
+    assert_eq!(pod_status(&pool, "wp-held").await, "done");
+
+    // The trait the worker itself calls goes through the same CAS.
+    assert!(
+        !weft_task_store::WorkerPodClient::mark_done_if_idle(&store, "wp-held")
+            .await
+            .expect("cas"),
+        "a pod already done never flips twice"
+    );
+}
+
+/// Choosing the pod and promising it to the caller are one act.
+///
+/// A caller is about to be handed a ticket naming this exact pod, and
+/// nothing else in the system knows they are coming, so a pod chosen
+/// but not yet promised is free to leave in the gap. Two callers
+/// pointed at one pod both extend the promise, and neither ever cuts
+/// it short.
+#[sqlx::test]
+async fn reserving_a_pod_promises_it_and_never_shortens_the_promise(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_worker_pod(&pool, "wp-one", project, "bin-A").await;
+    let now = weft_dispatcher::lease::now_unix();
+
+    let held_until = |pod: &str| {
+        let pool = pool.clone();
+        let pod = pod.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT held_until_unix FROM worker_pod WHERE pod_name = $1",
+            )
+            .bind(pod)
+            .fetch_one(&pool)
+            .await
+            .expect("held_until_unix")
+        }
+    };
+    assert_eq!(held_until("wp-one").await, 0, "a fresh pod is promised to nobody");
+
+    let project_id = project.to_string();
+    let reserve = |until: i64| {
+        let (pool, project_id) = (pool.clone(), project_id.clone());
+        async move {
+            weft_task_store::worker_pod::reserve_pod_for_caller(
+                &pool,
+                &project_id,
+                weft_platform_traits::SATURATION_MEM_FRACTION,
+                Some("bin-A"),
+                until,
+            )
+            .await
+        }
+    };
+    assert_eq!(reserve(now + 240).await.expect("reserve").unwrap().0, "wp-one");
+    assert_eq!(held_until("wp-one").await, now + 240);
+
+    // A caller arriving later pushes the promise out.
+    assert!(reserve(now + 300).await.expect("reserve").is_some());
+    assert_eq!(held_until("wp-one").await, now + 300);
+
+    // One arriving on the heels of the first does not pull it back in.
+    assert!(reserve(now + 250).await.expect("reserve").is_some());
+    assert_eq!(held_until("wp-one").await, now + 300, "a promise is never shortened");
+
+    // A pod built from another program is not this caller's to take,
+    // and there is nothing else: the handshake spawns instead.
+    assert!(
+        reserve_other(&pool, project, now + 240).await.is_none(),
+        "a pod running a different program cannot serve this caller"
+    );
+}
+
+async fn reserve_other(pool: &PgPool, project: Uuid, until: i64) -> Option<(String, String)> {
+    weft_task_store::worker_pod::reserve_pod_for_caller(
+        pool,
+        &project.to_string(),
+        weft_platform_traits::SATURATION_MEM_FRACTION,
+        Some("bin-OTHER"),
+        until,
+    )
+    .await
+    .expect("reserve")
 }

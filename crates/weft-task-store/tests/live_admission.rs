@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use weft_task_store::tasks::{
     self, claim_one, reclaim_orphaned_tasks, AdmittedPod, ClaimFilter, LiveAdmitOutcome,
-    SetupFailureOutcome,
 };
 use weft_task_store::worker_pod::{
     self, has_live_for_project, mark_dead, mark_done_if_idle, pick_admittable_for_project,
@@ -140,7 +139,10 @@ fn live_payload(color: &str) -> Value {
         "project_id": PROJECT,
         "color": color,
         "definition_hash": "hash-1",
-        "live_connection": { "kind": "live_socket", "config": {} }
+        "live_connection": {
+            "spec": { "kind": "socket", "config": {} },
+            "request": { "method": "GET", "path": "" }
+        }
     })
 }
 
@@ -176,18 +178,6 @@ async fn admit_live_execution(
         LiveAdmitOutcome::Admitted(pod) | LiveAdmitOutcome::AlreadyAdmitted(pod) => Some(pod),
         LiveAdmitOutcome::Saturated => None,
     })
-}
-
-/// Test rig over `tasks::delete_pending_live_execution_in`, in its own
-/// transaction (production commits the cancel terminals with it).
-async fn delete_pending_live_execution(
-    pool: &PgPool,
-    color: &str,
-) -> anyhow::Result<SetupFailureOutcome> {
-    let mut tx = pool.begin().await?;
-    let outcome = tasks::delete_pending_live_execution_in(&mut tx, color).await?;
-    tx.commit().await?;
-    Ok(outcome)
 }
 
 /// Count in-flight (pending/claimed) live-execute tasks pinned to a pod.
@@ -973,69 +963,6 @@ async fn draining_pod_exits_despite_busy_sibling(pool: PgPool) {
     // The busy sibling must NOT exit (it still owns the live execution).
     let busy_exit = mark_done_if_idle(&pool, "pod-busy").await.expect("idle");
     assert!(!busy_exit, "the busy sibling keeps running");
-}
-
-// ----- setup-failure cleanup (SetupFailureOutcome) -------------------------
-
-/// A pending (never-claimed) live execution: cleanup deletes it and reports
-/// `NoWorkerWillRun` (caller journals the cancel terminal).
-#[sqlx::test]
-async fn cleanup_pending_is_no_worker_will_run(pool: PgPool) {
-    setup(&pool).await;
-    alive_pod(&pool, "pod-a").await;
-    let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
-        .await
-        .expect("admit")
-        .expect("chosen");
-
-    let outcome = delete_pending_live_execution(&pool, &color)
-        .await
-        .expect("cleanup");
-    assert_eq!(outcome, SetupFailureOutcome::NoWorkerWillRun);
-    assert_eq!(live_load(&pool, "pod-a").await, 0, "pending task deleted");
-}
-
-/// A CLAIMED live execution: cleanup leaves it and reports `WorkerOwnsIt`.
-#[sqlx::test]
-async fn cleanup_claimed_is_worker_owns_it(pool: PgPool) {
-    setup(&pool).await;
-    alive_pod(&pool, "pod-a").await;
-    let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
-        .await
-        .expect("admit")
-        .expect("chosen");
-    let claimed = claim_one(
-        &pool,
-        "pod-a",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
-    )
-    .await
-    .expect("claim")
-    .expect("a task to claim");
-    assert_eq!(claimed.color.as_deref(), Some(color.as_str()));
-
-    let outcome = delete_pending_live_execution(&pool, &color)
-        .await
-        .expect("cleanup");
-    assert_eq!(
-        outcome,
-        SetupFailureOutcome::WorkerOwnsIt,
-        "a claimed task is left for the worker; the decode must not error"
-    );
-    assert_eq!(live_load(&pool, "pod-a").await, 1, "claimed task untouched");
-}
-
-/// No task at all (enqueue never committed): cleanup reports `NoWorkerWillRun`.
-#[sqlx::test]
-async fn cleanup_no_task_is_no_worker_will_run(pool: PgPool) {
-    setup(&pool).await;
-    let color = Uuid::new_v4().to_string();
-    let outcome = delete_pending_live_execution(&pool, &color)
-        .await
-        .expect("cleanup");
-    assert_eq!(outcome, SetupFailureOutcome::NoWorkerWillRun);
 }
 
 // ----- orphan recovery ------------------------------------------------------

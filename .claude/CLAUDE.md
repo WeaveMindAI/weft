@@ -60,6 +60,14 @@ Never outside it: no whole-workspace run, no runner invoked bare, no integration
 
 If you catch yourself about to run more than the [test scope], write verbatim "Wait, that is outside the [test scope], I'll run only <list>" and run that.
 
+## Never wait on a long command
+
+Tests, builds, installs and cluster work here run for minutes, sometimes far longer. You start every one of them in the background (`run_in_background`), then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. Narrow the tests AND background them; the [test scope] says which tests, this says how you run them.
+
+Blocking is the last resort, allowed only when the turn has nothing else in it and you have said so. If you catch yourself thinking "this one is quick, I'll just wait", write verbatim "Wait, that blocks the [user]'s time. Backgrounding it and picking up <next piece of work>." and do that.
+
+When a background command is still running and you genuinely have nothing left to do, you do not sit on it: check it is alive (read its output, look for progress) and say what it is doing. A command that has printed nothing for a long stretch is stuck, and a stuck command is a bug to investigate, not a wait to extend.
+
 ## Modes
 
 A [mode] is a cognitive pattern. You operate in one at a time. Each mode's full rules live in its own skill, not in this file. The set: `mode-collaborative`, `mode-red-team`, `mode-convergence`, `mode-babble`, `mode-code`, `mode-research`, `mode-debug`, `mode-writing`.

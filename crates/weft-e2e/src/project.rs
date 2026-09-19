@@ -240,6 +240,25 @@ impl Project {
         Ok(())
     }
 
+    /// Replace `placeholder` in every `.weft` file under `src/`, included
+    /// files too. Errors if no file carries it (the fixture and the test
+    /// disagree).
+    pub fn substitute_in_sources(&self, placeholder: &str, value: &str) -> Result<()> {
+        let mut touched = 0usize;
+        for path in weft_sources(&self.dir.join("src"))? {
+            let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            if !raw.contains(placeholder) {
+                continue;
+            }
+            std::fs::write(&path, raw.replace(placeholder, value)).with_context(|| format!("write {}", path.display()))?;
+            touched += 1;
+        }
+        if touched == 0 {
+            bail!("placeholder '{placeholder}' not found under {}; fixture and test disagree", self.dir.join("src").display());
+        }
+        Ok(())
+    }
+
     /// Replace the project's `main.weft` wholesale. Transition tests evolve
     /// ONE project through several graph shapes (no-infra -> infra -> trigger
     /// -> ...) exactly as a user editing source would; the next verb picks the
@@ -316,6 +335,14 @@ impl Project {
     /// derived from the project's fresh id (stable within a run, distinct across
     /// runs). Call BEFORE activate.
     pub fn unique_live_path(&self) -> Result<String> {
+        self.mount_at(&self.bare_live_path())
+    }
+
+    /// The bare path [`Self::unique_live_path`] would claim, without
+    /// claiming it. For a test that hands one project's path to a
+    /// SECOND project, which is the only way to build a collision the
+    /// compiler cannot see: two files, each fine on its own.
+    pub fn bare_live_path(&self) -> String {
         // First 12 hex of the id (sans hyphens): short, unique, path-safe.
         let suffix: String = self
             .id
@@ -324,10 +351,15 @@ impl Project {
             .chars()
             .take(12)
             .collect();
-        let path = format!("e2e-{suffix}");
+        format!("e2e-{suffix}")
+    }
+
+    /// Mount this project's live triggers at `path`, whoever chose it,
+    /// and answer the callable path.
+    pub fn mount_at(&self, path: &str) -> Result<String> {
         // The node config carries the BARE path; the dispatcher prefixes the
         // owning tenant when it stores + serves the mount path.
-        self.substitute_in_main("__E2E_PATH__", &path)?;
+        self.substitute_in_sources("__E2E_PATH__", path)?;
         // The test connects at the tenant-namespaced path (e2e tenant = local).
         Ok(format!("local/{path}"))
     }
@@ -371,6 +403,18 @@ impl Project {
     /// side effect, so teardown must still remove it.
     pub fn mark_registered(&mut self) {
         self.teardown.mark_registered();
+    }
+
+    /// Remove the project the way a user does, as the thing under
+    /// test rather than as teardown: `weft rm <id> --yes`. Teardown
+    /// then only has the temp directory left to clear.
+    pub async fn remove(&mut self) -> Result<String> {
+        let id = self.id.to_string();
+        let out = cli_ok(&self.dir, &["rm", &id, "--yes"])
+            .await
+            .with_context(|| format!("weft rm {id}"))?;
+        self.teardown.mark_removed();
+        Ok(out)
     }
 
     /// End-of-test teardown for a PASSING test: remove the project from the
@@ -443,6 +487,22 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every `.weft` file under `dir`, recursively, in a stable order.
+fn weft_sources(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            out.extend(weft_sources(&path)?);
+        } else if path.extension().is_some_and(|ext| ext == "weft") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Rewrite the `package.id` in the copy's `weft.toml` to `new_id`, preserving

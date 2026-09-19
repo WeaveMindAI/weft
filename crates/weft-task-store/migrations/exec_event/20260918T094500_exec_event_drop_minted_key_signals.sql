@@ -1,0 +1,25 @@
+-- A route or socket used to be gated by a key the listener minted: it
+-- generated one at register, kept the readable value in that pod's
+-- memory, and stored only its hash on the row as auth_kind='api_key'.
+-- Both halves of that are gone. A key now lives on a connection, the
+-- broker compares it, and the row says auth_kind='connection' with the
+-- connection it points at.
+--
+-- So an old row cannot be carried forward. There is nothing to migrate
+-- it TO: its stored hash was half a mechanism whose other half no
+-- longer exists, and the author never made a connection for it. The two
+-- tempting rewrites are both worse than this one. Calling it
+-- 'connection' leaves a row whose config is the wrong shape, so every
+-- call through it fails at the gate. Calling it 'none' silently
+-- unprotects an address the author chose to protect.
+--
+-- The row goes instead. Registrations are rebuilt by `weft activate`,
+-- so the address stops answering until the author activates again, at
+-- which point it registers with whatever auth is wired now. Quiet is
+-- the honest outcome: the protection they had does not exist any more.
+--
+-- Leaving them would be worse than any of it. The reader treats an
+-- unrecognised value as fatal while loading EVERY signal on a listener
+-- pod, and pods are shared, so one leftover row stops that pod booting
+-- and takes every other tenant's routes down with it.
+DELETE FROM signal WHERE auth_kind = 'api_key';

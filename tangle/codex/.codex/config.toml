@@ -1,14 +1,16 @@
 # Tangle's Codex settings.
 
 # The working loop runs unimpeded, but Codex has no per-command allow list:
-# approval is a policy. `on-request` keeps the loop moving while still putting
-# the money-spending and state-destroying calls in front of the user, which is
-# the same line the other assistants draw with an ask list.
+# approval is a policy. `on-request` keeps the loop moving and leaves it to the
+# mode the user chose whether a call is put in front of them: the other
+# assistants keep no ask list either, and Tangle asks in prose before the two
+# things that are the user's alone (a live-tier test that spends their money,
+# and any secret).
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
-# The six specialists run side by side: Tangle dispatches one node-smith per
+# The five specialists run side by side: Tangle dispatches one node-smith per
 # missing node and waits for all of them before wiring anything.
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 6
+max_concurrent_threads_per_session = 5

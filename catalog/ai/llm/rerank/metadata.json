@@ -30,7 +30,6 @@
     {
       "name": "topN",
       "type": "Number",
-      "required": false,
       "label": "Top N",
       "description": "Only return the best N. Empty = all, reordered."
     }

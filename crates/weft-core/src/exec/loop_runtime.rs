@@ -1067,6 +1067,7 @@ pub fn instantiate(
     // The loop's gate is consumed at the boundary, never broadcast into
     // the body (the LoopIn has no `_should_flow` inside output).
     input.remove(crate::exec::skip::SHOULD_FLOW_PORT);
+    input.remove(crate::exec::skip::SHOULD_NOT_FLOW_PORT);
     // LoopConfig lives on LoopIn ONLY (the compiler emits the minimal
     // `{"parentId": ...}` on LoopOut); LoopOut reads the config from
     // the runtime instance it shares with LoopIn.
@@ -1265,9 +1266,8 @@ pub fn classify_loop_out(
                 //   - absent from the bag        (port not wired)
                 //   - present as Value::Null     (no-value marker;
                 //     `check_input` in ready.rs treats Null as Ok
-                //     for any port AND maps non-matching values on
-                //     optional ports to Null via NullIt, so Null
-                //     is the normalized form of "no usable vote")
+                //     on an optional port, so Null is the form of
+                //     "no usable vote")
                 //   - present as a real bool     (the actual vote)
                 // A non-null non-bool value here is impossible
                 // post-type-check; if one slips through, fail loud

@@ -1,7 +1,7 @@
 {
   "type": "PostgresDatabase",
   "label": "Postgres: Database",
-  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and weft never sees it twice; if the connection holding it is ever lost, the node's card has a Reset password button. Terminating this node's infra deletes the disk and everything on it.",
+  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and hands it out exactly ONCE, to whoever asks first: until that happens the node's card shows it, masked, with a button to copy it, which is how something outside the program (a frontend keeping its own tables here) gets in. After a run takes it, the card shows only that it was handed over, and the way back is the card's Reset password button, which mints a new one and shows it again. Terminating this node's infra deletes the disk and everything on it.",
   "tags": [
     "postgres",
     "database",
@@ -22,7 +22,6 @@
     {
       "name": "database",
       "type": "String",
-      "required": false,
       "default": "app",
       "label": "Database name",
       "description": "The database created the first time this node starts. Changing it later creates nothing: the connection would then name a database that does not exist."
@@ -30,7 +29,6 @@
     {
       "name": "storage",
       "type": "String",
-      "required": false,
       "default": "10Gi",
       "label": "Disk size",
       "description": "How much disk the database gets, read once when it is first created. Changing it here later has no effect; growing a live volume is a manual operation on it, and shrinking one is not possible."
@@ -38,10 +36,16 @@
     {
       "name": "version",
       "type": "String",
-      "required": false,
       "default": "17",
       "label": "Postgres version",
       "description": "The major version to run. Changing it on an existing database will NOT migrate the data: Postgres refuses to start on a data directory written by another major version."
+    },
+    {
+      "name": "reachable",
+      "type": "Boolean",
+      "default": false,
+      "label": "Reachable from this machine",
+      "description": "Let something that is not part of this program connect to this database directly: a frontend you are building, a `psql` session, a tool that reads the tables. Off by default, and off means the database answers only inside the project. On, weft gives it an address on the machine the runtime runs on, and `weft infra list-doors` prints it. Never the internet, and on a local install never anything but this machine: the address is bound to loopback. Getting there still costs the password, which is why only the database's own port can be opened this way and the part that hands out credentials never can."
     }
   ],
   "outputs": [

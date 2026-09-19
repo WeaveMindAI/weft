@@ -11,7 +11,7 @@
 //! `weft_compiler.rs`); enrich does not consult the catalog for them
 //! (it `continue`s past these node types).
 
-use weft_core::exec::skip::SHOULD_FLOW_PORT;
+use weft_core::exec::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
 use weft_core::node::Accepts;
@@ -202,6 +202,16 @@ pub fn is_lowering_builtin(node_type: &str) -> bool {
     weft_core::project::boundary_types::is_boundary(node_type)
 }
 
+/// The message for a type the catalog does not serve: a node whose
+/// code is not written yet is named as such (the catalog saw its
+/// description), anything else is unknown.
+pub fn unknown_type_message(catalog: &dyn MetadataCatalog, node_type: &str) -> String {
+    match catalog.not_ready(node_type) {
+        Some(reason) => format!("node type '{node_type}' is not ready yet: {reason}"),
+        None => format!("unknown node type: '{node_type}'"),
+    }
+}
+
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
     enrich_with_policy(project, catalog, EnrichPolicy::Strict)
 }
@@ -223,6 +233,76 @@ pub fn enrich_with_policy(
             errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "),
         ))
     }
+}
+
+/// The two gate ports, which sit on EVERY node: the port that says
+/// whether it runs at all, and the same gate read the other way round.
+/// Unwired, `_should_flow`'s `true` default fills it and nothing
+/// changes; wired, a `false` or a closure skips the node.
+///
+/// They sit with the catalog ports because the node type owns them, not
+/// the instance, and the node body never sees them (the input bag drops
+/// them: the language's decision, not the node's data).
+///
+/// One port each rather than one port with a flag: a wire names the
+/// port it lands on, which is what makes the polarity visible in source
+/// and in the graph. A node uses ONE of them; wiring both is refused by
+/// validate.
+fn gate_inputs() -> [InputDefinition; 2] {
+    [
+        InputDefinition {
+            port: PortDefinition {
+                name: SHOULD_FLOW_PORT.to_string(),
+                // Its OWN type variable, never the node's `T`: a join whose
+                // branches carry Strings must not also force its permission
+                // to be a String.
+                port_type: WeftType::type_var("T__should_flow"),
+                // Optional: unwired and unset, the node runs. The skip rule
+                // reads this port itself, so a closure on it does not need
+                // the required-input rule to bite.
+                required: false,
+                description: Some(
+                    "Whether this node runs. A `false` value or a closed input skips it, \
+                     and everything downstream closes in turn."
+                        .to_string(),
+                ),
+                synthesized_from_carry: false,
+                declared_type: None,
+            },
+            // Both, and never switchable: `_should_flow` is the
+            // language's gate, and validate types its constant itself.
+            accepts: Accepts::both(),
+            widget: None,
+            default: None,
+            label: None,
+            placeholder: None,
+            from_spec: true,
+            requires_scopes: None,
+            requires_values: None,
+        },
+        InputDefinition {
+            port: PortDefinition {
+                name: SHOULD_NOT_FLOW_PORT.to_string(),
+                port_type: WeftType::type_var("T__should_not_flow"),
+                required: false,
+                description: Some(
+                    "Whether this node runs, read the other way round. A value here skips \
+                     it; a CLOSED input (the thing never happened) is what runs it."
+                        .to_string(),
+                ),
+                synthesized_from_carry: false,
+                declared_type: None,
+            },
+            accepts: Accepts::both(),
+            widget: None,
+            default: None,
+            label: None,
+            placeholder: None,
+            from_spec: true,
+            requires_scopes: None,
+            requires_values: None,
+        },
+    ]
 }
 
 /// Enrich, returning every failure with the SOURCE SPAN of the offending node
@@ -247,6 +327,33 @@ pub fn enrich_collecting(
     let incoming_wires = incoming_wires_by_node(project);
 
     for node in project.nodes.iter_mut() {
+        // An opaque `@include` node (interface parse only): its file's
+        // body is not in the graph, so the parser recorded which node
+        // types are in there and this settles what they MEAN against the
+        // catalog. Without it the editor reads an include as an empty box
+        // and hides the Activate button on a project whose only trigger
+        // is inside one. The include node itself gets neither
+        // `requires_infra` nor `is_trigger`: those drive real per-node
+        // work (a provisioned infra slot, a trigger's mount URL) and the
+        // alias is not the node that does it.
+        if let Some(contents) = &mut node.include_contents {
+            for node_type in &contents.node_types {
+                let Some(meta) = catalog.lookup(node_type) else { continue };
+                contents.requires_infra |= meta.requires_infra;
+                contents.has_trigger |= meta.features.is_trigger;
+            }
+            // The gate ports too, or the editor underlines
+            // `f._should_flow = x` on an include that the real build
+            // accepts: this interface parse is the only enrichment the
+            // include node gets, and structural validation runs on it.
+            let gates: Vec<InputDefinition> = gate_inputs()
+                .into_iter()
+                .filter(|gate| !node.inputs.iter().any(|p| p.name == gate.name))
+                .collect();
+            node.inputs.extend(gates);
+            continue;
+        }
+
         // Built-in boundary node-types. Their ports are written by the
         // compiler's lowering pass (Passthrough by group-flatten, LoopIn
         // / LoopOut by loop-lowering); enrich does not consult the
@@ -287,7 +394,7 @@ pub fn enrich_collecting(
                 errors.push(EnrichError {
                     span: node.header_span_or_default(),
                     file: node.source_file.clone(),
-                    message: format!("unknown node type: '{}'", node.node_type),
+                    message: unknown_type_message(catalog, &node.node_type),
                 });
             }
             continue;
@@ -353,42 +460,7 @@ pub fn enrich_collecting(
             catalog_outputs.extend(derived_outputs);
         }
 
-        // `_should_flow` is on EVERY node: the port that says whether it
-        // runs at all. Unwired, its `true` default fills it and nothing
-        // changes; wired, a `false` or a closure skips the node. It sits
-        // with the catalog ports because the node type owns it, not the
-        // instance, and the node body never sees it (the input bag drops
-        // it: it is the language's decision, not the node's data).
-        catalog_inputs.push(InputDefinition {
-            port: PortDefinition {
-                name: SHOULD_FLOW_PORT.to_string(),
-                // Its OWN type variable, never the node's `T`: a join whose
-                // branches carry Strings must not also force its permission
-                // to be a String.
-                port_type: WeftType::type_var("T__should_flow"),
-                // Optional: unwired and unset, the node runs. The skip rule
-                // reads this port itself, so a closure on it does not need
-                // the required-input rule to bite.
-                required: false,
-                description: Some(
-                    "Whether this node runs. A `false` value or a closed input skips it, \
-                     and everything downstream closes in turn."
-                        .to_string(),
-                ),
-                synthesized_from_carry: false,
-                declared_type: None,
-            },
-            // Both, and never switchable: `_should_flow` is the
-            // language's gate, and validate types its constant itself.
-            accepts: Accepts::both(),
-            widget: None,
-            default: None,
-            label: None,
-            placeholder: None,
-            from_spec: true,
-            requires_scopes: None,
-            requires_values: None,
-        });
+        catalog_inputs.extend(gate_inputs());
 
         // An ACCESS NODE (metadata carries the `service` recipe):
         // stamp the service name onto its `access` widget, so the
@@ -536,6 +608,7 @@ pub fn enrich_collecting(
         }
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
+        node.fires_with = meta.fires_with.clone();
         // A node that hands out a connection to something it runs
         // itself carries that service's recipe from here on. Resolved
         // now, against the WHOLE catalog, because the built worker
@@ -812,6 +885,12 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
 struct IncomingWire {
     target_port: String,
     span: Span,
+    /// The file the span is a position IN. The wire's own, not the
+    /// node's: `site.port = x` is written where the site is, and the
+    /// node it lands on may have been spliced in from an included file.
+    /// Pairing this span with that node's file points a squiggle at a
+    /// line number in the wrong buffer.
+    source_file: Option<String>,
 }
 
 /// Every wire's landing point, keyed by target node id. Built once
@@ -826,6 +905,7 @@ fn incoming_wires_by_node(
         by_node.entry(edge.target.clone()).or_default().push(IncomingWire {
             target_port: target_port.clone(),
             span: edge.span.unwrap_or_default(),
+            source_file: edge.source_file.clone(),
         });
     }
     by_node
@@ -885,9 +965,13 @@ fn created_input_ports(
             continue;
         }
         if is_output(&wire.target_port) {
+            // Both anchor halves from the WIRE, for the same reason the
+            // config branch below takes both from the entry: a span and
+            // a file that came from different places name a line in a
+            // buffer the line is not in.
             errors.push(EnrichError {
                 span: wire.span,
-                file: node.source_file.clone(),
+                file: wire.source_file.clone(),
                 message: output_takes_no_value(&wire.target_port),
             });
             continue;

@@ -65,7 +65,6 @@
       "name": "confirmedText",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Text after the decision",
       "description": "What the message becomes once someone clicked. Defaults to the original text plus who chose what."
     }

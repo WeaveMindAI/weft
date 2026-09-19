@@ -181,6 +181,7 @@
             ],
             features: Default::default(),
             requires_infra: false,
+            fires_with: Default::default(),
             images: vec![],
             published_service: None,
             span: None,
@@ -191,6 +192,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
 
@@ -235,6 +237,7 @@
             }],
             features: Default::default(),
             requires_infra: false,
+            fires_with: Default::default(),
             images: vec![],
             published_service: None,
             span: None,
@@ -245,6 +248,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
 
@@ -276,6 +280,7 @@
             }],
             features: Default::default(),
             requires_infra: false,
+            fires_with: Default::default(),
             images: vec![],
             published_service: None,
             span: None,
@@ -286,6 +291,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
 
@@ -308,6 +314,7 @@
             outputs: vec![],
             features: Default::default(),
             requires_infra: false,
+            fires_with: Default::default(),
             images: vec![],
             published_service: None,
             span: None,
@@ -318,6 +325,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
 
@@ -1058,6 +1066,7 @@
                 .collect(),
             features: Default::default(),
             requires_infra: false,
+            fires_with: Default::default(),
             images: vec![],
             published_service: None,
             span: None,
@@ -1068,6 +1077,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
         for port in &producer.outputs {
@@ -1111,12 +1121,12 @@
                 PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, images: vec![],
+            features: Default::default(), requires_infra: false, images: vec![], fires_with: Default::default(),
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
-            file_refs: Default::default(), include_path: None, source_file: None,
+            file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         // LoopOut carries only `{"parentId": ...}` (matches compiler).
         let loop_out_cfg = serde_json::json!({"parentId": group_id});
@@ -1134,12 +1144,12 @@
                 PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, images: vec![],
+            features: Default::default(), requires_infra: false, images: vec![], fires_with: Default::default(),
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
-            file_refs: Default::default(), include_path: None, source_file: None,
+            file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let body = NodeDefinition {
             id: body_id.clone(), node_type: "Concat".into(), label: None,
@@ -1158,12 +1168,12 @@
                 PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, images: vec![],
+            features: Default::default(), requires_infra: false, images: vec![], fires_with: Default::default(),
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
-            file_refs: Default::default(), include_path: None, source_file: None,
+            file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let consumer = NodeDefinition {
             id: consumer_id.clone(), node_type: "Sink".into(), label: None,
@@ -1173,12 +1183,12 @@
                 PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false, declared_type: None },
             ]),
-            outputs: vec![], features: Default::default(), requires_infra: false, images: vec![],
+            outputs: vec![], features: Default::default(), requires_infra: false, images: vec![], fires_with: Default::default(),
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
-            file_refs: Default::default(), include_path: None, source_file: None,
+            file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let edges = vec![
             // body reads element + carry from LoopIn.

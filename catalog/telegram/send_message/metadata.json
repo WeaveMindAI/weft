@@ -49,14 +49,12 @@
     {
       "name": "buttons",
       "type": "List[JsonDict]",
-      "required": false,
       "label": "Link buttons",
       "description": "Link buttons under the message: [{\"label\": \"Open\", \"url\": \"https://...\"}]."
     },
     {
       "name": "replyTo",
       "type": "Number",
-      "required": false,
       "label": "Reply to message id"
     }
   ],

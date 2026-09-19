@@ -130,7 +130,8 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- scale-down read; idle-exit (`mark_done_if_idle`) is gated by
             -- its pending/claimed-task `NOT EXISTS` check (any in-flight
             -- execution, live or not, is a worker task and so blocks
-            -- idle-exit).
+            -- idle-exit) and by `held_until_unix` (a caller who was
+            -- pointed here and has not arrived yet).
             binary_hash TEXT,
             -- The worker's last self-reported memory pressure
             -- (usage/limit, [0,1]), written on each heartbeat tick. The
@@ -158,6 +159,34 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- remaining in-flight work as a periodic breadcrumb, so a pod
             -- stuck draining is visible rather than silent.
             drained_at_unix BIGINT,
+            -- Unix time until which this pod is PROMISED to a caller who
+            -- has been pointed at it and has not arrived yet, so nothing
+            -- may take it away from them: it neither idle-exits
+            -- (`mark_done_if_idle`) nor becomes a scale-down drain target
+            -- (`pod_loads_for_project`, `projects_with_multiple_workers`).
+            -- Those three queries are every place the promise is read,
+            -- and they must stay in step: a pod held against the shutdown
+            -- but drained by the planner is worse than either alone,
+            -- because it stays alive and refuses the caller anyway.
+            -- 0 (the default) means nothing is promised.
+            --
+            -- A live caller's handshake picks ONE pod and hands the
+            -- caller a signed ticket naming it. Nothing is queued at
+            -- that moment on purpose (a caller who never follows the
+            -- redirect must leave nothing behind), so as far as every
+            -- other query goes the pod has no work, and a pod with no
+            -- work shuts itself down in half a minute. A caller on a
+            -- slow phone would then arrive at a machine that is gone,
+            -- holding a ticket that is still perfectly valid. This
+            -- column is the promise the ticket implies, written where
+            -- the shutdown decision already reads.
+            --
+            -- It reaches past the ticket's own expiry, so a caller who
+            -- is merely late still finds the worker and is told their
+            -- ticket has run out instead of meeting a dead socket. It
+            -- expires by itself, so nothing ever has to clear it, and
+            -- a second ticket only ever pushes it further out.
+            held_until_unix BIGINT NOT NULL DEFAULT 0,
             -- What the pod IS: 'worker' (runs the project's compiled
             -- graph and claims work) or 'node-test' (a short-lived
             -- test pod holding a broker identity, driven by its
@@ -471,6 +500,14 @@ pub async fn mark_dead(pool: &PgPool, pod_name: &str) -> Result<()> {
 /// Either way no exec is ever routed to a dying worker. Returns true if
 /// this call won the flip (caller should then exit).
 ///
+/// A pod PROMISED to a caller who has not arrived yet never wins the
+/// flip, whether it is draining or not (`held_until_unix`). Nothing is
+/// queued when a caller is handed a ticket, so without this the pod
+/// looks idle and shuts down under a caller who is merely slow. The
+/// promise expires by itself and the picker tries again after its next
+/// idle window, so a caller who never comes costs one warm pod for the
+/// life of their ticket and nothing after it.
+///
 /// "No more work" depends on whether the pod is DRAINING:
 ///   - NOT draining: no pending/claimed worker task for the whole
 ///     PROJECT. While the project has any work, a live worker stays warm
@@ -489,6 +526,7 @@ pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
            SET status = $2, terminal_at_unix = $3
            WHERE wp.pod_name = $1
              AND wp.status = 'alive'
+             AND wp.held_until_unix <= $3
              AND CASE WHEN wp.draining THEN
                  NOT EXISTS (
                      SELECT 1 FROM task t
@@ -537,28 +575,6 @@ pub async fn has_live_for_project(
     .fetch_optional(pool)
     .await?;
     Ok(row.is_some())
-}
-
-/// Look up the currently-alive worker pod for `project_id`. Returns
-/// the `(pod_name, namespace, binary_hash)` of the first match, or
-/// None when no pod is alive. Used by `spawn_pod` to decide whether
-/// to reuse the existing pod or replace it (when its binary_hash no
-/// longer matches the project's current `running_binary_hash`).
-pub async fn alive_pod_for_project_full(
-    pool: &PgPool,
-    project_id: &str,
-) -> Result<Option<(String, String, String)>> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
-           WHERE project_id = $1 AND status IN ('spawning', 'alive')
-             AND role = 'worker'
-           ORDER BY created_at_unix ASC
-           LIMIT 1"#,
-    )
-    .bind(project_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
 }
 
 /// EVERY currently-alive worker pod for `project_id` as
@@ -617,20 +633,89 @@ pub async fn pick_admittable_for_project<'e>(
     saturation: f64,
     binary_hash: Option<&str>,
 ) -> Result<Option<(String, String)>> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT pod_name, namespace FROM worker_pod
-           WHERE project_id = $1
+    admittable_pod_for_project(executor, project_id, saturation, binary_hash, None).await
+}
+
+/// [`pick_admittable_for_project`], narrowed to one pod when `pinned`
+/// names it: the answer is that pod with its namespace when it is
+/// admittable right now, `None` when it is not (gone, draining, or
+/// saturated since it was chosen). A live caller's handshake reserves
+/// the pod ([`reserve_pod_for_caller`]) and the birth on arrival admits
+/// to exactly that pod, since the caller is already standing at it.
+/// This read is that second look, and it changes nothing: the promise
+/// is already made and the arrival is what redeems it.
+pub async fn admittable_pod_for_project<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: &str,
+    saturation: f64,
+    binary_hash: Option<&str>,
+    pinned: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(&format!(
+        "SELECT pod_name, namespace FROM worker_pod
+         WHERE {ADMITTABLE} AND ($4::TEXT IS NULL OR pod_name = $4)
+         {BEST_FIRST} LIMIT 1"
+    ))
+    .bind(project_id)
+    .bind(saturation)
+    .bind(binary_hash)
+    .bind(pinned)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+/// What makes a worker pod able to take a new execution right now.
+/// Written once and shared by every query that asks, because "which
+/// pods can take work" drifting between the read and the reservation
+/// is how a caller ends up pointed at a pod that was never going to
+/// serve them. `$1` project, `$2` saturation, `$3` binary hash.
+const ADMITTABLE: &str = "project_id = $1
              AND status IN ('spawning', 'alive')
              AND role = 'worker'
              AND NOT draining
              AND mem_pressure < $2
-             AND ($3::TEXT IS NULL OR binary_hash = $3)
-           ORDER BY mem_pressure ASC, created_at_unix ASC, pod_name ASC
-           LIMIT 1"#,
-    )
+             AND ($3::TEXT IS NULL OR binary_hash = $3)";
+
+/// Emptiest first, then oldest, then by name so the choice is stable.
+const BEST_FIRST: &str = "ORDER BY mem_pressure ASC, created_at_unix ASC, pod_name ASC";
+
+/// Pick the pod a live caller will be served by AND promise it to them
+/// in the same breath, until `held_until_unix`.
+///
+/// One statement, because the two halves cannot be allowed to come
+/// apart: a pod picked and not yet held can shut down in the gap, and
+/// the caller would be handed a ticket naming a machine that is
+/// already going away. The update re-asserts the WHOLE [`ADMITTABLE`]
+/// predicate on the row it locks, not just that the pod still exists:
+/// a pod that started draining or filled up between the pick and the
+/// write yields `None` and the caller's handshake looks again, rather
+/// than promising a pod the arrival would refuse.
+///
+/// `held_until_unix` only ever moves forward: a second caller pointed
+/// at the same pod extends the promise, never shortens it.
+pub async fn reserve_pod_for_caller<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: &str,
+    saturation: f64,
+    binary_hash: Option<&str>,
+    held_until_unix: i64,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(&format!(
+        "UPDATE worker_pod
+         SET held_until_unix = GREATEST(held_until_unix, $4)
+         WHERE pod_name = (
+             SELECT pod_name FROM worker_pod
+             WHERE {ADMITTABLE}
+             {BEST_FIRST} LIMIT 1
+         )
+         AND {ADMITTABLE}
+         RETURNING pod_name, namespace"
+    ))
     .bind(project_id)
     .bind(saturation)
     .bind(binary_hash)
+    .bind(held_until_unix)
     .fetch_optional(executor)
     .await?;
     Ok(row)
@@ -638,8 +723,13 @@ pub async fn pick_admittable_for_project<'e>(
 
 /// Per-pod `(pod_name, mem_pressure)` for every ESTABLISHED worker of a
 /// project, the raw input to the dispatcher's scale-down planner.
-/// "Established" = alive (not still spawning) and not already draining: a
-/// pod mid-spawn or mid-drain is not a stable scale-down candidate.
+/// "Established" = alive (not still spawning), not already draining, and
+/// not promised to a caller who has not arrived: a pod mid-spawn or
+/// mid-drain is not a stable scale-down candidate, and a held pod is
+/// spoken for (see `held_until_unix`). The hold matters here more than
+/// anywhere else, because the reservation takes the EMPTIEST pod and the
+/// planner sheds the EMPTIEST pod, so without this predicate the planner
+/// would preferentially drain the very pod a caller was just pointed at.
 /// Returns raw tuples (NOT `PoolPodLoad`) so this crate stays free of a
 /// `weft-platform-traits` dependency; the dispatcher maps the tuples
 /// into the planner's shape at the call site.
@@ -650,9 +740,11 @@ pub async fn pod_loads_for_project(
     let rows: Vec<(String, f64)> = sqlx::query_as(
         r#"SELECT pod_name, mem_pressure FROM worker_pod
            WHERE project_id = $1 AND status = 'alive'
-             AND role = 'worker' AND NOT draining"#,
+             AND role = 'worker' AND NOT draining
+             AND held_until_unix <= $2"#,
     )
     .bind(project_id)
+    .bind(unix_now())
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -661,20 +753,22 @@ pub async fn pod_loads_for_project(
 /// Projects with more than one alive, NON-draining worker, the only
 /// scale-DOWN candidates (a single stable worker has nothing to
 /// consolidate; an already-draining worker is on its way out and is not
-/// a candidate). Cheap pre-filter so the scaledown sweep runs the
-/// planner only where it could act. The `NOT draining` predicate MUST
-/// match `pod_loads_for_project` exactly: if it didn't (e.g. counting a
-/// draining pod here), a project with one live + one draining worker
-/// would pass this gate but feed the planner a single pod, wasting a
-/// tick (the planner's own len() < 2 floor then no-ops). Same candidate
-/// set on both sides keeps this honest.
+/// a candidate; a pod held for a caller is spoken for). Cheap pre-filter
+/// so the scaledown sweep runs the planner only where it could act. The
+/// predicate MUST match `pod_loads_for_project` exactly: if it didn't
+/// (e.g. counting a draining or held pod here), a project with one free
+/// + one excluded worker would pass this gate but feed the planner a
+/// single pod, wasting a tick (the planner's own len() < 2 floor then
+/// no-ops). Same candidate set on both sides keeps this honest.
 pub async fn projects_with_multiple_workers(pool: &PgPool) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         r#"SELECT project_id FROM worker_pod
            WHERE status = 'alive' AND role = 'worker' AND NOT draining
+             AND held_until_unix <= $1
            GROUP BY project_id
            HAVING COUNT(*) > 1"#,
     )
+    .bind(unix_now())
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(p,)| p).collect())

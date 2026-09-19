@@ -37,7 +37,6 @@
     {
       "name": "source",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -60,13 +59,11 @@
     {
       "name": "filter",
       "type": "JsonDict",
-      "required": false,
       "description": "Notion filter JSON (developers.notion.com, 'Filter database entries')."
     },
     {
       "name": "sorts",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Notion sorts JSON."
     },
     {

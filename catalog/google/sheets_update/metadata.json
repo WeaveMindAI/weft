@@ -100,7 +100,6 @@
     {
       "name": "rowNumber",
       "type": "Number",
-      "required": false,
       "label": "Row number",
       "description": "The 1-based sheet row to overwrite (exactly one of rowNumber / range).",
       "widget": {
@@ -112,7 +111,6 @@
     {
       "name": "range",
       "type": "String",
-      "required": false,
       "label": "Range",
       "placeholder": "B2:D2",
       "description": "An A1 range inside the tab to write instead of a whole row (exactly one of rowNumber / range)."

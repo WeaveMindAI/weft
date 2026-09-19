@@ -333,6 +333,15 @@ pub struct RunSummary {
     pub status: String,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+    /// Why a cancelled run was cancelled. Defaulted so the CLI still
+    /// reads a tree from a dispatcher that predates the field.
+    #[serde(default)]
+    pub cancel_cause: Option<weft_core::exec::CancelCause>,
+    /// How many nodes never ran because something upstream closed. The
+    /// number a person wants when a run says it completed and the thing
+    /// they were waiting for never happened.
+    #[serde(default)]
+    pub skipped_nodes: u64,
 }
 
 pub async fn fetch_tree(client: &DispatcherClient, project_id: &str) -> Result<Tree> {
@@ -369,9 +378,30 @@ pub fn resolve_run<'a>(tree: &'a Tree, reference: &str) -> Result<&'a RunSummary
         many => bail!(
             "{reference} names {} runs ({}); give more characters",
             many.len(),
-            many.iter().map(|r| short(&r.color)).collect::<Vec<_>>().join(", ")
+            some_ids(many.iter().map(|r| r.color.as_str()))
         ),
     }
+}
+
+/// How many ambiguous matches an error names before it stops. An empty
+/// or one-character reference matches every run in the tree, and a
+/// hundred ids scroll the instruction that follows them off the screen.
+const AMBIGUOUS_SHOWN: usize = 5;
+
+/// The first few ids, shortened, with an ellipsis when there are more.
+/// One definition, because all three resolvers below report the same
+/// way and a list that is short in one of them is short in all.
+fn some_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    let mut shown: Vec<&str> = Vec::new();
+    let mut total = 0usize;
+    for id in ids {
+        total += 1;
+        if shown.len() < AMBIGUOUS_SHOWN {
+            shown.push(id);
+        }
+    }
+    let list = shown.into_iter().map(short).collect::<Vec<_>>().join(", ");
+    if total > AMBIGUOUS_SHOWN { format!("{list}, ...") } else { list }
 }
 
 /// The version `ref` names: a checkpoint label, a whole id, or the
@@ -385,7 +415,7 @@ pub fn resolve_version<'a>(tree: &'a Tree, reference: &str) -> Result<&'a Versio
         many => bail!(
             "{reference} labels {} versions ({}); name one by its id",
             many.len(),
-            many.iter().map(|v| short(&v.id)).collect::<Vec<_>>().join(", ")
+            some_ids(many.iter().map(|v| v.id.as_str()))
         ),
     }
     let matches: Vec<&VersionSummary> = tree.versions.iter().filter(|v| v.id.starts_with(reference)).collect();
@@ -395,7 +425,7 @@ pub fn resolve_version<'a>(tree: &'a Tree, reference: &str) -> Result<&'a Versio
         many => bail!(
             "{reference} names {} versions ({}); give more characters",
             many.len(),
-            many.iter().map(|v| short(&v.id)).collect::<Vec<_>>().join(", ")
+            some_ids(many.iter().map(|v| v.id.as_str()))
         ),
     }
 }
@@ -695,7 +725,19 @@ pub fn outside_facts(rows: &[Value]) -> OutsideFacts {
                     });
                 }
             }
-            Some("caller_inbound") => facts.caller.push(row.clone()),
+            // BOTH directions of the exchange, one entry per message.
+            // The journal folds a window of the conversation into a
+            // single row, so the messages come out of that row's
+            // `messages` list rather than one row each; each carries
+            // its own `direction`, which is what makes the answer
+            // readable beside the request. Recording the window rows
+            // whole instead would put the journal's batching into a
+            // file a person reads.
+            Some("caller_window") => {
+                if let Some(messages) = row.get("messages").and_then(|m| m.as_array()) {
+                    facts.caller.extend(messages.iter().cloned());
+                }
+            }
             _ => {}
         }
     }
@@ -1151,13 +1193,22 @@ mod tests {
             json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" }),
             json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t", "value": { "answer": "yes" } }),
             json!({ "kind": "node_resumed", "node": "crashed", "frames": [], "token": null, "value": null }),
-            json!({ "kind": "caller_inbound", "offset": 0, "payload": "hi" }),
+            // One window row carrying the whole short conversation,
+            // which is how the journal writes it: the messages come out
+            // of the row, not one row each.
+            json!({ "kind": "caller_window", "first_offset": 0, "last_offset": 1, "messages": [
+                { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payload_byte_size": 4, "at_unix": 1 },
+                { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payload_byte_size": 5, "terminal": true, "at_unix": 1 },
+            ], "totals": [], "at_unix": 1 }),
         ];
         let facts = outside_facts(&rows);
         assert_eq!(facts.answers.len(), 1, "a crash re-dispatch is not an answer");
         assert_eq!(facts.answers[0].payload, json!({ "answer": "yes" }));
         assert_eq!(facts.answers[0].question, Some(json!({ "prompt": "ok?" })));
-        assert_eq!(facts.caller.len(), 1);
+        assert_eq!(facts.caller.len(), 2, "both halves of the exchange, request AND answer");
+        let directions: Vec<&str> =
+            facts.caller.iter().filter_map(|m| m["direction"].as_str()).collect();
+        assert_eq!(directions, vec!["inbound", "outbound"], "each message says which way it went");
     }
 
     #[test]

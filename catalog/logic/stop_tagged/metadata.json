@@ -16,13 +16,11 @@
     {
       "name": "tags",
       "type": "List[String]",
-      "required": false,
       "description": "Tags to stop, as one list. Wired inputs of your own are tags too; the two add up."
     },
     {
       "name": "includeSelf",
       "type": "Boolean",
-      "required": false,
       "widget": {
         "kind": "checkbox"
       },

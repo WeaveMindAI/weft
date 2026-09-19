@@ -16,7 +16,7 @@
 db = PostgresDatabase
 
 create = PostgresExecuteQuery {
-  query: "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text)"
+  query: "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text, tag text)"
 }
 create.account = db.access
 
@@ -34,3 +34,26 @@ read.written = write.rows
 
 out = Debug
 out.data = read.rows
+
+# A value that may not be there. `maybe` declares `photo` and simply
+# never emits it (a key missing from the returned dict is no pulse), so
+# the port closes, the insert's OPTIONAL `photo?` input receives
+# nothing, and the query binds SQL NULL rather than refusing: the
+# author said the value may be absent, and absent is an answer. Before
+# this, a declared-but-silent input was indistinguishable from one
+# nobody wrote, and the query refused with "declare the port and wire
+# it" at a port that WAS declared and wired.
+maybe = ExecPython() -> (title: String, photo: String) {
+  code: "return {'title': 'no picture'}"
+}
+maybe._should_flow = create.rows
+
+optional = PostgresExecuteQuery(title: String, photo?: String) {
+  query: "INSERT INTO notes (body, tag) VALUES ($title, $photo) RETURNING body, tag"
+}
+optional.account = db.access
+optional.title = maybe.title
+optional.photo = maybe.photo
+
+absent = Debug
+absent.data = optional.rows

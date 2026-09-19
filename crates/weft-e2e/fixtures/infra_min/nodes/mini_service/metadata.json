@@ -8,7 +8,15 @@
   ],
   "icon": "Server",
   "color": "#22c55e",
-  "inputs": [],
+  "inputs": [
+    {
+      "name": "reachable",
+      "type": "Boolean",
+      "default": false,
+      "label": "Reachable from this machine",
+      "description": "Let a client that is not part of this program reach the sidecar directly, at an address on the machine the runtime runs on. Off by default; `weft infra list-doors` prints the address when it is on."
+    }
+  ],
   "outputs": [
     {
       "name": "endpointUrl",

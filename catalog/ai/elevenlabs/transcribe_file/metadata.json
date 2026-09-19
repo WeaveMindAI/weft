@@ -28,7 +28,6 @@
     {
       "name": "language",
       "type": "String",
-      "required": false,
       "label": "Language",
       "placeholder": "(auto-detect)",
       "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."

@@ -10,21 +10,42 @@ import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import type * as vscode from 'vscode';
 
-/** Thrown when `weft <args>` exits non-zero. Carries the captured
- *  stderr so the caller surfaces the CLI's actual reason. */
 /** The message of a CLI `phase: "error"` event, when `value` is one. */
-function jsonErrorMessage(value: unknown): string | undefined {
-  if (typeof value !== 'object' || value === null) return undefined;
-  const ev = value as { phase?: unknown; detail?: { message?: unknown } };
-  if (ev.phase !== 'error') return undefined;
-  return typeof ev.detail?.message === 'string' ? ev.detail.message : undefined;
+/// The error event a failing `--json` verb prints, as the fields this
+/// side reads off it.
+interface CliFailure {
+  message?: string;
+  /// The request never reached the daemon: it is not running, or was
+  /// never installed here. A FLAG rather than a sentence to match on,
+  /// because the sentence is wording and wording changes.
+  // SYNC: daemonUnreachable <-> crates/weft-cli/src/progress.rs report_plain_error
+  daemonUnreachable?: boolean;
 }
 
+function jsonFailure(value: unknown): CliFailure | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const ev = value as { phase?: unknown; detail?: CliFailure };
+  if (ev.phase !== 'error') return undefined;
+  const detail = ev.detail;
+  return {
+    message: typeof detail?.message === 'string' ? detail.message : undefined,
+    daemonUnreachable: detail?.daemonUnreachable === true,
+  };
+}
+
+/** Thrown when `weft <args>` exits non-zero. Carries the captured
+ *  stderr so the caller surfaces the CLI's actual reason. */
 export class WeftCliError extends Error {
   constructor(
     public readonly args: string[],
     public readonly code: number | null,
     public readonly stderr: string,
+    /// True when nothing answered at all: the daemon is not running, or
+    /// this machine only has the editor extension. Every verb fails the
+    /// same way until that is fixed, which is a different thing to tell
+    /// somebody than "that project is not registered", so it travels as
+    /// its own fact rather than as words inside `stderr`.
+    public readonly daemonUnreachable: boolean = false,
   ) {
     const reason = stderr.trim() ? stderr.trim() : `exited ${code}`;
     super(`weft ${args.join(' ')}: ${reason}`);
@@ -32,20 +53,24 @@ export class WeftCliError extends Error {
   }
 }
 
-/** Directory to invoke the `weft` CLI from, and the base for watching
- *  a project's `nodes/`, for a given document. The CLI walks up from
- *  here to find `weft.toml` (project-root resolution lives in the CLI,
- *  authoritatively; the extension does not re-implement it). The nodes
- *  watchers (graphView, diagnostics) treat this as the project root.
+/** Directory to invoke the `weft` CLI from, for a given document. The
+ *  CLI walks up from here to find `weft.toml` (project-root resolution
+ *  lives in the CLI, authoritatively; the extension does not
+ *  re-implement it).
  *
- *  Assumption: a `.weft` file sits at its project root, next to
- *  `weft.toml` and `nodes/`. True today (one `main.weft` per project).
- *  When multi-file projects land (`.weft` files in subdirs), the
- *  watchers' nodes-dir base would be wrong; resolve the actual root
- *  then, sharing the CLI's discovery rather than forking a second
- *  walk-up here. `path.dirname` handles the fs-root case (`/x.weft`
- *  -> `/`). One definition so every call site resolves identically. */
-export function projectDirOf(doc: vscode.TextDocument): string {
+ *  This is the document's OWN directory, which is only the project root
+ *  when the program sits at the top; a program under `src/` gets `src/`.
+ *  That is fine for a cwd, because the CLI walks up to `weft.toml`
+ *  itself, and it is what every caller here wants it for.
+ *
+ *  It is NOT the root, so never build a project-relative path on it. A
+ *  watcher once did (`nodes/**` against this) and watched `src/nodes/`,
+ *  a folder that does not exist, so a node package written while the
+ *  window was open never invalidated the warm catalog and every custom
+ *  node read as an unknown type. `findProjectRoot` answers that
+ *  question. `path.dirname` handles the fs-root case (`/x.weft` -> `/`).
+ *  One definition so every call site resolves identically. */
+export function docDirOf(doc: vscode.TextDocument): string {
   return path.dirname(doc.uri.fsPath);
 }
 
@@ -83,6 +108,9 @@ export function runWeftJson<T>(
             args,
             null,
             'weft CLI not found on PATH. Install it or add it to your PATH.',
+            // Nothing answered, for the same reason from the caller's
+            // side: weft is not on this machine, so no verb can work.
+            true,
           ),
         );
       } else {
@@ -104,7 +132,15 @@ export function runWeftJson<T>(
         // Under `--json` a failing verb prints one `phase: "error"`
         // event on stdout and nothing on stderr; the message lives in
         // its detail. Anything else on a failure is stderr's to tell.
-        reject(new WeftCliError(args, code, jsonErrorMessage(parsed) ?? stderr));
+        const failure = jsonFailure(parsed);
+        reject(
+          new WeftCliError(
+            args,
+            code,
+            failure?.message ?? stderr,
+            failure?.daemonUnreachable ?? false,
+          ),
+        );
         return;
       }
       reject(new Error(`weft ${args.join(' ')}: invalid JSON output`));

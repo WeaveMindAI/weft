@@ -150,13 +150,10 @@ impl Registry {
 /// Reads through the broker's `signal/list_for_pod` (the signals whose
 /// `listener_pod` is this pod) so the listener never opens a Postgres
 /// connection. Routing is REBUILT
-/// from the persisted columns (surface_kind, mount_path, auth_kind,
-/// auth_config), NOT recomputed from the kind impl. Recomputing
-/// would mint a fresh API key on every restart and silently
-/// invalidate the user's existing one. The plaintext is gone after
-/// a Pod restart (secret_cache is per-Pod by design); the user
-/// must explicitly regenerate via `/action` if they need plaintext
-/// access again.
+/// from the persisted columns (surface_kind, mount_path,
+/// mount_methods, auth_kind, auth_config), NOT recomputed from the
+/// kind impl: the row is the truth the dispatcher routes by, and a
+/// recompute could drift from it.
 ///
 /// Failures here are fatal: a malformed spec_json or unknown kind
 /// row means the schema is in an inconsistent state. We bail rather

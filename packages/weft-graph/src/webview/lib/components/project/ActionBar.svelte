@@ -240,6 +240,24 @@
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
+			case 'drain_wait': {
+				// The bar would otherwise keep saying "Deactivating
+				// triggers..." for as long as the running executions
+				// take, which is the exact stretch this event exists to
+				// explain. The cap is shown when the person set one, so
+				// a long wait reads as the wait they asked for.
+				const cap =
+					typeof detail?.capSeconds === 'number' ? ` (up to ${detail.capSeconds}s)` : '';
+				return `Waiting for running executions${cap}...`;
+			}
+			case 'warning': {
+				// Something the person should know that is not a failure:
+				// the verb carries on and still ends `complete`. Swallowing
+				// it left the bar showing the generic verb label and the
+				// message nowhere at all.
+				const message = typeof detail?.message === 'string' ? detail.message : '';
+				return message ? `Careful: ${message}` : 'Careful...';
+			}
 			case 'infra_wait': {
 				// The heartbeat of an unbounded wait (fires for start,
 				// stop, and terminate alike): show which verb waits and

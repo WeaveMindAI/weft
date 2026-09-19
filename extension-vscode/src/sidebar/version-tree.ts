@@ -4,6 +4,8 @@
 // an editor process; the provider only draws it.
 
 import { specScopedTo, type RunSpec } from '../../../packages/weft-graph/src/run-spec';
+import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
+import { describeOutcome } from './outcome';
 
 // SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-cli/src/commands/versions.rs Tree, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs), crates/weft-dispatcher/src/api/versions.rs TreeResponse, VersionSummary, RunSummary
 export interface TreeJson {
@@ -34,6 +36,10 @@ export interface RunSummary {
   status: string;
   started_at: number;
   completed_at: number | null;
+  /** For a cancelled run: who or what stopped it. */
+  cancel_cause?: CancelCause | null;
+  /** Node firings the run skipped. */
+  skipped_nodes?: number;
 }
 
 /** One version in the drawn tree. */
@@ -174,7 +180,7 @@ export function versionMarks(node: VersionTreeNode): string[] {
 
 /** A run's description: status, seed, scope, example. */
 export function runDescription(run: RunSummary, headRun: string | null): string {
-  const parts = [run.status];
+  const parts = [describeOutcome(run.status, run.cancel_cause, run.skipped_nodes)];
   if (run.seed_color) parts.push(`seed ${shortId(run.seed_color)} (${run.stale.length} stale)`);
   if (run.spec) parts.push(`spec ${run.spec.name}`);
   if (run.example) parts.push(`example ${run.example}`);

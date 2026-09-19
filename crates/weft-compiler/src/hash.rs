@@ -125,6 +125,13 @@ mod fs_hashes {
     /// participates in the binary / infra / builder-base hashes.
     pub const BUILDER_BASE_DOCKERFILE: &str = "deploy/docker/worker-builder-base.Dockerfile";
 
+    /// The script that Dockerfile runs to split the compiled artifacts
+    /// into its two image layers. Hashed with the Dockerfile for the
+    /// same reason: it decides what the baked image contains, so an
+    /// edit here must mint a new base tag rather than leave every host
+    /// holding an image built by the old rule.
+    pub const BUILDER_BASE_SPLIT_SCRIPT: &str = "deploy/docker/worker-builder-base-split.sh";
+
     /// Fold the worker build environment into `hasher`: the worker crate
     /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
     /// crates a worker build links), the workspace manifests + toolchain
@@ -152,11 +159,9 @@ mod fs_hashes {
         for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
-        hash_path(
-            hasher,
-            BUILDER_BASE_DOCKERFILE,
-            &weft_root.join(BUILDER_BASE_DOCKERFILE),
-        )?;
+        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT] {
+            hash_path(hasher, rel, &weft_root.join(rel))?;
+        }
         // The stdlib packages' dependency declarations. The builder base
         // compiles the stock worker, whose dependency tree (and the
         // feature unification of every shared crate in it) is the fixed

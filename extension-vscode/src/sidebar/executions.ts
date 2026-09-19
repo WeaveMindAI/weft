@@ -22,6 +22,8 @@ import {
   type TreeJson,
   type VersionTreeNode,
 } from './version-tree';
+import { describeOutcome, statusThemeIcon } from './outcome';
+import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
@@ -40,6 +42,12 @@ export interface ExecutionSummary {
   /** The tags the run put on itself (`ctx.tag_execution`), in claim
    *  order; the handle a sibling's `ctx.stop_tagged` selects on. */
   tags: string[];
+  /** For a cancelled run: who or what stopped it. Decides the row's
+   *  icon (a person stopping it is not the runtime cutting it). */
+  cancel_cause?: CancelCause | null;
+  /** Node firings the run skipped; said beside `completed`, never
+   *  drawn as a different icon (a skipped branch is a normal run). */
+  skipped_nodes?: number;
 }
 
 export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -475,6 +483,8 @@ export class RunNode extends vscode.TreeItem {
       started_at: run.started_at,
       completed_at: run.completed_at,
       tags: [],
+      cancel_cause: run.cancel_cause,
+      skipped_nodes: run.skipped_nodes,
     };
     this.description = runDescription(run, headRun);
     this.tooltip = new vscode.MarkdownString(
@@ -489,7 +499,7 @@ export class RunNode extends vscode.TreeItem {
       ].join('\n\n'),
     );
     this.contextValue = `weftRun-${run.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(run.status);
+    this.iconPath = statusThemeIcon(run.status, run.cancel_cause);
     this.command = { command: 'weft.viewExecution', title: 'View', arguments: [this] };
   }
 }
@@ -514,22 +524,17 @@ interface ExecutionPage {
 
 export class ExecutionNode extends vscode.TreeItem {
   constructor(public readonly summary: ExecutionSummary) {
-    const statusIcon = {
-      running: '$(sync~spin)',
-      completed: '$(check)',
-      failed: '$(error)',
-      cancelled: '$(circle-slash)',
-      corrupt: '$(warning)',
-    }[summary.status.toLowerCase()] ?? '$(circle-outline)';
     const started = new Date(summary.started_at * 1000).toLocaleString();
     // A corrupt row has no entry node (its journal payload no longer
-    // decodes); it is listed so the user can see and delete it.
+    // decodes); it is listed so the user can see and delete it. The
+    // icon is `iconPath` below, never text in the label (a codicon
+    // reference in a label renders as its literal `$(name)`).
     const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
-    super(`${statusIcon} ${name} (${started})`, vscode.TreeItemCollapsibleState.None);
+    super(`${name} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.color;
     const tags = summary.tags;
     const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';
-    this.description = `${summary.status}${tagged}`;
+    this.description = `${describeOutcome(summary.status, summary.cancel_cause, summary.skipped_nodes)}${tagged}`;
     this.tooltip = new vscode.MarkdownString(
       [
         `**exec** ${summary.color}`,
@@ -541,7 +546,7 @@ export class ExecutionNode extends vscode.TreeItem {
       ].join('\n\n'),
     );
     this.contextValue = `weftExecution-${summary.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(summary.status);
+    this.iconPath = statusThemeIcon(summary.status, summary.cancel_cause);
     this.command = {
       command: 'weft.viewExecution',
       title: 'View',
@@ -550,19 +555,3 @@ export class ExecutionNode extends vscode.TreeItem {
   }
 }
 
-function statusThemeIcon(status: string): vscode.ThemeIcon {
-  switch (status.toLowerCase()) {
-    case 'running':
-      return new vscode.ThemeIcon('sync~spin', new vscode.ThemeColor('charts.blue'));
-    case 'completed':
-      return new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
-    case 'failed':
-      return new vscode.ThemeIcon('error', new vscode.ThemeColor('errorForeground'));
-    case 'cancelled':
-      return new vscode.ThemeIcon('circle-slash');
-    case 'corrupt':
-      return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
-    default:
-      return new vscode.ThemeIcon('circle-outline');
-  }
-}

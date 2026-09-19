@@ -34,14 +34,12 @@
     {
       "name": "sourceLang",
       "type": "String",
-      "required": false,
       "label": "Source language",
       "description": "ISO code of the spoken language. Absent = auto-detect."
     },
     {
       "name": "numSpeakers",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 0,

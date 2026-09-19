@@ -1,13 +1,19 @@
 # Tangle
 
 Tangle is the AI builder that lives inside a weft project. It is not a
-product and not a plugin: it is a persona, fifteen skills, six specialists
+product and not a plugin: it is a persona, sixteen skills, five specialists
 and six commands, written as files that an AI coding assistant loads when
 the user opens the project.
 
 One folder here per assistant. `weft new <name> --assistant <one of them>`
-symlinks that folder's files into the new project, so a `git pull` of this
-checkout refreshes Tangle in every project that asked for it.
+copies that folder's files into the new project, where they are the
+project's own files and get committed with it. To move a project onto a
+newer Tangle, run `weft tangle update` in it.
+
+Copies rather than links, because an assistant treats a project's
+instructions as untrusted input: Kilo refuses outright to read an agent
+file that resolves outside the project, so a link into this checkout
+loads nothing and says nothing about why.
 
 | Folder | Assistant | Flag |
 |---|---|---|

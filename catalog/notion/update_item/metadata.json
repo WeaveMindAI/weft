@@ -37,13 +37,11 @@
     {
       "name": "properties",
       "type": "JsonDict",
-      "required": false,
       "description": "The columns to change, as Notion property values."
     },
     {
       "name": "archived",
       "type": "Boolean",
-      "required": false,
       "description": "true archives the row, false restores it."
     }
   ],

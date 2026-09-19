@@ -1,7 +1,7 @@
 //! Wake-signal kinds.
 //!
 //! A wake signal is "something the listener listens for on behalf of
-//! a node." Each kind (timer, form, sse_subscribe, api_endpoint, ...) is
+//! a node." Each kind (timer, form, sse_subscribe, route, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
 //! `ctx.await_signal(...)` (mid-execution resume). The framework
@@ -64,8 +64,8 @@ pub use socket_listen::{SocketFrame, SocketListen};
 pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
 #[cfg(feature = "runtime")]
 pub use live_connection::{
-    protocol_for_tag, ApiEndpoint, Backpressure, DataType, ErrorMode, JournalMode,
-    LiveConnectionConfig, LiveSocket, Protocol,
+    protocol_for_tag, Backpressure, DataType, ErrorMode, JournalMode, LiveConnectionConfig,
+    Protocol, Route, Socket, DEFAULT_CALLER_SILENCE_SECS,
 };
 
 #[cfg(feature = "runtime")]
@@ -90,7 +90,7 @@ use crate::primitive::{AccessRef, SignalSpec};
 /// `ExecutionContext` method the author called.
 #[cfg(feature = "runtime")]
 pub trait Signal: Serialize + DeserializeOwned + Sized {
-    /// Kind tag stored on the wire (`"timer"`, `"api_endpoint"`, ...).
+    /// Kind tag stored on the wire (`"timer"`, `"route"`, ...).
     /// Used to route incoming specs to the right handler in the
     /// listener.
     const TAG: &'static str;
@@ -339,11 +339,11 @@ mod tests {
         assert_eq!(
             tags,
             vec![
-                "api_endpoint",
                 "form",
-                "live_socket",
                 "poll_endpoint",
                 "provider_events",
+                "route",
+                "socket",
                 "socket_listen",
                 "sse_subscribe",
                 "stream_listen",
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn validate_spec_routes_to_kind() {
         let spec = SignalSpec::of_kind(
-            "api_endpoint",
+            "route",
             serde_json::json!({ "path": "/leading-slash", "auth": { "kind": "none" } }),
         );
         let err = validate_spec(&spec).expect_err("leading slash should fail");

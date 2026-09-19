@@ -27,8 +27,10 @@
 
 	let mode = $state<DeactivationSpec['mode']>('park');
 	let runningPolicy = $state<DeactivationSpec['runningPolicy']>('wait');
-	let graceMinutes = $state(15);
-	let drainTimeoutSecs = $state(DEFAULT_DRAIN_TIMEOUT_SECS);
+	// `number | null`: an emptied number input binds as null, and the
+	// confirm below reads that as "not chosen" rather than as zero.
+	let graceMinutes = $state<number | null>(15);
+	let drainTimeoutSecs = $state<number | null>(DEFAULT_DRAIN_TIMEOUT_SECS);
 
 	const MODES: Array<{ value: DeactivationSpec['mode']; label: string; detail: string }> = [
 		{
@@ -73,13 +75,25 @@
 		mode === 'wipe' ? 'cancel' : runningPolicy,
 	);
 
+	/// An emptied number box reads as `null` in Svelte, and sending that
+	/// as a 0 would be the opposite of what the box says: a "wait at most
+	/// 0 seconds" cancels every running execution at once under a Wait
+	/// label. An empty box means "I did not choose", so the field is left
+	/// out and the server's own default applies.
+	function chosen(value: number | null): number | undefined {
+		if (value === null || !Number.isFinite(value)) return undefined;
+		return Math.max(0, Math.floor(value));
+	}
+
 	function confirm() {
+		const grace = chosen(graceMinutes);
+		const drain = chosen(drainTimeoutSecs);
 		onConfirm({
 			mode,
 			runningPolicy: effectivePolicy,
-			...(mode === 'hibernate' ? { graceMinutes: Math.max(0, Math.floor(graceMinutes)) } : {}),
-			...(effectivePolicy === 'wait'
-				? { drainTimeoutSecs: Math.max(0, Math.floor(drainTimeoutSecs)) }
+			...(mode === 'hibernate' && grace !== undefined ? { graceMinutes: grace } : {}),
+			...(effectivePolicy === 'wait' && drain !== undefined
+				? { drainTimeoutSecs: drain }
 				: {}),
 		});
 	}

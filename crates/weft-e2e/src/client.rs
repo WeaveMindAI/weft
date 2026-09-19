@@ -24,9 +24,9 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Default dispatcher API base. The daemon port-forwards the dispatcher to
+/// Default dispatcher API base. The kind node maps the dispatcher to
 /// `127.0.0.1:9999`; override with `WEFT_DISPATCHER_URL` to match a
-/// non-default `WEFT_HTTP_PORT`.
+/// non-default `WEFT_DISPATCHER_PORT`.
 pub const DEFAULT_DISPATCHER_URL: &str = "http://127.0.0.1:9999";
 
 /// Mints the bearer a request authenticates with. With no auth, the default is

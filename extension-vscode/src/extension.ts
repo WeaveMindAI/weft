@@ -18,7 +18,7 @@ import * as vscode from 'vscode';
 import * as nodePath from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { DispatcherClient } from './dispatcher';
+import { DispatcherClient, HttpError } from './dispatcher';
 import { GraphViewController } from './graphView';
 import { attachDiagnostics } from './diagnostics';
 import { ParseServer } from './parseServer';
@@ -30,7 +30,7 @@ import { ActionBarStore } from './actionBarState';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
-import { runWeftJson } from './cli';
+import { runWeftJson, WeftCliError } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
@@ -52,6 +52,8 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push({ dispose: () => parseServer.dispose() });
 
   const projectsProvider = new ProjectsProvider();
+  // Its file watcher dies with the extension rather than outliving it.
+  context.subscriptions.push(projectsProvider);
   const executionsProvider = new ExecutionsProvider(dispatcher);
 
   // Single source of truth for which project the UI is "looking at".
@@ -240,6 +242,7 @@ export function activate(context: vscode.ExtensionContext) {
     graphView.forgetExecVersion();
   }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
+  graphView.setTreeVerbHandler((args) => treeVerb(args));
   graphView.setCliStatusHandler(() => refreshActionBarFromStatus());
   graphView.setStopActionHandler(() => stopAction());
   graphView.setDismissErrorHandler(() => {
@@ -598,7 +601,7 @@ export function activate(context: vscode.ExtensionContext) {
         actedOn = true;
       }
     }
-    const liveColor = actionBar.watchedLiveColor(projectId);
+    const liveColor = actionBar.watchedRunningColor(projectId);
     if (liveColor) {
       // HTTP cancel: lock the bar into "Cancelling..." until SSE
       // confirms. The dispatcher enqueues a cancel_execution task;
@@ -610,6 +613,12 @@ export function activate(context: vscode.ExtensionContext) {
       channel.appendLine(`> cancel execution ${liveColor}`);
       dispatcher.post(`/executions/${liveColor}/cancel`, {}).catch((err) => {
         channel.appendLine(`! cancel failed: ${err}`);
+        if (err instanceof HttpError && err.status === 409) {
+          // The run had already ended (its terminal event never
+          // reached us): it is finished, and the bar says so.
+          actionBar.markExecutionFinished(projectId, liveColor);
+          return;
+        }
         // Network failure: revert the pending state so the user
         // can try again. The bar falls back to whatever it would
         // have shown without the cancel intent.
@@ -658,15 +667,20 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  /// Did this failure mean "nothing answered", rather than "the answer
+  /// was no"? The CLI says so as a flag on its own error event, which
+  /// the runner carries through; reading it beats matching on wording.
+  function isDaemonUnreachable(err: unknown): boolean {
+    return err instanceof WeftCliError && err.daemonUnreachable;
+  }
+
   interface StatusResult {
     snapshot: import('../../packages/weft-graph/src/protocol').ActionAvailability;
-    /// Most-recent execution color from the status fetch.
-    color: string | undefined;
-    /// Whether that color's worker is currently running. SSE
-    /// drives the same transition during a live session; this
-    /// covers the bootstrap case (graph open / pin switch / a
-    /// missed event during a reload).
-    isRunning: boolean;
+    /// Every execution running right now, per the dispatcher. The
+    /// bar's running set is REPLACED with this: SSE drives the same
+    /// transitions during a live session, the fetch is the truth
+    /// that catches whatever the stream lost.
+    runningColors: string[];
   }
 
   /// Run `weft status --json` for a specific project root and
@@ -680,35 +694,62 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       out = await runWeftCliCapture(['--json', 'status'], projectRoot);
     } catch (err) {
-      // Project not registered with the dispatcher yet (typical on first graph open,
-      // after a wipe, or after a rename), so `weft status` has nothing to report.
-      // This is NOT special-cased into a faked action list anymore: the shared
-      // ActionBar makes the STARTER verbs (run / activate / infra_start) clickable
-      // from the parsed graph shape regardless of backend state, and each verb's CLI
-      // path builds + registers on demand. So we return an honest snapshot with an
-      // EMPTY available list: the starter verbs light up from shape, and the
-      // state-dependent verbs (deactivate, cancel_*, infra_stop/terminate/upgrade,
-      // resync) correctly stay hidden until a real status reports the live lifecycle.
-      console.warn('[weft] status fetch failed; project not registered yet', err);
+      // Two different failures used to read as one here, and the one
+      // that got swallowed is the one the person can act on.
+      //
+      // The ordinary one: the project is not registered with the daemon
+      // yet (first graph open, after a wipe, after a rename), so `weft
+      // status` has nothing to report. That is not an error and gets no
+      // banner. It is NOT special-cased into a faked action list: the
+      // shared ActionBar makes the STARTER verbs (run / activate /
+      // infra_start) clickable from the parsed graph shape whatever the
+      // backend says, and each verb's CLI path builds and registers on
+      // demand. So the snapshot is honest and EMPTY: the starter verbs
+      // light up from shape, and the state-dependent ones (deactivate,
+      // cancel_*, infra_stop/terminate/upgrade, resync) stay hidden
+      // until a real status reports a live lifecycle.
+      //
+      // The other one: nothing answered at all, because the daemon is
+      // not running or was never installed on this machine. Every verb
+      // will fail the same way, so the bar keeps its buttons and says
+      // what is wrong above them instead of quietly looking like a
+      // project nobody has registered.
+      if (pinnedProject && isDaemonUnreachable(err)) {
+        actionBar.setError(
+          pinnedProject.id,
+          'run',
+          'The weft daemon is not answering, so nothing here can run.',
+          {
+            what: 'Reading the project status',
+            stage: 'dispatch',
+            diagnostics: [
+              {
+                severity: 'error',
+                message: 'Nothing answered at the daemon. It is not running, or not installed.',
+                hint:
+                  'Start it with `weft daemon start`. If this machine only has the editor ' +
+                  'extension, install the daemon first: the install guide in the weft docs ' +
+                  'walks through it.',
+              },
+            ],
+          },
+        );
+      } else {
+        console.warn('[weft] status fetch failed; project not registered yet', err);
+      }
       return {
         snapshot: emptyActionAvailability(),
-        color: undefined,
-        isRunning: false,
+        runningColors: [],
       };
     }
     try {
       // The remap lives in the shared package (`parseStatusPayload`)
       // so every host builds the exact same snapshot.
       const json = JSON.parse(out) as import('../../packages/weft-graph/src/status').RawStatusPayload;
-      const execs = json?.executions ?? {};
-      const lastStatus: string | undefined = execs.last_status;
-      const lastColor: string | undefined = execs.last_color;
-      const isRunning =
-        lastStatus === 'running' || lastStatus === 'started' || lastStatus === 'queued';
+      const running = json?.executions?.running_colors;
       return {
         snapshot: parseStatusPayload(json),
-        color: typeof lastColor === 'string' ? lastColor : undefined,
-        isRunning,
+        runningColors: Array.isArray(running) ? running.filter((c): c is string => typeof c === 'string') : [],
       };
     } catch (err) {
       console.warn('[weft] fetchActionAvailability failed', err);
@@ -736,18 +777,9 @@ export function activate(context: vscode.ExtensionContext) {
     if (!id || !root) return;
     const result = await fetchActionAvailability(root);
     if (!result) return;
-    // Backend snapshot lands first.
-    actionBar.pushStatus(
-      id,
-      result.snapshot,
-      result.isRunning ? result.color : undefined,
-    );
-    // If status reports the most-recent color is terminal, make
-    // sure the slot's runningColors set doesn't keep it (covers
-    // missed SSE events during reload).
-    if (result.color && !result.isRunning) {
-      actionBar.markExecutionFinished(id, result.color);
-    }
+    // The snapshot and the running set land together; the set is the
+    // reconciliation for any SSE event a dropped stream lost.
+    actionBar.pushStatus(id, result.snapshot, result.runningColors);
     // Webview only renders the pinned project's snapshot. Older
     // slots get refreshed silently for when the user pins back.
     if (pinnedProject?.id === id) {
@@ -1120,15 +1152,17 @@ export function activate(context: vscode.ExtensionContext) {
       // drops pulses, then delete the journal. The cancel is the
       // delete's precondition: if it fails, deleting anyway would
       // leave the worker streaming into an erased journal, so abort
-      // loudly instead. (Cancelling an already-finished execution is
-      // an idempotent success, so a stale 'running' label is fine.)
+      // loudly instead. (A stale 'running' label on a run that has
+      // ended answers 409: nothing to cancel, so the delete goes on.)
       try {
         await dispatcher.post(`/executions/${summary.color}/cancel`, {});
       } catch (err) {
-        void vscode.window.showErrorMessage(
-          `Could not cancel ${summary.color}, so it was not deleted (it is still running): ${err}`,
-        );
-        return false;
+        if (!(err instanceof HttpError && err.status === 409)) {
+          void vscode.window.showErrorMessage(
+            `Could not cancel ${summary.color}, so it was not deleted (it is still running): ${err}`,
+          );
+          return false;
+        }
       }
     }
     // If the graph is streaming exactly this execution, drop the

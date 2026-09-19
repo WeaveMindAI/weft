@@ -9,6 +9,13 @@
   ],
   "icon": "HardDrive",
   "color": "#0F9D58",
+  "firesWith": {
+    "state": "String",
+    "changed?": "String",
+    "resource?": "String",
+    "resourceUri?": "String",
+    "messageNumber?": "String"
+  },
   "features": {
     "isTrigger": true
   },

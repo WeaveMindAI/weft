@@ -35,11 +35,12 @@ installs the same assistant with no flag at all, until you pass
 `--assistant <name>` to change it or `--assistant none` to stop. Claude Code
 is also available as `--assistant claude-code` (shorthand `cc`).
 
-Tangle is deliberately symlinked from your weft checkout rather than
-copied, so updating weft (`git pull` + `./setup.sh` in the checkout)
-refreshes Tangle in every such project at once. That is the one exception to
-"the project owns everything" below; the links are machine-local and
-already gitignored for you.
+Tangle is copied into the project, so those files are yours like the rest
+of it: they get committed, and someone who clones your project gets Tangle
+without needing a weft checkout. The price is that a project holds the
+Tangle that created it. If you want one on a newer version after updating
+weft, run `weft tangle update` in it, which re-copies every file Tangle
+owns and leaves anything your assistant wrote beside them alone.
 
 ## What got created
 

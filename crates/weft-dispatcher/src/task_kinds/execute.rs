@@ -104,7 +104,7 @@ pub fn execution_task_spec(
     // atomic claim guarantees exactly one). Resume passes the alive
     // owner so a sibling worker can't steal a live color.
     target_pod_name: Option<String>,
-    live_connection: Option<serde_json::Value>,
+    live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
 ) -> Result<NewTask> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {

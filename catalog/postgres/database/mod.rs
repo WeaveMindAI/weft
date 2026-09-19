@@ -153,6 +153,11 @@ impl Node for PostgresDatabaseNode {
         let database: String = input.get("database")?;
         let storage: String = input.get("storage")?;
         let version: String = input.get("version")?;
+        // Whether anything outside this program may connect. The
+        // author's decision, read here because the spec IS the answer:
+        // a person reading this node sees what is reachable, and
+        // nothing after the fact can change it.
+        let reachable: bool = input.get("reachable")?;
 
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
@@ -265,15 +270,30 @@ impl Node for PostgresDatabaseNode {
                 // The socket lives and dies with the pod.
                 Volume { name: "socket".into(), kind: VolumeKind::EmptyDir { size_limit: None } },
             ],
-            // Both cluster-internal. The credential endpoint in
-            // particular is never published outside the project.
+            // `sql` is the only endpoint that may ever be reachable,
+            // and only when the author asked: reaching Postgres there
+            // still costs a password, so letting a client at it gives
+            // nobody anything they did not already have. That is what
+            // lets a frontend on the same machine use this database
+            // for its own tables instead of standing up a second one.
+            //
+            // `credential` never is, and the difference is the whole
+            // rule for an infra node: that endpoint HANDS OUT the
+            // password, so reaching it would give the database away to
+            // anything that could reach the port. It stays
+            // cluster-internal whatever anybody asks for, which is why
+            // `reachable` cannot touch it.
             endpoints: vec![
                 Endpoint {
                     name: "sql".into(),
                     unit: "db".into(),
                     container: "postgres".into(),
                     port: "sql".into(),
-                    expose: Expose::ClusterInternal,
+                    expose: if reachable {
+                        Expose::SameNetwork
+                    } else {
+                        Expose::ClusterInternal
+                    },
                 },
                 Endpoint {
                     name: "credential".into(),

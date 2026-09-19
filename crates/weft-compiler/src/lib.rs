@@ -144,7 +144,7 @@ fn parse_only_inner(
                 node.header_span_or_default(),
                 Severity::Warning,
                 "unknown-type",
-                format!("unknown node type '{}'", node.node_type),
+                enrich::unknown_type_message(catalog, &node.node_type),
             ));
         }
     }

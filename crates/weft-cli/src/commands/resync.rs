@@ -38,7 +38,6 @@ async fn run_inner(
     }
     let trigger_deactivation = super::deactivate::prompt_trigger_deactivation(
         ctx.json(),
-        "resync",
         opts.mode.as_deref(),
         opts.grace,
         opts.running_policy.as_deref(),
@@ -48,6 +47,7 @@ async fn run_inner(
     let path = format!("/projects/{}/resync", handle.id);
     let mut body_map = serde_json::Map::new();
     handle.inject_hash_fields(&mut body_map);
+    progress.drain_wait(&trigger_deactivation, opts.drain_timeout);
     body_map.insert("triggerDeactivation".into(), trigger_deactivation);
     let body = serde_json::Value::Object(body_map);
     progress.trigger_register_start();

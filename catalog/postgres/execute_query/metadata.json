@@ -1,7 +1,7 @@
 {
   "type": "PostgresExecuteQuery",
   "label": "Postgres: Query",
-  "description": "Run SQL against a Postgres database and get the rows back. The query's parameters are the node's own input ports, declared inline and read by name in the SQL: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. A string binds as text, a boolean as bool, a number to whichever numeric column it meets, null to any column, an object or list as jsonb; cast the placeholder for other types (`$when::timestamptz`). Several statements are a script: with `$name` parameters each statement runs with the ports it names, in one transaction; without any, the script is sent whole and cells come back as text. Either way the rows of the last statement come back. Declare output ports (`-> (name: String)`) to read the first row's columns by name.",
+  "description": "Run SQL against a Postgres database and get the rows back. The query's parameters are the node's own input ports, declared inline and read by name in the SQL: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. A string binds as the text of whatever the placeholder's type is (a text column as is; `$when::timestamptz`, a uuid column or `$amount::numeric` parse it like a quoted literal), a boolean as bool, a number to whichever numeric column it meets, null to any column, an object or list as jsonb (read a key with `$params::jsonb->>'id'`). Several statements are a script: with `$name` parameters each statement runs with the ports it names, in one transaction; without any, the statements before the last go whole (so transaction control and the utility statements work) and the last runs on its own. Either way the rows of the last statement come back, typed the same as a one-statement query. Declare output ports (`-> (name: String)`) to read the first row's columns by name.",
   "tags": [
     "postgres",
     "database",
@@ -12,7 +12,10 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
       "required": true,
       "requiresValues": [
         "host",
@@ -43,11 +46,54 @@
     },
     {
       "name": "count",
-      "type": "Number"
+      "type": "Number",
+      "description": "How many rows came back, which is NOT how many rows a write changed: an `update` or `delete` with no `RETURNING` answers no rows, so this is 0 on a statement that worked. Add `RETURNING id` when you want the number. This is the node's own port, so a column called `count` cannot use it; alias such a column in the SQL (`count(*) as total`) and declare a port for that name."
     }
   ],
   "features": {
     "canAddInputPorts": true,
     "canAddOutputPorts": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "query",
+        "regex": "(?i)\\bas\\s+\"?(count|rows)\"?\\b"
+      },
+      "then": {
+        "message": "'{id}' aliases a column to `count` or `rows`, which are this node's own outputs (how many rows came back, and the rows themselves). A column of that name has nowhere to go: reading the port gives you what the node puts there. Alias it to something else in the SQL, `count(*) as total`, and declare a port for that name.",
+        "level": "structural",
+        "severity": "error",
+        "field": "query"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "output_wired", "port": "count" },
+          {
+            "kind": "config_matches",
+            "field": "query",
+            "regex": "(?is)^\\s*(update|delete|insert)\\b"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "query",
+              "regex": "(?is)\\b(returning|select)\\b"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "'{id}' wires `count`, but its statement answers no rows: `count` is how many rows came BACK, not how many a write changed, so it would be 0 on a write that worked perfectly and anything gated on it would never fire. Add `RETURNING id` (or whichever column) to the statement, and `count` becomes the number of rows it touched.",
+        "level": "structural",
+        "severity": "error",
+        "field": "query"
+      }
+    }
+  ]
 }

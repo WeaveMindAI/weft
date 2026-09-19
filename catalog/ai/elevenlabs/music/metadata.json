@@ -27,7 +27,6 @@
     {
       "name": "lengthSecs",
       "type": "Number",
-      "required": false,
       "widget": {
         "kind": "number",
         "min": 3,

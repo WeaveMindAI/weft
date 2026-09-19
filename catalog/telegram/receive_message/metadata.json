@@ -19,14 +19,12 @@
     {
       "name": "chatId",
       "type": "String",
-      "required": false,
       "label": "Chat id",
       "description": "Only fire on messages in this chat. Empty = every chat the bot is in."
     },
     {
       "name": "keyword",
       "type": "String",
-      "required": false,
       "label": "Contains",
       "description": "Only fire when the text contains this."
     },
@@ -66,6 +64,9 @@
       "description": "The full Telegram message object."
     }
   ],
+  "firesWith": {
+    "item": "{ update_id: Number, message: JsonDict }"
+  },
   "features": {
     "isTrigger": true
   }

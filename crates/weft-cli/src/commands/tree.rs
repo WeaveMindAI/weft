@@ -51,8 +51,30 @@ pub fn render(tree: &Tree, when: &dyn Fn(u64) -> String) -> Vec<String> {
             roots.push(v);
         }
     }
+    let mut shown: std::collections::BTreeSet<&str> = Default::default();
     for root in roots {
-        render_version(tree, root, 0, &children, &runs_by_version, when, &mut out);
+        render_version(tree, root, 0, &children, &runs_by_version, when, &mut shown, &mut out);
+    }
+    // Whatever the walk did not reach, printed anyway.
+    //
+    // A version can have a parent that is present and still not hang off
+    // any root, if the parent links ever come out in a shape this walk
+    // cannot follow. Those used to be dropped from the listing in
+    // silence, while `--json` (which forwards the server's answer whole)
+    // still showed them, so the two views of one tree disagreed and only
+    // one of them said so. A version you own is never invisible; it is
+    // printed flat, under a line saying the tree could not place it.
+    let unplaced: Vec<&VersionSummary> =
+        tree.versions.iter().filter(|v| !shown.contains(v.id.as_str())).collect();
+    if !unplaced.is_empty() {
+        out.push(format!(
+            "({} version(s) below could not be placed in the tree: their parent is \
+             recorded but the line back to a root is broken)",
+            unplaced.len()
+        ));
+        for v in unplaced {
+            render_version(tree, v, 0, &children, &runs_by_version, when, &mut shown, &mut out);
+        }
     }
     out
 }
@@ -64,8 +86,16 @@ fn render_version<'a>(
     children: &BTreeMap<Option<&str>, Vec<&'a VersionSummary>>,
     runs: &BTreeMap<&str, Vec<&'a RunSummary>>,
     when: &dyn Fn(u64) -> String,
+    // Every version this walk has printed, so the caller can print what
+    // it never reached instead of losing it.
+    shown: &mut std::collections::BTreeSet<&'a str>,
     out: &mut Vec<String>,
 ) {
+    // A version reached twice would print its whole subtree twice; a
+    // version reached never is the caller's to print flat.
+    if !shown.insert(v.id.as_str()) {
+        return;
+    }
     let indent = "  ".repeat(depth);
     let mut marks = Vec::new();
     if tree.head.head_version.as_deref() == Some(v.id.as_str()) {
@@ -98,10 +128,28 @@ fn render_version<'a>(
         let scope = r.spec.as_ref().map(|s| format!(" spec {}", s.name)).unwrap_or_default();
         let example = r.example.as_deref().map(|e| format!(" example {e}")).unwrap_or_default();
         let ended = r.completed_at.map(|t| format!(" -> {}", when(t))).unwrap_or_default();
-        out.push(format!("{indent}  run {} {}{ended} {}{seed}{scope}{example}{head}", short(&r.color), when(r.started_at), r.status));
+        // A cancelled run says who ended it, because a person stopping
+        // a run and the runtime cutting one are different stories.
+        let cause = match &r.cancel_cause {
+            Some(weft_core::exec::CancelCause::User) => " (a person stopped it)".to_string(),
+            Some(weft_core::exec::CancelCause::Execution { by, .. }) => {
+                format!(" (run {} stopped it)", short(&by.to_string()))
+            }
+            Some(weft_core::exec::CancelCause::CallerGone) => {
+                " (the caller went away)".to_string()
+            }
+            Some(weft_core::exec::CancelCause::Runtime { detail }) => format!(" ({detail})"),
+            None => String::new(),
+        };
+        let skipped = if r.skipped_nodes > 0 {
+            format!(" {} skipped", r.skipped_nodes)
+        } else {
+            String::new()
+        };
+        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.color), when(r.started_at), r.status));
     }
     for child in children.get(&Some(v.id.as_str())).cloned().unwrap_or_default() {
-        render_version(tree, child, depth + 1, children, runs, when, out);
+        render_version(tree, child, depth + 1, children, runs, when, shown, out);
     }
 }
 
@@ -133,6 +181,10 @@ mod tests {
             status: status.into(),
             started_at: 0,
             completed_at: if status == "completed" { Some(9) } else { None },
+            // A cancelled run in this fixture says a person did it, so
+            // the line that renders a cause is exercised at all.
+            cancel_cause: (status == "cancelled").then_some(weft_core::exec::CancelCause::User),
+            skipped_nodes: 0,
         }
     }
 

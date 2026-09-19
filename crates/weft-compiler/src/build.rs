@@ -576,6 +576,10 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// <ctx>/
 ///   Dockerfile           (worker-builder-base.Dockerfile with its tokens
 ///                         substituted; build with -f THIS file)
+///   worker-builder-base-split.sh
+///                        (copied verbatim; the Dockerfile runs it to
+///                         split the compiled artifacts into its two
+///                         image layers)
 ///   rust-toolchain.toml
 ///   Cargo.toml           (workspace manifest scoped to the worker closure)
 ///   Cargo.lock
@@ -658,6 +662,18 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
         rendered = rendered.replace(token, &value);
     }
     std::fs::write(ctx.join("Dockerfile"), rendered).map_err(CompileError::Io)?;
+
+    // The artifact split the Dockerfile runs. Copied rather than
+    // rendered (it takes its paths as arguments), and covered by the
+    // base hash next to the Dockerfile, so editing it mints a new tag.
+    let split_name = std::path::Path::new(crate::hash::BUILDER_BASE_SPLIT_SCRIPT)
+        .file_name()
+        .expect("the split script constant names a file");
+    std::fs::copy(
+        weft_root.join(crate::hash::BUILDER_BASE_SPLIT_SCRIPT),
+        ctx.join(split_name),
+    )
+    .map_err(CompileError::Io)?;
     Ok(ctx.to_path_buf())
 }
 
@@ -695,7 +711,7 @@ fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
 /// host mtime keeps unchanged sources looking unchanged inside the
 /// container, so cargo only rebuilds the package whose node source
 /// genuinely changed (plus the worker relink).
-pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
+pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
     copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
 }
 

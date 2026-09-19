@@ -1,0 +1,13 @@
+[package]
+name = "api"
+
+# Making a program an API: the two live triggers (`Route` for HTTP,
+# `Socket` for WebSocket), the three nodes that answer whichever caller
+# the run has (`Reply` once, `Stream` a bus, `Close` the exchange), and
+# the three auth access nodes a route can be gated by (`ApiKeyAuth`,
+# `JwtAuth`, `HmacAuth`). The shared `wire.rs` turns port values into
+# outbound chunks and inbound messages into port values per the trigger's
+# declared data type; `framing.rs` is the pure SSE / ndjson framing.
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"

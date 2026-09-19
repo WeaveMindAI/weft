@@ -34,9 +34,6 @@
       "Bash(weft status)",
       "Bash(weft ps)",
       "Bash(weft follow:*)",
-      "Bash(weft daemon start:*)",
-      "Bash(weft daemon stop:*)",
-      "Bash(weft daemon restart:*)",
       "Bash(weft daemon status)",
       "Bash(weft daemon logs:*)",
       "Bash(weft catalog update)",
@@ -58,29 +55,19 @@
       "Bash(weft connect:*)",
       "Bash(weft token:*)",
       "Bash(weft checkpoint:*)",
+      "Bash(weft branch:*)",
       "Bash(weft tree:*)",
       "Bash(weft diff:*)",
       "Bash(weft freeze:*)",
       "Bash(weft examples:*)",
       "Bash(weft bake:*)",
-      "Bash(weft wake:*)"
-    ],
-    "ask": [
-      "Bash(weft test-node --tier live:*)",
-      "Bash(weft test-node --yes:*)",
-      "Bash(weft test-node * --tier live:*)",
-      "Bash(weft test-node * --yes:*)",
-      "Bash(weft connect --forget:*)",
-      "Bash(weft connect * --forget:*)",
+      "Bash(weft wake:*)",
       "Bash(weft deactivate:*)",
       "Bash(weft resync:*)",
       "Bash(weft rm:*)",
       "Bash(weft clean:*)",
-      "Bash(weft infra terminate:*)",
-      "Bash(weft infra node-terminate:*)",
-      "Bash(weft files rm:*)",
-      "Bash(weft branch:*)",
       "Bash(weft prune:*)"
     ]
+
   }
 }

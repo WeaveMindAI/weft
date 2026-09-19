@@ -1,6 +1,6 @@
 ---
 name: weft-check
-description: "COMMAND, not reference: Validate and build the weft program, fix diagnostics until clean. Run this when the user asks for this step by name. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Validate and build the weft program, fix diagnostics until clean. Run this when the user asks for this step by name. The sixteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Run the compiler over this project and fix what it names, without running anything.

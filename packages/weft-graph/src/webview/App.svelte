@@ -3,12 +3,14 @@
   import { LoaderCircle } from '@lucide/svelte';
   import { toast } from 'svelte-sonner';
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
+  import { MessagesSquare } from '@lucide/svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
+  import CallerPanel from './lib/components/project/CallerPanel.svelte';
   import DeactivationPicker from './lib/components/project/DeactivationPicker.svelte';
   import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './host';
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
-  import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
+  import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
   import { bareRecord } from './lib/types';
   import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
@@ -269,18 +271,17 @@
   // bar sections (don't show the Infra section for a project with no
   // infra nodes in source). Recomputed on every truth so the bar
   // follows graph edits too, e.g. dropping in the first infra node.
+  //
+  // Counted through `@include`s: this parse is interface mode, so an
+  // included file is one opaque node and its body is absent, and a
+  // project whose only trigger (or only infra node) lives in one would
+  // read as having neither. The include node carries what its file
+  // holds, and the project predicates fold that in.
   let hasInfraInGraph = $state(false);
   let hasTriggersInGraph = $state(false);
   function recomputeSourceFlags(project: ProtocolProject): void {
-    hasInfraInGraph = project.nodes.some((n) =>
-      nodeRequiresInfra({
-        nodeType: n.nodeType,
-        requiresInfra: (n as unknown as { requiresInfra?: boolean }).requiresInfra,
-      }),
-    );
-    hasTriggersInGraph = project.nodes.some((n) =>
-      nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
-    );
+    hasInfraInGraph = projectHasInfra(project.nodes);
+    hasTriggersInGraph = projectHasTriggers(project.nodes);
   }
 
   // Auto-follow state. The host-side controller owns the actual
@@ -297,6 +298,10 @@
     executionState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
   );
   let sourceOpen = $state(false);
+  /// Whether the caller panel is showing. Closed on every load: it is a
+  /// thing you go and look at, not a thing that takes up the canvas
+  /// until you dismiss it.
+  let callerPanelOpen = $state(false);
 
   // Action-bar state: single source of truth for what the bar
   // renders. The host's ActionBarStore pushes every transition;
@@ -493,43 +498,6 @@
         executionState.nodeExecutions = rows;
         return;
       }
-      if (msg.kind === 'execPortWarning') {
-        // Non-terminal: append a port-type-mismatch warning to the
-        // matching firing's row without touching its status.
-        const framesKey = JSON.stringify(msg.frames);
-        const rows = executionState.nodeExecutions[msg.nodeId];
-        const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
-        if (!rows || idx < 0) {
-          // The firing's row must already exist (node_started precedes the
-          // mismatch on both the live and replay paths). Don't fabricate a
-          // stateless row, but don't swallow either: a miss means an
-          // ordering/keying regression, so surface it instead of losing
-          // the warning silently.
-          console.warn('[weft] port warning for an unknown firing', msg);
-          return;
-        }
-        // Idempotent WITHIN a firing: the dispatcher re-streams journal
-        // events on every follow/reconnect, so the same mismatch can
-        // arrive via both the replay snapshot and the live stream (the
-        // same overlap the bus reducer dedups). A port mismatches AT MOST
-        // ONCE per firing (one emission per port), so `port` is its
-        // identity within the firing's row; skip a re-delivery instead of
-        // stacking it. This dedup is safe across re-runs because the
-        // `execEvent` reducer clears `portWarnings` on each `running`
-        // transition, so we only ever dedup within one firing's warnings,
-        // never against a previous attempt's.
-        const existing = rows[idx].portWarnings ?? [];
-        if (existing.some((w) => w.port === msg.port)) {
-          return;
-        }
-        const warning = { port: msg.port, expected: msg.expected, actual: msg.actual };
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
-          [msg.nodeId]: rows.map((r, i) =>
-            i === idx ? { ...r, portWarnings: [...existing, warning] } : r,
-          ),
-        });
-        return;
-      }
       if (msg.kind === 'execCost') {
         // One metered call's cost, added onto the matching firing's total.
         // Dedup by the record's stable identity: the dispatcher re-streams
@@ -558,8 +526,20 @@
               ? {
                   ...r,
                   costIds: [...seen, msg.costId],
-                  costUsd: r.costUsd + (msg.amountUsd ?? 0),
-                  costUnknown: (r.costUnknown ?? false) || msg.amountUsd === null,
+                  // A cost this run INHERITED was paid by the run it was
+                  // seeded from: real money, already spent, and adding it
+                  // to this run's own total counts it twice. It lands in
+                  // the reused column the group rows already use.
+                  costUsd: r.costUsd + (msg.inheritedFrom ? 0 : msg.amountUsd ?? 0),
+                  costUnknown:
+                    (r.costUnknown ?? false) ||
+                    (!msg.inheritedFrom && msg.amountUsd === null),
+                  inheritedCostUsd:
+                    (r.inheritedCostUsd ?? 0) +
+                    (msg.inheritedFrom ? msg.amountUsd ?? 0 : 0),
+                  inheritedCostUnknown:
+                    (r.inheritedCostUnknown ?? false) ||
+                    (!!msg.inheritedFrom && msg.amountUsd === null),
                   credentialOwner:
                     r.credentialOwner === undefined || r.credentialOwner === msg.origin
                       ? msg.origin
@@ -637,19 +617,6 @@
             if (e.providedPorts !== undefined) updated.providedPorts = e.providedPorts;
             if (e.backupPorts !== undefined) updated.backupPorts = e.backupPorts;
             if (e.inheritedPorts !== undefined) updated.inheritedPorts = e.inheritedPorts;
-            // A non-resumed `running` transition is a FRESH firing of
-            // this (node, frames) row. Reset its per-firing port
-            // warnings so the new firing starts clean and the inspector
-            // shows THIS firing's dropped ports, not a stale union with
-            // a previous attempt's. A RESUME (crash re-dispatch,
-            // suspension waking) continues the same attempt: warnings
-            // recorded before it still belong to this firing and
-            // survive. Same per-firing-state discipline as `error`
-            // (refreshed on terminal) and `closedPorts` (refreshed
-            // below).
-            if (state === 'running' && !e.resumed) {
-              updated.portWarnings = [];
-            }
             // closedPorts may arrive on node_started (state=running) or
             // node_skipped (state=skipped); always refresh from the event
             // if present so the inspector shows the per-port (closed)
@@ -700,10 +667,14 @@
         return;
       }
       if (msg.kind === 'callerEvent') {
-        // One caller per execution: a flat ordered log. Dedup on offset
-        // (unique per caller stream) because the replay snapshot and the
+        // One caller per execution: a flat ordered log. Dedup on the
+        // row's own position (an offset for a lifecycle row, the span
+        // for a window of messages) because the replay snapshot and the
         // live stream overlap during a replay follow.
-        const callerKey = `caller:${msg.event.offset}`;
+        const callerKey =
+          msg.event.kind === 'window'
+            ? `caller:${msg.event.firstOffset}-${msg.event.lastOffset}`
+            : `caller:${msg.event.offset}`;
         if (seenCallerOffsets.has(callerKey)) return;
         seenCallerOffsets.add(callerKey);
         executionState.callerLog = [...executionState.callerLog, msg.event];
@@ -1133,7 +1104,36 @@
             {#snippet trailing()}
               {#if toolbarTrailing}{@render toolbarTrailing(editorContext)}{/if}
             {/snippet}
+            {#snippet below()}
+              <!-- The run's conversation with its caller. A run-level
+                   fact, so it lives beside the run's own controls rather
+                   than inside a node's inspector: there is one caller per
+                   run and the exchange is the same whichever node you
+                   open. Nothing is drawn for a run that had no caller. -->
+              {#if executionState.callerLog.length > 0}
+                <button
+                  type="button"
+                  onclick={() => (callerPanelOpen = !callerPanelOpen)}
+                  class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border shadow-sm text-xs font-medium transition
+                    {callerPanelOpen
+                      ? 'bg-zinc-900 text-white border-zinc-900 hover:bg-zinc-800'
+                      : 'bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50'}"
+                  title="Show what this run and its caller said to each other"
+                >
+                  <MessagesSquare class="w-3 h-3" />
+                  Caller
+                </button>
+              {/if}
+            {/snippet}
           </GraphToolbar>
+          {#if callerPanelOpen && executionState.callerLog.length > 0}
+            <div class="absolute top-24 left-3 z-30 pointer-events-auto">
+              <CallerPanel
+                events={executionState.callerLog}
+                onClose={() => (callerPanelOpen = false)}
+              />
+            </div>
+          {/if}
     {#key viewGeneration}
     <!-- Failure wall for the editor: an uncaught throw in its render or
          effects would otherwise kill the whole webview SILENTLY, and the

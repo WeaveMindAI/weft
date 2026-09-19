@@ -450,8 +450,11 @@ pub async fn admit_live_execution_in(
         };
     }
 
-    let chosen = crate::worker_pod::pick_admittable_for_project(
-        &mut *conn, project_id, saturation, spec.binary_hash.as_deref(),
+    // A spec that names its pod (the caller is already standing at it)
+    // is admitted there or not at all; an unpinned one goes to the
+    // least-loaded pod with headroom.
+    let chosen = crate::worker_pod::admittable_pod_for_project(
+        &mut *conn, project_id, saturation, spec.binary_hash.as_deref(), spec.target_pod_name.as_deref(),
     ).await?;
     let Some((pod_name, namespace)) = chosen else {
         return Ok(LiveAdmitOutcome::Saturated);
@@ -1001,67 +1004,6 @@ pub async fn delete_task(pool: &PgPool, id: Uuid) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// Outcome of [`delete_pending_live_execution_in`]: who, if anyone, will run
-/// the live execution after a failed dispatcher-side setup. Tells the caller
-/// whether IT must journal the cancel terminal, or whether a worker owns it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetupFailureOutcome {
-    /// The pending execute task was deleted (or never existed): NO worker will
-    /// run this color, so the caller must journal the terminal cancel.
-    NoWorkerWillRun,
-    /// An execute task is already `claimed`: a worker owns the run and will
-    /// write its own terminal. The caller must NOT cancel (that would stack a
-    /// second, contradictory terminal on the same color).
-    WorkerOwnsIt,
-}
-
-/// Clean up a live execution whose dispatcher-side setup FAILED (after
-/// [`admit_live_execution_in`] inserted its task). Because admission IS the
-/// task insert, the cleanup is: delete the task IF still `pending` (no worker
-/// has run it), then check whether ANY execute task for the color still
-/// exists:
-///   - none remains (we deleted the pending one, or none ever existed) ->
-///     `NoWorkerWillRun`: the caller journals the cancel terminal.
-///   - one remains (it was already `claimed` in the commit-but-Err race) ->
-///     `WorkerOwnsIt`: the worker runs it and writes its own terminal; the
-///     caller must NOT also cancel.
-/// This is what lets the caller avoid stacking a second terminal on a color a
-/// worker is concurrently finishing. There is no slot counter to release: the
-/// task row IS the slot, so deleting it frees the slot.
-///
-/// MUST run inside a caller-owned transaction: the caller writes the cancel
-/// terminals in the same transaction, so "task deleted" and "terminal
-/// journaled" can never disagree (a crash between the two would otherwise
-/// leave a live-looking execution nothing will ever run or reclaim).
-pub async fn delete_pending_live_execution_in(
-    conn: &mut sqlx::PgConnection,
-    color: &str,
-) -> Result<SetupFailureOutcome> {
-    sqlx::query(
-        r#"DELETE FROM task
-           WHERE color = $1 AND kind = 'execute' AND status = 'pending'
-             AND payload -> 'live_connection' IS NOT NULL
-             AND payload -> 'live_connection' != 'null'::jsonb"#,
-    )
-    .bind(color)
-    .execute(&mut *conn)
-    .await?;
-    // `1::bigint` so sqlx's i64 expectation matches: a bare `1` is typed
-    // int4 by Postgres and would fail the decode whenever a row IS returned
-    // (the exact pitfall guarded the same way in `worker_pod`).
-    let remaining: Option<(i64,)> = sqlx::query_as(
-        r#"SELECT 1::bigint FROM task WHERE color = $1 AND kind = 'execute' LIMIT 1"#,
-    )
-    .bind(color)
-    .fetch_optional(&mut *conn)
-    .await?;
-    Ok(if remaining.is_some() {
-        SetupFailureOutcome::WorkerOwnsIt
-    } else {
-        SetupFailureOutcome::NoWorkerWillRun
-    })
 }
 
 /// Decode a `task` row. Every column propagates its decode error

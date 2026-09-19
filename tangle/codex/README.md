@@ -10,16 +10,15 @@ for other assistants.
 
 The persona is a plain `AGENTS.md` at the project root, which is Codex's own
 native format rather than a compatibility shim. Skills sit in
-`.agents/skills/`, and the six specialists are TOML files in
+`.agents/skills/`, and the five specialists are TOML files in
 `.codex/agents/`. The six commands are skills as well: Codex deprecated its
 custom-prompts directory in favour of skills, which the CLI invokes with `$name`.
 
 Two things this copy uses.
 
 **A sandbox per specialist.** Each agent's TOML carries `sandbox_mode`. The
-three research specialists get `read-only`, so `catalog-scout`, `run-digger`
-and `red-teamer` cannot write even if they try; the two builders get
-`workspace-write`.
+two research specialists get `read-only`, so `run-digger` and `red-teamer`
+cannot write even if they try; the three builders get `workspace-write`.
 
 **Specialists that run side by side.** `.codex/config.toml` sets
 `max_concurrent_threads_per_session = 5`, so when a program is missing three
@@ -33,7 +32,7 @@ Codex injects at the next safe point.
 
 ## What is here
 
-Tangle is one persona plus fifteen skills, six specialists and six commands.
+Tangle is one persona plus sixteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

@@ -66,3 +66,4 @@ packages/weft-syntax/node_modules
 # Example projects generate build state when opened; never commit it.
 examples/*/.weft/
 tangle/old
+.claude/skills/prompt-engineer/SKILL.md

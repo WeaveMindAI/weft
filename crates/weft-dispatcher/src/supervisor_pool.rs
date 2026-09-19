@@ -80,6 +80,15 @@ pub trait SupervisorBackend: Send + Sync {
 // Backends
 // =============================================================
 
+/// The admin-URL scheme a subprocess-spawned supervisor is registered
+/// with. It is the row's own record of HOW the pod was started, and the
+/// only such record: `forget_vanished` reads it to know that no
+/// Deployment was ever created for this pod, so the cluster roster says
+/// nothing about whether it is alive.
+// SYNC: written by SubprocessSupervisorBackend::spawn, read by
+//       SupervisorPool::forget_vanished (both in this file)
+const SUBPROCESS_ADMIN_SCHEME: &str = "subprocess://";
+
 /// Local-development backend: forks the `weft-infra-supervisor` binary
 /// as a child process. The supervisor has no HTTP surface, so unlike the
 /// listener there is no port to pre-allocate; the admin URL is a stable
@@ -122,7 +131,7 @@ impl SupervisorBackend for SubprocessSupervisorBackend {
         // claim-loop). The child being spawned is the liveness signal;
         // the broker lease + reaper handle a pod that never comes up.
         Ok(SupervisorHandle {
-            admin_url: format!("subprocess://{pod_name}"),
+            admin_url: format!("{SUBPROCESS_ADMIN_SCHEME}{pod_name}"),
         })
     }
 
@@ -561,6 +570,135 @@ impl SupervisorPool {
             pod_name,
             admin_url: handle.admin_url,
         })
+    }
+
+    /// Forget supervisor pods the cluster no longer has, and release
+    /// the projects they owned so a live supervisor adopts them.
+    ///
+    /// The registry is a record of what we asked for; the cluster is
+    /// what exists. Nothing reconciled the two, and the gap is not
+    /// theoretical: `renew_owned` keeps a row's lease fresh for as long
+    /// as this dispatcher runs, and `reap_idle` only ever looks at rows
+    /// owning NO projects. So a supervisor that went away while owning
+    /// work stayed "live" for ever, its projects stayed leased to a pod
+    /// that could never claim them, and every `weft infra start` on
+    /// those projects waited on an apply nothing would execute. A kind
+    /// node rebuilt by `setup.sh` (a changed cluster shape) destroys
+    /// every supervisor at once, which is how this was found.
+    ///
+    /// Releasing ownership is safe on its own: an `infra_owner` row is a
+    /// lease, not the infrastructure, so dropping it moves who is
+    /// responsible and never touches what is running.
+    ///
+    /// Three things make "the cluster does not list it" a safe reason to
+    /// forget a pod, and all three have to hold:
+    ///
+    ///   - The pod is past its SPAWN GRACE. `spawn_pod` applies the
+    ///     Deployment and only then writes the registry row, so a pod
+    ///     spawned by a sibling dispatcher can be listed-but-unrowed or
+    ///     rowed-but-not-yet-listed for a moment. `reap_idle` guards the
+    ///     same race for the same reason; forgetting is far worse than a
+    ///     wrong reap, because nothing ever re-inserts the row: the pod
+    ///     would keep running, unreachable to `pick_live` and invisible
+    ///     to the reaper (which scans registry rows), for ever.
+    ///   - The pod was spawned as a Deployment at all. A subprocess
+    ///     supervisor has none, so the roster can never mention it.
+    ///   - The roster came back non-empty. An empty answer is the shape
+    ///     a transient listing failure takes, and acting on it would
+    ///     release every project this dispatcher owns in one sweep.
+    pub async fn forget_vanished(
+        &self,
+        kube: &dyn weft_platform_traits::KubeReader,
+        pg_pool: &PgPool,
+        pod_id: &str,
+    ) -> Result<usize> {
+        let now = crate::lease::now_unix();
+        let ours: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pod_name, admin_url FROM supervisor_pod \
+             WHERE owner_pod_id = $1 AND grace_until_unix < $2",
+        )
+        .bind(pod_id)
+        .bind(now)
+        .fetch_all(pg_pool)
+        .await?;
+        // A subprocess supervisor is a child process with no Deployment
+        // behind it, so the cluster roster is not evidence about it and
+        // this sweep has nothing to say.
+        let ours: Vec<String> = ours
+            .into_iter()
+            .filter(|(_, admin_url)| !admin_url.starts_with(SUBPROCESS_ADMIN_SCHEME))
+            .map(|(pod_name, _)| pod_name)
+            .collect();
+        if ours.is_empty() {
+            return Ok(0);
+        }
+        // Each pooled supervisor is a Deployment named for the pod, so
+        // the roster the cluster answers with IS the set of live names.
+        let live: std::collections::BTreeSet<String> = kube
+            .list_replica_state(&self.namespace, "weft.dev/role=infra-supervisor")
+            .await?
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        if live.is_empty() {
+            // We hold rows for Deployments we applied ourselves, so an
+            // empty roster is either a listing that failed quietly or a
+            // cluster that lost every supervisor at once. The first must
+            // not delete anything, and the second is worth an operator's
+            // eyes rather than a silent mass release.
+            tracing::warn!(
+                target: "weft_dispatcher::supervisor_pool",
+                rows = ours.len(),
+                "the cluster listed no supervisor Deployments although we hold registry \
+                 rows for some; forgetting nothing this sweep. If this repeats, the \
+                 supervisors really are gone and their rows need clearing"
+            );
+            return Ok(0);
+        }
+        let mut forgotten = 0;
+        for pod_name in ours {
+            if live.contains(&pod_name) {
+                continue;
+            }
+            // One transaction, because half of this is worse than none:
+            // leases naming a pod no row mentions are exactly the state
+            // this function exists to clear, and nothing else would ever
+            // find them again (every sweep starts from the rows).
+            let mut tx = pg_pool.begin().await?;
+            // The gated DELETE is the exactly-one-winner step (the
+            // reaper's discipline): a sibling dispatcher adopting the pod
+            // or the pod's row being reaped between the scan and now both
+            // make it hit zero rows, and we leave the leases alone.
+            let gone: Option<(String,)> = sqlx::query_as(
+                "DELETE FROM supervisor_pod \
+                 WHERE pod_name = $1 AND owner_pod_id = $2 AND grace_until_unix < $3 \
+                 RETURNING pod_name",
+            )
+            .bind(&pod_name)
+            .bind(pod_id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if gone.is_none() {
+                tx.rollback().await?;
+                continue;
+            }
+            let released = sqlx::query("DELETE FROM infra_owner WHERE supervisor_pod = $1")
+                .bind(&pod_name)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            tracing::warn!(
+                target: "weft_dispatcher::supervisor_pool",
+                pod = %pod_name,
+                released,
+                "supervisor pod is gone from the cluster; forgot it and released the \
+                 projects it owned so a live supervisor adopts them"
+            );
+            forgotten += 1;
+        }
+        Ok(forgotten)
     }
 
     /// Renew the lease on every supervisor pod this dispatcher owns. The

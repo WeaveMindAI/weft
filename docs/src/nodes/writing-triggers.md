@@ -4,13 +4,14 @@ A trigger node writes **two bodies** and never inspects any phase. The engine
 calls the right one.
 
 ```rust
-use weft::signal::{ApiEndpoint, LiveConnectionConfig};
+use weft::signal::{LiveConnectionConfig, Route};
 
 #[async_trait]
 impl Node for MyTriggerNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
-        ctx.register_signal(ApiEndpoint { common }).await
+        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)
+            .map_err(weft::node_error)?;
+        ctx.register_signal(Route { common }).await
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
@@ -49,9 +50,9 @@ broken delivery can never pass as an empty one.
 Each is a struct in `weft::signal`. You construct one and pass it to
 `register_signal`.
 
-Two families, pointing opposite ways. `SocketListen` and `LiveSocket` sound
+Two families, pointing opposite ways. `SocketListen` and `Socket` sound
 alike and are easy to swap by mistake: `SocketListen` dials out to a service,
-`LiveSocket` is what an outside caller dials into.
+`Socket` is what an outside caller dials into.
 
 ### Outbound event sources
 
@@ -83,11 +84,15 @@ An outside caller dials in and holds the connection; nodes talk back through
 
 | Kind | For |
 |---|---|
-| `ApiEndpoint { common }` | an HTTP endpoint people call; a node replies once or streams |
-| `LiveSocket { common }` | an inbound WebSocket; a node holds a two-way conversation |
+| `Route { common }` | an HTTP route people call; a node replies once or streams |
+| `Socket { common }` | an inbound WebSocket; a node holds a two-way conversation |
 
 Both share `LiveConnectionConfig`, built from the node's merged values with
-`LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)`.
+`LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)`: the route
+pattern, the method, the body shape, the auth connection, and the
+suspension defaults. The caller's opening request arrives as the fire
+payload, so a trigger of this shape reads it off `ctx.wake` (the shipped
+`Route` and `Socket` fan it onto their ports).
 
 The wire protocol is the **kind**, not a config field. The runtime derives it
 from which struct you passed, which is why there is no `protocol:` knob to set

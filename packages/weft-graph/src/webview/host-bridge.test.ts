@@ -100,6 +100,33 @@ describe('translateProject', () => {
     expect(labels.get('outer.inner')).toBe('inner');
   });
 
+  it("labels an included file's body by its file name, never its path id", () => {
+    // Opening an included file parses it under its body id, which is the
+    // file's path and is unspellable on purpose. The box the reader sees
+    // is that file, so it reads as the file.
+    const group = (id: string, parentGroupId: string | null) => ({
+      id,
+      kind: 'group' as const,
+      label: null,
+      inPorts: [],
+      outPorts: [],
+      parentGroupId,
+      childGroupIds: [],
+      nodeIds: [],
+    });
+    const host = {
+      id: 'p1',
+      nodes: [],
+      edges: [],
+      groups: [group('@src:cards:read_cards', null), group('@src:cards:read_cards.rows', '@src:cards:read_cards')],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const labels = new Map(v1.nodes.map((n) => [n.id, n.label]));
+    expect(labels.get('@src:cards:read_cards')).toBe('read_cards');
+    expect(labels.get('@src:cards:read_cards.rows')).toBe('rows');
+  });
+
   it("carries a group's `_should_flow` literal across as a port literal", () => {
     const host = {
       id: 'p1',

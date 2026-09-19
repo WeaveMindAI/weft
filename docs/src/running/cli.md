@@ -10,6 +10,8 @@ CLI.
 | Command | What it does |
 |---|---|
 | `weft new <name>` | scaffold a project: `weft.toml`, `src/main.weft`, `nodes/` with the standard library seeded in |
+| `weft new <name> --assistant <who>` | the same, plus Tangle, the AI builder persona, copied in for that assistant (`cc` Claude Code, `kc` Kilo Code, `cu` Cursor, and the rest; repeat the flag for several). The choice is remembered for later `weft new` runs; `--assistant none` stops it. See [Your first program](../start/first-program.md). |
+| `weft tangle update [--assistant <who>]` | re-copy this project's Tangle from the installed weft, the way `weft catalog update` re-copies the standard library. With no flag it refreshes the assistants the project already has; with one it also installs an assistant that is not here yet. It **replaces every file Tangle owns**, so your own edits to those personas, skills and commands go; anything your assistant wrote beside them stays. |
 | `weft build` | build the project's worker image and register the project, starting nothing. Registering is also how you put back code the dispatcher no longer holds: it records the compiled program under its own hash, which is what a past run's values are worked out from, so the run reads again. It does not add a version to the tree; `weft checkpoint` does that |
 | `weft run [--detach] [--referenced]` | compile, register, fire one execution, stream its events until completion, including across waits. `--detach` returns after starting it. The whole catalog is compiled by default; `--referenced` opts into compiling only the graph's node types. Every run records the code it ran as a version: [Versions](versions.md). |
 | `weft run --target <node>` | the same, but it runs only these nodes and whatever they need. Repeatable, and several targets run the union of what each needs; any node can be a target. See [what actually runs](../language/mental-model.md#what-actually-runs). |
@@ -63,9 +65,17 @@ so `deactivate` takes a `--mode` to say which you meant:
 
 | If you want work in flight to be | Pass |
 |---|---|
-| thrown away | `--mode wipe` |
+| thrown away | `--mode wipe`, the default |
 | kept, and resumable when you turn the project back on | `--mode hibernate` |
 | kept, and queued to run the moment you turn it back on | `--mode park` |
+
+Every verb that turns triggers off takes this same flag: `deactivate`,
+`resync`, and `infra stop` / `terminate` / `upgrade` on an active project. Ask
+from a terminal and it offers you the three; from a script or an agent, with no
+flag, it wipes. That default is deliberate. The two preserving modes carry
+signals and suspended runs across a change to the program, and on a project you
+are still building that is how a run ends up waiting for something nobody will
+ever answer. Keeping the work in flight is the thing you say out loud.
 
 Executions that are running right now are a separate question, answered by
 `--running-policy`. The default, `wait`, lets them finish while new fires are
@@ -73,6 +83,12 @@ held; `--drain-timeout <seconds>` caps that wait at 600 seconds by default,
 after which the stragglers are cancelled. `--running-policy cancel` kills them
 immediately. With `--mode hibernate`, `--grace <minutes>` is how long the
 hibernation window lasts, 15 by default.
+
+Waiting is a hibernate thing. Under `--mode park` the running executions are
+left exactly as they are and the command lands at once, because park's whole
+promise is that they stay alive with no time limit; a park that waited would
+end by cancelling the very runs it was keeping. If you want them stopped under
+park, say so with `--running-policy cancel`.
 
 Turning a project back on asks the mirror question, because reactivating has to
 decide what happens to whatever the deactivation kept. On a terminal `weft
@@ -105,7 +121,7 @@ actually do to a unit.
 
 | Command | What it does |
 |---|---|
-| `weft daemon start [--rebuild] [--rebuild-cluster] [--public-url\|--no-public-url]` | start the runtime. `--rebuild` re-makes the shared images under their existing tags and rolls everything onto the new bytes (kind only; on a k8s cluster, publish with `weft build-images --push` instead). `--rebuild-cluster` allows deleting and recreating the kind cluster when its shape changed; every project's own database lives inside the node and is destroyed with it, so this never happens without the flag. |
+| `weft daemon start [--rebuild] [--rebuild-cluster] [--public-url\|--no-public-url]` | start the runtime. `--rebuild` re-makes the shared images under their existing tags and rolls everything onto the new bytes (kind only; on a k8s cluster, publish with `weft build-images --push` instead). `--rebuild-cluster` deletes and recreates the kind cluster even when its shape did not change (a shape change, a port or a kind version, rebuilds on its own, saying so first); every project's own database lives inside the node and is destroyed with it. |
 | `weft daemon stop` | stop it |
 | `weft daemon status` | is it up, and its public address if it has one |
 | `weft daemon restart` | the same reconcile as `weft daemon start` (an alias): apply what changed, roll what needs it |
@@ -121,6 +137,7 @@ Aliased to `weft d`.
 |---|---|
 | `weft test-node [target]` | run node self-tests: the basic and fake tiers, locally, no cluster. `--tier live` adds the real-credential tier, which **can spend money**, so it asks first (`--yes` to skip the prompt). See [Testing a node](../nodes/testing.md). |
 | `weft node-test-hash [target]` | the content hash of a package's test inputs. Run it when you want to know whether anything a package's tests depend on has changed since they last passed. |
+| `weft infra list-doors` | the pieces of this project's infrastructure a client on this machine can reach, and the address each answers on. A door is part of what a node IS (its endpoint declares it, usually behind an input like `PostgresDatabase`'s `reachable`), so this only reports: there is nothing here to open or close. The address is not in the source because the cluster allocates the port, which is why you ask. |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's standard library. It **wipes and recopies** that folder, so copy anything you edited in there out first. |
 | `weft describe-nodes [--stdlib] [--list \| --node <Type> [--compact]]` | print the catalog. `--list` is one line per node type (type, tags, one-line description): the cheap first look, and how you find a node. `--node <Type> --compact` is one node's wiring view (no labels, icons, connect recipes, or null knobs), the token-cheap thing a model reads before wiring it; without `--compact` it is the full resolved metadata. The bare form prints the whole catalog as JSON for the editor's palette, and it is large. |
 
@@ -160,7 +177,7 @@ narrow what a token can ever see:
 | Variable | Default | Set it when |
 |---|---|---|
 | `WEFT_DISPATCHER_URL` | `http://localhost:9999` | the runtime is not on this machine, or you moved its port |
-| `WEFT_HTTP_PORT` | `9999` | something else already has 9999 |
+| `WEFT_DISPATCHER_PORT` | `9999` | something else already has 9999. The port is baked into the local cluster, so changing it makes the next `weft daemon start` rebuild the cluster; go and read [Port 9999 is taken](../start/troubleshooting.md#port-9999-is-taken) before you do |
 | `CREDENTIAL_ENCRYPTION_KEY` | a development key, with a warning on every boot | before you store a credential you care about. It seals them at rest, and changing it later strands every connection you had. |
 | `WEFT_ACCESS_APPS_FILE` | | you are pointing weft at a [shared-credentials file](../connections/the-apps-file.md) |
 | `WEFT_PUBLIC_TUNNEL_TOKEN` | | you want a [permanent public address](../connections/public-address.md) instead of the random one |

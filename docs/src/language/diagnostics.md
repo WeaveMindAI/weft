@@ -26,7 +26,7 @@ there.
 | `input-accepts` | a driver the port does not take: a wire on a port whose `accepts` is `["literal"]`, a written value on one whose `accepts` is `["wire"]`, or a wire or a `@file`/`@asset` on a port the compiler reads to build the node. The message reads the list back. |
 | `duplicate-input-port` | the same input name declared twice on one node. |
 | `duplicate-node-id` | two nodes share an id in one scope. |
-| `should-flow-not-boolean` | a `_should_flow` written down that is not `true` or `false`. A wire may carry any value; a constant is a Boolean. |
+| `gate-not-boolean` | a gate written down (either spelling) that is not `true` or `false`. A wire may carry any value; a constant is a Boolean. |
 | `undeclared-port-no-custom` | a port was referenced that the node neither declares nor allows you to add. |
 | `value-on-output` | a value was written on one of the node's output ports. An output takes no value: a firing emits on it, and you read it as `node.port`. |
 
@@ -59,6 +59,7 @@ there.
 | `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
 | `trigger-into-trigger` | a trigger wired into another trigger. No phase delivers that. |
 | `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
+| `route-overlap` | two nodes of this program claim public addresses a single call could reach, so which one answers has no answer (`cards/count` against `cards/{id}`, on a shared method). Change one path, or give them different methods. The same question is asked again at activation, across every project of the account, because only the dispatcher knows what your other programs already serve. |
 | `duplicate-port` | two ports on the node share a name on one side, which config-derived ports are the usual way to reach. Give them different names. |
 | `config-ports-not-a-list` | the config key a node derives its ports from does not hold a list. |
 | `config-entry-not-an-object` | an entry of that list is not an object. |

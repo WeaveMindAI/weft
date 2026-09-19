@@ -30,7 +30,7 @@
 //! code directly via `#[path]` includes driven by codegen; it does NOT
 //! use this crate at runtime.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -171,9 +171,16 @@ pub struct FsCatalog {
     /// All discovered packages, keyed by package root. Each
     /// `CatalogEntry` has a `package_key` pointing back in here.
     packages: HashMap<PathBuf, Package>,
-    /// Soft errors collected under `DiscoverPolicy::Lenient` (always
-    /// empty under `Strict`, which errors instead).
+    /// Soft errors collected under `DiscoverPolicy::Lenient` (`Strict`
+    /// errors on those instead), plus, under either policy, one line
+    /// per node left out because it is not ready (see `pending`).
     warnings: Vec<String>,
+    /// Nodes seen but left out: a folder with a `metadata.json` and no
+    /// `mod.rs` yet (a specialist writes the description before the
+    /// code). Type name to the folder. A build never references such a
+    /// node's code, so a program that does not name it builds; the
+    /// compiler names the folder when a program does.
+    pending: BTreeMap<String, PathBuf>,
     /// The project's resolved type registry: builtin aliases plus every
     /// `types` declaration harvested from the tree's `metadata.json`
     /// files. Built BEFORE any metadata is deserialized (port type
@@ -218,6 +225,7 @@ impl FsCatalog {
             entries: HashMap::new(),
             packages: HashMap::new(),
             warnings: Vec::new(),
+            pending: BTreeMap::new(),
             type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         };
         let roots: Vec<&Path> = roots.iter().copied().filter(|r| r.exists()).collect();
@@ -258,14 +266,22 @@ impl FsCatalog {
             entries: HashMap::new(),
             packages: HashMap::new(),
             warnings: Vec::new(),
+            pending: BTreeMap::new(),
             type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         }
     }
 
     /// Soft errors collected during a `Lenient` discover (malformed
-    /// `metadata.json`, duplicate node types). Empty after `Strict`.
+    /// `metadata.json`, duplicate node types), and under either policy
+    /// one line per node left out for not being ready yet.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// The nodes left out for not being ready yet: type name to the
+    /// folder holding the `metadata.json` that has no `mod.rs` beside it.
+    pub fn pending(&self) -> &BTreeMap<String, PathBuf> {
+        &self.pending
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &CatalogEntry> {
@@ -348,6 +364,15 @@ impl MetadataCatalog for FsCatalog {
     fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
         self.type_registry.clone()
     }
+    fn not_ready(&self, node_type: &str) -> Option<String> {
+        self.pending.get(node_type).map(|dir| pending_reason(node_type, dir))
+    }
+}
+
+/// The one sentence a pending node is described by, in the discovery
+/// warnings and in the compiler's diagnostic alike.
+fn pending_reason(node_type: &str, dir: &Path) -> String {
+    format!("node '{node_type}' at {} has no mod.rs yet; it is left out until it does", dir.display())
 }
 
 impl FsCatalog {
@@ -577,8 +602,10 @@ enum RecordedInstallRoot {
 ///    by setup.sh from the rolling release) bakes its BUILDER's
 ///    checkout path into (3), which does not exist on this machine;
 ///    setup.sh records where the repo actually lives, one line in a
-///    file.
-///    SYNC: repo-root file <-> setup.sh (prebuilt CLI install: repo-root write)
+///    file, and every successful `weft daemon start` records the
+///    checkout it installed from, so a later start from a project
+///    folder finds the same manifests and shared-credentials file.
+///    SYNC: repo-root file <-> setup.sh (prebuilt CLI install: repo-root write), crates/weft-cli/src/commands/daemon.rs (record_repo_root)
 ///
 /// THE single resolver; `weft_compiler::build::resolve_weft_root`
 /// delegates here so the two can't drift (they must return the same
@@ -713,6 +740,14 @@ struct DiscoverCtx<'a> {
 }
 
 impl DiscoverCtx<'_> {
+    /// A node seen but not ready: left out under EITHER policy (a
+    /// half-written node is not an error in anyone's build), recorded
+    /// so the compiler can name it when a program asks for it.
+    fn leave_pending(&mut self, node_type: String, dir: PathBuf) {
+        self.cat.warnings.push(pending_reason(&node_type, &dir));
+        self.cat.pending.insert(node_type, dir);
+    }
+
     /// Resolve a soft failure (malformed node, duplicate type) per the
     /// policy: `Strict` propagates the error, `Lenient` records a
     /// warning and returns `Ok(())` so the walk continues.
@@ -1015,7 +1050,11 @@ fn visit_dir_children(
 /// the whole story).
 fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> {
     let entry = match load_node_entry(dir, dir, None) {
-        Ok(e) => e,
+        Ok(Loaded::Ready(e)) => *e,
+        Ok(Loaded::Pending { node_type }) => {
+            ctx.leave_pending(node_type, dir.to_path_buf());
+            return Ok(());
+        }
         Err(e) => return ctx.soft_fail(e),
     };
     // The package name is the directory name. A non-UTF-8 name is a
@@ -1106,6 +1145,7 @@ fn register_package(
     // seen identically by discovery, staging, and hashing.
     let mut node_types: Vec<String> = Vec::new();
     let mut shared_rs: Vec<PathBuf> = Vec::new();
+    let mut pending_members = 0usize;
     for entry in entries {
         match entry {
             NodeDirEntry::Dir(path) => {
@@ -1114,7 +1154,8 @@ fn register_package(
                     continue;
                 }
                 match load_node_entry(&path, dir, package_defaults.as_ref()) {
-                    Ok(entry) => {
+                    Ok(Loaded::Ready(entry)) => {
+                        let entry = *entry;
                         let node_type = entry.node_type.clone();
                         // Only list the type if it was actually inserted.
                         // Under Lenient a collision is dropped-with-warning;
@@ -1123,6 +1164,10 @@ fn register_package(
                         if ctx.insert_entry(entry)? {
                             node_types.push(node_type);
                         }
+                    }
+                    Ok(Loaded::Pending { node_type }) => {
+                        pending_members += 1;
+                        ctx.leave_pending(node_type, path);
                     }
                     Err(e) => ctx.soft_fail(e)?,
                 }
@@ -1138,6 +1183,12 @@ fn register_package(
     node_types.sort();
     shared_rs.sort();
 
+    // A package whose members are all still being written is not a
+    // package with no members: the pending lines already say what is
+    // missing, and it registers once one member is ready.
+    if node_types.is_empty() && pending_members > 0 {
+        return Ok(());
+    }
     if node_types.is_empty() {
         return ctx.soft_fail(CatalogError::Parse {
             path: toml_path.to_path_buf(),
@@ -1205,6 +1256,13 @@ fn load_package_defaults(
     Ok(Some(obj))
 }
 
+/// What loading a node folder found: a node ready to catalog, or one
+/// whose description exists but whose code does not yet.
+enum Loaded {
+    Ready(Box<CatalogEntry>),
+    Pending { node_type: String },
+}
+
 /// Load a single node's metadata + form field specs.
 ///
 /// `node_dir` = directory containing the node's `metadata.json`,
@@ -1217,7 +1275,7 @@ fn load_node_entry(
     node_dir: &Path,
     package_key: &Path,
     package_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Result<CatalogEntry, CatalogError> {
+) -> Result<Loaded, CatalogError> {
     let meta_path = node_dir.join("metadata.json");
     let raw = fs::read_to_string(&meta_path).map_err(|e| CatalogError::Io {
         path: meta_path.clone(),
@@ -1275,12 +1333,18 @@ fn load_node_entry(
         });
     }
 
-    Ok(CatalogEntry {
+    // The description is sound; the code may not be there yet. The
+    // same `read_node_dir` view the walk and the staging use decides.
+    if !has_node_file(&read_node_dir(node_dir)?, "mod.rs") {
+        return Ok(Loaded::Pending { node_type: metadata.node_type });
+    }
+
+    Ok(Loaded::Ready(Box::new(CatalogEntry {
         node_type: metadata.node_type.clone(),
         metadata,
         source_dir: node_dir.to_path_buf(),
         package_key: package_key.to_path_buf(),
-    })
+    })))
 }
 
 // ----- Errors --------------------------------------------------------
@@ -1492,6 +1556,44 @@ mod package_tests {
             "the drop is warned, not silent: {:?}",
             cat.warnings()
         );
+    }
+
+    /// A folder with a `metadata.json` and no `mod.rs` is a node still
+    /// being written: left out under either policy, one warning naming
+    /// the folder, and answered by `not_ready`. A package whose only
+    /// members are pending is left out too, without the "no members"
+    /// complaint; a ready sibling registers as usual.
+    #[test]
+    fn a_node_without_its_code_is_left_out_and_named() {
+        let root = tempfile::tempdir().expect("temp root");
+        let stdlib = stdlib_root().expect("stdlib root");
+        // A bare node: description only.
+        let bare = root.path().join("nodes/resizer");
+        fs::create_dir_all(&bare).expect("mkdir");
+        fs::write(bare.join("metadata.json"), r#"{"type": "Resizer", "label": "Resizer", "description": "Shrinks a picture.", "inputs": [], "outputs": []}"#).expect("write");
+        // A package: one ready member (copied from the stdlib), one pending.
+        copy_dir(&stdlib.join("logic"), &root.path().join("nodes/logic"));
+        let member = root.path().join("nodes/logic/later");
+        fs::create_dir_all(&member).expect("mkdir");
+        fs::write(member.join("metadata.json"), r#"{"type": "Later", "label": "Later", "description": "Not yet.", "inputs": [], "outputs": []}"#).expect("write");
+        // A package whose only member is pending.
+        let alone = root.path().join("nodes/alone");
+        fs::create_dir_all(alone.join("only")).expect("mkdir");
+        fs::write(alone.join("package.toml"), "[package]\nname = \"alone\"\n").expect("write");
+        fs::write(alone.join("only/metadata.json"), r#"{"type": "Only", "label": "Only", "description": "Not yet.", "inputs": [], "outputs": []}"#).expect("write");
+
+        for policy in [DiscoverPolicy::Strict, DiscoverPolicy::Lenient] {
+            let cat = FsCatalog::discover_with_policy(&root.path().join("nodes"), policy).expect("a pending node is no error");
+            assert!(cat.lookup("Resizer").is_none() && cat.lookup("Later").is_none() && cat.lookup("Only").is_none());
+            assert!(cat.lookup("FirstInOrder").is_some(), "the ready sibling registers");
+            assert!(cat.packages().any(|p| p.name == "logic") && !cat.packages().any(|p| p.name == "alone"));
+            assert_eq!(cat.pending().keys().collect::<Vec<_>>(), ["Later", "Only", "Resizer"]);
+            let reason = cat.not_ready("Resizer").expect("named");
+            assert!(reason.contains("no mod.rs yet") && reason.contains(&bare.display().to_string()), "{reason}");
+            assert!(cat.not_ready("Nowhere").is_none());
+            assert_eq!(cat.warnings().iter().filter(|w| w.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
+            assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
+        }
     }
 
     /// A project's nodes live in two trees, `nodes/` and beside the code

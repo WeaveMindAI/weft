@@ -22,7 +22,6 @@
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -54,7 +53,6 @@
     {
       "name": "user",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -83,21 +81,18 @@
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "label": "Text",
       "description": "The message text. With blocks present, this is the notification fallback text."
     },
     {
       "name": "blocks",
       "type": "List[JsonDict]",
-      "required": false,
       "label": "Blocks",
       "description": "Block Kit blocks (the JSON array from Slack's Block Kit Builder) for rich layout. Text and/or blocks must be provided."
     },
     {
       "name": "threadTs",
       "type": "String",
-      "required": false,
       "label": "Reply in thread",
       "placeholder": "The parent message's ts",
       "description": "Post as a reply inside this message's thread instead of top-level."
@@ -105,7 +100,6 @@
     {
       "name": "postAt",
       "type": "Number",
-      "required": false,
       "label": "Schedule (epoch seconds)",
       "description": "Schedule the message for this Unix time (up to 120 days ahead) instead of posting now. A scheduled message emits scheduledId instead of ts/permalink."
     }

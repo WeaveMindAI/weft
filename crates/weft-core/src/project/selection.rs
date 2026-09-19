@@ -51,7 +51,7 @@ pub struct SelectionBounds {
     pub fire: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Direction {
     Upstream,
     Downstream,
@@ -102,12 +102,6 @@ fn step(project: &ProjectDefinition, from: &Located, edge: &Edge, direction: Dir
 /// when the wire is another call's (see `step`).
 pub fn source_place(project: &ProjectDefinition, at: &Located, edge: &Edge) -> Option<Located> {
     step(project, at, edge, Direction::Upstream)
-}
-
-/// The place of `edge`'s target when its source is at `at`; `None`
-/// when the wire is another call's (see `step`).
-pub fn target_place(project: &ProjectDefinition, at: &Located, edge: &Edge) -> Option<Located> {
-    step(project, at, edge, Direction::Downstream)
 }
 
 /// The places of a wire's two ends, `(source, target)`, from the wire's
@@ -366,8 +360,19 @@ impl RunSelection {
 
     /// Roots are relative to selected wires. Enclosing gates still control
     /// when these intents can dispatch, including an explicitly fired trigger.
+    ///
+    /// A member of a loop body is never a root here, wired or not: it
+    /// runs once per iteration, at the iteration's frames, and the loop
+    /// launcher kicks it there (`scope_body_roots`). A kick from this
+    /// list would land at the loop's own frames, where no iteration's
+    /// value can ever reach it, and hold the run open for ever. A
+    /// member of a plain group is kicked by both and the two kicks
+    /// merge (same node, same frames): the group launcher stamps its
+    /// verdict onto the kick that is already there.
     pub fn roots(&self, project: &ProjectDefinition) -> Vec<Located> {
-        self.nodes.iter().filter(|place| !project.edges.iter().any(|edge| edge.target == place.id && self.fed_by(project, place, edge)))
+        self.nodes.iter()
+            .filter(|place| !in_a_loop_body(project, place))
+            .filter(|place| !project.edges.iter().any(|edge| edge.target == place.id && self.fed_by(project, place, edge)))
             .cloned().collect()
     }
 
@@ -478,6 +483,17 @@ fn gates_of(project: &ProjectDefinition, place: &Located) -> Vec<Located> {
         }
     }
     gates
+}
+
+/// Whether `place` runs inside a loop's body: a loop in the node's own
+/// scope, or around a site on its path. A loop's own boundaries are
+/// not inside it (they run at the loop's frames), so `enclosing_loops`,
+/// which counts them, is the wrong question for what the loop launcher
+/// owns.
+pub fn in_a_loop_body(project: &ProjectDefinition, place: &Located) -> bool {
+    let is_loop = |group: &str| project.groups.iter().any(|g| g.id == group && matches!(g.kind, GroupKind::Loop { .. }));
+    let scope_has_loop = |id: &str| project.nodes.iter().find(|n| n.id == id).is_some_and(|n| n.scope.iter().any(|g| is_loop(g)));
+    scope_has_loop(&place.id) || place.path.iter().any(|site| scope_has_loop(&boundary_in_id(site)))
 }
 
 /// The loops around `place`, outermost first, each at the place the
@@ -679,8 +695,28 @@ fn walk_ports(project: &ProjectDefinition, mut pending: Vec<(Located, Option<Str
                 .map(|(edge, target, _)| (target, port_of(project, &edge.target, edge.target_handle.as_deref()))).collect(),
         };
         pending.extend(next);
+        // A `_should_flow` wire into a group's door says "run what is in
+        // here", the way the same wire into a node says "run this node":
+        // walking forward through it puts the whole group in the run,
+        // its body behind a call site included. A data port on the door
+        // keeps the port-by-port walk, so a cut stays precise.
+        if direction == Direction::Downstream && port.as_deref().is_some_and(crate::exec::skip::is_gate_port) {
+            if let Some(group) = gated_group(project, &place) {
+                for member in members_with_paths(project, &group, &place.path) {
+                    if !visited.contains(&(member.clone(), None)) { pending.push((member, None)); }
+                }
+            }
+        }
     }
     nodes
+}
+
+/// The group whose door `place` is: an ordinary In boundary's group,
+/// `None` for anything else.
+fn gated_group(project: &ProjectDefinition, place: &Located) -> Option<String> {
+    let node = project.nodes.iter().find(|n| n.id == place.id)?;
+    let boundary = node.group_boundary.as_ref()?;
+    (is_ordinary_boundary(project, &place.id) && boundary.role == GroupBoundaryRole::In).then(|| boundary.group_id.clone())
 }
 
 /// The port a walk arrives on at an ordinary boundary (whose ports are
@@ -783,6 +819,30 @@ mod tests {
             let before = RunSelection::carve(&project, &SelectionBounds { before: vec!["g".into()], ..Default::default() }).unwrap();
             assert!(top_members(&project, "g").is_disjoint(&before.nodes));
             assert_eq!(before.nodes, tops(&["a", "unrelated", "gate"]));
+        }
+    }
+
+    /// An unwired node inside a plain group is a root the run kicks
+    /// (its kick merges with the group launcher's); the same node
+    /// inside a loop is the loop launcher's alone, once per iteration,
+    /// so the pre-run list leaves it out. The loop's own door stays a
+    /// root the way any node does.
+    #[test]
+    fn a_loop_body_member_is_never_a_pre_run_root() {
+        for looping in [false, true] {
+            let mut project = program();
+            project.nodes.push(serde_json::from_value(json!({
+                "id": "lonely", "nodeType": "T", "label": null, "config": {},
+                "position": {"x": 0, "y": 0}, "inputs": [], "outputs": [],
+                "features": {}, "scope": ["g"], "groupBoundary": null, "requiresInfra": false
+            })).unwrap());
+            project.groups[0].node_ids.push("lonely".into());
+            if looping { project.groups[0].kind = GroupKind::Loop { loop_config: json!({}) }; }
+            let roots: BTreeSet<Located> = RunSelection::whole(&project).roots(&project).into_iter().collect();
+            let expected = if looping { tops(&["a", "unrelated", "gate"]) } else { tops(&["a", "unrelated", "gate", "trigger", "lonely"]) };
+            assert_eq!(roots, expected, "looping={looping}");
+            assert_eq!(in_a_loop_body(&project, &top("lonely")), looping);
+            assert!(!in_a_loop_body(&project, &top("g__in")), "a door is not inside its own loop");
         }
     }
 
@@ -946,6 +1006,46 @@ mod tests {
             target: vec!["after".into()], ..Default::default()
         }).unwrap();
         assert!(top_members(&project, "g").is_subset(&selection.nodes));
+    }
+
+    /// A loop is bad at running half of itself, so no selection may
+    /// hold some of a loop's body and not the rest. Every door that
+    /// builds a selection asks `validate_loops` before handing it
+    /// back, and this is the check itself: a partial body is refused
+    /// naming the loop, the whole body passes.
+    ///
+    /// The refusal here is NOT the one a named endpoint gets. Asking
+    /// to cut AT a node inside a loop is turned down earlier, by
+    /// `validate_place`, whose message reads "cannot cut AT '<node>'
+    /// inside loop". This one has no "at": it is about the SHAPE of
+    /// the resulting set, which is why it can catch a cut that named
+    /// nothing illegal and still came out half a loop.
+    #[test]
+    fn a_selection_holding_half_a_loop_is_refused() {
+        let mut project = program();
+        project.groups[0].kind = GroupKind::Loop { loop_config: json!({}) };
+
+        let refusal = RunSelection::restricted(&project, tops(&["b"]))
+            .expect_err("one member of a loop body is half a loop");
+        assert!(refusal.contains("cannot cut inside loop 'g'"), "{refusal}");
+        assert!(refusal.contains("select the whole loop"), "{refusal}");
+        assert!(!refusal.contains("cannot cut at"), "this is the shape check, not the endpoint one: {refusal}");
+
+        // Two of the four is still half.
+        assert!(RunSelection::restricted(&project, tops(&["b", "c"])).is_err());
+
+        // The whole body, and the check is satisfied: it refuses a
+        // partial loop, not every loop.
+        let whole: BTreeSet<Located> = top_members(&project, "g")
+            .into_iter()
+            .chain(tops(&["g__in", "g__out"]))
+            .collect();
+        RunSelection::restricted(&project, whole).expect("the whole body is a legal cut");
+
+        // A plain group is not a loop: half of one is fine.
+        let mut plain = program();
+        plain.groups[0].kind = GroupKind::Group;
+        RunSelection::restricted(&plain, tops(&["b"])).expect("a group may be cut into");
     }
 
     #[test]
@@ -1213,5 +1313,121 @@ mod tests {
         }).unwrap();
         assert_eq!(serde_json::from_value::<RunSelection>(serde_json::to_value(&selection).unwrap()).unwrap(), selection);
         assert_eq!(serde_json::from_value::<RunSelection>(serde_json::to_value(RunSelection::default()).unwrap()).unwrap(), RunSelection::default());
+    }
+
+    /// The program an API builder writes: a route at the top, and the
+    /// work hanging off it through `_should_flow` alone, once as a
+    /// plain group and once as an included file whose body includes
+    /// another. The route feeds no data into either.
+    fn gated_program() -> ProjectDefinition {
+        use super::super::boundary_types as bt;
+        let node = |id: &str, ty: &str, scope: &[&str], boundary: Value, trigger: bool| json!({
+            "id": id, "nodeType": ty, "label": null, "config": {},
+            "position": {"x": 0, "y": 0}, "inputs": [], "outputs": [],
+            "features": {"isTrigger": trigger}, "scope": scope, "groupBoundary": boundary, "requiresInfra": false
+        });
+        let edge = |source: &str, sp: &str, target: &str, tp: &str| json!({
+            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
+            "sourceHandle": sp, "targetHandle": tp
+        });
+        serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("db", "T", &[], Value::Null, false),
+                node("live", "T", &[], Value::Null, true),
+                node("g__in", bt::PASSTHROUGH, &[], json!({"groupId": "g", "role": "In"}), false),
+                node("g.make", "T", &["g"], Value::Null, false),
+                node("g__out", bt::PASSTHROUGH, &[], json!({"groupId": "g", "role": "Out"}), false),
+                node("s__in", bt::CALL_IN, &[], json!({"groupId": "s", "role": "In"}), false),
+                node("s__out", bt::CALL_OUT, &[], json!({"groupId": "s", "role": "Out"}), false),
+                node("S__in", bt::INCLUDE_IN, &[], json!({"groupId": "S", "role": "In"}), false),
+                node("S.query", "T", &["S"], Value::Null, false),
+                node("S.inner__in", bt::CALL_IN, &["S"], json!({"groupId": "S.inner", "role": "In"}), false),
+                node("S.inner__out", bt::CALL_OUT, &["S"], json!({"groupId": "S.inner", "role": "Out"}), false),
+                node("S__out", bt::INCLUDE_OUT, &[], json!({"groupId": "S", "role": "Out"}), false),
+                node("I__in", bt::INCLUDE_IN, &[], json!({"groupId": "I", "role": "In"}), false),
+                node("I.deep", "T", &["I"], Value::Null, false),
+                node("I__out", bt::INCLUDE_OUT, &[], json!({"groupId": "I", "role": "Out"}), false),
+                node("stray", "T", &[], Value::Null, false),
+            ],
+            "edges": [
+                edge("db", "access", "g__in", "db"), edge("g__in", "db", "g.make", "account"),
+                edge("live", "method", "g__in", "_should_flow"),
+                edge("db", "access", "s__in", "db"), edge("s__in", "db", "S__in", "db"),
+                edge("S__in", "db", "S.query", "account"), edge("S__in", "db", "S.inner__in", "db"),
+                edge("S.inner__in", "db", "I__in", "db"), edge("I__in", "db", "I.deep", "account"),
+                edge("live", "method", "s__in", "_should_flow"),
+                edge("S.query", "count", "S.inner__in", "_should_flow"),
+                edge("stray", "out", "live", "setting"),
+            ],
+            "groups": [
+                {"id": "g", "kind": "group", "nodeIds": ["g.make"]},
+                {"id": "s", "kind": "call", "body": "S", "nodeIds": []},
+                {"id": "S", "kind": "body", "nodeIds": ["S.query"]},
+                {"id": "S.inner", "kind": "call", "body": "I", "nodeIds": [], "parentGroupId": "S"},
+                {"id": "I", "kind": "body", "nodeIds": ["I.deep"]}
+            ]
+        })).unwrap()
+    }
+
+    /// `g._should_flow = live.method` means "run the group once the
+    /// route fired", the way it means "run the node" on a node: the
+    /// fire's program holds the group's members and what they need,
+    /// the database included. Through a call site the same wire runs
+    /// the included file, and a `_should_flow` inside that file runs
+    /// the file it includes in turn.
+    #[test]
+    fn a_should_flow_into_a_door_runs_everything_behind_it() {
+        let project = gated_program();
+        let fire = RunSelection::carve(&project, &SelectionBounds { fire: Some("live".into()), ..Default::default() }).unwrap();
+        for place in [top("db"), top("live"), top("g__in"), top("g.make"), top("s__in"),
+            at("S__in", &["s"]), at("S.query", &["s"]), at("S.inner__in", &["s"]),
+            at("I__in", &["s", "S.inner"]), at("I.deep", &["s", "S.inner"])] {
+            assert!(fire.nodes.contains(&place), "{place:?} missing from {:?}", fire.nodes);
+        }
+        assert!(fire.edges.contains(&top("db.access->g__in.db")) && fire.edges.contains(&top("g__in.db->g.make.account")));
+        assert!(fire.edges.contains(&at("S__in.db->S.query.account", &["s"])));
+        assert!(fire.edges.contains(&at("I__in.db->I.deep.account", &["s", "S.inner"])));
+        assert_eq!(fire.boundary_ports[&top("g__in")], names(&["db", "_should_flow"]));
+        assert_eq!(fire.boundary_ports[&at("I__in", &["s", "S.inner"])], names(&["db", "_should_flow"]));
+        // Setup-only producers stay out of a fire, as before.
+        assert!(!fire.nodes.contains(&top("stray")));
+        let roots: BTreeSet<Located> = fire.roots(&project).into_iter().collect();
+        assert!(roots.contains(&top("db")) && roots.contains(&top("live")), "{roots:?}");
+    }
+
+    /// What a trigger's `_should_flow` runs, runs ONCE at activation: the
+    /// setup phase walks up from every trigger, so the node is in it, and
+    /// a fire walks down from the trigger and stops at triggers on the way
+    /// up, so it is not. That is the documented way to create tables
+    /// before a program serves, and it holds only if both walks agree.
+    #[test]
+    fn a_node_feeding_a_triggers_gate_runs_at_setup_and_never_on_a_fire() {
+        let mut project = gated_program();
+        project.edges.push(serde_json::from_value(json!({
+            "id": "db.access->live._should_flow", "source": "db", "sourceHandle": "access",
+            "target": "live", "targetHandle": "_should_flow"
+        })).unwrap());
+        let setup = RunSelection::setup(&project, &[top("live")]).unwrap();
+        assert!(setup.nodes.contains(&top("db")), "the trigger's gate source is in the setup program: {:?}", setup.nodes);
+        let fire = RunSelection::carve(&project, &SelectionBounds { fire: Some("live".into()), ..Default::default() }).unwrap();
+        assert!(!fire.edges.iter().any(|wire| wire.id == "db.access->live._should_flow"),
+            "a wire into the trigger is not re-read on a fire: {:?}", fire.edges);
+    }
+
+    /// The same doors reached on a data port keep the port-by-port
+    /// walk: a fire that feeds `db` into the group runs only what reads
+    /// it, so a precise cut stays precise.
+    #[test]
+    fn a_data_port_on_a_door_still_walks_port_by_port() {
+        let mut project = gated_program();
+        project.edges.retain(|edge| edge.target_handle.as_deref() != Some("_should_flow"));
+        project.edges.push(serde_json::from_value(json!({
+            "id": "live.method->g__in.when", "source": "live", "sourceHandle": "method", "target": "g__in", "targetHandle": "when"
+        })).unwrap());
+        let fire = RunSelection::carve(&project, &SelectionBounds { fire: Some("live".into()), ..Default::default() }).unwrap();
+        assert!(fire.nodes.contains(&top("g__in")));
+        assert!(!fire.nodes.contains(&top("g.make")), "nothing reads `when`, so the member is not pulled in: {:?}", fire.nodes);
+        assert!(!fire.nodes.contains(&at("S.query", &["s"])));
     }
 }

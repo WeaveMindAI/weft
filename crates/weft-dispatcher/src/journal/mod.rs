@@ -176,19 +176,6 @@ pub trait Journal: Send + Sync {
         saturation: f64,
     ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome>;
 
-    /// ATOMICALLY tear down a live execution whose setup failed AFTER
-    /// admission: delete its still-pending task and journal the cancel
-    /// terminals (`NodeCancelled` per non-terminal node + `ExecutionCancelled`)
-    /// in one transaction, so "task deleted" and "cancel journaled" can never
-    /// disagree. `WorkerOwnsIt` means a worker already claimed the task: it
-    /// owns the run and its own terminal, so nothing was cancelled.
-    async fn cancel_never_claimed_execution(
-        &self,
-        color: Color,
-        program: Option<&weft_core::ProjectDefinition>,
-        cause: &weft_core::exec::CancelCause,
-    ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome>;
-
     /// THE dispatcher-side cancel of an execution, in ONE transaction:
     /// strip the color's wake signals (the parked form, the timer, the
     /// webhook, so nothing can revive it), journal its cancel terminals
@@ -349,6 +336,12 @@ pub trait Journal: Send + Sync {
     /// wipe / cancel_running / the activation sweep to enumerate what
     /// needs cancelling without the limit-truncation problem of
     /// `list_executions`. Single SQL roundtrip, no per-color fold.
+    ///
+    /// Oldest first, so the LAST one is the most recently started. The
+    /// editor's action bar follows "the latest run" and the wire
+    /// carries no other way to tell which that is, so the order is part
+    /// of the contract rather than an accident of the query. Ties break
+    /// on the color, so the answer is stable across calls.
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
@@ -449,6 +442,28 @@ pub trait Journal: Send + Sync {
 
     /// Delete all data for a color. Called only by `weft clean`.
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()>;
+
+    /// Delete all data for every execution of a project, and say how
+    /// many went. Called by `weft rm`.
+    ///
+    /// Removing a project erases its history rather than orphaning it.
+    /// Keeping the runs sounded kind and was not: the project row that
+    /// named them is gone, so `weft rm` can never run again for them
+    /// and `weft clean` has no project to clean, which left rows nobody
+    /// could reach or free. What survives a removal is what the person
+    /// still has: their files on disk.
+    async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64>;
+
+    /// Every project id that still has executions while the project
+    /// itself is gone. What the reaper sweeps.
+    ///
+    /// The erase at removal is best-effort, because a project is
+    /// already gone by then and failing the answer would say the
+    /// removal did not happen when it did. Nothing else can reach those
+    /// rows afterwards (`weft rm` refuses a project it cannot find, and
+    /// `weft clean` needs a project), so without this one transient
+    /// failure would keep them for good.
+    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<String>>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -499,17 +514,22 @@ pub struct SignalRegistration {
     /// 'task_callback'. Read by `public_url()` to format the
     /// activate-response URLs.
     pub surface_kind: String,
-    /// `signal.mount_path`. Some(path) for PublicEntry,
-    /// None for TaskCallback. Empty string means root '/'.
-    /// UNIQUE in DB. Read by `public_url()`.
+    /// `signal.mount_path`. Some(pattern) for PublicEntry (the
+    /// tenant-prefixed route pattern, `/<tenant>/chat/{room}`), None
+    /// for TaskCallback. Read by `public_url()`.
     pub mount_path: Option<String>,
+    /// `signal.mount_methods`. The HTTP methods a PublicEntry serves,
+    /// uppercase; empty = any method, and empty for every other
+    /// surface.
+    pub mount_methods: Vec<String>,
     /// `signal.auth_kind` discriminant. Stored on the row and
     /// read directly by the fire-gate SQL in `fire_public_entry`;
     /// the field is part of the struct so writes go through one
     /// shape but reads of this field happen via SQL, not struct.
     pub auth_kind: String,
-    /// `signal.auth_config`. Per-auth-kind JSON (e.g. for
-    /// api_key: `{header_name, value_hash}`). Plaintext NEVER
+    /// `signal.auth_config`. Per-auth-kind JSON: `{access_id,
+    /// service}` for `connection` (the connection the broker checks
+    /// the caller against), null for `none`. No secret is ever
     /// stored here. Same write-through-struct / read-via-SQL
     /// pattern as `auth_kind`.
     pub auth_config: Option<Value>,
@@ -563,14 +583,31 @@ impl SignalRegistration {
             "public_entry" => {
                 let path = self.mount_path.as_deref().unwrap_or("");
                 let path = path.trim_start_matches('/');
-                // Live-connection kinds (ApiEndpoint/LiveSocket) are ONLY
-                // reachable through `/connect/...`; a bare-path fire does not
+                // Live-connection kinds (Route/Socket) are ONLY reachable
+                // through `/connect/...`; a bare-path fire does not
                 // open the held connection. Everything else (a plain public
                 // fire) is the bare path. The kind lives in spec_json.
-                let is_live = serde_json::from_str::<weft_core::primitive::SignalSpec>(&self.spec_json)
-                    .ok()
-                    .and_then(|s| weft_core::signal::protocol_for_tag(&s.kind))
-                    .is_some();
+                //
+                // A row whose spec does not parse gets NO url rather than
+                // a bare-path guess. The two addresses look equally real
+                // and only one of them works, so handing out the wrong
+                // one sends somebody to debug a route that was answering
+                // all along at the address they were not given. No url at
+                // least says "I cannot tell you", and the parse failure
+                // is a broken row, which is worth a line in the log.
+                let spec = serde_json::from_str::<weft_core::primitive::SignalSpec>(&self.spec_json);
+                let is_live = match &spec {
+                    Ok(spec) => weft_core::signal::protocol_for_tag(&spec.kind).is_some(),
+                    Err(error) => {
+                        tracing::error!(
+                            target: "weft_dispatcher::journal",
+                            token = %self.token,
+                            %error,
+                            "signal row has an unreadable spec; its public address cannot be told"
+                        );
+                        return None;
+                    }
+                };
                 let prefix = if is_live { "connect/" } else { "" };
                 if path.is_empty() {
                     Some(format!("{base}/{prefix}"))
@@ -640,6 +677,16 @@ pub struct ExecutionSummary {
     /// The tags the run put on itself (`ctx.tag_execution`), in the
     /// order it claimed them. Empty for a run that never tagged.
     pub tags: Vec<String>,
+    /// For a `cancelled` run: who or what stopped it (a person, a
+    /// sibling run, the caller leaving, the runtime). What the
+    /// executions panel draws the row's icon and words from. `None`
+    /// for every other status, and for a cancel row written without
+    /// a cause.
+    pub cancel_cause: Option<weft_core::exec::CancelCause>,
+    /// How many node firings the run skipped (a branch that did not
+    /// flow). A completed run with skips is still completed; the count
+    /// is what the panel says beside it.
+    pub skipped_nodes: u64,
 }
 
 /// The query for a page of a tenant's executions: pagination plus optional
@@ -659,6 +706,16 @@ pub struct ExecutionQuery {
     /// `Fire` hides the activate / resync / infra-start runs so a
     /// listing answers "what did my triggers actually do".
     pub phase: Option<weft_core::context::Phase>,
+    /// Only runs whose ENTRY NODE is this one: the node whose firing
+    /// started the run, as the `execution_started` event recorded it.
+    /// The filter that lets a person find their own run in a project
+    /// that is answering thousands: everything else about a run
+    /// (project, phase, when) is shared by every run beside it.
+    pub entry_node: Option<String>,
+    /// Only runs that ended this way: `completed`, `failed`,
+    /// `cancelled`, or `running` for the ones that have not ended at
+    /// all. "Which of mine broke" in one question.
+    pub status: Option<String>,
 }
 
 /// One page of executions plus the total number matching the same filters
@@ -832,21 +889,6 @@ impl LogEntry {
                 written_at_ms: Self::end_of_second_ms(*at_unix),
                 seq: None,
             },
-            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, at_unix, .. } => {
-                LogEntry {
-                    inherited_from: None,
-                    at_unix: *at_unix,
-                    level: "warn".into(),
-                    node: Some(node_id.clone()),
-                    frames: frames.clone(),
-                    message: format!(
-                        "port `{port}` refused a value: expected {expected}, got {actual}; \
-                         the port was closed"
-                    ),
-                    written_at_ms: Self::end_of_second_ms(*at_unix),
-                    seq: None,
-                }
-            }
             ExecEvent::ExecutionFailed { error, at_unix, .. } => LogEntry {
                 inherited_from: None,
                 at_unix: *at_unix,
@@ -880,7 +922,6 @@ impl LogEntry {
         "log_line",
         "node_failed",
         "node_cancelled",
-        "port_type_mismatch",
         "execution_failed",
         "execution_cancelled",
     ];
@@ -964,16 +1005,6 @@ mod log_entry_tests {
                 reason: "stopped".into(),
                 at_unix: 3,
             },
-            ExecEvent::PortTypeMismatch {
-                color,
-                emission_id: uuid::Uuid::nil(),
-                node_id: "bridge".into(),
-                frames: Default::default(),
-                port: "jid".into(),
-                expected: "String".into(),
-                actual: "Null".into(),
-                at_unix: 4,
-            },
             ExecEvent::ExecutionFailed { color, error: "stuck".into(), at_unix: 5 },
             ExecEvent::ExecutionCancelled {
                 color,
@@ -993,15 +1024,13 @@ mod log_entry_tests {
     fn failures_project_to_log_lines() {
         let events = sample_events();
         let lines: Vec<LogEntry> = events.iter().filter_map(LogEntry::from_event).collect();
-        assert_eq!(lines.len(), 6, "six log-worthy events: {lines:?}");
+        assert_eq!(lines.len(), 5, "five log-worthy events: {lines:?}");
         assert_eq!((lines[0].level.as_str(), lines[0].node.as_deref()), ("info", Some("greet")));
         assert_eq!((lines[1].level.as_str(), lines[1].node.as_deref()), ("error", Some("llm")));
         assert!(lines[1].message.contains("boom"), "{}", lines[1].message);
         assert_eq!(lines[2].level, "warn");
-        assert_eq!(lines[3].node.as_deref(), Some("bridge"));
-        assert!(lines[3].message.contains("jid"), "{}", lines[3].message);
-        assert_eq!((lines[4].level.as_str(), lines[4].node.as_deref()), ("error", None));
-        assert!(lines[5].message.contains("by hand"), "{}", lines[5].message);
+        assert_eq!((lines[3].level.as_str(), lines[3].node.as_deref()), ("error", None));
+        assert!(lines[4].message.contains("by hand"), "{}", lines[4].message);
     }
 
     /// Every kind in `KINDS` has a sample here and projects: the

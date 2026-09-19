@@ -224,12 +224,20 @@ async fn signal_tokens_are_scoped_to_the_caller_tenant() {
 /// removed project, silently, because the program history was deleted
 /// along with the project row.
 ///
-/// So: removing a project keeps the versions its surviving runs were
-/// started against, and drops the ones nothing points at. Cleaning the
-/// last run that needed one takes it too, because a program nobody can
-/// reach is junk the user cannot see or delete.
+/// So retiring programs goes by what the journal still points at: a
+/// version a run was started against stays, a version nothing ran is
+/// dropped, and cleaning the last run that needed one takes it too,
+/// because a program nobody can reach is junk the user can neither see
+/// nor delete.
+///
+/// The project row is removed here to put the runs in the state the
+/// reaper actually finds them in: a removal erases a project's runs,
+/// but that erase is best-effort, so between a failed erase and the
+/// reaper's next sweep there are runs whose project is gone. They must
+/// still hold their programs, or what the sweep eventually reads is a
+/// run nobody can make sense of.
 #[tokio::test]
-async fn a_removed_projects_runs_keep_the_code_they_ran() {
+async fn a_program_is_retired_only_when_no_run_still_names_it() {
     let store = MockProjectStore::new();
     let journal = MockJournal::new();
     let project = Uuid::new_v4();

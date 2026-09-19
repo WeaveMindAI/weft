@@ -1,0 +1,27 @@
+# Gated routes: one behind a set of API keys, one behind a signing secret. The
+# rig stores the connections through the dispatcher's store (as the editor
+# does), stamps them onto the access nodes, then calls each route without a
+# credential, with a wrong one, and with a right one, asserting the gateway's
+# 401s and the `caller` identity the run receives.
+
+keys = ApiKeyAuth
+secure = Route -> (text: String) { path: "__E2E_PATH__/secure", method: "POST" }
+secure.auth = keys.access
+show = ExecPython(caller: JsonDict | Null, text: String) -> (body: JsonDict) {
+  code: "return {'body': {'caller': caller, 'text': text}}"
+}
+show.caller = secure.caller
+show.text = secure.text
+answer = Reply
+answer.body = show.body
+
+secret = HmacAuth
+signed = Route -> (text: String) { path: "__E2E_PATH__/signed", method: "POST" }
+signed.auth = secret.access
+show2 = ExecPython(caller: JsonDict | Null, text: String) -> (body: JsonDict) {
+  code: "return {'body': {'caller': caller, 'text': text}}"
+}
+show2.caller = signed.caller
+show2.text = signed.text
+answer2 = Reply
+answer2.body = show2.body

@@ -26,7 +26,6 @@
     {
       "name": "value",
       "type": "T",
-      "required": false,
       "accepts": ["wire"],
       "label": "Value",
       "description": "Passed through unchanged once the time has come. Optional: the node also works as a pure delay on `_should_flow`."

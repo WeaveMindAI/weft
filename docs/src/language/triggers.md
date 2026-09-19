@@ -8,9 +8,9 @@ outputs downstream like any node. The difference is that an external event
 fires a fresh execution carrying that event's data.
 
 ```weft
-api = ApiEndpoint { path: "hello" }
-reply = Reply
-reply.started = api.started
+hello = Route -> (name: String) { path: "hello", method: "POST" }
+answer = Reply
+answer.body = hello.name
 ```
 
 ## Two phases
@@ -33,10 +33,27 @@ trigger runs again when it fires, and re-activating the project is what
 refreshes those values. If you want something computed fresh per event, compute
 it **downstream** of the trigger.
 
+The same rule is how you run something once before a program starts serving.
+Anything wired into a trigger's `_should_flow` runs at activation and never on
+a fire, so creating your tables is one node and one wire:
+
+```weft
+make = PostgresExecuteQuery { account: db.access, query: @file("assets/sql/schema.sql") }
+live = Route { path: "live/count" }
+live._should_flow = make.count
+```
+
+Every activation runs it again, so write SQL that is safe to repeat
+(`create table if not exists`, `alter table ... add column if not exists`).
+
 ## What runs on a fire
 
 One program: the trigger that fired, everything downstream of it, and
-everything upstream of that, stopping at other triggers on the way up. At
+everything upstream of that, stopping at other triggers on the way up. A
+`_should_flow` wire counts as downstream like any other, and on a group or an
+included file it takes the whole group along (`work._should_flow =
+live.method` runs everything in `work`, and pulls in what those nodes need),
+so a route can hand its work to a group without wiring any data into it. At
 fire time a trigger's outputs are the event, not a function of its inputs
 (those were read once, at activation), so a node that only feeds a trigger
 has nothing to contribute to a fire. Sibling programs it cannot reach do
@@ -69,8 +86,8 @@ path, fire it. The editor can send a hand-written payload.
 
 | Node | Fires when |
 |---|---|
-| `ApiEndpoint { path }` | an HTTP request arrives, and a node can answer it live |
-| `LiveSocket { path }` | a WebSocket connects, and nodes hold a two-way conversation |
+| `Route { path, method }` | an HTTP request arrives; the body's keys come out on the ports you declare, and `Reply` / `Stream` / `Close` answer it ([Building an API](building-an-api.md)) |
+| `Socket { path }` | a WebSocket connects; every message is one item of its `inbound` stream |
 | `Cron { cron, timezone }` | the schedule says so, on that zone's clock (UTC unless you pick one) |
 | `HumanTrigger { fields }` | a person submits a form |
 

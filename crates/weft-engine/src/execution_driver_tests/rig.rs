@@ -321,9 +321,9 @@
         /// orders totally).
         type PulseRow = (String, uuid::Uuid, String, bool, Option<String>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, ordinal, status,
-        /// error, suspension token, port warnings, absorbed pulses.
+        /// error, suspension token, absorbed pulses.
         type RecordRow =
-            (String, Vec<u32>, usize, NodeExecutionStatus, Option<String>, Option<String>, String, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
+            (String, Vec<u32>, usize, NodeExecutionStatus, Option<String>, Option<String>, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
         /// One gather port as compared: per iteration index, the write
         /// (a value as JSON text, or the closed slot).
         type GatherRow = (String, Vec<(u32, String)>);
@@ -408,7 +408,6 @@
                             r.status.clone(),
                             r.error.clone(),
                             r.callback_id.clone(),
-                            format!("{:?}", r.port_warnings),
                             absorbed,
                             weft_core::project::hash::canonical_json(&serde_json::to_value(&r.received).unwrap()),
                             r.inherited_from,

@@ -1,95 +1,43 @@
 # Putting it on a URL
 
 So far the program runs when you ask it to. A **trigger** node makes it run
-when the outside world asks instead.
+when the outside world asks instead, and for an HTTP request that trigger is
+`Route`.
 
 Replace `main.weft` with:
 
 ```weft
-api = ApiEndpoint { path: "hello" }
-reply = Reply
-
-reply.started = api.started
+hello = Route -> (name: String) { path: "hello", method: "POST" }
+answer = Reply { status: 201 }
+answer.body = hello.name
 ```
 
-Every HTTP request that hits that path fires a fresh execution.
+Every POST to `hello` fires a fresh execution. The body's `name` key comes out
+on the port you declared after the arrow, and `Reply` sends it back as the
+response, under a `201`. No Rust, no node folder.
 
-`Reply` does not exist yet, so you are about to write it. A node is a folder
-under `nodes/` with two files in it.
+Two things in that program are worth a closer look.
 
-```bash
-mkdir -p nodes/reply
-```
+**The body keys are ports you declare.** A route has no `body` port. You say
+which top-level keys you want (`-> (name: String, age: Number)`) and each one
+arrives typed on its own port, the same way an LLM call with Parse JSON on
+splits its reply. Anything you did not name is dropped, so name every key you
+mean to read. The request itself is always there on the fixed ports: `method`, `path`, `params` (the `{name}` captures of the path),
+`query`, `headers`, and `caller` (who the auth gate let in; null on an open
+route).
 
-## The declaration
+A port named like a `{capture}` in the path reads that capture
+(`Route -> (id: String) { path: "cards/{id}" }`). A port declared `Image`
+takes a picture the body carries as a data URL or base64: the route stores it
+and hands you the stored-file value, never the bytes.
 
-`nodes/reply/metadata.json` says what the node looks like from outside.
-
-```json
-{
-  "type": "Reply",
-  "label": "Reply",
-  "description": "Echo the caller's request body back as JSON.",
-  "tags": ["live", "http"],
-  "icon": "Send",
-  "color": "#06b6d4",
-  "inputs": [
-    { "name": "started", "type": "Boolean", "required": false,
-      "description": "Kick from the ApiEndpoint trigger." }
-  ],
-  "outputs": [
-    { "name": "done", "type": "Boolean",
-      "description": "Fires true once the response has been sent." }
-  ],
-  "requires_infra": false
-}
-```
-
-Ports, types, and enough presentation for the editor to draw the box. This is
-data, not code, which is why the compiler can read a node's shape without
-compiling a single line of its Rust.
-
-## The code
-
-`nodes/reply/mod.rs`:
-
-```rust
-use async_trait::async_trait;
-use serde_json::{json, Value};
-
-use weft::caller::{InboundMessage, OutboundChunk};
-use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
-
-#[derive(NodeManifest)]
-pub struct ReplyNode;
-
-#[async_trait]
-impl Node for ReplyNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let http = ctx.http_caller().await?;
-        let req = http.request_parts()?;
-        let echoed = match &req.body {
-            InboundMessage::Json(v) => v.clone(),
-            InboundMessage::Text(s) => Value::String(s.clone()),
-            InboundMessage::Bytes(b) => json!({ "bytes": b.len() }),
-        };
-        http.respond(OutboundChunk::Json(json!({ "you_sent": echoed }))).await?;
-        ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
-    }
-}
-```
-
-The only parsing in there is reading the body you were handed.
-
-`ctx.http_caller()` hands you a live handle to whoever is waiting on the other
-end of the socket. The trigger declared the endpoint; the runtime holds the
-connection open and routes it to the worker running this execution.
-
-`#[derive(NodeManifest)]` is what connects the two files. It reads the
-`metadata.json` sitting next to this source at compile time and embeds it. A
-missing or malformed file is a compile error, so the declaration and the code
-cannot drift apart.
+**Reply is one message.** Behind a `Route` it is the response: `status`,
+`headers`, the `body`, and the exchange ends. The body's shape follows the
+route's `dataType`: any value on the default `json`, a `String` on `text`, a
+stored file on `bytes`. A stored file inside a `json` body goes out as a link
+the caller can fetch (`{ url, mimeType, filename, sizeBytes }`). Every answer
+mints a fresh link and the old one dies within minutes, so what you keep
+between runs is the file itself.
 
 ## Turn it on
 
@@ -97,19 +45,22 @@ cannot drift apart.
 weft activate
 ```
 
-`activate` compiles the project, registers it, and prints the live URL. A
-project with triggers has to be activated; one without them just runs.
+`activate` compiles the project and registers it, printing `activated <name> (<id>)`.
+A project with triggers has to be activated; one without them just runs.
 
-Then call it from anywhere:
+It prints no URL, and it does not need to: the address is fixed by the
+install, so you can write it down before the program ever runs. Locally it is
+`http://127.0.0.1:9999/connect/local/<your path>`. That address answers on
+this machine only for now, so call it from here:
 
 ```bash
-curl -X POST "<the URL activate printed>" \
+curl -X POST "http://127.0.0.1:9999/connect/local/hello" \
      -H "content-type: application/json" \
-     -d '{"message":"hi"}'
+     -d '{"name":"ada"}'
 ```
 
-```json
-{"you_sent":{"message":"hi"}}
+```
+"ada"
 ```
 
 Each request is a full execution with its own color and its own row in the
@@ -131,13 +82,24 @@ brief: The VS Code sidebar's Weft executions tree, with several executions
 
 ## What just happened underneath
 
-Activating the project told the runtime: when a request arrives at this path,
-start an execution of this program and hand the held connection to whichever
-worker picks it up. Nothing in your program is listening.
+Activating the project told the runtime: when a request arrives at this path
+with this method, start an execution of this program and hand the held
+connection to whichever worker picks it up. Nothing in your program is
+listening.
 
 So the endpoint exists whether or not any worker is running. When a request
 arrives cold the runtime starts one, which is why the first request after an
 idle period is slower. Workers shut themselves down after thirty seconds with
 nothing to do.
+
+The response head is held until your program's first outbound item: a `Reply`
+sets the status, a `Stream` starts a body, a `Close` ends it bare. A program
+that never does any of those holds the caller while it runs, and when the run
+ends the caller gets a `500` whose body says `the run ended without
+answering`. That is the program's bug, and the `500` is how you find out.
+
+The rest of the shapes an API takes (a route that answers 404, a stream of
+server-sent events, a WebSocket conversation, a route behind an API key) are
+in [Building an API](../language/building-an-api.md).
 
 Next: [putting a person in the loop](a-person-in-the-loop.md).

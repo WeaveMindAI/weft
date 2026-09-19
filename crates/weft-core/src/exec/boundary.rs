@@ -437,7 +437,6 @@ fn dispatch_passthrough(
         completed_at: None,
         cost_usd: 0.0,
         logs: Vec::new(),
-        port_warnings: Vec::new(),
         mentioned_ports: Default::default(),
         closed_output_ports: Default::default(),
         color,
@@ -483,6 +482,7 @@ fn dispatch_passthrough(
         // the scope's decision as a whole.
         let mut forwarded: OutputBag = group.received.input.clone().into_iter().collect();
         forwarded.remove(SHOULD_FLOW_PORT);
+        forwarded.remove(crate::exec::skip::SHOULD_NOT_FLOW_PORT);
         match postprocess_output(
             &node_id, &forwarded, emission_id, color, &frames, project, pulses, edge_idx,
             &mut emissions,
@@ -1239,7 +1239,7 @@ mod tests {
             id: Uuid::new_v4(), received: Default::default(), skip_reason: None, node_id: "B__in".into(),
             status: NodeExecutionStatus::Completed, pulses_absorbed: vec![], ordinal: 0, error: None,
             callback_id: None, started_at: 0, completed_at: Some(1), cost_usd: 0.0, logs: vec![],
-            port_warnings: vec![], mentioned_ports: Default::default(), closed_output_ports: Default::default(),
+            mentioned_ports: Default::default(), closed_output_ports: Default::default(),
             color: Uuid::nil(), frames: vec![outer, call], inherited_from: None,
         });
         assert_eq!(scope_permission(&project, member, &frames, &executions), ScopePermission::Allowed);

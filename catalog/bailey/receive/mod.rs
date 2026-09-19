@@ -50,10 +50,12 @@ impl Node for BaileyReceiveNode {
         // lands as null and is refused by a port whose type has no Null.
         //
         // `file` is a port THIS node computes (a stored-file reference, only
-        // on the media path below); it is never a payload field. Strip it
-        // before fanning so an event carrying a `file` key can't put a value
-        // on the `file` port. The set-after-fan on the media path only guards
-        // that one path; stripping here guards both.
+        // on the media path below); it is never a payload field, and the
+        // trigger's declared payload does not name it, so an event
+        // smuggling one is refused before this body runs at all. Stripping
+        // it here is the second line: it costs one statement and it holds
+        // whatever the declaration says, so the port can only ever carry a
+        // reference this node made.
         let mut data = ctx.wake.object()?.clone();
         data.remove("file");
         let data = Value::Object(data);

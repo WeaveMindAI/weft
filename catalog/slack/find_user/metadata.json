@@ -22,14 +22,12 @@
     {
       "name": "email",
       "type": "String",
-      "required": false,
       "label": "Email",
       "placeholder": "person@company.com"
     },
     {
       "name": "id",
       "type": "String",
-      "required": false,
       "label": "User id",
       "placeholder": "U0123456789"
     }

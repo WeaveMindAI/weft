@@ -27,6 +27,11 @@ export interface PortMenuAction {
 	label: string;
 	onClick: () => void;
 	color?: string;
+	/// Inline SVG markup drawn before the label, in the gap the row
+	/// already leaves for it. For an action whose result is easier to
+	/// SHOW than to name: the gate's flip draws the mark it will leave
+	/// behind, so the row reads "click this to get that".
+	icon?: string;
 	editable?: {
 		value: string;
 		onCommit: (newValue: string) => void;
@@ -307,7 +312,15 @@ function createPortContextMenu(
 			btn.style.cssText = `width:100%;display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:12px;text-align:left;border:none;background:none;cursor:pointer;color:${color};`;
 			btn.addEventListener('mouseenter', () => { btn.style.background = '#f4f4f5'; });
 			btn.addEventListener('mouseleave', () => { btn.style.background = 'none'; });
-			btn.textContent = item.label;
+			if (item.icon) {
+				const icon = document.createElement('span');
+				icon.style.cssText = 'display:flex;align-items:center;flex:none;';
+				icon.innerHTML = item.icon;
+				btn.appendChild(icon);
+			}
+			const text = document.createElement('span');
+			text.textContent = item.label;
+			btn.appendChild(text);
 			btn.addEventListener('click', () => {
 				if (item.editable) {
 					renderInput(item.editable);

@@ -2,7 +2,7 @@
 //! two-way conversation with the caller: receives each inbound message
 //! and sends back an echo with a turn counter, until the caller
 //! disconnects (or the trigger's session cap fires). Pairs with a
-//! `LiveSocket` trigger.
+//! `Socket` trigger.
 //!
 //! ctx-driven: `ctx.ws_caller()` gives the connected WebSocket handle
 //! (failing loud on a non-WebSocket run), and `recv_next` / `send` /

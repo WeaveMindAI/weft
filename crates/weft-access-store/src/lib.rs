@@ -33,11 +33,10 @@ pub use subscriptions::{
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,
 };
 pub use resolve::{
-    connections_for_event, events_recipe_hash, events_recipes_of, granted_items, lookup, lookup_url,
-    recipe_value_names, record_events_recipes, resolve_event_source, resolve_for_worker,
-    EventTarget, GrantedQuery, LookupItem, LookupPage, LookupRequest, RecordedEventsRecipe,
-    ResolvedAccess,
-    ResolvedEventSource,
+    caller_verifier, connections_for_event, events_recipe_hash, events_recipes_of, granted_items,
+    lookup, lookup_url, recipe_value_names, record_events_recipes, resolve_event_source,
+    resolve_for_worker, CallerVerifier, EventTarget, GrantedQuery, LookupItem, LookupPage,
+    LookupRequest, RecordedEventsRecipe, ResolvedAccess, ResolvedEventSource,
 };
 
 // The connect flow's wire shapes live in weft-core `access::wire`,

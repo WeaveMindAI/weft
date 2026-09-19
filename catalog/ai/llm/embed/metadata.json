@@ -25,7 +25,6 @@
     {
       "name": "dimensions",
       "type": "Number",
-      "required": false,
       "description": "Shrink vectors to this many dimensions (models supporting matryoshka sizing only)."
     }
   ],

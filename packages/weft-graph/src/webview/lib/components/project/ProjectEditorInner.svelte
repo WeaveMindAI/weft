@@ -18,12 +18,13 @@
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { callPathOf, locatedKey, type Frame } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { locatedKey, type Frame } from "../../../../protocol";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
 	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
-	import { SHOULD_FLOW_PORT } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -567,27 +568,10 @@
 	/** A node's execution-journal key: its id, in every view. An included
 	 *  file's nodes are journaled under the file's own id (`C.strip`), which
 	 *  is the id this view gives them, so no prefix is added; which CALL a
-	 *  row belongs to is its call frames, filtered in `readOverlayCtx`. */
+	 *  row belongs to is its call frames, split in `readOverlayCtx`
+	 *  (`rowsByCallPath`). */
 	function execKey(localId: string): string {
 		return localId;
-	}
-
-	/** The rows of a run that belong to the calls this view descended
-	 *  through: a row's call frames, in order, equal `callPath`. At the top
-	 *  level that is every row with no call frame; inside an included file
-	 *  it is the rows of the one call on screen, and the same file reached
-	 *  through another site keeps its own. */
-	function rowsUnderCallPath(
-		rows: Record<string, import('../../types').NodeExecution[]>,
-		path: readonly string[],
-	): Record<string, import('../../types').NodeExecution[]> {
-		const same = (a: readonly string[]) => a.length === path.length && a.every((s, i) => s === path[i]);
-		const out: Record<string, import('../../types').NodeExecution[]> = Object.create(null);
-		for (const [id, list] of Object.entries(rows)) {
-			const kept = list.filter((r) => same(callPathOf(r.frames)));
-			if (kept.length > 0) out[id] = kept;
-		}
-		return out;
 	}
 
 	/** Whose key a group's members spent, folded for the group's synthetic
@@ -601,6 +585,71 @@
 		);
 		if (origins.size === 0) return undefined;
 		return origins.size === 1 ? [...origins][0] : 'mixed';
+	}
+
+	/// Flip a node's gate between `_should_flow` and `_should_not_flow`.
+	///
+	/// Both spellings are ordinary ports, so the flip is the ops that
+	/// already exist: a wire moves with removeEdge + addEdge, a written
+	/// value with removeConfig + setConfig. Nothing new on the wire and
+	/// nothing new in Rust, which is also why it undoes like any other
+	/// edit.
+	///
+	/// Deliberately NOT routed through `createNodeUpdateHandler`: that
+	/// path classifies config updates for one node, and this gesture is
+	/// two ops that may touch an edge, which is a different shape.
+	function createGateToggleHandler(nodeId: string) {
+		return async () => {
+			// A node's written values are an open bag on the canvas type,
+			// so read it as one rather than indexing the empty shape.
+			const literals = (nodes.find((n) => n.id === nodeId)?.data?.portLiterals ?? {}) as Record<
+				string,
+				unknown
+			>;
+			const from =
+				edges.some((e) => e.target === nodeId && e.targetHandle === SHOULD_NOT_FLOW_PORT)
+				|| literals[SHOULD_NOT_FLOW_PORT] !== undefined
+					? SHOULD_NOT_FLOW_PORT
+					: SHOULD_FLOW_PORT;
+			const to = from === SHOULD_FLOW_PORT ? SHOULD_NOT_FLOW_PORT : SHOULD_FLOW_PORT;
+			const wire = edges.find((e) => e.target === nodeId && e.targetHandle === from);
+			const ops: import('../../../../protocol').EditOp[] = [];
+			if (wire) {
+				const scopeGroup = (wire as { data?: { scopeGroup?: string | null } }).data?.scopeGroup ?? null;
+				ops.push({
+					op: 'removeEdge',
+					source: wire.source,
+					sourcePort: wire.sourceHandle ?? 'default',
+					target: nodeId,
+					targetPort: from,
+					scopeGroup,
+				});
+				ops.push({
+					op: 'addEdge',
+					source: wire.source,
+					sourcePort: wire.sourceHandle ?? 'default',
+					target: nodeId,
+					targetPort: to,
+					scopeGroup,
+				});
+			}
+			const literal = literals[from];
+			if (literal !== undefined) {
+				ops.push({ op: 'removeConfig', node: nodeId, key: from });
+				// The written forms mirror each other: `_should_flow: false`
+				// and `_should_not_flow: true` both mean "never run this".
+				ops.push({
+					op: 'setConfig',
+					node: nodeId,
+					key: to,
+					value: String(literal) === 'false' ? 'true' : 'false',
+				});
+			}
+			// Nothing drives the gate, so there is nothing to flip and no
+			// edit to record: an empty op list would still cost a reparse.
+			if (ops.length === 0) return;
+			await onApplyEdits(ops);
+		};
 	}
 
 	function createNodeUpdateHandler(nodeId: string) {
@@ -1091,7 +1140,10 @@
 	// 'IncludedGroup' is the opaque @include block: no catalog entry by
 	// design (its ports come from the included file's Group header), so it
 	// must be allowed through the catalog filter explicitly.
-	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
+	// A container's own name lives in `containerKindOf`, so it is asked
+	// rather than spelled again here.
+	const isSpecialNodeType = (nodeType: string): boolean =>
+		isContainerNodeType(nodeType) || nodeType === 'Annotation' || nodeType === INCLUDE_NODE_TYPE;
 
 	// `liveNodes` is the CURRENTLY-rendered xyflow array, read only for last-render
 	// measured sizes (the simplified containment floor). It is passed explicitly
@@ -1155,7 +1207,7 @@
 		// Unknown node types are already handled by the parser as opaque blocks
 		// (they never reach project.nodes), so we only need to filter for known types.
 		const validNodes = projectNodes.filter(n =>
-			SPECIAL_NODE_TYPES.has(n.nodeType) || NODE_TYPE_CONFIG[n.nodeType]
+			isSpecialNodeType(n.nodeType) || NODE_TYPE_CONFIG[n.nodeType]
 		);
 
 		// xyflow requires parent nodes to appear before children in the array.
@@ -1399,6 +1451,7 @@
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
+					onToggleGate: createGateToggleHandler(n.id),
 					onSaveFileRef: saveFileRef,
 					onOpenInclude: openInclude,
 				},
@@ -1640,7 +1693,10 @@
 	// calling it in an effect's tracked region registers all of them.
 	type OverlayCtx = {
 		nodeOutputs: Record<string, unknown>;
-		nodeExecutions: Record<string, import('../../types').NodeExecution[]>;
+		/// The followed run's rows around this view's call path: `here` by
+		/// node id for the rows at this level, `inside` by include site for
+		/// everything that ran under one (see `rowsByCallPath`).
+		rows: RowsByCallPath<import('../../types').NodeExecution>;
 		busLogByBus: Record<string, import('../../../../protocol').BusInspectorEvent[]>;
 		busesByNode: Record<string, string[]>;
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
@@ -1692,7 +1748,7 @@
 		}
 		return {
 			nodeOutputs: state?.nodeOutputs || {},
-			nodeExecutions: rowsUnderCallPath(state?.nodeExecutions || {}, callPath),
+			rows: rowsByCallPath(state?.nodeExecutions || {}, callPath),
 			busLogByBus: state?.busLogByBus || {},
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
@@ -1735,9 +1791,10 @@
 
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
-			nodeOutputs, nodeExecutions, busLogByBus, busesByNode, busMetaByBus,
+			nodeOutputs, busLogByBus, busesByNode, busMetaByBus,
 			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
 		} = ctx;
+		const nodeExecutions = ctx.rows.here;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
 		let subgraphNodeIds: Set<string> | null = null;
@@ -1794,20 +1851,30 @@
 
 					let executions: import('../../types').NodeExecution[];
 
-					if (isContainerNodeType(nodeType)) {
+					if (isBoundaryBoxNodeType(nodeType)) {
 						const groupId = n.id;
 
-						// Boundary passthrough executions (one id derivation: host-bridge)
+						// The boundary pair that stands for this box at this level
+						// (one id derivation: host-bridge). A container's halves fire
+						// here around its members; an include's are its call site's
+						// halves, which fire here in the caller's frames, while the
+						// body runs one call frame deeper.
 						const inExecs = nodeExecutions[execKey(boundaryInId(groupId))] || [];
 						const outExecs = nodeExecutions[execKey(boundaryOutId(groupId))] || [];
 
-						// Collect internal node executions via scope field (against the
-						// CURRENT projected nodes, not the stale initial prop).
+						// Everything that ran inside the box: its members at this level
+						// (via scope, against the CURRENT projected nodes, not the stale
+						// initial prop), and every row that ran under a call site that is
+						// the box itself or one of its members, however deep the calls
+						// below go (`ctx.rows.inside` is keyed by the site at this level).
 						const internalExecs: import('../../types').NodeExecution[] = [];
+						if (isIncludeNodeType(nodeType)) {
+							internalExecs.push(...(ctx.rows.inside[groupId] ?? []));
+						}
 						for (const projNode of ctx.projectNodes) {
-							if (projNode.scope?.includes(groupId) && nodeExecutions[execKey(projNode.id)]) {
-								internalExecs.push(...nodeExecutions[execKey(projNode.id)]);
-							}
+							if (!projNode.scope?.includes(groupId)) continue;
+							internalExecs.push(...(nodeExecutions[execKey(projNode.id)] ?? []));
+							internalExecs.push(...(ctx.rows.inside[projNode.id] ?? []));
 						}
 
 						// Pair the __out boundary execution to its __in by
@@ -1881,8 +1948,11 @@
 					// A node outside the followed run's scope is "not in this run":
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
+					// A scope names places, which are compiled nodes: a box (a
+					// container, an include) is never one, its In boundary is.
+					const placeId = isBoundaryBoxNodeType(nodeType) ? boundaryInId(n.id) : n.id;
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(locatedKey(n.id, ctx.callPath)) && executions.length === 0;
+						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && executions.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
 					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
@@ -1957,7 +2027,6 @@
 							runTarget: ctx.runTargets.has(n.id),
 							debugData,
 							executions,
-							executionCount: executions.length,
 							busLogs,
 							loopEvents,
 							journalCorruptions,
@@ -3549,15 +3618,22 @@
 		};
 	}
 
+	/// The node under the pointer: the INNERMOST one, which is the one
+	/// the person is pointing at.
+	///
+	/// Walking every node and taking the first whose box contains the
+	/// point gives the wrong answer inside an expanded group, because a
+	/// group is drawn before the nodes inside it and its box contains
+	/// all of them. Right-clicking a node inside a group then acted on
+	/// the GROUP: Duplicate copied the whole group, Delete deleted it.
+	/// `elementsFromPoint` returns what is actually stacked under the
+	/// pointer, innermost first, so the first node in that list is the
+	/// one on top.
 	function findNodeAtPosition(clientX: number, clientY: number): string | null {
-		const nodeElements = document.querySelectorAll('.svelte-flow__node');
-		for (const nodeEl of nodeElements) {
-			const rect = nodeEl.getBoundingClientRect();
-			if (clientX >= rect.left && clientX <= rect.right && 
-				clientY >= rect.top && clientY <= rect.bottom) {
-				const nodeId = nodeEl.getAttribute('data-id');
-				if (nodeId) return nodeId;
-			}
+		for (const el of document.elementsFromPoint(clientX, clientY)) {
+			const nodeEl = el.closest('.svelte-flow__node');
+			const nodeId = nodeEl?.getAttribute('data-id');
+			if (nodeId) return nodeId;
 		}
 		return null;
 	}

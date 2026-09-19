@@ -281,19 +281,6 @@ impl ExecutionProjector {
                     project_id,
                 }]
             }
-            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, .. } => {
-                let mut out = vec![DispatcherEvent::PortTypeMismatch {
-                    color, at_unix,
-                    node: node_id.clone(),
-                    frames: frames.clone(),
-                    port: port.clone(),
-                    expected: expected.clone(),
-                    actual: actual.clone(),
-                    project_id: project_id.clone(),
-                }];
-                out.extend(sniff_emissions(color, &project_id, &effects));
-                out
-            }
             ExecEvent::NodeSuspended { node_id, frames, token, .. } => {
                 vec![DispatcherEvent::NodeSuspended {
                     color, at_unix,
@@ -502,20 +489,13 @@ impl ExecutionProjector {
                     protocol: protocol.clone(), at_unix,
                 }]
             }
-            ExecEvent::CallerInbound { offset, payload, payload_byte_size, .. } => {
-                vec![DispatcherEvent::CallerInbound {
-                    color, project_id, offset: *offset,
-                    payload: payload.clone(),
-                    payload_byte_size: *payload_byte_size,
-                    at_unix,
-                }]
-            }
-            ExecEvent::CallerOutbound { offset, payload, payload_byte_size, terminal, .. } => {
-                vec![DispatcherEvent::CallerOutbound {
-                    color, project_id, offset: *offset,
-                    payload: payload.clone(),
-                    payload_byte_size: *payload_byte_size,
-                    terminal: *terminal,
+            ExecEvent::CallerWindow { first_offset, last_offset, messages, totals, .. } => {
+                vec![DispatcherEvent::CallerWindow {
+                    color, project_id,
+                    first_offset: *first_offset,
+                    last_offset: *last_offset,
+                    messages: messages.clone(),
+                    totals: totals.clone(),
                     at_unix,
                 }]
             }
@@ -656,8 +636,7 @@ fn needs_program(ev: &ExecEvent) -> bool {
             | ExecEvent::BusWindow { .. }
             | ExecEvent::BusClosed { .. }
             | ExecEvent::CallerConnected { .. }
-            | ExecEvent::CallerInbound { .. }
-            | ExecEvent::CallerOutbound { .. }
+            | ExecEvent::CallerWindow { .. }
             | ExecEvent::CallerErrored { .. }
             | ExecEvent::CallerDisconnected { .. }
     )

@@ -1097,9 +1097,9 @@ fn write_registry_rs(
     Ok(())
 }
 
-/// Convert a PascalCase node type (e.g. `ApiEndpoint`, `HumanQuery`,
+/// Convert a PascalCase node type (e.g. `ApiKeyAuth`, `HumanQuery`,
 /// `LlmInference`) into a snake_case Rust module identifier
-/// (`api_endpoint`, `human_query`, `open_router_inference`). Rules: lowercase
+/// (`api_key_auth`, `human_query`, `open_router_inference`). Rules: lowercase
 /// the first char; insert `_` before every subsequent uppercase.
 fn ident_for_node_type(node_type: &str) -> String {
     let mut out = String::with_capacity(node_type.len() + 4);
@@ -1618,6 +1618,7 @@ mod tests {
             group_boundary: None,
             requires_infra: false,
             images: Vec::new(),
+            fires_with: Default::default(),
             published_service: None,
             span: None,
             header_span: None,
@@ -1627,6 +1628,7 @@ mod tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         }
     }

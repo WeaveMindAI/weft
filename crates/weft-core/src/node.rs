@@ -305,6 +305,287 @@ pub struct NodeMetadata {
     /// are nominal and global: any node's ports may use them by name.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub types: std::collections::BTreeMap<String, String>,
+    /// What a TRIGGER wakes with: field name to weft type
+    /// (`{"scheduledTime": "String", "caller?": "JsonDict"}`). A `?` on
+    /// the NAME means the payload may arrive without that field, the
+    /// same `?` a record type uses.
+    ///
+    /// A trigger's fire payload is not its inputs and not its outputs:
+    /// it is what the listener (or a person typing `weft run --fire`)
+    /// delivers to start one firing, and until now it lived only inside
+    /// the node body, where nothing outside could read it or hold the
+    /// node to it. Declared here it becomes a contract the engine
+    /// checks before the body runs, so a listener that changed its
+    /// fields and a hand-typed payload both fail naming the field
+    /// rather than somewhere inside the node.
+    ///
+    /// It names EVERY field that can arrive, not just the ones the node
+    /// puts on ports: a payload carrying a field this does not name is
+    /// refused, the same as one missing a field it does
+    /// ([`check_fire_payload`]). A field that only sometimes arrives
+    /// takes the `?`. For a trigger fed by a provider's events, the
+    /// list to copy is the service's topic
+    /// (`AccessSpec.events.<topic>.fields`), which is exactly what a
+    /// named event can carry.
+    ///
+    /// Nothing renders it in the graph: it is not a port, nothing can
+    /// wire to it, and no one types into it.
+    ///
+    /// Only a trigger is meant to declare it (`features.isTrigger`), and
+    /// every trigger is meant to have one: `weft run --fire` prints it
+    /// when a payload does not match, which is the only way an author
+    /// learns what to send. No code enforces either half. What holds the
+    /// shipped nodes to both is the repo test
+    /// `weft-compiler/tests/fires_with.rs`, walking the catalog; a
+    /// third-party node is held to neither.
+    #[serde(
+        default,
+        rename = "firesWith",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub fires_with: std::collections::BTreeMap<String, String>,
+    /// The public address this node claims when the project goes live,
+    /// named by the config fields that hold it. `None` for everything
+    /// that mounts nothing.
+    ///
+    /// One address is served by one node, so two nodes claiming
+    /// addresses that overlap is a program with no answer to "which one
+    /// does a call reach". The account-wide half of that question can
+    /// only be answered at activation, where every project's claims are
+    /// in one table. The half INSIDE one program is answerable from the
+    /// source alone, and this key is what lets the compiler answer it:
+    /// it says which field holds the pattern and which holds the
+    /// methods, and route patterns are the language's own vocabulary
+    /// (`weft_core::route`), so the check reads no node's mind.
+    #[serde(default, rename = "claimsRoute", skip_serializing_if = "Option::is_none")]
+    pub claims_route: Option<ClaimsRoute>,
+}
+
+/// Which config fields carry the public address a node claims. The
+/// pattern field is required; the methods field is optional, because a
+/// node may serve every method (a Socket does) and then has no such
+/// field at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimsRoute {
+    /// The config field holding the route pattern (`cards/{id}`).
+    #[serde(rename = "pathField")]
+    pub path_field: String,
+    /// The config field holding the HTTP method, when the node has
+    /// one. Absent, or empty on the instance, means every method.
+    #[serde(default, rename = "methodField", skip_serializing_if = "Option::is_none")]
+    pub method_field: Option<String>,
+}
+
+/// The declared fire payload as ONE record type, so the whole check is
+/// the ordinary type check every other value gets: `{"scheduledTime":
+/// "String", "caller?": "JsonDict"}` becomes
+/// `{ scheduledTime: String, caller?: JsonDict }`. The `?` rides on the
+/// NAME, exactly where a record type wants it, which is why the
+/// declaration can be a flat map and still say "may be absent".
+///
+/// `None` when nothing is declared (every non-trigger, and a trigger
+/// that has not been given a shape yet): nothing to hold a payload to.
+/// An unparseable entry is `Err` with the field named. Nothing calls
+/// this when metadata is loaded: the callers are the fire check at run
+/// time ([`check_fire_payload`]) and the repo test that walks the
+/// shipped catalog (`weft-compiler/tests/fires_with.rs`). So a typo in
+/// a type does reach a run, and fails there rather than at build.
+pub fn fire_payload_type(
+    fires_with: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<crate::weft_type::WeftType>, String> {
+    if fires_with.is_empty() {
+        return Ok(None);
+    }
+    for (field, ty) in fires_with {
+        if crate::weft_type::WeftType::parse(ty).is_none() {
+            return Err(format!("firesWith field `{field}` is not a weft type: `{ty}`"));
+        }
+    }
+    let fields: Vec<String> =
+        fires_with.iter().map(|(field, ty)| format!("{field}: {ty}")).collect();
+    let record = format!("{{ {} }}", fields.join(", "));
+    crate::weft_type::WeftType::parse(&record)
+        .map(Some)
+        .ok_or_else(|| format!("firesWith does not describe a record: `{record}`"))
+}
+
+/// Hold one firing's wake payload to what the trigger declared. `Ok`
+/// when nothing is declared (the shape is unknown, so nothing is
+/// refused) and when the payload matches EXACTLY; `Err` naming the
+/// field otherwise.
+///
+/// Called by the engine before a trigger's body runs, so BOTH ways a
+/// payload arrives are covered by the one check: a listener whose
+/// fields moved, and a person typing `weft run --fire`.
+///
+/// ## The declaration is exhaustive, and that is the point
+///
+/// A payload missing a field declared without `?` is refused. A payload
+/// carrying ANY field the declaration does not name is refused too.
+/// Both are the same rule: the node said what it wakes with, so at run
+/// time it knows exactly what it has, the way a typed language knows
+/// what is in a value.
+///
+/// This is deliberately NOT forgiving of a provider adding a field. The
+/// alternative, letting an unknown field through, means a node's real
+/// input quietly stops being what the node says it is, and the day that
+/// matters is the day something reads a field nobody declared. A
+/// provider that adds a field is a node that needs one line changed,
+/// which is a small, quick, obvious edit; a node whose declaration
+/// silently drifts from reality is none of those things.
+///
+/// So a declaration has to name EVERY field that can arrive, with `?`
+/// on the ones that only sometimes do. For a trigger fed by a
+/// provider's events, the authoritative list is the service's topic
+/// (`AccessSpec.events.<topic>.fields`): a named event carries those
+/// keys and no others, minus any the raw event did not have. The repo
+/// test `weft-compiler/tests/fires_with.rs` holds every shipped trigger
+/// to that list, so a forgotten field fails there rather than in front
+/// of a user.
+///
+/// There is no field the rule lets through, not one, and nothing here
+/// looks at a field's NAME. `body` used to be the exception, cut out of
+/// every payload before the check so a hand-fired route would not fail
+/// on it. A trigger that can wake with a body now declares one, like
+/// any other field, and the node reads it off its own wake.
+pub fn check_fire_payload(
+    fires_with: &std::collections::BTreeMap<String, String>,
+    payload: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(ty) = fire_payload_type(fires_with)? else {
+        return Ok(());
+    };
+    let payload = payload.unwrap_or(&serde_json::Value::Null);
+    ty.validate_value(payload).map_err(|why| {
+        format!("the fire payload does not match what this trigger wakes with: {why}. It wants {ty}")
+    })
+}
+
+#[cfg(test)]
+mod fire_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn shape() -> std::collections::BTreeMap<String, String> {
+        [("scheduledTime", "String"), ("caller?", "JsonDict")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_shape_holds_the_payload_to_it() {
+        let fires = shape();
+        check_fire_payload(&fires, Some(&json!({"scheduledTime": "2026-01-01T00:00:00Z"})))
+            .expect("the optional field may be absent");
+        check_fire_payload(&fires, Some(&json!({"scheduledTime": "t", "caller": {"id": 1}})))
+            .expect("the optional field may also be there");
+
+        let err = check_fire_payload(&fires, Some(&json!({"caller": {}})))
+            .expect_err("a missing required field is refused");
+        assert!(err.contains("scheduledTime"), "{err}");
+
+        let err = check_fire_payload(&fires, Some(&json!({"scheduledTime": 7})))
+            .expect_err("a wrong type is refused");
+        assert!(err.contains("scheduledTime"), "{err}");
+
+        let err = check_fire_payload(&fires, None).expect_err("no payload at all is refused");
+        assert!(err.contains("scheduledTime"), "{err}");
+    }
+
+    /// `body` is a field like any other: declared, it is accepted;
+    /// undeclared, it is refused.
+    ///
+    /// It used to be cut out of every payload before the check, which
+    /// made it the one field no trigger had to declare and therefore
+    /// the one way anything could get past an exhaustive contract. This
+    /// is that exception gone: a trigger that CAN carry a body says so
+    /// (the Route does), and on one that cannot, the word `body` earns
+    /// nothing.
+    #[test]
+    fn a_body_is_an_ordinary_field_on_both_sides() {
+        let timer = shape();
+        let err = check_fire_payload(
+            &timer,
+            Some(&json!({ "scheduledTime": "t", "body": { "name": "ada" } })),
+        )
+        .expect_err("a timer wakes with no body, so this one is a field nobody declared");
+        assert!(err.contains("body"), "and it is named: {err}");
+
+        let route: std::collections::BTreeMap<String, String> =
+            [("method", "String"), ("body?", "JsonDict | String")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        check_fire_payload(&route, Some(&json!({ "method": "POST", "body": { "name": "ada" } })))
+            .expect("a route declares one, so a json body is what it says it is");
+        check_fire_payload(&route, Some(&json!({ "method": "POST", "body": "raw text" })))
+            .expect("and a text body too");
+        check_fire_payload(&route, Some(&json!({ "method": "GET" })))
+            .expect("and a GET carries none, which is what the `?` says");
+    }
+
+
+    /// A field nobody declared is refused, at the top level and nested,
+    /// and that is the contract rather than an inconvenience.
+    ///
+    /// The declaration is the node's promise about what it wakes with.
+    /// A payload carrying something it does not name means the promise
+    /// is no longer true, and the run stops there, naming the field, so
+    /// the node gets the one line it needs. Letting the extra through
+    /// instead would leave the node's real input quietly different from
+    /// what the node says it is.
+    #[test]
+    fn a_field_the_trigger_never_declared_is_refused() {
+        let slack: std::collections::BTreeMap<String, String> =
+            [("type", "String"), ("channel", "String"), ("text?", "String")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+        check_fire_payload(
+            &slack,
+            Some(&json!({ "type": "message", "channel": "C123", "text": "hi" })),
+        )
+        .expect("exactly what was declared");
+        check_fire_payload(&slack, Some(&json!({ "type": "message", "channel": "C123" })))
+            .expect("the optional one may be absent");
+
+        // One field the provider added and the node never declared.
+        let err = check_fire_payload(
+            &slack,
+            Some(&json!({ "type": "message", "channel": "C123", "bot": "B9" })),
+        )
+        .expect_err("an undeclared field is refused");
+        assert!(err.contains("bot"), "the message names the field to add: {err}");
+
+        // The same one level down.
+        let nested: std::collections::BTreeMap<String, String> =
+            [("event".to_string(), "{ id: String }".to_string())].into_iter().collect();
+        check_fire_payload(&nested, Some(&json!({ "event": { "id": "E1" } })))
+            .expect("exactly what was declared");
+        let err = check_fire_payload(&nested, Some(&json!({ "event": { "id": "E1", "new": 1 } })))
+            .expect_err("an undeclared field nested inside is refused too");
+        assert!(err.contains("new"), "{err}");
+    }
+
+    /// A node that declares nothing is held to nothing: the shape is
+    /// unknown, so refusing would be inventing a contract.
+    #[test]
+    fn an_undeclared_trigger_refuses_nothing() {
+        let none = std::collections::BTreeMap::new();
+        check_fire_payload(&none, Some(&json!({"anything": true}))).expect("nothing declared");
+        check_fire_payload(&none, None).expect("nothing declared");
+    }
+
+    #[test]
+    fn a_type_that_does_not_parse_is_named() {
+        let broken: std::collections::BTreeMap<String, String> =
+            [("when".to_string(), "Strng".to_string())].into_iter().collect();
+        let err = check_fire_payload(&broken, Some(&json!({"when": "x"}))).expect_err("typo");
+        assert!(err.contains("`when`") && err.contains("Strng"), "{err}");
+    }
 }
 
 /// The one charset a provider name may use: lowercase ASCII letters,
@@ -514,7 +795,7 @@ impl NodeMetadata {
             // Every node gets `_should_flow` from the language (the port
             // that decides whether it runs). A node type declaring its
             // own would shadow that decision with node data.
-            if input.name == crate::exec::skip::SHOULD_FLOW_PORT {
+            if crate::exec::skip::is_gate_port(&input.name) {
                 return Err(format!(
                     "input '{}' is the language's own port (it decides whether a node runs); a node type cannot declare it",
                     input.name
@@ -859,6 +1140,30 @@ impl NodeMetadata {
                 }
             }
         }
+        if let Some(claims) = &self.claims_route {
+            // Same reason as `matchInput` above: the compiler reads the
+            // node's address out of the input this NAMES, so a name that
+            // is not an input resolves to nothing, and the route checks
+            // (is the pattern servable, does it collide with another)
+            // quietly do nothing for every instance of this node type,
+            // for ever, with no sign anywhere. Refused at the one moment
+            // somebody could notice, which is loading the node.
+            if !self.inputs.iter().any(|i| i.name == claims.path_field) {
+                return Err(format!(
+                    "claimsRoute reads the address from input '{}', which this node does \
+                     not declare",
+                    claims.path_field
+                ));
+            }
+            if let Some(field) = &claims.method_field {
+                if !self.inputs.iter().any(|i| i.name == *field) {
+                    return Err(format!(
+                        "claimsRoute reads the method from input '{field}', which this \
+                         node does not declare"
+                    ));
+                }
+            }
+        }
         if let Some(service) = &self.publishes {
             // The SAME rule an `AccessSpec.service` is held to (that is
             // what this name has to match), not a lookalike.
@@ -1036,7 +1341,7 @@ impl NodeMetadata {
 /// widgets and the spec-field widgets under `portsFromConfig`).
 /// Free-form values (a `default`'s contents, a rule's `equals`
 /// payload) keep every key name and every null they hold.
-pub const COMPACT_KEEP_TOP_LEVEL: [&str; 10] = [
+pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
     "type",
     "description",
     "inputs",
@@ -1047,6 +1352,11 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 10] = [
     "portsFromConfig",
     "publishes",
     "types",
+    // What a trigger wakes with. Not a port and not wirable, but it is
+    // the only place `weft run --fire`'s payload shape is written
+    // down, and a wiring view that hides it leaves a reader guessing
+    // at the one thing they have to type by hand.
+    "firesWith",
 ];
 
 /// Top-level metadata keys the compact wiring view drops by NOT being
@@ -1059,7 +1369,7 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 10] = [
 /// that); it exists so every top-level key has exactly one declared
 /// disposition, keep or drop, which is what the classification tests
 /// hold to account when the schema grows.
-pub const COMPACT_DROP_TOP_LEVEL: [&str; 8] = [
+pub const COMPACT_DROP_TOP_LEVEL: [&str; 9] = [
     "label",
     "tags",
     "icon",
@@ -1068,6 +1378,9 @@ pub const COMPACT_DROP_TOP_LEVEL: [&str; 8] = [
     "display",
     "service",
     "accessApps",
+    // Which config fields hold the address this node claims. The
+    // compiler's overlap check reads it; nobody writing weft does.
+    "claimsRoute",
 ];
 
 /// Presentation keys stripped inside the `portsFromConfig` subtree of
@@ -1275,6 +1588,12 @@ pub enum Condition {
     /// Port has a wired incoming edge specifically (no config-literal
     /// shortcut). Rare; prefer `InputSatisfied`.
     InputWired { port: String },
+    /// An OUTPUT port with at least one wire leaving it: somebody
+    /// downstream reads this value. The mirror of `InputWired`, and
+    /// what makes "this port answers a misleading number, but only if
+    /// anybody reads it" expressible without shouting at every program
+    /// that ignores the port.
+    OutputWired { port: String },
     /// Port's incoming edge(s) all come from a node whose
     /// `node_type` equals `equals`. True vacuously if the port has
     /// no wired edges (pair with `InputWired` or `InputSatisfied`
@@ -1294,12 +1613,73 @@ pub enum Condition {
     /// sibling ConfigX condition, which all treat an absent field as not-present).
     /// Wrap in `not` to assert a non-match.
     ConfigMatches { field: String, regex: String },
+    /// The source declared output ports beyond the metadata's own (a
+    /// node with `canAddOutputPorts`, written `-> (verdict: String)`).
+    /// The ingredient for "added outputs need X": a node whose added
+    /// ports only fire under some setting says so with this and a
+    /// `config_equals` on the setting. `{custom_outputs}` in the
+    /// message names them.
+    /// Braced (`{}`) so a stray field on it is refused like on every
+    /// other kind.
+    CustomOutputsDeclared {},
+    /// The run this node is part of holds a node of one of `types`, in
+    /// the given direction. `downstream`: every run started from this
+    /// node (a trigger's fire, or a run seeded at the node) contains
+    /// one of them; the check a trigger makes to know its caller gets
+    /// answered. `upstream`: this node is in the run of some node of
+    /// one of `types`; the check an answering node makes to know a
+    /// caller exists. Computed on the same program selection a fire
+    /// uses, so the diagnostic and the run cannot disagree.
+    ///
+    RunReaches { direction: RunDirection, types: Vec<String> },
     /// All sub-conditions must hold.
     All { of: Vec<Condition> },
     /// At least one sub-condition must hold.
     Any { of: Vec<Condition> },
     /// Negation.
     Not { of: Box<Condition> },
+}
+
+/// Which way `run_reaches` looks from the node it is evaluated on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunDirection {
+    Downstream,
+    Upstream,
+}
+
+#[cfg(test)]
+mod condition_tests {
+    use super::Condition;
+
+    /// Metadata is the wire for a rule: every condition kind reads back
+    /// as itself, the two port-declaration kinds carrying no fields.
+    #[test]
+    fn every_condition_kind_round_trips_through_json() {
+        let rule: Condition = serde_json::from_value(serde_json::json!({
+            "kind": "all",
+            "of": [
+                { "kind": "custom_outputs_declared" },
+                { "kind": "not", "of": { "kind": "config_equals", "field": "parseJson", "equals": true } },
+                { "kind": "any", "of": [
+                    { "kind": "input_satisfied", "port": "prompt" },
+                    { "kind": "input_wired", "port": "history" },
+                    { "kind": "output_wired", "port": "count" },
+                    { "kind": "input_source_type", "port": "provider", "equals": "OpenRouter" },
+                    { "kind": "config_present", "field": "model" },
+                    { "kind": "config_nonempty", "field": "model" },
+                    { "kind": "config_in_set", "field": "mode", "values": ["a", "b"] },
+                    { "kind": "config_matches", "field": "path", "regex": "^/" },
+                    { "kind": "run_reaches", "direction": "downstream", "types": ["Reply", "Stream"] },
+                    { "kind": "run_reaches", "direction": "upstream", "types": ["Route"] }
+                ] }
+            ]
+        }))
+        .expect("every kind parses");
+        let again: Condition = serde_json::from_value(serde_json::to_value(&rule).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&rule).unwrap());
+        assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_outputs_declared", "port": "x" })).is_err(), "no fields");
+    }
 }
 
 /// Node-level semantic constraints. All optional; empty by default.
@@ -1788,6 +2168,14 @@ pub trait MetadataCatalog: Send + Sync {
     fn lookup(&self, node_type: &str) -> Option<&NodeMetadata>;
     /// Every known node's metadata.
     fn all(&self) -> Vec<&NodeMetadata>;
+    /// Why a type the catalog has SEEN is not in it: a node folder whose
+    /// `metadata.json` exists but whose code does not yet. Such a node is
+    /// left out of the catalog (a program that never names it builds),
+    /// and a program that does name it is told this instead of "unknown
+    /// node type". `None` for a type the catalog never saw.
+    fn not_ready(&self, _node_type: &str) -> Option<String> {
+        None
+    }
     /// The type registry this catalog's metadata was loaded under
     /// (builtin aliases plus the project's `types` declarations). The
     /// compile pipeline activates it so type names in weft source
@@ -2529,9 +2917,10 @@ impl NodeOutput {
 #[cfg(test)]
 mod node_output_tests {
     /// A dynamic payload says "no caption on this picture" with a
-    /// null. Firing that at a `String` port makes the engine record a
-    /// mismatch and close the port on every run; the fan skips it, and
-    /// a port that declares Null among its types still receives it.
+    /// null. Sending that at a `String` port is refused by the engine
+    /// (the send fails and the port stays open), so the fan drops it
+    /// here rather than building a send that could only be turned
+    /// down. A port that declares Null among its types still gets it.
     #[test]
     fn a_null_is_skipped_unless_the_port_can_hold_one() {
         use crate::weft_type::{WeftPrimitive, WeftType};
@@ -3973,7 +4362,7 @@ mod compact_view_tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        const SERIALIZED_WHEN_NON_EMPTY: [&str; 8] = [
+        const SERIALIZED_WHEN_NON_EMPTY: [&str; 10] = [
             "images",
             "publishes",
             "display",
@@ -3982,6 +4371,8 @@ mod compact_view_tests {
             "service",
             "accessApps",
             "types",
+            "firesWith",
+            "claimsRoute",
         ];
         observed.extend(SERIALIZED_WHEN_NON_EMPTY);
 

@@ -3,11 +3,9 @@
 //! broker, and loops if the spec is recurring.
 
 use std::str::FromStr;
-use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Duration, Instant};
@@ -29,17 +27,26 @@ impl KindHandler for TimerHandler {
         Timer::TAG
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::Internal,
             auth: SignalAuth::None,
             auth_config: Value::Null,
         })
+    }
+
+    /// A timer is the one kind a person can wake by hand, because what
+    /// it waits for is the clock and "now" is a true answer for it.
+    ///
+    /// Both stamps are now, and they differ from a real tick in exactly
+    /// the way they should: a tick reports the deadline it was AIMED at
+    /// as `scheduledTime` and when it actually woke as `actualTime`, so
+    /// a late tick shows the gap. A hand wake was aimed at this moment,
+    /// so the two agree. The node reads the same two fields either way
+    /// and never has to know which happened.
+    fn wake_by_hand(&self) -> Option<Value> {
+        let now = Utc::now().to_rfc3339();
+        Some(serde_json::json!({ "scheduledTime": now, "actualTime": now }))
     }
 
     /// Pin the fire time at register time for `After` schedules so a
@@ -74,6 +81,19 @@ impl KindHandler for TimerHandler {
         let pinned_after = kind_state
             .get("next_fire_at_unix_ms")
             .and_then(|v| v.as_i64());
+        // Checked HERE, where a failure is this registration's error and
+        // becomes a 400 the person sees, rather than inside the loop.
+        // An `After` with no pinned deadline used to panic in the
+        // spawned task, and a panic in a detached task is caught by the
+        // runtime and goes nowhere: the signal stayed in the registry,
+        // counted towards this pod's load, showed as registered, and
+        // never fired. Loud is only loud where somebody is listening.
+        if matches!(timer.spec, TimerSpec::After { .. }) && pinned_after.is_none() {
+            anyhow::bail!(
+                "an `after` timer must carry the moment it was aimed at, so a listener restart \
+                 keeps the same deadline instead of starting the wait again; this one has none"
+            );
+        }
         Ok(Some(spawn_loop(timer.spec, pinned_after, ctx.fire)))
     }
 
@@ -146,13 +166,14 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Ins
         TimerSpec::After { duration_ms: _ } => {
             // `After` is one-shot and must be pinned (in ms) at
             // register time so a listener restart preserves the
-            // deadline. If the pin is missing, the register flow is
-            // broken; fail loudly instead of silently restarting the
-            // clock. Millisecond-precise throughout (no second
-            // truncation): a sub-second After fires after its real
-            // duration, not immediately.
-            let target_ms = pinned_after_unix_ms
-                .expect("After timer must have pinned next_fire_at_unix_ms in kind_state");
+            // deadline. `spawn_task` refuses a registration without the
+            // pin, which is where the person can be told; by here the
+            // only honest thing left is to not fire, since firing on a
+            // restarted clock would be a deadline nobody asked for.
+            // Millisecond-precise throughout (no second truncation): a
+            // sub-second After fires after its real duration, not
+            // immediately.
+            let target_ms = pinned_after_unix_ms?;
             let delta_ms = (target_ms - unix_now_ms() as i64).max(0) as u64;
             let deadline = DateTime::from_timestamp_millis(target_ms)?;
             Some((Instant::now() + Duration::from_millis(delta_ms), deadline))
@@ -171,11 +192,11 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Ins
             // The expression is supposed to be validated at register
             // time (Signal::validate inside register_signal). If the
             // validator and the `cron` parser drift apart on a minor
-            // version bump, a panic here would crash the timer task
-            // and silently take down every other timer the same task
-            // owned. Log + return None instead: the signal stays
-            // registered but doesn't fire until the underlying bug
-            // is fixed.
+            // version bump, a panic here would go NOWHERE: each timer
+            // runs in its own detached task, so the runtime swallows it
+            // and the signal sits registered, counted, and silent. Log
+            // and return None instead, which at least leaves a line
+            // saying which expression stopped working.
             let schedule = match cron::Schedule::from_str(expression) {
                 Ok(s) => s,
                 Err(e) => {

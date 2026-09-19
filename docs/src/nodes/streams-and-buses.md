@@ -151,6 +151,11 @@ marker.
 bus: what a window row contains is in
 [The journal](../running/the-journal.md#what-the-journal-costs).
 
+These last three, the mode, the window and the aggregation, are the same
+decision a live caller conversation makes, answered by the same code, so a
+bus and a route cannot disagree about where a payload gets trimmed or about
+what ephemeral means. If you change one, you have changed both.
+
 ## Keep bus work on your own task
 
 Nothing enforces this one, so you have to hold it yourself. Do all of a bus's

@@ -213,23 +213,38 @@ r = Range { to: 3, values: [1] }
     assert!(!codes(&d).contains(&"undeclared-port-no-custom"), "one finding, the precise one: {d:?}");
 }
 
+/// A gate decides whether the node runs, so it is a yes or a no and
+/// nothing else. Both spellings are gates and both are held to it: a
+/// value that is not a boolean is refused rather than read as one,
+/// because guessing here silently changes whether the node runs.
+///
+/// A WIRE into a gate is a different matter and deliberately allowed:
+/// what a wire carries is not knowable until the run, so that is the
+/// runtime's to judge.
 #[test]
-fn a_written_should_flow_must_be_a_boolean() {
-    let project = parse_enrich(
-        r#"
-t = Text { value: "x", _should_flow: "yes" }
-"#,
-    );
-    let d = validate(&project, &catalog());
-    assert!(codes(&d).contains(&"should-flow-not-boolean"), "{d:?}");
-    let project = parse_enrich(
-        r#"
-t = Text { value: "x" }
-t._should_flow = false
-"#,
-    );
-    let d = validate(&project, &catalog());
-    assert!(!codes(&d).contains(&"should-flow-not-boolean"), "{d:?}");
+fn a_written_gate_must_be_a_boolean() {
+    for gate in ["_should_flow", "_should_not_flow"] {
+        // The parser turns away a few shapes before validation ever
+        // sees them (an unquoted object, a bare `null`), so these are
+        // the ones that reach the gate check.
+        for value in ["\"yes\"", "1", "[true]"] {
+            let project = parse_enrich(&format!("t = Text {{ value: \"x\", {gate}: {value} }}"));
+            let d = validate(&project, &catalog());
+            let hit = d
+                .iter()
+                .find(|e| e.code.as_deref() == Some("gate-not-boolean"))
+                .unwrap_or_else(|| panic!("{gate}: {value} is not a yes or a no: {d:?}"));
+            assert!(hit.message.contains(gate), "the message names the gate: {}", hit.message);
+            assert!(hit.message.contains('t'), "and the node: {}", hit.message);
+        }
+
+        // A boolean written either way passes, as does a wire, whose
+        // value nobody can know before the run.
+        let project = parse_enrich(&format!("t = Text {{ value: \"x\", {gate}: true }}"));
+        assert!(!codes(&validate(&project, &catalog())).contains(&"gate-not-boolean"));
+        let project = parse_enrich(&format!("t = Text {{ value: \"x\" }}\nt.{gate} = false"));
+        assert!(!codes(&validate(&project, &catalog())).contains(&"gate-not-boolean"));
+    }
 }
 
 #[test]
@@ -447,7 +462,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 
 // ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
 
-/// The ApiEndpoint node carries a declarative rule:
+/// The Route node carries a declarative rule:
 /// `when config_matches(path, "^/") then warn`. These tests exercise the
 /// declarative-rule engine + the `ConfigMatches` condition end-to-end, including
 /// the fail-closed behavior on an absent field (the rule must NOT fire when the
@@ -455,7 +470,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 #[test]
 fn config_matches_rule_fires_only_when_pattern_matches() {
     // path starts with `/` -> the rule fires (warning).
-    let with_slash = parse_enrich("t = ApiEndpoint { path: \"/hook\" }\n");
+    let with_slash = parse_enrich("t = Route { path: \"/hook\" }\n");
     let d = validate(&with_slash, &catalog());
     assert!(
         d.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -463,7 +478,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     );
 
     // path without a leading slash -> no rule.
-    let no_slash = parse_enrich("t = ApiEndpoint { path: \"hook\" }\n");
+    let no_slash = parse_enrich("t = Route { path: \"hook\" }\n");
     let d2 = validate(&no_slash, &catalog());
     assert!(
         !d2.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -473,12 +488,32 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     // path absent entirely -> no rule (fail-closed: an absent field is not a
     // match, matching every sibling ConfigX condition; the old `unwrap_or(true)`
     // wrongly fired this).
-    let absent = parse_enrich("t = ApiEndpoint {}\n");
+    let absent = parse_enrich("t = Route {}\n");
     let d3 = validate(&absent, &catalog());
     assert!(
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),
         "config_matches must NOT fire when the field is absent: {d3:?}"
     );
+}
+
+/// `LlmInference`'s added output ports only fire with `parseJson: true`:
+/// the metadata says so through `custom_outputs_declared`, so a program
+/// declaring `-> (verdict: String)` without the flag is a structural
+/// error naming the ports, and the same program with the flag, or with
+/// no added ports, is clean.
+#[test]
+fn added_llm_output_ports_without_parse_json_are_a_structural_error() {
+    let without = parse_enrich("n = LlmInference -> (verdict: String, score: Number) { prompt: \"judge\" }\n");
+    let d = validate(&without, &catalog());
+    let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("rule-structural")).expect("the rule fires");
+    assert!(hit.message.contains("'n' declares output ports (verdict, score)"), "{}", hit.message);
+    assert!(hit.message.contains("parseJson: true"), "{}", hit.message);
+
+    let with = parse_enrich("n = LlmInference -> (verdict: String, score: Number) { prompt: \"judge\", parseJson: true }\n");
+    assert!(!codes(&validate(&with, &catalog())).contains(&"rule-structural"), "{:?}", validate(&with, &catalog()));
+
+    let plain = parse_enrich("n = LlmInference -> (response: String) { prompt: \"judge\" }\n");
+    assert!(!codes(&validate(&plain, &catalog())).contains(&"rule-structural"), "{:?}", validate(&plain, &catalog()));
 }
 
 // ─── Loop validate tests ────────────────────────────────────────────────────
@@ -926,8 +961,9 @@ fn storage_plane_example_chain_validates_clean() {
     // demands displayable media, which File does NOT satisfy. The author NARROWS the
     // fetch's output port to Image in the node header (`-> (file: Image)`):
     // legal because Image is a sub-case of the declared File, and the
-    // narrowed Image then satisfies MediaDisplay. The runtime enforces the
-    // narrow (a non-image fetched here closes the port and warns).
+    // narrowed Image then satisfies MediaDisplay. The runtime holds the
+    // node to the narrow it wrote: fetching a non-image here fails the
+    // send, inside the node that made it, and nothing reaches the port.
     let project = parse_enrich(
         r#"
 file_url = Text { value: "https://example.com/x.png" }
@@ -1457,6 +1493,108 @@ out.data = c.value
 
 
 // ----- Generator[T] wiring rules -------------------------------------
+
+/// A `Socket` declares `inbound: Generator[MustOverride]` in its metadata:
+/// the author's `-> (inbound: Generator[JsonDict])` resolves the element
+/// type and a Loop over it validates clean, exactly like a Range stream.
+#[test]
+fn a_declared_socket_inbound_drives_a_loop_clean() {
+    let (project, errs) = parse_enrich_lenient(
+        r#"
+sock = Socket -> (inbound: Generator[JsonDict]) { path: "chat" }
+turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
+    parallel: false
+    over: ["msg"]
+    say = Reply
+    say.body = self.msg
+    self.results = say.done
+}
+turn.msg = sock.inbound
+bye = Close
+bye.code = 1000
+"#,
+    );
+    assert!(errs.is_empty(), "compiles: {errs:?}");
+    let sock = project.nodes.iter().find(|n| n.id == "sock").expect("the socket node");
+    let inbound = sock.outputs.iter().find(|p| p.name == "inbound").expect("inbound port");
+    assert_eq!(inbound.port_type.to_string(), "Generator[JsonDict]", "the declaration resolves the element");
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "expected a clean socket loop, got {:?}", errors(&d));
+}
+
+/// The same wiring with NO declaration on `inbound`: the element type is
+/// still the placeholder, and wiring it is refused (the author must
+/// declare it), never silently accepted as an opaque stream.
+#[test]
+fn an_undeclared_socket_inbound_is_refused_when_wired() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+sock = Socket { path: "chat" }
+turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
+    parallel: false
+    over: ["msg"]
+    say = Reply
+    say.body = self.msg
+    self.results = say.done
+}
+turn.msg = sock.inbound
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = errors(&d).iter().any(|x| {
+        matches!(x.code.as_deref(), Some("must-override-unmet") | Some("unresolved-typevar"))
+    });
+    assert!(hit, "an undeclared stream element must be refused, got {:?}", errors(&d));
+}
+
+/// A route reading a body declares the keys it wants; one that ignores
+/// its body declares nothing and is still a valid trigger (no
+/// undeclared-port complaint, no must-override complaint on a port
+/// nobody reads).
+#[test]
+fn a_route_with_declared_body_keys_and_one_with_none_both_validate() {
+    let (project, errs) = parse_enrich_lenient(
+        r#"
+hello = Route -> (name: String) { path: "hello", method: "POST" }
+answer = Reply { status: 201 }
+answer.body = hello.name
+"#,
+    );
+    assert!(errs.is_empty(), "compiles: {errs:?}");
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "a declared body key wires clean, got {:?}", errors(&d));
+
+    let (project, errs) = parse_enrich_lenient(
+        r#"
+ping = Route { path: "ping", method: "GET" }
+answer = Reply
+answer.body = ping.path
+"#,
+    );
+    assert!(errs.is_empty(), "compiles: {errs:?}");
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "a bodiless route wires clean, got {:?}", errors(&d));
+}
+
+/// The streaming shape: an LLM stream's bus into a Stream node behind a
+/// route validates clean (a Bus port connects to a Bus port).
+#[test]
+fn a_bus_into_a_stream_node_validates_clean() {
+    let (project, errs) = parse_enrich_lenient(
+        r#"
+ask = Route -> (prompt: String) { path: "chat", method: "POST" }
+prov = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
+live = LlmStream
+live.provider = prov.provider
+live.prompt = ask.prompt
+out = Stream { format: "sse" }
+out.bus = live.stream
+"#,
+    );
+    assert!(errs.is_empty(), "compiles: {errs:?}");
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "a bus into Stream wires clean, got {:?}", errors(&d));
+}
 
 #[test]
 fn clean_stream_loop_over_a_generator_validates() {
@@ -2429,6 +2567,8 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("legacy");
     std::fs::create_dir_all(&node_dir).unwrap();
+    // The description alone leaves a node out of the catalog (not ready yet).
+    std::fs::write(node_dir.join("mod.rs"), "// node impl\n").unwrap();
     std::fs::write(
         node_dir.join("metadata.json"),
         r#"{
@@ -2477,6 +2617,8 @@ fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("legacy");
     std::fs::create_dir_all(&node_dir).unwrap();
+    // The description alone leaves a node out of the catalog (not ready yet).
+    std::fs::write(node_dir.join("mod.rs"), "// node impl\n").unwrap();
     std::fs::write(
         node_dir.join("metadata.json"),
         r#"{
@@ -2521,6 +2663,8 @@ fn enrich_stamps_declared_types_from_the_header_only() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("gadget");
     std::fs::create_dir_all(&node_dir).unwrap();
+    // The description alone leaves a node out of the catalog (not ready yet).
+    std::fs::write(node_dir.join("mod.rs"), "// node impl\n").unwrap();
     std::fs::write(
         node_dir.join("metadata.json"),
         r#"{
@@ -2575,6 +2719,8 @@ fn declaring_a_typevar_port_narrows_the_whole_node() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("hold");
     std::fs::create_dir_all(&node_dir).unwrap();
+    // The description alone leaves a node out of the catalog (not ready yet).
+    std::fs::write(node_dir.join("mod.rs"), "// node impl\n").unwrap();
     std::fs::write(
         node_dir.join("metadata.json"),
         r#"{
@@ -2606,6 +2752,8 @@ fn two_declarations_of_one_typevar_must_agree() {
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("pick");
     std::fs::create_dir_all(&node_dir).unwrap();
+    // The description alone leaves a node out of the catalog (not ready yet).
+    std::fs::write(node_dir.join("mod.rs"), "// node impl\n").unwrap();
     std::fs::write(
         node_dir.join("metadata.json"),
         r#"{
@@ -3513,3 +3661,573 @@ ws = SlackAccess { account: {"identity": 42} }
 
 
 
+
+/// `run_reaches`: a route whose run never reaches an answering node
+/// is flagged at edit time, and so is an answering node no trigger's
+/// run reaches. The run is the fire's own selection, so a group or an
+/// included file hanging off the route through `_should_flow` alone
+/// counts as reached, the way it runs.
+#[test]
+fn a_route_whose_run_answers_nobody_is_flagged_and_a_gated_group_counts() {
+    let answers = |source: &str| -> bool {
+        let d = validate(&parse_enrich(source), &catalog());
+        !d.iter().any(|x| x.message.contains("never answers its caller"))
+    };
+    let orphaned = |source: &str| -> bool {
+        let d = validate(&parse_enrich(source), &catalog());
+        d.iter().any(|x| x.message.contains("answers nobody"))
+    };
+    // Wired by data: fine both ways.
+    let wired = "t = Route -> (text: String) { path: \"hook\" }\nr = Reply\nr.body = t.text\n";
+    assert!(answers(wired) && !orphaned(wired));
+    // Nothing behind the route, and a reply nothing reaches.
+    let alone = "t = Route { path: \"hook\" }\nr = Reply { body: \"x\" }\n";
+    assert!(!answers(alone) && orphaned(alone), "{:?}", validate(&parse_enrich(alone), &catalog()));
+    // The reply inside a group the route runs through `_should_flow`.
+    let gated = "t = Route { path: \"hook\" }\nwork = Group() {\n  r = Reply { body: \"x\" }\n}\nwork._should_flow = t.method\n";
+    assert!(answers(gated) && !orphaned(gated), "{:?}", validate(&parse_enrich(gated), &catalog()));
+    // A route whose only connection is to a group's door, with nothing inside.
+    let empty = "t = Route { path: \"hook\" }\nwork = Group() {\n  n = ExecPython() -> (out: String) { code: \"return {'out': 'x'}\" }\n}\nwork._should_flow = t.method\n";
+    assert!(!answers(empty));
+}
+
+/// A trigger fires on its event, never on its inputs, so the all-optional
+/// warning never applies to one: a route with only its auth wired is a
+/// correct program.
+#[test]
+fn a_trigger_never_gets_the_all_optional_inputs_warning() {
+    let project = parse_enrich(
+        r#"
+gate = ApiKeyAuth {}
+t = Route { path: "hook" }
+t.auth = gate.access
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let warned: Vec<&Diagnostic> = d.iter().filter(|x| x.code.as_deref() == Some("no-required-skip")).collect();
+    assert!(warned.is_empty(), "a trigger's inputs are settings, not what fires it: {warned:?}");
+}
+
+/// A node whose gate is wired never gets the all-optional warning: the
+/// author already said when it runs. A Close with its `reason` wired
+/// from upstream and its gate from a Switch's failing case is a
+/// correct program, and the same Close with no gate still warns.
+#[test]
+fn a_wired_gate_silences_the_all_optional_inputs_warning() {
+    let warned = |source: &str| -> bool {
+        validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("no-required-skip"))
+    };
+    let base = "t = Route { path: \"gone\", method: \"DELETE\" }\n\
+                step = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
+                step.method = t.method\n\
+                bye = Close { status: 404 }\nbye.reason = step.why\n";
+    assert!(warned(base), "all of Close's wired inputs are optional and nothing gates it");
+    assert!(!warned(&format!("{base}bye._should_flow = step.ok\n")), "the gate is the author's decision");
+}
+
+/// Close's two wires have one field each, and the pair that cannot work
+/// (a message under a status that carries no body) is caught while the
+/// author is still typing, not at the moment a caller is waiting.
+#[test]
+fn close_says_at_edit_time_which_wire_its_fields_belong_to() {
+    let says = |source: &str, needle: &str| -> bool {
+        validate(&parse_enrich(source), &catalog()).iter().any(|d| d.message.contains(needle))
+    };
+    let route = "t = Route { path: \"gone\", method: \"DELETE\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
+    // A reason under a 204 cannot reach the caller.
+    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = step.n\n"), "carries no body"));
+    // A socket's close code behind a Route, and an HTTP status behind a socket.
+    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = step.n\n"), "WebSocket close code"));
+    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
+    assert!(says(socket, "an HTTP status"));
+    assert!(!says(socket, "WebSocket close code"));
+}
+
+/// A declared type is still a type: wiring one into a port that wants a
+/// LIST of it is a mismatch, and it must be named. The nesting is the
+/// point, so this uses a record inside the list rather than a bare
+/// scalar: the shape has to survive the name on both sides for the
+/// comparison to mean anything.
+#[test]
+fn a_declared_type_wired_into_a_list_of_itself_is_a_mismatch() {
+    let project = parse_enrich(
+        r#"
+type Order = { id: String, lines: List[{ sku: String, qty: Number }] }
+type Orders = List[Order]
+
+seed = ExecPython() -> (raw: JsonDict) { code: "return {'raw': {}}" }
+one = Cast() -> (value: Order)
+one.value = seed.raw
+many = ExecPython(o: Orders) -> (n: Number) { code: "return {'n': len(o)}" }
+many.o = one.value
+out = Debug
+out.data = many.n
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let codes = codes(&d);
+    assert!(
+        codes.contains(&"type-mismatch"),
+        "an Order where a List[Order] goes must be refused, got {codes:?}: {:?}",
+        errors(&d).iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+/// The same graph with the port declared as the type it is actually
+/// fed: nothing to report, so the refusal above is the mismatch's
+/// doing and not something else in the shape.
+#[test]
+fn the_same_declared_type_on_both_ends_is_fine() {
+    let project = parse_enrich(
+        r#"
+type Order = { id: String, lines: List[{ sku: String, qty: Number }] }
+
+seed = ExecPython() -> (raw: JsonDict) { code: "return {'raw': {}}" }
+one = Cast() -> (value: Order)
+one.value = seed.raw
+read = ExecPython(o: Order) -> (n: Number) { code: "return {'n': 1}" }
+read.o = one.value
+out = Debug
+out.data = read.n
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+}
+
+/// `?` on an OUTPUT port is meaningless: an output either fires or it
+/// does not, and nothing about the declaration can say which. Only an
+/// INPUT can be optional (it means "this node runs even if nothing
+/// arrives here"). Writing one should be refused rather than quietly
+/// accepted, because it reads as a promise the language cannot keep.
+#[test]
+fn an_optional_marker_on_an_output_is_refused() {
+    let refusal = compile(
+        r#"
+src = ExecPython() -> (a: String, b?: String) { code: "return {'a': 'x'}" }
+out = Debug
+out.data = src.a
+"#,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect_err("an optional output never reaches enrich");
+    let said = format!("{refusal:?}");
+    assert!(
+        said.contains("output port") && said.contains("no optionality") && said.contains("CLOSES it"),
+        "the refusal has to say what an output's absence DOES mean: {said}"
+    );
+    // And what to do about it, which is the half an author actually
+    // needs: the body key that may be missing is fine as a plain port,
+    // and the node behind it marks its own input optional to survive.
+    assert!(said.contains("mark ITS input optional"), "it names the fix on the other side: {said}");
+}
+
+// ── two-gates ────────────────────────────────────────────────────────────────
+
+/// `_should_flow` and `_should_not_flow` are one decision read two
+/// ways, so a node carrying both asks one question twice and there is
+/// nothing to combine. Written as body values is the shape an author
+/// reaches for first.
+#[test]
+fn both_gates_written_on_one_node_are_refused() {
+    let p = parse_enrich("t = Text { value: \"x\", _should_flow: true, _should_not_flow: false }\n");
+    let d = validate(&p, &catalog());
+    let found: Vec<&Diagnostic> =
+        d.iter().filter(|x| x.code.as_deref() == Some("two-gates")).collect();
+    assert_eq!(found.len(), 1, "one node, one finding: {d:?}");
+    // The author is looking at one line and has to know which half to
+    // drop, so the message names the node and both spellings.
+    let said = &found[0].message;
+    assert!(
+        said.contains("'t'") && said.contains("_should_flow") && said.contains("_should_not_flow"),
+        "the finding names the node and both gates: {said}"
+    );
+}
+
+/// The same node, gated from upstream instead: a wire lands on the
+/// port exactly as a written value does, so the rule reads both
+/// drivers the same way.
+#[test]
+fn both_gates_arriving_as_wires_are_refused() {
+    let p = parse_enrich(
+        "yes = Text { value: \"y\" }\n\
+         no = Text { value: \"n\" }\n\
+         t = Text { value: \"x\" }\n\
+         t._should_flow = yes.value\n\
+         t._should_not_flow = no.value\n",
+    );
+    let d = validate(&p, &catalog());
+    assert_eq!(
+        d.iter().filter(|x| x.code.as_deref() == Some("two-gates")).count(),
+        1,
+        "two wires on one node is the same one question twice: {d:?}"
+    );
+}
+
+/// One gate is the normal case and neither spelling is special, so
+/// both have to pass clean on their own.
+#[test]
+fn one_gate_alone_is_fine_in_either_spelling() {
+    for source in [
+        "a = Text { value: \"y\" }\nt = Text { value: \"x\" }\nt._should_flow = a.value\n",
+        "a = Text { value: \"y\" }\nt = Text { value: \"x\" }\nt._should_not_flow = a.value\n",
+        "t = Text { value: \"x\", _should_flow: false }\n",
+        "t = Text { value: \"x\", _should_not_flow: false }\n",
+    ] {
+        let p = parse_enrich(source);
+        let d = validate(&p, &catalog());
+        assert!(
+            !d.iter().any(|x| x.code.as_deref() == Some("two-gates")),
+            "one gate is the whole point of the port: {source} -> {d:?}"
+        );
+    }
+}
+
+/// A group takes a gate too (it decides whether the whole subgraph
+/// runs), and flatten homes it on the group's boundary node. Both
+/// gates there is the same mistake, reached through a different door:
+/// one written in the group's body, one filled from outside.
+#[test]
+fn both_gates_on_a_group_are_refused() {
+    let p = parse_enrich(
+        "g = Group() -> (out: String) {\n\
+        \x20   _should_flow: true\n\
+        \x20   p = Text { value: \"x\" }\n\
+        \x20   self.out = p.value\n\
+         }\n\
+         g._should_not_flow = false\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("two-gates")),
+        "a boundary node carries one gate like any other node: {d:?}"
+    );
+}
+
+/// An included file's call site is gated the same way, so the pair is
+/// caught after the include is expanded rather than shipping a program
+/// whose subgraph has two answers.
+#[test]
+fn both_gates_on_an_included_file_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.weft"),
+        "Group() -> (out: String) {\n  p = Text { value: \"x\" }\n  self.out = p.value\n}\n",
+    )
+    .unwrap();
+    let source = "c = @include(\"lib.weft\")\nc._should_flow = false\nc._should_not_flow = false\n";
+    let mut project =
+        compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    let d = validate(&project, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("two-gates")),
+        "the include's boundary node has one gate too: {d:?}"
+    );
+}
+
+// ── route-overlap ────────────────────────────────────────────────────────────
+
+/// Two routes of one program that a single call could both reach. The
+/// dispatcher refuses this pair at activation, where it can also see
+/// the author's other projects; these cases are the half the source
+/// alone answers, so it is answered while the file is being written.
+///
+/// A literal segment beside a capture that also matches it is the most
+/// common shape in any API, and it has an obvious answer: `cards/count`
+/// takes that one call and `cards/{id}` takes every other. Sharing a
+/// call is not what gets refused; having no way to pick between the two
+/// is.
+#[test]
+fn a_literal_route_lives_beside_the_capture_that_would_swallow_it() {
+    let p = parse_enrich(
+        "count = Route { path: \"cards/count\", method: \"GET\" }\n\
+         one = Route { path: \"cards/{id}\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "the literal is the more specific, so it serves that call: {d:?}"
+    );
+}
+
+/// Two captures on one shape: `cards/7` reaches both and there is
+/// nothing to prefer, so the pair cannot stand.
+#[test]
+fn two_captures_on_one_shape_are_refused() {
+    let p = parse_enrich(
+        "by_id = Route { path: \"cards/{id}\", method: \"GET\" }\n\
+         by_slug = Route { path: \"cards/{slug}\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    let found: Vec<&Diagnostic> =
+        d.iter().filter(|x| x.code.as_deref() == Some("route-overlap")).collect();
+    assert_eq!(found.len(), 1, "one pair, one finding: {d:?}");
+    // The message is only useful if it names the OTHER node: the author
+    // is looking at one line and has to find the line it fights with.
+    let said = &found[0].message;
+    assert!(
+        said.contains("cards/{id}") && said.contains("cards/{slug}") && said.contains("by_id"),
+        "the finding names both paths and the node already there: {said}"
+    );
+}
+
+/// Each pattern spells out a segment the other captures, so `a/b/c`
+/// reaches both with two equal claims. Counting captures would call
+/// these equally specific and pick whichever was seen first, which is
+/// exactly the guess the refusal exists to prevent.
+#[test]
+fn two_routes_that_each_win_a_position_are_refused() {
+    let p = parse_enrich(
+        "mid = Route { path: \"a/{x}/c\", method: \"GET\" }\n\
+         last = Route { path: \"a/b/{y}\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "neither is the more specific, so the call has no answer: {d:?}"
+    );
+}
+
+/// Different methods on one path is the ordinary REST shape and has to
+/// stay legal: a call carries one method, so only one of them answers.
+#[test]
+fn one_path_under_two_methods_is_fine() {
+    let p = parse_enrich(
+        "read = Route { path: \"cards/{id}\", method: \"GET\" }\n\
+         drop = Route { path: \"cards/{id}\", method: \"DELETE\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "two methods on one path serve different calls: {d:?}"
+    );
+}
+
+/// A route with no method serves every method, so it collides with one
+/// that names a method on the same shape.
+#[test]
+fn a_route_serving_every_method_collides_with_a_named_one() {
+    let p = parse_enrich(
+        "any = Route { path: \"cards\" }\n\
+         post = Route { path: \"cards\", method: \"POST\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "an unset method is every method: {d:?}"
+    );
+}
+
+/// Paths of different lengths, and two captures in different places,
+/// cannot both take one call.
+#[test]
+fn routes_that_cannot_take_the_same_call_are_left_alone() {
+    let p = parse_enrich(
+        "a = Route { path: \"cards\", method: \"GET\" }\n\
+         b = Route { path: \"cards/{id}\", method: \"GET\" }\n\
+         c = Route { path: \"decks/{id}\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "different lengths and different literals never meet: {d:?}"
+    );
+}
+
+/// A path that is not a pattern at all. This is the only place either
+/// half of a claim is read at compile time, so letting it through
+/// would compile clean and die at `weft activate`.
+#[test]
+fn a_path_that_is_not_a_pattern_is_refused() {
+    for path in ["cards/{id", "a//b", "/cards"] {
+        let p = parse_enrich(&format!("r = Route {{ path: \"{path}\", method: \"GET\" }}\n"));
+        let d = validate(&p, &catalog());
+        let found = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("route-path-invalid"))
+            .unwrap_or_else(|| panic!("{path} is not servable: {d:?}"));
+        // The author has to know what to change, so the message repeats
+        // the path it choked on.
+        assert!(found.message.contains(path), "{}", found.message);
+    }
+}
+
+/// A trigger with no address at all. At run time an absent path is
+/// read as the project's own address, so two triggers that both forgot
+/// one both claim it and the second dies at activation. Refused here,
+/// where the person can see which node it is.
+#[test]
+fn a_route_with_no_address_is_refused() {
+    for source in [
+        "r = Route { method: \"GET\" }\n",
+        "r = Route { path: \"\", method: \"GET\" }\n",
+        "s = Socket { }\n",
+    ] {
+        let p = parse_enrich(source);
+        let d = validate(&p, &catalog());
+        let found = d
+            .iter()
+            .find(|x| x.code.as_deref() == Some("route-path-missing"))
+            .unwrap_or_else(|| panic!("no address is refused: {source} -> {d:?}"));
+        // The message has to leave the author knowing what to type, so
+        // it names the field and shows one.
+        assert!(
+            found.message.contains("path") && found.message.contains("hooks/stripe"),
+            "{}",
+            found.message
+        );
+    }
+}
+
+/// Two triggers that both forgot their address are the reason the one
+/// above is an error: this is what used to compile clean.
+#[test]
+fn two_addressless_routes_do_not_compile() {
+    let p = parse_enrich(
+        "a = Route { method: \"GET\" }\n\
+         b = Route { method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert_eq!(
+        d.iter().filter(|x| x.code.as_deref() == Some("route-path-missing")).count(),
+        2,
+        "each one is named, not just the pair: {d:?}"
+    );
+}
+
+/// A path computed by the program is not an address this pass can read,
+/// so it is left alone rather than reported as missing.
+#[test]
+fn a_wired_path_is_not_called_missing() {
+    let p = parse_enrich(
+        "src = Text { value: \"hooks/stripe\" }\n\
+         r = Route { method: \"GET\" }\n\
+         r.path = src.out\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-path-missing")),
+        "a wired path is computed at setup, not missing: {d:?}"
+    );
+}
+
+/// A misspelled method (`GTE`). Worse than late: an empty method list
+/// reads as "any method", so swallowing the typo would widen what the
+/// node claims to every verb.
+#[test]
+fn a_method_that_is_not_an_http_method_is_refused() {
+    let p = parse_enrich("r = Route { path: \"cards\", method: \"GTE\" }\n");
+    let d = validate(&p, &catalog());
+    let found = d
+        .iter()
+        .find(|x| x.code.as_deref() == Some("route-method-unknown"))
+        .unwrap_or_else(|| panic!("{d:?}"));
+    assert!(
+        found.message.contains("GTE") && found.message.contains("GET"),
+        "it names the typo and the methods there are: {}",
+        found.message
+    );
+    // And the broken claim is out of the overlap comparison, so the
+    // author reads one finding about one mistake.
+    let p = parse_enrich(
+        "bad = Route { path: \"cards\", method: \"GTE\" }\n\
+         ok = Route { path: \"cards\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "a claim that does not parse claims nothing: {d:?}"
+    );
+}
+
+/// A Socket claims a path the same way and through the same key, so the
+/// rule holds across node types without knowing what either one is.
+#[test]
+fn a_socket_and_a_route_claiming_one_path_collide() {
+    let p = parse_enrich(
+        "live = Socket { path: \"chat/{room}\" }\n\
+         http = Route { path: \"chat/{room}\", method: \"GET\" }\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("route-overlap")),
+        "one address, one node, whatever kind of node it is: {d:?}"
+    );
+}
+
+/// The one that reached production: `select count(*) as count` asks
+/// for a port the node already answers with the number of rows, so an
+/// API served `1` for a page of nine cards with nothing saying so. The
+/// alias is right there in the SQL, so the compiler refuses it before
+/// anything runs; the node keeps its own check for what a regex cannot
+/// see (a `select *` over a table with a column of that name).
+#[test]
+fn a_column_aliased_to_one_of_the_nodes_own_outputs_is_refused() {
+    let refused = |source: &str| -> bool {
+        validate(&parse_enrich(source), &catalog())
+            .iter()
+            .any(|x| x.message.contains("has nowhere to go"))
+    };
+    let q = |sql: &str| format!("q = PostgresExecuteQuery {{ query: \"{sql}\" }}\n");
+    assert!(refused(&q("select count(*) as count from card")));
+    assert!(refused(&q("SELECT count(*) AS \\\"rows\\\" FROM card")));
+    assert!(!refused(&q("select count(*) as total from card")), "the author's own name");
+    assert!(!refused(&q("select n as counted from card")), "a longer word is a different word");
+    assert!(!refused(&q("select count(*) from card")), "unaliased, it never reaches a port");
+
+    let w = "w = PostgresWatchQuery { query: \"select id as rows from card\" }\n";
+    assert!(refused(w), "the watch node answers `rows` too");
+}
+
+// ── output_wired ─────────────────────────────────────────────────────────────
+
+/// `count` is how many rows came BACK. A write with no `RETURNING`
+/// answers none, so `count` is 0 on a statement that changed a hundred
+/// rows, and a node gated on it never fires. It reads as "the write did
+/// nothing" and it sends you hunting a bug that is not there.
+///
+/// The rule can only fire when somebody actually READS the port, which
+/// is what `output_wired` is for: a program that ignores `count` is not
+/// wrong and must not be shouted at.
+#[test]
+fn a_write_whose_count_is_read_must_return_its_rows() {
+    let wired = parse_enrich(
+        r#"
+db = PostgresAccess
+mark = PostgresExecuteQuery { query: "update cards set judged = true where judged = false" }
+mark.account = db.access
+seen = Debug
+seen.data = mark.count
+"#,
+    );
+    let said = format!("{:?}", errors(&validate(&wired, &catalog())));
+    assert!(said.contains("RETURNING"), "it names the fix: {said}");
+    assert!(said.contains("came BACK"), "it says what count actually counts: {said}");
+
+    // The same statement with nobody reading `count` is an ordinary
+    // write and says nothing.
+    let ignored = parse_enrich(
+        r#"
+db = PostgresAccess
+mark = PostgresExecuteQuery { query: "update cards set judged = true where judged = false" }
+mark.account = db.access
+"#,
+    );
+    assert!(errors(&validate(&ignored, &catalog())).is_empty());
+
+    // And with RETURNING the number means what the reader thinks.
+    let returning = parse_enrich(
+        r#"
+db = PostgresAccess
+mark = PostgresExecuteQuery { query: "update cards set judged = true where judged = false returning id" }
+mark.account = db.access
+seen = Debug
+seen.data = mark.count
+"#,
+    );
+    assert!(errors(&validate(&returning, &catalog())).is_empty());
+}

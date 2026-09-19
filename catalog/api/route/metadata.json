@@ -1,0 +1,197 @@
+{
+  "type": "Route",
+  "label": "Route",
+  "description": "Turn this program into an HTTP route. A call to the route's path (and method) starts a fresh execution: the request's method, path, parameters, query and headers come out on the fixed ports, and the body's top-level keys come out on the output ports you declare in the source (`-> (user_id: String, text: String)`), exactly like an LLM call with Parse JSON on. Declare every field you read; there is no port for the whole body (a field that is itself an object is `-> (meta: JsonDict)`). A declared port named like a path capture reads the capture (`-> (id: String)` on `cards/{id}`). A port declared as a file kind (`photo: Image`) takes a picture the body carries as a `data:` URL or base64: it is stored on the way in and the stored-file value flows, never the bytes (a value on a wire is at most 100 KB). The whole request body is capped at 256 KB, and a `data:` URL inflates what it carries by about a third, so roughly 190 KB of picture: a caller sending more gets 413 before the run starts, and a page that takes photos resizes them before posting. Answer with a Reply, Stream or Close node downstream, or read the caller through the ctx in a custom node.",
+  "tags": [
+    "api",
+    "http",
+    "trigger",
+    "route",
+    "endpoint"
+  ],
+  "icon": "Globe",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "path",
+      "type": "String",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Path",
+      "description": "The route under the project's live URL: literal segments and `{name}` captures (`users/{id}`, `chat/{room}/messages`). Required, and never empty: a trigger with no address would answer at the project's own address, where every other one that forgot would answer too. Must not start with '/'. Two routes of one account may share a call when one spells out what the other captures (`cards/count` beside `cards/{id}`); a pair where neither is the more specific is refused at activation."
+    },
+    {
+      "name": "method",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "",
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "HEAD",
+          "OPTIONS"
+        ]
+      },
+      "label": "Method",
+      "description": "The HTTP method this route serves. Empty serves every method; a call with another method on a served path is answered 405 by the gateway."
+    },
+    {
+      "name": "dataType",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "json",
+          "text",
+          "bytes"
+        ]
+      },
+      "default": "json",
+      "label": "Body shape",
+      "description": "What the body is. `json`: the body parses as JSON and its top-level keys land on the ports you declare, one port per key you want; there is no port for the whole object, so a caller sending anything but an object (a bare list or string) is refused by name. `text`: the whole body is a String on the one port you declare. `bytes`: the whole body is stored as a file and its stored-file value lands on the one port you declare (declare it `File`, or the kind you expect: `Image` for an image upload, which is checked against the file's own bytes and refused if they are something else). The same shape applies to what Reply and Stream send back."
+    },
+    {
+      "name": "auth",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "description": "Who may call this route: wire an auth access node (ApiKeyAuth, JwtAuth, HmacAuth). Unwired, the route is open to anyone with the URL. With one wired, the gateway checks the caller before a run starts and the established identity comes out on `caller`."
+    },
+    {
+      "name": "outlivesCaller",
+      "type": "Boolean",
+      "label": "May outlive the caller",
+      "description": "Who owns the run, which decides what a caller leaving means. Off (default): the run is the caller's, so their leaving cancels it, and a node that hits a long durable wait holds the worker briefly and is then killed rather than parked. On: the run is its own, so the caller leaving does not touch it and a long wait parks properly and resumes later, making it a background job. Turn it on to answer early and keep working afterwards. Be deliberate about it: the caller leaving is what ends a tied run, so switching this on removes that ending and the work behind the answer must end by itself. Work that finishes on its own (a call, a query, a script) is fine; anything that watches, subscribes or loops until something changes is not, and then you say what ends it, with `maxSessionSecs` here or a TagRun and StopTagged pair in the graph."
+    },
+    {
+      "name": "defaultHoldSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Hold seconds before giving up on a wait",
+      "description": "For a caller-tied run: how long a node's wait holds the worker (keeping the connection alive) before giving up. Per-wait overrides win over this. Never unbounded."
+    },
+    {
+      "name": "maxSessionSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Give up on one connection after this long",
+      "description": "A hard ceiling on one whole connection, off by default and with no default on purpose: it ends the connection on the clock whatever the caller is doing, so it would cut a healthy live feed short. You rarely want it. A caller who vanishes is already found by `Call the caller gone after this much silence`, whatever the answer is framed as, and that ends the run when the run is the caller's. Reach for this only when it is not: with `May outlive the caller` on, the caller going away no longer ends anything, so a run that would otherwise never finish needs something of its own, and this is the bluntest version of that (stopping older runs by tag is usually the better one)."
+    },
+    {
+      "name": "callerSilenceSecs",
+      "type": "Number",
+      "default": 30,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Call the caller gone after this much silence",
+      "description": "How long the caller's machine may leave what the worker sent it unacknowledged before the connection is called dead, in seconds. This is NOT a ceiling on the call: a machine that is still there acknowledges every packet by itself, whatever the person is doing, so a caller who stays resets this constantly and a run that legitimately lasts hours is never touched. It bounds SILENCE, which is the only way to tell a caller who vanished (a closed laptop, a dropped network) from one who is simply quiet. Raise it for a client on a link that genuinely goes silent for longer, like a device that sleeps its radio between messages; lower it to notice a departure sooner. `0` leaves the machine's own default, which is about fifteen minutes."
+    },
+    {
+      "name": "journalEphemeral",
+      "type": "Boolean",
+      "label": "Keep the exchange out of the journal",
+      "description": "What the journal keeps of what was said. Off (default): the request and the answer are recorded, so the inspector replays the exchange and you can see what a caller actually sent. Anything over 100 KB is recorded trimmed, and raw bytes are never recorded whatever this says, so the journal holds what a person would read rather than a copy of the traffic. On: only the sizes and the count are kept, never the content. Turn it on for a route carrying something you would rather not have written down for every run, remembering that you are also giving up seeing it when you debug."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "method",
+      "type": "String",
+      "description": "The HTTP method the caller used."
+    },
+    {
+      "name": "path",
+      "type": "String",
+      "description": "The path as called under the project (no leading slash), for example `users/42`."
+    },
+    {
+      "name": "params",
+      "type": "Dict[String, String]",
+      "description": "The `{name}` captures of the route's path, by name."
+    },
+    {
+      "name": "query",
+      "type": "Dict[String, String]",
+      "description": "The query string's parameters, by name."
+    },
+    {
+      "name": "headers",
+      "type": "Dict[String, String]",
+      "description": "The request headers, by lowercase name."
+    },
+    {
+      "name": "caller",
+      "type": "JsonDict | Null",
+      "description": "Who the auth gate established: a JWT's claims, `{\"key\": <index>}` for an API key, `{}` for an HMAC. Null when the route has no `auth`."
+    }
+  ],
+  "requires_infra": false,
+  "claimsRoute": {
+    "pathField": "path",
+    "methodField": "method"
+  },
+  "firesWith": {
+    "method": "String",
+    "path": "String",
+    "params?": "Dict[String, String]",
+    "query?": "Dict[String, String]",
+    "headers?": "List[List[String]]",
+    "caller?": "JsonDict",
+    "body?": "JsonDict | String"
+  },
+  "features": {
+    "isTrigger": true,
+    "canAddOutputPorts": true
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "path",
+        "regex": "^/"
+      },
+      "then": {
+        "message": "Route '{id}' path starts with '/'. The gateway prefixes the route automatically; drop the leading slash.",
+        "level": "structural",
+        "severity": "warning",
+        "field": "path"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "run_reaches",
+          "direction": "downstream",
+          "types": [
+            "Reply",
+            "Stream",
+            "Close"
+          ]
+        }
+      },
+      "then": {
+        "message": "Route '{id}' starts a run that never answers its caller: no Reply, Stream or Close is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in); a custom node answering through the ctx is the one case to ignore this.",
+        "level": "structural",
+        "severity": "warning"
+      }
+    }
+  ]
+}

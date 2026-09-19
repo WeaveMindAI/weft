@@ -130,7 +130,10 @@ impl Node for PostgresUpdateRowsNode {
         let mut params: Vec<Value> = where_params;
         params.extend(obj.values().cloned());
 
-        let rows = query_json(&client, &sql, &params).await?;
+        // No port names: the `$1` in a `where` here is the author's own
+        // position in `whereParams`, so rewriting it would replace the
+        // one numbering they DID write with something else.
+        let rows = query_json(&client, &sql, &[], &params).await?;
         let count = rows.len() as f64;
         ctx.pulse_downstream(NodeOutput::new().set("rows", json!(rows)).set("count", count))
             .await

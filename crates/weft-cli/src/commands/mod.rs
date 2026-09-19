@@ -26,6 +26,7 @@ pub mod parse;
 pub mod executions;
 pub mod status;
 pub mod test_node;
+pub mod tangle;
 pub mod token;
 pub mod connect;
 pub mod listener;
@@ -223,6 +224,46 @@ pub async fn resolve_color(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color: {resp}"))
+}
+
+/// The id the runtime keys a node by, from the way the PROGRAM spells
+/// it: `setup.store` for the node `store` inside the file the site
+/// `setup` includes. Outside a project the spelling is taken as the id.
+///
+/// Every command that takes a node from a person goes through here, and
+/// `spell_node` is the way back out, because the id itself is not
+/// something a person can be asked to type: a node inside an included
+/// file is keyed by the file's path (`@src:sweep.key`), which the
+/// language calls unspellable on purpose and names through the call
+/// site everywhere a person can see.
+pub fn node_id_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
+    let Ok(project) = ctx.project() else { return Ok(spelled.to_string()) };
+    let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
+    let (id, call_path) = weft_core::project::resolve_address(&definition, spelled);
+    anyhow::ensure!(
+        definition.nodes.iter().any(|n| n.id == id),
+        "'{spelled}' names no node in this program (a node inside an included file is named \
+         through its site, like `site.{}`)",
+        spelled.rsplit('.').next().unwrap_or(spelled)
+    );
+    // The compiler's own id for a node inside an included file carries
+    // the file's PATH (`@src:lib:clean.strip`). It resolves, because it
+    // IS the id, and taking it would teach a person a spelling the
+    // language calls unspellable and no other command accepts. Refuse
+    // it and name the one that works, the same way `weft events` does.
+    if call_path.is_empty() {
+        if let Some(node) = definition.nodes.iter().find(|n| n.id == id) {
+            if weft_core::project::selection::enclosing_body(&definition, node).is_some() {
+                anyhow::bail!(
+                    "'{spelled}' is inside an included file; name it through the site that \
+                     includes the file, like `site.{}`",
+                    weft_core::project::address_of(&definition, &id, &["site".into()])
+                        .trim_start_matches("site.")
+                );
+            }
+        }
+    }
+    Ok(id)
 }
 
 pub fn resolve_project_id(ctx: &Ctx, explicit: Option<String>) -> anyhow::Result<String> {

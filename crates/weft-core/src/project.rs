@@ -90,8 +90,15 @@ pub mod boundary_types {
     /// A boundary whose ports are selected one by one when a run is
     /// cut (`RunSelection`): a group's, a call site's and a body's. A
     /// loop is indivisible and goes in whole.
+    ///
+    /// The same set as [`is_forwarding`], and that is not a
+    /// coincidence: a boundary forwards its ports one for one exactly
+    /// when its ports can be taken one at a time. Written as one list
+    /// because two lists of one closed set drift the first time a
+    /// boundary kind is added and only one is edited. The two names
+    /// stay because the callers are asking different questions.
     pub fn is_port_selected(node_type: &str) -> bool {
-        matches!(node_type, PASSTHROUGH | CALL_IN | CALL_OUT | INCLUDE_IN | INCLUDE_OUT)
+        is_forwarding(node_type)
     }
 
     /// An In boundary that opens a new frame for its scope: a loop's
@@ -298,6 +305,14 @@ pub struct NodeDefinition {
     /// the dispatcher.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// What this TRIGGER wakes with: field name to weft type, mirrored
+    /// from NodeMetadata.fires_with at enrich time. Carried on the
+    /// definition so the engine can hold a firing to it without a
+    /// catalog lookup, and so `weft run --fire` can print the shape it
+    /// wanted from the compiled program alone. Empty on every node that
+    /// is not a trigger, and on a trigger that declares nothing.
+    #[serde(default, rename = "firesWith", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fires_with: std::collections::BTreeMap<String, String>,
     /// The recipe for the service this node publishes a connection to
     /// (`ctx.publish_access`), resolved from the catalog at enrich
     /// time from the node metadata's `publishes` name. Carried on the
@@ -360,6 +375,46 @@ pub struct NodeDefinition {
     /// that navigates into the file. Only present in interface-parse output.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "includePath")]
     pub include_path: Option<String>,
+    /// Set on an opaque `@include` interface node: what the file behind it
+    /// holds, reached through its own includes too. The body is not in the
+    /// graph in interface mode, so this is the only way the editor can tell
+    /// that a project's only trigger (or only infra node) lives inside an
+    /// include. Absent in full-mode output, where the real nodes are there
+    /// to be counted.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "includeContents")]
+    pub include_contents: Option<IncludedContents>,
+}
+
+/// What an opaque `@include` node stands for: the roles its file plays,
+/// and every file reached to find out. Carried on the include node rather
+/// than folded into `requires_infra` / `features.is_trigger`, because
+/// those two are per-node identities that drive real work (an infra node
+/// gets a provisioned slot and a live row, a trigger gets a mount URL),
+/// and the alias is neither of those things. It only contains them.
+///
+/// SYNC: IncludedContents <-> packages/weft-graph/src/protocol.ts IncludedContents
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IncludedContents {
+    /// Some node inside requires infrastructure, so the project needs its
+    /// infra up before it can run even though no visible node says so.
+    #[serde(default, rename = "requiresInfra", skip_serializing_if = "std::ops::Not::not")]
+    pub requires_infra: bool,
+    /// Some node inside is a trigger, so the project can be activated.
+    #[serde(default, rename = "hasTrigger", skip_serializing_if = "std::ops::Not::not")]
+    pub has_trigger: bool,
+    /// Every `.weft` file reached through this include, nested ones
+    /// included, each relative to the PROJECT ROOT. Root-relative and not
+    /// as-written, because an `@include` path is relative to the file that
+    /// wrote it: a nested one resolved against the top file's directory
+    /// would point at nothing. The editor watches these so editing a
+    /// deeply included file re-parses the graph that depends on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// The node types found inside, before the catalog was consulted.
+    /// The parser has no catalog, so it records the types and enrich
+    /// settles the two booleans above from them.
+    #[serde(default, rename = "nodeTypes", skip_serializing_if = "Vec::is_empty")]
+    pub node_types: Vec<String>,
 }
 
 /// Which directive wrote a file reference, and therefore its edit contract.
@@ -808,6 +863,17 @@ mod address_tests {
         })).unwrap()
     }
 
+    /// With no program at hand, an id reads as the file's own name
+    /// and the rest; a name somebody wrote stays as it is.
+    #[test]
+    fn a_compiled_id_reads_to_a_person_without_its_path() {
+        assert_eq!(plain_id("@src:lib:setup.store"), "setup.store");
+        assert_eq!(plain_id("@src:setup"), "setup");
+        assert_eq!(plain_id("@src:cards.rows.read"), "cards.rows.read");
+        assert_eq!(plain_id("outer.inner"), "outer.inner");
+        assert_eq!(plain_id("plain"), "plain");
+    }
+
     #[test]
     fn an_address_walks_the_call_sites_the_way_the_source_reads() {
         let p = program();
@@ -846,6 +912,25 @@ pub fn group_address(project: &ProjectDefinition, group_id: &str, call_path: &[S
         Some((site, above)) if selection::is_body(project, group_id) => address_of(project, site, above),
         _ => address_of(project, group_id, call_path),
     }
+}
+
+/// A compiled id as a person reads it, when no program is at hand to
+/// spell its address through a call site ([`address_of`] is the answer
+/// when one is). An id inside an included file carries the file's
+/// path (`@src:lib:setup.store`), unspellable on purpose; a person
+/// reads it as the file's own name and the rest (`setup.store`). Any
+/// other id is already a name somebody wrote and comes back as it is.
+///
+/// Every message the runtime writes for a person goes through this or
+/// through `address_of`: the id itself is internal, and it leaks the
+/// moment it is printed raw.
+pub fn plain_id(id: &str) -> String {
+    let Some(rest) = id.strip_prefix('@') else { return id.to_string() };
+    // The path stops at the first `.`: the file `@src:lib:setup`, then
+    // the node `.store` (or the nested group `.rows`).
+    let (path, tail) = rest.split_once('.').unwrap_or((rest, ""));
+    let file = path.rsplit(':').next().unwrap_or(path);
+    if tail.is_empty() { file.to_string() } else { format!("{file}.{tail}") }
 }
 
 /// The inverse of [`resolve_address`]: the way a person writes the node
@@ -1081,6 +1166,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra: false,
             images: vec![],
+            fires_with: Default::default(),
             published_service: None,
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
@@ -1090,6 +1176,7 @@ mod project_wire_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         };
         let group = GroupDefinition {
@@ -1176,6 +1263,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra,
             images: vec![],
+            fires_with: Default::default(),
             published_service: None,
             span: None,
             header_span: None,
@@ -1185,6 +1273,7 @@ mod project_wire_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            include_contents: None,
             source_file: None,
         }
     }

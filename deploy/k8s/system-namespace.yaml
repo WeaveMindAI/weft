@@ -20,7 +20,8 @@ spec:
     - Egress
 ---
 # Dispatcher ingress. Allowed sources:
-#   - public ingress controller (CLI / extension / external webhooks)
+#   - public ingress controller (external webhooks, storage links)
+#   - the operator's machine through the mapped node port (CLI / editor)
 #   - intra-namespace (other dispatcher Pods, headless Service)
 # Tenant pods CANNOT reach the dispatcher: their NetworkPolicy denies
 # egress to weft-system.
@@ -40,6 +41,19 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 9999
+    # The operator's machine, arriving through the node port the kind
+    # config maps to its loopback (deploy/k8s/kind-node-ports.yaml).
+    # kube-proxy rewrites the destination to the pod before the policy
+    # engine sees the packet and the source only after, so the source
+    # it compares is the machine's address on the cluster network: the
+    # docker gateway /32 on kind. A real cluster maps no node port and
+    # gets a benign unused address here.
+    - from:
+        - ipBlock:
+            cidr: ${WEFT_NODE_PORT_SOURCE_CIDR}
       ports:
         - protocol: TCP
           port: 9999

@@ -28,14 +28,12 @@
     {
       "name": "name",
       "type": "String",
-      "required": false,
       "label": "Name",
       "description": "The Drive filename. Defaults to the stored file's name."
     },
     {
       "name": "folder",
       "type": "String",
-      "required": false,
       "label": "Folder id",
       "description": "The destination Drive folder's id (from its URL). Empty = My Drive root."
     }

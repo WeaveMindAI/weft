@@ -181,9 +181,35 @@ pub(crate) async fn record_trigger_run(state: &DispatcherState, color: Color) ->
     if state.versions.run(color).await?.is_some() { return Ok(()); }
     let rows = state.journal.events_log(color).await?;
     if let Some(run) = trigger_run_from_birth(color, &rows)? {
-        state.versions.insert_run(&run).await?;
+        if let Err(error) = state.versions.insert_run(&run).await {
+            return orphaned_run_is_recorded_nowhere(color, error);
+        }
     }
     Ok(())
+}
+
+/// A run whose tree is gone (its project removed, or its version pruned,
+/// between the birth reaching the journal and the bridge reading it) has
+/// nothing left to be recorded in, and its history stays readable in the
+/// journal. That is not a failure: the bridge retries a failed row until
+/// it passes, so treating it as one parked the bridge on that row for
+/// good, with every event of every project behind it, and every
+/// activation waiting on those events with it. Any other failure (the
+/// database) stays an error, so the bridge retries it as designed.
+fn orphaned_run_is_recorded_nowhere(color: Color, error: anyhow::Error) -> anyhow::Result<()> {
+    match error.downcast_ref::<crate::versions::VersionMissing>() {
+        Some(missing) => {
+            tracing::info!(
+                target: "weft_dispatcher::journal_bridge",
+                %color,
+                project = %missing.project,
+                version = %missing.version,
+                "a fire's tree row has nowhere to go (its project or version is gone); its journal stays, nothing to record"
+            );
+            Ok(())
+        }
+        None => Err(error),
+    }
 }
 
 fn trigger_run_from_birth(color: Color, rows: &[weft_journal::ExecEvent]) -> anyhow::Result<Option<RunRow>> {
@@ -597,13 +623,41 @@ pub async fn run(
     let bakes = if spec.fire.is_some() {
         state.journal.trigger_bakes(&project_id).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
+    // A fired CALLER trigger (a Route) gets a stand-in caller: there is
+    // no socket coming, so the run serves the body the author typed and
+    // the program's answer goes to the journal. Without it a route's
+    // program is unrunnable offline, because the trigger and every
+    // Reply behind it ask for a caller that is not there.
+    //
+    // The trigger's signal spec comes from its BAKE, the same capture
+    // the port snapshot below comes from, so the dispatcher needs no
+    // knowledge of what a Route is: whether this trigger speaks to a
+    // caller at all is `protocol_for_tag` on the signal kind, which is
+    // the language's own vocabulary.
+    let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
     for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
-        weft_core::run_spec::validate_fire_bake(&kick.node, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
+        // A bake captures a trigger under its address (`one.door` for the
+        // `door` an include site `one` reaches), so the kick's raw id is
+        // spelled back through its call frames before the lookup.
+        let call_path: Vec<String> = weft_core::frames::call_path(&kick.frames).into_iter().map(str::to_string).collect();
+        let address = weft_core::project::address_of(&project, &kick.node, &call_path);
+        weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
             .map_err(|refusal| refused(&refusal))?;
         let capture = bakes.iter().find(|bake| bake.program == program)
-            .and_then(|bake| bake.captured.get(&kick.node))
+            .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
         kick.port_snapshot = Some(capture.ports.clone());
+        if weft_core::signal::protocol_for_tag(&capture.spec.kind).is_some() {
+            let payload = spec
+                .fire
+                .as_ref()
+                .map(|(_, payload)| payload.clone())
+                .unwrap_or(serde_json::Value::Null);
+            fired_caller = Some(
+                stand_in_caller(&capture.spec, &payload, &address)
+                    .map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?,
+            );
+        }
     }
 
     // Infra pre-flight, scoped to what THIS run executes.
@@ -725,6 +779,7 @@ pub async fn run(
             seed.clone(),
             None,
             Some(&version.version),
+            fired_caller.clone(),
         )
         .await?;
         // Head moves LAST, and a lost race is reported, never refused.
@@ -779,6 +834,59 @@ pub async fn run(
         ran,
         warnings,
     }))
+}
+
+/// What a fired caller trigger serves: the request the author typed,
+/// standing in for the socket nobody opened.
+///
+/// The payload is what the trigger's `firesWith` declares and the run
+/// spec already held it to, so the request is read straight out of it.
+/// Fields this type has no place for are left alone rather than
+/// refused: they are the trigger's, declared by it, checked against its
+/// own contract, and the node reads them off its wake.
+///
+/// Every fired caller trigger gets a stand-in, whether or not the
+/// payload carries anything to say. The difference matters more than it
+/// looks: NO stand-in means the trigger itself fails, asking to be
+/// triggered through a Route, which is the node the author is already
+/// looking at.
+fn stand_in_caller(
+    spec: &weft_core::primitive::SignalSpec,
+    payload: &serde_json::Value,
+    address: &str,
+) -> Result<weft_task_store::kinds::LiveConnectionStart, String> {
+    // Refused HERE, at the command, rather than only in the worker that
+    // would serve it: the engine keeps its own floor, but by then the
+    // person has already waited for an execution to start just to be
+    // told the thing they asked for cannot happen.
+    if weft_core::signal::live_connection::protocol_for_tag(&spec.kind)
+        == Some(weft_core::signal::Protocol::Websocket)
+    {
+        return Err(format!(
+            "--fire {address}: a Socket cannot be fired. Its shape is a conversation over \
+             time, and there is nothing honest to invent for the caller's next message. \
+             Point a real client at it (`weft activate` prints the URL)"
+        ));
+    }
+    // The payload travels WHOLE. The request is read out of it, and
+    // whatever else the trigger declared (a `body`, for the triggers
+    // that can carry one) stays where the author put it and reaches the
+    // node as its wake. Nothing is lifted out on the way: a body cut out
+    // here and served back through the ordinary request call would mean
+    // this tier holding a caller trigger's field name to make the
+    // impersonation work.
+    let request: weft_core::caller::LiveRequest =
+        serde_json::from_value(payload.clone()).map_err(|e| {
+            format!(
+                "--fire {address}: this trigger answers a caller, so its payload is the \
+                 request to serve: {e}"
+            )
+        })?;
+    Ok(weft_task_store::kinds::LiveConnectionStart {
+        spec: spec.clone(),
+        request,
+        fired: Some(weft_task_store::kinds::FiredExchange {}),
+    })
 }
 
 fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, color: Color, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
@@ -887,6 +995,11 @@ pub struct RunSummary {
     pub status: String,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+    /// For a cancelled run, who or what stopped it (see
+    /// `ExecutionSummary::cancel_cause`).
+    pub cancel_cause: Option<weft_core::exec::CancelCause>,
+    /// Node firings the run skipped (see `ExecutionSummary::skipped_nodes`).
+    pub skipped_nodes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -936,9 +1049,9 @@ pub async fn tree(
         .map_err(|e| internal("execution summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
     for r in runs {
-        let (mut status, started_at, completed_at) = match summaries.get(&r.color) {
-            Some(s) => (s.status.clone(), s.started_at, s.completed_at),
-            None => ("unknown".to_string(), r.created_at, None),
+        let (mut status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.color) {
+            Some(s) => (s.status.clone(), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
+            None => ("unknown".to_string(), r.created_at, None, None, 0),
         };
         if status == "running" && suspended.contains(&r.color) {
             status = "waiting_for_input".to_string();
@@ -954,6 +1067,8 @@ pub async fn tree(
             status,
             started_at,
             completed_at,
+            cancel_cause,
+            skipped_nodes,
         });
     }
     Ok(Json(TreeResponse { head, versions: version_summaries, runs: run_summaries }))
@@ -1474,4 +1589,92 @@ mod fire_snapshot_tests {
         assert!(resolved.kicks.iter().any(|k| k.node == "tick" && k.firing));
     }
 
+}
+
+#[cfg(test)]
+mod orphaned_run_tests {
+    use super::orphaned_run_is_recorded_nowhere;
+    use crate::versions::VersionMissing;
+
+    /// A run whose version is gone is recorded nowhere and that is fine;
+    /// any other failure keeps the bridge retrying the row.
+    #[test]
+    fn only_a_missing_version_is_forgiven() {
+        let color = uuid::Uuid::new_v4();
+        let missing = VersionMissing { project: uuid::Uuid::new_v4(), version: "v7".into() };
+        orphaned_run_is_recorded_nowhere(color, missing.into()).expect("nothing to record in is not a failure");
+        let storage = anyhow::anyhow!("connection reset by peer");
+        let err = orphaned_run_is_recorded_nowhere(color, storage).expect_err("a storage failure retries");
+        assert!(err.to_string().contains("connection reset"));
+    }
+}
+
+#[cfg(test)]
+mod stand_in_caller_tests {
+    use super::stand_in_caller;
+    use serde_json::json;
+
+    fn route_spec() -> weft_core::primitive::SignalSpec {
+        serde_json::from_value(json!({ "kind": "route", "config": {} }))
+            .expect("a minimal signal spec")
+    }
+
+    /// A GET has no body, so the natural spelling of firing one has no
+    /// `body` key. That must still attach a caller: without one the
+    /// Route node itself fails, telling the author to trigger it
+    /// through a Route, which is the node they are already firing.
+    #[test]
+    fn a_get_with_no_body_still_gets_a_caller() {
+        let start = stand_in_caller(
+            &route_spec(),
+            &json!({ "method": "GET", "path": "cards" }),
+            "list.door",
+        )
+        .expect("a request with no body is a request");
+        assert_eq!(start.request.method, "GET");
+        assert!(start.fired.is_some(), "no body key is still a caller, never a missing one");
+    }
+
+    /// A socket is a conversation over time and there is nothing
+    /// honest to invent for the caller's next message, so firing one is
+    /// refused. At the command, not after an execution has started:
+    /// the worker keeps its own floor, but waiting for a run just to be
+    /// told no is a worse way to hear it.
+    #[test]
+    fn firing_a_socket_is_refused_at_the_command() {
+        let socket: weft_core::primitive::SignalSpec =
+            serde_json::from_value(json!({ "kind": "socket", "config": {} }))
+                .expect("a minimal signal spec");
+        let why = stand_in_caller(&socket, &json!({ "path": "chat" }), "chat.door")
+            .expect_err("a socket cannot be fired");
+        assert!(why.contains("Socket cannot be fired"), "{why}");
+        // And it says what to do instead, which is the whole point of
+        // refusing early.
+        assert!(why.contains("weft activate"), "{why}");
+    }
+
+    /// The request is READ from the payload, never carved out of it.
+    ///
+    /// A `body` the author typed is the trigger's own declared field:
+    /// it stays in the payload, reaches the node as its wake, and the
+    /// node reads it from there. Cutting it out here and feeding it
+    /// back through the ordinary request call would mean this tier
+    /// holding a caller trigger's field name.
+    #[test]
+    fn the_payload_is_read_not_carved_up() {
+        let payload = json!({ "method": "POST", "path": "hello", "body": { "name": "ada" } });
+        let start = stand_in_caller(&route_spec(), &payload, "hello").expect("a post with a body");
+        assert_eq!(start.request.path, "hello");
+        assert_eq!(start.request.method, "POST");
+        assert!(start.fired.is_some(), "a fired run has a stand-in");
+    }
+
+    /// A payload that is not a request at all is refused naming the
+    /// trigger, rather than starting a run that fails inside the node.
+    #[test]
+    fn a_payload_that_is_not_a_request_is_refused_by_name() {
+        let why = stand_in_caller(&route_spec(), &json!({ "method": 7 }), "list.door")
+            .expect_err("a method that is not a string is not a request");
+        assert!(why.contains("list.door") && why.contains("request to serve"), "{why}");
+    }
 }

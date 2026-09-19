@@ -233,11 +233,13 @@ output.data = preprocessor.result
 
     let pt_in = result.nodes.iter().find(|n| n.id == "preprocessor__in").expect("input passthrough");
     assert_eq!(pt_in.node_type, "Passthrough");
-    // The group's own port, plus `_should_flow`: a group is guarded on
-    // its In boundary, so guarding it takes everything inside with it.
+    // The group's own port, plus BOTH spellings of the gate: a group is
+    // guarded on its In boundary, so guarding it takes everything inside
+    // with it, and it can be guarded on an absence the same way a node
+    // can (the author uses one spelling; wiring both is a compile error).
     assert_eq!(
         pt_in.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-        vec!["raw", "_should_flow"]
+        vec!["raw", "_should_flow", "_should_not_flow"]
     );
 
     let pt_out = result.nodes.iter().find(|n| n.id == "preprocessor__out").expect("output passthrough");
@@ -2294,6 +2296,94 @@ c = @include("cleaner.weft")
     assert!(c.outputs.iter().any(|p| p.name == "cleaned"));
     // No body leaked into the parent graph.
     assert!(!project.nodes.iter().any(|n| n.id == "c.strip"));
+
+    // But WHAT is in the body is reported, because the editor decides
+    // from it whether the project can be activated or needs infra up.
+    let contents = c.include_contents.as_ref().expect("contents of the include");
+    assert_eq!(contents.node_types, vec!["Text".to_string()], "the body's node types");
+    assert_eq!(contents.files, vec!["cleaner.weft".to_string()], "the file itself");
+}
+
+/// An include whose file includes another file, and the trigger is in the
+/// DEEPEST one. Interface mode stops at the first file (its whole point is
+/// not loading bodies), so the walk that answers "has this project a
+/// trigger" has to go the rest of the way itself, and name every file it
+/// passed through so the editor can watch them.
+#[test]
+fn include_interface_reaches_through_nested_includes() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("lib")).unwrap();
+    // deep.weft holds the thing that matters; mid.weft only points at it.
+    std::fs::write(
+        dir.path().join("lib/deep.weft"),
+        "Group() -> (out: String) {\n  t = Cron { schedule: \"* * * * *\" }\n  self.out = t.value\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("lib/mid.weft"),
+        "Group() -> (out: String) {\n  d = @include(\"deep.weft\")\n  self.out = d.out\n}\n",
+    )
+    .unwrap();
+
+    let source = "m = @include(\"lib/mid.weft\")\n";
+    let project = compile_with_mode(
+        source,
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Interface,
+        None,
+    )
+    .expect("compile");
+    let m = project.nodes.iter().find(|n| n.id == "m").expect("opaque include node");
+    let contents = m.include_contents.as_ref().expect("contents of the include");
+    assert!(
+        contents.node_types.contains(&"Cron".to_string()),
+        "the deepest file's node type is reported: {:?}",
+        contents.node_types
+    );
+    // Root-relative, because a nested `@include` path is written relative
+    // to the file that wrote it ("deep.weft") and means nothing anywhere
+    // else.
+    assert_eq!(
+        contents.files,
+        vec!["lib/deep.weft".to_string(), "lib/mid.weft".to_string()],
+        "every file on the way, from the project root"
+    );
+}
+
+/// A file that includes itself, through a second file. The walk visits each
+/// file once instead of recursing until the stack ends.
+#[test]
+fn include_interface_contents_stop_at_a_cycle() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.weft"),
+        "Group() -> (out: String) {\n  b = @include(\"b.weft\")\n  self.out = b.out\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.weft"),
+        "Group() -> (out: String) {\n  a = @include(\"a.weft\")\n  self.out = a.out\n}\n",
+    )
+    .unwrap();
+
+    let project = compile_with_mode(
+        "x = @include(\"a.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Interface,
+        None,
+    )
+    .expect("interface mode renders the graph; the build is what refuses the cycle");
+    let x = project.nodes.iter().find(|n| n.id == "x").expect("opaque include node");
+    let contents = x.include_contents.as_ref().expect("contents of the include");
+    assert_eq!(
+        contents.files,
+        vec!["a.weft".to_string(), "b.weft".to_string()],
+        "each file once, and the walk terminated"
+    );
 }
 
 #[test]

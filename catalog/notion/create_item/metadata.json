@@ -37,7 +37,6 @@
     {
       "name": "source",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",

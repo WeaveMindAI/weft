@@ -284,7 +284,8 @@ fn rebuild_map(
     ))
 }
 
-fn base64_decode(payload: &str) -> Result<Vec<u8>, String> {
+/// Decode standard base64 (what a `data:` URL and a JSON body carry).
+pub fn base64_decode(payload: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(payload)

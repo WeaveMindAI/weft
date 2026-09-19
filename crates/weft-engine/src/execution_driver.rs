@@ -1667,7 +1667,6 @@ async fn drive(
                     completed_at: None,
                     cost_usd: 0.0,
                     logs: Vec::new(),
-                    port_warnings: Vec::new(),
                     mentioned_ports: Default::default(),
                     closed_output_ports: Default::default(),
                     color: group.color,
@@ -1890,6 +1889,12 @@ async fn drive(
                     .iter()
                     .map(|p| (p.name.clone(), p.port_type.clone()))
                     .collect();
+            let declared_inputs: std::collections::HashMap<String, weft_core::weft_type::WeftType> =
+                node_def
+                    .inputs
+                    .iter()
+                    .map(|p| (p.name.clone(), p.port_type.clone()))
+                    .collect();
             let wake_payload = kick_payloads.remove(&FiringLocation::new(node_id.clone(), group.frames.clone()));
             let mut runner = RunnerHandle::new(
                 exec_id.to_string(),
@@ -1906,11 +1911,29 @@ async fn drive(
                 waits.clone(),
                 bus_coordinator.clone(),
                 declared_outputs,
+                declared_inputs,
                 !generator_ports.is_empty(),
             )
             .with_awaited_sequence(sequence)
             .with_emit_channel(task_tx.clone())
             .with_caller_connection(caller.cloned());
+            // What a trigger wakes with is a declared contract
+            // (`firesWith` in its metadata), so a payload that does not
+            // match fails the firing HERE, naming the field, instead of
+            // somewhere inside the body where the author cannot see what
+            // was expected. Both ways a payload arrives are covered by
+            // the one check: a listener whose fields moved, and a
+            // hand-typed `weft run --fire`. Read before the payload is
+            // handed to the runner; acted on below, next to the other
+            // reason a firing cannot start, so there is one failure path.
+            let fire_payload_refusal = match (&wake_payload, node_def.features.is_trigger) {
+                (Some(payload), true)
+                    if matches!(phase, weft_core::context::Phase::Fire) =>
+                {
+                    weft_core::node::check_fire_payload(&node_def.fires_with, Some(payload)).err()
+                }
+                _ => None,
+            };
             let has_wake = wake_payload.is_some();
             if let Some(payload) = wake_payload {
                 runner = runner.with_wake_payload(payload);
@@ -1942,10 +1965,17 @@ async fn drive(
             // for this start was written from the delivered values
             // above, so it never carries one. A link that cannot be
             // minted fails the firing loudly, like a bag it cannot read.
-            if let Err(err) = ctx
+            // The two reasons a firing cannot start, down one path: the
+            // links its body would read cannot be minted, or the payload
+            // that woke it is not what the trigger declared.
+            let cannot_start = match ctx
                 .link_file_inputs(node_def.inputs.iter().map(|p| (p.name.as_str(), &p.port_type)))
                 .await
             {
+                Err(err) => Some(err.to_string()),
+                Ok(()) => fire_payload_refusal,
+            };
+            if let Some(err) = cannot_start {
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(
@@ -1955,7 +1985,7 @@ async fn drive(
                 }
                 let mentioned = std::collections::HashSet::new();
                 handle_node_failure(
-                    &node_id, &mentioned, group.color, &group.frames, &err.to_string(),
+                    &node_id, &mentioned, group.color, &group.frames, &err,
                     project, edge_idx, pulses, executions, journal, pod_name,
                 )
                 .await;
@@ -3679,7 +3709,7 @@ fn loc_of(node_id: &str, frames: &weft_core::frames::LoopFrames) -> FiringLocati
 /// The one user-facing sentence for "this consumer ended and the item
 /// can never be taken", shared by every path that says it.
 fn consumer_gone_reason(node_id: &str) -> String {
-    format!("the consumer '{node_id}' finished without taking this stream item")
+    format!("the consumer '{}' finished without taking this stream item", weft_core::project::plain_id(node_id))
 }
 
 fn set_pulse_status(
@@ -4118,7 +4148,7 @@ async fn apply_one_emission(
     // Drop them; a delivery wait on one fails loudly.
     if firing_already_terminal(executions, &msg.loc.node_id, color, &msg.loc.frames) {
         if let Some(gate) = &delivery {
-            gate.fail(format!("the firing of '{}' already failed", msg.loc.node_id));
+            gate.fail(format!("the firing of '{}' already failed", weft_core::project::plain_id(&msg.loc.node_id)));
         }
         return;
     }
@@ -4196,11 +4226,10 @@ async fn apply_one_emission(
                 }
             }
         }
-        crate::context::EmitKind::Close { port: port_name, refused } => {
+        crate::context::EmitKind::Close { port: port_name } => {
             // Same failure routing as the Values arm above: a
             // `close_port` on an undeclared port is a wiring bug and
             // fails the firing loud (nothing was committed).
-            let failure = refused.as_ref().map(weft_core::exec::PortWarning::message);
             if let Err(err) = weft_core::exec::postprocess::emit_port_closure(
                 &msg.loc.node_id,
                 &port_name,
@@ -4211,7 +4240,7 @@ async fn apply_one_emission(
                 pulses,
                 edge_idx,
                 &mut emissions,
-                failure.as_deref(),
+                None,
             ) {
                 refuse_emission(
                     &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, color, project,
@@ -4220,19 +4249,9 @@ async fn apply_one_emission(
                 .await;
                 return;
             }
-            // A refused value is the record's warning too, live as on
-            // the fold: the node did NOT fail, one port's value was
-            // dropped.
-            if let Some(warning) = &refused {
-                if let Some(rec) =
-                    latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
-                {
-                    rec.port_warnings.push(warning.clone());
-                }
-            }
             ship_port_closed(
                 journal, pod_name, color, emission_id, &msg.loc.node_id, &msg.loc.frames,
-                &port_name, refused.as_ref(),
+                &port_name,
             )
             .await;
             latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
@@ -4492,7 +4511,7 @@ async fn terminate(
     match completion {
         Some(false) => Ok(ExecutionOutcome::Completed),
         Some(true) => Ok(ExecutionOutcome::Failed {
-            error: first_failure(executions).unwrap_or_else(|| "execution failed".into()),
+            error: first_failure(project, executions).unwrap_or_else(|| "execution failed".into()),
         }),
         None => {
             if has_waiting {
@@ -4525,16 +4544,21 @@ fn waiting_count(executions: &NodeExecutionTable) -> usize {
 /// tie-break). The table is a HashMap, so a plain "first hit wins"
 /// scan would report a different failure run-to-run; the earliest one
 /// is the root cause the user should see.
-fn first_failure(executions: &NodeExecutionTable) -> Option<String> {
+/// The run's failure reason: the first node that failed, named the way
+/// the source spells it (`cards.answer` for the `answer` inside the
+/// file the site `cards` includes, never its compiled id), and why.
+fn first_failure(project: &ProjectDefinition, executions: &NodeExecutionTable) -> Option<String> {
     executions
         .values()
         .flat_map(|v| v.iter())
         .filter(|e| e.status == NodeExecutionStatus::Failed)
         .min_by_key(|e| (e.completed_at.unwrap_or(u64::MAX), e.node_id.clone()))
         .map(|e| {
+            let call_path: Vec<String> =
+                weft_core::frames::call_path(&e.frames).into_iter().map(str::to_string).collect();
             format!(
                 "{}: {}",
-                e.node_id,
+                weft_core::project::address_of(project, &e.node_id, &call_path),
                 e.error.clone().unwrap_or_else(|| "failed".into())
             )
         })
@@ -4575,6 +4599,11 @@ fn mark_skipped(
     if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
         e.status = NodeExecutionStatus::Skipped;
         e.completed_at = Some(now_unix());
+        // A skip is the firing's whole outcome: the body never ran, so
+        // a port's refusal found at readiness is not a fact about it.
+        // The `NodeSkipped` row carries no error, and the fold reads
+        // none; the live record says the same.
+        e.error = None;
     }
 }
 
@@ -4789,6 +4818,17 @@ mod bus_comm_tests;
 #[cfg(test)]
 #[path = "execution_driver_tests/branching.rs"]
 mod branching_tests;
+
+// Layer 3: a wire carries values, never bytes; an oversize emission
+// fails its node.
+#[cfg(test)]
+#[path = "execution_driver_tests/wire_values.rs"]
+mod wire_values_tests;
+
+// Layer 1: a run's failure reason spells the failed node's address.
+#[cfg(test)]
+#[path = "execution_driver_tests/failure_naming.rs"]
+mod failure_naming_tests;
 
 // Layer 3: a seeded run inherits its seed's rows through the real
 // loop, re-runs only what is stale, and a scoped run fires from a

@@ -887,10 +887,16 @@ pub struct SupervisorClaimCommandResponse {
 
 /// Default cap on a `RunningPolicy::Wait` drain before the lifecycle
 /// op proceeds anyway (with a loud warning). A parameter everywhere it
-/// applies (the supervisor's stop/terminate drain, the dispatcher's
-/// worker-replacement drain); this is only the default when the
-/// request doesn't say. The trigger-side deactivate wait is NOT capped
-/// (the Deactivating state is unbounded, legible, and cancellable).
+/// applies, and this is only what it means when the request does not
+/// say: the supervisor's stop/terminate drain, the dispatcher's
+/// worker-replacement drain, and the trigger-side deactivate wait
+/// (`DeactivateSpec::drain_timeout_secs`, reachable as
+/// `--drain-timeout` and as the graph picker's "wait at most" box).
+///
+/// A cap rather than an open-ended wait because the person doing this
+/// is answering "how long am I willing to hold", and past it the
+/// remaining executions are cancelled and the op lands, so a
+/// deactivate is never stuck behind one long run nobody is watching.
 // SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> packages/weft-graph/src/protocol.ts DEFAULT_DRAIN_TIMEOUT_SECS
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 600;
 
@@ -1404,6 +1410,24 @@ impl DeactivateSpec {
         }
         Ok(())
     }
+
+    /// Whether this deactivation waits for the running executions
+    /// before it lands, which ends by cancelling whatever is still
+    /// running at the cap.
+    ///
+    /// The policy decides this and the mode has no say: they are two
+    /// separate questions. The mode is about the SUSPENDED fires and
+    /// the door (drop them, keep them hidden, keep them and stay
+    /// visible); the policy is about what is RUNNING right now. A
+    /// person picking `wait` is answering the second question, so
+    /// `wait` waits under park exactly as it does under hibernate.
+    ///
+    /// `wipe` never gets here: [`Self::validate`] refuses it with
+    /// `wait` up front, so the only combinations that reach this are
+    /// the ones where waiting means something.
+    pub fn drains(&self) -> bool {
+        self.running_policy == RunningPolicy::Wait
+    }
 }
 
 wire_enum! {
@@ -1643,20 +1667,21 @@ wire_enum! {
 
 wire_enum! {
     /// Authentication scheme attached to a signal. `None` means
-    /// any caller with the URL can fire; `ApiKey` requires a
-    /// matching key in the request (config in `auth_config`).
+    /// any caller with the URL can fire; `Connection` verifies the
+    /// caller against a stored connection (`auth_config` names it).
     pub enum SignalAuthKind {
         None = "none",
-        ApiKey = "api_key",
+        Connection = "connection",
     }
 }
 
 impl SignalRowWire {
     /// Reassemble the typed `SignalRouting` from this wire row's
     /// flat columns. The wire stores `surface_kind` as a tag and
-    /// keeps the `PublicEntry` path in `mount_path`; the typed
-    /// `SignalSurface::PublicEntry { path }` packs them together.
-    /// One adapter, one source of truth for the projection.
+    /// keeps the `PublicEntry` pattern in `mount_path` and its
+    /// methods in `mount_methods`; the typed
+    /// `SignalSurface::PublicEntry { path, methods }` packs them
+    /// together. One adapter, one source of truth for the projection.
     ///
     /// Returns Err if the row violates a documented invariant
     /// (`PublicEntry` with `mount_path = NULL`). The signal schema
@@ -1667,6 +1692,7 @@ impl SignalRowWire {
         routing_from_columns(
             self.surface_kind,
             self.mount_path.as_deref(),
+            &self.mount_methods,
             self.auth_kind,
             self.auth_config.clone(),
         )
@@ -1680,6 +1706,7 @@ impl SignalRowWire {
 pub fn routing_from_columns(
     surface_kind: SignalSurfaceKind,
     mount_path: Option<&str>,
+    mount_methods: &[String],
     auth_kind: SignalAuthKind,
     auth_config: Option<Value>,
 ) -> Result<weft_core::primitive::SignalRouting, &'static str> {
@@ -1690,14 +1717,14 @@ pub fn routing_from_columns(
             // Stored mount_path has a leading `/`; the surface
             // field doesn't carry it.
             let path = raw.strip_prefix('/').unwrap_or(raw).to_string();
-            SignalSurface::PublicEntry { path }
+            SignalSurface::PublicEntry { path, methods: mount_methods.to_vec() }
         }
         SignalSurfaceKind::TaskCallback => SignalSurface::TaskCallback,
         SignalSurfaceKind::Internal => SignalSurface::Internal,
     };
     let auth = match auth_kind {
         SignalAuthKind::None => SignalAuth::None,
-        SignalAuthKind::ApiKey => SignalAuth::ApiKey,
+        SignalAuthKind::Connection => SignalAuth::Connection,
     };
     Ok(SignalRouting { surface, auth, auth_config: auth_config.unwrap_or(Value::Null) })
 }
@@ -1719,6 +1746,11 @@ pub struct SignalRowWire {
     pub color: Option<String>,
     pub surface_kind: SignalSurfaceKind,
     pub mount_path: Option<String>,
+    /// The HTTP methods a `PublicEntry` serves, uppercase; empty = any
+    /// (the `signal.mount_methods` column, `'{}'` for every other
+    /// surface).
+    #[serde(default)]
+    pub mount_methods: Vec<String>,
     pub auth_kind: SignalAuthKind,
     pub auth_config: Option<Value>,
     /// Opaque per-kind state. `{}` for kinds that don't persist
@@ -1796,6 +1828,38 @@ pub struct SubscriptionEnsureResponse {
 pub struct SubscriptionDropRequest {
     pub tenant: String,
     pub signal_token: String,
+}
+
+/// One caller of a live route, as the dispatcher forwards it to the
+/// broker to check against the connection the route is gated by. The
+/// broker holds the connection (its `verify` recipe and its stored
+/// material); the dispatcher never sees a secret. The body is base64
+/// (an HMAC scheme signs the exact bytes); a scheme that does not read
+/// it is handed an empty one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerVerifyRequest {
+    pub tenant: String,
+    pub access_id: String,
+    pub service: String,
+    pub method: String,
+    /// The path as called under the project (no tenant, no leading
+    /// slash).
+    pub path: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub query: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_b64: String,
+}
+
+/// The broker's yes on a caller: the identity the scheme established
+/// (a JWT's claims, `{"key": i}` for a shared key, `{}` for an HMAC),
+/// which rides the request as its `caller`. A no is the door's `401`,
+/// flat, with the reason in the broker's log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerVerified {
+    pub identity: Value,
 }
 
 /// One raw push, as the dispatcher forwards it to the broker: the
@@ -2104,7 +2168,7 @@ mod supervisor_protocol_tests {
         let req = ResolveConnectionRequest {
             color: "c1".into(),
             node_id: "ask".into(),
-            frames: vec![weft_core::LoopIteration { index: 3 }],
+            frames: vec![weft_core::frames::Frame::Loop { index: 3 }],
             node_type: "openrouter.inference".into(),
             connection_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "openrouter".into(),
@@ -2131,7 +2195,7 @@ mod supervisor_protocol_tests {
             })
         );
         let back: ResolveConnectionRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 3 }]);
+        assert_eq!(back.frames, vec![weft_core::frames::Frame::Loop { index: 3 }]);
         assert_eq!(back.service, "openrouter");
         assert_eq!(back.expected_duration_secs, 120);
     }
@@ -2452,6 +2516,7 @@ mod supervisor_protocol_tests {
             color: None,
             surface_kind,
             mount_path: mount_path.map(|s| s.to_string()),
+            mount_methods: Vec::new(),
             auth_kind,
             auth_config,
             kind_state: Value::Null,
@@ -2471,10 +2536,34 @@ mod supervisor_protocol_tests {
         .to_routing()
         .unwrap();
         match r.surface {
-            SignalSurface::PublicEntry { path } => assert_eq!(path, "hooks/x"),
+            SignalSurface::PublicEntry { path, methods } => {
+                assert_eq!(path, "hooks/x");
+                assert!(methods.is_empty());
+            }
             _ => panic!("expected PublicEntry"),
         }
         assert!(matches!(r.auth, SignalAuth::None));
+    }
+
+    #[test]
+    fn to_routing_public_entry_carries_its_methods() {
+        use weft_core::primitive::SignalSurface;
+        let mut row = make_row(SignalSurfaceKind::PublicEntry, Some("/t/chat/{room}"), SignalAuthKind::None, None);
+        row.mount_methods = vec!["POST".into()];
+        let r = row.to_routing().unwrap();
+        match r.surface {
+            SignalSurface::PublicEntry { path, methods } => {
+                assert_eq!(path, "t/chat/{room}");
+                assert_eq!(methods, vec!["POST".to_string()]);
+            }
+            _ => panic!("expected PublicEntry"),
+        }
+        // A row from before the column existed decodes with no methods.
+        let v = serde_json::to_value(&row).unwrap();
+        let mut bare = v.clone();
+        bare.as_object_mut().unwrap().remove("mount_methods");
+        let back: SignalRowWire = serde_json::from_value(bare).unwrap();
+        assert!(back.mount_methods.is_empty());
     }
 
     #[test]
@@ -2489,7 +2578,7 @@ mod supervisor_protocol_tests {
         .to_routing()
         .unwrap();
         match r.surface {
-            SignalSurface::PublicEntry { path } => assert_eq!(path, ""),
+            SignalSurface::PublicEntry { path, .. } => assert_eq!(path, ""),
             _ => panic!(),
         }
     }
@@ -2739,19 +2828,79 @@ mod supervisor_protocol_tests {
     }
 
     #[test]
-    fn to_routing_api_key_passes_config_through() {
+    fn to_routing_connection_auth_passes_config_through() {
         use weft_core::primitive::SignalAuth;
-        let cfg = json!({"header_name": "x-api-key", "value_hash": "abc"});
+        let cfg = json!({"access_id": "acc-1", "service": "api_key_auth"});
         let r = make_row(
             SignalSurfaceKind::PublicEntry,
             Some("/x"),
-            SignalAuthKind::ApiKey,
+            SignalAuthKind::Connection,
             Some(cfg.clone()),
         )
         .to_routing()
         .unwrap();
-        assert!(matches!(r.auth, SignalAuth::ApiKey));
+        assert!(matches!(r.auth, SignalAuth::Connection));
         assert_eq!(r.auth_config, cfg);
+    }
+
+    #[test]
+    fn caller_verify_wire_round_trips() {
+        let req = CallerVerifyRequest {
+            tenant: "alice".into(),
+            access_id: "acc-1".into(),
+            service: "hmac_auth".into(),
+            method: "POST".into(),
+            path: "chat/room7".into(),
+            headers: [("x-signature".to_string(), "abc".to_string())].into_iter().collect(),
+            query: [("v".to_string(), "1".to_string())].into_iter().collect(),
+            body_b64: "e30=".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "tenant": "alice", "access_id": "acc-1", "service": "hmac_auth",
+                "method": "POST", "path": "chat/room7",
+                "headers": { "x-signature": "abc" }, "query": { "v": "1" },
+                "body_b64": "e30="
+            })
+        );
+        let back: CallerVerifyRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.path, "chat/room7");
+        let bare: CallerVerifyRequest = serde_json::from_value(json!({
+            "tenant": "t", "access_id": "a", "service": "s", "method": "GET", "path": ""
+        }))
+        .unwrap();
+        assert!(bare.headers.is_empty() && bare.query.is_empty() && bare.body_b64.is_empty());
+
+        let ok = CallerVerified { identity: json!({ "key": 2 }) };
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v, json!({ "identity": { "key": 2 } }));
+        let back: CallerVerified = serde_json::from_value(v).unwrap();
+        assert_eq!(back.identity["key"], 2);
+    }
+
+    /// The policy decides the wait and the mode has no say. They
+    /// answer two separate questions: the mode is about the
+    /// suspended fires and the door, the policy is about what is
+    /// running right now. So `wait` waits under park exactly as it
+    /// does under hibernate, and `cancel` never waits under either.
+    ///
+    /// `wipe` is the one pair that is refused rather than answered,
+    /// because a wipe drops the suspended fires outright and there is
+    /// nothing coherent for a wait to mean beside it.
+    #[test]
+    fn the_policy_decides_the_wait_whatever_the_mode() {
+        let spec = |mode, running_policy| DeactivateSpec {
+            mode, grace_minutes: 15, running_policy, drain_timeout_secs: None,
+        };
+        for mode in [DeactivationMode::Hibernate, DeactivationMode::Park] {
+            assert!(spec(mode, RunningPolicy::Wait).drains(), "{mode:?} + wait waits");
+            assert!(!spec(mode, RunningPolicy::Cancel).drains(), "{mode:?} + cancel does not");
+            assert!(spec(mode, RunningPolicy::Wait).validate().is_ok(), "{mode:?} + wait is legal");
+        }
+        assert!(!spec(DeactivationMode::Wipe, RunningPolicy::Cancel).drains());
+        assert!(spec(DeactivationMode::Wipe, RunningPolicy::Wait).validate().is_err());
     }
 }
 

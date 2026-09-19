@@ -1,0 +1,9 @@
+# Answers the run it is gated into. The include has no ports at all: the
+# only thing reaching it is the `_should_flow` wire from the route.
+Group() {
+  body = ExecPython() -> (body: JsonDict) {
+    code: "return {'body': {'where': 'include'}}"
+  }
+  answer = Reply
+  answer.body = body.body
+}

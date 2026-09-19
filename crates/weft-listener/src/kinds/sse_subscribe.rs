@@ -4,10 +4,8 @@
 //! enqueues a `FireSignal` task via the broker for every matching
 //! event. Reconnects with exponential backoff up to 60s on failures.
 
-use std::sync::Arc;
 
 use anyhow::Result;
-use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -32,12 +30,7 @@ impl KindHandler for SseSubscribeHandler {
         SseSubscribe::TAG
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::Internal,
             auth: SignalAuth::None,

@@ -549,3 +549,48 @@ async fn activation_pins_a_version_in_the_tree() -> anyhow::Result<()> {
 
     project.finish().await
 }
+
+/// Removing a project frees the space its history took.
+///
+/// What a person means by removing a project is that it is gone: the
+/// project, its version tree, and every run it ever did, so the
+/// storage comes back. What survives is the copy of the files on their
+/// own machine, which removal never touches.
+///
+/// The half this pins is the runs. Before, removal took the project
+/// row and the version tree and left every execution's journal behind,
+/// reachable by nothing and freeing nothing, which is the worst of
+/// both: gone from view, still on disk.
+#[tokio::test]
+async fn removing_a_project_takes_its_runs_with_it() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("version_tree", disp.clone()).await?;
+
+    let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
+    project.mark_registered();
+    let color = color_of(&stdout)?;
+    SettledRun::observe(project.dispatcher(), color).await?.completed()?;
+
+    // The run is there to be lost: a test that asserted absence
+    // without this would pass against a run that never happened.
+    let before = weft_e2e::run::status_of(&disp, color).await?;
+    anyhow::ensure!(before == "completed", "the run finished before the removal: {before}");
+
+    project.remove().await?;
+
+    // The run's journal is gone, not merely hidden: nothing answers
+    // for that color any more.
+    let after = weft_e2e::run::status_of(&disp, color).await;
+    anyhow::ensure!(
+        after.is_err(),
+        "the run outlived its project and is still holding its space: {after:?}"
+    );
+
+    // The files on disk are the user's, and removal is not about them.
+    anyhow::ensure!(
+        project.has_file("src/main.weft"),
+        "removing a project must not touch the copy on the person's machine"
+    );
+
+    project.finish().await
+}

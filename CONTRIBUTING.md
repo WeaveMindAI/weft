@@ -192,6 +192,11 @@ For why the code is shaped this way, including the no-fallbacks rule, naming by
 contract, and the prose header every file opens with, go and read
 [Design principles](https://weavemindai.github.io/weft/thinking/design-principles.html).
 
+Before building a feature, go and read
+[the three fronts](https://weavemindai.github.io/weft/thinking/how-we-decide.html):
+the levers, the defaults, and what the compiler refuses. A feature
+that answers two of the three is half built.
+
 **No em dashes**, in code and comments as much as in prose. You can go check
 [why we hunt em dashes](https://weavemindai.github.io/weft/thinking/em-dashes.html).
 

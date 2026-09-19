@@ -33,6 +33,7 @@
 		headerBadge,
 		onReadonlyEdit,
 		onClear,
+		noticeOf,
 	}: {
 		fields: FieldDefinition[];
 		config: Record<string, unknown>;
@@ -88,6 +89,12 @@
 		/// enables; text controls clear themselves by being emptied and
 		/// never show it.
 		onClear?: (key: string) => void;
+		/// Per-key notice that REPLACES the control: when it returns text
+		/// for a key, the strip renders that text as an error block where
+		/// the control would be, and nothing is editable. Used for a
+		/// file-backed field whose file could not be read: the failure is
+		/// shown as a failure, never as content in an editor.
+		noticeOf?: (key: string) => string | undefined;
 	} = $props();
 
 	/// Keydown handler for readonly text controls: an editing keystroke
@@ -240,7 +247,12 @@
 				</div>
 			</div>
 
-			{#if field.type === 'textarea'}
+			{#if noticeOf?.(field.key) !== undefined}
+				<div
+					role="alert"
+					class="text-[10px] px-2 py-1.5 rounded border border-rose-200 bg-rose-50 text-rose-700 font-mono whitespace-pre-wrap break-all nodrag nopan"
+				>{noticeOf(field.key)}</div>
+			{:else if field.type === 'textarea'}
 				<textarea
 					id={domId(field)}
 					readonly={ro}

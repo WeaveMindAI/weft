@@ -123,6 +123,8 @@ impl MockJournal {
         })?;
         let mut status = "running".to_string();
         let mut completed_at = None;
+        let mut cancel_cause = None;
+        let mut skipped_nodes = 0u64;
         for tail in g.events.iter().filter(|e| e.color() == color) {
             match tail {
                 ExecEvent::ExecutionCompleted { at_unix, .. } => {
@@ -133,10 +135,12 @@ impl MockJournal {
                     status = "failed".into();
                     completed_at = Some(*at_unix);
                 }
-                ExecEvent::ExecutionCancelled { at_unix, .. } => {
+                ExecEvent::ExecutionCancelled { at_unix, cause, .. } => {
                     status = "cancelled".into();
                     completed_at = Some(*at_unix);
+                    cancel_cause = cause.clone();
                 }
+                ExecEvent::NodeSkipped { .. } => skipped_nodes += 1,
                 _ => {}
             }
         }
@@ -148,7 +152,7 @@ impl MockJournal {
             .collect();
         tagged.sort();
         let tags = tagged.into_iter().map(|(_, tag)| tag).collect();
-        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags })
+        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, skipped_nodes })
     }
 
     /// Every execution summary owned by `tenant` (unordered). Tenant ownership
@@ -363,32 +367,6 @@ impl Journal for MockJournal {
         Ok(weft_task_store::tasks::LiveAdmitOutcome::Admitted(pod))
     }
 
-    async fn cancel_never_claimed_execution(
-        &self,
-        color: Color,
-        _program: Option<&weft_core::ProjectDefinition>,
-        cause: &weft_core::exec::CancelCause,
-    ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
-        // Dumb: the mock has no 'claimed' state, so the outcome is always
-        // NoWorkerWillRun: drop the recorded task and append the terminal
-        // (idempotent, exactly like the real dedup'd write).
-        let mut g = self.inner.lock().unwrap();
-        let color_str = color.to_string();
-        g.tasks.retain(|t| t.color.as_deref() != Some(color_str.as_str()));
-        let has_terminal = g.events.iter().any(|e| {
-            e.color() == color && e.is_execution_terminal()
-        });
-        if !has_terminal {
-            g.events.push(ExecEvent::ExecutionCancelled {
-                color,
-                reason: cause.to_string(),
-                cause: Some(cause.clone()),
-                at_unix: 0,
-            });
-        }
-        Ok(weft_task_store::tasks::SetupFailureOutcome::NoWorkerWillRun)
-    }
-
     async fn cancel_execution(
         &self,
         color: Color,
@@ -412,7 +390,7 @@ impl Journal for MockJournal {
                 e.color() == color && e.is_execution_terminal()
             });
             if !has_terminal {
-                // Same fidelity as `cancel_never_claimed_execution`: the
+                // Same fidelity as the real cancel: the
                 // terminal row, no per-node rows (the mock folds no nodes).
                 g.events.push(ExecEvent::ExecutionCancelled {
                     color,
@@ -581,6 +559,8 @@ impl Journal for MockJournal {
             .filter(|s| query.started_after.is_none_or(|a| s.started_at >= a))
             .filter(|s| query.started_before.is_none_or(|b| s.started_at < b))
             .filter(|s| query.phase.is_none_or(|p| s.phase == p))
+            .filter(|s| query.entry_node.as_deref().is_none_or(|n| s.entry_node == n))
+            .filter(|s| query.status.as_deref().is_none_or(|st| s.status == st))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.color.cmp(&a.color)));
         let total = all.len() as u64;
@@ -667,6 +647,19 @@ impl Journal for MockJournal {
                 out.push(*color);
             }
         }
+        // Oldest first, like Postgres orders on `started_at_unix`: the
+        // editor reads the last one as "the latest run", so a mock that
+        // answered in map order would let a test pass against an order
+        // production never gives.
+        out.sort_by_key(|color| {
+            let started = g
+                .events
+                .iter()
+                .find(|e| e.color() == *color)
+                .map(|e| e.at_unix())
+                .unwrap_or(0);
+            (started, color.to_string())
+        });
         Ok(out)
     }
 
@@ -703,6 +696,34 @@ impl Journal for MockJournal {
         g.execution_colors.remove(&color);
         g.execution_tags.retain(|(c, _), _| *c != color);
         Ok(())
+    }
+
+    async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64> {
+        // Mirrors Postgres: the project's colors come from the index,
+        // then each one's whole footprint goes. A mock that erased less
+        // than the real store would let a leak of whatever it skipped
+        // pass every test here.
+        let colors: Vec<Color> = {
+            let g = self.inner.lock().unwrap();
+            g.execution_colors
+                .iter()
+                .filter(|(_, row)| row.project_id == project_id)
+                .map(|(color, _)| *color)
+                .collect()
+        };
+        for color in &colors {
+            self.delete_execution(*color).await?;
+        }
+        Ok(colors.len() as u64)
+    }
+
+    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<String>> {
+        // The mock has no project table, so it cannot know which
+        // project rows are gone. Answering "none" is honest here and
+        // safe: it under-reports, so a test can never see a sweep the
+        // real one would not do. Anything that turns on this predicate
+        // belongs in a database test.
+        Ok(Vec::new())
     }
 
     async fn live_tagged_executions(
@@ -907,6 +928,7 @@ mod tests {
             consumer_payload: None,
             surface_kind: "public_entry".into(),
             mount_path: None,
+            mount_methods: Vec::new(),
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
@@ -1243,6 +1265,79 @@ mod tests {
         let paget2 = j.list_executions("t2", &qt2).await.unwrap();
         assert_eq!(paget2.total, 1);
         assert_eq!(paget2.executions[0].color, x1);
+    }
+
+    /// The filter that answers "where is MY run": in a project whose
+    /// triggers are all answering at once, the entry node is the only
+    /// thing that tells one run from the thousands beside it.
+    #[tokio::test]
+    async fn list_executions_filters_by_entry_node() {
+        let j = MockJournal::new();
+        j.set_project_tenant("p", "t");
+        let mine = weft_core::Color::new_v4();
+        let noise = weft_core::Color::new_v4();
+        let mut start = started_at(mine, "p", 10);
+        if let ExecEvent::ExecutionStarted { entry_node, .. } = &mut start {
+            *entry_node = "cards.post".into();
+        }
+        j.record_event(&start).await.unwrap();
+        j.record_event(&started_at(noise, "p", 20)).await.unwrap();
+
+        let q = ExecutionQuery {
+            limit: 50,
+            entry_node: Some("cards.post".into()),
+            ..Default::default()
+        };
+        let page = j.list_executions("t", &q).await.unwrap();
+        assert_eq!(page.total, 1, "the count matches the filter, not the whole history");
+        assert_eq!(page.executions[0].color, mine);
+
+        // A node nothing started by is an empty answer, never everything.
+        let none = ExecutionQuery {
+            limit: 50,
+            entry_node: Some("nobody".into()),
+            ..Default::default()
+        };
+        assert_eq!(j.list_executions("t", &none).await.unwrap().total, 0);
+    }
+
+    /// "Which of mine broke": a run's status is which terminal event it
+    /// ended on, and `running` is the absence of one, so the filter has
+    /// to answer both shapes.
+    #[tokio::test]
+    async fn list_executions_filters_by_status() {
+        let j = MockJournal::new();
+        j.set_project_tenant("p", "t");
+        let broke = weft_core::Color::new_v4();
+        let fine = weft_core::Color::new_v4();
+        let going = weft_core::Color::new_v4();
+        j.record_event(&started_at(broke, "p", 10)).await.unwrap();
+        j.record_event(&ExecEvent::ExecutionFailed {
+            color: broke,
+            error: "boom".into(),
+            at_unix: 11,
+        })
+        .await
+        .unwrap();
+        j.record_event(&started_at(fine, "p", 20)).await.unwrap();
+        j.record_event(&ExecEvent::ExecutionCompleted { color: fine, at_unix: 21 }).await.unwrap();
+        j.record_event(&started_at(going, "p", 30)).await.unwrap();
+
+        let of = |status: &str| ExecutionQuery {
+            limit: 50,
+            status: Some(status.to_string()),
+            ..Default::default()
+        };
+        let failed = j.list_executions("t", &of("failed")).await.unwrap();
+        assert_eq!(failed.total, 1);
+        assert_eq!(failed.executions[0].color, broke);
+
+        let completed = j.list_executions("t", &of("completed")).await.unwrap();
+        assert_eq!(completed.executions[0].color, fine);
+
+        let running = j.list_executions("t", &of("running")).await.unwrap();
+        assert_eq!(running.total, 1, "a run with no terminal event is still going");
+        assert_eq!(running.executions[0].color, going);
     }
 
     /// The phase filter separates a trigger's real fires from the

@@ -9,6 +9,12 @@
   ],
   "icon": "FileInput",
   "color": "#4A154B",
+  "firesWith": {
+    "type": "String",
+    "fileId?": "String",
+    "channel?": "String",
+    "user?": "String"
+  },
   "features": {
     "isTrigger": true
   },
@@ -25,7 +31,6 @@
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",

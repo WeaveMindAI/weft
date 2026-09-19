@@ -1,0 +1,91 @@
+{
+  "type": "Stream",
+  "label": "Stream",
+  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes. Behind a Route the response body streams as the bus flows (`sse` for a browser's EventSource and LLM-style clients, `ndjson` for a script reading lines, `raw` for the payloads as they are) and ends when the bus closes. Behind a Socket each message is one socket message and the socket stays open. Wire an LLM Stream's bus in to stream a reply as it is generated, or a Postgres: Watch query's to keep a page live. A stored file inside a message goes out as `{ url, mimeType, filename, sizeBytes }`, a link the caller can fetch.",
+  "tags": [
+    "api",
+    "http",
+    "websocket",
+    "stream",
+    "sse"
+  ],
+  "icon": "Waves",
+  "color": "#06b6d4",
+  "inputs": [
+    {
+      "name": "bus",
+      "type": "Bus",
+      "required": true,
+      "accepts": [
+        "wire"
+      ],
+      "description": "The live bus to stream: every message on it, in order, from the earliest still buffered; the bus closing ends the stream."
+    },
+    {
+      "name": "first",
+      "type": "T",
+      "description": "A value sent ahead of the bus, framed exactly like the messages behind it. This is the header every streaming API has: an id, the row that was just created, a session token, and then the feed. Leave it off and the response is the bus alone."
+    },
+    {
+      "name": "format",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "raw",
+          "ndjson",
+          "sse"
+        ]
+      },
+      "default": "raw",
+      "label": "Format",
+      "description": "How each message is framed on an HTTP body (ignored on a socket, where a message is a frame). `raw`: the payload as-is, no separator. `ndjson`: one JSON value per line. `sse`: server-sent events, `data:` lines and a blank line per message."
+    },
+    {
+      "name": "status",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 100,
+        "max": 599,
+        "step": 1
+      },
+      "default": 200,
+      "label": "Status",
+      "description": "The HTTP status of the response (Route only)."
+    },
+    {
+      "name": "headers",
+      "type": "Dict[String, String]",
+      "description": "Extra response headers by name (Route only). A content-type here overrides the one the format implies."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "Fires true once the bus closed and the last chunk was handed to the caller."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "run_reaches",
+          "direction": "upstream",
+          "types": [
+            "Route",
+            "Socket"
+          ]
+        }
+      },
+      "then": {
+        "message": "Stream '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "level": "structural",
+        "severity": "warning"
+      }
+    }
+  ]
+}

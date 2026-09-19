@@ -15,8 +15,8 @@ when the work calls for them.
 
 The central loop, in one paragraph: the user asks for something (vibe level
 is enough). Tangle shapes it as a graph, scouts the project's catalog
-(`nodes/` on disk) directly or through `catalog-scout`, and writes the weft
-code. A missing capability is a dispatch: Tangle designs the node's typed
+with `weft describe-nodes` (the listing, then each candidate's wiring view),
+and writes the weft code. A missing capability is a dispatch: Tangle designs the node's typed
 contract and sends a `node-smith` specialist (several in parallel when
 several nodes are missing), which researches the real API documentation on
 the web, writes the node and extensive tests (live-tier tests included),
@@ -72,17 +72,17 @@ commands are the expert's hand on the same loop.
 | `.kilo/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, the browser extension, a public URL |
 | `.kilo/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
 | `.kilo/skills/weft-frontend/` | on demand, when the user wants a page, app, or site | the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes as its API, the signal doors for human steps, sharing one Postgres, the build |
+| `.kilo/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |
 | `.kilo/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.kilo/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
 | `.kilo/command/` | `/weft-check`, `/weft-run`, `/weft-grow`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
 | `.kilo/plugin/weft-validation.ts` | after every edit | the compiler answers every edit: fast validate on the touched source, structural errors and the level warning fed back to the model automatically |
-| `.kilo/agent/catalog-scout.md` | when dispatched | research only: sweeps the catalog, reports exact node specs |
 | `.kilo/agent/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |
 | `.kilo/agent/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
 | `.kilo/agent/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.kilo/agent/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
 | `.kilo/agent/frontend-builder.md` | when dispatched | builds and proves the project's frontend under `front/`, unsupervised: the pages, the server-held api token, the client that calls the program's own routes and signals, on the default stack unless the user named their own |
-| `kilo.json` | every session | `default_agent: tangle`, plus permissions: the working loop runs unimpeded; only the genuinely destructive asks (live-tier tests, deactivations that wipe, terminate, rm, clean, forget). Unlike Claude Code there is no exclude switch for the user's global config: a project-level `default_agent` wins, so Tangle is what loads as the agent, but instructions from the user's own Kilo setup (AGENTS.md and global config) still load alongside. |
+| `kilo.json` | every session | `default_agent: tangle`, plus permissions: an allow list for every `weft` verb Tangle runs, and no ask list; whether a call is put in front of you is your mode's decision (automatic: Tangle activates, resyncs, deactivates and runs infra on its own; manual: it asks in prose). The daemon's lifecycle stays off the list: a reinstall of weft is never Tangle's move. Unlike Claude Code there is no exclude switch for the user's global config: a project-level `default_agent` wins, so Tangle is what loads as the agent, but instructions from the user's own Kilo setup (AGENTS.md and global config) still load alongside. |
 
 The design rests on two disciplines. Ground truth: the catalog is on disk
 in the project (`nodes/base_catalog/`), so the persona's central rule is to
@@ -103,15 +103,13 @@ The intended distribution is built into the CLI:
 weft new <project> --assistant kilo-code     # shorthand: --assistant kc
 ```
 
-That symlinks `kilo.json` and `.kilo/` from the local weft checkout's
-`tangle/kilo-code/` into the project, so a later `git pull` +
-`./setup.sh` of the checkout refreshes Tangle in every such project at once,
-no per-project copy to drift stale. The flag's value names the assistant
+That copies `kilo.json` and `.kilo/` out of the local weft checkout's
+`tangle/kilo-code/` into the project. The flag's value names the assistant
 (repeatable for several), and the choice is remembered: later `weft new`
 runs install it with no flag, until `--assistant <name>` changes it or
-`--assistant none` stops it. The links are absolute and machine-local:
-`weft new` gitignores them, because a teammate cloning the project would
-only get dangling pointers into a checkout they do not have.
+`--assistant none` stops it. The files are the project's own from then
+on, so they are committed with it and a teammate cloning the project gets
+Tangle with no weft checkout to point at.
 
 Opening the project in Kilo Code (VS Code, or the Kilo CLI in the project
 directory) then loads `tangle` as the default agent from `kilo.json`; the
@@ -122,8 +120,10 @@ still works for a project that already exists:
 cp -r tangle/kilo-code/{kilo.json,.kilo} <project>/
 ```
 
-A copied install does not follow checkout updates: re-copy after a weft
-update, or replace the copy with symlinks by hand. `VERSION` marks the
+A project holds the version of Tangle that installed it. `weft tangle
+update` inside the project re-copies it from the checkout, replacing every
+file Tangle owns and leaving anything the assistant wrote beside them
+alone. `VERSION` marks the
 template release; it is meant to track a tag of this repository.
 
 Prerequisites sit on the machine, not in the template: the `weft` CLI on the

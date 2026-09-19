@@ -45,7 +45,6 @@
     {
       "name": "whereParams",
       "type": "List[String | Number | Boolean | Null | JsonDict]",
-      "required": false,
       "description": "Values for the condition's $1, $2, ..."
     }
   ],

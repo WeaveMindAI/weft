@@ -131,6 +131,10 @@
       "description": "The new row's 1-based sheet row number."
     }
   ],
+  "firesWith": {
+    "item": "List[String | Number | Boolean]",
+    "index": "Number"
+  },
   "features": {
     "isTrigger": true
   }

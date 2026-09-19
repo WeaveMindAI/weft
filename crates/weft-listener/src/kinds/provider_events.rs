@@ -41,7 +41,7 @@ use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, Sig
 use weft_core::signal::{EventScope, ProviderEvents, Signal};
 
 use crate::event_context::FireContext;
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use crate::protocol::{ProcessOutcome, ProcessTarget, PushEvent};
 use crate::registry::{RegisteredSignal, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
@@ -62,12 +62,37 @@ impl KindHandler for ProviderEventsHandler {
         true
     }
 
-    fn compute_routing(
-        &self,
-        _token: &str,
-        _spec: &SignalSpec,
-        _secret_cache: &Arc<DashMap<String, String>>,
-    ) -> Result<SignalRouting> {
+    /// A push arrives for one ACCOUNT and one topic, so this is where a
+    /// subscription decides whether it was meant.
+    ///
+    /// The connection was already matched by the dispatcher (a push
+    /// reaches this signal's pod only because the signal hangs off one
+    /// of the connections the broker named). What is left is this kind's
+    /// own vocabulary, and it is the reason this decision cannot live
+    /// anywhere else:
+    ///
+    ///   - the TOPIC. One connection can hold several, and their field
+    ///     names overlap, so a mailbox push must not wake a file watch.
+    ///   - the SCOPE. An `app` subscription means "every install of my
+    ///     app", which a push aimed at one account can never be: serving
+    ///     it here would half-serve it, so those are left to the
+    ///     dial-out socket that really does see every install.
+    ///
+    /// The payload is the named event as it arrived. The event's shape
+    /// is the topic's declared fields, which is exactly what the trigger
+    /// declared it wakes with.
+    fn match_push(&self, sig: &RegisteredSignal, push: &PushEvent) -> Option<Value> {
+        let cfg: ProviderEvents = serde_json::from_value(sig.spec.config.clone()).ok()?;
+        if cfg.topic != push.topic {
+            return None;
+        }
+        if cfg.scope == EventScope::App {
+            return None;
+        }
+        Some(push.event.clone())
+    }
+
+    fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         // Fires arrive internally: from this pod's shared socket, or
         // from the public events receiver (which routes by content,
         // not by a mount path).

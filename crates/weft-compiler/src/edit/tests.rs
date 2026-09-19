@@ -3816,3 +3816,63 @@ fn port_updates_reject_a_duplicate_port_name_per_side() {
     let err = apply_err(src, vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![], outputs: dup, removed_inputs: vec![], removed_outputs: vec![] }]);
     assert!(err.contains("duplicate output port 'a'"), "{err}");
 }
+
+/// The editor's gate toggle, as the ops it actually sends.
+///
+/// Flipping a gate is not a new operation: a wire moves with
+/// RemoveEdge + AddEdge and a written value with RemoveConfig +
+/// SetConfig, so it undoes and round-trips like any other edit. This
+/// pins that those ops accept the reserved gate ports, because nothing
+/// else in the editor writes to one and a refusal here would surface as
+/// a right-click that silently does nothing.
+#[test]
+fn the_gate_toggles_between_its_two_spellings() {
+    // A WIRED gate: the wire moves to the other port.
+    let wired = "src = Text { value: \"x\" }\nn = Debug\nn.data = src.value\nn._should_flow = src.value\n";
+    let out = apply(wired, vec![
+        EditOp::RemoveEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_flow".into(),
+            scope_group: None,
+        },
+        EditOp::AddEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_not_flow".into(),
+            scope_group: None, path: Vec::new(),
+        },
+    ]);
+    assert!(out.contains("n._should_not_flow = src.value"), "{out}");
+    assert!(!out.contains("n._should_flow ="), "the old spelling is gone: {out}");
+    parse_ok(&out);
+
+    // And back again, so the gesture is reversible by the same route.
+    let back = apply(&out, vec![
+        EditOp::RemoveEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_not_flow".into(),
+            scope_group: None,
+        },
+        EditOp::AddEdge {
+            source: "src".into(), source_port: "value".into(),
+            target: "n".into(), target_port: "_should_flow".into(),
+            scope_group: None, path: Vec::new(),
+        },
+    ]);
+    assert!(back.contains("n._should_flow = src.value"), "{back}");
+    assert!(!back.contains("_should_not_flow"), "{back}");
+    parse_ok(&back);
+
+    // A WRITTEN gate: the two forms mirror each other, so the value
+    // flips with the key (`_should_flow: false` means the same as
+    // `_should_not_flow: true`).
+    let written = "n = Debug {\n  _should_flow: false\n}\n";
+    let flipped = apply(written, vec![
+        EditOp::RemoveConfig { node: "n".into(), key: "_should_flow".into(), form: None },
+        EditOp::SetConfig {
+            node: "n".into(), key: "_should_not_flow".into(), value: "true".into(), form: None,
+        },
+    ]);
+    assert!(flipped.contains("_should_not_flow: true"), "{flipped}");
+    assert!(!flipped.contains("_should_flow: false"), "{flipped}");
+    parse_ok(&flipped);
+}

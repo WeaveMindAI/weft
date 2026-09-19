@@ -84,13 +84,11 @@
       "name": "filterByFormula",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "Airtable formula the records must match, e.g. {Stage} = 'Lead'."
     },
     {
       "name": "view",
       "type": "String",
-      "required": false,
       "description": "A view's name or id: only its records, in its order."
     },
     {

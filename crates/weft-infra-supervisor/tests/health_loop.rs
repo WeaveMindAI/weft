@@ -60,7 +60,7 @@ fn workload_with_unit(
     ready: i64,
 ) -> WorkloadReplicaState {
     let mut labels = HashMap::new();
-    labels.insert("weft.dev/node".into(), node_id.into());
+    labels.insert("weft.dev/node".into(), weft_core::infra::node_label_value(node_id));
     labels.insert("weft.dev/instance".into(), "inst1".into());
     labels.insert("weft.dev/unit".into(), unit.into());
     labels.insert("weft.dev/role".into(), "infra".into());

@@ -1,9 +1,9 @@
 {
   "type": "LiveHttpResponder",
   "label": "Live: HTTP Responder",
-  "description": "Demo node for an HTTP live connection. Reads the caller's request, streams two progress chunks, then sends a final JSON body echoing what they sent. Wire under an ApiEndpoint trigger.",
+  "description": "Demo node for an HTTP live connection driven through the ctx. Reads the caller's request off the handle, streams two progress chunks, then sends a final JSON body echoing what they sent. Wire under a Route trigger.",
   "tags": [
-    "live",
+    "api",
     "http",
     "demo",
     "stream"
@@ -12,10 +12,10 @@
   "color": "#06b6d4",
   "inputs": [
     {
-      "name": "started",
-      "type": "Boolean",
-      "required": false,
-      "description": "Kick from the ApiEndpoint trigger."
+      "name": "message",
+      "type": "String",
+      "required": true,
+      "description": "The body key the Route trigger declared and delivered; echoed back beside the body read off the handle."
     }
   ],
   "outputs": [

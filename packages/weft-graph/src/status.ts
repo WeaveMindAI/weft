@@ -38,7 +38,13 @@ export interface RawStatusPayload {
   };
   available_actions?: string[];
   preservation?: { parked?: number; suspended?: number };
-  executions?: { last_status?: string; last_color?: string };
+  executions?: {
+    last_status?: string;
+    last_color?: string;
+    /** Every execution running right now; the editor replaces its
+     *  running set with this on each refresh. */
+    running_colors?: string[];
+  };
 }
 
 // SYNC: infra_rollup values <-> crates/weft-dispatcher/src/api/project.rs (infra_rollup)

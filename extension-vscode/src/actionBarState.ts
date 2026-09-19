@@ -9,8 +9,11 @@
 //     trigger/infra rollups, per-node infra status.
 //
 //   - Live executions: a Set of currently-running colors on the
-//     project. Seeded from status fetch's `last_color` + `last_status`,
-//     mutated by SSE `execution_started/completed/failed`.
+//     project. REPLACED by every status fetch's `running_colors` (the
+//     reconciliation), mutated between fetches by SSE
+//     `execution_started/completed/failed/cancelled` (the fast path).
+//     A terminal event lost to a dropped stream is caught by the next
+//     fetch, so a Stop button never outlives its run.
 //
 //   - Follow state: which color the user is watching, and in what
 //     mode (latest tracks the newest live exec; pinned holds on a
@@ -104,32 +107,40 @@ export class ActionBarStore {
     return this.derive();
   }
 
-  /// Color the user is watching live, or undefined if they're
-  /// looking at a finished execution / nothing running. Stop button
-  /// uses this; cancel POSTs against this color.
-  watchedLiveColor(projectId?: string): string | undefined {
+  /// A color that is running right now on this project, or undefined
+  /// if the user is looking at a finished execution or nothing runs.
+  /// Stop button uses this; cancel POSTs against this color.
+  watchedRunningColor(projectId?: string): string | undefined {
     const id = projectId ?? this.pinnedProjectId;
     if (!id) return undefined;
     const slot = this.slots.get(id);
     if (!slot) return undefined;
-    return computeWatchedLiveColor(slot);
+    return computeWatchedRunningColor(slot);
   }
 
   pushStatus(
     projectId: string,
     snapshot: ActionAvailability,
-    seedRunningColor: string | undefined,
+    runningColors: readonly string[],
   ): void {
     const slot = this.ensureSlot(projectId);
     slot.backend = snapshot;
-    // Seed running colors from status fetch's most-recent
-    // execution. SSE is the authoritative source for transitions
-    // during a live session; this seed only matters on graph open
-    // / project pin (before SSE has any history). Older parallel
-    // execs aren't covered by `last_*`, but they'll appear via
-    // SSE if any events fire while we're connected.
-    if (seedRunningColor !== undefined) {
-      slot.runningColors.add(seedRunningColor);
+    // The fetch is the truth about what runs: colors it does not name
+    // are gone (their terminal event may have been lost to a dropped
+    // stream), colors it names and the set lacks are live.
+    //
+    // The fetch's ORDER is the truth too, and it replaces what was
+    // here rather than being merged into it. The dispatcher sends them
+    // oldest first (see `ProjectExecutionsSummary::running_colors`), so
+    // taking the last is taking the newest. Keeping the old positions
+    // and appending, which is what this used to do, mixed one ordering
+    // into another and left "latest" following an arbitrary run.
+    slot.runningColors = new Set(runningColors);
+    const next = slot.runningColors;
+    // A Stop waiting on a run the fetch no longer lists is over: the
+    // run ended, whether or not its terminal event ever arrived.
+    if (slot.pendingAction && !next.has(slot.pendingAction.color)) {
+      slot.pendingAction = undefined;
     }
     this.notifyIfPinned(projectId);
   }
@@ -378,32 +389,37 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
       message: slot.pendingAction.message,
     };
   }
-  const watchedLive = computeWatchedLiveColor(slot);
+  const watchedLive = computeWatchedRunningColor(slot);
   if (watchedLive && slot.backend) {
     return { kind: 'execution_running', color: watchedLive };
   }
   return { kind: 'idle' };
 }
 
-/// Pure function: which color is the user watching live on this slot?
+/// Pure function: which running color does the bar act on for this slot?
 ///
 ///   pinned mode: the user's pinned color, only if it's currently running.
-///   latest mode: any currently-running color (newest if multiple).
-///                Returns undefined when nothing is running.
+///   latest mode: the most recently started of the running colors.
+///                Returns undefined when nothing runs.
+///
+/// "Latest" is the last element of an insertion-ordered set, and that
+/// really is the newest from both directions: a run arriving on the
+/// live stream is appended as it starts, and a status fetch replaces
+/// the whole set with the dispatcher's own oldest-first list.
 ///
 /// Returns undefined when the user is looking at a finished
 /// execution (so the bar shows Run, not Stop), even if a different
 /// execution is running on the same project.
-function computeWatchedLiveColor(slot: Slot): string | undefined {
+function computeWatchedRunningColor(slot: Slot): string | undefined {
   if (slot.runningColors.size === 0) return undefined;
   if (slot.follow.mode === 'pinned') {
     return slot.follow.color && slot.runningColors.has(slot.follow.color)
       ? slot.follow.color
       : undefined;
   }
-  // Latest mode: pick any running color. Set iteration is
-  // insertion-order; the most recently added (newest exec) is
-  // last. Iterating to grab the last one gives us "newest live".
+  // Latest mode: the newest running color. Set iteration is
+  // insertion-order, and both things that fill this set put the newest
+  // last (see the note above), so the last element is the answer.
   let last: string | undefined;
   for (const c of slot.runningColors) last = c;
   return last;

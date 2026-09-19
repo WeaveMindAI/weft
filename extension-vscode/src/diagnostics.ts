@@ -12,8 +12,9 @@
 
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { projectDirOf } from './cli';
+import { docDirOf } from './cli';
 import { DiagnosticRouter } from './diagnosticRouter';
+import { findProjectRoot } from './sidebar/projects';
 import { canonicalPath, weftPositionToVsCode } from './locations';
 import type { ParseServer } from './parseServer';
 import type { Diagnostic as WeftDiagnostic, Severity } from '../../packages/weft-graph/src/protocol';
@@ -86,7 +87,11 @@ export function attachDiagnostics(context: vscode.ExtensionContext, parseServer:
     const changedPath = changed.fsPath;
     for (const doc of vscode.workspace.textDocuments) {
       if (doc.languageId !== 'weft') continue;
-      const projectDir = projectDirOf(doc);
+      // The PROJECT root, not the document's folder: `nodes/` sits
+      // beside `weft.toml` while a program lives in `src/`, so matching
+      // against the document's own directory never saw a catalog change
+      // and the warm server kept serving the catalog it started with.
+      const projectDir = findProjectRoot(doc.uri.fsPath) ?? docDirOf(doc);
       if (changedPath === projectDir || changedPath.startsWith(projectDir + path.sep)) {
         // A `nodes/` change altered the catalog: tell the warm server to
         // rebuild it before this validation, else it serves a stale catalog.

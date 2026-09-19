@@ -1046,7 +1046,7 @@ fn set_config(
         // `_should_flow`: an ordinary key there is a loop knob or an
         // error, never a port value. Every other port is written as a
         // `g.key = value` statement.
-        if key != weft_core::exec::skip::SHOULD_FLOW_PORT {
+        if !weft_core::exec::skip::is_gate_port(key) {
             // Only a DECLARED in-port may be written as `g.key = value`:
             // anything else would emit source the compiler then rejects.
             // Loop knobs (`over`, `parallel`, ...) are not ports and ride

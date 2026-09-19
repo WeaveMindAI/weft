@@ -9,6 +9,14 @@
   ],
   "icon": "SmilePlus",
   "color": "#4A154B",
+  "firesWith": {
+    "emoji?": "String",
+    "user?": "String",
+    "channel?": "String",
+    "ts?": "String",
+    "messageUser?": "String",
+    "type": "String"
+  },
   "features": {
     "isTrigger": true
   },
@@ -25,7 +33,6 @@
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -52,7 +59,6 @@
     {
       "name": "emoji",
       "type": "String",
-      "required": false,
       "label": "Emoji",
       "placeholder": "eyes (with or without colons)",
       "description": "Only fire on this emoji. Leave empty for any."

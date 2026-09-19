@@ -40,7 +40,6 @@
     {
       "name": "includeDomains",
       "type": "List[String]",
-      "required": false,
       "description": "Only results from these domains. Empty = the whole web."
     }
   ],

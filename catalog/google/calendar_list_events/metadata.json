@@ -40,7 +40,6 @@
     {
       "name": "query",
       "type": "String",
-      "required": false,
       "label": "Search"
     }
   ],

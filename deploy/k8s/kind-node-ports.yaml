@@ -1,0 +1,91 @@
+# The way in from the operator's machine on kind, and kind ONLY (the
+# daemon applies this file for the kind backend alone; a real cluster is
+# reached at the operator's external addresses).
+#
+# Each front door gets a NodePort Service pinned to a fixed node port,
+# and the kind node's config maps that node port to a loopback port on
+# the host (`extraPortMappings`, rendered by the daemon from the same
+# numbers). Docker publishes the port, kube-proxy sends it on to the
+# pod: no process on the host holds the connection open, so nothing
+# drops it when one client's transfer breaks, which a `kubectl
+# port-forward` did for every client at once.
+#
+# The node-port placeholders below are substituted by the daemon from
+# `MappedPort` in crates/weft-cli/src/commands/daemon.rs, the one place
+# the numbers live; never type a node port here.
+#
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+---
+# The dispatcher's API: what the CLI and the editor talk to at
+# http://127.0.0.1:<dispatcher_port>. Selects the same pods as the
+# ClusterIP Service in dispatcher.yaml; that one stays the in-cluster
+# address, this one is the host's.
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-dispatcher-node-port
+  namespace: weft-system
+  labels:
+    app: weft-dispatcher
+spec:
+  type: NodePort
+  selector:
+    app: weft-dispatcher
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999
+      nodePort: ${WEFT_DISPATCHER_NODE_PORT}
+---
+# The ingress controller: storage downloads minted as
+# http://127.0.0.1:<ingress_port>/storage/... land here and are routed
+# by ingress.yaml. Selects the controller pods of the kind ingress-nginx
+# bundle the daemon installs (their labels and the `http` port name are
+# the bundle's).
+# SYNC: selector labels + port name <-> the INGRESS_MANIFEST bundle
+#       (crates/weft-cli/src/commands/daemon.rs)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-node-port
+  namespace: ingress-nginx
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: ${WEFT_INGRESS_NODE_PORT}
+---
+# The live-connection gateway: a route caller's URL,
+# http://<pod>.<ns>.127-0-0-1.nip.io:<gateway_port>/..., lands here and
+# gateway.yaml routes it to the worker pod. Selects the proxy pods Envoy
+# Gateway generates for our Gateway, by the owning-gateway labels it
+# stamps on them. The Gateway's listener is on 80; Envoy Gateway runs
+# its proxy unprivileged and moves every listener below 1024 up by
+# 10000, so the container listens on 10080.
+# SYNC: owning-gateway labels <-> deploy/k8s/gateway.yaml (the Gateway's
+#       name + namespace); container port <-> ENVOY_GATEWAY_VERSION
+#       (crates/weft-cli/src/commands/daemon.rs), whose translator adds
+#       10000 to a listener port below 1024
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-live-gateway-node-port
+  namespace: envoy-gateway-system
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: envoy
+    gateway.envoyproxy.io/owning-gateway-name: weft-live-gateway
+    gateway.envoyproxy.io/owning-gateway-namespace: envoy-gateway-system
+  ports:
+    - name: http
+      port: 80
+      targetPort: 10080
+      nodePort: ${WEFT_GATEWAY_NODE_PORT}

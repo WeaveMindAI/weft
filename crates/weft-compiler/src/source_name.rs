@@ -43,6 +43,25 @@ pub fn body_id(root: &Path, file: &Path) -> String {
     format!("@{}", parts.iter().map(|part| plain(part)).collect::<Vec<_>>().join(":"))
 }
 
+/// How a group id reads to a PERSON, which is never the id itself for
+/// an included file's body. A body id is the file's path
+/// (`@src:lib:clean`), unspellable on purpose, so it shows as the
+/// file's own name (`clean`); a nested group's id carries its parents
+/// (`outer.inner`), so it shows as its last segment; anything else is
+/// already a name a person wrote.
+///
+/// Every surface that puts a group in front of a person goes through
+/// this: the editor's box header, a boundary node's label, anywhere
+/// else that would otherwise print the id.
+// SYNC: display_name <-> packages/weft-graph/src/webview/host-bridge.ts displayName
+pub fn display_name(group_id: &str) -> String {
+    let plain = weft_core::project::plain_id(group_id);
+    match plain.rsplit_once('.') {
+        Some((_, local)) => local.to_string(),
+        None => plain,
+    }
+}
+
 /// The anonymous-root id a file is parsed under: the body id when the
 /// file sits in a project (the compiler gives an `@include` of it the
 /// same id, so the editor's standalone view of the file and the journal
@@ -125,6 +144,18 @@ mod tests {
         assert!(!weft_core::is_rust_identifier("@src:lib:clean"));
         assert_eq!(file_id(None, Some(&PathBuf::from("my-cleaner.weft"))), "MyCleaner");
     }
+    /// A body id is a path, so it reads as the file; a nested group
+    /// reads as its own segment; a plain name is already one.
+    #[test]
+    fn a_group_reads_to_a_person_as_its_own_name_never_its_path() {
+        assert_eq!(display_name("@src:lib:clean"), "clean");
+        assert_eq!(display_name("@clean"), "clean");
+        assert_eq!(display_name("outer.inner"), "inner");
+        assert_eq!(display_name("cards"), "cards");
+        // A body's nested group carries both shapes at once.
+        assert_eq!(display_name("@src:cards.rows"), "rows");
+    }
+
     fn label(s: &str) -> String { derive_label(Some(&PathBuf::from(s))) }
 
     #[test]

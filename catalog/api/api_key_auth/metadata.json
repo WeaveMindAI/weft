@@ -1,0 +1,50 @@
+{
+  "type": "ApiKeyAuth",
+  "label": "API Key Auth",
+  "description": "Gate a Route or Socket with a set of API keys you hand out. Store the accepted keys on the connection (comma-separated); a caller presents one as `X-Api-Key: <key>` or `Authorization: Bearer <key>`, the gateway checks it before a run starts, and the trigger's `caller` port says which key matched (`{\"key\": 0}` for the first). Wire the access output into the trigger's `auth` input.",
+  "tags": [
+    "api",
+    "auth",
+    "access",
+    "key"
+  ],
+  "icon": "KeyRound",
+  "color": "#06b6d4",
+  "service": {
+    "service": "api_key_auth",
+    "label": "API keys",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "keys",
+          "label": "Accepted keys",
+          "placeholder": "one or more keys, comma-separated",
+          "secret": true
+        }
+      ]
+    },
+    "identity": "API keys",
+    "verify": {
+      "kind": "api_keys"
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Keys"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "The key set: wire it into a Route or Socket's `auth` input."
+    }
+  ],
+  "requires_infra": false
+}

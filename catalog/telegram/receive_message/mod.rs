@@ -5,6 +5,22 @@
 //! parameter: Telegram only discards a queued update once a later
 //! `offset` is sent, so each poll confirms the previous batch and the
 //! queue drains instead of pinning at its oldest 100 entries.
+//! What it wakes with is Telegram's `Update`, narrowed to the one kind
+//! this asks for: the poll sends `allowed_updates=["message"]`, so the
+//! update is always `update_id` plus `message` and never one of the
+//! other twenty kinds. THAT is what `firesWith` pins, exactly: two
+//! fields, no others, so an update of a kind this never asked for is
+//! refused rather than half-read.
+//!
+//! The message itself is declared as an object and not enumerated, and
+//! that is deliberate. A record type is closed at the level it names
+//! and open below it, so spelling out the Bot API's hundred-and-twenty
+//! `Message` fields would still leave every chat, user and photo inside
+//! them open: the strictness would stop one level down either way. What
+//! it WOULD add is a trigger that stops firing the next time Telegram
+//! ships a field, in exchange for knowledge this node never uses, since
+//! it reads four values out of the message and hands the rest on whole.
+//!
 //! Activation starts from now: the priming poll sends `offset=-1`
 //! (Telegram's drain idiom: answer only the newest queued update,
 //! discard the rest), so a deep pre-activation backlog never replays;

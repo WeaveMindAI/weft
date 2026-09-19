@@ -333,7 +333,10 @@ async fn bytes_are_held_to_the_declared_kind() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("@asset(\"a.png\", Image): the file's bytes are Audio, not Image"), "{err}");
+    // The `@asset(...)` half is THIS caller's framing (the check itself
+    // reports only what is wrong with the bytes, so a stranger uploading
+    // a file to an API is never shown weft syntax they did not write).
+    assert!(err.contains("@asset(\"a.png\", Image): the bytes are Audio, not the Image"), "{err}");
     assert!(err.contains("@asset(\"notes.txt\", Image)") && err.contains("no Image signature"), "{err}");
     assert!(store.uploads.lock().unwrap().is_empty(), "nothing uploaded while a ref is refused");
 
@@ -364,7 +367,7 @@ async fn one_path_under_two_types_is_checked_under_each() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("@asset(\"clip.wav\", Image)") && err.contains("are Audio, not Image"), "{err}");
+    assert!(err.contains("@asset(\"clip.wav\", Image)") && err.contains("are Audio, not the Image"), "{err}");
     assert!(store.uploads.lock().unwrap().is_empty(), "nothing uploads while a ref is broken");
 
     // Two agreeing declarations of one path: one upload, one value each.

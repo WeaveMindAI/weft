@@ -35,7 +35,6 @@
     {
       "name": "rename",
       "type": "String",
-      "required": false,
       "label": "Rename to"
     }
   ],

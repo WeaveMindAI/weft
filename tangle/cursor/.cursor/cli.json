@@ -13,7 +13,6 @@
       "Shell(weft status)",
       "Shell(weft ps)",
       "Shell(weft follow)",
-      "Shell(weft daemon)",
       "Shell(weft catalog)",
       "Shell(weft activate)",
       "Shell(weft cancel-activate)",
@@ -30,9 +29,9 @@
       "Shell(weft wake)",
       "Shell(weft node-test-hash)",
       "Shell(weft token)",
-      "Shell(weft listener)"
-    ],
-    "deny": [
+      "Shell(weft listener)",
+      "Shell(weft daemon status)",
+      "Shell(weft daemon logs)",
       "Shell(weft test-node)",
       "Shell(weft connect)",
       "Shell(weft deactivate)",

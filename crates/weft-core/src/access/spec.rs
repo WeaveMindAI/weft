@@ -126,6 +126,17 @@ pub struct AccessSpec {
     /// trigger on it cannot be served and says so at registration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub events: BTreeMap<String, crate::access::events::EventsSpec>,
+    /// How a CALLER presenting a connection of this service is checked
+    /// when a live route is gated by it (`Route { auth: ... }`): the
+    /// scheme (a shared-key set, an identity token, an HMAC) is data
+    /// here, and the connection's stored values hold the material by
+    /// the names the scheme reserves (`keys`, `signing_secret`,
+    /// `public_key`, `audience`; an `oidc` scheme names its addresses
+    /// as templates over the fields). The broker runs it, secret-free
+    /// from the gateway's side. Absent = connections of this service
+    /// cannot gate a route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::access::events::VerifyKind>,
     /// Named groups of OPTIONAL fields, for a service whose optional
     /// fields come in sets that each unlock one capability (a
     /// mailbox's receiving server and its sending server).
@@ -1476,6 +1487,31 @@ impl AccessSpec {
             }
         }
         crate::access::events::validate_topics(&self.service, &self.events)?;
+        if let Some(verify) = &self.verify {
+            // The scheme reads the connection: every value it needs must
+            // be a field the paste page declares, or no connection of
+            // this service could ever verify anyone.
+            let declared: Vec<String> = self.own_fields().into_iter().map(|f| f.name).collect();
+            for name in verify.required_value_names()? {
+                if !declared.contains(&name) {
+                    return Err(format!(
+                        "service '{}' declares a `{}` verify that reads the stored value \
+                         '{name}', but no credential field of that name is declared; add it \
+                         to the acquisition fields",
+                        self.service,
+                        verify.tag()
+                    ));
+                }
+            }
+            if matches!(verify, crate::access::events::VerifyKind::TokenEcho) {
+                return Err(format!(
+                    "service '{}' declares a token_echo verify for callers, but that scheme \
+                     compares a token weft minted when subscribing, which a caller of a \
+                     route never has; use api_keys, hmac, signature or oidc",
+                    self.service
+                ));
+            }
+        }
         if let Some(page) = &self.own_page {
             if let Some(mint) = &page.mint {
                 validate_captures(&mint.captures)?;
@@ -2322,5 +2358,101 @@ mod tests {
         assert_eq!(lookup_path(&v, "channels.1.id"), Some(&json!("C2")));
         assert_eq!(lookup_path(&v, "missing.path"), None);
         assert_eq!(lookup_path(&v, "team.name.deeper"), None);
+    }
+
+    fn verifier_spec(fields: &[&str], verify: serde_json::Value) -> serde_json::Result<AccessSpec> {
+        serde_json::from_value(json!({
+            "service": "api_key_auth",
+            "acquisition": {
+                "kind": "static",
+                "fields": fields.iter().map(|f| json!({ "name": f })).collect::<Vec<_>>()
+            },
+            "verify": verify
+        }))
+    }
+
+    /// A caller-verify recipe round-trips and is refused when it reads
+    /// a value the paste page does not declare.
+    #[test]
+    fn a_verify_block_must_name_declared_fields() {
+        let ok = verifier_spec(&["keys"], json!({ "kind": "api_keys" })).unwrap();
+        ok.validate().expect("keys is declared");
+        assert!(matches!(ok.verify, Some(crate::access::events::VerifyKind::ApiKeys { .. })));
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["verify"], json!({ "kind": "api_keys" }), "defaults stay off the wire");
+
+        let missing = verifier_spec(&["token"], json!({ "kind": "api_keys" })).unwrap();
+        let err = missing.validate().expect_err("keys is not declared");
+        assert!(err.contains("'keys'"), "{err}");
+
+        let oidc = verifier_spec(
+            &["jwks_url", "issuer", "audience"],
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+        )
+        .unwrap();
+        oidc.validate().expect("templated addresses over declared fields");
+        let short = verifier_spec(
+            &["issuer"],
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+        )
+        .unwrap();
+        let err = short.validate().expect_err("jwks_url is not declared");
+        assert!(err.contains("'jwks_url'"), "{err}");
+
+        let echo = verifier_spec(&["token"], json!({ "kind": "token_echo" })).unwrap();
+        let err = echo.validate().expect_err("token echo cannot gate callers");
+        assert!(err.contains("token_echo"), "{err}");
+    }
+
+    /// The oidc scheme resolves its templates against a connection's
+    /// values, and a push recipe may not carry placeholders at all.
+    #[test]
+    fn oidc_templates_resolve_against_the_connection() {
+        use crate::access::events::VerifyKind;
+        let kind: VerifyKind = serde_json::from_value(
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+        )
+        .unwrap();
+        assert_eq!(
+            kind.required_value_names().unwrap(),
+            vec!["jwks_url".to_string(), "issuer".to_string()]
+        );
+        let values = BTreeMap::from([
+            ("issuer".to_string(), "https://auth.example".to_string()),
+            ("jwks_url".to_string(), "https://auth.example/jwks".to_string()),
+        ]);
+        let resolved = kind.resolved(&values).unwrap();
+        match resolved {
+            VerifyKind::Oidc { issuers, jwks_url } => {
+                assert_eq!(issuers[0].0, "https://auth.example");
+                assert_eq!(jwks_url.0, "https://auth.example/jwks");
+            }
+            other => panic!("expected oidc, got {other:?}"),
+        }
+        let err = kind.resolved(&BTreeMap::new()).expect_err("a missing value is loud");
+        assert!(err.contains("stores no value"), "{err}");
+
+        let pushed = |verify: serde_json::Value| -> AccessSpec {
+            serde_json::from_value(json!({
+                "service": "svc",
+                "acquisition": { "kind": "static", "fields": [{ "name": "token" }] },
+                "events": {
+                    "pushes": {
+                        "fields": { "text": "event.text" },
+                        "account": { "value": "token", "path": "account" },
+                        "webhook": { "verify": verify }
+                    }
+                }
+            }))
+            .expect("parses")
+        };
+        let err = pushed(json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }))
+            .validate()
+            .expect_err("a push recipe must be literal");
+        assert!(err.contains("placeholder"), "{err}");
+        let err = pushed(json!({ "kind": "api_keys" }))
+            .validate()
+            .expect_err("a push is never keyed");
+        assert!(err.contains("api_keys"), "{err}");
     }
 }

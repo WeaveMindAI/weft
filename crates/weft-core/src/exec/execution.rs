@@ -78,18 +78,10 @@ pub struct NodeExecution {
     pub completed_at: Option<u64>,
     pub cost_usd: f64,
     pub logs: Vec<Value>,
-    /// Non-terminal per-port warnings raised during this dispatch. The
-    /// only current source is a runtime output-type mismatch: the node
-    /// tried to emit a value whose type is not compatible with the
-    /// port's declared type, so the engine refused the value and closed
-    /// the port instead (downstream sees null). The node did NOT fail
-    /// (`status` stays Completed); the warning is the visible record
-    /// that one port's value was dropped.
-    pub port_warnings: Vec<PortWarning>,
     /// The output ports this firing has put on a wire or closed (an
-    /// emission, a close, a refusal): what its termination sweep
-    /// leaves alone, closing every other output port. Kept on the
-    /// record so the worker and the fold read one thing.
+    /// emission, a close): what its termination sweep leaves alone,
+    /// closing every other output port. Kept on the record so the
+    /// worker and the fold read one thing.
     #[serde(default)]
     pub mentioned_ports: HashSet<String>,
     /// Explicit output closures, including generator ends already delivered.
@@ -103,24 +95,6 @@ pub struct NodeExecution {
     /// THIS run's `color` (the table is this run's); the origin is here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<Color>,
-}
-
-/// A non-terminal, per-port problem on a single firing. Today the sole
-/// kind is an output-type mismatch (see `NodeExecution::port_warnings`).
-// SYNC: PortWarning <-> packages/weft-graph/src/webview/lib/types/index.ts PortWarning
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PortWarning {
-    pub port: String,
-    /// The port's declared type (what the node promised to emit).
-    pub expected: String,
-    /// The inferred type of the value the node actually tried to emit.
-    pub actual: String,
-}
-
-impl PortWarning {
-    pub fn message(&self) -> String {
-        format!("output '{}': expected {}, received {}", self.port, self.expected, self.actual)
-    }
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.

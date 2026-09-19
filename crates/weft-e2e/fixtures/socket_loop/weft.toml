@@ -1,0 +1,4 @@
+[package]
+name = "e2e_socket_loop"
+id = "00000000-0000-0000-0000-000000000084"
+version = "0.1.0"

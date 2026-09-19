@@ -170,6 +170,118 @@ let resp = post(format!("{}/action", base.trim_end_matches('/')), body).await?;
 The author chooses what to send downstream, and with several endpoints exports
 each by name.
 
+## Letting a client outside the cluster in
+
+Everything above is for a node talking to its own infrastructure, and by
+default that is the only thing that can reach it: an endpoint is a ClusterIP,
+and the network policy lets workers in and nobody else.
+
+Sometimes that is not enough. A frontend needs the program's Postgres for its
+own sign-in tables. You want a `psql` session to see what a run wrote. A
+dashboard wants to read the same database the program writes. All of those are
+one thing: a client that is not a weft node, speaking the service's own
+protocol.
+
+If your endpoint can serve such a client, say so:
+
+```rust
+Endpoint {
+    name: "sql".into(),
+    unit: "db".into(),
+    container: "postgres".into(),
+    port: "sql".into(),
+    expose: Expose::SameNetwork,
+}
+```
+
+That is the whole of it. The endpoint says it is reachable and it is, the same
+way a volume you declare is a volume you get. Nothing opens a door after the
+fact, and nothing in the project's source can open one your node did not
+declare, so reading the node tells you what is reachable.
+
+"The same network" means the machine on a local install, where the door binds
+to loopback so nothing else on your network can reach it, and the cluster's
+own subnet in a deployed one. It never means the internet. No `Expose` reaches
+the internet except `TenantPublic`, which is HTTP and goes through the ingress.
+
+### Let the author decide, with an input
+
+A door is rarely something every user of your node wants, so make it theirs to
+choose. `provision_infra` runs with your node's inputs already computed, so
+you branch on one like any other decision:
+
+```rust
+let reachable: bool = input.get("reachable")?;
+...
+expose: if reachable { Expose::SameNetwork } else { Expose::ClusterInternal },
+```
+
+That is how `PostgresDatabase` does it, with a `reachable` input that is off
+by default. The lever is an ordinary port with a label and a description, it
+shows up in the graph next to the disk size, and whether a database is
+reachable reads as part of what the program is.
+
+### Finding the address
+
+The port is not yours and not the author's: the cluster allocates it, so that
+two projects can each have a door without colliding. So the address is not in
+the source, and asking the runtime is how anyone learns it:
+
+```
+$ weft infra list-doors
+db.sql  127.0.0.1:30080
+```
+
+That command only ever reports. There is nothing to open or close, because the
+node already said.
+
+### The rule: never a credential endpoint
+
+If you write only one thing down from this page, write this one.
+
+**An endpoint that hands out a credential is never `SameNetwork`.** Not when
+it would be convenient, not when it is guarded by a token, not when it only
+answers once.
+
+`PostgresDatabase` is the worked example, because it has one of each. Postgres
+itself listens on `sql`, and reaching it still costs you a password, so that
+endpoint is `SameNetwork`. Beside it runs a small server that mints that
+password, on `credential`, and that one stays `ClusterInternal` for ever. A
+door onto it would hand the database away to anything that could reach the
+port.
+
+The test on your own node: if reaching this port gives somebody something they
+could not already have, it is not `SameNetwork`.
+
+### Which connection the door hands out
+
+A door is half of letting a client in. The other half is what that client
+connects AS.
+
+The simple answer, and the one you get for free, is the connection your node
+already publishes: the same one the program's own nodes use. That is what a
+door carries unless you do something about it, and for plenty of services it
+is the only answer there is.
+
+It is worth doing something about it when your service can express a narrower
+identity AND the wider one can destroy things the program depends on. A
+database is the clear case: the connection your node publishes owns the
+tables, and the client coming through the door is usually somebody's frontend,
+written fast, which should not be one typo from dropping them. Where the
+service supports it, a node can mint a second identity for the door (a
+database role with its own schema, a broker user scoped to its own topics) and
+publish that instead.
+
+Two things to hold on to. This is a capability, not a rule: a service with no
+notion of a second identity has nothing to mint, and a node that publishes one
+connection is not wrong. And like the door itself, it is a choice you give the
+author rather than one you make for them: a second input, branched on in the
+same body, so a program that wants the full connection through the door says
+so and gets it.
+
+The rule that IS absolute is the one above: an endpoint that hands out a
+credential is never `SameNetwork`. That one holds whatever anybody intends.
+
 ## The routes your container serves
 
 | Route | Method | Called by | Contract |

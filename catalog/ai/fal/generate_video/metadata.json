@@ -67,7 +67,6 @@
     {
       "name": "params",
       "type": "JsonDict",
-      "required": false,
       "description": "Model-specific extras merged into the request (duration, resolution, generate_audio, ...). Declared knobs win."
     }
   ],

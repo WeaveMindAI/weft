@@ -17,6 +17,7 @@
     onNavigateBack,
     leading,
     trailing,
+    below,
   }: {
     mode: 'latest' | 'pinned';
     color: string | undefined;
@@ -52,12 +53,23 @@
     /// Host-injected controls placed at the END of the toolbar, after the
     /// editor's own buttons. Symmetric with `leading`. Absent = nothing.
     trailing?: Snippet;
+    /// Controls for the RUN itself, on their own row under the toolbar.
+    ///
+    /// The row above is about the view (which run is followed, whether the
+    /// source is open, where in an include you are). This one is about
+    /// what happened inside the run, and those are not the same question,
+    /// so they do not share a line. A run's caller conversation goes here.
+    ///
+    /// The row is not rendered at all when the snippet is absent or draws
+    /// nothing, so a run with nothing to say about it costs no space.
+    below?: Snippet;
   } = $props();
 
   const shortColor = $derived(color ? color.slice(0, 8) : '');
 </script>
 
-<div class="absolute top-3 left-3 z-30 flex items-center gap-2 pointer-events-auto">
+<div class="absolute top-3 left-3 z-30 flex flex-col items-start gap-2 pointer-events-auto">
+<div class="flex items-center gap-2">
   {#if leading}{@render leading()}{/if}
   {#if navDepth > 0}
     <button
@@ -143,4 +155,8 @@
     </button>
   {/if}
   {#if trailing}{@render trailing()}{/if}
+</div>
+{#if below}
+  <div class="flex items-center gap-2">{@render below()}</div>
+{/if}
 </div>

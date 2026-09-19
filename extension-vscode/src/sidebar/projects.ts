@@ -44,7 +44,9 @@ export function readProjectIdFromToml(entryFsPath: string): string | undefined {
 }
 
 /** Walk up from a file (max 8 levels) to the directory containing `weft.toml`,
- *  the project root the compiler resolves `@file`/`@include` paths against.
+ *  the project root the compiler resolves `@file` and `@asset` paths against.
+ *  `@include` is the exception: it resolves against the INCLUDING file's own
+ *  directory, so a file deep in `src/` includes its neighbours by name.
  *  The single project-root walk; `readProjectIdFromToml` builds on it. */
 export function findProjectRoot(entryFsPath: string): string | undefined {
   let dir = path.dirname(entryFsPath);
@@ -92,13 +94,29 @@ export class ProjectsProvider implements vscode.TreeDataProvider<ProjectNode> {
   readonly onDidChangeTreeData = this._onDidChange.event;
 
   private cache: WeftProject[] = [];
+  /// The watcher and its subscriptions, so closing this panel closes
+  /// them too. Without it, every pin change left another live watcher
+  /// behind, each one refreshing this tree for the rest of the session.
+  private readonly disposables: vscode.Disposable[] = [];
 
   constructor() {
-    // Refresh on workspace folder changes + on any .weft save/create/delete.
+    // Refresh on workspace folder changes and on any .weft file being
+    // created, saved or deleted. `onDidChange` is the save: it was
+    // missing, so a save that turned a folder into a project (or
+    // renamed one) did not show up until something else refreshed.
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.weft');
-    watcher.onDidCreate(() => this.refresh());
-    watcher.onDidDelete(() => this.refresh());
-    vscode.workspace.onDidChangeWorkspaceFolders(() => this.refresh());
+    this.disposables.push(
+      watcher,
+      watcher.onDidCreate(() => this.refresh()),
+      watcher.onDidChange(() => this.refresh()),
+      watcher.onDidDelete(() => this.refresh()),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.refresh()),
+    );
+  }
+
+  dispose(): void {
+    for (const d of this.disposables) d.dispose();
+    this.disposables.length = 0;
   }
 
   async refresh(): Promise<void> {

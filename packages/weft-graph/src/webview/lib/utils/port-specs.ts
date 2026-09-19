@@ -1,5 +1,5 @@
 import type { PortDefinition, PortType } from '../types';
-import { SHOULD_FLOW_PORT, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
+import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
 import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
@@ -248,7 +248,7 @@ export function entryPortCollisions(
 		...collide(
 			deriveInputsFromEntries([entry], specMap),
 			deriveInputsFromEntries(others, specMap),
-			[...reserved.inputs, SHOULD_FLOW_PORT],
+			[...reserved.inputs, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT],
 		),
 		...collide(
 			deriveOutputsFromEntries([entry], specMap),

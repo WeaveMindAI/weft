@@ -34,7 +34,6 @@
     {
       "name": "mask",
       "type": "Image",
-      "required": false,
       "description": "Inpaint mask: white areas change, black areas stay (models that take mask_url)."
     },
     {
@@ -67,7 +66,6 @@
     {
       "name": "params",
       "type": "JsonDict",
-      "required": false,
       "description": "Model-specific extras merged into the request. Declared knobs win."
     }
   ],

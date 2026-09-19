@@ -92,10 +92,9 @@ in seconds.
 
 Neither is ever needed to apply an update. `./setup.sh` brings an existing
 install to whatever the code now says: the schema, the images, the manifests,
-the ingress and gateway controllers, and the object store's container. The one
-thing it never does on its own is rebuild the cluster: when the cluster's
-shape or your `kind` version has moved, it stops and asks for
-`--rebuild-cluster`, because every project's own database lives inside the
+the ingress and gateway controllers, and the object store's container. When
+the cluster's shape or your `kind` version has moved, it rebuilds the cluster
+too, and says so first, because every project's own database lives inside the
 cluster's node and dies with it. Your system database survives a rebuild
 either way; its files live in `~/.local/share/weft/postgres-data` rather than
 inside the cluster.

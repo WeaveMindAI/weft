@@ -58,6 +58,16 @@
     }
   ],
   "requires_infra": false,
+  "firesWith": {
+    "content?": "String",
+    "from?": "String",
+    "pushName?": "String",
+    "messageId?": "String",
+    "timestamp?": "Number",
+    "isGroup?": "Boolean",
+    "chatId?": "String",
+    "messageType?": "String"
+  },
   "features": {
     "isTrigger": true
   }

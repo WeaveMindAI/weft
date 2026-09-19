@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft_core::frames::Located;
-use weft_core::project::{infra_places, trigger_ids, trigger_places};
+use weft_core::project::{infra_places, trigger_places};
 use weft_core::ProjectDefinition;
 
 use crate::authenticator::{authorize_project, CallerTenant};
@@ -409,20 +409,41 @@ pub async fn remove(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("remove: {e}")))?;
     if removed {
-        // The journal keeps this project's runs on purpose, so what
-        // describes those runs stays with them: the code each one ran,
-        // and its row in the version tree. Everything nothing points at
-        // goes now.
+        // Removing a project erases its history. The project row and
+        // its version tree went with `remove`; this takes the runs
+        // themselves, every event and every recorded value, so the
+        // space comes back. What a person keeps is what they still
+        // have: their files on disk.
+        //
+        // Keeping the runs is the shape this used to have and it was
+        // the worst of both: the tree row that said which version a run
+        // was on had already gone, so what survived was less readable
+        // than before AND still took the space. There is also no way
+        // back to it: `rm` cannot run again with the project row gone,
+        // and `weft clean` has no project to clean.
+        match state.journal.delete_project_executions(&id.to_string()).await {
+            Ok(erased) => tracing::info!(
+                target: "weft_dispatcher::project",
+                project_id = %id, executions = erased,
+                "erased the removed project's executions"
+            ),
+            // Logged, not fatal: the project is already gone, and
+            // answering an error would tell the user the removal failed
+            // when it did not. The rows left behind are unreachable
+            // rather than dangerous, and they are what the reaper's
+            // sweep is for.
+            Err(e) => tracing::warn!(
+                target: "weft_dispatcher::project",
+                project_id = %id, error = %e,
+                "could not erase the removed project's executions; the reaper will retry"
+            ),
+        }
         if let Err(e) = retire_what_no_run_needs(&state, &id.to_string()).await {
-            // Logged, not fatal: the removal has happened. The reaper's
-            // `retired_rows` sweep comes back for whatever is left, which
-            // is what keeps this from being junk nobody can ever reach
-            // (the project row is gone, so `rm` will not run again, and
-            // with no runs left neither will `weft clean`).
+            // Same reasoning: logged, not fatal, the reaper retries.
             tracing::warn!(
                 target: "weft_dispatcher::project",
                 project_id = %id, error = %e,
-                "could not retire what no surviving run needs; the reaper will retry"
+                "could not retire what the removed project left behind; the reaper will retry"
             );
         }
         Ok(StatusCode::NO_CONTENT)
@@ -433,21 +454,24 @@ pub async fn remove(
     }
 }
 
-/// Drop everything a REMOVED project left behind that no surviving run
-/// needs: the programs those runs were started against, and their rows in
-/// the version tree.
+/// Drop what a REMOVED project left behind that no surviving run needs:
+/// the programs those runs were started against, and their rows in the
+/// version tree.
 ///
-/// Both halves, because they describe the same surviving run. The program
-/// is what its inputs and outputs are derived from, and the tree row is
-/// which version it was on, what it inherited, which example it checked
-/// and what the check concluded. Keeping one and dropping the other left
-/// a run half-readable.
+/// On the ordinary removal path this finds nothing, and that is the
+/// point rather than a waste. A removal takes the project, its whole
+/// tree and every one of its executions, so there is no survivor left
+/// to need anything. What this is for is a removal that failed halfway:
+/// each of those three steps can fail on its own, and once the project
+/// row is gone nothing else can reach what they left (`weft rm` refuses
+/// a project it cannot find, and `weft clean` needs a project). Without
+/// this and the reaper sweep behind it, one transient failure would
+/// keep those rows for good.
 ///
-/// Callers: the removal itself, `weft clean` (which may have just deleted
-/// the last run that needed either), and the reaper's periodic sweep,
-/// which is what makes a failure here recoverable rather than permanent
-/// junk. On a project that still exists both stores keep everything, so
-/// calling it there is a no-op rather than a mistake.
+/// Callers: the removal itself, `weft clean` (which may have just
+/// deleted the last run that needed either), and the reaper's periodic
+/// sweep. On a project that still exists both stores keep everything,
+/// so calling it there is a no-op rather than a mistake.
 pub(crate) async fn retire_what_no_run_needs(
     state: &DispatcherState,
     project_id: &str,
@@ -632,11 +656,49 @@ pub(crate) async fn non_terminal_infra_setup_colors(
 }
 
 /// Whether an InfraSetup provisioning execution is in flight.
+/// Is an infra setup genuinely in flight, or only RECORDED as one?
+///
+/// A setup that no worker will ever advance is not in flight, and the
+/// difference matters because this answer refuses a new start. An
+/// interrupted one leaves a run with no terminal event, nothing ages it
+/// out, and every later start then collides with a run that is over:
+/// the project can never bring its infrastructure up again, and the
+/// only way out is a person noticing and cancelling by hand. That
+/// wedged a real project, twice.
+///
+/// So a recorded setup whose worker is gone is ENDED here, on the way
+/// past, rather than believed. Cancelling it is honest (it is what the
+/// interruption meant to do) and it lands the terminal event the
+/// journal was missing, which is what lets the next start through.
 pub(crate) async fn infra_setup_in_flight(
     state: &DispatcherState,
     project_id: &str,
 ) -> anyhow::Result<bool> {
-    Ok(!non_terminal_infra_setup_colors(state, project_id).await?.is_empty())
+    let colors = non_terminal_infra_setup_colors(state, project_id).await?;
+    if colors.is_empty() {
+        return Ok(false);
+    }
+    let mut alive = false;
+    for color in colors {
+        if crate::api::execution::execution_is_being_worked_on(state, color).await? {
+            alive = true;
+            continue;
+        }
+        tracing::warn!(
+            target: "weft_dispatcher::infra_setup",
+            project_id, %color,
+            "an infra setup is recorded as running but nothing is working on it \
+             (an earlier start was interrupted); ending it so this project can \
+             provision again"
+        );
+        crate::api::execution::cancel_color(
+            state,
+            color,
+            &weft_core::exec::CancelCause::User,
+        )
+        .await?;
+    }
+    Ok(alive)
 }
 
 /// A started InfraSetup sub-execution: the color to await plus the
@@ -669,7 +731,7 @@ async fn start_queued_execution(
 ) -> Result<(), (StatusCode, String)> {
     let id = project_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("project id: {e}")))?;
     let source_version = super::versions::record_program_source(state, id, program).await?;
-    start_queued_execution_with(state, color, project_id, phase, entry_node, kicks, &[], program, subgraph, seed, expected_activation, Some(&source_version))
+    start_queued_execution_with(state, color, project_id, phase, entry_node, kicks, &[], program, subgraph, seed, expected_activation, Some(&source_version), None)
         .await
 }
 
@@ -698,6 +760,10 @@ pub(crate) async fn start_queued_execution_with(
     seed: Option<weft_journal::Seed>,
     expected_activation: Option<weft_core::Color>,
     source_version: Option<&str>,
+    // Set only when this run FIRES a caller trigger: the request it
+    // serves and the body that stands in for a socket nobody opened.
+    // `None` for every other run, which is almost all of them.
+    live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
 ) -> Result<(), (StatusCode, String)> {
     let now = crate::lease::now_unix() as u64;
     let definition_hash = &program.definition_hash;
@@ -714,7 +780,7 @@ pub(crate) async fn start_queued_execution_with(
         &program.binary_hash,
         Some(tenant.as_str()),
         None,
-        None,
+        live_connection,
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execute task spec: {e}")))?;
     let (start, mut kick_events) =
@@ -857,6 +923,8 @@ pub async fn start_infra_setup(
         None,
         None,
         Some(&source_version),
+        // An infra setup answers nobody.
+        None,
     )
     .await?;
     Ok(Some(InfraSetupRun { color, events, project_id }))
@@ -881,6 +949,32 @@ pub async fn await_infra_setup(
     loop {
         tokio::select! {
             _ = breadcrumb.tick() => {
+                // The journal is authoritative, and the bus is not: a
+                // terminal event raised while nothing was subscribed
+                // (this waiter replacing an earlier one, a dispatcher
+                // restart mid-wait) never reaches the arm below, and
+                // waiting on it is waiting for a message that has
+                // already been and gone. That is how a start left
+                // behind by an interrupted one wedged a project for
+                // ever: the run was over, and the only thing that did
+                // not know was the waiter.
+                match crate::api::execution::terminal_outcome(&state.pg_pool, color).await {
+                    Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => return Ok(()),
+                    Ok(Some(crate::api::execution::TerminalOutcome::Cancelled)) => {
+                        return Err((StatusCode::CONFLICT, "infra setup cancelled".into()))
+                    }
+                    Ok(Some(_)) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "infra setup failed".into(),
+                        ))
+                    }
+                    // Genuinely still in flight, or the lookup itself
+                    // failed (which is not this wait's to report: the
+                    // breadcrumb below keeps the state legible and the
+                    // next tick tries again).
+                    Ok(None) | Err(_) => {}
+                }
                 tracing::info!(
                     target: "weft_dispatcher::infra_setup",
                     project_id = %project_id,
@@ -1005,9 +1099,12 @@ pub fn compute_trigger_fire(
     port_snapshot: Option<&Value>,
 ) -> Result<TriggerFire, String> {
     // All trigger nodes register signals during TriggerSetup; that set
-    // is what fires route to.
-    let triggers: HashSet<String> = trigger_ids(project).into_iter().collect();
-    if !triggers.contains(firing_node_id) {
+    // is what fires route to. A fire names the trigger by its address
+    // (`door`, or `one.door` for the `door` inside the file the site
+    // `one` includes), which resolves to the node and the call path
+    // its kick runs under.
+    let (fired, path) = weft_core::project::resolve_address(project, firing_node_id);
+    if !project.nodes.iter().any(|node| node.id == fired && node.features.is_trigger) {
         return Err(format!("'{firing_node_id}' is not a trigger"));
     }
 
@@ -1022,7 +1119,6 @@ pub fn compute_trigger_fire(
         &weft_core::project::selection::SelectionBounds {
             fire: Some(firing_node_id.into()), ..Default::default()
         })?;
-    let (fired, path) = weft_core::project::resolve_address(project, firing_node_id);
     let kicks = Kick::for_selection(project, &selection, Some((&Located::new(fired, path), payload)), port_snapshot);
     Ok(TriggerFire { kicks, subgraph: selection })
 }
@@ -1157,7 +1253,14 @@ pub struct ProjectDrift {
 
 #[derive(Debug, Serialize)]
 pub struct ProjectInfraEntry {
+    /// The runtime's key for the node, which the editor matches against
+    /// the canvas and sends back on an action. For a node inside an
+    /// included file it carries the file's path (`@src:lib:db.store`),
+    /// so it is a key and never a label.
     pub node_id: String,
+    /// The same node the way the PROGRAM spells it, which is what a
+    /// person is shown (`weft status`, `weft infra status`).
+    pub node: String,
     /// Infra node type (e.g. "whatsapp_bridge"). Sourced from the
     /// project definition so the extension can decorate the node
     /// without re-parsing the source.
@@ -1170,12 +1273,26 @@ pub struct ProjectInfraEntry {
     pub failure_message: Option<String>,
 }
 
+// SYNC: ProjectExecutionsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.executions
 #[derive(Debug, Serialize)]
 pub struct ProjectExecutionsSummary {
     pub total: usize,
     pub last_completed_at: Option<u64>,
     pub last_color: Option<String>,
     pub last_status: Option<String>,
+    /// Every execution running right now (suspended ones excluded),
+    /// the same set `running_count` counts. The editor REPLACES its
+    /// own running set with this on every status refresh: the live
+    /// stream is the fast path, this is the reconciliation, so a
+    /// terminal event lost to a dropped stream never leaves a Stop
+    /// button on a run that ended.
+    ///
+    /// OLDEST FIRST, so the last one is the most recently started.
+    /// That is part of the contract, not an accident: the editor's
+    /// action bar follows "the latest run" and nothing else here says
+    /// which that is. A queued run with no journal row yet sorts last,
+    /// which is right, it is the newest thing in the list.
+    pub running_colors: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1330,6 +1447,7 @@ pub async fn status(
         };
         infra.push(ProjectInfraEntry {
             node_id: row.node_id.clone(),
+            node: weft_core::project::plain_id(&row.node_id),
             node_type,
             status: row.status.as_str().to_string(),
             // Coarse UI hint: first endpoint by name (BTreeMap = stable).
@@ -1356,16 +1474,27 @@ pub async fn status(
                 started_after: None,
                 started_before: None,
                 phase: None,
+                entry_node: None,
+                status: None,
             },
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     let last = execs.executions.first();
+    let (running, _) = running_colors(&state, &project_id, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_colors: {e}")))?;
+    // Oldest first, so the LAST is the most recently started. The
+    // editor's action bar follows "the latest run" and nothing else on
+    // the wire says which that is; sorting these by id, as this used
+    // to, made "latest" mean whichever uuid happened to sort highest.
+    let running_colors: Vec<String> = running.iter().map(|c| c.to_string()).collect();
     let executions = ProjectExecutionsSummary {
         total: execs.total as usize,
         last_completed_at: last.and_then(|l| l.completed_at),
         last_color: last.map(|l| l.color.to_string()),
         last_status: last.map(|l| l.status.clone()),
+        running_colors,
     };
 
     let binary_hash = state
@@ -2131,7 +2260,7 @@ async fn activate_trigger_setup_window(
                     spec: capture.spec.clone(), is_resume: false, call_index: 0,
                     port_snapshot: Some(capture.ports.clone()),
                 }).await.map_err(|error| ActivateWindowError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{node_id}': {error:#}"),
+                    status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{}': {error:#}", weft_core::project::plain_id(node_id)),
                     rollback: ActivateRollback::WipeSignals,
                 })?;
         }
@@ -3098,7 +3227,7 @@ pub async fn resync(
         ));
     };
     execute_trigger_deactivation(&state, id, spec).await?;
-    if spec.running_policy == crate::infra_lifecycle_command::RunningPolicy::Wait {
+    if spec.drains() {
         // Wait for the drain through THE shared loop, capped at
         // the spec's cap; stragglers past it are cancelled with
         // the ONE cancel helper, and the ONE landing CAS flips
@@ -3427,11 +3556,22 @@ pub async fn deactivate_project(
 /// `running_policy` ∈ {cancel, wait}:
 ///   - `cancel`: cancel running (non-suspended) executions
 ///               immediately, then flip status straight to Inactive.
-///   - `wait`:   leave running executions to drain. Status is set
-///               to Deactivating; the journal-bridge CASes it to
-///               Inactive once `running_count = 0`: see
-///               `journal_bridge::terminal_cleanup`. Hibernate /
-///               park + wait leave suspended executions alone.
+///   - `wait`:   leave running executions to drain, under HIBERNATE
+///               and PARK alike. Status is set to Deactivating; the
+///               journal-bridge CASes it to Inactive once
+///               `running_count = 0` (see
+///               `journal_bridge::terminal_cleanup`), and the
+///               stuck-transition reaper cancels whatever is still
+///               running at the cap. `DeactivateSpec::drains` is the
+///               one answer, shared with `resync`.
+///
+/// The mode has no say in that: the two are separate questions. The
+/// mode is about the SUSPENDED fires and the door (drop them, keep
+/// them hidden, keep them and stay visible); the policy is about what
+/// is RUNNING right now. Somebody who picked `wait` asked the second
+/// question and gets a wait whichever mode they picked.
+///
+/// Either preservation mode leaves SUSPENDED executions alone.
 ///
 /// `wait` is only ever paired with hibernate / park. Wipe is always
 /// paired with cancel (the only producers are the supervisor's
@@ -3549,7 +3689,12 @@ pub async fn deactivate_project_with_mode(
     // running set empties. Wipe never reaches the wait branch:
     // upstream rejects (mode=wipe, running_policy=wait).
     use crate::infra_lifecycle_command::RunningPolicy;
-    let lifecycle_to_set = if running_policy == RunningPolicy::Wait {
+    // One answer to "does this wait?", shared with `resync`: the
+    // policy decides it and the mode has no say (see
+    // `DeactivateSpec::drains`). Wipe never reaches here with `wait`,
+    // which the spec's own validator refuses.
+    let drains = running_policy == RunningPolicy::Wait;
+    let lifecycle_to_set = if drains {
         // The user's drain cap ("wait at most N, then proceed", same
         // semantics as the infra drains): past the deadline the
         // stuck-transition reaper cancels the remaining executions
@@ -3561,11 +3706,13 @@ pub async fn deactivate_project_with_mode(
             ),
             ..ProjectLifecycle::deactivating_to(target)
         }
-    } else if mode != DeactivationMode::Wipe {
+    } else if running_policy == RunningPolicy::Cancel && mode != DeactivationMode::Wipe {
         cancel_running_non_suspended(state, &project_id, None).await?;
         target
     } else {
-        // wipe + cancel: rows + executions already gone above.
+        // Park + wait leaves the running executions exactly as they
+        // are, and wipe + cancel already dropped its rows and
+        // executions above: either way the row lands now.
         target
     };
 
@@ -3607,7 +3754,7 @@ pub async fn deactivate_project_with_mode(
         let running_now = running_count(state, &project_id, None)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
-        if running_policy == RunningPolicy::Wait
+        if drains
             && lifecycle_to_set.status == ProjectStatus::Deactivating
             && running_now == 0
         {
@@ -3861,6 +4008,20 @@ pub(crate) async fn running_count(
     project_id: &str,
     exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<usize> {
+    let (running, colorless) = running_colors(state, project_id, exclude_task).await?;
+    Ok(running.len() + colorless)
+}
+
+/// The executions running right now: every non-terminal, non-suspended
+/// color the journal knows, plus the colors of live tasks (a queued run
+/// is running as far as a person is concerned), and beside them the
+/// count of live tasks that have no color yet (a run about to be born,
+/// counted but not nameable).
+pub(crate) async fn running_colors(
+    state: &DispatcherState,
+    project_id: &str,
+    exclude_task: Option<uuid::Uuid>,
+) -> anyhow::Result<(Vec<weft_core::Color>, usize)> {
     let suspended_colors = suspended_color_set(state, project_id).await?;
     let colors = state
         .journal
@@ -3875,7 +4036,10 @@ pub(crate) async fn running_count(
         .journal
         .list_terminal_colors_for_project(project_id)
         .await?;
-    let mut running: std::collections::HashSet<weft_core::Color> = colors
+    // A Vec, not a set, and the journal's own order is kept: oldest
+    // first, so the last is the most recently started. The editor reads
+    // it that way and a set would throw that away.
+    let mut running: Vec<weft_core::Color> = colors
         .into_iter()
         .filter(|c| !suspended_colors.contains(c))
         .collect();
@@ -3903,12 +4067,17 @@ pub(crate) async fn running_count(
                 if terminal_colors.contains(&parsed) || suspended_colors.contains(&parsed) {
                     continue;
                 }
-                running.insert(parsed);
+                // A queued run has no journal row yet, so it has no
+                // start time to sort by and belongs after everything
+                // that has one: it is the newest thing here.
+                if !running.contains(&parsed) {
+                    running.push(parsed);
+                }
             }
             None => colorless += 1,
         }
     }
-    Ok(running.len() + colorless)
+    Ok((running, colorless))
 }
 
 /// Spawn a worker for the TriggerSetup sub-execution and block

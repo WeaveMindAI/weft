@@ -18,7 +18,7 @@ use weft_broker_client::protocol::{
 pub async fn signals_held_by_pod(pool: &PgPool, pod_name: &str) -> anyhow::Result<Vec<SignalRowWire>> {
     let rows = sqlx::query(
         "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.color, \
-                s.surface_kind, s.mount_path, s.auth_kind, s.auth_config, \
+                s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
                 s.kind_state, s.kind_state_seq, s.placement_generation \
          FROM signal s JOIN project p ON p.id::TEXT = s.project_id \
          WHERE s.listener_pod = $1 AND p.status = ANY($2)",
@@ -47,6 +47,7 @@ pub async fn signals_held_by_pod(pool: &PgPool, pod_name: &str) -> anyhow::Resul
                 color: r.try_get("color")?,
                 surface_kind,
                 mount_path: r.try_get("mount_path")?,
+                mount_methods: r.try_get("mount_methods")?,
                 auth_kind,
                 auth_config: r.try_get("auth_config")?,
                 kind_state: r.try_get("kind_state")?,

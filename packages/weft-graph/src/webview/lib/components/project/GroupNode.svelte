@@ -2,7 +2,6 @@
 	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { isLoopNodeType, containerHasConfigStrip } from "../../types";
-	import { NODE_TYPE_CONFIG } from '../../nodes';
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx, expandedContainerMinPx } from "../../constants/container-layout";
@@ -14,9 +13,9 @@
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
-	import { SHOULD_FLOW_PORT } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from "../../../../protocol";
 	import FieldStrip from './FieldStrip.svelte';
-	import { LOOP_CONFIG_FIELDS, fieldForInput, nextPortLiterals, shouldFlowField } from '../../utils/input-field';
+	import { LOOP_CONFIG_FIELDS, fieldForInput, gateField, nextPortLiterals } from '../../utils/input-field';
 
 	// Group interface ports cannot take a body-set literal (see the rule
 	// enforced in enrichment's validate_required_ports). Pass an empty set to
@@ -34,13 +33,20 @@
 			simplified?: boolean;
 			config: Record<string, unknown>;
 			/// Body-set PORT values. A container's only entry today is
-			/// `_should_flow`, written as a literal in its braces.
+			/// its gate (`_should_flow` or `_should_not_flow`, whichever
+			/// spelling it carries), written as a literal in its braces.
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			onUpdate?: (updates: NodeDataUpdates) => void;
+			/// Flip the gate between `_should_flow` and
+			/// `_should_not_flow`. Its own hook rather than a
+			/// `NodeDataUpdates` field: the gesture moves a wire, which
+			/// the config classifier has no shape for. Absent on a
+			/// read-only view, which hides the gesture instead of
+			/// offering a dead one.
+			onToggleGate?: () => void;
 			executions?: NodeExecution[];
-			executionCount?: number;
 			/// Aggregated IRC logs over every node inside this group:
 			/// one entry per bus any member node touched. Empty `[]`
 			/// when no member node has used a bus.
@@ -76,8 +82,16 @@
 	// ports. Filled means something answers it: a wire, or a literal
 	// written in the braces.
 	const flowConnected = $derived(
-		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_FLOW_PORT)
+		edgesState.current.some((e) => e.target === id && isGatePort(e.targetHandle ?? ''))
 			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_FLOW_PORT] !== undefined
+			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
+	);
+	/// Which way round this container's gate reads. A container gates
+	/// everything inside it, so the inverted spelling means the whole
+	/// group runs when the thing wired here did not happen.
+	const flowInverted = $derived(
+		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_NOT_FLOW_PORT)
+			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
 	);
 	const outputs = $derived((data.outputs ?? []) as PortDefinition[]);
 	// Simplified view draws a dot only when an edge attaches to it: structure
@@ -141,7 +155,7 @@
 	/// spells out.
 	const portFields: FieldDefinition[] = $derived(
 		Object.keys(portLiterals).map((key) => {
-			if (key === SHOULD_FLOW_PORT) return shouldFlowField('container');
+			if (isGatePort(key)) return gateField(key, 'container');
 			const port = inputs.find((p) => p.name === key);
 			return port
 				? fieldForInput(port)
@@ -541,7 +555,13 @@
 </script>
 
 {#snippet flowDock(topPx: number)}
-	<FlowDock top={topPx} subject={isLoop ? 'loop' : 'group'} connected={flowConnected} />
+	<FlowDock
+		top={topPx}
+		subject={isLoop ? 'loop' : 'group'}
+		connected={flowConnected}
+		inverted={flowInverted}
+		onToggle={data.onToggleGate}
+	/>
 {/snippet}
 
 {#if isExpanded}

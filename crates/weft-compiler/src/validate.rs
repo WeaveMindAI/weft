@@ -9,7 +9,7 @@
 use weft_core::node::{
     Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
 };
-use weft_core::exec::skip::SHOULD_FLOW_PORT;
+
 use weft_core::project::{NodeDefinition, Span};
 use weft_core::weft_type::WeftType;
 use weft_core::ProjectDefinition;
@@ -69,6 +69,7 @@ fn validate_scoped(
     check_config_derived_ports(project, catalog, &mut d);
     check_loop_config(project, &mut d);
     check_double_driven_ports(project, &mut d);
+    check_two_gates(project, &mut d);
     check_warnings(project, &mut d);
     check_level_sizes(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
@@ -76,7 +77,175 @@ fn validate_scoped(
     check_graph_shape(project, &mut d);
     check_generator_wiring(project, &mut d);
     check_named_type_conflicts(project, &mut d);
+    check_route_claims(project, catalog, &mut d);
     d
+}
+
+/// route-overlap: two nodes of this program claim public addresses a
+/// single call could reach, and neither is the more specific, so which
+/// one answers has no answer. A pair where one IS more specific is
+/// fine and common (`cards/count` beside `cards/{id}`): the literal
+/// takes the call it spells out, the capture takes the rest.
+///
+/// The same question is asked again at activation, across every project
+/// of the account, because only the dispatcher's table knows what the
+/// author's OTHER programs already serve. What is answerable here is
+/// the half inside one file, and answering it here is worth it: the
+/// editor underlines it while you type instead of a deploy failing
+/// minutes later on `cards/{id}` against `cards/{slug}`.
+///
+/// Nothing here knows what a Route is. A node type says which of its
+/// config fields hold the address (`claimsRoute`), and route patterns
+/// are the language's own vocabulary, so the rule reads the same for
+/// Socket or anything else that ever mounts a path.
+fn check_route_claims(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    d: &mut Vec<Diagnostic>,
+) {
+    use weft_core::route::{compare_patterns, methods_overlap, PatternOrder, RoutePattern};
+
+    // Every claim this program makes, in source order.
+    //
+    // A path that is WIRED is skipped: it is computed when the trigger
+    // sets up, so there is no address here to read or to compare. A path
+    // that is simply not written is NOT skipped, because at run time an
+    // absent path is the root of the project's address, which means two
+    // triggers that both forgot one both claim it and the second dies at
+    // activation. Refused here instead, where the person can see it.
+    //
+    // A path or a method that IS written and does not parse is reported
+    // here, because this is the only place either is read at compile
+    // time. Letting them through would ship a program that dies at
+    // `weft activate`, and a bad method is worse than late: an empty
+    // method list reads as "any method", so a typo would silently widen
+    // what the node claims.
+    let mut claims: Vec<(&NodeDefinition, &str, RoutePattern, Vec<String>)> = Vec::new();
+    for node in &project.nodes {
+        let Some(spec) = catalog
+            .lookup(&node.node_type)
+            .and_then(|entry| entry.claims_route.as_ref())
+        else {
+            continue;
+        };
+        let written = node.written_value(&spec.path_field);
+        let raw = match written.map(|value| value.as_str()) {
+            Some(Some(raw)) => raw,
+            // Written, but not text. The config type rules name that.
+            Some(None) => continue,
+            None => {
+                if has_incoming_edge(node, project, &spec.path_field) {
+                    continue;
+                }
+                cfg_push(
+                    d,
+                    node,
+                    &spec.path_field,
+                    Severity::Error,
+                    "route-path-missing",
+                    format!(
+                        "'{}' has no address, so it would answer at the project's own \
+                         address and collide with anything else that did. Give it a \
+                         `{}` (`hooks/stripe`, `chat/{{room}}`)",
+                        author_name(node),
+                        spec.path_field
+                    ),
+                );
+                continue;
+            }
+        };
+        if raw.trim().is_empty() {
+            cfg_push(
+                d,
+                node,
+                &spec.path_field,
+                Severity::Error,
+                "route-path-missing",
+                format!(
+                    "'{}' has an empty address, so it would answer at the project's own \
+                     address and collide with anything else that did. Give it a `{}` \
+                     (`hooks/stripe`, `chat/{{room}}`)",
+                    author_name(node),
+                    spec.path_field
+                ),
+            );
+            continue;
+        }
+        let pattern = match RoutePattern::parse(raw) {
+            Ok(pattern) => pattern,
+            Err(why) => {
+                cfg_push(
+                    d,
+                    node,
+                    &spec.path_field,
+                    Severity::Error,
+                    "route-path-invalid",
+                    format!("'{}' cannot be served: {why}", author_name(node)),
+                );
+                continue;
+            }
+        };
+        let written_method = spec
+            .method_field
+            .as_deref()
+            .and_then(|field| node.written_value(field))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|method| !method.is_empty());
+        let mut methods = Vec::new();
+        if let Some(method) = written_method {
+            match weft_core::route::normalize_method(method) {
+                Ok(method) => methods.push(method),
+                Err(why) => {
+                    cfg_push(
+                        d,
+                        node,
+                        spec.method_field.as_deref().unwrap_or(&spec.path_field),
+                        Severity::Error,
+                        "route-method-unknown",
+                        format!("'{}' cannot be served: {why}", author_name(node)),
+                    );
+                    continue;
+                }
+            }
+        }
+        claims.push((node, spec.path_field.as_str(), pattern, methods));
+    }
+
+    // Each colliding pair reported once, on the SECOND of the two: the
+    // first claim is the one that was already there, so the finding
+    // sits where the author just typed.
+    for (index, (node, field, pattern, methods)) in claims.iter().enumerate() {
+        for (earlier, _, earlier_pattern, earlier_methods) in &claims[..index] {
+            // Two patterns a call can reach are fine when one of them
+            // is the more specific: that one takes the calls it spells
+            // out and the other takes the rest. Only the pair where
+            // neither wins leaves a call with no answer.
+            if compare_patterns(pattern, earlier_pattern) != PatternOrder::Ambiguous
+                || !methods_overlap(methods, earlier_methods)
+            {
+                continue;
+            }
+            cfg_push(
+                d,
+                node,
+                field,
+                Severity::Error,
+                "route-overlap",
+                format!(
+                    "'{}' serves '{}' and '{}' serves '{}'. A call can reach either, and \
+                     neither is the more specific, so there is no answer to give. One of \
+                     them has to spell out what the other captures (a literal segment \
+                     where the other has '{{name}}'), or they need different paths or \
+                     different methods",
+                    author_name(node),
+                    pattern.as_str(),
+                    author_name(earlier),
+                    earlier_pattern.as_str(),
+                ),
+            );
+        }
+    }
 }
 
 /// named-type-conflict: nominal compatibility compares the NAME alone
@@ -686,8 +855,8 @@ fn check_declarative_rules(
             {
                 continue;
             }
-            if eval_condition(&rule.when, node, project) {
-                emit_rule_diagnostic(node, rule, out);
+            if eval_condition(&rule.when, node, meta, project) {
+                emit_rule_diagnostic(node, meta, rule, out);
             }
         }
         // Every access node requires a connection BY DEFAULT: declaring a
@@ -698,8 +867,8 @@ fn check_declarative_rules(
         // case: `connection_optional: true` on the recipe.
         if mode == ValidationMode::Runtime {
             if let Some(rule) = implicit_connection_rule(meta, node) {
-                if eval_condition(&rule.when, node, project) {
-                    emit_rule_diagnostic(node, &rule, out);
+                if eval_condition(&rule.when, node, meta, project) {
+                    emit_rule_diagnostic(node, meta, &rule, out);
                 }
             }
         }
@@ -753,10 +922,16 @@ fn implicit_connection_rule(
     })
 }
 
-fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefinition) -> bool {
+fn eval_condition(
+    cond: &Condition,
+    node: &NodeDefinition,
+    meta: &weft_core::node::NodeMetadata,
+    project: &ProjectDefinition,
+) -> bool {
     match cond {
         Condition::InputSatisfied { port } => input_satisfied(node, project, port),
         Condition::InputWired { port } => has_incoming_edge(node, project, port),
+        Condition::OutputWired { port } => has_outgoing_edge(node, project, port),
         Condition::InputSourceType { port, equals } => {
             // Vacuously true if the port has no wired edges (use
             // `all(input_wired, input_source_type)` to require both).
@@ -790,10 +965,70 @@ fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefi
             // than silently evaluating true and suppressing/forcing a diagnostic.
             .and_then(|s| regex::Regex::new(regex).ok().map(|r| r.is_match(s)))
             .unwrap_or(false),
-        Condition::All { of } => of.iter().all(|c| eval_condition(c, node, project)),
-        Condition::Any { of } => of.iter().any(|c| eval_condition(c, node, project)),
-        Condition::Not { of } => !eval_condition(of, node, project),
+        Condition::RunReaches { direction, types } => {
+            run_reaches(node, project, *direction, types)
+        }
+        Condition::CustomOutputsDeclared {} => !custom_outputs(node, meta).is_empty(),
+        Condition::All { of } => of.iter().all(|c| eval_condition(c, node, meta, project)),
+        Condition::Any { of } => of.iter().any(|c| eval_condition(c, node, meta, project)),
+        Condition::Not { of } => !eval_condition(of, node, meta, project),
     }
+}
+
+/// Whether `node` sits in a run with a node of one of `types`, looking
+/// `direction` from it. The run is the same selection a fire computes
+/// (`RunSelection::carve`: forward from the seed, then back for what
+/// that needs), taken at every place the node runs (once per call
+/// site for a node inside an included file). Downstream: every run
+/// seeded at the node holds one of the types. Upstream: every place
+/// of the node is in the run of some node of one of the types. A seed
+/// that cannot be carved (a cut inside a loop) counts as not reaching,
+/// so a malformed program never silences the rule.
+fn run_reaches(
+    node: &NodeDefinition,
+    project: &ProjectDefinition,
+    direction: weft_core::node::RunDirection,
+    types: &[String],
+) -> bool {
+    use weft_core::node::RunDirection;
+    use weft_core::frames::Located;
+    use weft_core::project::selection::{every_place, RunSelection, SelectionBounds};
+    let of_type = |place: &Located| {
+        project.nodes.iter().any(|n| n.id == place.id && types.contains(&n.node_type))
+    };
+    let program_of = |seed: &Located| -> Option<RunSelection> {
+        let is_trigger = project.nodes.iter().any(|n| n.id == seed.id && n.features.is_trigger);
+        let spelled = weft_core::project::address_of(project, &seed.id, &seed.path);
+        let bounds = if is_trigger {
+            SelectionBounds { fire: Some(spelled), ..Default::default() }
+        } else {
+            SelectionBounds { from: vec![spelled], ..Default::default() }
+        };
+        RunSelection::carve(project, &bounds).ok()
+    };
+    let places: Vec<Located> = every_place(project).into_iter().filter(|place| place.id == node.id).collect();
+    match direction {
+        RunDirection::Downstream => places.iter().all(|place| {
+            program_of(place).is_some_and(|run| run.nodes.iter().any(of_type))
+        }),
+        RunDirection::Upstream => {
+            let seeds: Vec<Located> = every_place(project).into_iter().filter(of_type).collect();
+            places.iter().all(|place| {
+                seeds.iter().any(|seed| program_of(seed).is_some_and(|run| run.nodes.contains(place)))
+            })
+        }
+    }
+}
+
+/// The output ports the source added beyond the metadata's own: after
+/// enrich a node's ports are the catalog's merged with the written
+/// ones, so a name the metadata does not declare is a custom port.
+fn custom_outputs<'a>(node: &'a NodeDefinition, meta: &weft_core::node::NodeMetadata) -> Vec<&'a str> {
+    node.outputs
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|name| !meta.outputs.iter().any(|o| o.name == *name))
+        .collect()
 }
 
 /// Port is "satisfied" if either (a) it has a wired incoming edge, or
@@ -821,6 +1056,13 @@ fn has_incoming_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &
         .any(|e| e.target == node.id && e.target_handle.as_deref() == Some(port))
 }
 
+fn has_outgoing_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
+    project
+        .edges
+        .iter()
+        .any(|e| e.source == node.id && e.source_handle.as_deref() == Some(port))
+}
+
 fn is_nonempty(v: Option<&serde_json::Value>) -> bool {
     match v {
         None | Some(serde_json::Value::Null) => false,
@@ -831,7 +1073,12 @@ fn is_nonempty(v: Option<&serde_json::Value>) -> bool {
     }
 }
 
-fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut Vec<Diagnostic>) {
+fn emit_rule_diagnostic(
+    node: &NodeDefinition,
+    meta: &weft_core::node::NodeMetadata,
+    rule: &ValidationRule,
+    out: &mut Vec<Diagnostic>,
+) {
     let span = node.header_span_or_default();
     let severity = match rule.then.severity {
         RuleSeverity::Error => Severity::Error,
@@ -839,7 +1086,7 @@ fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut 
         RuleSeverity::Info => Severity::Info,
         RuleSeverity::Hint => Severity::Hint,
     };
-    let message = interpolate(&rule.then.message, node, &rule.then);
+    let message = interpolate(&rule.then.message, node, meta, &rule.then);
     let code = match rule.then.level {
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
@@ -847,15 +1094,25 @@ fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut 
     out.push(Diagnostic::at(span, severity, code, message).in_file(node.source_file.as_deref()));
 }
 
-/// Replace `{id}`, `{port}`, `{field}` placeholders in the rule
-/// message with concrete values from the context.
-fn interpolate(template: &str, node: &NodeDefinition, diag: &RuleDiagnostic) -> String {
+/// Replace `{id}`, `{port}`, `{field}` and `{custom_outputs}`
+/// placeholders in the rule message with concrete values from the
+/// context (the last one: the output ports the source added, comma
+/// separated).
+fn interpolate(
+    template: &str,
+    node: &NodeDefinition,
+    meta: &weft_core::node::NodeMetadata,
+    diag: &RuleDiagnostic,
+) -> String {
     let mut s = template.replace("{id}", &node.id);
     if let Some(p) = &diag.port {
         s = s.replace("{port}", p);
     }
     if let Some(f) = &diag.field {
         s = s.replace("{field}", f);
+    }
+    if s.contains("{custom_outputs}") {
+        s = s.replace("{custom_outputs}", &custom_outputs(node, meta).join(", "));
     }
     s
 }
@@ -947,6 +1204,12 @@ fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for node in &project.nodes {
         for name in node.port_literals.keys() {
+            // A `null` literal drives nothing (`literal_fills`), so a
+            // wired port beside `port: null` has ONE driver, not two.
+            // `config-null-literal` is what speaks for the null itself.
+            if !literal_fills(node, name) {
+                continue;
+            }
             let wired = project
                 .edges
                 .iter()
@@ -973,6 +1236,42 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
                     ),
                 );
             }
+        }
+    }
+}
+
+/// two-gates: a node has ONE gate. `_should_flow` and
+/// `_should_not_flow` are the same decision read opposite ways, so a
+/// node carrying both is asking for two answers to one question and
+/// there is no sane rule for combining them. Refused loudly instead of
+/// quietly picking one.
+fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    use weft_core::exec::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
+    for node in &project.nodes {
+        // `literal_fills`, not a raw key lookup: a `null` literal is
+        // nothing, not a gate. `_should_not_flow: null` beside a real
+        // `_should_flow` is ONE gate, and reporting it as two sent the
+        // author looking for a second one that was never there (with
+        // `config-null-literal` already telling them about the null).
+        let driven = |port: &str| {
+            literal_fills(node, port)
+                || project.edges.iter().any(|e| {
+                    e.target == node.id && e.target_handle.as_deref() == Some(port)
+                })
+        };
+        if driven(SHOULD_FLOW_PORT) && driven(SHOULD_NOT_FLOW_PORT) {
+            push(
+                d,
+                node.source_file.as_deref(),
+                node.header_span_or_default(),
+                Severity::Error,
+                "two-gates",
+                format!(
+                    "'{}' has both `_should_flow` and `_should_not_flow`; a node has one gate, \
+                     so keep the one that says what you mean and drop the other",
+                    author_name(node)
+                ),
+            );
         }
     }
 }
@@ -1493,7 +1792,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             {
                 if let Err(why) = input.widget.as_ref().expect("matched above").check_handle_shape(value) {
                     push(d, file, span, Severity::Error, "config-type-mismatch",
-                        format!("config '{}.{}': {why}", node.id, key));
+                        format!("config '{}.{}': {why}", author_name(node), key));
                 }
                 continue;
             }
@@ -1509,7 +1808,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     push(d, file, span, Severity::Error, "config-type-mismatch",
                         format!(
                             "config '{}.{}: {}' incompatible with input type '{}': {}",
-                            node.id, key, inferred, input.port_type, why,
+                            author_name(node), key, inferred, input.port_type, why,
                         ));
                 }
             }
@@ -1526,8 +1825,8 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// input-accepts: a driver the port does not take (a wire on a
 ///   literal-only port, a written value on a wire-only port, or a
 ///   wire or a marker on a compiler-read port).
-/// should-flow-not-boolean: a written `_should_flow` that is not a
-///   Boolean.
+/// gate-not-boolean: a written gate (`_should_flow` or
+///   `_should_not_flow`) that is not a Boolean.
 /// undeclared-port-no-custom: node doesn't support canAddInputPorts
 ///   but config has a key not matching any declared input.
 ///
@@ -1646,10 +1945,11 @@ fn check_port_coverage(
                 );
             }
 
-            // should-flow-not-boolean: `_should_flow` is the language's
-            // gate, and a constant written for it is a Boolean or a type
-            // error (a wire may carry anything; the run reads it).
-            if input.name == SHOULD_FLOW_PORT {
+            // gate-not-boolean: either spelling of the gate is the
+            // language's own, and a constant written for one is a
+            // Boolean or a type error (a wire may carry anything; the
+            // run reads it).
+            if weft_core::exec::skip::is_gate_port(&input.name) {
                 if let Some(v) = literal.filter(|v| !v.is_boolean()) {
                     let (lit_file, lit_span) = literal_anchor();
                     push(
@@ -1657,11 +1957,11 @@ fn check_port_coverage(
                         lit_file,
                         lit_span,
                         Severity::Error,
-                        "should-flow-not-boolean",
+                        "gate-not-boolean",
                         format!(
-                            "'{}._should_flow: {}' is not a Boolean; written down, `_should_flow` \
-                             is `true` or `false` (a wire may carry any value)",
-                            author_name(node), crate::file_ref::literal_type(v)
+                            "'{}.{}: {}' is not a Boolean; written down, a gate is `true` or \
+                             `false` (a wire may carry any value)",
+                            author_name(node), input.name, crate::file_ref::literal_type(v)
                         ),
                     );
                 }
@@ -1739,7 +2039,7 @@ fn check_port_coverage(
                 let available: Vec<&str> = node
                     .inputs
                     .iter()
-                    .filter(|p| p.name != SHOULD_FLOW_PORT)
+                    .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
                     .map(|p| p.name.as_str())
                     .collect();
                 push(
@@ -1829,7 +2129,7 @@ fn check_port_coverage(
                         format!(
                             "node '{}': '{}' is an output port, and an output takes no value: \
                              a firing emits on it. Read it with `{}.{}`",
-                            node.id, key, node.id, key
+                            author_name(node), key, author_name(node), key
                         ),
                     );
                     continue;
@@ -1842,7 +2142,7 @@ fn check_port_coverage(
                     "undeclared-port-no-custom",
                     format!(
                         "node '{}' does not accept custom inputs; config key '{}' names no declared input",
-                        node.id, key
+                        author_name(node), key
                     ),
                 );
             }
@@ -2612,6 +2912,12 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if node.group_boundary.is_some() {
             continue;
         }
+        // A trigger fires on its event, never on its inputs (they are
+        // settings read at setup), so "runs even when every input is
+        // null" describes exactly what a trigger does on purpose.
+        if node.features.is_trigger {
+            continue;
+        }
         let name = author_name(node);
         let span = node.header_span_or_default();
         let file = node.source_file.as_deref();
@@ -2627,16 +2933,25 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // built from constants alone (an inline `LlmParams`) never
         // warns. Nor does `_should_flow` count, which every node
         // carries: it is permission, not the data the warning is about.
+        // And a node whose gate IS wired never warns at all: the author
+        // already said when it runs (a Switch's failing case gating a
+        // Close), which is the very decision the warning asks for, and
+        // a gate fed from a branch that did not run closes the node
+        // with it.
+        let gated = wired_ports
+            .get(node.id.as_str())
+            .is_some_and(|w| w.iter().any(|p| weft_core::exec::skip::is_gate_port(p)));
         let wired: Vec<_> = node
             .inputs
             .iter()
-            .filter(|p| p.name != SHOULD_FLOW_PORT)
+            .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
             .filter(|p| wired_ports.get(node.id.as_str()).is_some_and(|w| w.contains(p.name.as_str())))
             .collect();
         // A node whose created inputs are optional BY NATURE (a join,
         // which exists to run on whichever branch survived) is the one
         // shape this warning's advice is wrong for.
-        if !wired.is_empty()
+        if !gated
+            && !wired.is_empty()
             && !node.outputs.is_empty()
             && wired.iter().all(|p| !p.required)
             && !node.features.optional_custom_inputs
@@ -2921,3 +3236,4 @@ mod validation_mode_wire_tests {
         }
     }
 }
+

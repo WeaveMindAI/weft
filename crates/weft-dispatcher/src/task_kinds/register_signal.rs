@@ -47,20 +47,22 @@ pub struct RegisterSignalPayload {
 pub struct RegisterSignalExecutor;
 
 /// The stored mount path for a public-entry surface, namespaced by the owning
-/// tenant: `/<tenant>/<path>`. The tenant prefix walls each account into its own
-/// path space, so two tenants can both claim `chat` without colliding, and one
-/// tenant claiming a path never blocks another (the old global unique index
-/// did both wrong). Callers reach it at `/connect/<tenant>/<path>` (live) or
-/// `POST /<tenant>/<path>` (public fire), the tenant segment is in the URL.
-/// A guessable URL is fine here: live/public endpoints are API surfaces whose
-/// callers bring their own auth; the tenant prefix is for COLLISION, not
-/// secrecy.
+/// tenant: `/<tenant>/<pattern>`. The tenant prefix walls each account into
+/// its own path space, so two tenants can both claim `chat` without
+/// colliding, and one tenant claiming a path never blocks another (the old
+/// global unique index did both wrong). Callers reach it at
+/// `/connect/<tenant>/<path>` (live) or `POST /<tenant>/<path>` (public
+/// fire), the tenant segment is in the URL. A guessable URL is fine here:
+/// live/public endpoints are API surfaces whose callers bring their own
+/// auth; the tenant prefix is for COLLISION, not secrecy. The path is a
+/// route PATTERN (`chat/{room}`), stored as written; the dispatcher matches
+/// calls against it in Rust.
 fn mount_path_for(
     surface: &weft_core::primitive::SignalSurface,
     tenant: &str,
 ) -> Option<String> {
     match surface {
-        weft_core::primitive::SignalSurface::PublicEntry { path } => {
+        weft_core::primitive::SignalSurface::PublicEntry { path, .. } => {
             let path = path.trim_start_matches('/');
             Some(if path.is_empty() {
                 format!("/{tenant}")
@@ -71,6 +73,111 @@ fn mount_path_for(
         weft_core::primitive::SignalSurface::TaskCallback
         | weft_core::primitive::SignalSurface::Internal => None,
     }
+}
+
+/// The stored method list for a surface: a public entry's methods
+/// (empty = any), empty for every other surface.
+fn mount_methods_for(surface: &weft_core::primitive::SignalSurface) -> Vec<String> {
+    match surface {
+        weft_core::primitive::SignalSurface::PublicEntry { methods, .. } => methods.clone(),
+        weft_core::primitive::SignalSurface::TaskCallback
+        | weft_core::primitive::SignalSurface::Internal => Vec::new(),
+    }
+}
+
+/// The pattern under the tenant prefix a stored mount path carries
+/// (`/alice/chat/{room}` -> `chat/{room}`, `/alice` -> ``). Every row of a
+/// tenant is prefixed the same way, so the strip is exact.
+pub(crate) fn pattern_of_mount_path(mount_path: &str, tenant: &str) -> String {
+    let prefix = format!("/{tenant}");
+    let rest = mount_path.strip_prefix(&prefix).unwrap_or(mount_path);
+    rest.trim_start_matches('/').to_string()
+}
+
+/// One other public entry of the tenant, as the overlap check sees it.
+pub(crate) struct RegisteredRoute {
+    pub pattern: String,
+    pub methods: Vec<String>,
+    pub project_id: String,
+    pub node_id: String,
+}
+
+/// The identity a captured trigger is registered under: its address,
+/// the way the source spells it (`door` at the top of the program,
+/// `caption.door` for the `door` inside the file the site `caption`
+/// includes). An included file is a group with a different lifetime,
+/// so a trigger inside one is as ordinary as a trigger inside a group:
+/// the call frames it registers under name the site, and the address
+/// is what a fire resolves back to the node and its site. Two sites
+/// including one file are two triggers with two addresses. What is
+/// refused is a trigger inside a LOOP (an entry cannot fire per
+/// iteration) and a second registration from one node (the engine
+/// caps it too; belt and braces).
+pub(crate) fn captured_trigger_address(
+    project: &weft_core::ProjectDefinition,
+    node_id: &str,
+    frames: &LoopFrames,
+    call_index: u32,
+) -> Result<String> {
+    anyhow::ensure!(
+        frames.iter().all(|frame| frame.loop_index().is_none()),
+        "entry capture cannot occur inside a loop"
+    );
+    anyhow::ensure!(call_index == 0, "entry capture cannot register more than once");
+    anyhow::ensure!(
+        project.nodes.iter().any(|node| node.id == node_id && node.features.is_trigger),
+        "entry capture must come from a trigger in its original program"
+    );
+    let call_path: Vec<String> = weft_core::frames::call_path(frames).into_iter().map(str::to_string).collect();
+    Ok(weft_core::project::address_of(project, node_id, &call_path))
+}
+
+/// The node a registration is for. An entry is armed under its ADDRESS
+/// (`one.door` for the `door` inside the file the site `one` includes;
+/// see [`captured_trigger_address`]): that is what the signal row
+/// carries and what a fire resolves, so the node behind it is the
+/// address resolved back to its id. A resume names its node by id
+/// already (its frames carry the site).
+pub(crate) fn registering_node<'a>(
+    project: &'a weft_core::ProjectDefinition,
+    node_id: &str,
+    is_resume: bool,
+) -> Result<&'a weft_core::project::NodeDefinition> {
+    let id = if is_resume {
+        node_id.to_string()
+    } else {
+        weft_core::project::resolve_address(project, node_id).0
+    };
+    project
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .ok_or_else(|| anyhow::anyhow!("node_id='{node_id}' not in project"))
+}
+
+/// Is there a registered route that shares a call with this one and
+/// that nothing can arbitrate between? Sharing a call is fine when one
+/// of the two is the more specific: it serves what it spells out and
+/// the other serves the rest, which is how `users/me` lives beside
+/// `users/{id}`. What has to be refused is the pair where neither
+/// wins, because a shared call would then have two equal claims.
+/// Pure: the first offender, or `None`. The stored pattern of another
+/// row that no longer parses is skipped, never a reason to refuse this
+/// one (that row's own register validated it).
+pub(crate) fn ambiguous_route<'a>(
+    pattern: &weft_core::route::RoutePattern,
+    methods: &[String],
+    others: impl IntoIterator<Item = &'a RegisteredRoute>,
+) -> Option<&'a RegisteredRoute> {
+    others.into_iter().find(|other| {
+        weft_core::route::RoutePattern::parse(&other.pattern)
+            .map(|theirs| {
+                weft_core::route::compare_patterns(pattern, &theirs)
+                    == weft_core::route::PatternOrder::Ambiguous
+                    && weft_core::route::methods_overlap(methods, &other.methods)
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[async_trait]
@@ -84,17 +191,15 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             anyhow::ensure!(matches!(rows.first(), Some(weft_journal::ExecEvent::ExecutionStarted {
                 phase: weft_core::context::Phase::TriggerSetup, program: Some(_), ..
             })), "entry capture requires a trigger-setup run with a pinned program");
-            anyhow::ensure!(payload.frames.is_empty() && payload.call_index == 0, "entry capture cannot occur inside a loop or register more than once");
             let found = crate::projection::execution_program(state, color).await?;
             let project = found.program().context("entry capture has no original program")?;
-            anyhow::ensure!(project.nodes.iter().any(|node| node.id == payload.node_id && node.features.is_trigger),
-                "entry capture must come from a trigger in its original program");
+            let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.call_index)?;
             let ports = payload.port_snapshot.context("entry capture requires its input port snapshot")?;
             anyhow::ensure!(ports.is_object(), "entry capture ports must be an object");
             state.journal.record_event_dedup(&weft_journal::ExecEvent::TriggerCaptured {
-                color, node_id: payload.node_id.clone(), spec: payload.spec, port_snapshot: ports,
+                color, node_id: node_id.clone(), spec: payload.spec, port_snapshot: ports,
                 at_unix: crate::lease::now_unix() as u64,
-            }, &format!("trigger_capture:{color}:{}", payload.node_id)).await?;
+            }, &format!("trigger_capture:{color}:{node_id}")).await?;
             return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured)?);
         }
         let token = Self::arm(state, payload).await?;
@@ -223,16 +328,8 @@ impl RegisterSignalExecutor {
         // would silently never fire. Fail explicitly on either case.
         let project_def = crate::projection::execution_program(state, color).await?
             .program().context("register_signal: original program is unavailable")?;
-        let node = project_def
-            .nodes
-            .iter()
-            .find(|n| n.id == payload.node_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "register_signal: node_id='{}' not in project_id={project_uuid}",
-                    payload.node_id
-                )
-            })?;
+        let node = registering_node(&project_def, &payload.node_id, payload.is_resume)
+            .with_context(|| format!("register_signal: project_id={project_uuid}"))?;
         let tags = node.tags();
         let events = state.journal.events_log(color).await?;
         let (program, source_version) = match events.first() {
@@ -240,247 +337,359 @@ impl RegisterSignalExecutor {
             _ => anyhow::bail!("register_signal: execution has no birth"),
         };
 
-        let (listener_pod, (routing, kind_state, rendered)) = state
-            .listeners
-            .place_signal(
-                state.listener_backend.as_ref(),
-                &state.pg_pool,
-                state.pod_id.as_str(),
-                |handle| async move {
-                    let (routing, kind_state) = crate::listener::register_signal(
-                        &handle,
-                        &token_call,
-                        &tenant_for_register,
-                        &spec_call,
-                        &node_id_call,
-                        payload.is_resume,
-                        resume_color_owned.as_deref(),
-                        placement_generation,
-                        weft_listener::protocol::RegisterSource::Fresh {
-                            prior_kind_state: prior_state_call,
-                            prior_seq,
-                        },
-                    )
-                    .await?;
+        // From the overlap check (inside the placement closure) to the
+        // signal row's insert, this tenant's registrations run one at a
+        // time cluster-wide: the check reads the rows the insert writes,
+        // so two routes registering at once would each pass the check
+        // before the other's row existed and both arm (`chat/{a}` next
+        // to `chat/{b}`). The lock comes from the lock pool, so a waiter
+        // pins no work connection; the listener round-trip and the
+        // insert below use the work pool as before.
+        let mount_key = crate::lease::advisory_key(crate::lease::SIGNAL_MOUNT_DOMAIN, tenant.as_str());
+        crate::lease::with_advisory_lock_blocking(&state.lock_pool, mount_key, || async move {
+            let (listener_pod, (routing, kind_state, rendered)) = state
+                .listeners
+                .place_signal(
+                    state.listener_backend.as_ref(),
+                    &state.pg_pool,
+                    state.pod_id.as_str(),
+                    |handle| async move {
+                        let (routing, kind_state) = crate::listener::register_signal(
+                            &handle,
+                            &token_call,
+                            &tenant_for_register,
+                            &spec_call,
+                            &node_id_call,
+                            payload.is_resume,
+                            resume_color_owned.as_deref(),
+                            placement_generation,
+                            weft_listener::protocol::RegisterSource::Fresh {
+                                prior_kind_state: prior_state_call,
+                                prior_seq,
+                            },
+                        )
+                        .await?;
 
-                    // Everything after the listener register has to
-                    // roll back the listener-side registration if it
-                    // fails: otherwise the listener holds a registry
-                    // entry (and any minted secret) with no
-                    // corresponding signal row. On task retry,
-                    // `register_signal` would re-run and mint a
-                    // fresh secret, flipping the user's API key.
-                    let post_register: Result<_> = async {
-                        // Mount-path collision check: another
-                        // (project, node) already owns this path.
-                        // Refuse with a clear error rather than
-                        // letting the unique index surface a generic
-                        // SQL error. Same (project, node) reclaiming
-                        // the path on reactivate is fine because we
-                        // reused the existing token above.
-                        if let Some(mp) = mount_path_for(&routing.surface, &tenant_for_register) {
-                            // Single-claim within THIS tenant: the mount path is
-                            // already tenant-prefixed, so this query only ever
-                            // sees the caller's own account. A different (project,
-                            // node) of the SAME tenant owning the path is the
-                            // conflict (e.g. two of the user's projects both
-                            // claim `chat`); another tenant's identical path has a
-                            // different prefix and cannot appear here.
-                            if let Some((existing_project, existing_node)) =
-                                sqlx::query_as::<_, (String, String)>(
-                                    "SELECT project_id, node_id FROM signal \
-                                     WHERE mount_path = $1 \
-                                       AND NOT (project_id = $2 AND node_id = $3) \
-                                     LIMIT 1",
-                                )
-                                .bind(&mp)
-                                .bind(&project_id_call)
-                                .bind(&node_id_call)
-                                .fetch_optional(&pool_call)
-                                .await?
+                        // Everything after the listener register has to
+                        // roll back the listener-side registration if it
+                        // fails: otherwise the listener holds a registry
+                        // entry (and any minted secret) with no
+                        // corresponding signal row. On task retry,
+                        // `register_signal` would re-run and mint a
+                        // fresh secret, flipping the user's API key.
+                        let post_register: Result<_> = async {
+                            // Route overlap check: another (project, node) of
+                            // THIS tenant already serves a call this route
+                            // would claim (`chat/{room}` against `chat/{x}`,
+                            // or `chat/general`, on a shared method). Refuse
+                            // with a clear error rather than let the gateway
+                            // pick one at call time. Same (project, node)
+                            // reclaiming its route on reactivate is fine
+                            // because we reused the existing token above.
+                            // The rows are already tenant-prefixed, so only
+                            // the caller's own account is in play; another
+                            // tenant's identical pattern has a different
+                            // prefix and cannot collide.
+                            if let weft_core::primitive::SignalSurface::PublicEntry { path, methods } =
+                                &routing.surface
                             {
-                                anyhow::bail!(
-                                    "you already registered this path \
-                                     (project='{existing_project}', node='{existing_node}'); \
-                                     change `path` config or unregister the existing node"
-                                );
+                                let mine = weft_core::route::RoutePattern::parse(path)
+                                    .map_err(anyhow::Error::msg)?;
+                                let others: Vec<RegisteredRoute> =
+                                    sqlx::query_as::<_, (String, Vec<String>, String, String)>(
+                                        "SELECT mount_path, mount_methods, project_id, node_id \
+                                         FROM signal \
+                                         WHERE tenant_id = $1 AND mount_path IS NOT NULL \
+                                           AND NOT (project_id = $2 AND node_id = $3)",
+                                    )
+                                    .bind(&tenant_for_register)
+                                    .bind(&project_id_call)
+                                    .bind(&node_id_call)
+                                    .fetch_all(&pool_call)
+                                    .await?
+                                    .into_iter()
+                                    .map(|(mp, ms, project_id, node_id)| RegisteredRoute {
+                                        pattern: pattern_of_mount_path(&mp, &tenant_for_register),
+                                        methods: ms,
+                                        project_id,
+                                        node_id,
+                                    })
+                                    .collect();
+                                if let Some(taken) = ambiguous_route(&mine, methods, &others) {
+                                    let method_words = |m: &[String]| {
+                                        if m.is_empty() { "any method".to_string() } else { m.join("/") }
+                                    };
+                                    anyhow::bail!(
+                                        "route `{}` ({}) and `{}` ({}), already registered by \
+                                         project='{}' node='{}', can both be reached by one \
+                                         call and neither is the more specific, so that call \
+                                         has no answer. Both projects are yours, so: make one \
+                                         of them spell out what the other captures, change \
+                                         this route's `path` or `method`, or free the other \
+                                         with `weft deactivate --project {}` (a project you \
+                                         are done with can also go entirely, `weft rm {}`)",
+                                        mine.as_str(),
+                                        method_words(methods),
+                                        taken.pattern,
+                                        method_words(&taken.methods),
+                                        taken.project_id,
+                                        taken.node_id,
+                                        taken.project_id,
+                                        taken.project_id,
+                                    );
+                                }
+                            }
+
+                            let rendered =
+                                crate::listener::render_signal(&handle, &token_call).await?;
+                            Ok(rendered)
+                        }
+                        .await;
+                        match post_register {
+                            Ok(rendered) => Ok((routing, kind_state, rendered)),
+                            Err(e) => {
+                                // Best-effort rollback: if this fails too
+                                // the listener entry leaks, but the user
+                                // gets the original error which is the
+                                // more useful diagnostic.
+                                if let Err(unreg_err) =
+                                    crate::listener::unregister_signal(&handle, &token_call).await
+                                {
+                                    tracing::warn!(
+                                        target: "weft_dispatcher::register_signal",
+                                        token = %token_call,
+                                        rollback_error = %unreg_err,
+                                        original_error = %e,
+                                        "register_signal rollback failed; listener entry may leak"
+                                    );
+                                }
+                                Err(e)
                             }
                         }
-
-                        let rendered =
-                            crate::listener::render_signal(&handle, &token_call).await?;
-                        Ok(rendered)
-                    }
-                    .await;
-                    match post_register {
-                        Ok(rendered) => Ok((routing, kind_state, rendered)),
-                        Err(e) => {
-                            // Best-effort rollback: if this fails too
-                            // the listener entry leaks, but the user
-                            // gets the original error which is the
-                            // more useful diagnostic.
-                            if let Err(unreg_err) =
-                                crate::listener::unregister_signal(&handle, &token_call).await
-                            {
-                                tracing::warn!(
-                                    target: "weft_dispatcher::register_signal",
-                                    token = %token_call,
-                                    rollback_error = %unreg_err,
-                                    original_error = %e,
-                                    "register_signal rollback failed; listener entry may leak"
-                                );
-                            }
-                            Err(e)
-                        }
-                    }
-                },
-            )
-            .await?;
-
-        let surface_kind_str = routing.surface.kind_tag().to_string();
-        let mount_path = mount_path_for(&routing.surface, tenant.as_str());
-        let auth_kind_str = routing.auth.kind_tag().to_string();
-        let auth_config_value = if routing.auth_config.is_null() {
-            None
-        } else {
-            Some(routing.auth_config.clone())
-        };
-        let consumer_payload = if rendered.is_null() {
-            None
-        } else {
-            Some(rendered)
-        };
-
-        let insert_result = state
-            .journal
-            .signal_insert(&crate::journal::SignalRegistration {
-                setup_color: (!payload.is_resume).then_some(color),
-                source_version,
-                program,
-                token: token.clone(),
-                tenant_id: tenant.to_string(),
-                project_id,
-                color: if payload.is_resume { Some(color) } else { None },
-                node_id: payload.node_id.clone(),
-                is_resume: payload.is_resume,
-                spec_json,
-                access_id: payload.spec.access.as_ref().map(|a| a.id.clone()),
-                consumer_kind: payload.spec.consumer_kind.clone(),
-                tags,
-                port_snapshot: payload.port_snapshot.clone(),
-                consumer_payload,
-                surface_kind: surface_kind_str,
-                mount_path,
-                auth_kind: auth_kind_str,
-                auth_config: auth_config_value,
-                kind_state,
-                // The state carried forward keeps the seq it was read
-                // at, so the insert's fence lets any newer in-flight
-                // cursor write win instead of being rewound.
-                kind_state_seq: prior_seq,
-                // Read-side field: the insert stamps the placement below.
-                listener_pod: None,
-            },
-            // Born with its holder + generation so the row is never
-            // committed with a NULL holder while the pod already holds it
-            // (that window let a fire double-place). Both are known:
-            // `listener_pod` is the pod we just registered on,
-            // `placement_generation` was reserved above.
-            &crate::journal::SignalPlacement {
-                listener_pod: listener_pod.clone(),
-                generation: placement_generation,
-            })
-            .await;
-        if let Err(e) = insert_result {
-            // signal_insert failed AFTER the listener registered. Roll
-            // the listener side back so the in-RAM registry + any minted
-            // secret don't outlive their non-existent DB row. We know
-            // the pod we placed on (`listener_pod`); unregister there.
-            // Best-effort: the pod may have been reaped meanwhile, in
-            // which case its registry is already gone. We never wrote
-            // `signal.listener_pod` (the row insert failed), so there is
-            // no placement to clear; an emptied pod is reaped on the
-            // next idle sweep.
-            let token_for_rollback = token.clone();
-            let rollback = async {
-                if let Some(handle) =
-                    state.listeners.resolve_pod(&listener_pod, &state.pg_pool).await?
-                {
-                    crate::listener::unregister_signal(&handle, &token_for_rollback).await?;
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(unreg_err) = rollback {
-                tracing::warn!(
-                    target: "weft_dispatcher::register_signal",
-                    %token,
-                    rollback_error = %unreg_err,
-                    original_error = %e,
-                    "signal_insert rollback failed; listener entry may leak"
-                );
-            }
-            return Err(e);
-        }
-
-        // signal_insert wrote the holder + generation WITH the row (see
-        // SignalRegistration.listener_pod / placement_generation), so
-        // there is no separate placement write here: fires already
-        // resolve to `listener_pod`, and boot/rehydrate of that pod
-        // re-registers this signal.
-
-        if payload.is_resume {
-            // Suspension state lives on the signal row; we also
-            // journal SuspensionRegistered so the engine's fold can
-            // rebuild the awaited-sequence replay structure on
-            // worker restart. Sequenced AFTER signal_insert so the
-            // signal row exists by the time anything reads the
-            // journal entry. Dedup key collapses retries on the
-            // same (color, node_id, frames, call_index); a failure
-            // here triggers the task framework to retry, and
-            // signal_insert's UPSERT is idempotent so the second
-            // pass converges cleanly.
-            let now = crate::lease::now_unix() as u64;
-            let frames_key = payload
-                .frames
-                .iter()
-                .map(weft_core::frames::Frame::text)
-                .collect::<Vec<_>>()
-                .join("/");
-            state
-                .journal
-                .record_event_dedup(
-                    &weft_journal::ExecEvent::SuspensionRegistered {
-                        color,
-                        node_id: payload.node_id.clone(),
-                        frames: payload.frames.clone(),
-                        token: token.clone(),
-                        spec: payload.spec.clone(),
-                        call_index: payload.call_index,
-                        at_unix: now,
                     },
-                    &format!(
-                        "register_signal:{color}:{node_id}:{frames_key}:{call_index}",
-                        color = color,
-                        node_id = payload.node_id,
-                        call_index = payload.call_index
-                    ),
                 )
                 .await?;
-        }
 
-        Ok(token)
+            let surface_kind_str = routing.surface.kind_tag().to_string();
+            let mount_path = mount_path_for(&routing.surface, tenant.as_str());
+            let mount_methods = mount_methods_for(&routing.surface);
+            let auth_kind_str = routing.auth.kind_tag().to_string();
+            let auth_config_value = if routing.auth_config.is_null() {
+                None
+            } else {
+                Some(routing.auth_config.clone())
+            };
+            let consumer_payload = if rendered.is_null() {
+                None
+            } else {
+                Some(rendered)
+            };
+
+            let insert_result = state
+                .journal
+                .signal_insert(&crate::journal::SignalRegistration {
+                    setup_color: (!payload.is_resume).then_some(color),
+                    source_version,
+                    program,
+                    token: token.clone(),
+                    tenant_id: tenant.to_string(),
+                    project_id,
+                    color: if payload.is_resume { Some(color) } else { None },
+                    node_id: payload.node_id.clone(),
+                    is_resume: payload.is_resume,
+                    spec_json,
+                    access_id: payload.spec.access.as_ref().map(|a| a.id.clone()),
+                    consumer_kind: payload.spec.consumer_kind.clone(),
+                    tags,
+                    port_snapshot: payload.port_snapshot.clone(),
+                    consumer_payload,
+                    surface_kind: surface_kind_str,
+                    mount_path,
+                    mount_methods,
+                    auth_kind: auth_kind_str,
+                    auth_config: auth_config_value,
+                    kind_state,
+                    // The state carried forward keeps the seq it was read
+                    // at, so the insert's fence lets any newer in-flight
+                    // cursor write win instead of being rewound.
+                    kind_state_seq: prior_seq,
+                    // Read-side field: the insert stamps the placement below.
+                    listener_pod: None,
+                },
+                // Born with its holder + generation so the row is never
+                // committed with a NULL holder while the pod already holds it
+                // (that window let a fire double-place). Both are known:
+                // `listener_pod` is the pod we just registered on,
+                // `placement_generation` was reserved above.
+                &crate::journal::SignalPlacement {
+                    listener_pod: listener_pod.clone(),
+                    generation: placement_generation,
+                })
+                .await;
+            if let Err(e) = insert_result {
+                // signal_insert failed AFTER the listener registered. Roll
+                // the listener side back so the in-RAM registry + any minted
+                // secret don't outlive their non-existent DB row. We know
+                // the pod we placed on (`listener_pod`); unregister there.
+                // Best-effort: the pod may have been reaped meanwhile, in
+                // which case its registry is already gone. We never wrote
+                // `signal.listener_pod` (the row insert failed), so there is
+                // no placement to clear; an emptied pod is reaped on the
+                // next idle sweep.
+                let token_for_rollback = token.clone();
+                let rollback = async {
+                    if let Some(handle) =
+                        state.listeners.resolve_pod(&listener_pod, &state.pg_pool).await?
+                    {
+                        crate::listener::unregister_signal(&handle, &token_for_rollback).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(unreg_err) = rollback {
+                    tracing::warn!(
+                        target: "weft_dispatcher::register_signal",
+                        %token,
+                        rollback_error = %unreg_err,
+                        original_error = %e,
+                        "signal_insert rollback failed; listener entry may leak"
+                    );
+                }
+                return Err(e);
+            }
+
+            // signal_insert wrote the holder + generation WITH the row (see
+            // SignalRegistration.listener_pod / placement_generation), so
+            // there is no separate placement write here: fires already
+            // resolve to `listener_pod`, and boot/rehydrate of that pod
+            // re-registers this signal.
+
+            if payload.is_resume {
+                // Suspension state lives on the signal row; we also
+                // journal SuspensionRegistered so the engine's fold can
+                // rebuild the awaited-sequence replay structure on
+                // worker restart. Sequenced AFTER signal_insert so the
+                // signal row exists by the time anything reads the
+                // journal entry. Dedup key collapses retries on the
+                // same (color, node_id, frames, call_index); a failure
+                // here triggers the task framework to retry, and
+                // signal_insert's UPSERT is idempotent so the second
+                // pass converges cleanly.
+                let now = crate::lease::now_unix() as u64;
+                let frames_key = payload
+                    .frames
+                    .iter()
+                    .map(weft_core::frames::Frame::text)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                state
+                    .journal
+                    .record_event_dedup(
+                        &weft_journal::ExecEvent::SuspensionRegistered {
+                            color,
+                            node_id: payload.node_id.clone(),
+                            frames: payload.frames.clone(),
+                            token: token.clone(),
+                            spec: payload.spec.clone(),
+                            call_index: payload.call_index,
+                            at_unix: now,
+                        },
+                        &format!(
+                            "register_signal:{color}:{node_id}:{frames_key}:{call_index}",
+                            color = color,
+                            node_id = payload.node_id,
+                            call_index = payload.call_index
+                        ),
+                    )
+                    .await?;
+            }
+
+            Ok(token)
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mount_path_for;
+    use super::{
+        ambiguous_route, captured_trigger_address, mount_methods_for, mount_path_for, registering_node,
+        pattern_of_mount_path, RegisteredRoute,
+    };
+    use weft_core::frames::Frame;
     use weft_core::primitive::SignalSurface;
+    use weft_core::route::RoutePattern;
+
+    /// A program with a trigger at the top and the same body included
+    /// through two sites, each holding a trigger.
+    fn program_with_included_triggers() -> weft_core::ProjectDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                {"id": "top", "nodeType": "Route", "label": null, "config": {}, "position": {"x": 0, "y": 0},
+                 "features": {"isTrigger": true}, "requiresInfra": false},
+                {"id": "Api.door", "nodeType": "Route", "label": null, "config": {}, "position": {"x": 0, "y": 0},
+                 "scope": ["Api"], "features": {"isTrigger": true}, "requiresInfra": false},
+                {"id": "Api.work", "nodeType": "Debug", "label": null, "config": {}, "position": {"x": 0, "y": 0},
+                 "scope": ["Api"], "features": {"isTrigger": false}, "requiresInfra": false}
+            ],
+            "edges": [],
+            "groups": [
+                {"id": "one", "kind": "call", "body": "Api", "nodeIds": []},
+                {"id": "two", "kind": "call", "body": "Api", "nodeIds": []},
+                {"id": "Api", "kind": "body", "nodeIds": ["Api.door", "Api.work"]}
+            ]
+        }))
+        .expect("a valid program")
+    }
+
+    #[test]
+    fn an_included_trigger_is_captured_under_its_address_like_one_in_a_group() {
+        let p = program_with_included_triggers();
+        assert_eq!(captured_trigger_address(&p, "top", &vec![], 0).unwrap(), "top");
+        let under_one = vec![Frame::Call { site: "one".into() }];
+        let under_two = vec![Frame::Call { site: "two".into() }];
+        assert_eq!(captured_trigger_address(&p, "Api.door", &under_one, 0).unwrap(), "one.door");
+        assert_eq!(captured_trigger_address(&p, "Api.door", &under_two, 0).unwrap(), "two.door");
+        // The address a fire resolves lands back on the node and its site.
+        assert_eq!(
+            weft_core::project::resolve_address(&p, "two.door"),
+            ("Api.door".to_string(), vec!["two".to_string()])
+        );
+    }
+
+    /// Arming reads the trigger's tags from the node behind the
+    /// registration: an entry by its address (the captured spelling),
+    /// a resume by its node id.
+    #[test]
+    fn an_armed_entry_finds_its_node_through_its_address() {
+        let p = program_with_included_triggers();
+        assert_eq!(registering_node(&p, "one.door", false).unwrap().id, "Api.door");
+        assert_eq!(registering_node(&p, "top", false).unwrap().id, "top");
+        assert_eq!(registering_node(&p, "Api.work", true).unwrap().id, "Api.work");
+        let err = registering_node(&p, "one.nothing", false).unwrap_err().to_string();
+        assert!(err.contains("'one.nothing' not in project"), "{err}");
+    }
+
+    #[test]
+    fn a_trigger_inside_a_loop_or_registering_twice_is_refused() {
+        let p = program_with_included_triggers();
+        let in_loop = vec![Frame::Call { site: "one".into() }, Frame::Loop { index: 0 }];
+        let err = captured_trigger_address(&p, "Api.door", &in_loop, 0).unwrap_err().to_string();
+        assert!(err.contains("inside a loop"), "{err}");
+        let err = captured_trigger_address(&p, "top", &vec![], 1).unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+        let err = captured_trigger_address(&p, "Api.work", &vec![], 0).unwrap_err().to_string();
+        assert!(err.contains("must come from a trigger"), "{err}");
+    }
+
+    fn entry(path: &str) -> SignalSurface {
+        SignalSurface::PublicEntry { path: path.into(), methods: Vec::new() }
+    }
 
     #[test]
     fn public_entry_path_is_tenant_namespaced() {
-        let s = SignalSurface::PublicEntry { path: "chat".into() };
+        let s = entry("chat");
         assert_eq!(mount_path_for(&s, "alice").as_deref(), Some("/alice/chat"));
         // Same path, different tenant -> different mount path (no collision).
         assert_eq!(mount_path_for(&s, "bob").as_deref(), Some("/bob/chat"));
@@ -488,14 +697,65 @@ mod tests {
 
     #[test]
     fn public_entry_empty_path_is_just_the_tenant() {
-        let s = SignalSurface::PublicEntry { path: String::new() };
-        assert_eq!(mount_path_for(&s, "alice").as_deref(), Some("/alice"));
+        assert_eq!(mount_path_for(&entry(""), "alice").as_deref(), Some("/alice"));
     }
 
     #[test]
     fn leading_slash_in_path_is_normalized() {
-        let s = SignalSurface::PublicEntry { path: "/webhooks/stripe".into() };
+        let s = entry("/webhooks/stripe");
         assert_eq!(mount_path_for(&s, "acme").as_deref(), Some("/acme/webhooks/stripe"));
+    }
+
+    #[test]
+    fn a_pattern_is_stored_as_written_and_read_back_without_the_tenant() {
+        let s = SignalSurface::PublicEntry { path: "chat/{room}".into(), methods: vec!["POST".into()] };
+        let stored = mount_path_for(&s, "alice").unwrap();
+        assert_eq!(stored, "/alice/chat/{room}");
+        assert_eq!(pattern_of_mount_path(&stored, "alice"), "chat/{room}");
+        assert_eq!(pattern_of_mount_path("/alice", "alice"), "");
+        assert_eq!(mount_methods_for(&s), vec!["POST".to_string()]);
+        assert!(mount_methods_for(&SignalSurface::TaskCallback).is_empty());
+    }
+
+    fn registered(pattern: &str, methods: &[&str]) -> RegisteredRoute {
+        RegisteredRoute {
+            pattern: pattern.into(),
+            methods: methods.iter().map(|m| m.to_string()).collect(),
+            project_id: "p2".into(),
+            node_id: "other".into(),
+        }
+    }
+
+    #[test]
+    fn a_route_is_refused_only_when_nothing_can_arbitrate_the_shared_call() {
+        let mine = RoutePattern::parse("chat/{room}").unwrap();
+        let post = vec!["POST".to_string()];
+        let others = vec![registered("chat/{x}", &["POST"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_some(), "two captures, same method");
+        let others = vec![registered("chat/{x}", &["GET"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_none(), "two captures, disjoint methods");
+        let others = vec![registered("chat/{x}", &[])];
+        assert!(ambiguous_route(&mine, &post, &others).is_some(), "any-method claims every method");
+        // The pair the refusal used to reject and now allows: the
+        // literal serves `chat/general`, the capture serves the rest.
+        let others = vec![registered("chat/general", &["POST"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_none(), "a literal is the more specific");
+        let others = vec![registered("mail/{x}", &["POST"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_none(), "a different literal");
+        let others = vec![registered("chat/{x}/y", &["POST"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_none(), "a different length");
+        let others = vec![registered("chat/{", &["POST"])];
+        assert!(ambiguous_route(&mine, &post, &others).is_none(), "an unparseable row is skipped");
+        // Each wins a position, so `a/b/c` has two equal claims and
+        // neither can be preferred. Counting captures would tie here,
+        // which is why the comparison reads positions.
+        let split = RoutePattern::parse("a/{x}/c").unwrap();
+        let others = vec![registered("a/b/{y}", &["POST"])];
+        assert!(ambiguous_route(&split, &post, &others).is_some(), "each wins a position");
+        // The same address twice is the plainest ambiguity there is.
+        let exact = RoutePattern::parse("chat/general").unwrap();
+        let others = vec![registered("chat/general", &["POST"])];
+        assert!(ambiguous_route(&exact, &post, &others).is_some(), "the same pattern twice");
     }
 
     #[test]

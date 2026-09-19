@@ -37,13 +37,11 @@
       "name": "firstMessage",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": false,
       "description": "What the agent says first. Absent = it waits for the caller."
     },
     {
       "name": "voice",
       "type": "String",
-      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",

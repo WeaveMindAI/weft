@@ -179,8 +179,9 @@ spec:
             # File DOWNLOADS do NOT use it: a download is a short-lived presigned
             # URL straight to the object store (see WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
             # below), so the bytes never traverse the dispatcher. The daemon
-            # substitutes the local port-forward host here; an operator deploying
-            # against a real cluster substitutes the external ingress host. Loopback is allowed in-cluster only
+            # substitutes the loopback port the kind node maps to the ingress
+            # here; an operator deploying against a real cluster substitutes
+            # the external ingress host. Loopback is allowed in-cluster only
             # when WEFT_LOCAL_DEV is set (see below); production must set a real host.
             - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
               value: "${WEFT_DISPATCHER_PUBLIC_BASE_URL}"
@@ -199,8 +200,8 @@ spec:
             # blocked, so a deployment that serves media must set it.
             - name: WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
               value: "${WEFT_OBJECT_STORE_PUBLIC_ENDPOINT}"
-            # Declares "this is a local kind cluster reached via
-            # port-forward", which makes a loopback public base URL
+            # Declares "this is a local kind cluster reached at the
+            # host's loopback", which makes a loopback public base URL
             # legal in-cluster. The daemon sets it to "1" locally;
             # absent in any real deploy, where loopback stays a fatal
             # misconfiguration.

@@ -65,7 +65,7 @@ pub struct RegisterRequest {
 /// Where a registration's routing and kind_state come from.
 ///
 /// `Fresh` is the register/reactivate path: the kind computes routing
-/// (which may mint a secret) and its initial state; `prior_kind_state`
+/// and its initial state; `prior_kind_state`
 /// carries the token's previously-persisted state when the row already
 /// exists (entry tokens are reused across reactivates), so a kind
 /// whose state is a feed cursor can carry it forward instead of
@@ -73,10 +73,10 @@ pub struct RegisterRequest {
 /// the project was inactive.
 ///
 /// `Restore` is the pod-move path (scale-down drain, fire
-/// re-placement): both values come from the durable row VERBATIM.
-/// Recomputing routing would mint a fresh API key and silently
-/// invalidate the user's existing one; recomputing state would reset
-/// a timer's clock mid-schedule. A move is not a user action, so
+/// re-placement): both values come from the durable row VERBATIM. The
+/// row is what the dispatcher routes by, so a recomputed routing could
+/// drift from what fires actually arrive at; recomputing state would
+/// reset a timer's clock mid-schedule. A move is not a user action, so
 /// nothing may change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -109,10 +109,9 @@ impl Default for RegisterSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
     /// Listener-computed routing + auth metadata for this signal.
-    /// The dispatcher copies surface_kind, mount_path, auth_kind,
-    /// auth_config onto the signal row. Plaintext secrets the kind
-    /// minted live in the listener's secret_cache and are served via
-    /// `/display`; they don't travel back through this response.
+    /// The dispatcher copies surface_kind, mount_path, mount_methods,
+    /// auth_kind, auth_config onto the signal row. No secret ever
+    /// rides here: a gated route names the connection that holds it.
     pub routing: SignalRouting,
     /// Opaque per-kind state computed at register time. The
     /// dispatcher persists it on the signal row and ships it back
@@ -154,9 +153,9 @@ pub struct LoadReport {
 
 /// Body for `POST /display` on the listener (admin-only). The
 /// dispatcher proxies inspector reads here; the listener returns
-/// whatever the kind impl wants to show (mount_path, just-minted
-/// plaintext, etc). Looked up by token, not by node_id, because
-/// the listener's in-RAM registry is keyed by token.
+/// whatever the kind impl wants to show (the surface, the auth, the
+/// serving state). Looked up by token, not by node_id, because the
+/// listener's in-RAM registry is keyed by token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayRequest {
     pub token: String,
@@ -164,39 +163,11 @@ pub struct DisplayRequest {
 
 /// Free-form display payload returned from the listener. Inspector
 /// renders kind-specific. Standard fields the inspector knows
-/// about: `mount_path`, `auth: { kind, header_name }`, `secret`
-/// (plaintext, only present when minted recently and listener
-/// still holds it in RAM).
+/// about: `surface: { kind, path, methods }`, `auth: { kind }`,
+/// `serving`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayResponse {
     pub display: Value,
-}
-
-/// Body for `POST /action` on the listener (admin-only, project-
-/// token gated at the dispatcher). The kind impl picks `kind`
-/// names: e.g. `regenerate_api_key`. Generic dispatch shape so
-/// new actions land without touching the listener's routing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionRequest {
-    pub token: String,
-    /// Action name; the kind impl decides what it means.
-    pub kind: String,
-    /// Optional kind-specific payload.
-    #[serde(default)]
-    pub payload: Value,
-}
-
-/// Generic action response. The kind impl owns the JSON shape;
-/// the dispatcher passes it through to the inspector verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionResponse {
-    pub result: Value,
-    /// `routing` is updated routing metadata when the action
-    /// changed it (e.g. regenerate_api_key updates the value_hash
-    /// on auth_config). The dispatcher writes the new fields onto
-    /// the signal row when present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<SignalRouting>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +181,68 @@ pub struct UnregisterRequest {
 pub struct ProcessRequest {
     pub token: String,
     pub payload: Value,
+}
+
+/// Body for `/wake_by_hand`: which signal a person is waking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeByHandRequest {
+    pub token: String,
+}
+
+/// What that signal wakes with, or `None` when its kind cannot be woken
+/// by hand at all (almost all of them: there is nothing truthful to
+/// invent in place of the answer a form is waiting for).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeByHandResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+/// One verified push a provider delivered to the public events
+/// receiver, as the listener is asked about it.
+///
+/// The dispatcher owns the public door and the "is this genuine"
+/// verdict, and it stops there: which registered signals a push feeds
+/// is a question about a KIND's own vocabulary (a topic name, a
+/// subscription scope), and the kinds live here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushEvent {
+    /// The service the push arrived for, as its access recipe names it.
+    pub service: String,
+    /// The topic within that service.
+    pub topic: String,
+    /// The named event the broker built from the raw delivery: the
+    /// topic's declared fields and nothing else.
+    pub event: Value,
+}
+
+/// Body sent by the dispatcher to listener `/match_push`: one push,
+/// and the signals held by THIS pod that might be fed by it.
+///
+/// Batched per pod rather than per signal, because one account-routed
+/// push can feed many subscriptions and a call each would make the
+/// provider wait on a round trip per candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchPushRequest {
+    pub push: PushEvent,
+    pub tokens: Vec<String>,
+}
+
+/// One signal the push feeds, with the payload it wakes with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedPush {
+    pub token: String,
+    pub payload: Value,
+}
+
+/// Which of the offered signals the push feeds. A token this pod does
+/// not hold, whose kind is not fed by pushes, whose kind says the push
+/// does not address it, or whose filter refuses the payload, is simply
+/// absent: a push that feeds nothing here is an empty list, never an
+/// error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchPushResponse {
+    pub matched: Vec<MatchedPush>,
 }
 
 /// Outcome of one stateless fire's listener-side processing. Two

@@ -43,7 +43,7 @@ pub use traits::{
     PostgresTaskStoreClient, PostgresWorkerPodClient, TaskStoreClient, WorkerPodClient,
 };
 pub use worker_pod::{
-    alive_pod_for_project_full, delete_row, has_live_for_project,
+    delete_row, has_live_for_project,
     insert_spawning, list_orphaned_node_test, list_stale, list_stale_spawning, list_terminal,
     mark_dead, mark_done, mark_done_if_idle, register_alive, AliveTransition, PodStatus,
     WorkerPodRow, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_STALE_SECS, SPAWN_BOOT_DEADLINE_SECS,

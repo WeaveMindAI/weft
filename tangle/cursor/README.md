@@ -10,15 +10,15 @@ for other assistants.
 
 The persona is a project rule with `alwaysApply: true`
 (`.cursor/rules/tangle.mdc`), so it loads every session. Skills sit in
-`.cursor/skills/`, the six specialists are subagents in `.cursor/agents/`,
+`.cursor/skills/`, the five specialists are subagents in `.cursor/agents/`,
 and permissions live in `.cursor/cli.json`. The six commands are skills too:
 Cursor has no separate command file type, and any skill is invocable as
 `/skill-name`.
 
 Three things this copy uses that the others cannot.
 
-**A subagent that cannot write.** `catalog-scout`, `run-digger` and
-`red-teamer` carry `readonly: true`, so the promise each one makes in its own
+**A subagent that cannot write.** `run-digger` and `red-teamer` carry
+`readonly: true`, so the promise each one makes in its own
 prose ("never fixes", "never edits") is enforced by the tool instead of by
 good behaviour. The red-teamer in particular is an attacker walking a program
 it must never run; here it structurally cannot.
@@ -35,14 +35,18 @@ right after the edit. It is `postToolUse` rather than the more obvious
 `afterFileEdit` on purpose: that event fires on the same edits but accepts no
 output fields, so a finding reported there would reach nobody.
 
-One thing to know: Cursor has no "ask" tier for shell commands. What the other
-assistants gate behind a prompt is denied here, in `.cursor/cli.json`, so the
-user runs those themselves. Deny beats allow, which is what keeps the broad
-`weft connect*` allow from also permitting `weft connect --forget`.
+One thing to know: `.cursor/cli.json` allows every `weft` verb Tangle runs and
+denies none. Whether a call is put in front of you is your Cursor mode's
+decision, never a list here: in an automatic mode Tangle activates, resyncs,
+deactivates and starts or stops infra on its own; in a manual one it asks in
+prose. The two things it always asks about are a live-tier node test (your
+money) and any secret (yours to paste, never its to read). The daemon's
+lifecycle (`weft daemon start`, `stop`, `restart`) is not on the list: that is
+a reinstall of weft, never Tangle's move.
 
 ## What is here
 
-Tangle is one persona plus fifteen skills, six specialists and six commands.
+Tangle is one persona plus sixteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

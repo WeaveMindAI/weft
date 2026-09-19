@@ -4,6 +4,7 @@
 	import { frameText, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
 	import { parseFileValue } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
+	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import ValueCard from './ValueCard.svelte';
 	import FileCard from './FileCard.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
@@ -48,18 +49,10 @@
 	/// JSON so `JSON.stringify` cannot fail on the data path; a circular
 	/// reference would mean the wire was corrupted upstream, and the
 	/// user wants to see that loud rather than have it stringified.
-	function prettyPayload(value: unknown): string {
-		if (typeof value === 'string') return value;
-		return JSON.stringify(value);
-	}
-
-	function formatBusTime(atUnix: number): string {
-		const d = new Date(atUnix * 1000);
-		const hh = String(d.getHours()).padStart(2, '0');
-		const mm = String(d.getMinutes()).padStart(2, '0');
-		const ss = String(d.getSeconds()).padStart(2, '0');
-		return `${hh}:${mm}:${ss}`;
-	}
+	// The bus panel and the caller panel show the same kind of line and
+	// obey the same rules about saying what was really sent, so those
+	// rules live in one place (`utils/stream-log`) and both read them.
+	const formatBusTime = formatClockTime;
 
 	/// Short human label for a bus id ("bus #" + first 4 chars of the
 	/// uuid). The full id is just noise in the header; the first chars
@@ -81,13 +74,10 @@
 
 	/// Format one message-kind line for either the on-screen IRC panel
 	/// or the copy-text. A JSON payload renders its value (which may
-	/// legitimately be null); a binary payload renders its size (the
-	/// base64 itself is noise).
+	/// legitimately be null); a message the journal did not write down
+	/// renders its size instead, which is all there is to show.
 	function formatMessageBody(event: BusInspectorEvent & { kind: 'message' }): string {
-		if (event.payload.kind === 'bytes') {
-			return `sent ${event.msgKind} of ${event.payloadByteSize} bytes (binary)`;
-		}
-		return prettyPayload(event.payload.data);
+		return formatStreamBody(event.payload, event.payloadByteSize, event.trimmed, event.msgKind);
 	}
 
 	/// Format an ephemeral window's rollup line: what flew in one
@@ -334,14 +324,11 @@
 {#if selected}
 {@const inputJson = (selected.input !== null && selected.input !== undefined) ? JSON.stringify(selected.input, null, 2) : null}
 {@const outputJson = (selected.output !== null && selected.output !== undefined) ? JSON.stringify(selected.output, null, 2) : null}
-{@const warningsText = (selected.portWarnings ?? [])
-	.map((w) => `port ${w.port} expected ${w.expected} but got ${w.actual}; the value was not sent and the port was closed`)
-	.join('\n')}
 {@const inheritedText = selected.inheritedFrom
 	? `Inherited from run ${selected.inheritedFrom}: this firing was reused, not run again`
 	: ''}
 {@const statusText = selected.error ?? (selected.status === 'completed' ? 'Completed successfully' : displayStatus(selected.status))}
-{@const detailsText = [inheritedText, warningsText, statusText].filter(Boolean).join('\n')}
+{@const detailsText = [inheritedText, statusText].filter(Boolean).join('\n')}
 {@const portOriginsText = (selected.input && typeof selected.input === 'object' ? Object.keys(selected.input as Record<string, unknown>) : [])
 	.map((port) => [port, portOrigin(selected, port, false)] as const)
 	.filter(([, origin]) => origin)
@@ -461,16 +448,6 @@
 			{#if selected.inheritedFrom}
 				<div class="rounded-md border border-sky-200 bg-sky-50 p-2.5 text-[11px] text-sky-800">
 					Inherited from run <span class="font-mono">{selected.inheritedFrom.slice(0, 8)}</span>: this firing was reused, not run again.
-				</div>
-			{/if}
-			{#if selected.portWarnings && selected.portWarnings.length > 0}
-				<div class="rounded-md border border-amber-200 bg-amber-50 p-2.5">
-					<div class="text-[10px] font-semibold text-amber-700 mb-1">Output type mismatch</div>
-					{#each selected.portWarnings as w}
-						<div class="text-[11px] text-amber-700 break-words">
-							Port <span class="font-mono font-semibold">{w.port}</span> expected <span class="font-mono font-semibold">{w.expected}</span> but got <span class="font-mono font-semibold">{w.actual}</span>; the value was not sent and the port was closed.
-						</div>
-					{/each}
 				</div>
 			{/if}
 			{#if selected.error}

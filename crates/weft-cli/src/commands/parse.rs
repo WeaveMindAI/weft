@@ -544,6 +544,18 @@ fn file_dir(file: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
 
 pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> {
     let source = read_stdin()?;
+    // Nothing piped in is a loud error, never a clean bill. The source
+    // comes from stdin (the editor's parse server pipes it), so a person
+    // who types `weft validate` at a terminal and pipes nothing would
+    // otherwise get an empty program validated and `{"diagnostics":[]}`
+    // back, which reads as "your project is fine" when nothing was
+    // checked at all.
+    if source.trim().is_empty() {
+        anyhow::bail!(
+            "weft validate reads the program from stdin and nothing arrived, so nothing was \
+             checked. Pipe the file in: `weft validate < src/main.weft`"
+        );
+    }
     // Validate is the strict pipeline: it must run against the real
     // catalog. Validating outside a project is meaningless (every node
     // type would be unknown), so a missing project is a hard error, not

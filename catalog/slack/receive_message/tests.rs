@@ -36,7 +36,11 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn fire_fans(rig: FakeRig) -> WeftResult<()> {
-    rig.wake(json!({ "text": "deploy now", "channel": "C1", "user": "U1", "ts": "1.2" }));
+    // A real Slack message event: `type` rides every one of them, and
+    // the node's own subscription filters on it.
+    rig.wake(json!({
+        "type": "message", "text": "deploy now", "channel": "C1", "user": "U1", "ts": "1.2"
+    }));
     let outcome = rig
         .run(
             &SlackReceiveMessageNode,

@@ -1453,6 +1453,29 @@ fn file_url(mime: &str) -> serde_json::Value {
       }
   }
 
+  /// A stored file that went through a database comes back as a plain
+  /// object holding its marker: the table lets an object shape claim a
+  /// file kind, and the runtime cast passes a marker of that kind, names
+  /// a marker of another kind, and names a plain object for what it is.
+  #[test]
+  fn cast_lets_an_object_shape_claim_a_stored_file_and_checks_the_marker() {
+      use serde_json::json;
+      for source in ["JsonDict", "Dict[String, String]", "{ key: String }"] {
+          assert!(WeftType::cast_allowed(&ty(source), &ty("Image")).is_ok(), "{source} -> Image");
+          assert!(WeftType::cast_allowed(&ty(source), &ty("File")).is_ok(), "{source} -> File");
+      }
+      assert!(WeftType::cast_allowed(&ty("String"), &ty("Image")).is_err(), "text never becomes a file");
+      assert!(WeftType::cast_allowed(&ty("Number"), &ty("Blob")).is_err());
+
+      let image = json!({ "__weft_image__": { "key": "project/p/1", "mimeType": "image/png", "sizeBytes": 3, "filename": "cat.png" } });
+      assert_eq!(ty("Image").cast_value(&image).unwrap(), image, "a marker of the kind flows unchanged");
+      assert_eq!(ty("File").cast_value(&image).unwrap(), image, "File takes any kind");
+      let err = ty("Video").cast_value(&image).unwrap_err();
+      assert!(err.contains("a stored Image, not Video"), "{err}");
+      let err = ty("Image").cast_value(&json!({ "photo": "cat.png" })).unwrap_err();
+      assert!(err.contains("__weft_image__") && err.contains("is not one"), "{err}");
+  }
+
   #[test]
   fn zero_value_per_type() {
       use serde_json::json;
@@ -1822,6 +1845,23 @@ fn union_with_unresolved_leaf_keeps_the_permissive_gate() {
     assert!(resolved.accepts_runtime_value(&json!({ "x": 1 })));
     assert!(resolved.accepts_runtime_value(&json!("s")));
     assert!(!resolved.accepts_runtime_value(&json!(5)));
+}
+
+/// The declared type is the question: a dict port takes an object
+/// whatever its keys, a file marker included (a Python node handing a
+/// stored file back as plain data on a `JsonDict` port used to be
+/// refused because the value's shape was guessed first). Only a port
+/// declared as a file reads the marker, and it still refuses a plain
+/// object.
+#[test]
+fn a_declared_dict_accepts_an_object_that_happens_to_carry_a_file_marker() {
+    use serde_json::json;
+    let marker = json!({ "__weft_image__": { "key": "project/p/1", "mimeType": "image/png", "sizeBytes": 3, "filename": "cat.png" } });
+    assert!(WeftType::JsonDict.accepts_runtime_value(&marker));
+    assert!(WeftType::parse("Dict[String, JsonDict]").unwrap().accepts_runtime_value(&marker));
+    assert!(WeftType::parse("Image").unwrap().accepts_runtime_value(&marker));
+    assert!(!WeftType::parse("Image").unwrap().accepts_runtime_value(&json!({ "url": "x" })));
+    assert!(!WeftType::parse("Dict[String, Number]").unwrap().accepts_runtime_value(&marker));
 }
 
 #[test]

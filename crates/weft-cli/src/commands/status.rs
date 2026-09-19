@@ -146,7 +146,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         } else {
             println!("  infra:");
             for entry in infra {
-                let node = entry.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                // `node` is the spelling, `node_id` the runtime's key;
+                // a person reads the first one.
+                let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
                 let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let url = entry
                     .get("endpoint_url")

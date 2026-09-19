@@ -7,6 +7,7 @@
 pub(crate) mod caller_conn;
 pub(crate) mod context;
 pub(crate) mod execution_driver;
+pub(crate) mod fired_caller;
 pub(crate) mod metering;
 pub(crate) mod socket;
 pub(crate) mod stream_runtime;
