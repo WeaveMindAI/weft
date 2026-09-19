@@ -906,14 +906,14 @@ async fn drain_buses(
                     // which wedges the bus over one second of traffic.
                     // Written BEFORE this message joins, so it opens the
                     // next window rather than overflowing this one.
-                    if policy.row_is_full(state.kept_bound, weighs) {
-                        if matches!(
+                    if policy.row_is_full(state.kept_bound, weighs)
+                        && matches!(
                             write_open_window(&inner, color, &bus_id_str, journal, pod_name, state)
                                 .await,
                             WindowWrite::Degraded
-                        ) {
-                            break 'entries;
-                        }
+                        )
+                    {
+                        break 'entries;
                     }
                     if state.entries.is_empty() {
                         state.deadline =

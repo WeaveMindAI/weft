@@ -237,7 +237,7 @@ fn wire_value(payload: &Value) -> Value {
             .into_iter()
             .filter(|(_, terminal)| *terminal)
             .map(|(payload, _)| payload)
-            .last()
+            .next_back()
     }
 
     /// What the caller SENT, as the journal recorded it.
