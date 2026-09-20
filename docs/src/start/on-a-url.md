@@ -4,7 +4,7 @@ So far the program runs when you ask it to. A **trigger** node makes it run
 when the outside world asks instead, and for an HTTP request that trigger is
 `Route`.
 
-Replace `main.weft` with:
+Replace `src/main.weft` with:
 
 ```weft
 hello = Route -> (name: String) { path: "hello", method: "POST" }

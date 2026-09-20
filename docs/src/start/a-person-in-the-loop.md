@@ -36,7 +36,7 @@ key to one project only, or you lost the URL and need a new one, go and read
 
 ## Ask before continuing
 
-Put this in `main.weft`:
+Put this in `src/main.weft`:
 
 ```weft
 draft = Text { value: "We can replace the damaged item." }

@@ -209,7 +209,7 @@ builder view. You can still move boxes around and fold groups open and shut.
 ## Moving boxes around
 
 Where you drag a box is saved next to the program, in `layouts/`, not in
-`main.weft`. Dragging a box somewhere else does not change your program at all.
+`src/main.weft`. Dragging a box somewhere else does not change your program at all.
 
 Moving one *into* or *out of* a group does change it, because it changes what
 that step can reach.

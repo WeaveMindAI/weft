@@ -4,7 +4,7 @@ Let's give the graph a word counter: text in, the number of words out, so
 `"hello from weft"` gives you `3`. Words are split on whitespace, so
 punctuation stays stuck to whatever it is next to.
 
-Do this in a practice project whose `main.weft` you can throw away. If you
+Do this in a practice project whose `src/main.weft` you can throw away. If you
 need one, [Your first program](../start/first-program.md) makes it.
 
 ## Declare what the node takes and produces
@@ -82,7 +82,7 @@ which is what tests are for.
 
 ## Put it in a graph
 
-Replace the contents of your practice project's `main.weft` with:
+Replace the contents of your practice project's `src/main.weft` with:
 
 ```weft
 count = WordCount { text: "hello from weft" }

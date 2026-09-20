@@ -13,7 +13,7 @@ Already in place: `first_program.png` (Tangle building the greeting, used in
 
 | File | Used by | What to capture |
 |---|---|---|
-| `graph-split-view.png` | [Reading and building the graph](../start/reading-the-graph.md) | The three-box greeting program as it looks right after opening `main.weft`. Source on the left, graph on the right. Nothing running, no inspector open. Do not reverse the panes: the graph opens on the right, and the page says so. |
+| `graph-split-view.png` | [Reading and building the graph](../start/reading-the-graph.md) | The three-box greeting program as it looks right after opening `src/main.weft`. Source on the left, graph on the right. Nothing running, no inspector open. Do not reverse the panes: the graph opens on the right, and the page says so. |
 | `graph-inspector.png` | same | One box selected with **Inspect execution** open, showing that firing's input and output, its status and its timing. Pick a box whose value is worth reading, so an LLM answer rather than `hello world`. |
 | `graph-groups.png` | same | Side by side, or a before and after. Left: a group folded shut, showing its name, its description line and its edge dots. Right: the same graph with it open and the boxes inside visible. The wiring outside the group must be identical in both halves; that is the whole point of the shot. |
 | `extension-task.png` | [Putting a person in the loop](../start/a-person-in-the-loop.md) | Two panels. Left: the task tab with **Send this answer?**, the draft text, and the Approve and Reject buttons. Right: the same run in the graph, `review` wearing its cyan waiting ring and `approved` not yet run. Both sides of the handover at once. |
