@@ -1,179 +1,131 @@
 # Cancellation
 
-Every execution carries a cancellation flag. When the user clicks stop, or a
-project is deactivated, or the dispatcher tears an execution down, the flag is
-set. The engine's drive loop sees it at the next iteration and exits, dropping
-the task set holding every in-flight node future, which aborts each one at its
-next `.await`.
+When someone stops an execution, weft cancels its running node tasks.
+For ordinary async work, the engine handles this without a cancellation
+loop in every node. If you launch a subprocess or blocking computation,
+you need to arrange for that work to stop too.
 
-**Ordinary async Rust is cancellable instantly, with no node-side code.** A
-node has to do something unusual to *escape* cancellation.
+Cancellation stops local work when it yields control. It does not undo a
+request another service has already accepted. A cancelled node may have
+sent a message, started a job, or incurred a charge before the stop arrived.
 
-## The default
+## Ordinary async work
 
-```rust
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let resp = ctx.http()
-        .post("https://api.example.com/v1/messages")
-        .json(&body)
-        .send().await.node_err("posting to the API")?
-        .json::<ApiResponse>().await.node_err("decoding the reply")?;
+A node waiting on an HTTP response, a timer, or a stream can be aborted by
+dropping its future. Code after that wait does not continue in the aborted
+task. This is cooperative: CPU work that does not yield can delay cancellation,
+even if it is inside an `async fn`.
 
-    ctx.pulse_downstream(NodeOutput::new().set("response", resp.text)).await
-}
-```
+Dropping a request future does not establish what happened at the remote
+service. If your node needs to cancel a remote job or undo a database
+change, that requires the relevant service's API or transaction behavior.
 
-Cancelled mid-call, the future at `.send().await` is dropped, the client
-closes the underlying socket, the request is cancelled in flight, and the
-function exits. Nothing further is billed and nothing further runs.
-
-The same holds for retry loops, streaming receives, and anything with regular
-awaits: every iteration is a cancellation point.
-
-Tokio cancels every primitive that respects future drop, which is most of
-them: HTTP through reqwest, databases through sqlx, sleeps, file I/O,
-WebSocket streams, channel receives.
-
-## The quick reference
-
-| Node behavior | Cancellable? | What you do |
-|---|---|---|
-| async HTTP, database, sleep, file I/O | yes, instantly | nothing |
-| async with retries | yes, instantly | nothing |
-| streaming receive | yes, instantly | nothing |
-| suspended via `await_signal` | yes, engine path | nothing |
-| a measured call on a connection | yes, instantly | nothing; the metering settles on its own |
-| a subprocess | **the process leaks** | `.kill_on_drop(true)` |
-| CPU-bound `spawn_blocking` | **the thread leaks** | pass the flag, poll it |
-| a resource needing explicit cleanup | best effort | `tokio::select!` on the flag |
+| Work the node starts | What cancellation needs |
+|---|---|
+| Async work awaited by the node | The engine aborts the node task |
+| A child process | Opt into killing it when its handle is dropped |
+| An already-running `spawn_blocking` closure | Check the cancellation flag inside the closure |
+| A remote operation | Use that service's cancellation mechanism if one exists |
+| A durable wait | The runtime cancels the execution and its wake registration |
 
 ## Reaching the flag
 
-```rust
-let flag = ctx.cancellation();          // Arc<CancellationFlag>
+Use `ctx.cancellation()` when work needs to observe the stop itself:
 
-flag.is_cancelled()                     // sync atomic load; cheap in tight loops
-flag.cancelled().await                  // a future, for tokio::select!
-flag.cancelled_err().await              // the same wait, resolving to the
-                                        // error to return with `?`
+```rust
+let cancel = ctx.cancellation();
 ```
 
-The flag is **persistent**: once cancelled, every later `is_cancelled()`
-returns true and every new `cancelled()` future resolves immediately, so there
-is no window in which you can miss one.
+| Method | Result |
+|---|---|
+| `cancel.is_cancelled()` | Boolean check for synchronous code |
+| `cancel.cancelled().await` | Waits until cancelled, then returns `()` |
+| `cancel.cancelled_err().await` | Waits until cancelled, then returns `WeftError::Cancelled` |
 
-The engine aborts your future as soon as it observes the cancel, so a
-`cancelled()` branch in your body only runs if it wins that race. Treat that
-cleanup as best effort.
+The last method returns the error itself. Use `return Err(error)`;
+it is not a `Result` to which you can apply `?`.
 
-Paid calls need nothing from you: the metering runs **below** your future and
-resolves an interrupted call's real cost on its own.
+Once cancellation has been set, it stays set. Later checks still see it,
+and later waits return immediately.
 
 ## Subprocesses
 
-Dropping a `tokio::process::Child` does **not** kill the underlying process. It
-keeps running, forever, with nobody watching it.
+By default, dropping a `tokio::process::Child` leaves the process running.
+If the subprocess belongs to this node's work, set `kill_on_drop(true)`:
 
 ```rust
-// BAD: the future drops, `python` keeps running.
-let mut child = tokio::process::Command::new("python")
-    .arg(script_path)
-    .spawn().node_err("starting python")?;
-let status = child.wait().await.node_err("waiting on python")?;
-```
+use weft::NodeErrExt;
 
-One line fixes it:
-
-```rust
-// GOOD: cancel drops the future, drop kills the process.
-let mut child = tokio::process::Command::new("python")
+let script_path: String = ctx.inputs.get("script")?;
+let mut child = tokio::process::Command::new("python3")
     .arg(script_path)
     .kill_on_drop(true)
-    .spawn().node_err("starting python")?;
-let status = child.wait().await.node_err("waiting on python")?;
-```
+    .spawn()
+    .node_err("starting the script")?;
 
-For a graceful shutdown, letting the subprocess flush before it dies:
-
-```rust
-let mut child = tokio::process::Command::new("python").arg(script_path)
-    .spawn().node_err("starting python")?;
-let cancel = ctx.cancellation();
-
-tokio::select! {
-    status = child.wait() => Ok(format(status.node_err("waiting on python")?)),
-    err = cancel.cancelled_err() => {
-        let _ = child.start_kill();                    // SIGTERM
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            child.wait(),
-        ).await;                                        // then drop kills it
-        Err(err)
-    }
+let status = child.wait().await.node_err("waiting for the script")?;
+if !status.success() {
+    return Err(weft::node_error(format!("The script exited with {status}")));
 }
 ```
+
+This is a node-body fragment with a `script` string input. The script and
+Python interpreter must exist in the worker image.
+
+The option requests termination when the child handle drops. It does not
+give the child time to flush or run a shutdown handler. On Unix, Tokio's
+`start_kill()` also sends `SIGKILL`; it is not a graceful-shutdown call.
+If the subprocess needs an orderly shutdown, implement its shutdown
+protocol and keep forced termination as the fallback when that cannot finish.
 
 ## Blocking CPU work
 
-Dropping a `JoinHandle` from `spawn_blocking` does **not** kill the worker
-thread. The thread runs the closure to completion and only its result is
-discarded.
+A `spawn_blocking` closure that has started keeps running even if the
+async task awaiting it is aborted. Pass the cancellation flag into the
+closure and check it between chunks.
 
-From the user's point of view the cancel "worked": the graph stopped, the loop
-exited. Meanwhile a core is still pinned.
-
-If the work happens in chunks, pass the flag in and check it between them:
+For example, this body fragment counts zero bytes from a `bytes` input:
 
 ```rust
+use weft::NodeErrExt;
+
+let bytes: Vec<u8> = ctx.inputs.get("bytes")?;
 let cancel = ctx.cancellation();
-let result = tokio::task::spawn_blocking(move || {
-    for chunk in chunks_of(image) {
+let count = tokio::task::spawn_blocking(move || -> weft::WeftResult<u64> {
+    let mut count = 0_u64;
+    for chunk in bytes.chunks(4096) {
         if cancel.is_cancelled() {
-            return Err(weft::node_error("cancelled"));
+            return Err(weft::WeftError::Cancelled);
         }
-        process_chunk(chunk);
+        count += chunk.iter().filter(|byte| **byte == 0).count() as u64;
     }
-    Ok(...)
+    Ok(count)
 })
 .await
-.node_err("the image worker")??;
+.node_err("counting bytes")??;
 ```
 
-The closure is ordinary blocking code, so it cannot `.await` and builds its
-error the plain way. `.node_err` on the outside handles the task itself dying;
-the second `?` is your closure's own result.
+The first `?` handles a failure of the task, such as a panic. The second
+handles the result returned by the closure. Use `count` in your node's
+output afterwards.
 
-`is_cancelled()` is one atomic load, so check it as often as you like.
+Cancellation is checked between chunks. If one chunk calls a blocking
+library function that never returns, the flag cannot interrupt that call.
 
-## Cleanup on a held resource
+## Cleanup that needs another await
 
-```rust
-let mut conn = open_connection().await?;
-let cancel = ctx.cancellation();
+You can listen for cancellation in a `tokio::select!` branch and attempt
+cleanup there. That branch competes with the engine aborting your task,
+so it may never run or may itself be interrupted.
 
-loop {
-    tokio::select! {
-        msg = conn.recv() => {
-            match msg? { Some(m) => handle(m), None => break }
-        }
-        err = cancel.cancelled_err() => {
-            conn.send_close_message().await.ok();
-            return Err(err);
-        }
-    }
-}
-```
-
-Write this when you have something to do at the end: notify a peer, release a
-lock you hold externally, flush to disk. Otherwise the default abort path
-closes the connection at drop.
+If cleanup must happen even after a worker crash, it cannot depend only
+on code at the end of the node body. Arrange for the external resource to
+expire or for another component to perform the cleanup.
 
 ## Suspension is a different thing
 
-`ctx.await_signal` is not a tokio wait. The engine journals a suspension and
-the worker exits.
+`ctx.await_signal` records a wait that can resume later. Cancellation
+ends the execution and removes the registration that would resume it.
+A node using that API needs no separate cancellation handler.
 
-Cancelling a suspended execution goes through the dispatcher: it strips the
-wake registration, so an external event cannot resume a dead execution, and
-records the terminal event. Nodes using `await_signal` need nothing special
-for cancel.
+For how a suspended body resumes, read [Surviving a restart](durable-execution.md).

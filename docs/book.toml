@@ -10,14 +10,14 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
-default-theme = "ayu"
-preferred-dark-theme = "ayu"
+default-theme = "coal"
+preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/WeaveMindAI/weft"
-edit-url-template = "https://github.com/WeaveMindAI/weft/edit/main/docs/{path}"
+edit-url-template = "https://github.com/WeaveMindAI/weft/edit/mvp/docs/{path}"
 site-url = "/weft/"
-no-section-label = false
+no-section-label = true
 additional-css = ["theme/weft.css"]
-additional-js = ["theme/highlight-weft.js"]
+additional-js = ["theme/highlight-weft.js", "theme/inline-code.js", "theme/copy-markdown.js"]
 
 [output.html.fold]
 enable = true
@@ -35,6 +35,10 @@ runnable = false
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
+
+[preprocessor.copy-markdown]
+command = "python3 theme/copy_markdown.py"
+before = ["mermaid"]
 
 [output.html.print]
 enable = true

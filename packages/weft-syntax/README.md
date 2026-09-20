@@ -1,6 +1,6 @@
 # Weft syntax highlighting
 
-Colours for weft source, in the two formats the world actually reads.
+Colours for weft source, as TextMate and highlight.js grammars.
 
 - `weft.tmLanguage.json` is a TextMate grammar. That is what VS Code speaks,
   and what most editors speak through it.

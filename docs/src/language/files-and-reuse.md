@@ -54,6 +54,10 @@ runs inside that one call, and a frozen example keeps the spelling. Include
 the same file from two places and the two read apart (`triage.classify`,
 `again.classify`).
 
+An included file sees its own type declarations and the catalog's, never the
+types of the file that included it. For that, read [giving a type a
+name](types.md#giving-a-type-a-name).
+
 ## `@file`
 
 ```weft
@@ -68,8 +72,9 @@ triage = LlmParams {
 }
 ```
 
-A marker is a constant like any other, so it goes wherever a literal goes,
-in either spelling: [Literals on a connection line](syntax.md#literals-on-a-connection-line).
+A marker is a constant like any other, so it goes wherever a literal goes, in
+either spelling. For what a written value can sit on, read [writing values
+in](syntax.md#writing-values-in).
 The type defaults to `String` and can be any type whose value is text
 (`@file("n.txt", Number)` casts the file's text, and a text that will not
 cast is a compile error on that line).
@@ -145,6 +150,9 @@ runs; that is what the editor's file picker writes for a file picked from
 outside, so a large file is never copied into the project. An `@include` path is the one exception: it is relative to the file
 that writes it, the way an import is, so `@include("../lib/auth.weft")`
 reaches a sibling folder.
+
+Before uploading a local asset, weft checks its bytes against the kind you
+declared, and a mismatch fails with the file's name. `Blob` takes anything.
 
 ### The asset sync
 

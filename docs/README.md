@@ -8,9 +8,12 @@ on GitHub.
 
 ## Build it locally
 
+Python 3 is also required for the page's Copy Markdown button.
+
 ```bash
 cargo install mdbook mdbook-mermaid
 cd docs
+mdbook-mermaid install .
 mdbook serve --open
 ```
 
@@ -23,7 +26,10 @@ both places.
 ```
 docs/
   book.toml           mdBook configuration
-  theme/weft.css      small theme tweaks over mdBook's defaults
+  theme/weft.css      book colors, typography and responsive layout
+  theme/header.hbs    sidebar wordmark
+  theme/fonts/       local fonts and their licenses
+  theme/highlight-weft.js  link to the shared Weft syntax highlighter
   src/
     SUMMARY.md        the table of contents. A page not listed here is not built.
     introduction.md
@@ -50,14 +56,9 @@ say so on the page.
 **Start where the reader is**, including the wrong belief they arrived with.
 Taking that apart is usually the first job, before any syntax.
 
-**No em dashes.** Comma, colon, parentheses, or two sentences. Why we hunt them
-is [its own page](src/thinking/em-dashes.md).
+**No em dashes.** Comma, colon, parentheses, or two sentences. Models reach for
+them far more than people do, so an em dash reads as a tell that nobody reviewed the
+line again.
 
 If you add a page, add it to `SUMMARY.md`. `create-missing` is off, so a link
 to a file that does not exist fails the build rather than shipping a dead link.
-
-## Images
-
-Every image the book references is listed in
-[`src/img/README.md`](src/img/README.md) with a brief describing exactly what to
-capture.

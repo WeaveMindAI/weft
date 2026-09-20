@@ -1,73 +1,36 @@
 # Your first program
 
+Make a project and run it:
+
 ```bash
-weft new hello
+weft new hello --assistant claude-code
 cd hello
 weft run
 ```
 
-`weft new` scaffolds a project. `weft run` compiles it, registers it with the
-daemon, fires one execution, and streams the events back until it finishes.
+`--assistant claude-code` installs Tangle: instructions that teach your AI
+assistant how weft works. Once it is in place, you can ask for changes in plain
+English and it will make them. If you use Kilo Code, write `--assistant
+kilo-code` instead. If you use neither, run `weft new hello --assistant none`
+and skip [Ask Tangle](#ask-tangle); this page shows you two other ways to make
+the same change. Repeat the flag to install for several assistants at once.
+Whichever you pick is remembered, so your next `weft new` installs the same
+one with no flag at all, until you pass `--assistant <name>` to change it or
+`--assistant none` to stop.
 
-## Bring your AI assistant
+If `weft run` says it cannot reach the runtime, start it with
+`weft daemon start` and try again.
 
-You are meant to build weft by talking. The assistant that builds with you
-is called Tangle: a persona weft installs into your project, who knows the
-language, the whole node catalog on disk, and the loop of build one stage,
-run it, read what came out. Tangle is part of weft, not a plugin you wire
-up.
+The terminal prints `registered hello` and the project id, then `started color`
+and a long id, then a line or two for each step as it starts and finishes. That
+long id is a **color**, and the last line, `✓ completed color=`, repeats its
+first eight characters. A color is how you point at one particular run later.
 
-The flow is two steps:
+## See the program as a graph
 
-```bash
-weft new hello --assistant kilo-code       # shorthand: --assistant kc
-```
-
-then open the `hello` folder in that assistant (Kilo Code, here). Tangle
-loads on its own, with its method, its node reference, and its commands
-already in place. You describe what you want, in plain words; it shapes the
-program, picks or writes the nodes, runs it, and shows you what happened.
-
-The flag's value is the assistant you use, so the same command covers every
-assistant weft supports as more arrive (repeat the flag to install for
-several at once). And the choice is remembered: your next `weft new`
-installs the same assistant with no flag at all, until you pass
-`--assistant <name>` to change it or `--assistant none` to stop. Claude Code
-is also available as `--assistant claude-code` (shorthand `cc`).
-
-Tangle is copied into the project, so those files are yours like the rest
-of it: they get committed, and someone who clones your project gets Tangle
-without needing a weft checkout. The price is that a project holds the
-Tangle that created it. If you want one on a newer version after updating
-weft, run `weft tangle update` in it, which re-copies every file Tangle
-owns and leaves anything your assistant wrote beside them alone.
-
-## What got created
-
-```
-hello/
-  weft.toml      the project's name and its permanent id
-  src/
-    main.weft    the program
-  nodes/         every node this project can use
-  .weft/         build output and caches (already gitignored for you)
-```
-
-`nodes/` is the surprising one, because it changes where your nodes come
-from. When you run `weft new`, the entire standard library is **copied into
-your project** under `nodes/base_catalog/`, so the build never reaches back
-into the weft installation and upgrading weft cannot change what your program
-does. If you want the newer standard library later, `weft catalog update` re-syncs
-that mirror.
-
-Your own nodes go anywhere else under `nodes/`, or beside the code under
-`src/`, never inside `base_catalog/`,
-because `weft catalog update` wipes and recopies that folder and anything you
-edited in there goes with it.
-
-## The program
-
-`src/main.weft` is three lines:
+Open the `hello` folder in VS Code and open `src/main.weft`. The text opens on the
+left and the graph opens beside it: two boxes joined by an arrow. This is the
+same file both ways:
 
 ```weft
 greeting = Text { value: "hello world" }
@@ -76,72 +39,119 @@ out = Debug
 out.data = greeting.value
 ```
 
-Two node declarations and one connection.
+`greeting` and `out` are names, and you can change them to anything.
+`Text` and `Debug` say what kind of step each one is. The last line is the
+arrow: `greeting.value` flows into `out.data`.
 
-The first line says: make a node called `greeting`, of type `Text`, configured
-with the string `"hello world"`. The second makes a `Debug` node called `out`.
-The third wires them.
+## Change it
 
-Read the connection right to left, the way an assignment reads: the value
-flows **from** `greeting.value` **into** `out.data`.
+Now suppose you want it to greet a person by name.
 
-```
-  greeting (Text)                 out (Debug)
-  ┌──────────────────┐            ┌──────────────┐
-  │ value: "hello…"  │            │              │
-  │            value ●───────────▶● data         │
-  └──────────────────┘            └──────────────┘
-```
+The step for that is `Format`. It fills in a template: you write `{{name}}`
+wherever a value should go, and you give the box an input with the same name so
+the value has somewhere to land. Every placeholder needs an input of the same
+name, or the step fails and tells you which is missing.
 
-Before anything ran, the compiler checked that connection. Both ports exist,
-`Text.value` emits a `String`, `Debug.data` accepts one, and nothing required
-was left unwired.
+There are three ways to make this change. Pick whichever you like.
 
-## What `weft run` printed
+### Ask Tangle
 
-One line per node event, in order: the execution started, `greeting` ran and
-emitted, `out` ran, the execution completed. All of it is written to the
-journal as it happens, and you can
-read them back later with `weft events <color>`.
+Open the project in your assistant and tell it:
 
-A **color** is one execution. Running the same project again mints a new one,
-so whenever anything in weft says "per color", it means per execution.
+> Greet a person by name, with the name as its own input so I can change it
+> without touching the text. Run it and show me the result.
 
-## Change something
+Tangle makes the change and runs it for you.
 
-Edit `src/main.weft`:
+![Tangle building the greeting, with the finished graph and its result beside it](../img/first_program.png)
+
+You end up with three boxes, and the last one shows `"data": "Hello, Ada!"`.
+The name sits in its own box. Tangle picked its own names for the boxes here, so
+yours may read differently.
+
+### Build it in the graph
+
+Press `Ctrl+P`, type `Format`, and pick it. Double-click the new box's title and
+rename it to `sentence`.
+
+A new `Format` box arrives with one input, `template`. The value you want to
+drop into the sentence needs an input of its own, so make that first. Underneath
+the box's inputs there is a small **+ input** button. Click it, type `name`, and
+press Enter.
+
+Now right-click that new `name` dot. A menu opens with a row reading
+`✎ Type: MustOverride`. Click it and the row turns into a text box with
+`MustOverride` already selected, so type `String` over it and press Enter.
+`MustOverride` is weft's way of saying nobody has decided this type yet, and the
+build stops until you do.
+
+Open the box. Its body has a **Template** field: click that and type
+`Hello, {{name}}!`.
+
+Now connect the boxes. Drag from the `value` dot on the right of `greeting` to
+the `name` dot you just made, then from the `text` dot on the right of `sentence`
+to `data` on `out`.
+
+One thing left: `greeting` still holds `hello world`. Open it and change that to
+`Ada`. Then click empty canvas so the box is no longer being typed into, and
+press `Ctrl+Enter` to run.
+
+### Write it
+
+Go to the text (if you closed it, the code button at the top right of the
+graph brings it back) and replace the file with this:
 
 ```weft
-greeting = Text { value: "hello world" }
-shout = ExecPython(text: String) -> (out: String) {
-  code: "return {'out': text.upper() + '!'}"
-}
-out = Debug
+greeting = Text { value: "Ada" }
 
-shout.text = greeting.value
-out.data = shout.out
+sentence = Format(name: String) {
+  template: "Hello, {{name}}!"
+  name: greeting.value
+}
+
+out = Debug
+out.data = sentence.text
 ```
 
-`weft run` again. The chain is three nodes now.
+Then press `Ctrl+Enter` to run it.
 
-`ExecPython` is worth noticing because of the arrow. Most nodes have fixed
-ports declared by their author; this one lets you declare them inline.
-`(text: String)` is its input, `-> (out: String)` is its output, and the Python
-body gets `text` as a variable and returns a dict keyed by output port name.
-The compiler type-checks those ports like any others.
+## See what each box received
 
-## The mental model
+Once the program has run, a small magnifying glass appears in the top right of
+every box. Click the one on `sentence` and a panel shows what went in, the
+template along with `"name": "Ada"`, and what came out: `"Hello, Ada!"`.
 
-A node fires when all of its required inputs have arrived. When it fires it
-runs its code and emits values on its output ports, and each emission travels
-along a wire to exactly one input port and waits there. A node with no upstream
-fires immediately, and the execution ends when nothing is left in flight and
-nothing is waiting.
+Change `Ada` to another name and run again.
 
-Everything else in the language, groups and loops and streams and human pauses,
-is built out of that one rule, including the wrinkle where branching comes
-from: what happens when a node produces **nothing**. That is
-[How a weft program runs](../language/mental-model.md), the chapter to read
-once you want to build something real.
+## What is in the folder
 
-Next: [reading the graph](reading-the-graph.md).
+| File or directory | What it is for |
+|---|---|
+| `src/main.weft` | The program |
+| `weft.toml` | The project's name and its permanent id |
+| `nodes/` | The code for every kind of step it can use |
+| `CLAUDE.md`, `.claude/` (or `kilo.json`, `.kilo/`) | Tangle's instructions, for whichever assistant you picked. They are copied in, so they get committed with the rest and somebody who clones your project gets Tangle without a weft checkout. After updating weft, `weft tangle update` re-copies them. |
+| `layouts/` | Where you dragged the boxes. It turns up the first time you move a box. |
+| `.weft/` | Build files, generated |
+
+`weft new` also starts a git repository and writes a `.gitignore` for you.
+
+If you write a step of your own, put it anywhere under `nodes/` except
+`base_catalog/`. That folder holds the standard steps, and `weft catalog update`
+wipes it and copies fresh ones in, deleting anything you left there.
+
+If you want a step that does something new, check whether one already exists
+before you write it. `weft describe-nodes --list` prints every step in the
+project, one line each. Once a name looks promising,
+`weft describe-nodes --node Text --compact` prints what that one takes in and
+gives back.
+
+## Where to go next
+
+If you already have something you want to build, ask for it now. Ask for one
+small piece at a time, run it against a real input, then say what is wrong with
+it before you ask for the next. For more on working that way, read
+[Sequential Diffusion Programming](../thinking/sdp.md).
+
+If you would rather keep reading, go and read
+[Reading and building the graph](reading-the-graph.md) next.

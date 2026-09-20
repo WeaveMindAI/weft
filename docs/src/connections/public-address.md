@@ -1,131 +1,104 @@
 # A public address
 
-If you want services to be able to reach your weft, `./setup.sh --public-url`
-gives it a public https address. By default that address comes from a free
-quick tunnel and is **random**: it changes whenever the tunnel reconnects, and
-everything you registered at a provider against the old one silently stops
-working until you go and re-register it.
+You need a public address when a provider has to send events in, or when
+somebody outside needs a signal or a file link.
 
-And if you own a domain on Cloudflare, the setup below gives your weft a
-**permanent** address instead, so those registrations never rot.
-
-## What you need
-
-A domain managed by Cloudflare. Any plan; the free one works.
-
-A subdomain name for this weft. Pick something unguessable, for example
-`weft-dev-amber-comet.example.com`. Nothing publishes it, so treat it as a
-secret you happen to have typed into DNS, and do not rely on it staying
-unknown: what actually protects the surface is that only four addresses pass
-through it, each with its own check.
-
-What it exposes is weft's filtered trigger surface, which is built to face the
-internet. See
-[what the proxy passes](events.md#what---public-url-actually-does).
-
-## Create the tunnel
-
-1. Open the Zero Trust dashboard at `one.dash.cloudflare.com`.
-
-2. **Networks** then **Tunnels** then **Create a tunnel**, connector type
-   **Cloudflared**. Name it anything, such as `weft-local`. Save.
-
-3. The next step shows connector install commands. **Ignore them**: weft runs
-   the connector inside its own cluster. You only need the **token**, the long
-   `eyJ...` string after `--token`. Copy it.
-
-   You can get it again any time by opening the tunnel and clicking Edit, where
-   a refresh option also rotates it if it ever leaks.
-
-4. **Public Hostname** tab, then **Add a public hostname**:
-
-   | Field | Value |
-   |---|---|
-   | Subdomain | your chosen name |
-   | Domain | your domain |
-   | Path | leave empty |
-   | Type | `HTTP` |
-   <!-- SYNC: weft-system <-> crates/weft-core/src/infra/mod.rs (SYSTEM_NAMESPACE) -->
-   | URL | `weft-public-proxy.weft-system.svc.cluster.local:8080` |
-
-   That tells Cloudflare "whatever arrives at that subdomain, hand it down the
-   tunnel to weft's filtering proxy". It creates the DNS record itself.
-
-## Point weft at it
-
-In your shell, or the repo's `.env`:
+For a throwaway address:
 
 ```bash
-WEFT_PUBLIC_TUNNEL_TOKEN=eyJ...
-WEFT_PUBLIC_TUNNEL_HOSTNAME=https://weft-dev-amber-comet.example.com
+./setup.sh --public-url
+weft daemon status
 ```
 
-Both must be set together. Setting one without the other fails loudly.
+That starts a Cloudflare quick tunnel and reports a random hostname, which can
+change whenever the tunnel restarts. For a hostname that stays put, keep
+reading.
+
+The tunnel dials out from the cluster, so you do not need to forward a port on
+your router.
+
+## What the outside world can reach
+
+Requests go through weft's filtering proxy, which allows exactly these:
+
+| Route | For |
+|---|---|
+| `/events/...` | Providers posting events in, each one checked against the signature the service declares |
+| `/signal/...` | Firing a signal with its token |
+| `/signal-token/...` | Reading what a signal token may see, for a caller holding that token |
+| `/public/files/...` | Reading a file with an expiring share link |
+| `/access/oauth/callback` | Finishing an OAuth connection |
+
+The landing page and its logo are public too. Everything else answers 404, and
+the management API is not behind the proxy at all.
+
+Signal tokens and file links are credentials: whoever holds one has the access
+it grants.
+
+<!-- SYNC: weft-system <-> crates/weft-core/src/infra/mod.rs (SYSTEM_NAMESPACE) -->
+
+## A hostname that stays put
+
+You need a domain on Cloudflare and a named tunnel. In the [Cloudflare
+dashboard](https://dash.cloudflare.com/), under **Networking → Tunnels**,
+create a tunnel and copy its connector token. weft runs the connector for you,
+inside your own weft cluster, so there is nothing to install on your machine.
+
+Add a **Published application** route to that tunnel:
+
+| Field | Value |
+|---|---|
+| Hostname | Your subdomain, such as `weft.example.com` |
+| Service URL | `http://weft-public-proxy.weft-system.svc.cluster.local:8080` |
+
+Cloudflare's own [tunnel
+setup](https://developers.cloudflare.com/tunnel/setup/) covers their side.
+
+Then set both of these where you run the daemon:
 
 ```bash
-./setup.sh --public-url      # first time; persists the choice
-weft daemon start            # any later restart
+export WEFT_PUBLIC_TUNNEL_TOKEN='paste-your-tunnel-token'
+export WEFT_PUBLIC_TUNNEL_HOSTNAME='https://weft.example.com'
+./setup.sh --public-url
 ```
 
-## Two signs it worked
+Both have to be there, and the hostname has to be HTTPS with no port, path or
+query. A `.env` file works too, with the same two names and no `export`. If a
+name is in both places, what you exported is what weft uses. weft remembers
+that
+you want a public URL, so later starts keep one, but it does not remember your
+token. Start without those two set and you get a quick tunnel again, on a new
+random hostname, so keep them somewhere you can find them.
 
-The daemon prints `public trigger surface reachable at https://<your hostname>`.
+Open the address in a browser afterwards. weft's landing page means requests
+are reaching the proxy. It says nothing about whether a provider's credentials
+or subscriptions are right.
 
-The tunnel's page in the Cloudflare dashboard flips to **Healthy**.
+Then register that hostname wherever your connection needs it, such as an
+OAuth callback or a webhook URL. For the event routes, read [events from a
+service](events.md).
 
-To check from the outside, open `https://<your-host>/` in a browser. You should
-see a small weft page. That page is served by weft's filtering proxy inside
-your cluster, so seeing it proves the whole chain: DNS, Cloudflare, the tunnel,
-into your cluster.
+## If Cloudflare refuses a program's request
 
-Every other path answers "not found" on purpose. If something were broken you
-would see a Cloudflare error page or a timeout instead.
+File links get fetched by programs, not just browsers. Cloudflare's Browser
+Integrity Check can challenge an unfamiliar user agent, and it does that at
+the edge, before the request ever reaches weft.
 
-## Turn off the browser check for this hostname
+If Cloudflare's security events name that check, add a configuration rule for
+your weft hostname and turn **Browser Integrity Check** off for it, following
+[their
+instructions](https://developers.cloudflare.com/waf/tools/browser-integrity-check/).
+Then try again. If the 403 survives that, something else is causing it, and
+Cloudflare's security event log will name what.
 
-Cloudflare's Browser Integrity Check refuses some client signatures with a
-403 and the text `error code: 1010`, at Cloudflare's edge, before anything
-reaches your cluster. Python's standard library is one of them: a node
-fetching a file link with `urllib` gets that 403 while `curl` and `requests`
-get the bytes. The links weft hands out under this address
-(`/public/files/...`) are read by programs, never by browsers, so the check
-only ever refuses your own nodes. Turn it off for this hostname, and leave
-it on for the rest of your domain.
+## Changing or closing the tunnel
 
-1. In the Cloudflare dashboard (`dash.cloudflare.com`, not the Zero Trust
-   one), open your domain, then **Rules**, then **Overview**, then
-   **Create rule**, then **Configuration Rule**.
-2. Name it anything, such as `weft no browser check`.
-3. Under **When incoming requests match**, pick the field **Hostname**,
-   the operator **equals**, and type your weft hostname without the
-   `https://`, such as `weft-dev-amber-comet.example.com`.
-4. Under **Then the settings are**, add **Browser Integrity Check** and
-   set it to **Off**.
-5. **Deploy**.
+To go back to a quick tunnel, take both named-tunnel settings out of your
+environment and any `.env`, then `./setup.sh --public-url` again. Check
+the new address and update anything registered against the old one.
 
-If you would rather switch it off for the whole domain, it is the
-**Browser integrity check** toggle under **Security**, then **Settings**.
-
-To confirm, from any shell:
+To close the tunnel entirely:
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" -A "Python-urllib/3.12" https://<your-host>/
+./setup.sh --no-public-url
 ```
-
-`200` means fixed; `403` means the check is still on (a rule takes a
-minute or so to apply).
-
-## Register the address at providers, once
-
-**Slack**: OAuth redirect URL `https://<your-host>/access/oauth/callback`.
-Event Subscriptions request URL `https://<your-host>/events/slack/messages`.
-Interactivity, for button approvals,
-`https://<your-host>/events/slack/interactions`.
-
-Everything else in [Events from a service](events.md) that says "your public
-address" means this hostname now.
-
-## Going back
-
-Unset the two variables and rerun the daemon to fall back to the random quick
-tunnel. `./setup.sh --no-public-url` closes the surface entirely.

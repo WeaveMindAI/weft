@@ -34,7 +34,7 @@
     leftPanel?: Snippet<[EditorContext]>;
     rightPanel?: Snippet<[EditorContext]>;
     // Host-injected controls at the START of the editor's floating toolbar
-    // (before Live / Source), handed the full EditorContext. A web host can put
+    // (before Live), handed the full EditorContext. A web host can put
     // a "back to projects" button here so it sits inline with the editor's own
     // buttons; VS Code injects nothing. Absent = nothing rendered.
     toolbarLeading?: Snippet<[EditorContext]>;
@@ -312,7 +312,6 @@
   const runNotPainted = $derived(
     executionState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
   );
-  let sourceOpen = $state(false);
   /// Whether the caller panel is showing. Closed on every load: it is a
   /// thing you go and look at, not a thing that takes up the canvas
   /// until you dismiss it.
@@ -793,10 +792,6 @@
         );
         return;
       }
-      if (msg.kind === 'sourceState') {
-        sourceOpen = msg.open;
-        return;
-      }
       if (msg.kind === 'actionBarState') {
         actionBarState = msg.state;
         return;
@@ -1033,8 +1028,6 @@
     get executionState() { return shownExecutionState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
-    get sourceOpen() { return sourceOpen; },
-    toggleSource() { send({ kind: 'openSource' }); },
     editActiveSource(source: string) { send({ kind: 'editActiveSource', source }); },
     // The proper applyEdits RPC: it registers a pending resolver, so the host's
     // `editApplied` reply carries the post-edit truth back into `project` (the
@@ -1106,8 +1099,6 @@
             onTogglePin={() => send({ kind: 'followTogglePin' })}
             onCatchUp={() => send({ kind: 'followCatchUp' })}
             onClearFollow={() => send({ kind: 'followClear' })}
-            onOpenSource={() => send({ kind: 'openSource' })}
-            sourceOpen={sourceOpen}
             {navDepth}
             {navFileName}
             {interactive}

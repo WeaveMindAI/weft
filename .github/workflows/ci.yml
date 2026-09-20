@@ -45,6 +45,13 @@ jobs:
           fetch-depth: 0
       - run: scripts/check-extension-bump.sh "origin/${{ github.base_ref }}"
 
+  public-proxy:
+    name: public proxy routes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 deploy/tests/test_public_proxy.py
+
   rust:
     name: cargo test + clippy
     runs-on: ubuntu-latest

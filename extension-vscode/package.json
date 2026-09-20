@@ -84,9 +84,28 @@
     ],
     "commands": [
       {
-        "command": "weft.openGraphView",
-        "title": "Open Graph View",
-        "category": "Weft"
+        "command": "weft.openGraph",
+        "title": "Open Graph",
+        "category": "Weft",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "weft.openGraphToSide",
+        "title": "Open Graph to the Side",
+        "category": "Weft",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "weft.openSource",
+        "title": "Open Code",
+        "category": "Weft",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "weft.openSourceToSide",
+        "title": "Open Code to the Side",
+        "category": "Weft",
+        "icon": "$(split-horizontal)"
       },
       {
         "command": "weft.runProject",
@@ -201,6 +220,28 @@
       ]
     },
     "menus": {
+      "editor/title": [
+        {
+          "command": "weft.openGraphToSide",
+          "when": "resourceLangId == weft && !isInDiffEditor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "weft.openGraph",
+          "when": "resourceLangId == weft && !isInDiffEditor",
+          "group": "navigation@2"
+        },
+        {
+          "command": "weft.openSourceToSide",
+          "when": "activeWebviewPanelId == weft.graph",
+          "group": "navigation@1"
+        },
+        {
+          "command": "weft.openSource",
+          "when": "activeWebviewPanelId == weft.graph",
+          "group": "navigation@2"
+        }
+      ],
       "commandPalette": [
         {
           "command": "weft.loadMoreExecutions",

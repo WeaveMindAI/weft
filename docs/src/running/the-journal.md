@@ -210,6 +210,18 @@ write failures are reported separately on the affected bus.
 The failed write is logged in `weft daemon logs`. A replacement worker can only
 recover what was saved, so work done after the last saved result may repeat.
 
+The failure itself never reaches the journal, because the journal is the thing
+that failed. So if the worker pod is still around, read its container logs:
+
+```bash
+kubectl --context kind-weft-local get pods -A -l weft.dev/role=worker -L weft.dev/project
+kubectl --context kind-weft-local logs -n <namespace> <pod-name>
+```
+
+That context name is the default. If you set `WEFT_KUBE_CONTEXT` or
+`WEFT_CLUSTER_NAME`, use yours instead. Those are the container's own logs:
+`weft logs <color>` reads the journal, and `weft daemon logs` the dispatcher.
+
 An unreadable saved event prevents the worker from loading the execution.
 Some events decode but cannot be applied to the program: a row naming a node
 the program does not have, a loop row with no instance behind it, a malformed

@@ -1,57 +1,58 @@
 # Stopping other runs
 
-A run can put a label on itself, and any run of the same project can stop
-every run carrying that label. You reach for it when a second message
-should cancel the answer to the first.
+If a new message makes work on the previous message obsolete, tag the runs
+with the same conversation ID. A later run can then ask weft to stop the
+earlier ones.
 
-## The shape you will want first
+## Tag, stop, then start the work
 
-Somebody sends your assistant three messages in a row. Each message starts
-a run, and each run takes a few seconds to answer, because it waits on the
-language model. Without help, the person gets three answers.
-
-If you are writing weft, two catalog nodes at the top of the program fix
-it, and you never touch Rust:
+Use `TagRun` followed by `StopTagged`. This small program shows the order:
 
 ```weft
-telegram = TelegramAccess
+sender = Text { value: "user_7" }
 
-ask = TelegramReceiveMessage { account: telegram.access }
-
-claim = TagRun { sender: ask.chatId }
+claim = TagRun { sender: sender.value }
 
 stop = StopTagged {
   _should_flow: claim.done
-  sender: ask.chatId
+  sender: sender.value
 }
 
-draft = LlmInference {
+work = Debug {
   _should_flow: stop.done
-  ...
+  data: sender.value
 }
 ```
 
-Every input you wire onto `TagRun` is a tag; `StopTagged` reads its
-targets the same way, and `includeSelf: true` on it takes the current run
-down as well. The two `_should_flow` wires are the order: tag, then stop,
-then the work.
+For a message handler, wire the conversation ID from your trigger in place
+of `sender.value`, and put your answer-generating work after `stop.done`.
+The `_should_flow` connections make tagging finish before the stop is
+requested, then allow the new work to begin.
 
-If you are writing a node, the same two moves are two ctx calls:
+A stop is queued asynchronously. `stop.done` means the request was queued,
+not that every older run has finished stopping. An older run may already
+have sent an answer. Use this to cancel obsolete work; it does not by
+itself guarantee that only one answer reaches the person.
+
+The ordering is based on when runs register their tags. If handling two
+messages happens out of arrival order, the later tag registration belongs
+to the surviving run. The message's timestamp is not used.
+
+## Calling from a node
+
+The same operations are available inside a node body:
 
 ```rust
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let sender: String = ctx.inputs.get("sender")?;
-    ctx.tag_execution([sender.as_str()]).await?;
-    ctx.stop_tagged(sender.as_str(), StopSelf::Keep).await?;
-    ctx.pulse_downstream(NodeOutput::new().set("sender", sender)).await
-}
+use weft::StopSelf;
+
+let sender: String = ctx.inputs.get("sender")?;
+ctx.tag_execution([sender.as_str()]).await?;
+ctx.stop_tagged(sender.as_str(), StopSelf::Keep).await?;
 ```
 
-Put that node first in the chain. Every run tags itself with the sender,
-then stops every earlier run carrying the same sender, and keeps going. The
-third message kills the second, which had already killed the first, and the
-third run is the only one that answers. No queue and no state of your own
-to write.
+This fragment assumes a `sender` string input containing a valid tag.
+Tags belong to the current project; a stop cannot reach another project's
+runs.
 
 ## `tag_execution`
 
@@ -59,92 +60,62 @@ to write.
 ctx.tag_execution(["user_7", "batch_a"]).await?;
 ```
 
-Adds labels to the run this node is part of. Any node can call it, at any
-point, as often as it likes; tags add up, and tagging the same thing twice
-changes nothing. A tag is one to sixty-four characters of `[A-Za-z0-9_-]`,
-the same rule a node's `_tags` follows; anything else fails here, naming
-the character, before anything is written.
+Tags accumulate on the execution. Adding the same tag again changes
+neither its value nor the run's place in the tag order.
 
-The two catalog nodes take any string and make a tag of it the same way:
-a value that already is one stays as written, anything else has its other
-characters replaced by `_` and a short fingerprint of the original appended
-(`49151@s.whatsapp.net` becomes `49151_s_whatsapp_net-` and sixteen hex
-characters), so two values that only differ in the replaced characters never
-share a tag. If you write a node that tags with a value it did not choose,
-do the same, or call the ctx with what you know is clean.
+The Rust API accepts tags of 1 to 64 ASCII letters, digits, underscores,
+or hyphens. Other values return an error before tagging. The catalog
+nodes additionally accept nonempty strings that need conversion:
+they replace unsupported characters, shorten the readable part if needed,
+and append 16 hexadecimal characters from a hash of the original value.
 
-The tags show on the run: in the inspector's footer, in the Executions
-view, and in `weft executions`.
+Both catalog nodes perform the same conversion, so the same input produces
+the same tag. The fingerprint reduces collisions between converted values;
+it is not a uniqueness guarantee. If you call the Rust API directly,
+supply valid tags yourself.
+
+Tags appear in the execution inspector and in `weft executions`.
 
 ## `stop_tagged`
 
 ```rust
 ctx.stop_tagged("user_7", StopSelf::Keep).await?;
-ctx.stop_tagged("exp_3", StopSelf::Include).await?;
+ctx.stop_tagged("batch_a", StopSelf::Include).await?;
 ```
 
-Stops every live run of this project carrying the tag. `StopSelf` says
-whether this run is one of them:
+| Choice | Runs selected |
+|---|---|
+| `Keep`, when this run carries the tag | Live runs that registered that tag before this run |
+| `Keep`, when this run does not carry the tag | Matching live runs tagged before this stop request |
+| `Include` | All matching live runs when the dispatcher handles the stop, including this one |
 
-- `Keep`: stop the others, keep running. This is the opening example: the
-  newest message survives, the older ones die.
-- `Include`: stop them all, this one too. One run of an experiment finds
-  the experiment is broken and takes the whole batch down; its own body
-  ends cancelled at its next await, exactly as `weft stop` would end it.
+For the catalog node, `includeSelf: true` selects `Include`.
+The default is `Keep`.
 
-A stop reaches a run whatever it is doing:
+The registration order prevents two concurrent tagged runs using `Keep`
+from selecting each other. The later one can stop the earlier one;
+the earlier one cannot stop the later one.
 
-- **Running.** The node in flight is told to stop the same way
-  [cancellation](cancellation.md) always works: an HTTP call in flight is
-  dropped, a node waiting on the flag wakes with the cancel.
-- **Parked** on a person, a webhook, or a timer, with no worker alive. The
-  thing that would have woken it is erased: the form is gone, the timer is
-  gone. Answering the old form does nothing.
-- **Waking up** at that exact moment. The wake finds the run already dead
-  and does nothing with it.
-
-The call returns as soon as the stop is durably queued; the runtime carries
-it out. Do not write the next node to depend on the siblings being gone by
-the time it fires.
-
-A stop never crosses a project: the tag is only looked up among your
-project's own runs.
-
-## Two runs at once
-
-Two messages from the same sender land a few milliseconds apart, and both
-runs say "stop the others, keep me". Left alone, they would kill each other.
-
-They do not, because of one rule: a run only stops runs that tagged
-themselves **before** it did. The runtime numbers every tag in the order it
-was written, and a `Keep` stop reaches only the numbers below the caller's
-own. So the later of the two survives and the earlier one dies. A run that
-asks for a tag it never put on itself (a supervisor clearing a sender's
-whole backlog, say) has no position of its own to compare against, so it
-reaches everything tagged so far.
-
-`Include` has no ordering: every live run carrying the tag goes, whenever it
-tagged itself.
+A selected run is cancelled through the same mechanism as
+[ordinary cancellation](cancellation.md). For a suspended run, the runtime
+also removes its wake registrations.
 
 ## What a stopped run looks like
 
-A stopped run ends with `execution_cancelled`, and the event says who did
-it: the run that asked and the tag that matched. In `weft events <color>`
-that is the `reason=` on the last line:
-
-```
-[1725370001] execution_cancelled   reason=Stopped by execution 9d3f8f4e-... (tag user_7)
-```
-
-Every node that was still running or waiting gets a `node_cancelled` with
-the same reason, and the graph prints it on the node in place of the usual
-"Cancelled by user".
+The journal records `execution_cancelled` with the requesting execution
+and matching tag as the cause. The inspector displays that reason, and
+`weft events <color>` shows it in the execution's events.
 
 ## After a crash
 
-A body that re-runs after a worker crash re-tags and re-asks. Both are safe:
-a repeated tag lands on the same row it landed on the first time, so the
-run's place in the order does not move, and a repeated stop finds its
-earlier targets already ended and stops nothing new. Neither call needs the
-`ctx.run` wrapper that [Surviving a restart](durable-execution.md) puts
-around work that must not happen twice.
+Tagging again keeps the execution's original position. For a tagged run
+using `Keep`, repeating the stop therefore keeps the same cutoff and
+cannot reach runs tagged after it.
+
+Other forms can select new targets when called again. An untagged run
+using `Keep` gets a new cutoff at each call. `Include` has no cutoff,
+so a later call can stop matching runs that appeared in the meantime.
+Account for that if the node body can replay.
+
+For saved results and replayed work, read
+[Surviving a restart](durable-execution.md).

@@ -102,4 +102,9 @@ The rest of the shapes an API takes (a route that answers 404, a stream of
 server-sent events, a WebSocket conversation, a route behind an API key) are
 in [Building an API](../language/building-an-api.md).
 
+That local address is your own install's. The `--public-url` tunnel, the one
+provider events come in through, is a different and filtered surface: it does
+not publish every `Route`. For how the two differ, read
+[A public address](../connections/public-address.md).
+
 Next: [putting a person in the loop](a-person-in-the-loop.md).

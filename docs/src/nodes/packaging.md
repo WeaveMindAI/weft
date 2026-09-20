@@ -1,31 +1,33 @@
 # Packaging
 
-A node is either a folder on its own or a member of a package. You want a
-package when several nodes share code.
+Put nodes in a package when they share code or dependencies. A package
+gives them one home, while each node keeps its own metadata and implementation.
 
 ## A bare node
 
-A directory with a `metadata.json` at its root. It stands alone.
+A standalone node is a directory containing `metadata.json` and `mod.rs`:
 
-```
+```text
 nodes/reply/
   metadata.json
   mod.rs
-  deps.toml        optional
-  tests.rs         optional
+  deps.toml
+  tests.rs
 ```
+
+`deps.toml` and `tests.rs` are optional. For the node files themselves,
+follow [Your first node](your-first-node.md).
 
 ## A package
 
-A directory with a `package.toml` at its root. Its members are **auto-detected**:
-every immediate subdirectory holding a `metadata.json`. Adding a node is adding
-a folder.
+A package has a `package.toml`. Its immediate subdirectories containing
+`metadata.json` become member nodes:
 
-```
-nodes/slack/
+```text
+nodes/my_service/
   package.toml
-  api.rs                      shared code, reached as `super::api`
-  metadata.json               optional PARTIAL: defaults every member inherits
+  api.rs
+  metadata.json
   send_message/
     metadata.json
     mod.rs
@@ -35,56 +37,66 @@ nodes/slack/
     mod.rs
 ```
 
-`package.toml` carries the package name and the cargo dependencies its members
-share:
+For example:
 
 ```toml
 [package]
-name = "slack"
+name = "my_service"
 
 [dependencies]
-async-trait = "0.1"
-serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 ```
 
-Any `.rs` file at the package root is shared code, reached from a member as
-`use super::<filename>;`. That is where the API wrapper goes, and where a
-package defines its own [provider meter](../connections/meters.md) when its
-nodes call a paid service weft does not ship.
+The dependency is shared by the members. A member can use `super::api`
+to reach `api.rs` at the package root. This is also where you can place a
+[provider meter](../connections/meters.md) shared by the service's nodes.
+
+The root `metadata.json` is optional and contains defaults inherited by
+members. For how fields combine, read
+[Package defaults](metadata.md#package-defaults).
 
 ## Nesting and discovery
 
-The catalog walk recurses until it hits a **unit**, meaning a directory with
-either a `metadata.json` or a `package.toml`, and then stops descending. So
-units may sit at any depth (`catalog/ai/llm/anthropic/`), and a unit never
-nests inside a unit.
+The catalog searches recursively until it reaches a directory containing
+`package.toml` or `metadata.json`. That directory is a package or a
+standalone node; discovery then follows that unit's layout.
+You can organize packages under category directories, but cannot hide
+another package inside a package member.
 
-Symlinks are never followed, and `target`, `node_modules`, `.git` and `.weft`
-are skipped. Two units declaring the same node type is a loud collision rather
-than a last-one-wins.
+Symlinks are followed. Broken links and cycles report errors.
+Directories named `target`, `node_modules`, `.git`, and `.weft` are
+excluded. If different nodes declare the same type name, catalog loading
+reports a collision.
 
 ## What gets compiled
 
-Only what your program actually uses.
+The compiler reads node metadata without compiling the node implementations.
+That lets it check a graph before building its worker.
 
-The compiler reads every node's `metadata.json` **without compiling any node
-Rust**, which is what makes the editor's live feedback fast. Codegen then emits
-one cargo crate per **referenced** package, containing only the referenced
-nodes, plus a registry mapping node type names to implementations.
-
-So a project using three nodes out of the whole catalog compiles three nodes.
-Nothing scans the filesystem at run time; the generated code names exactly what
-it needs.
+For the build, it includes the nodes the program references, plus their
+packages' shared Rust files and dependencies. An unused sibling node is
+left out; a shared root module is still included. The generated worker
+registers the selected implementations explicitly.
 
 ## Dependencies
 
-`deps.toml` next to a `mod.rs`, for that one node:
+Put node-specific dependencies in `deps.toml` beside `mod.rs`:
 
 ```toml
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+```
 
+The generated package already provides `weft`, `weft-providers`,
+`tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, and
+`tracing`. Declare other crates your code uses, and comment dependencies
+whose purpose would be unclear to the next reader.
+
+If the code needs native libraries, declare the build and runtime
+requirements separately. For example, these are dependency-file fragments
+for an image using `apt`:
+
+```toml
 [build-dependencies]
 cc = "1"
 
@@ -98,31 +110,27 @@ default = ["ca-certificates"]
 SOME_PATH = "{{catalog_path}}/vendor"
 ```
 
-Always available without declaring anything: `weft`, `tokio`, `serde`,
-`serde_json`, `async-trait`, `anyhow`, `tracing`, `uuid`.
+For a standalone node, place `build.rs` beside `mod.rs` and declare its
+crates under `[build-dependencies]` in `deps.toml`. Its entry point must
+be `pub fn main()`: weft calls it from the generated build script.
 
-`[system.*]` entries declare OS packages the node needs, keyed by package
-manager and optionally by distro version. That is what lets a node carry a
-native dependency without every user hand-installing it.
+Named packages currently also compile their root `build.rs` as a shared
+runtime module, where build-only dependencies are unavailable. A script
+using a crate declared only in `[build-dependencies]` therefore fails in
+that layout.
 
-Comment each dependency with why it is there.
+The `system.build` packages are installed in the builder image;
+`system.runtime` packages go in the worker image.
 
-## Package-level metadata
-
-A package root may hold a **partial** `metadata.json` of defaults every member
-inherits, which is how a package's nodes share a `types` block or a provider
-name: [Package defaults](metadata.md#package-defaults).
+A system-package table can use a distro key such as `debian_12` in place
+of `default`. weft selects the matching distro entry, then falls back to
+`default` if one exists. In build environment values,
+`{{catalog_path}}` expands to the node's staged directory.
 
 ## Sharing a package
 
-Copy the folder. A package is self-contained on disk, so putting one in your
-project's `nodes/` is the whole install.
+Copy the package folder into another project's `nodes/` directory.
+Include its shared files and any assets its code or build script needs.
+If you used symlinks, their targets must remain available or be copied too.
 
-Nothing pulls a package from git for you yet. That command is an open
-contribution slot, and the shape it should take is in
-[CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#pulling-somebodys-nodes-from-git-up-for-grabs).
-
-Whatever gets built has to hold one property. A project's `nodes/` is the
-complete list of what its programs can do, and nothing outside the project
-folder is reached during a build. That is what makes a project directory
-portable, and what stops an upgrade changing what an existing program does.
+The build also needs weft and the declared Rust and system dependencies.

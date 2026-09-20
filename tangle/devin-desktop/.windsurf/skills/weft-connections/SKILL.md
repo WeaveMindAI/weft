@@ -149,7 +149,7 @@ answer resumes the run from where it stopped, seconds or weeks later.
 A trigger the outside world pushes to, rather than one weft polls, needs the
 runtime reachable from the internet (a route is the plain case, and a
 service's own watch or event subscription is the other):
-`weft daemon start --public-url` tunnels a public base and the trigger surfaces
+`./setup.sh --public-url` tunnels a public base and the trigger surfaces
 get real URLs (shown in the trigger node's live feed in the graph).
 Without it, polling triggers (Telegram, email, sheets, RSS, cron) and
 everything local still work. With a public address, the `url` on a file

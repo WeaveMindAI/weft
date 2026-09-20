@@ -57,11 +57,21 @@ and one thing for a reader to learn.
 ] }
 ```
 
-Four item types render. `text` is a copyable box, `image` takes anything an
-`<img src>` accepts, `progress` takes a number from 0 to 1 and draws a bar, and
-`secret` sits behind a `••••` mask until the user clicks the eye. Use `secret`
-for anything that should not sit on somebody's screen, like an API key; the
-copy button hands over the real value whether or not it is revealed.
+Four item types render:
+
+| Type | Data | What appears |
+|---|---|---|
+| `text` | String or number | Copyable text |
+| `image` | Image URL or data URL | Image |
+| `progress` | Number from 0 to 1 | Progress bar |
+| `secret` | String or number | Masked text, with reveal and copy buttons |
+
+Use `secret` for anything that should not sit on somebody's screen, like an
+API key. The mask keeps it off the screen and nothing more: the copy button
+hands over the real value whether or not it is revealed.
+
+An item needs a string `label`, and an action needs string `label` and
+`actionKind` fields of its own; an item missing those is dropped.
 
 An infra node's item may carry one button. Pressing it posts `{ "action":
 "<actionKind>", "payload": ... }` back to the container, which is the only

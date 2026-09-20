@@ -1,82 +1,322 @@
-/* Weft book theme tweaks.
-   Kept small on purpose: mdBook's defaults are good, these only fix the
-   places where a language reference needs more room or more contrast than
-   a generic book does. */
-
+/* The landing page's warm ground, cream ink and amber thread, adapted for reading. */
 :root {
-  --weft-accent: #7c5cff;
-  --weft-accent-soft: rgba(124, 92, 255, 0.14);
+  --sidebar-target-width: 290px;
+  --content-max-width: 790px;
+  --menu-bar-height: 64px;
+  --page-padding: 32px;
+  --mono-font: "Geist Mono", monospace;
+  --weft-serif: "Source Serif 4", Georgia, serif;
+  --weft-accent: var(--links);
+  --weft-line: var(--table-border-color);
+  --weft-muted: var(--sidebar-fg);
+  --weft-panel: var(--table-alternate-bg);
 }
 
-/* Wider measure. Type tables and port signatures wrap badly at 750px. */
-.content main {
-  max-width: 860px;
+.ayu {
+  --bg: #0d0b09;
+  --fg: #d9d3c9;
+  --sidebar-bg: #13100d;
+  --sidebar-fg: #b8aea1;
+  --sidebar-active: #f0ad54;
+  --sidebar-spacer: #302820;
+  --sidebar-header-border-color: #8d642f;
+  --sidebar-non-existant: #9a8e7f;
+  --links: #edab57;
+  --icons: #ab9d8c;
+  --icons-hover: #f4f1ea;
+  --inline-code-color: #ebbd80;
+  --theme-popup-bg: #1d1813;
+  --theme-popup-border: #44372b;
+  --theme-hover: #30261c;
+  --quote-bg: #1c160f;
+  --quote-border: #d97706;
+  --table-border-color: #332b22;
+  --table-header-bg: #211b15;
+  --table-alternate-bg: #171310;
+  --searchbar-bg: #171310;
+  --searchbar-fg: #f4f1ea;
+  --searchbar-border-color: #665039;
+  --searchbar-shadow-color: transparent;
+  --searchresults-header-fg: #b8aea1;
+  --searchresults-border-color: #44372b;
+  --searchresults-li-bg: #211b15;
+  --search-mark-bg: #edab57;
+  --scrollbar: #665442;
 }
 
-/* Code blocks carry a lot of the weight here, so give them air. */
-.content pre {
-  padding: 1rem 1.1rem;
-  border-radius: 8px;
-  line-height: 1.55;
+.light {
+  --bg: #faf7f1;
+  --fg: #342d25;
+  --sidebar-bg: #f1ece2;
+  --sidebar-fg: #65594b;
+  --sidebar-active: #8c480e;
+  --sidebar-spacer: #dcd2c3;
+  --sidebar-header-border-color: #bc8a48;
+  --links: #965018;
+  --icons: #786651;
+  --icons-hover: #382619;
+  --inline-code-color: #814311;
+  --theme-popup-bg: #faf7f1;
+  --theme-popup-border: #d6c8b6;
+  --theme-hover: #eae0d1;
+  --quote-bg: #f2e9db;
+  --quote-border: #ae650c;
+  --table-border-color: #ddd2c2;
+  --table-header-bg: #eee5d7;
+  --table-alternate-bg: #f3eee5;
+  --searchbar-bg: #fffdf8;
+  --searchbar-fg: #342d25;
+  --searchbar-border-color: #aa8b65;
+  --searchbar-shadow-color: transparent;
+  --searchresults-header-fg: #65594b;
+  --searchresults-border-color: #d6c8b6;
+  --searchresults-li-bg: #eee5d7;
+  --search-mark-bg: #f2cd90;
+  --scrollbar: #b4a48f;
 }
 
-.content pre > .buttons {
-  opacity: 0.35;
+body {
+  font-family: "Geist", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.75;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Inline code should read as a token, not as body text. */
-.content code {
-  border-radius: 4px;
-  padding: 0.1em 0.35em;
-  font-size: 0.92em;
+::selection { background: var(--search-mark-bg); color: var(--bg); }
+.light ::selection, .rust ::selection { color: var(--fg); }
+a:focus-visible, button:focus-visible, input:focus-visible,
+.icon-button:focus-visible {
+  outline: 2px solid var(--weft-accent);
+  outline-offset: 4px;
 }
 
-/* Tables: the reference pages lean on them heavily. */
-.content table {
-  width: 100%;
-  display: table;
-  border-collapse: collapse;
+/* The desktop masthead stays above the independently scrolling contents. */
+.weft-brand {
+  position: fixed;
+  inset: 0 auto auto 0;
+  z-index: 101;
+  box-sizing: border-box;
+  width: var(--sidebar-width);
+  height: 88px;
+  padding: 16px 26px;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  background: var(--sidebar-bg);
+  border-bottom: 1px solid var(--weft-line);
+  color: var(--sidebar-fg);
+  text-decoration: none;
 }
-
-.content table th {
-  text-align: left;
+.weft-wordmark {
+  font-family: var(--weft-serif);
+  font-size: 36px;
+  font-weight: 600;
+  letter-spacing: -1.5px;
+}
+.weft-wordmark > span { color: var(--sidebar-active); }
+.weft-book-label {
+  font-family: var(--mono-font);
+  font-size: 10px;
+  letter-spacing: 1.8px;
+  text-transform: uppercase;
+  color: var(--weft-muted);
+  border-left: 1px solid var(--weft-line);
+  padding-left: 15px;
+}
+#mdbook-sidebar-toggle-anchor:not(:checked) ~ .page-wrapper .weft-brand { display: none; }
+.sidebar { border-right: 1px solid var(--weft-line); }
+.sidebar .sidebar-scrollbox { top: 88px; padding: 18px 16px 40px; }
+.chapter { font-size: 13px; line-height: 1.5; }
+.chapter li.chapter-item { margin-top: 2px; }
+.chapter li a {
+  display: block;
+  flex: 1;
+  padding: 6px 10px;
+  border-left: 2px solid transparent;
+  border-radius: 0 4px 4px 0;
+}
+.chapter li a:hover { background: var(--theme-hover); }
+.chapter li a.active {
+  background: var(--theme-hover);
+  border-left-color: var(--weft-accent);
   font-weight: 600;
 }
+.chapter li.part-title {
+  margin-top: 26px;
+  margin-bottom: 9px;
+  padding-inline: 12px;
+  font-family: var(--mono-font);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--weft-muted);
+}
+.chapter .section { padding-left: 14px; }
 
-.content table td,
-.content table th {
-  padding: 0.5rem 0.7rem;
+#mdbook-menu-bar {
+  border-bottom: 1px solid var(--weft-line);
+  background: var(--bg);
+}
+.menu-title {
+  font-family: var(--mono-font);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--icons);
+}
+.theme-popup { border-radius: 6px; padding: 6px; }
+.theme-popup .theme { padding: 8px 14px; }
+
+.content main { padding-top: 42px; padding-bottom: 72px; }
+.page-actions {
+  float: right;
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 160px;
+  margin: 8px 0 12px 20px;
+  font-size: 12px;
+}
+.copy-markdown {
+  padding: 7px 12px;
+  border: 1px solid var(--weft-line);
+  border-radius: 5px;
+  background: var(--weft-panel);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.copy-markdown:hover { border-color: var(--links); color: var(--links); }
+.copy-markdown-status { color: var(--fg); }
+.content h1, .content h2 {
+  font-family: var(--weft-serif);
+  font-weight: 550;
+  line-height: 1.17;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+.content h1 { font-size: clamp(36px, 4vw, 52px); margin: 0 0 32px; }
+.content h2 {
+  font-size: 31px;
+  margin-top: 56px;
+  padding-top: 25px;
+  border-top: 1px solid var(--weft-line);
+}
+.content h3 { font-size: 20px; line-height: 1.4; margin-top: 32px; font-weight: 600; }
+.content h1 .header, .content h2 .header, .content h3 .header { color: var(--fg); }
+.ayu .content h1 .header, .ayu .content h2 .header { color: #f4f1ea; }
+.content p { margin-block: 1.2em; }
+.content p, .content ul, .content ol { line-height: 1.7; }
+.content main > h1 + p { font-size: 18px; line-height: 1.7; }
+.content li { margin-block: 0.4em; }
+.content a:not(.header) { text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.content a:not(.header):hover { text-decoration: underline; }
+.content hr { margin-block: 38px; background: var(--weft-line); border: 0; height: 1px; }
+
+.content pre {
+  margin-block: 26px;
+  padding: 20px 22px;
+  border: 1px solid var(--weft-line);
+  border-radius: 6px;
+  background: var(--weft-panel);
+  line-height: 1.65;
+  overflow-x: auto;
+}
+.content :not(pre) > code {
+  display: inline;
+  color: var(--links);
+  padding: 0.12em 0.35em;
+  border: 1px solid var(--weft-line);
+  border-radius: 3px;
+  background: var(--weft-panel);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+.content pre > code { padding: 0; font-size: 13px; background: transparent; }
+.content pre > .buttons { opacity: 0.6; }
+.content pre:hover > .buttons, .content pre:focus-within > .buttons { opacity: 1; }
+.ayu .hljs { color: #ded4c5; }
+.ayu .hljs-comment { color: #ab9d8c; }
+.ayu .hljs-keyword, .ayu .hljs-type { color: #edab57; }
+.ayu .hljs-string { color: #c5c995; }
+.ayu .hljs-number, .ayu .hljs-literal { color: #dba586; }
+.light .hljs { color: #342d25; }
+.light .hljs-comment { color: #736653; }
+.light .hljs-keyword, .light .hljs-type { color: #86500e; }
+.light .hljs-attr, .light .hljs-meta { color: #994522; }
+.light .hljs-string { color: #4b6325; }
+.light .hljs-number, .light .hljs-literal { color: #825940; }
+
+.content table { width: 100%; border-collapse: collapse; font-size: 14px; margin-block: 26px; }
+.content table th, .content table td {
+  padding: 11px 14px;
   vertical-align: top;
+  border: 1px solid var(--weft-line);
 }
-
-/* Callouts. Written as blockquotes whose first line is a bold marker, so
-   they degrade to ordinary quotes on GitHub and render as boxes here. */
+.content table th { text-align: left; font-weight: 600; }
 .content blockquote {
-  border-left: 3px solid var(--weft-accent);
-  background: var(--weft-accent-soft);
-  padding: 0.8rem 1rem;
-  margin: 1.4rem 0;
+  border-left: 2px solid var(--quote-border);
+  background: var(--quote-bg);
+  padding: 16px 22px;
+  margin: 28px 0;
+  border-radius: 0 4px 4px 0;
+}
+.content blockquote > :first-child { margin-top: 0; }
+.content blockquote > :last-child { margin-bottom: 0; }
+.content img { max-width: 100%; border-radius: 6px; }
+.content .checkbox-label { display: block; margin-block: 28px; }
+.mermaid { margin-block: 28px; overflow-x: auto; text-align: center; }
+#mdbook-searchbar { border-radius: 5px; padding: 14px; font: inherit; }
+.nav-chapters { border-radius: 5px; }
+
+/* mdBook translates the page on small screens, which also moves fixed
+   descendants. Keep the mobile sidebar entirely within mdBook's nav. */
+@media (max-width: 1079px) {
+  .weft-brand { display: none; }
+  .sidebar .sidebar-scrollbox { top: 0; }
 }
 
-.content blockquote > :first-child {
-  margin-top: 0;
+@media (max-width: 600px) {
+  :root { --page-padding: 22px; --menu-bar-height: 54px; }
+  body { font-size: 15px; }
+  .content main { padding-top: 28px; padding-bottom: 32px; }
+  .content main > h1 + p { font-size: 17px; }
+  .content h2 { font-size: 27px; margin-top: 38px; }
+  .content pre { padding: 16px; }
+  .content table { display: block; overflow-x: auto; }
+  .menu-title { display: none; }
 }
 
-.content blockquote > :last-child {
-  margin-bottom: 0;
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  html:not(.sidebar-resizing) .sidebar, .chapter-fold-toggle div { transition: none; }
 }
 
-/* Image briefs: while an image file is still missing, the alt text is what
-   readers see. Make that legible rather than a broken-icon mess. */
-.content img {
-  max-width: 100%;
-  border-radius: 8px;
-  display: block;
-  margin: 1.6rem auto;
-}
-
-/* Mermaid diagrams sit better centered with a little breathing room. */
-.mermaid {
-  margin: 1.8rem auto;
-  text-align: center;
+@media print {
+  html[class] {
+    --bg: #fff;
+    --fg: #222;
+    --weft-panel: #f7f7f7;
+    --weft-line: #ccc;
+    --quote-bg: #f7f7f7;
+    --quote-border: #777;
+    --table-header-bg: #eee;
+    --table-alternate-bg: #fff;
+    --inline-code-color: #222;
+  }
+  #mdbook-page-wrapper.page-wrapper {
+    margin-inline-start: 0 !important;
+    transition: none !important;
+  }
+  .page { padding: 0; margin-block-start: 0; }
+  .weft-brand { display: none; }
+  .content main { padding: 0; max-width: none; }
+  .page-actions { display: none; }
+  .content, .content * { color: #222 !important; }
+  .content h1, .content h2, .content h3 { break-after: avoid; }
+  .content pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 }

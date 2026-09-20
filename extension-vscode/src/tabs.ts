@@ -28,19 +28,6 @@ export function textTabsForPath(
   );
 }
 
-/// The canonical path of every open text-editor tab, in one scan. For
-/// callers checking MANY paths against the open set (a batch of closed
-/// tabs), where per-path `textTabsForPath` scans would multiply.
-export function openTextTabPaths(): Set<string> {
-  return new Set(
-    vscode.window.tabGroups.all.flatMap((group) =>
-      group.tabs
-        .filter((tab) => tab.input instanceof vscode.TabInputText)
-        .map((tab) => canonicalPath((tab.input as vscode.TabInputText).uri.fsPath)),
-    ),
-  );
-}
-
 /// True when this document is open for REVIEW rather than for editing: one
 /// side of a diff, or a revision from source control (`git:`, and every
 /// other read-only scheme a provider serves).

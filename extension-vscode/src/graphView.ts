@@ -15,7 +15,7 @@ import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
-import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
+import { afterTabModelSettles, isReviewDoc } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
@@ -56,6 +56,11 @@ function unrenderableItem(item: unknown): LiveDataItem {
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
+  /// Set while `open` is between deciding to create the panel and holding
+  /// it (the storage-origin lookup awaits in between). A second `open`
+  /// landing in that window waits for this instead of creating a second
+  /// panel: the panel is a singleton and the loser would leak.
+  private creating: Promise<void> | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
   /// The OBJECT STORE's browser-facing origin (scheme://host:port),
@@ -106,7 +111,7 @@ export class GraphViewController {
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
   private followClearHandler: (() => void) | undefined;
-  private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
+  private openSourceHandler: ((location: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
   /// process or POST /executions/{color}/cancel.
@@ -230,7 +235,7 @@ export class GraphViewController {
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
   setFollowClearHandler(fn: () => void): void { this.followClearHandler = fn; }
-  setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
+  setOpenSourceHandler(fn: (location: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
   /// execution_running (POST /cancel) state.
@@ -292,30 +297,30 @@ export class GraphViewController {
     this.panel?.webview.postMessage(msg);
   }
 
-  /** True iff the graph webview panel currently exists. The
-   *  cold-open handler in extension.ts uses this to distinguish
-   *  "user just opened a .weft and we should swap it to graph"
-   *  from "user is refocusing an already-pinned project's text
-   *  tab and we should leave it alone". */
+  /// True iff the graph panel exists (or is being created). The tab-open
+  /// listener in extension.ts creates a graph only when there is none.
   isOpen(): boolean {
-    return this.panel !== undefined;
-  }
-
-  /// Bring the graph panel to front (e.g. after a `.weft` click stole focus
-  /// to a stray text tab we're about to close).
-  reveal(): void {
-    this.panel?.reveal();
+    return this.panel !== undefined || this.creating !== undefined;
   }
 
   /// Path of the `.weft` the graph is currently showing. This tracks include
   /// navigation (it's the navigated-into file, not the project entry), so the
-  /// Source button opens the file you're actually looking at.
+  /// panel's code buttons open the file you're actually looking at.
   currentFilePath(): string | undefined {
     return this.watchedDoc?.uri.fsPath;
   }
 
-
-  async open(doc: vscode.TextDocument, projectId?: string, keepNavStack = false): Promise<void> {
+  /// Show `doc` as a graph. The panel is a singleton: the first open creates
+  /// it in `column` (the text stays where it is, like a markdown preview),
+  /// every later open reveals it wherever the user has since put it and
+  /// repoints it at `doc`. We never move an existing panel: moving a webview
+  /// between columns destroys its iframe (microsoft/vscode#141001).
+  async open(
+    doc: vscode.TextDocument,
+    projectId: string | undefined,
+    column: vscode.ViewColumn,
+    keepNavStack = false,
+  ): Promise<void> {
     // A fresh open (sidebar, command) resets include-navigation; only
     // navigateInto/navigateBack preserve the stack. The webview learns
     // the new place with the parse result (`applyParseResult`).
@@ -334,25 +339,39 @@ export class GraphViewController {
     if (this.execVersionFor !== undefined && this.execVersionFor !== this.watchedProjectId) {
       this.forgetExecVersion();
     }
-    // Graph takes ViewColumn.Active so the .weft text doesn't
-    // show by default. The "Source" button opens the text in
-    // ViewColumn.Beside (column 2). We don't try to swap them
-    // because moving a webview between columns destroys the
-    // iframe (microsoft/vscode#141001).
+    if (this.creating) {
+      await this.creating;
+      return this.open(doc, projectId, column, keepNavStack);
+    }
     if (this.panel) {
-      this.panel.reveal(vscode.ViewColumn.Active);
+      this.panel.reveal();
+      // Re-opening the doc the panel already shows (the title-bar button
+      // on a file whose graph is up) has nothing new to parse when the
+      // render is current; a different doc always parses.
+      const sameDoc = doc === this.watchedDoc;
       // The pollers were asking about the previous file's nodes; the
       // next parse starts the new file's. Left running, they would
       // paint the old file's displays onto same-named nodes of the new
       // one until that parse lands, and forever if it fails.
-      if (doc !== this.watchedDoc) this.stopAllLivePollers();
+      if (!sameDoc) this.stopAllLivePollers();
       this.watchedDoc = doc;
       this.watchNodesDir(doc);
       this.watchSelfFile(doc);
-      await this.triggerParse();
+      await this.triggerParse(false, sameDoc);
       return;
     }
 
+    this.creating = this.createPanel(doc, column);
+    try {
+      await this.creating;
+    } finally {
+      this.creating = undefined;
+    }
+    this.watchNodesDir(doc);
+    this.watchSelfFile(doc);
+  }
+
+  private async createPanel(doc: vscode.TextDocument, column: vscode.ViewColumn): Promise<void> {
     // Learn the media origin before rendering the CSP, so an
     // <img>/<video> can stream the bytes a minted link points at.
     this.loadStorageOrigin();
@@ -360,7 +379,7 @@ export class GraphViewController {
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
       this.panelTitle(doc),
-      vscode.ViewColumn.Active,
+      column,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -469,17 +488,7 @@ export class GraphViewController {
           void this.triggerParse(false, !isDifferentDoc);
         }
       }),
-      // Push source-open state to the webview so the "Source"
-      // button can render as active when the .weft is visible in
-      // some tab. Fires on every tab change anywhere; the
-      // computeSourceOpen helper short-circuits when the watched
-      // doc hasn't moved.
-      vscode.window.tabGroups.onDidChangeTabs(() => this.pushSourceState()),
     );
-    this.watchNodesDir(doc);
-    this.watchSelfFile(doc);
-    // Initial state push.
-    this.pushSourceState();
   }
 
   /// Watch the watched `.weft` file on disk. `onDidChangeTextDocument`
@@ -679,12 +688,6 @@ export class GraphViewController {
       // The `nodes/` catalog changed: have the warm server rebuild it.
       void this.triggerParse(true);
     }, debounce);
-  }
-
-  private pushSourceState(): void {
-    if (!this.panel || !this.watchedDoc) return;
-    const open = textTabsForPath(this.watchedDoc.uri.fsPath).length > 0;
-    this.post({ kind: 'sourceState', open });
   }
 
   /// The strongest reason among the schedules coalesced into the pending
@@ -1207,7 +1210,6 @@ export class GraphViewController {
         // even with retainContextWhenHidden.
         void this.sendGlobalCatalog();
         void this.triggerParse();
-        this.pushSourceState();
         // External state (action bar, status snapshot) lives in
         // extension.ts. Hand off so it can re-push.
         this.readyHandler?.();
@@ -2061,7 +2063,9 @@ export class GraphViewController {
     // The place is sent by `applyParseResult`, right before the parse
     // result it belongs to, once `open` has made the target the watched
     // doc: sent here it would pair the new call path with the old file.
-    await this.open(target, undefined, true);
+    // The column is moot: navigation always has the panel already up, so
+    // `open` reveals it where the user put it.
+    await this.open(target, undefined, vscode.ViewColumn.Beside, true);
   }
 
   /// The root of the project the watched document belongs to.
@@ -2228,7 +2232,7 @@ export class GraphViewController {
     this.freshMount = true;
     // The place goes out with the parse result, once the previous file
     // is the watched doc again (see `navigateInto`).
-    await this.open(previous.doc, undefined, true);
+    await this.open(previous.doc, undefined, vscode.ViewColumn.Beside, true);
   }
 
   /// Where in the program this view stands. The call path is the chain
