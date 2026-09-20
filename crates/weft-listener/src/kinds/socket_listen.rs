@@ -23,7 +23,8 @@ use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct SocketListenHandler;
 
@@ -67,11 +68,35 @@ impl KindHandler for SocketListenHandler {
             }
             .boxed()
         });
-        Ok(Some(socket_engine::spawn(prepare, on_event, "socket_listen")))
+        Ok(Some(socket_engine::spawn(prepare, on_event, "socket_listen", super::serving_sink(&ctx))))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
         ProcessOutcome { value: payload, target: ProcessTarget::Entry }
+    }
+
+    /// Nothing calls in, so there is no address to show: the display
+    /// is what this signal is listening to and whether the loop
+    /// holding it is healthy right now.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let sig = ctx.sig;
+        let cfg = match super::config_for_display::<SocketListen>(sig, "Listening to") {
+            Ok(cfg) => cfg,
+            Err(feed) => return feed,
+        };
+        // A socket whose gateway address is minted per connection has no
+        // configured url at all (`validate` refuses having both), so the
+        // line says that; the engine's state line below says whether
+        // the socket it minted is up.
+        let mut items: Vec<LiveItem> = match super::configured_url_item("Listening to", &cfg.url) {
+            Some(item) => vec![item],
+            None => vec![LiveItem::text(
+                "Listening to",
+                "an address minted for each connection",
+            )],
+        };
+        items.extend(super::serving_item(sig));
+        LiveFeed::new(items)
     }
 
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {

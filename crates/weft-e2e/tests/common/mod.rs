@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use weft_e2e::client::{cli, CliOutput};
 use weft_e2e::fakes::SseFake;
-use weft_e2e::{run, Dispatcher};
+use weft_e2e::{run, Dispatcher, Project};
 
 pub const INFRA_NODE: &str = "svc";
 /// Bodies the HoldGate polls for: anything without "release" holds.
@@ -102,27 +102,33 @@ pub async fn assert_verb_rejected(disp: &Dispatcher, path: &str, why: &str) -> a
     Ok(())
 }
 
-/// Assert a RUN is rejected by the LIFECYCLE gate (a REJ cell).
+/// Assert a whole-graph RUN is refused, and by the gate the test means.
 ///
-/// The status code alone does not prove it: a definition hash that does
-/// not match the project's answers 409 too, three lines further down
-/// the same handler, so a test that only checked the code would pass
-/// with the gate deleted. The message is what tells the two apart.
-pub async fn assert_run_rejected(disp: &Dispatcher, pid: &Uuid, why: &str) -> anyhow::Result<()> {
-    let path = format!("/projects/{pid}/versions/runs");
-    let body = json!({ "manifest": {}, "definitionHash": "e2e-never-registered", "binaryHash": "e2e-never-registered" });
-    let (code, text) = disp.post_raw(&path, &body).await?;
+/// Through the CLI, which builds and sends the real definition hash, so
+/// the refusal reaches the gate under test: a bare POST with a made-up
+/// hash would be turned away for the hash, three lines further down the
+/// same handler, and a test that only checked the code would pass with
+/// the gate deleted. `gate` is the fragment of the refusal that names
+/// it: `LIFECYCLE_GATE` for the reconciliation table (a transitional
+/// project), `INFRA_GATE` for the run's own infra pre-flight (declared
+/// infra not running).
+pub async fn assert_run_rejected(project: &Project, why: &str, gate: &str) -> anyhow::Result<()> {
+    let out = cli(project.dir(), &["run", "--json"]).await?;
+    anyhow::ensure!(!out.success, "`weft run` must be refused ({why}), but it ran:\n{}", out.stdout);
+    let text = format!("{}\n{}", out.stdout, out.stderr);
     anyhow::ensure!(
-        code == reqwest::StatusCode::CONFLICT,
-        "POST {path} must be rejected by the gate ({why}) with 409, but got HTTP {code}: {text}"
-    );
-    anyhow::ensure!(
-        text.contains("is not available right now"),
-        "POST {path} must be rejected by the LIFECYCLE gate ({why}), but it answered 409 for \
-         another reason: {text}"
+        text.contains(gate),
+        "`weft run` must be refused by the gate ({why}: `{gate}`), but it was refused for \
+         another reason:\n{text}"
     );
     Ok(())
 }
+
+/// The reconciliation table's refusal (`require_action`).
+pub const LIFECYCLE_GATE: &str = "is not available right now";
+/// The run's own infra pre-flight (`versions::run`), which names the
+/// places that are down.
+pub const INFRA_GATE: &str = "infra not running for";
 
 /// The current status string of one execution (`running` /
 /// `waiting_for_input` / `completed` / `cancelled` / `failed`), read live

@@ -7,7 +7,7 @@
 
 use reqwest::Method;
 use serde_json::{json, Value};
-use weft_e2e::{ensure, live, run, project::Project};
+use weft_e2e::{display, ensure, live, run, project::Project};
 
 #[tokio::test]
 async fn a_route_inside_an_included_file_registers_and_answers() -> anyhow::Result<()> {
@@ -16,6 +16,16 @@ async fn a_route_inside_an_included_file_registers_and_answers() -> anyhow::Resu
     let base = project.unique_live_path()?;
     project.activate().await?;
     let before = run::execution_colors(&disp, &project.id()).await?;
+
+    // The included route's display is reached by its PLACE, the way the
+    // editor spells it after walking into the include (`one.door`): its
+    // registration is keyed by that spelling, and the file's own id for
+    // the node opens nothing.
+    let pid = project.id();
+    let shown = display::as_editor(&disp, &pid, "one.door").await?;
+    anyhow::ensure!(!shown.labels().is_empty(), "the included route's display is empty");
+    let (status, _) = disp.get_raw(&format!("/projects/{pid}/signals/@src:lib:door.door/live")).await?;
+    anyhow::ensure!(status == 404, "the compiled id must open no display, got {status}");
 
     // The top-level route answers as it always did.
     let (status, _, body) =

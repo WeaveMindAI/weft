@@ -852,6 +852,54 @@ fn an_include_carries_the_gate_ports_in_the_editors_parse() {
     );
 }
 
+/// A value written for an include alias's port (`keep.n = 7`) reaches
+/// the editor's parse in the one home every port constant has, so the
+/// card shows it, marks the port filled and refuses a wire over it,
+/// exactly as on a node. Before this, the include node was skipped by
+/// the pass that gives constants that home, and the card read empty.
+#[test]
+fn a_value_on_an_include_port_is_a_port_literal_in_the_editors_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("store.weft"),
+        "Group(note: String, n: Number) -> (stored: String) {\n  p = Text { value: \"x\" }\n  self.stored = p.value\n}\n",
+    )
+    .unwrap();
+    let source = "keep = @include(\"store.weft\")\nkeep.note = \"from main\"\nkeep.n = 7\n";
+    let (parsed, diags) = weft_compiler::parse_only(
+        source,
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        &catalog(),
+        None,
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    let keep = parsed.nodes.iter().find(|n| n.id == "keep").expect("the include node");
+    assert_eq!(keep.port_literals.get("note"), Some(&serde_json::json!("from main")));
+    assert_eq!(keep.port_literals.get("n"), Some(&serde_json::json!(7)));
+    assert!(keep.config.as_object().is_none_or(|c| !c.contains_key("n")), "one home: {:?}", keep.config);
+    assert_eq!(
+        keep.port_literal_spans.get("n").map(|s| s.origin),
+        Some(weft_core::project::ConfigOrigin::Connection),
+        "written on a statement line"
+    );
+
+    // A name outside the file's signature is refused in this parse the
+    // way the build refuses it, so the editor never shows a phantom field
+    // for a line the build will reject.
+    let (_, diags) = weft_compiler::parse_only(
+        "keep = @include(\"store.weft\")\nkeep.bogus = 1\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        &catalog(),
+        None,
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("'keep' has no input port 'bogus'")),
+        "{diags:?}"
+    );
+}
+
 /// Navigating INTO an included file parses that file alone. Its nodes must
 /// come out under the same ids the build gives them, because the editor's
 /// live pollers ask the dispatcher about a node by id: a trigger's mount
@@ -898,7 +946,7 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
         uuid::Uuid::new_v4(),
         CompileFs::disk(dir.path()).anchored_at(Some(&lib)),
         &cat,
-        Some(&source_id),
+        source_id.as_deref(),
     );
     assert!(
         parsed.nodes.iter().any(|n| n.id == "@lib:front.door"),

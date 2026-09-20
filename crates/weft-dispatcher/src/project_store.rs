@@ -237,10 +237,10 @@ pub trait ProjectStoreOps: Send + Sync {
     /// in flight (the caller should reject, e.g. 409).
     ///
     /// Every other status is a legal entry: Registered/Inactive (the
-    /// action bar), and Active/Deactivating (sync's auto-reactivate
-    /// after an infra upgrade, which may call while a wait-mode
-    /// deactivate is still draining; the roll-forward `resume_active`
-    /// verb). A drain-watcher CAS that loses to this transition
+    /// action bar), and Active/Deactivating (the roll-forward
+    /// `resume_active` verb, and the supervisor's auto-recover, either
+    /// of which may call while a wait-mode deactivate is still
+    /// draining). A drain-watcher CAS that loses to this transition
     /// already tolerates the loss and retries. Also refused while a
     /// build transition is in flight (`transition <> 'none'`).
     /// Stamps the transition heartbeat so the stuck-transition reaper
@@ -493,8 +493,9 @@ impl ProjectLifecycle {
 
     /// User-facing mode label derived from the axes. Used by the
     /// status response so the CLI / extension can render a single
-    /// string ("active", "wipe", "hibernate", "park", "deactivating")
-    /// without reverse-engineering the booleans.
+    /// string ("registered", "activating", "active", "deactivating",
+    /// and for an inactive project the way it went down: "wipe",
+    /// "hibernate", "park") without reverse-engineering the booleans.
     pub fn mode_label(&self) -> &'static str {
         match self.status {
             ProjectStatus::Registered => "registered",

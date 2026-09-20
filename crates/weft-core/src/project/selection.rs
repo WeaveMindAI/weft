@@ -135,6 +135,42 @@ fn incoming<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<I
     })
 }
 
+/// Every place reached from `seeds` by following wires backward, seeds
+/// included: the plain data walk over PLACES. A body entered through a
+/// site is walked under that site alone (see `step`), so an infra node
+/// inside a file included twice is reached once per call, and a wire
+/// another caller put on the same body boundary is never taken.
+///
+/// Wires only. Nothing structural is pulled in (no enclosing group's
+/// door, no gate feeding it, no loop taken whole), which is what tells
+/// this walk apart from [`RunSelection::dependencies`]: that one is the
+/// run's shape, this one is what a value's path runs through.
+pub fn upstream_by_wires(project: &ProjectDefinition, seeds: &[Located]) -> BTreeSet<Located> {
+    let mut reached = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut pending: Vec<(Located, Option<String>)> = seeds.iter().map(|place| (place.clone(), None)).collect();
+    while let Some((place, port)) = pending.pop() {
+        if !visited.insert((place.clone(), port.clone())) { continue; }
+        reached.insert(place.clone());
+        pending.extend(upstream_of(project, &place, port.as_deref()));
+    }
+    reached
+}
+
+/// The wires a walk arriving at `place` on `port` follows backward, each
+/// with its source's place and the port the walk arrives on there. A
+/// node takes every wire into it. An ordinary boundary takes only the
+/// wires into `port`: its ports are walked one at a time, so what feeds
+/// a group's `y` never reaches a member reading its `x`, and what feeds
+/// its gate reaches no member at all.
+fn upstream_of(project: &ProjectDefinition, place: &Located, port: Option<&str>) -> Vec<(Located, Option<String>)> {
+    let ordinary = is_ordinary_boundary(project, &place.id);
+    incoming(project, place)
+        .filter(|(edge, _, _)| !ordinary || port.is_none_or(|p| edge.target_handle.as_deref().unwrap_or("default") == p))
+        .map(|(edge, source, _)| (source, port_of(project, &edge.source, edge.source_handle.as_deref())))
+        .collect()
+}
+
 /// The wires out of `at` that are on its path, each with the place of
 /// its target and the wire's own place.
 fn outgoing<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
@@ -687,9 +723,7 @@ fn walk_ports(project: &ProjectDefinition, mut pending: Vec<(Located, Option<Str
         }
         let ordinary = is_ordinary_boundary(project, &place.id);
         let next: Vec<(Located, Option<String>)> = match direction {
-            Direction::Upstream => incoming(project, &place)
-                .filter(|(edge, _, _)| !ordinary || port.as_ref().is_none_or(|p| edge.target_handle.as_deref().unwrap_or("default") == p))
-                .map(|(edge, source, _)| (source, port_of(project, &edge.source, edge.source_handle.as_deref()))).collect(),
+            Direction::Upstream => upstream_of(project, &place, port.as_deref()),
             Direction::Downstream => outgoing(project, &place)
                 .filter(|(edge, _, _)| !ordinary || port.as_ref().is_none_or(|p| edge.source_handle.as_deref().unwrap_or("default") == p))
                 .map(|(edge, target, _)| (target, port_of(project, &edge.target, edge.target_handle.as_deref()))).collect(),

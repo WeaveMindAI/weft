@@ -56,6 +56,7 @@ pub mod access;
 pub mod assert;
 pub mod bus;
 pub mod client;
+pub mod display;
 pub mod ensure;
 pub mod event;
 pub mod fakes;

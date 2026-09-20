@@ -43,7 +43,7 @@ CLI.
 | `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
 | `weft examples` | list saved parameters and frozen examples; inspect them, rerun with `weft run <name>`, then compare with `weft diff` |
 | `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming |
-| `weft wake <color> <node>` | resolve a pure time wait now. A wait that expects a value is refused, naming its kind. |
+| `weft wake <color> <node>` | resolve a pure time wait now. `<node>` is the waiting node's place, spelled the way the source reads (`triage.hold` for the `hold` inside the file the site `triage` includes; a file included twice holds one wait per site). A wait that expects a value is refused, naming its kind. |
 | `weft prune <version> [--yes]` | delete a version, everything under it, and their runs. Asks first. Refuses on head's version, the activated version, any version a frozen example was frozen from or any ancestor of one, and while a run in the subtree is running. It names each reason. |
 
 For what each verb does and what every refusal means, go and read
@@ -108,11 +108,11 @@ activate` prompts you. To answer up front, pass one of:
 | `weft infra stop` | take units down per their stop behavior |
 | `weft infra upgrade` | stop then start. On an active project this deactivates the triggers and **leaves them off**, so activate again when you are ready. |
 | `weft infra terminate` | delete every infra resource, disks included unless a node's spec preserves them |
-| `weft infra status` | per-node health and endpoint URLs |
+| `weft infra status` | health and endpoint URL per infra instance, each named the way the source reads it (`db`, or `one.db` for the `db` inside the file the site `one` includes). A file included twice runs two instances, and both are listed. |
 | `weft infra logs [node] [--tail N] [-f]` | what the infra containers wrote: every infra node of the project, or one node's, each line prefixed with its pod and container. The place a failure inside an image is read from. |
 | `weft infra cancel` | abort an operation in progress |
-| `weft infra node-stop <id> [--force]` | stop one node. `--force` overrides a unit's stop behavior. |
-| `weft infra node-terminate <id>` | terminate one node |
+| `weft infra node-stop <node> [--force]` | stop one instance, named as `weft infra status` lists it (`one.db`). `--force` overrides a unit's stop behavior. |
+| `weft infra node-terminate <node>` | terminate one instance, named the same way |
 
 See [Infrastructure nodes](../nodes/infrastructure.md) for what the verbs
 actually do to a unit.
@@ -169,7 +169,10 @@ answers on incomplete source; `validate` is strict.
 | `weft rm [project]` | remove a project: triggers wiped, runs cancelled, infra terminated, stored data reclaimed. Asks first; `--yes` answers it (required when scripting). `--journal`, `--local`, `--all`, `--force` |
 
 `weft token mint` also takes repeatable `--projects` and `--tags` flags that
-narrow what a token can ever see:
+narrow what a token can ever see, and `--display` / `--displays`,
+which GRANT it what a node is showing (a token says nothing about displays and
+reads none). `--display` takes a node the way you write it (`test.whatsapp`), resolved
+against the project you are in:
 [Scoping a token](browser-extension.md#scoping-a-token).
 
 ## The environment

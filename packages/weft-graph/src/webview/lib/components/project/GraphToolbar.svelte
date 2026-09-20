@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowLeft, Code, EyeOff, Pin, PinOff } from '@lucide/svelte';
+  import { ArrowLeft, Code, EyeOff, Info, Pin, PinOff } from '@lucide/svelte';
   import type { Snippet } from 'svelte';
 
   let {
@@ -14,6 +14,7 @@
     sourceOpen = false,
     navDepth = 0,
     navFileName = '',
+    interactive = true,
     onNavigateBack,
     leading,
     trailing,
@@ -43,6 +44,10 @@
     /// Return button shows. navFileName labels the current file.
     navDepth?: number;
     navFileName?: string;
+    /// False when the file on screen was opened on its own rather than
+    /// reached from the entry file: the graph is drawn and edited, but
+    /// no run is shown, and a pill says where to go for one.
+    interactive?: boolean;
     onNavigateBack?: () => void;
     /// Host-injected controls placed at the START of the toolbar, before the
     /// editor's own buttons. A web host can put a "back to projects" button
@@ -82,6 +87,19 @@
       Return{navFileName ? ` · ${navFileName}` : ''}
     </button>
   {/if}
+
+  <!-- A view that is no place in the program shows no run, so none of
+       the run controls below (catch up, pin, stop showing) mean anything
+       here: the pill takes their spot and says where a run is seen. -->
+  {#if !interactive}
+    <div
+      class="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-slate-100 text-slate-700 border border-slate-300 shadow-sm text-xs font-medium"
+      title="This file is included by the program, maybe from more than one place. To see what a run did here, open src/main.weft and walk in through the include that reaches it."
+    >
+      <Info class="w-3 h-3" />
+      Opened on its own: no runs shown. Walk in from src/main.weft for those.
+    </div>
+  {:else}
 
   {#if notPainted}
     <div
@@ -136,6 +154,7 @@
     >
       <EyeOff class="w-3.5 h-3.5" />
     </button>
+  {/if}
   {/if}
 
   {#if onOpenSource}

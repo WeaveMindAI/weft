@@ -146,8 +146,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         } else {
             println!("  infra:");
             for entry in infra {
-                // `node` is the spelling, `node_id` the runtime's key;
-                // a person reads the first one.
+                // `node` is the instance's place, spelled the way the
+                // source reads it (`one.db`): the key and the label are one.
                 let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
                 let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let url = entry

@@ -110,6 +110,25 @@ with `jq` instead of parsing the human columns; `test-node` prints its
 reports as one JSON array. `new`, `follow`, `daemon`, `catalog`, `clean` and
 `update` ignore it.
 
+## Naming a node
+
+Every command that takes a node takes its whole path from the entry file,
+dot-joined, the way the source reads: `classify` for a node written in
+`src/main.weft`, `review.classify` for one inside the group `review`,
+`triage.classify` for one inside the file the site `triage` includes
+(`triage = @include("triage.weft")`), and `triage.review.classify` when it
+sits in a group inside that file. Sites, groups and nodes are one tree, and a
+name is the walk down it from the top. There is no short form: a bare
+`classify` names nothing once the node sits inside a group or an included
+file, and the refusal spells the name that works. The same file included
+twice is two places with two names (`triage.classify` and `again.classify`),
+each with its own runs, waits and display. This is what `--from`, `--emit`,
+`--target`, `--before`, `--seed-until`, `--seed-before`, `--group`, `--fire`,
+`weft events --node`, `weft wake`, `weft freeze --expect`, `weft infra
+node-stop`, `weft infra node-terminate`, `weft infra logs` and `weft token
+mint --display` take, and what `weft events`, `weft executions`, `weft infra
+status` and the graph print back.
+
 ## The command map
 
 | Command | What it does |

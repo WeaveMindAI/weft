@@ -1,0 +1,4 @@
+[package]
+name = "e2e_include_twice"
+id = "00000000-0000-0000-0000-00000000c4c2"
+version = "0.1.0"

@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf } from "../../types";
+	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf, portValueFirstForm, isIncludeNodeType } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -103,10 +103,11 @@
 			/// footer names a cancel's cause from it, and the cancel card
 			/// falls back to it when the node's own row carries no reason.
 			runTerminal?: import('../../types').ExecutionTerminal;
-			/// Body-panel feed for this node, set ONLY for infra
-			/// (infra /live) and trigger (listener /display) nodes.
-			/// Other nodes get undefined and render no body panel
-			/// here. Distinct from `debugData` which is the JSON
+			/// What this node is showing: its display, set ONLY for the
+			/// two kinds that have one (an infra node whose container
+			/// serves `/live`, and a trigger, whose signal kind serves
+			/// one). Other nodes get undefined and render no body panel
+			/// here. Distinct from `debugData`, which is the JSON
 			/// preview chip Debug-style nodes show under the body
 			/// from the last execution's output.
 			bodyFeed?: NodeFeedState;
@@ -134,7 +135,7 @@
 
 	// Opaque `@include` block: carries a file path, navigates into the file
 	// on Open. Renders ports + an Open affordance, no config/body.
-	const isInclude = $derived(!!data.includePath);
+	const isInclude = $derived(isIncludeNodeType(data.nodeType));
 	// Human-readable name of the included component, derived from its filename
 	// (`components/my-cleaner.weft` -> "My Cleaner"): the basename without
 	// `.weft`, `-`/`_` to spaces, each word capitalized. Matches the name the
@@ -216,7 +217,10 @@
 		const filled = new Set<string>();
 		for (const [name, v] of Object.entries(portLiterals)) {
 			if (wiredInputPorts.has(name)) continue;
-			if (v !== undefined && v !== null && v !== '') filled.add(name);
+			// The one notion of "has a value" (an empty string counts: the
+			// compiler takes `k = ""` as the port's driver, and the wire
+			// veto reads it the same way).
+			if (isFilledIn(v)) filled.add(name);
 		}
 		return filled;
 	});
@@ -233,7 +237,7 @@
 		for (const input of inputList) {
 			const rendered = inputRendersField(input, {
 				wired: wiredInputPorts.has(input.name),
-				hasWrittenValue: portLiterals[input.name] !== undefined,
+				hasWrittenValue: isFilledIn(ownValue(portLiterals, input.name)),
 			});
 			if (!rendered) continue;
 			result.push(
@@ -244,12 +248,12 @@
 	});
 
 	/** The written form of a port field's value ('inline' = braces,
-	 *  'connection' = statement). Spelling is never gated: a value not
-	 *  yet in source takes the braces form on its first write, and the
-	 *  toggle flips it. */
+	 *  'connection' = statement). A value not yet in source takes the
+	 *  node kind's first form (a node's braces, an include's statement
+	 *  line), and on a node the toggle flips it. */
 	function portFieldForm(key: string): 'inline' | 'connection' {
 		const span = ownValue(portLiteralSpans, key) as ConfigFieldSpan | undefined;
-		return span?.origin ?? 'inline';
+		return span?.origin ?? portValueFirstForm(data.nodeType);
 	}
 
 
@@ -299,11 +303,17 @@
 				data.bodyFeed.state === 'absent' ||
 				(data.bodyFeed.state === 'ok' && data.bodyFeed.items.length > 0)),
 	);
+	/// Which of the two display-bearing kinds this node is. Only used to
+	/// word the "nothing is serving it yet" line, since the items
+	/// themselves are the same shape whichever kind produced them.
+	const isTriggerNode = $derived(
+		nodeIsTrigger({ nodeType: data.nodeType, features: data.features }),
+	);
 	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
 	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
-	// Simplified view: a node with any live-display part (an infra/trigger feed, a
-	// debug preview, an image/file preview) is drawn as a card showing that display
-	// instead of a bare square.
+	// Simplified view: a node with anything to show (its display, a
+	// debug preview, an image/file preview) is drawn as a card showing
+	// that instead of a bare square.
 	const hasLiveDisplay = $derived(showBodyFeed || showDebugDisplay || showFileDisplay);
 
 	// An access field with no connection picked pins the node open (the
@@ -1421,7 +1431,7 @@
 			onclick={(e) => {
 				e.stopPropagation();
 				const action = item.action!;
-				const ev = new CustomEvent('weft-signal-action', {
+				const ev = new CustomEvent('weft-display-action', {
 					detail: { nodeId: id, actionKind: action.actionKind, payload: action.payload, confirm: action.confirm },
 					bubbles: true,
 				});
@@ -1446,7 +1456,7 @@
 			     naming the button that brings it back, never the red
 			     error box (nothing is broken, nothing is running). -->
 			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
-				{#if nodeIsTrigger({ nodeType: data.nodeType, features: data.features })}
+				{#if isTriggerNode}
 					Nothing is listening for this trigger. Activate the project from the action bar.
 				{:else}
 					Not running. Start it from the action bar.
@@ -1514,7 +1524,7 @@
 	{/if}
 {/snippet}
 
-<!-- The simplified-view live display: the body feed plus the debug/image
+<!-- The simplified view: the node's display plus the debug/image
      previews, shown together under the card header. The full builder view
      renders bodyFeed (always) and debug/image (expanded-gated) separately; the
      bodyFeed markup is shared via {@render bodyFeedDisplay}. -->
@@ -2007,12 +2017,14 @@
 								: `Switch ${ref?.path} to pull-only @asset`}
 							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
 						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
-					{:else if field.portDriven}
+					{:else if field.portDriven && !isInclude}
 						{@const form = portFieldForm(field.key)}
 						{@const hasLiteral = isFilledIn(ownValue(portLiterals, field.key))}
 						<!-- The form-toggle marker: which SOURCE FORM this port's
 						     value is written in, braces `{ }` vs statement `=`.
-						     Spelling is never gated, so it always flips. -->
+						     A node's value flips freely; an include alias has
+						     no braces, its values are statement lines only, so
+						     it gets no toggle. -->
 						<button
 							type="button"
 							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors bg-muted text-muted-foreground hover:bg-accent"

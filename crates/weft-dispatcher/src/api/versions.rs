@@ -636,11 +636,10 @@ pub async fn run(
     // the language's own vocabulary.
     let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
     for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
-        // A bake captures a trigger under its address (`one.door` for the
-        // `door` an include site `one` reaches), so the kick's raw id is
-        // spelled back through its call frames before the lookup.
-        let call_path: Vec<String> = weft_core::frames::call_path(&kick.frames).into_iter().map(str::to_string).collect();
-        let address = weft_core::project::address_of(&project, &kick.node, &call_path);
+        // A bake captures a trigger under its place (`one.door` for the
+        // `door` an include site `one` reaches), so the kick is spelled
+        // through its call frames before the lookup.
+        let address = crate::api::project::kick_place(&project, kick);
         weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
             .map_err(|refusal| refused(&refusal))?;
         let capture = bakes.iter().find(|bake| bake.program == program)
@@ -660,8 +659,18 @@ pub async fn run(
         }
     }
 
-    // Infra pre-flight, scoped to what THIS run executes.
-    let bound: Option<HashSet<String>> = Some(resolved.selection.nodes.iter().map(|place| place.id.clone()).collect());
+    // THE infra gate on a run: against the definition this run was just
+    // built from, scoped to the places it executes (spelled the way
+    // their infra rows are keyed). A run aimed at part of the graph
+    // waits on that part's infra alone; a whole-graph run waits on all
+    // of it. `require_action` above deliberately does not enforce the
+    // whole-graph fact (it reports it, for the bar's unaimed button),
+    // the way it leaves the trigger facts to `require_trigger_infra`.
+    let bound: Option<HashSet<String>> = Some(
+        resolved.selection.nodes.iter()
+            .map(|place| weft_core::project::address_of(&project, &place.id, &place.path))
+            .collect(),
+    );
     let missing = crate::api::project::missing_infra_nodes(&state, &project_id, &project, bound.as_ref()).await?;
     if !missing.is_empty() {
         return Err((
@@ -716,8 +725,10 @@ pub async fn run(
     let is_trigger = |node: &str| project.nodes.iter().any(|n| n.id == node && n.features.is_trigger);
     let entry_node = kicks.iter()
         .min_by_key(|k| (!k.firing, is_trigger(&k.node), k.frames.len(), order(&k.node)))
-        .map(|k| spell(&Located::at(&k.node, &k.frames)))
-        .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| n.clone())))
+        .map(|k| crate::api::project::kick_place(&project, k))
+        // A provided value's consumers sit inside the call the value is
+        // emitted under, so they are spelled through its frames too.
+        .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| spell(&Located::at(n, &p.frames)))))
         .or_else(|| stale.iter().next().map(spell))
         .unwrap_or_else(|| "everything inherited".into());
     // Recording the run and starting it happen under the project's

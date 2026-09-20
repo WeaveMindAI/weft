@@ -23,8 +23,9 @@ export interface RawStatusPayload {
   running_count?: number;
   orphaned_infra?: boolean;
   infra_rollup?: string;
+  infra_busy?: boolean;
   infra?: Array<{
-    node_id?: string;
+    node?: string;
     node_type?: string;
     status?: string;
     failureStage?: string;
@@ -95,6 +96,7 @@ export function emptyActionAvailability(): ActionAvailability {
     mode: 'unknown',
     runningCount: 0,
     infraRollup: 'none',
+    infraBusy: false,
     infraNodes: [],
     preservation: { parked: 0, suspended: 0 },
   };
@@ -119,7 +121,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
   const firesDeadlineUnix =
     typeof raw.fires_deadline_unix === 'number' ? raw.fires_deadline_unix : undefined;
   const infraNodes = (Array.isArray(raw.infra) ? raw.infra : []).map((n) => ({
-    nodeId: n.node_id ?? '',
+    node: n.node ?? '',
     nodeType: n.node_type ?? '',
     status: n.status ?? 'unknown',
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
@@ -139,6 +141,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(firesDeadlineUnix !== undefined ? { firesDeadlineUnix } : {}),
     runningCount: Number(raw.running_count ?? 0),
     infraRollup,
+    infraBusy: !!raw.infra_busy,
     infraNodes,
     preservation: {
       parked: Number(raw.preservation?.parked ?? 0),
@@ -157,6 +160,7 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
     orphanedInfra: snapshot.orphanedInfra,
     mode: snapshot.mode,
     infraRollup: snapshot.infraRollup,
+    infraBusy: snapshot.infraBusy,
     runningCount: snapshot.runningCount,
     ...(snapshot.firesDeadlineUnix !== undefined
       ? { firesDeadlineUnix: snapshot.firesDeadlineUnix }

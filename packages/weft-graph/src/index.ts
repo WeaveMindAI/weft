@@ -74,9 +74,9 @@ export type {
 // Convert a compiled (Rust-shape) ProjectDefinition into the editor's view.
 export { translateProject } from './webview/host-bridge';
 
-// Shared node-feed transforms/guards (`infraLive` / `signalDisplay`), so every
-// host maps the backend's live payloads to `LiveDataItem[]` identically.
-export { isLiveDataItem, signalDisplayToLiveItems } from './live-data';
+// The shared guard on a node's display, so every host decides what is
+// renderable the same way.
+export { isLiveDataItem } from './live-data';
 
 // Node catalog registration (the editor needs node metadata to render ports +
 // config). A consumer feeds it the metadata catalog (the same metadata-only

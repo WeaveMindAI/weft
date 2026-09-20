@@ -50,9 +50,11 @@ pub struct SyncRequest {
     pub definition_hash: Option<String>,
     #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
-    /// Per-(node, image_name) hash map. Shape:
-    /// `{ "<node_id>": { "<image_name>": "<hash_tag>" } }`.
-    /// The supervisor reads it (executing a claimed infra lifecycle command)
+    /// Per-(place, image_name) hash map. Shape:
+    /// `{ "<node>": { "<image_name>": "<hash_tag>" } }`, `<node>` being
+    /// the infra node's place spelled the way a person writes it
+    /// (`one.db`), the key its `infra_node` row is stored under. The
+    /// supervisor reads it (executing a claimed infra lifecycle command)
     /// to resolve `Image::Local { name }` references to concrete docker tags.
     #[serde(default, rename = "imageHashes")]
     pub image_hashes: BTreeMap<String, BTreeMap<String, String>>,
@@ -136,11 +138,9 @@ pub struct LifecycleCommandIssued {
 
 #[derive(Debug, Serialize)]
 pub struct InfraStatusEntry {
-    /// The runtime's key for the node (see `ProjectInfraEntry`): a
-    /// match key, never a label.
-    pub node_id: String,
-    /// The same node the way the program spells it, for whoever prints
-    /// it at a person.
+    /// The instance's place, spelled the way a person writes the node
+    /// (`db`, `one.db`): what a person is shown, what the editor matches
+    /// against its canvas, and what every per-node verb takes.
     pub node: String,
     pub status: String,
     pub endpoint_url: Option<String>,
@@ -692,17 +692,19 @@ async fn issue_destroy(
     ))
 }
 
+/// `POST /projects/{id}/infra/nodes/{node}/stop`, `{node}` being the
+/// instance's place as a person spells it (`one.db`).
 pub async fn stop_node(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node_id)): Path<(String, String)>,
+    Path((id_str, node)): Path<(String, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
     authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
     issue_per_node(
         state,
         id_str,
-        node_id,
+        node,
         InfraLifecycleVerb::Stop,
         body,
         RunningPolicy::Wait,
@@ -710,17 +712,18 @@ pub async fn stop_node(
     .await
 }
 
+/// `POST /projects/{id}/infra/nodes/{node}/terminate`; see `stop_node`.
 pub async fn terminate_node(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node_id)): Path<(String, String)>,
+    Path((id_str, node)): Path<(String, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
     authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
     issue_per_node(
         state,
         id_str,
-        node_id,
+        node,
         InfraLifecycleVerb::Terminate,
         body,
         RunningPolicy::Cancel,
@@ -731,7 +734,7 @@ pub async fn terminate_node(
 async fn issue_per_node(
     state: DispatcherState,
     id_str: String,
-    node_id: String,
+    node: String,
     verb: InfraLifecycleVerb,
     body: Option<Json<PerNodeRequest>>,
     default_running: RunningPolicy,
@@ -742,6 +745,25 @@ async fn issue_per_node(
     // Validation is in the type: serde rejected unknown variants
     // at deserialize. None falls back to the verb's default.
     let running_policy = body.running_policy.unwrap_or(default_running);
+    // The place has to be one the program declares, or one a live row
+    // still holds (an orphan the user is taking down by hand): a
+    // spelling that is neither would enqueue a command for a row that
+    // cannot exist, and a 202 for it would be a lie. The program is
+    // read once here and reused by the dependent-trigger guard below.
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let declared = weft_core::project::infra_place_spellings(&project).contains(&node);
+    let live = infra_node::get(&state.pg_pool, &project_id, &node)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
+        .is_some();
+    if !declared && !live {
+        return Err((StatusCode::NOT_FOUND, format!("'{node}' is no infra node of this project")));
+    }
     // Surgical or not, the verb is the same destructive command the
     // project-level one is: it is held to the same reconciliation the
     // action bar renders, so a transitional project refuses it here
@@ -772,16 +794,13 @@ async fn issue_per_node(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     if matches!(lifecycle.status, crate::project_store::ProjectStatus::Active) {
-        let project = state
-            .projects
-            .project(id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-            .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+        // Both sides spelled per place: the trigger under `one` depends
+        // on the instance under `one`, and stopping `two.db` leaves it
+        // alone.
         let deps = crate::api::project::compute_trigger_deps(&project);
         let dependent_triggers: Vec<String> = deps
             .into_iter()
-            .filter(|(infra, _)| infra == &node_id)
+            .filter(|(infra, _)| infra == &node)
             .map(|(_, trigger)| trigger)
             .collect();
         if !dependent_triggers.is_empty() {
@@ -791,7 +810,7 @@ async fn issue_per_node(
                     "project is active and triggers depend on infra node '{}': [{}]. \
                      Deactivate the project (or run a project-level stop with \
                      trigger preservation) before per-node {}.",
-                    node_id,
+                    node,
                     dependent_triggers.join(", "),
                     verb.as_str()
                 ),
@@ -804,7 +823,7 @@ async fn issue_per_node(
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
         &project_id,
-        Some(&node_id),
+        Some(&node),
         verb,
         running_policy,
         force,
@@ -890,7 +909,7 @@ pub async fn doors(
                 continue;
             };
             doors.push(DoorEntry {
-                node: weft_core::project::plain_id(&row.node_id),
+                node: row.node_id.clone(),
                 endpoint: endpoint.clone(),
                 port: holder.port,
             });
@@ -951,18 +970,39 @@ pub async fn command_status(
     }))
 }
 
+/// `GET /projects/{id}/infra/nodes/{node}/live`, `{node}` being the
+/// instance's place as a person spells it (`one.db`).
 pub async fn live(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let endpoint_url = live_endpoint_url(&state, &caller, &id_str, &node_id).await?;
+    Path((id_str, node)): Path<(String, String)>,
+) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    Ok(Json(read_live(&state, id, &node).await?))
+}
+
+/// What an infra node's container is showing right now.
+///
+/// The container's `/live` answer, read into the one display shape on
+/// the way through: an answer that is not `{ "items": [...] }` is a
+/// 502 naming what it sent, and an item that does not fit becomes a
+/// line saying so. The caller has already been authorized for the
+/// project (the editor by its project token, an outside consumer by
+/// its signal token), so this is the one implementation both doors
+/// share.
+pub(crate) async fn read_live(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    node: &str,
+) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
+    let endpoint_url = live_endpoint_url(state, id, node).await?;
     let live_url = format!("{}/live", endpoint_url.trim_end_matches('/'));
     // Reuse the dispatcher's shared HTTP client (one connection pool for the
     // process, not a fresh pool per request). Bound the WHOLE exchange, connect +
     // headers + body, with a single 3s deadline so a downstream node that accepts
     // the connection then trickles the body can't pin the request open.
-    let value = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         let resp = state
             .http
             .get(&live_url)
@@ -975,12 +1015,21 @@ pub async fn live(
     })
     .await
     .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "live endpoint timed out".to_string()))??;
-    Ok(Json(value))
+    // Read it into the one display shape here, at the door, so a
+    // container serving something else is a loud 502 naming what it
+    // sent rather than an empty panel every reader has to interpret.
+    weft_core::live::LiveFeed::from_answer(&answer)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the container's /live: {e}")))
 }
 
-/// Body for `/infra/nodes/{node_id}/action`: the button a `/live` item
-/// carries, pressed. Same shape as a signal action so the editor sends
-/// one message for both.
+/// Body for `/infra/nodes/{node}/action`: the button a `/live` item
+/// carries, pressed.
+///
+/// The one press body on this side of weft, shared by the editor's
+/// door here and the token door at `/signal-token/displays/.../action`,
+/// so a node's author writes one `/action` handler and both reach it.
+/// Only an INFRA node's display has buttons; a trigger's is read-only.
+// SYNC: InfraActionBody <-> crates/weft-core/src/live.rs LiveAction, packages/weft-graph/src/protocol.ts LiveDataItem.action
 #[derive(Debug, Deserialize)]
 pub struct InfraActionBody {
     pub kind: String,
@@ -988,7 +1037,8 @@ pub struct InfraActionBody {
     pub payload: serde_json::Value,
 }
 
-/// POST /projects/{id}/infra/nodes/{node_id}/action: press a button a
+/// POST /projects/{id}/infra/nodes/{node}/action, `{node}` being the
+/// instance's place as a person spells it (`one.db`): press a button a
 /// `/live` item offered. The container serving `/live` also serves
 /// `/action` with the bridge envelope (`{ "action", "payload" }` in,
 /// `{ "result" }` out; a `result.error` is the container refusing),
@@ -1005,15 +1055,30 @@ pub struct InfraActionBody {
 pub async fn action(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node_id)): Path<(String, String)>,
+    Path((id_str, node)): Path<(String, String)>,
     Json(body): Json<InfraActionBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let endpoint_url = live_endpoint_url(&state, &caller, &id_str, &node_id).await?;
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    Ok(Json(press_live(&state, id, &node, &body.kind, &body.payload).await?))
+}
+
+/// Press a button one of an infra node's `/live` items carries. The
+/// caller has already been authorized for the project; both doors onto
+/// a node's display land here.
+pub(crate) async fn press_live(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    node: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let endpoint_url = live_endpoint_url(state, id, node).await?;
     let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
     let resp = state
         .http
         .post(&action_url)
-        .json(&serde_json::json!({ "action": body.kind, "payload": body.payload }))
+        .json(&serde_json::json!({ "action": kind, "payload": payload }))
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action send: {e}")))?;
@@ -1036,8 +1101,7 @@ pub async fn action(
     }
     let answer = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action parse: {e}")))?;
-    let result = infra_action_result(&body.kind, answer)?;
-    Ok(Json(result))
+    infra_action_result(kind, answer)
 }
 
 /// The `result` of a container's `/action` answer, or the refusal it
@@ -1066,14 +1130,11 @@ fn infra_action_result(
 /// and the endpoint must be provisioned. Every miss is a 404 naming
 /// which of those it is, so a TCP-only node (Postgres) answers "no
 /// live endpoint" instead of a 502 from a refused connection.
-async fn live_endpoint_url(
+pub(crate) async fn live_endpoint_url(
     state: &DispatcherState,
-    caller: &CallerTenant,
-    id_str: &str,
-    node_id: &str,
+    id: uuid::Uuid,
+    node: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let id = parse_id(id_str)?;
-    authorize_project(state, &caller.0, id).await?;
     let project_id = id.to_string();
     let project = state
         .projects
@@ -1081,6 +1142,9 @@ async fn live_endpoint_url(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    // `node` is a place spelling; the node behind it says whether it
+    // serves a display, and the row under that spelling says where.
+    let (node_id, _) = weft_core::project::resolve_address(&project, node);
     let node_def = project
         .nodes
         .iter()
@@ -1090,7 +1154,7 @@ async fn live_endpoint_url(
         StatusCode::NOT_FOUND,
         "node does not expose a /live endpoint".to_string(),
     ))?;
-    let row = infra_node::get(&state.pg_pool, &project_id, node_id)
+    let row = infra_node::get(&state.pg_pool, &project_id, node)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "no such infra node".into()))?;
@@ -1116,8 +1180,7 @@ async fn read_infra_entries(
 
 fn row_to_entry(row: InfraNodeRow) -> InfraStatusEntry {
     InfraStatusEntry {
-        node: weft_core::project::plain_id(&row.node_id),
-        node_id: row.node_id,
+        node: row.node_id,
         status: row.status.as_str().to_string(),
         // Coarse UI hint: the first endpoint by name (BTreeMap, so
         // deterministic). Node code resolves a specific endpoint by
@@ -1364,8 +1427,10 @@ async fn issue_lifecycle_ensuring_supervisor(
     })
 }
 
-/// Reap infra_node rows whose `node_id` no longer appears in the
-/// project source as a `requires_infra` node. Step 1 of the sync
+/// Reap infra_node rows whose place is no longer one the project
+/// source puts a `requires_infra` node at: the node was deleted, or the
+/// include that reached it was (a file included twice and then once
+/// leaves the second call's instance behind). Step 1 of the sync
 /// pipeline so the rest of the subworkflow operates on the new
 /// shape only.
 ///
@@ -1386,12 +1451,7 @@ async fn reap_orphans(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let declared: std::collections::HashSet<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.requires_infra)
-        .map(|n| n.id.clone())
-        .collect();
+    let declared = weft_core::project::infra_place_spellings(&project);
     let rows = crate::infra_node::list_for_project(&state.pg_pool, &project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;

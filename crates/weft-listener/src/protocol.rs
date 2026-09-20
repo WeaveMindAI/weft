@@ -34,8 +34,12 @@ pub struct RegisterRequest {
     pub tenant_id: String,
     /// The resolved signal spec. Carries everything kind-specific.
     pub spec: SignalSpec,
-    /// Node id this signal belongs to. Relayed back to the
-    /// dispatcher on fire so it can attribute the event.
+    /// The PLACE this signal is registered at, spelled the way a person
+    /// writes the node (`door`, or `one.door` inside the file the site
+    /// `one` includes): the same string the dispatcher keys the signal
+    /// row by. The kind's `render` shows it to a consumer as the
+    /// task's node; a fire never echoes it (the dispatcher reads the
+    /// row by token).
     pub node_id: String,
     /// True iff this signal is a mid-execution resume (HumanQuery
     /// awaiting form submission, etc) rather than an entry trigger.
@@ -151,23 +155,35 @@ pub struct LoadReport {
     pub held_connections: u32,
 }
 
-/// Body for `POST /display` on the listener (admin-only). The
-/// dispatcher proxies inspector reads here; the listener returns
-/// whatever the kind impl wants to show (the surface, the auth, the
-/// serving state). Looked up by token, not by node_id, because the
-/// listener's in-RAM registry is keyed by token.
+/// Body for `POST /live` on the listener. The dispatcher proxies a
+/// read of what a trigger is showing here, whether the reader is the
+/// editor or an outside client holding a signal token; the listener
+/// has no public surface of its own and authorizes nothing, so the
+/// dispatcher has already decided the reader may see this. Looked up
+/// by token, not by node_id, because the in-RAM registry is keyed by
+/// token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DisplayRequest {
+pub struct LiveRequest {
     pub token: String,
+    /// The address an outside caller reaches this signal at, when it
+    /// has one. The listener cannot work this out: it holds the bare
+    /// path the kind computed, while the real address carries the
+    /// dispatcher's own host, the tenant segment that walls one
+    /// account's paths off from another's, and the `/connect/` prefix
+    /// a held-connection kind is served under. All three live on the
+    /// dispatcher, which reads them off the signal row
+    /// (`SignalRegistration::public_url`) and sends the finished
+    /// address here. Absent for a signal nothing calls in to.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
-/// Free-form display payload returned from the listener. Inspector
-/// renders kind-specific. Standard fields the inspector knows
-/// about: `surface: { kind, path, methods }`, `auth: { kind }`,
-/// `serving`.
+/// What the trigger's kind shows, in the shape every node's display
+/// uses (`weft_core::live::LiveFeed`), so a reader draws a trigger's
+/// panel and an infra container's panel with one renderer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DisplayResponse {
-    pub display: Value,
+pub struct LiveResponse {
+    pub live: weft_core::live::LiveFeed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

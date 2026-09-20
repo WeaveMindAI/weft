@@ -615,6 +615,17 @@ fn setup_kicks(project: &ProjectDefinition, seeds: Vec<Located>) -> Result<Vec<K
         .collect())
 }
 
+/// The place a kick fires at, spelled the way the program reads it
+/// (`keep.db` for the db of a file included as `keep`): the node under
+/// the call sites on the kick's frames. What a run is recorded as
+/// started by, setup runs here and fire runs in `versions::run`, so
+/// `weft executions` lists every run by a place and never by a
+/// compiled id.
+pub(crate) fn kick_place(project: &ProjectDefinition, kick: &Kick) -> String {
+    let place = Located::at(&kick.node, &kick.frames);
+    weft_core::project::address_of(project, &place.id, &place.path)
+}
+
 /// Non-terminal InfraSetup colors for the project. The journaled
 /// non-terminal color IS the durable "infra sync in flight" state:
 /// cancellable via the per-color cancel, crash-recovered by the
@@ -844,6 +855,34 @@ pub(crate) fn execution_birth_events(
     (start, kick_events)
 }
 
+/// Is every infra node the project's TRIGGERS depend on Running?
+///
+/// The one rule joining the two lifetimes: a trigger reads the address
+/// off the infra node feeding it, so arming it before that node is up
+/// would register a signal against an address that does not answer.
+/// Infra no trigger depends on is the RUN's to wait on and does not
+/// hold an activation back.
+///
+/// Vacuously true when the triggers depend on none, which includes
+/// every project without a trigger. A node with no row at all is not
+/// Running: nothing was ever provisioned for it.
+pub(crate) fn trigger_infra_ready(
+    depends_on: &std::collections::BTreeSet<String>,
+    rows: &[crate::infra_node::InfraNodeRow],
+) -> bool {
+    depends_on.iter().all(|id| {
+        rows.iter()
+            .any(|r| &r.node_id == id && r.status == crate::infra_node::InfraNodeStatus::Running)
+    })
+}
+
+/// Is every infra node the source declares Running, which is what a
+/// WHOLE-GRAPH run touches? The one definition of the fact the table
+/// reports about run (`ActionInputs::run_infra_ready`).
+pub(crate) fn run_infra_ready(has_infra: bool, infra_rollup: &str) -> bool {
+    !has_infra || infra_rollup == "running"
+}
+
 /// The `requires_infra` nodes whose infra is NOT currently Running. Empty means
 /// every infra node is up. The ONE place this pre-flight is computed: `run`,
 /// `activate`, and `reactivate` all consult it (a Stopped/Failed/Flaky/missing node
@@ -851,29 +890,32 @@ pub(crate) fn execution_birth_events(
 /// definition of "is the infra up" and no drift between the entry points.
 ///
 /// `within` narrows the check to the named nodes: a targeted run only touches
-/// its own upstream subgraph, so infra outside it has no bearing on that run
-/// and must not gate it. `None` checks the whole project (activate does).
+/// its own upstream subgraph, and arming the triggers only touches the infra
+/// they depend on, so infra outside either has no bearing on it and must not
+/// gate it. `None` checks the whole project, which is what an ordinary
+/// whole-graph run needs.
 pub(crate) async fn missing_infra_nodes(
     state: &DispatcherState,
     project_id: &str,
     project: &ProjectDefinition,
     within: Option<&HashSet<String>>,
 ) -> Result<Vec<String>, (StatusCode, String)> {
+    // Per PLACE, spelled: an infra node inside a file included twice is
+    // two instances with two rows, and `within` names places the same
+    // way, so a run cut to one call waits on that call's instance alone.
     let mut missing: Vec<String> = Vec::new();
-    for node in project
-        .nodes
-        .iter()
-        .filter(|n| n.requires_infra)
-        .filter(|n| within.is_none_or(|set| set.contains(&n.id)))
-    {
-        let row = crate::infra_node::get(&state.pg_pool, project_id, &node.id)
+    for spelled in weft_core::project::infra_place_spellings(project) {
+        if within.is_some_and(|set| !set.contains(&spelled)) {
+            continue;
+        }
+        let row = crate::infra_node::get(&state.pg_pool, project_id, &spelled)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
         let running = row
             .map(|r| r.status == crate::infra_node::InfraNodeStatus::Running)
             .unwrap_or(false);
         if !running {
-            missing.push(node.id.clone());
+            missing.push(spelled);
         }
     }
     Ok(missing)
@@ -915,7 +957,7 @@ pub async fn start_infra_setup(
         color,
         &project_id,
         weft_core::context::Phase::InfraSetup,
-        &kicks[0].node,
+        &kick_place(&project, &kicks[0]),
         &kicks,
         &[],
         &program,
@@ -1198,6 +1240,13 @@ pub struct ProjectStatusResponse {
     /// (mixed), "flaky", "failed". Clients map these to a status glyph.
     /// SYNC: infra_rollup values <-> packages/weft-graph/src/status.ts (infra_rollup consumer)
     pub infra_rollup: String,
+    /// An infra operation is in flight that the rollup cannot see yet
+    /// (a claimed stop still draining, a provisioning run before any
+    /// node row flips). The window where the rollup still reads
+    /// "stopped" and every verb but cancel is already refused, so a
+    /// client that renders buttons from the rollup alone offers one
+    /// that can only fail.
+    pub infra_busy: bool,
     /// Desired vs running source/infra-hash drift. Either bit is
     /// only meaningful when the caller passed the corresponding
     /// `desired_*_hash` query param.
@@ -1253,13 +1302,12 @@ pub struct ProjectDrift {
 
 #[derive(Debug, Serialize)]
 pub struct ProjectInfraEntry {
-    /// The runtime's key for the node, which the editor matches against
-    /// the canvas and sends back on an action. For a node inside an
-    /// included file it carries the file's path (`@src:lib:db.store`),
-    /// so it is a key and never a label.
-    pub node_id: String,
-    /// The same node the way the PROGRAM spells it, which is what a
-    /// person is shown (`weft status`, `weft infra status`).
+    /// The instance's place, spelled the way the PROGRAM writes the
+    /// node (`db`, or `one.db` inside the file the site `one` includes):
+    /// what a person is shown (`weft status`, `weft infra status`), what
+    /// the editor matches against the node under the calls it walked
+    /// into, and what every per-node verb takes. One entry per
+    /// instance, so a file included twice lists its infra twice.
     pub node: String,
     /// Infra node type (e.g. "whatsapp_bridge"). Sourced from the
     /// project definition so the extension can decorate the node
@@ -1437,17 +1485,20 @@ pub async fn status(
     // exists.
     let mut infra = Vec::new();
     for row in &snapshot.infra_rows {
+        // The row is keyed by the place spelling; the node behind it
+        // carries the type. A row whose spelling names no node any more
+        // is an orphan, counted above and not rendered per node.
+        let (node_id, _) = weft_core::project::resolve_address(&project, &row.node_id);
         let Some(node_type) = project
             .nodes
             .iter()
-            .find(|n| n.id == row.node_id)
+            .find(|n| n.id == node_id && n.requires_infra)
             .map(|n| n.node_type.clone())
         else {
             continue;
         };
         infra.push(ProjectInfraEntry {
-            node_id: row.node_id.clone(),
-            node: weft_core::project::plain_id(&row.node_id),
+            node: row.node_id.clone(),
             node_type,
             status: row.status.as_str().to_string(),
             // Coarse UI hint: first endpoint by name (BTreeMap = stable).
@@ -1526,6 +1577,8 @@ pub async fn status(
         transition: snapshot.transition,
         has_triggers,
         has_infra,
+        trigger_infra_ready: snapshot.trigger_infra_ready,
+        run_infra_ready: run_infra_ready(has_infra, &infra_rollup),
         orphaned_infra: snapshot.orphaned_infra,
         infra_rollup: &infra_rollup,
         infra_busy: snapshot.infra_busy,
@@ -1549,6 +1602,7 @@ pub async fn status(
         has_infra,
         orphaned_infra: snapshot.orphaned_infra,
         infra_rollup,
+        infra_busy: snapshot.infra_busy,
         drift: ProjectDrift {
             infra_drift: drift.infra_drift,
             binary_drift: drift.binary_drift,
@@ -1568,6 +1622,10 @@ pub(crate) struct ActionSnapshot {
     pub transition: crate::project_store::ProjectTransition,
     pub has_triggers: bool,
     pub has_infra: bool,
+    /// Every infra node the project's TRIGGERS depend on is Running,
+    /// walked from the REGISTERED definition (see
+    /// `ActionInputs::trigger_infra_ready` for what reads it).
+    pub trigger_infra_ready: bool,
     pub orphaned_infra: bool,
     pub infra_rollup: String,
     pub infra_busy: bool,
@@ -1598,14 +1656,15 @@ pub(crate) async fn gather_action_snapshot(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
 
-    let source_infra: HashSet<&str> = project
-        .nodes
-        .iter()
-        .filter(|n| n.requires_infra)
-        .map(|n| n.id.as_str())
-        .collect();
+    // Every infra PLACE the source declares, spelled the way its row is
+    // keyed: a file included twice declares two instances.
+    let source_infra = weft_core::project::infra_place_spellings(project);
     let has_infra = !source_infra.is_empty();
     let has_triggers = project.nodes.iter().any(|n| n.features.is_trigger);
+    let trigger_infra_ready = trigger_infra_ready(
+        &weft_core::project::infra_triggers_depend_on(project),
+        &infra_rows,
+    );
     // Orphans: live rows whose node the user deleted from source.
     // They count into the rollup (below) and raise the project-level
     // signal, so a FULLY-orphaned live infra set never collapses the
@@ -1613,7 +1672,7 @@ pub(crate) async fn gather_action_snapshot(
     // (Model 1's never-lose-track guarantee).
     let orphan_count = infra_rows
         .iter()
-        .filter(|r| !source_infra.contains(r.node_id.as_str()))
+        .filter(|r| !source_infra.contains(&r.node_id))
         .count();
     let orphaned_infra = orphan_count > 0;
 
@@ -1651,8 +1710,8 @@ pub(crate) async fn gather_action_snapshot(
             InfraNodeStatus::Provisioning => provisioning += 1,
             InfraNodeStatus::Stopped => stopped += 1,
         };
-        for n in project.nodes.iter().filter(|n| n.requires_infra) {
-            match infra_rows.iter().find(|r| r.node_id == n.id) {
+        for spelled in &source_infra {
+            match infra_rows.iter().find(|r| &r.node_id == spelled) {
                 Some(r) => count_status(r.status),
                 // No row: never provisioned OR terminated (terminate
                 // removes the row). Nothing lives in the namespace for
@@ -1662,7 +1721,7 @@ pub(crate) async fn gather_action_snapshot(
         }
         for r in infra_rows
             .iter()
-            .filter(|r| !source_infra.contains(r.node_id.as_str()))
+            .filter(|r| !source_infra.contains(&r.node_id))
         {
             count_status(r.status);
         }
@@ -1712,6 +1771,7 @@ pub(crate) async fn gather_action_snapshot(
         transition,
         has_triggers,
         has_infra,
+        trigger_infra_ready,
         orphaned_infra,
         infra_rollup,
         infra_busy,
@@ -1753,6 +1813,20 @@ pub(crate) async fn require_action(
         // trigger-less project after its build.
         has_triggers: true,
         has_infra: snapshot.has_infra,
+        // Same staleness posture, and for the same reason: this is
+        // walked from the REGISTERED definition, which lags the source
+        // the user just saved. Enforcing it here would refuse an
+        // activate over an infra node the user has already deleted,
+        // BEFORE the build that would have said so. `require_trigger_infra`
+        // runs after the build and refuses against the fresh definition,
+        // naming the nodes to start.
+        trigger_infra_ready: true,
+        // And the same for a run: the door is `versions::run`'s own
+        // pre-flight, after the build, scoped to the places the run
+        // executes. Enforcing the whole-graph fact here would refuse a
+        // run aimed at nodes whose infra is up because some other node's
+        // is down, which that run never touches.
+        run_infra_ready: true,
         orphaned_infra: snapshot.orphaned_infra,
         infra_rollup: &snapshot.infra_rollup,
         infra_busy: snapshot.infra_busy,
@@ -1875,6 +1949,27 @@ pub(crate) struct ActionInputs<'a> {
     /// Source declares any infra node. This is the SOURCE fact only;
     /// orphaned live infra does not count (Model 1).
     pub has_infra: bool,
+    /// Every infra node the project's TRIGGERS DEPEND ON is running
+    /// (vacuously true when they depend on none). Infra that only a
+    /// RUN touches is gated at run time and does not hold an
+    /// activation back. See `weft_core::project::infra_triggers_depend_on`.
+    ///
+    /// This is what the table REPORTS about activate, from the
+    /// registered definition. It is not what the door enforces:
+    /// `require_action` passes it satisfied, because the registered
+    /// definition lags the source, and `require_trigger_infra` does
+    /// the honest check after the build, on the definition the
+    /// activation will register.
+    pub trigger_infra_ready: bool,
+    /// Every infra node the source declares is running, which is what
+    /// a WHOLE-GRAPH run touches (`run_infra_ready`). The same posture
+    /// as `trigger_infra_ready`: what the table reports about run, from
+    /// the registered definition, for the bar's unaimed Run button.
+    /// `require_action` passes it satisfied, and `versions::run` does
+    /// the honest check after the build, on the definition the run will
+    /// execute and scoped to the places it executes: a run aimed at
+    /// part of the graph waits on that part's infra alone.
+    pub run_infra_ready: bool,
     /// Live `infra_node` rows exist whose node is NOT in the current
     /// source (the user deleted the node while it was deployed). Does
     /// NOT gate run/activate; DOES keep the infra controls offered so
@@ -1913,9 +2008,13 @@ pub(crate) struct ActionInputs<'a> {
 ///                     alongside live triggers; the bar may not show
 ///                     a button, the backend permits it).
 ///   - activate /
-///     reactivate    : Registered/Inactive, source has triggers,
-///                     infra (if any) running. Reactivate variant
-///                     when preserved state exists.
+///     reactivate    : Registered/Inactive, source has triggers, and
+///                     every infra node the TRIGGERS DEPEND ON running
+///                     (infra only a run touches is gated at run time
+///                     and does not hold activation back; the door
+///                     re-checks this against the definition it
+///                     builds). Reactivate variant when preserved
+///                     state exists.
 ///   - deactivate    : Active. NOT gated on has_triggers: deleting
 ///                     the last trigger from source while active must
 ///                     keep Deactivate offered (trigger divergence).
@@ -1931,6 +2030,7 @@ pub(crate) struct ActionInputs<'a> {
 ///                     orphan from); stop/terminate work on the live
 ///                     rows themselves, so they stay offered for a
 ///                     pure orphan (the never-lose-track guarantee).
+// SYNC: compute_available_actions <-> packages/weft-graph/src/webview/lib/verb-gates.ts (the starter verbs the bar offers on top of this table), packages/weft-graph/src/protocol.ts ActionVerb
 fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
     use crate::project_store::ProjectStatus;
 
@@ -1974,14 +2074,15 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
 
     // Stable states.
     let mut out = Vec::new();
-    let infra_ready = !inputs.has_infra || inputs.infra_rollup == "running";
 
     // `run` is offered whenever it is a legal NEXT STEP, NOT gated on
     // whether a worker image is already built (a click auto-builds on
-    // demand). The one gate is genuine live-state: any infra the
-    // SOURCE declares must be running (a run would fail fetching infra
-    // outputs; the user starts infra first, its own verb).
-    if infra_ready {
+    // demand). The one gate is genuine live-state: the infra a run
+    // touches must be running (a run would fail fetching infra outputs;
+    // the user starts infra first, its own verb). What the table can
+    // answer is the WHOLE-GRAPH run; a run aimed at part of the graph
+    // waits on that part alone, which only the door can tell.
+    if inputs.run_infra_ready {
         out.push("run".to_string());
     }
 
@@ -1990,12 +2091,22 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
             out.push("deactivate".to_string());
             // Registrations pin both the graph and the worker code. Either
             // change needs resync before listeners can fire the new program.
-            if inputs.drift.activation_drift {
+            // Resync re-arms exactly what activate arms, so it waits on the
+            // same infra: the triggers' own, checked again by the door after
+            // its build (`require_trigger_infra`).
+            if inputs.drift.activation_drift && inputs.trigger_infra_ready {
                 out.push("resync".to_string());
             }
         }
         ProjectStatus::Registered | ProjectStatus::Inactive => {
-            if inputs.has_triggers {
+            // A trigger whose infra is down cannot be armed: its
+            // registration reads the address off the infra node feeding
+            // it. Infra the trigger does not depend on is gated at run
+            // time instead, so it does not hold the activation back.
+            // The door's own copy of this is `require_trigger_infra`,
+            // which runs after the build; this one is what the bar and
+            // `weft status` are told.
+            if inputs.has_triggers && inputs.trigger_infra_ready {
                 let has_preserved =
                     inputs.preservation.parked + inputs.preservation.suspended > 0;
                 if has_preserved && inputs.lifecycle.status == ProjectStatus::Inactive {
@@ -2108,18 +2219,60 @@ pub async fn bake(
     Ok(Json(run_trigger_setup(&state, id, &project, kicks, &program, None).await?))
 }
 
+/// Refuse unless every infra node this project's TRIGGERS depend on is
+/// Running.
+///
+/// The one rule joining the two lifetimes: a trigger reads its address
+/// off the infra node feeding it, so arming it before that node is up
+/// registers a signal against an address that does not answer. Nothing
+/// here starts infra to satisfy itself; infra is the user's own verb,
+/// and provisioning on a click that said nothing about it would spend
+/// their money for them.
+///
+/// `project` must be the definition the caller is about to REGISTER,
+/// not the one on file: the registered one lags the source the moment
+/// the user writes a node, and refusing over an infra node they have
+/// already deleted is a dead end (see `require_action`, which exempts
+/// the same fact for the same reason).
+///
+/// The set comes from `infra_triggers_depend_on`, the one definition
+/// of the rule, which the per-node infra stop guard reads too.
+async fn require_trigger_infra(
+    state: &DispatcherState,
+    project_id: &str,
+    project: &ProjectDefinition,
+) -> Result<(), (StatusCode, String)> {
+    // Validation first: a trigger setup that cannot be selected at all
+    // (a trigger inside a half-selected loop) is a 400 about the graph,
+    // not a story about infra.
+    weft_core::project::selection::RunSelection::setup(project, &trigger_places(project))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let within = weft_core::project::infra_triggers_depend_on(project)
+        .into_iter()
+        .collect::<HashSet<String>>();
+    let missing = missing_infra_nodes(state, project_id, project, Some(&within)).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::PRECONDITION_REQUIRED,
+        format!(
+            "these triggers' infra is not running: {}. Start it with `weft infra start` \
+             and run this again.",
+            missing.join(", ")
+        ),
+    ))
+}
+
+/// Make the worker pod match what this project's triggers will need,
+/// and refuse first if their infra is not up.
 async fn prepare_trigger_setup(
     state: &DispatcherState,
     id: uuid::Uuid,
     project: &ProjectDefinition,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = id.to_string();
-    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_places(project))
-        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let nodes = selection.nodes.iter().map(|place| place.id.clone()).collect();
-    if !missing_infra_nodes(state, &project_id, project, Some(&nodes)).await?.is_empty() {
-        let _ = super::infra::sync_inner(state.clone(), id, super::infra::SyncRequest::default()).await?;
-    }
+    require_trigger_infra(state, &project_id, project).await?;
     reconcile_worker(state, &project_id, crate::infra_lifecycle_command::RunningPolicy::Wait,
         weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS).await
 }
@@ -2260,7 +2413,7 @@ async fn activate_trigger_setup_window(
                     spec: capture.spec.clone(), is_resume: false, call_index: 0,
                     port_snapshot: Some(capture.ports.clone()),
                 }).await.map_err(|error| ActivateWindowError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{}': {error:#}", weft_core::project::plain_id(node_id)),
+                    status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{node_id}': {error:#}"),
                     rollback: ActivateRollback::WipeSignals,
                 })?;
         }
@@ -2320,9 +2473,10 @@ async fn activate_trigger_setup_window(
     Ok(())
 }
 
-/// In-process callable for `activate`. Used by `/infra/sync`'s
-/// auto-reactivate path. Same body as the axum handler minus the
-/// extractor plumbing.
+/// In-process callable for `activate`: the axum handler, `resync`'s
+/// reactivate step and the supervisor's auto-recover path
+/// (`lifecycle_claimer`) all land here. Same body as the handler minus
+/// the extractor plumbing.
 pub async fn activate_inner(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -2379,6 +2533,11 @@ pub async fn activate_inner(
     // Wait policy: activate never silently kills running work; stale
     // workers drain (no new admissions, in-flight finishes) up to the
     // default cap before being replaced.
+    //
+    // This also carries the infra precondition, and it runs FIRST: an
+    // activation whose triggers need infra that is down is refused here,
+    // against the definition this activation just built, before any
+    // worker work happens.
     prepare_trigger_setup(state, id, &project).await?;
 
     // Validate (don't yet apply) the reactivate choice. Validation is
@@ -3171,8 +3330,9 @@ pub struct ResyncRequest {
 /// `runningPolicy = wait` the handler drains through THE shared drain
 /// loop up to the spec's cap, cancels the stragglers, lands the
 /// deactivation, then reactivates. Refuses with 412 if the project
-/// has infra nodes and infra isn't running (the deactivate step still
-/// runs; the user is told to start infra before reclicking activate).
+/// builds and then finds that the infra its triggers depend on is not
+/// running. That refusal happens BEFORE the deactivation, so a project
+/// it cannot finish is left exactly as it was.
 pub async fn resync(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -3185,12 +3345,6 @@ pub async fn resync(
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
     let project_id = id.to_string();
 
     // 1. Refuse unless the project is Active. Resync means "the
@@ -3226,6 +3380,25 @@ pub async fn resync(
                 .into(),
         ));
     };
+    // 2. Build, then refuse BEFORE tearing anything down. Resync takes
+    //    the triggers off and puts them back; a refusal after the first
+    //    half leaves the project down over a condition it could have
+    //    checked while it was still up. The build comes first because
+    //    the definition on file is stale by construction here (resync
+    //    is offered on definition drift), and the honest question is
+    //    about the definition this resync will register. The activate
+    //    below re-reads and re-checks; this one is what keeps the
+    //    project whole.
+    crate::transition::ensure_built_gated(&state, id).await?;
+    let built = state
+        .projects
+        .project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
+    require_trigger_infra(&state, &project_id, &built).await?;
+
+    // 3. Take the triggers down with the user's spec.
     execute_trigger_deactivation(&state, id, spec).await?;
     if spec.drains() {
         // Wait for the drain through THE shared loop, capped at
@@ -3267,22 +3440,7 @@ pub async fn resync(
             })?;
     }
 
-    // 2. Reactivate precondition: every requires_infra node must be
-    //    running. If not, leave the project deactivated and surface
-    //    a clear error. The user starts infra and clicks Activate.
-    let missing = missing_infra_nodes(&state, &project_id, &project, None).await?;
-    if !missing.is_empty() {
-        return Err((
-            StatusCode::PRECONDITION_REQUIRED,
-            format!(
-                "deactivated; cannot reactivate (infra not running for: {}). \
-                 Run `weft infra start`, then `weft activate`.",
-                missing.join(", ")
-            ),
-        ));
-    }
-
-    // 3. Reactivate. Reuses the activate handler so hash persistence
+    // 4. Reactivate. Reuses the activate handler so hash persistence
     //    + atomic-cleanup-on-failure semantics are identical. The caller was
     //    already authorized against this project at the top of resync; activate
     //    re-checks the same gate (cheap, and keeps activate self-contained).
@@ -4131,7 +4289,7 @@ async fn run_trigger_setup(
         color,
         &project_id,
         weft_core::context::Phase::TriggerSetup,
-        &kicks[0].node,
+        &kick_place(project, &kicks[0]),
         &kicks,
         program,
         Some(&selection),
@@ -4295,20 +4453,35 @@ mod trigger_kick_tests {
         let e_json: Vec<Value> = edges
             .iter()
             .map(|(s, t)| {
+                // The names `Edge` reads (see `infra_kick_and_dep_tests`
+                // for what the older `sourcePort` spelling silently did).
+                // One port name on both ends: a boundary's port keeps its
+                // name across it, and these tests are about which nodes a
+                // kick reaches, not which port feeds which.
                 serde_json::json!({
                     "id": format!("e_{}_{}", s, t),
                     "source": s,
-                    "sourcePort": "out",
+                    "sourceHandle": "v",
                     "target": t,
-                    "targetPort": "in"
+                    "targetHandle": "v"
                 })
             })
+            .collect();
+        // A `{g}__in` id is the In boundary of the group `g`, the way the
+        // compiler flattens one, and the group has to EXIST for the walk
+        // to treat the boundary as one: with no `groups` entry the
+        // boundary is an ordinary node and every "group" test here would
+        // pass without touching the boundary logic it is about.
+        let groups: Vec<Value> = nodes
+            .iter()
+            .filter_map(|(id, _, _)| id.strip_suffix("__in"))
+            .map(|g| serde_json::json!({ "id": g, "kind": "group" }))
             .collect();
         let body = serde_json::json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": n_json,
             "edges": e_json,
-            "groups": []
+            "groups": groups
         });
         serde_json::from_value(body).expect("valid test project")
     }
@@ -4626,12 +4799,17 @@ mod infra_kick_and_dep_tests {
         let e_json: Vec<serde_json::Value> = edges
             .iter()
             .map(|(s, t)| {
+                // `sourceHandle` / `targetHandle` are the names `Edge`
+                // reads. Writing `sourcePort` here dropped them silently
+                // (no `deny_unknown_fields`), so every wire was
+                // default -> default and no port-aware walk could be
+                // told apart from a port-blind one.
                 serde_json::json!({
                     "id": format!("e_{}_{}", s, t),
                     "source": s,
-                    "sourcePort": "out",
+                    "sourceHandle": "out",
                     "target": t,
-                    "targetPort": "in",
+                    "targetHandle": "in",
                 })
             })
             .collect();
@@ -4783,8 +4961,9 @@ mod infra_kick_and_dep_tests {
     }
 
     #[test]
-    fn trigger_deps_skip_when_trigger_does_not_reach_infra() {
-        // text → trigger (no infra in the path)
+    fn trigger_deps_reach_through_an_ordinary_node() {
+        // infra -> text -> trigger: the dependency is just as real one
+        // hop further out.
         let p = project(
             &[
                 ("text", false, false),
@@ -4793,10 +4972,26 @@ mod infra_kick_and_dep_tests {
             ],
             &[("text", "trigger"), ("infra", "text")],
         );
-        // text → trigger; infra → text; so trigger's upstream
-        // includes both text AND infra. Deps should include infra.
         let deps = compute_trigger_deps(&p);
         assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
+    }
+
+    #[test]
+    fn trigger_deps_skip_when_trigger_does_not_reach_infra() {
+        // trigger -> text, and infra sits downstream of the trigger.
+        // Stopping it cannot break an armed registration, so the guard
+        // must not refuse that stop. The name of this test claimed the
+        // negative case for a long time while its body asserted the
+        // positive one; this is the negative case.
+        let p = project(
+            &[
+                ("trigger", true, false),
+                ("text", false, false),
+                ("infra", false, true),
+            ],
+            &[("trigger", "text"), ("text", "infra")],
+        );
+        assert!(compute_trigger_deps(&p).is_empty());
     }
 }
 
@@ -4884,6 +5079,74 @@ mod run_subgraph_tests {
 }
 
 #[cfg(test)]
+mod trigger_infra_ready_tests {
+    use super::trigger_infra_ready;
+    use crate::infra_node::{InfraNodeRow, InfraNodeStatus};
+
+    fn row(node_id: &str, status: InfraNodeStatus) -> InfraNodeRow {
+        InfraNodeRow {
+            project_id: "p".into(),
+            node_id: node_id.into(),
+            instance_id: String::new(),
+            namespace: "ns".into(),
+            status,
+            failure_stage: None,
+            failure_message: None,
+            applied_spec_hash: None,
+            applied_at_unix: None,
+            endpoints: Default::default(),
+            preserve_pvcs: Vec::new(),
+            units: Default::default(),
+        }
+    }
+
+    fn deps(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn a_project_whose_triggers_need_no_infra_is_ready() {
+        assert!(trigger_infra_ready(&deps(&[]), &[]));
+        // Including one with infra running for something else entirely.
+        assert!(trigger_infra_ready(&deps(&[]), &[row("svc", InfraNodeStatus::Running)]));
+    }
+
+    #[test]
+    fn every_node_the_triggers_need_has_to_be_running() {
+        let both = deps(&["bridge", "db"]);
+        assert!(trigger_infra_ready(
+            &both,
+            &[row("bridge", InfraNodeStatus::Running), row("db", InfraNodeStatus::Running)]
+        ));
+        assert!(!trigger_infra_ready(
+            &both,
+            &[row("bridge", InfraNodeStatus::Running), row("db", InfraNodeStatus::Stopped)]
+        ));
+    }
+
+    #[test]
+    fn a_node_that_is_not_running_in_any_way_holds_the_activation_back() {
+        for status in [
+            InfraNodeStatus::Stopped,
+            InfraNodeStatus::Failed,
+            InfraNodeStatus::Flaky,
+            InfraNodeStatus::Provisioning,
+        ] {
+            assert!(!trigger_infra_ready(&deps(&["bridge"]), &[row("bridge", status)]), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_row_at_all_is_not_running() {
+        // Nothing was ever provisioned for it, which is the ordinary
+        // state of a project whose infra has never been started.
+        assert!(!trigger_infra_ready(&deps(&["bridge"]), &[]));
+        // And a row for a DIFFERENT node does not stand in for it.
+        assert!(!trigger_infra_ready(&deps(&["bridge"]), &[row("db", InfraNodeStatus::Running)]));
+    }
+}
+
+#[cfg(test)]
 mod available_actions_tests {
     //! Layer-1 tests for the reconciliation table
     //! (`docs/project-lifecycle-state-model.md` §8): one case per
@@ -4897,6 +5160,7 @@ mod available_actions_tests {
         transition: ProjectTransition,
         has_triggers: bool,
         has_infra: bool,
+        trigger_infra_ready: bool,
         orphaned_infra: bool,
         infra_rollup: &'static str,
         infra_busy: bool,
@@ -4912,6 +5176,7 @@ mod available_actions_tests {
                 transition: ProjectTransition::None,
                 has_triggers: true,
                 has_infra: false,
+                trigger_infra_ready: true,
                 orphaned_infra: false,
                 infra_rollup: "none",
                 infra_busy: false,
@@ -4928,6 +5193,8 @@ mod available_actions_tests {
             transition: case.transition,
             has_triggers: case.has_triggers,
             has_infra: case.has_infra,
+            trigger_infra_ready: case.trigger_infra_ready,
+            run_infra_ready: super::run_infra_ready(case.has_infra, case.infra_rollup),
             orphaned_infra: case.orphaned_infra,
             infra_rollup: case.infra_rollup,
             infra_busy: case.infra_busy,
@@ -5018,10 +5285,29 @@ mod available_actions_tests {
     }
 
     #[test]
-    fn inactive_infra_resting_allows_activation_to_prepare_infra() {
+    fn inactive_infra_resting_still_offers_activate_when_no_trigger_needs_it() {
+        // The infra sits on a branch no trigger touches, so arming the
+        // triggers is sound with it down. Run still waits: a run touches
+        // the whole graph.
         assert_actions(
             &Case { has_infra: true, infra_rollup: "none", ..Case::default() },
             &["activate", "infra_start"],
+        );
+    }
+
+    #[test]
+    fn a_trigger_whose_infra_is_down_cannot_be_armed() {
+        // The bridge the trigger DEPENDS ON is not up, so registering
+        // the signal would point it at an address that does not answer.
+        // Start the infra, and activate comes back.
+        assert_actions(
+            &Case {
+                has_infra: true,
+                infra_rollup: "none",
+                trigger_infra_ready: false,
+                ..Case::default()
+            },
+            &["infra_start"],
         );
     }
 
@@ -5044,13 +5330,51 @@ mod available_actions_tests {
     }
 
     #[test]
-    fn inactive_infra_degraded_allows_activation_to_prepare_infra() {
+    fn inactive_infra_degraded_holds_activate_back_only_when_a_trigger_needs_it() {
+        // `partial` is a steady state, not a transient. Whether it holds
+        // activation back depends on WHICH half is down.
         for rollup in ["failed", "flaky", "partial"] {
             assert_actions(
                 &Case { has_infra: true, infra_rollup: rollup, ..Case::default() },
                 &["activate", "infra_start", "infra_stop", "infra_terminate"],
             );
+            assert_actions(
+                &Case {
+                    has_infra: true,
+                    infra_rollup: rollup,
+                    trigger_infra_ready: false,
+                    ..Case::default()
+                },
+                &["infra_start", "infra_stop", "infra_terminate"],
+            );
         }
+    }
+
+    #[test]
+    fn each_verb_waits_on_the_infra_it_would_touch() {
+        // `run` touches the whole graph, so the whole-graph rollup gates
+        // it. `activate` arms the triggers, so only the infra those
+        // triggers DEPEND ON gates it. The two answers differ exactly
+        // when an infra node is not upstream of any trigger, which is
+        // the pair below: same rollup, and the only thing that moves is
+        // whether a trigger needs the node that is down.
+        for rollup in ["none", "stopped", "partial", "failed", "flaky"] {
+            let unrelated =
+                actions(&Case { has_infra: true, infra_rollup: rollup, ..Case::default() });
+            assert!(!unrelated.contains(&"run".to_string()), "{rollup}: run");
+            assert!(unrelated.contains(&"activate".to_string()), "{rollup}: activate");
+            let needed = actions(&Case {
+                has_infra: true,
+                infra_rollup: rollup,
+                trigger_infra_ready: false,
+                ..Case::default()
+            });
+            assert!(!needed.contains(&"run".to_string()), "{rollup}: run");
+            assert!(!needed.contains(&"activate".to_string()), "{rollup}: activate");
+        }
+        let ready = actions(&Case { has_infra: true, infra_rollup: "running", ..Case::default() });
+        assert!(ready.contains(&"run".to_string()));
+        assert!(ready.contains(&"activate".to_string()));
     }
 
     #[test]
@@ -5070,11 +5394,24 @@ mod available_actions_tests {
         );
         assert_actions(
             &Case {
-                lifecycle: active,
+                lifecycle: active.clone(),
                 drift: DriftBits { activation_drift: true, ..Default::default() },
                 ..Case::default()
             },
             &["run", "deactivate", "resync"],
+        );
+        // Resync re-arms the triggers, so the infra they depend on
+        // gates it the way it gates activate: the door would 412.
+        assert_actions(
+            &Case {
+                lifecycle: active,
+                has_infra: true,
+                infra_rollup: "running",
+                trigger_infra_ready: false,
+                drift: DriftBits { activation_drift: true, ..Default::default() },
+                ..Case::default()
+            },
+            &["run", "deactivate", "infra_stop", "infra_terminate"],
         );
     }
 

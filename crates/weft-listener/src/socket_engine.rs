@@ -26,6 +26,7 @@ use weft_core::access::client::run_connect_call;
 use weft_core::access::spec::{lookup_path, MintedSocket, ReplyRule};
 
 use crate::kinds::event_source::Backoff;
+use crate::kinds::ServingReport;
 
 /// One connect cycle's plan, answered by the caller's `prepare`.
 pub struct CyclePlan {
@@ -95,20 +96,33 @@ type Prepare = Box<dyn FnMut() -> BoxFuture<'static, Result<CyclePlan, PrepareEr
 type OnEvent = Box<dyn FnMut(Value) -> BoxFuture<'static, ()> + Send>;
 
 /// Run the engine until aborted (or a fatal prepare error). `target`
-/// names the driving kind in every log line.
-pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) -> JoinHandle<()> {
+/// names the driving kind in every log line. `report` is where the
+/// node's display reads what the engine is doing: every turn of the
+/// connect loop reports there, so a person looking at a stuck trigger
+/// sees "connect failed; retrying: ..." and not a panel that says
+/// nothing.
+pub fn spawn(
+    mut prepare: Prepare,
+    mut on_event: OnEvent,
+    target: &'static str,
+    report: ServingReport,
+) -> JoinHandle<()> {
+    let set_status = move |status: String| report(status);
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
         loop {
+            set_status("connecting".to_string());
             let plan = match prepare().await {
                 Ok(p) => p,
                 Err(PrepareError::Transient(e)) => {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %format!("{e:#}"), "connect preparation failed; retrying");
+                    set_status(format!("connect preparation failed; retrying: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(PrepareError::Fatal(e)) => {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %format!("{e:#}"), "connect preparation is misconfigured; giving up on this socket");
+                    set_status(format!("misconfigured, not retrying: {e:#}"));
                     return;
                 }
             };
@@ -116,10 +130,12 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
             let stream = match connect_async(&plan.url).await {
                 Ok((s, _resp)) => {
                     info!(target: "weft_listener::socket_engine", kind = target, "socket connected");
+                    set_status("connected".to_string());
                     s
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "connect failed; retrying");
+                    set_status(format!("connect failed; retrying: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -130,6 +146,7 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
             if let Some(frame) = &plan.handshake {
                 if let Err(e) = write.send(frame.clone()).await {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "handshake send failed; reconnecting");
+                    set_status(format!("handshake send failed; reconnecting: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -147,6 +164,7 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
                         if let Some(m) = &plan.heartbeat {
                             if let Err(e) = write.send(m.clone()).await {
                                 warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "heartbeat send failed; reconnecting");
+                                set_status(format!("heartbeat send failed; reconnecting: {e}"));
                                 break;
                             }
                         }
@@ -169,10 +187,12 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
                             }
                             Some(Err(e)) => {
                                 warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "socket error; reconnecting");
+                                set_status(format!("socket error; reconnecting: {e}"));
                                 break;
                             }
                             None => {
                                 info!(target: "weft_listener::socket_engine", kind = target, "socket closed; reconnecting");
+                                set_status("socket closed; reconnecting".to_string());
                                 break;
                             }
                         }

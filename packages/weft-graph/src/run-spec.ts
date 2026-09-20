@@ -265,7 +265,13 @@ export function specSummary(spec: RunSpec): string {
 /// body it sits in (`C.inner`), and the id being addressed under the
 /// body the view shows (`Inner.deep`), so the body prefix comes off
 /// each: what is left is the chain of names a person wrote. This is
-/// the spelling `weft run --group` and `weft events --node` take.
+/// the spelling `weft run --group` and `weft events --node` take, and
+/// the key the dispatcher holds a trigger's registration under, so a
+/// display poll built here has to spell exactly what the Rust side
+/// spells. The editor only ever addresses nodes and groups; a group's
+/// compiler-made boundaries (`__in`, `__out`), which the Rust side
+/// reads as the group, never reach this function.
+// SYNC: addressOf <-> crates/weft-core/src/project.rs address_of
 export function addressOf(callPath: readonly string[], id: string): string {
   const local = (scoped: string) => scoped.slice(scoped.indexOf('.') + 1);
   if (callPath.length === 0) return id;

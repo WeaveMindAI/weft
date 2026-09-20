@@ -378,11 +378,13 @@ pub enum Resolution {
 /// typed view and `flatten` agree on every scoped id with no rename pass.
 pub struct FileView<'a> {
     file: &'a WeftFile,
-    source_id: &'a str,
+    /// `None` for the project's entry file, which may hold no anonymous
+    /// group (the parse refuses one), so no anon-group prefix ever forms.
+    source_id: Option<&'a str>,
 }
 
 impl<'a> FileView<'a> {
-    pub fn new(file: &'a WeftFile, source_id: &'a str) -> Self {
+    pub fn new(file: &'a WeftFile, source_id: Option<&'a str>) -> Self {
         Self { file, source_id }
     }
 
@@ -391,7 +393,7 @@ impl<'a> FileView<'a> {
         self.file
     }
 
-    pub fn source_id(&self) -> &'a str {
+    pub fn source_id(&self) -> Option<&'a str> {
         self.source_id
     }
 
@@ -525,7 +527,11 @@ impl<'a> FileView<'a> {
     fn decl_local(&self, decl: &Decl) -> String {
         match decl.local_id() {
             Some(id) if !id.is_empty() => id,
-            _ => self.source_id.to_string(),
+            // An anonymous group in the entry file is refused by the
+            // parse, so this arm is only ever reached for an included
+            // file's root; the empty local reads as nothing, the way the
+            // lowering refuses it, rather than as an invented name.
+            _ => self.source_id.unwrap_or_default().to_string(),
         }
     }
 
@@ -663,7 +669,7 @@ mod tests {
     /// top-level groups, so the anon-group `source_id` is never exercised; the
     /// anon-prefix behaviour is covered by `parser_tests` against `flatten`.
     fn view(f: &WeftFile) -> FileView<'_> {
-        FileView::new(f, "Untitled")
+        FileView::new(f, Some("Untitled"))
     }
 
     /// Pin the load-bearing equivalence between the edit-side resolver

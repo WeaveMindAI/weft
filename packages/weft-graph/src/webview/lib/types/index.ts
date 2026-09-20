@@ -534,11 +534,12 @@ export interface ExecutionState {
 	callerLog: CallerInspectorEvent[];
 }
 
-/** A typed data item shown on a node's body-panel feed. The
- *  authoritative definition lives in `protocol.ts`; this
- *  re-export keeps webview imports under the `lib/types` module.
- *  Adding a new kind: extend the union in protocol.ts AND add a
- *  branch in ProjectNode.svelte's render block.
+/** One line of a node's display. The authoritative definition lives
+ *  in `protocol.ts`; this re-export keeps webview imports under the
+ *  `lib/types` module. Adding a new kind: extend the union in
+ *  protocol.ts, add the variant to `LiveItemKind` in
+ *  `crates/weft-core/src/live.rs`, and add a branch in
+ *  ProjectNode.svelte's render block.
  */
 export type { LiveDataItem } from '../../../protocol';
 
@@ -630,6 +631,11 @@ export interface NodeInstance {
 	inputs: PortDefinition[];
 	outputs: PortDefinition[];
 	features: NodeFeatures;
+	/// The compiler's word on whether this node brings up infra (it
+	/// mirrors the catalog's metadata onto every parsed node). A node
+	/// added in the editor and not yet parsed carries none, and the
+	/// catalog answers for it (`nodeRequiresInfra`).
+	requiresInfra?: boolean;
 	scope?: string[];
 	groupBoundary?: GroupBoundary | null;
 	// Source line where this node was declared in the weft code. Populated
@@ -728,6 +734,17 @@ export function containerHasConfigStrip(
 ): boolean {
 	if (!isContainerNodeType(nodeType)) return false;
 	return isLoopNodeType(nodeType) || Object.keys(portLiterals ?? {}).length > 0;
+}
+
+/** The written form a port value takes on its FIRST write, when no
+ *  span says where it already lives. A node's braces are its config,
+ *  so a new value goes there and the toggle can move it. A group's or
+ *  loop's braces hold its children and settings, and an include alias
+ *  has no braces at all, so their ports take a value on a statement
+ *  line only (`g.tone = "formal"`); the host refuses the braces form
+ *  for them. */
+export function portValueFirstForm(nodeType: unknown): import('../../../protocol').ConfigFieldSpan['origin'] {
+	return isContainerNodeType(nodeType) || isIncludeNodeType(nodeType) ? 'connection' : 'inline';
 }
 
 /** True iff a node is a Loop container (used by renderer + visual

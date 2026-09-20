@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use crate::kinds;
 use crate::protocol::{
-    DisplayRequest, DisplayResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome,
+    LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome,
     ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest, WakeByHandRequest,
     WakeByHandResponse,
 };
@@ -48,7 +48,7 @@ pub fn router(state: ListenerState) -> Router {
         .route("/match_push", post(match_push))
         .route("/wake_by_hand", post(wake_by_hand))
         .route("/render", post(render))
-        .route("/display", post(display))
+        .route("/live", post(live))
         .route("/signals", get(list_signals))
         .route("/rehydrate", post(rehydrate_handler))
         .with_state(state)
@@ -133,16 +133,20 @@ async fn register(
     Ok(Json(RegisterResponse { routing, kind_state }))
 }
 
-async fn display(
+async fn live(
     State(state): State<ListenerState>,
-    Json(req): Json<DisplayRequest>,
-) -> Result<Json<DisplayResponse>, (StatusCode, String)> {
+    Json(req): Json<LiveRequest>,
+) -> Result<Json<LiveResponse>, (StatusCode, String)> {
     let sig = state
         .registry
         .get(&req.token)
         .ok_or((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)))?;
-    let display = kinds::compute_display(&sig);
-    Ok(Json(DisplayResponse { display }))
+    let live = kinds::compute_live(&kinds::LiveCtx {
+        sig: &sig,
+        address: req.address.as_deref(),
+    });
+    kinds::read_only_display(&sig.spec.kind, &live).map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
+    Ok(Json(LiveResponse { live }))
 }
 
 async fn unregister(

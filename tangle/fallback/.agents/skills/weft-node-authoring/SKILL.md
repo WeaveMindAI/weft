@@ -55,7 +55,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
 - **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node.
-- **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its `/live` card that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
+- **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
 - **a marker in an outbound payload**: a `__weft_<kind>__` wrapper handed to a provider, a bridge, a form spec or a live item, instead of the plain URL, `data:` URL or `{ url, mimeType, filename }` that consumer reads; the rule is under A file input.
 - **silent failure in an image**: a service inside an infra image that fails a step without writing a line to its log, or answers the node with a success when the thing asked for did not fully happen; the two rules are under Infra node.
 
@@ -117,7 +117,7 @@ Unknown keys are a loud parse error. Top level:
 | `inputs` | one list for wired data and design-time config |
 | `outputs` | output ports |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint`, `castPorts`, `hidden` |
+| `features` | flags: `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden` |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
@@ -271,10 +271,10 @@ returns `None` when nothing is picked.
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
 Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
 returning the desired-state spec; the engine applies it, then calls `run`.
-A container that serves `/live` (named by `features.liveEndpoint`) can put a
-button on any item (`action: { label, actionKind, confirm? }`); the press
-reaches its own `/action` as `{ action, payload }`, and a `result.error`
-is the refusal the user reads. Every state the container can sit in has
+A container that serves `/live` (named by `features.liveEndpoint`) has a
+**display**, and "The display" below is its whole contract: the shape, the
+four item types, the `/action` envelope and a worked example. Every state
+the container can sit in has
 a button that leaves it, offered in every state: the WhatsApp bridge's
 "Disconnect phone" drops the pairing and shows a fresh QR code whether
 the bridge is paired, stuck, or half way through pairing; the Postgres
@@ -349,6 +349,9 @@ payload shape to name (a trigger that reads its own connection rather than
 the wake payload, or one whose fields are per-instance config the author
 typed in) and say why in the report.
 
+A trigger's display is NOT yours to write: the signal KIND serves it, inside
+weft. "The display" below says what that means for you.
+
 **A file input**: the value on an `Image` / `Audio` / `Video` / `Blob` port
 is the stored-file marker, and inside the running node it also carries a
 `url` minted for this firing (an hour), so a body that only speaks URLs (a
@@ -417,6 +420,111 @@ calls face opposite ways, so read them once before writing the suite:
 
 For the rest (streams, `yield_downstream` against `pulse_downstream`, what the
 journal keeps), go and read `docs/src/nodes/streams-and-buses.md`.
+
+## The display
+
+A **display** is what a node shows on its body in the editor while it runs:
+the WhatsApp bridge's QR code and then the phone that scanned it, the
+password the Postgres node minted, the address a webhook trigger listens on.
+The same feed also reaches a website or an app somebody built on the program,
+through a token their operator minted, so write it for a stranger's screen
+as much as for the graph.
+
+One shape, whoever produces it:
+
+```json
+{ "items": [
+  { "type": "image", "label": "Scan with WhatsApp", "data": "data:image/png;base64,iVBOR..." },
+  { "type": "text",  "label": "Phone", "data": "not paired",
+    "action": { "label": "Disconnect phone", "actionKind": "unpair",
+                "confirm": "Detach the paired phone and show a new QR code?" } },
+  { "type": "secret",   "label": "Password", "data": "hunter2" },
+  { "type": "progress", "label": "Restore",  "data": 0.4 }
+] }
+```
+
+| `type` | `data` is | drawn as |
+|---|---|---|
+| `text` | a string | a copyable box |
+| `image` | anything an `<img src>` takes: a `data:` URI, a URL | the picture, inline |
+| `progress` | a number from 0 to 1 | a bar |
+| `secret` | a string | masked behind `••••` until the reader clicks the eye; copy hands over the real value either way |
+
+`label` is required on every item. `action` is optional and at most one per
+item: `label` is the button's text, `actionKind` is the name you answer to,
+`confirm` (optional) is asked before the press, and `payload` (optional)
+rides along with it.
+
+### If the node is an infra node, you write it
+
+Serve it from the container, and name the endpoint that serves it in
+`metadata.json`:
+
+```json
+"features": { "liveEndpoint": "api" }
+```
+
+`"api"` is the name of one of the endpoints your `provision_infra` spec
+publishes. Naming it is what opts the node in; leave it out and the node has
+no display. Two routes on that endpoint, both called by weft itself:
+
+- `GET /live` returns the object above. Weft asks about every three seconds
+  while somebody is looking. Answer from current state, never from a cache:
+  a QR code expires in under a minute. An answer that is not
+  `{ "items": [...] }` comes back to the reader as an error naming what you
+  sent, so do not answer `{}` or a bare array.
+- `POST /action` receives a press as `{ "action": "<actionKind>", "payload": ... }`
+  and answers `{ "result": { ... } }`. Put a refusal in
+  `{ "result": { "error": "why" } }`; the reader sees that text as it is.
+  Weft reads `/live` again right after the press, so whatever it changed
+  shows at once.
+
+Node.js, matching the shape above:
+
+```js
+app.get('/live', (_req, res) => {
+  const state = bridge.getState();
+  const items = [];
+  if (state.status === 'qr_pending' && bridge.getQr()) {
+    items.push({ type: 'image', label: 'Scan with WhatsApp', data: bridge.getQr() });
+  }
+  items.push({
+    type: 'text', label: 'Phone',
+    data: state.status === 'connected' ? state.phoneNumber : 'not paired',
+    action: { label: 'Disconnect phone', actionKind: 'unpair',
+              confirm: 'Detach the paired phone and show a new QR code?' },
+  });
+  res.json({ items });
+});
+
+app.post('/action', async (req, res) => {
+  const { action, payload } = req.body;
+  if (action !== 'unpair') return res.json({ result: { error: `no action '${action}'` } });
+  await bridge.unpair(payload);
+  res.json({ result: { ok: true } });
+});
+```
+
+**Every state the container can sit in has a button that leaves it, offered
+in every state.** The bridge's "Disconnect phone" drops the pairing and shows
+a fresh QR code whether the bridge is paired, stuck, or half way through
+pairing; the Postgres node's "Reset password" mints a new one over the
+database's own socket. Walk the container's states and ask what a user does
+from the graph to leave each. A state whose only exit is restarting or
+terminating the infra is a dead end, and shipping one fails [the review].
+
+### If the node is a trigger, you write nothing
+
+The signal **kind** serves the display, from weft's listener, because the
+kind is what mints the address and the auth at activation. Every node
+declaring that kind gets the same panel, and a node cannot add to it. A
+trigger's panel is also read-only, where a container's may carry buttons:
+nothing about a registration is the reader's to change from there.
+
+So a trigger of yours showing nothing useful is a change in weft itself,
+`crates/weft-listener/src/kinds/<kind>.rs`, where the kind implements
+`KindHandler::live` and returns the same items. That is not node work: say so
+in your report and stop, rather than reaching for it from the node.
 
 ## deps.toml
 

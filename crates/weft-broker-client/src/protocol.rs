@@ -560,6 +560,9 @@ pub struct WorkerPodMarkDoneIfIdleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
     pub project_id: String,
+    /// The instance's place spelling (see `InfraEnqueueApplyRequest`):
+    /// the asking node's own place, so a node inside a file included
+    /// twice reaches the instance of its own call.
     pub node_id: String,
     pub endpoint_name: String,
 }
@@ -626,8 +629,11 @@ pub struct PublishAccessRequest {
     /// The publishing execution. The broker resolves the owning tenant
     /// AND project from it, so neither is taken from this request.
     pub color: String,
-    /// The publishing node. Its connection: publishing again updates
-    /// that one row, and terminating the node deletes it.
+    /// The publishing node's PLACE, spelled the way a person writes it
+    /// (`db`, or `one.db` inside the file the site `one` includes). Its
+    /// connection: publishing again updates that one row, and
+    /// terminating the node deletes it. A node inside a file included
+    /// twice publishes once per call, one row each.
     pub node_id: String,
     pub service: String,
     /// The service's own recipe, from the catalog the worker ships.
@@ -837,6 +843,7 @@ pub struct SupervisorInfraNodesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraNode {
+    /// The instance's place spelling (see `InfraEnqueueApplyRequest`).
     pub node_id: String,
     pub instance_id: String,
     pub status: InfraNodeStatus,
@@ -1326,6 +1333,10 @@ pub struct SupervisorEnqueueLifecycleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEnqueueApplyRequest {
     pub project_id: String,
+    /// The instance's PLACE, spelled the way a person writes the node
+    /// (`db`, or `one.db` inside the file the site `one` includes): the
+    /// key its `infra_node` row and every resource are made under. A
+    /// file included twice is applied twice, once per place.
     pub node_id: String,
     pub spec_json: serde_json::Value,
 }

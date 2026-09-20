@@ -17,7 +17,8 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct FormHandler;
 
@@ -55,6 +56,29 @@ impl KindHandler for FormHandler {
         }
     }
 
+    /// Nobody calls a form's address: the dispatcher hosts it and hands
+    /// the link to whoever must answer. So what the node shows is what
+    /// it is ASKING, which is the thing a person looking at a waiting
+    /// form wants to know.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let form = match super::config_for_display::<Form>(ctx.sig, "Asking") {
+            Ok(form) => form,
+            Err(feed) => return feed,
+        };
+        let mut items = vec![LiveItem::text(
+            "Asking",
+            form.title.clone().unwrap_or_else(|| "a form".to_string()),
+        )];
+        if let Some(description) = form.description.clone() {
+            items.push(LiveItem::text("About", description));
+        }
+        let fields = form.schema.fields.iter().map(|f| f.label.clone()).collect::<Vec<_>>();
+        if !fields.is_empty() {
+            items.push(LiveItem::text("Fields", fields.join(", ")));
+        }
+        LiveFeed::new(items)
+    }
+
     fn render(&self, token: &str, sig: &RegisteredSignal) -> Result<Option<Value>> {
         let form = parse(&sig.spec)?;
         let mut obj = serde_json::Map::new();
@@ -62,6 +86,10 @@ impl KindHandler for FormHandler {
         //       extension-browser/src/lib/api.ts (PendingTask),
         //       crates/weft-dispatcher/src/api/signal.rs (the isResume stamp)
         obj.insert("token".into(), Value::String(token.to_string()));
+        // The registration's place as a person spells it (`one.ask`
+        // for the `ask` inside the file the site `one` includes): the
+        // dispatcher registers every signal under that spelling, so it
+        // is fit to show as it is.
         obj.insert("nodeId".into(), Value::String(sig.node_id.clone()));
         obj.insert("kind".into(), Value::String(Form::TAG.into()));
         if let Some(ck) = &sig.spec.consumer_kind {
@@ -91,8 +119,9 @@ impl KindHandler for FormHandler {
 }
 
 /// Parse a Form spec's typed config. Fails loudly on malformed input
-/// so callers (compute_routing, render) surface the error to the
-/// register/display caller rather than rendering empty.
+/// so callers (compute_routing, render) surface the error to whoever
+/// registered the signal or asked for the consumer listing, rather
+/// than rendering empty.
 fn parse(spec: &SignalSpec) -> Result<Form> {
     serde_json::from_value(spec.config.clone()).map_err(|e| {
         anyhow::anyhow!(

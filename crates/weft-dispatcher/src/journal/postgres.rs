@@ -515,6 +515,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             name TEXT,
             allowed_projects UUID[] NOT NULL DEFAULT '{}',
             allowed_tags TEXT[] NOT NULL DEFAULT '{}',
+            -- The display dimension, which does NOT follow the
+            -- empty-means-wildcard rule above: a display can be a
+            -- credential, so a token says nothing about displays and
+            -- reads none. `all_displays` is the wildcard, set by
+            -- `weft token mint --displays`.
+            allowed_displays TEXT[] NOT NULL DEFAULT '{}',
+            all_displays BOOLEAN NOT NULL DEFAULT FALSE,
             created_at BIGINT NOT NULL
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_token_tenant ON signal_token(tenant_id)"#,
@@ -634,11 +641,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
            WHERE access_id IS NOT NULL"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_mount_path
              ON signal(mount_path, mount_methods) WHERE mount_path IS NOT NULL"#,
-        // Entry rows are keyed by (project_id, node_id): that pair
-        // is what TriggerSetup re-targets on every reactivate. The
-        // partial unique index lets `signal_insert` upsert entry
-        // rows in place. Resume rows (is_resume=TRUE) skip the
-        // constraint because each suspension mints its own row.
+        // Entry rows are keyed by (project_id, node_id), `node_id`
+        // being the trigger's place spelled the way a person writes
+        // it (`one.door`), so a file called from two places holds two
+        // rows: that pair is what TriggerSetup re-targets on every
+        // reactivate. The partial unique index lets `signal_insert`
+        // upsert entry rows in place. Resume rows (is_resume=TRUE)
+        // skip the constraint because each suspension mints its own
+        // row.
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_entry_node
              ON signal(project_id, node_id) WHERE is_resume = FALSE"#,
         // execution_color binds an execution color to its project +
@@ -888,8 +898,9 @@ impl Journal for PostgresJournal {
     async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+              allowed_displays, all_displays, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(tok.id)
         .bind(&tok.token_hash)
@@ -898,6 +909,8 @@ impl Journal for PostgresJournal {
         .bind(&tok.name)
         .bind(&tok.allowed_projects)
         .bind(&tok.allowed_tags)
+        .bind(&tok.allowed_displays)
+        .bind(tok.all_displays)
         // Store the caller-stamped mint time verbatim (the handler set it from
         // the canonical clock), so postgres and the mock agree.
         .bind(tok.created_at as i64)
@@ -910,7 +923,7 @@ impl Journal for PostgresJournal {
     async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
         let row: Option<SignalTokenRow> = sqlx::query_as(
             "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    created_at \
+                    allowed_displays, all_displays, created_at \
              FROM signal_token WHERE token_hash = $1",
         )
         .bind(token_hash)
@@ -922,7 +935,7 @@ impl Journal for PostgresJournal {
     async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
         let rows: Vec<SignalTokenRow> = sqlx::query_as(
             "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    created_at \
+                    allowed_displays, all_displays, created_at \
              FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
         )
         .bind(tenant)
@@ -1474,7 +1487,7 @@ impl Journal for PostgresJournal {
                 "SELECT status, activating_ts_color FROM project WHERE id = $1 FOR UPDATE",
             ).bind(sig.project_id.parse::<uuid::Uuid>()?).fetch_one(&mut *tx).await?;
             anyhow::ensure!(!sig.is_resume && lifecycle.0 == "activating" && lifecycle.1 == Some(setup),
-                "activation ended before trigger '{}' could be armed", weft_core::project::plain_id(&sig.node_id));
+                "activation ended before trigger '{}' could be armed", sig.node_id);
         }
         if let Some(version) = &sig.source_version {
             crate::versions::retain_source_version(&mut tx, &sig.project_id, version).await?;
@@ -1558,6 +1571,20 @@ impl Journal for PostgresJournal {
             .fetch_optional(&self.pool)
             .await
             .context("signal_get: read a signal row")?;
+        row.map(row_to_signal).transpose()
+    }
+
+    async fn signal_entry_at(
+        &self,
+        project_id: &str,
+        node: &str,
+    ) -> anyhow::Result<Option<SignalRegistration>> {
+        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_SELECT_ENTRY_AT_PLACE)
+            .bind(project_id)
+            .bind(node)
+            .fetch_optional(&self.pool)
+            .await
+            .context("signal_entry_at: read a signal row")?;
         row.map(row_to_signal).transpose()
     }
 
@@ -1724,11 +1751,22 @@ pub(crate) use signal_columns;
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
     concat!("SELECT ", signal_columns!(""), " FROM signal WHERE token = $1");
 
-const SIGNAL_SELECT_WHERE_COLOR_RESUME: &str =
-    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE color = $1 AND is_resume");
+/// In registration order, which is the order a run's waits are listed in.
+const SIGNAL_SELECT_WHERE_COLOR_RESUME: &str = concat!(
+    "SELECT ",
+    signal_columns!(""),
+    " FROM signal WHERE color = $1 AND is_resume ORDER BY created_at"
+);
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
     concat!("SELECT ", signal_columns!(""), " FROM signal WHERE project_id = $1");
+
+/// The one entry at a place: unique by `idx_signal_entry_node`.
+const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
+    "SELECT ",
+    signal_columns!(""),
+    " FROM signal WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE"
+);
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
     concat!("DELETE FROM signal WHERE color = $1 RETURNING ", signal_columns!(""));
@@ -1839,8 +1877,9 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
 }
 
 /// The `signal_token` SELECT row shape (id, token_hash, recognizer, tenant_id,
-/// name, allowed_projects, allowed_tags, created_at). One tuple type so both
-/// readers decode it through the single fallible `row_to_signal_token`.
+/// name, allowed_projects, allowed_tags, allowed_displays, all_displays,
+/// created_at). One tuple type so both readers decode it through the single
+/// fallible `row_to_signal_token`.
 type SignalTokenRow = (
     uuid::Uuid,
     String,
@@ -1849,11 +1888,14 @@ type SignalTokenRow = (
     Option<String>,
     Vec<uuid::Uuid>,
     Vec<String>,
+    Vec<String>,
+    bool,
     i64,
 );
 
 fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
-    let (id, token_hash, recognizer, tenant_id, name, projects, tags, created_at) = row;
+    let (id, token_hash, recognizer, tenant_id, name, projects, tags, displays, all_displays, created_at) =
+        row;
     Ok(SignalToken {
         id,
         token_hash,
@@ -1862,6 +1904,8 @@ fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
         name,
         allowed_projects: projects,
         allowed_tags: tags,
+        allowed_displays: displays,
+        all_displays,
         created_at: created_at as u64,
     })
 }

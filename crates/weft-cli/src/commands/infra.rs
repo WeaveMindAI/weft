@@ -35,10 +35,13 @@ pub enum InfraAction {
     /// between kubectl steps; unclaimed ones cancel outright; the
     /// provisioning execution is interrupted). HALT, not rollback.
     Cancel,
-    NodeStop { node_id: String, force: bool },
-    NodeTerminate { node_id: String },
+    /// Per-instance verbs. `node` is the instance's PLACE as a person
+    /// spells it (`one.db`), checked and written canonical by
+    /// `instance_named` before the daemon sees it.
+    NodeStop { node: String, force: bool },
+    NodeTerminate { node: String },
     /// What the infra containers wrote, read straight off the pods.
-    Logs { node_id: Option<String>, tail: usize, follow: bool },
+    Logs { node: Option<String>, tail: usize, follow: bool },
 }
 
 /// Trigger-deactivation choices for the infra verbs that take triggers
@@ -64,22 +67,18 @@ pub struct InfraOpts {
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
-    let action = match action {
-        InfraAction::NodeStop { node_id, force } => InfraAction::NodeStop { node_id: super::node_id_for(&ctx, &node_id)?, force },
-        InfraAction::NodeTerminate { node_id } => InfraAction::NodeTerminate { node_id: super::node_id_for(&ctx, &node_id)? },
-        InfraAction::Logs { node_id: Some(node_id), tail, follow } => {
-            InfraAction::Logs { node_id: Some(super::node_id_for(&ctx, &node_id)?), tail, follow }
-        }
-        other => other,
-    };
     if matches!(action, InfraAction::ListDoors) {
         return list_doors(&ctx).await;
     }
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
-    if let InfraAction::Logs { node_id, tail, follow } = action {
-        return infra_logs(&ctx, node_id.as_deref(), tail, follow).await;
+    if let InfraAction::Logs { node, tail, follow } = action {
+        let node = match node {
+            Some(node) => Some(instance_named(&ctx, &node).await?),
+            None => None,
+        };
+        return infra_logs(&ctx, node.as_deref(), tail, follow).await;
     }
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
@@ -132,11 +131,17 @@ async fn run_inner(
         InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
         InfraAction::Terminate => infra_terminate(ctx, progress, opts).await?,
         InfraAction::Cancel => infra_cancel(ctx, progress).await?,
-        InfraAction::NodeStop { node_id, force } => {
-            infra_node_verb(ctx, progress, &node_id, "stop", force).await?
+        // The place is read here, inside the progress wrapper, so a
+        // refusal ("names no node") reaches the graph's action bar as
+        // this verb's error like every other failure of the verb; the
+        // per-node menu is exactly the caller reading those events.
+        InfraAction::NodeStop { node, force } => {
+            let place = instance_named(ctx, &node).await?;
+            infra_node_verb(ctx, progress, &place, "stop", force).await?
         }
-        InfraAction::NodeTerminate { node_id } => {
-            infra_node_verb(ctx, progress, &node_id, "terminate", false).await?
+        InfraAction::NodeTerminate { node } => {
+            let place = instance_named(ctx, &node).await?;
+            infra_node_verb(ctx, progress, &place, "terminate", false).await?
         }
         InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
     }
@@ -156,20 +161,56 @@ async fn infra_cancel(ctx: &Ctx, progress: &Progress) -> Result<()> {
     Ok(())
 }
 
+/// The infra instance a person named, as the daemon keys it: the place
+/// spelling (`one.db`), checked against the program and written
+/// canonical, the way `weft wake` does. An instance the program no
+/// longer declares (its node deleted, or the include that reached it)
+/// is still live until it is stopped or terminated by hand, which is
+/// what these verbs are for; so a spelling the program does not know is
+/// taken as typed when the daemon lists an instance under it, and
+/// refused with the program's answer otherwise.
+async fn instance_named(ctx: &Ctx, spelled: &str) -> Result<String> {
+    let refusal = match super::node_address_for(ctx, spelled) {
+        Ok(place) => return Ok(place),
+        Err(refusal) => refusal,
+    };
+    // The orphan lookup is best effort: the program's refusal is the
+    // true answer, and only a live row carrying this exact spelling
+    // overrides it. A daemon that cannot be reached, or a listing that
+    // cannot be read, must not replace "'x' names no node" with
+    // "connection refused".
+    let live = async {
+        let (client, project_id, _) = super::resolve_project(ctx)?;
+        let status = client.get_json(&format!("/projects/{project_id}/infra/status")).await?;
+        anyhow::Ok(
+            status
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .is_some_and(|nodes| nodes.iter().any(|n| n.get("node").and_then(|v| v.as_str()) == Some(spelled))),
+        )
+    }
+    .await
+    .unwrap_or(false);
+    if live {
+        return Ok(spelled.to_string());
+    }
+    Err(refusal)
+}
+
 async fn infra_node_verb(
     ctx: &Ctx,
     progress: &Progress,
-    node_id: &str,
+    place: &str,
     verb: &str,
     force: bool,
 ) -> Result<()> {
     let (client, project_id, name) = super::resolve_project(ctx)?;
-    let path = format!("/projects/{project_id}/infra/nodes/{node_id}/{verb}");
+    let path = format!("/projects/{project_id}/infra/nodes/{place}/{verb}");
     let body = serde_json::json!({ "force": force });
     progress.dispatcher_call_start(&path);
     // 202 Accepted with { command_id }.
     let issued: serde_json::Value = client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id, "node_id": node_id }));
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id, "node": place }));
     let command_id = issued
         .get("command_id")
         .and_then(|v| v.as_i64())
@@ -398,12 +439,13 @@ async fn wait_for_command(
 /// them; the project's namespace is read off the first match, because
 /// `kubectl logs` takes no `--all-namespaces`. A node with no pod
 /// (never provisioned, or terminated) is said so by name.
-async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool) -> Result<()> {
+async fn infra_logs(ctx: &Ctx, node: Option<&str>, tail: usize, follow: bool) -> Result<()> {
     let (_client, project_id, _name) = super::resolve_project(ctx)?;
     let mut selector = format!("weft.dev/role=infra,weft.dev/project={project_id}");
-    if let Some(node) = node_id {
-        // The label carries the value that stands for the id, never
-        // the id (an included file's node has one no label can hold).
+    if let Some(node) = node {
+        // `node` is the instance's place (`one.db`), the same string the
+        // supervisor labelled the pod from; the label carries the
+        // label-safe form of it, which `node_label_value` is.
         selector.push_str(&format!(",{}={}", weft_core::infra::NODE_LABEL, weft_core::infra::node_label_value(node)));
     }
     let found = super::daemon::kubectl(&[
@@ -422,10 +464,10 @@ async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool)
     }
     let namespaces = String::from_utf8_lossy(&found.stdout);
     let Some(namespace) = namespaces.split_whitespace().next() else {
-        match node_id {
+        match node {
             Some(node) => anyhow::bail!(
                 "no pod for infra node `{node}`: it is not provisioned (`weft infra status` \
-                 says where each node stands), or the id is not an infra node"
+                 says where each instance stands), or it is not an infra node"
             ),
             None => anyhow::bail!(
                 "no infra pod for this project: nothing is provisioned (`weft infra start`)"
@@ -503,8 +545,8 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     }
     println!("infra for {name} ({id}):");
     for n in nodes {
-        // The spelled name, not the runtime's key (`@src:lib:db.store`
-        // for a node inside an included file).
+        // `node` is the instance's place, spelled the way the source
+        // reads it (`one.db`): the key and the label are one.
         let node = n.get("node").and_then(|v| v.as_str()).unwrap_or("?");
         let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let url = n
@@ -515,9 +557,14 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     }
 }
 
-/// Build the `(node_id -> { image_name -> hash_tag })` map for every
-/// `requires_infra` node in the project, the nested map shipped in the
-/// `/infra/sync` body. The images come straight from the `BuildPlan`
+/// Build the `(place -> { image_name -> hash_tag })` map for every
+/// infra INSTANCE in the project, the nested map shipped in the
+/// `/infra/sync` body: one entry per place an infra node is at (`db`,
+/// or `one.db` and `two.db` for a file included twice), spelled the
+/// way its row is keyed, because that is the key the supervisor reads
+/// the map by when it applies that instance. The images themselves are
+/// the node type's, so every place of one node carries the same tags.
+/// The images come straight from the `BuildPlan`
 /// `ensure_registered` already produced (kind `Infra`, refs minted by the ONE
 /// `TagPolicy`): no second compile, no re-enumeration, no tag re-derivation
 /// that could drift from the plan. The CLI's local refs are bare
@@ -542,6 +589,11 @@ async fn build_infra_images(
     // answer is unlearnable, and then every GC below is skipped, never
     // guessed.
     let referenced = images::referenced_set_for_gc(client).await;
+    // The plan names each image by the node's compiled id; the places
+    // that node is at come from the compiled program the plan carries.
+    let definition: weft_core::ProjectDefinition = serde_json::from_str(&plan.definition_json)
+        .context("read the build plan's compiled program")?;
+    let places = weft_core::project::selection::every_place(&definition);
 
     for img in plan.images.iter().filter(|i| i.kind == weft_compiler::build_plan::ImageKind::Infra)
     {
@@ -549,7 +601,18 @@ async fn build_infra_images(
             anyhow::bail!("planned infra image {} is missing node_id/image_name", img.image_ref);
         };
         let tag = img.image_ref.clone();
-        out.entry(node_id.clone()).or_default().insert(image_name.clone(), tag.clone());
+        let mut at_any_place = false;
+        for place in places.iter().filter(|place| &place.id == node_id) {
+            at_any_place = true;
+            let spelled = weft_core::project::address_of(&definition, &place.id, &place.path);
+            out.entry(spelled).or_default().insert(image_name.clone(), tag.clone());
+        }
+        anyhow::ensure!(
+            at_any_place,
+            "planned infra image {} belongs to '{}', which is at no place in the program",
+            img.image_ref,
+            weft_core::project::plain_id(node_id)
+        );
 
         if !seen_tags.insert(tag.clone()) {
             continue;

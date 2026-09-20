@@ -14,7 +14,7 @@
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
-import { isContainerNodeType, isLoopNodeType, containerKindOf } from '../types';
+import { isContainerNodeType, isLoopNodeType, isBoundaryBoxNodeType, containerKindOf, portValueFirstForm } from '../types';
 import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
 import { isGatePort } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
@@ -415,15 +415,15 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       // Mirror the compiler's enrich normalization so the optimistic
       // projection matches the host's next parse: a value written for an
       // INPUT PORT homes in `portLiterals`, whichever spelling wrote it;
-      // a key that names no port stays in `config`. A container has only
-      // the port home: its `config` is loop knobs, which ride their own
-      // ops.
+      // a key that names no port stays in `config`. A container or an
+      // include has only the port home: a container's `config` is loop
+      // knobs, which ride their own ops, and an include has nothing else.
       const input = node.inputs?.find((p) => p.name === op.key);
-      const isContainer = isContainerNodeType(node.nodeType);
-      if (isContainer && input === undefined && !isGatePort(op.key)) {
+      const portsOnly = isBoundaryBoxNodeType(node.nodeType);
+      if (portsOnly && input === undefined && !isGatePort(op.key)) {
         throw new Error(`'${op.node}' has no input port '${op.key}'`);
       }
-      const portHomed = isContainer || input !== undefined || isGatePort(op.key);
+      const portHomed = portsOnly || input !== undefined || isGatePort(op.key);
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});
@@ -432,10 +432,12 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
           if (!spans[op.key]) {
             // A fresh literal: record the written form so the field's
             // marker renders before the host round-trip (span stays
-            // zeroed; only `origin` matters to the view).
+            // zeroed; only `origin` matters to the view). An op with no
+            // form is written the way the host writes it for this node
+            // kind (the node kind's first form).
             spans[op.key] = {
               span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0 },
-              origin: op.form ?? 'inline',
+              origin: op.form ?? portValueFirstForm(node.nodeType),
             };
           }
         } else {

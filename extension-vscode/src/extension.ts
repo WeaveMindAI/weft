@@ -363,7 +363,7 @@ export function activate(context: vscode.ExtensionContext) {
       // pure-sounding name here once hid where the bar gets cleared.
       const stopHandled = (): boolean => {
         if (!abort.signal.aborted) return false;
-        actionBar.cliKilled(projectId);
+        actionBar.cliKilled(projectId, verbTag);
         return true;
       };
       try {
@@ -410,7 +410,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (choice === undefined || stopHandled()) {
           // User cancelled (the prompt or the bar); drop the in-flight
           // bar state.
-          actionBar.cliKilled(projectId);
+          actionBar.cliKilled(projectId, verbTag);
           return;
         }
         if (choice !== null) {
@@ -435,7 +435,12 @@ export function activate(context: vscode.ExtensionContext) {
     actionBar.cliStart(projectId, verbTag);
     try {
       await runWeftCliJson(projectId, [verb, ...args], projectRoot, (ev) => {
-        actionBar.cliEvent(projectId, ev);
+        // Stamp the verb this child was spawned for onto an event that
+        // carries none (a failure that reached the CLI's main
+        // unreported). This closure is the only place that knows which
+        // child wrote the line, so the bar can tell a late word from a
+        // previous verb apart from the running one's.
+        actionBar.cliEvent(projectId, ev.verb === undefined ? { ...ev, verb: verbTag } : ev);
         // A run's dispatcher reply carries the fresh execution's
         // color: follow it from HERE, the run's own reply channel,
         // never from the project SSE alone. On a brand-new project
@@ -452,11 +457,11 @@ export function activate(context: vscode.ExtensionContext) {
         ) {
           autoFollow.pinAndFollow(ev.detail.color);
         }
-      });
+      }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
       const tracking = cliTracking.get(projectId);
       if (tracking?.userKilled) {
-        actionBar.cliKilled(projectId);
+        actionBar.cliKilled(projectId, verbTag);
       } else {
         const message = err instanceof Error ? err.message : String(err);
         const details = (err as { details?: ActionErrorDetails } | undefined)?.details;
@@ -828,11 +833,20 @@ export function activate(context: vscode.ExtensionContext) {
     args: string[],
     cwd: string,
     onEvent: (ev: CliEvent) => void,
+    onLog: (text: string) => void,
   ): Promise<void> {
     const channel = getWeftOutputChannel();
     const fullArgs = ['--json', ...args];
     const command = `weft ${fullArgs.join(' ')}`;
-    channel.appendLine(`> ${command}  (${cwd})`);
+    // Everything the verb prints goes through here, so the output
+    // channel and the graph's activity log can never show different
+    // things. The NDJSON event stream is NOT output: it is the verb's
+    // state, and the bar already renders it as the spinner's label.
+    const say = (text: string): void => {
+      channel.append(text);
+      onLog(text);
+    };
+    say(`> ${command}  (${cwd})\n`);
     return new Promise((resolve, reject) => {
       const child = spawn('weft', fullArgs, {
         cwd,
@@ -866,7 +880,7 @@ export function activate(context: vscode.ExtensionContext) {
           const ev = JSON.parse(trimmed) as CliEvent;
           onEvent(ev);
         } catch {
-          channel.appendLine(`[non-json stdout] ${trimmed}`);
+          say(`[non-json stdout] ${trimmed}\n`);
           nonJsonStdout = appendCapped(nonJsonStdout, trimmed + '\n');
         }
       };
@@ -882,7 +896,7 @@ export function activate(context: vscode.ExtensionContext) {
       child.stderr?.on('data', (chunk: Buffer) => {
         const text = chunk.toString();
         stderrBuf = appendCapped(stderrBuf, text);
-        channel.append(text);
+        say(text);
       });
       child.on('error', (err) => reject(err));
       child.on('close', (code, signal) => {

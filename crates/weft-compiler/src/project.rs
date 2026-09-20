@@ -257,6 +257,9 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
 }
 
 /// The source folder and the entry file inside it (`src/main.weft`).
+/// The editor host restates the pair to tell the entry file apart
+/// from a file opened on its own.
+// SYNC: SRC_DIR / ENTRY_FILE <-> extension-vscode/src/graphView.ts viewPlace
 pub const SRC_DIR: &str = "src";
 pub const ENTRY_FILE: &str = "main.weft";
 /// The shared node tree: the standard library under `base_catalog/`

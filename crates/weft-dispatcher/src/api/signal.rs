@@ -1447,6 +1447,17 @@ async fn require_scoped_signal_token(
     Ok(TokenScope { row })
 }
 
+/// The signal token a request presents, loaded. The doors that are not
+/// about signals (a node's display) apply their own scope rules to the
+/// row, so they take it from here rather than re-reading the header.
+pub(crate) async fn token_from_bearer(
+    state: &DispatcherState,
+    headers: &HeaderMap,
+) -> Result<crate::journal::SignalToken, (StatusCode, String)> {
+    let presented = bearer_token(headers)?;
+    Ok(require_scoped_signal_token(state, &presented).await?.row)
+}
+
 struct TokenScope {
     row: crate::journal::SignalToken,
 }
@@ -1473,15 +1484,18 @@ impl TokenScope {
         if !self.row.allowed_tags.is_empty() {
             return false;
         }
-        if !self.row.allowed_projects.is_empty() {
-            let Ok(want) = sig.project_id.parse::<uuid::Uuid>() else {
-                return false;
-            };
-            if !self.row.allowed_projects.contains(&want) {
-                return false;
-            }
+        // A token with no project scope covers every project of its
+        // tenant, and asks nothing about the id: it never has to parse,
+        // which is what keeps a row whose project_id is not a uuid
+        // cancellable by a wildcard token. A scoped token does have to
+        // compare, so an id it cannot read is no project it was given.
+        if self.row.allowed_projects.is_empty() {
+            return true;
         }
-        true
+        let Ok(want) = sig.project_id.parse::<uuid::Uuid>() else {
+            return false;
+        };
+        self.row.covers_project(&want)
     }
 
     /// Run the SQL filter to enumerate every signal this token sees.
@@ -2070,7 +2084,7 @@ pub async fn connect_live(
     );
     tracing::info!(
         target: "weft_dispatcher::signal",
-        color = %color, node = %weft_core::project::plain_id(node_id), pod = %pod.pod_name,
+        color = %color, node = %node_id, pod = %pod.pod_name,
         "live handshake: caller pointed at the worker; the execution is born on arrival"
     );
 
@@ -2162,9 +2176,9 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
     let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
     let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
     let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
-    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{}' has no original source version; activate it again", weft_core::project::plain_id(&node_id))))?;
+    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no original source version; activate it again")))?;
     let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
-        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{}' has no armed code identity; activate it again", weft_core::project::plain_id(&node_id))))?)
+        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no armed code identity; activate it again")))?)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("armed program identity: {error}")))?;
 
     // The signal spec carries the kind tag + the live-caller config. The
@@ -2175,7 +2189,7 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
     let protocol = weft_core::signal::protocol_for_tag(&spec.kind).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            format!("endpoint of '{}' is not a live connection ({})", weft_core::project::plain_id(&node_id), spec.kind),
+            format!("endpoint of '{node_id}' is not a live connection ({})", spec.kind),
         )
     })?;
     // Validate the config body parses (fail loud on a malformed row); the
@@ -2535,61 +2549,82 @@ async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (Status
     }
 }
 
-/// Inspector proxy: read the listener's per-signal display info.
-/// Resolves (project_id, node_id) → signal row → token →
-/// listener `/display` call. Every way of having nothing to show
-/// (no signal row, no live holder, a holder that does not know the
-/// token) is one 404: the caller is the graph's trigger panel, which
-/// draws 404 as "not running, activate it", the way an infra node
-/// draws its unprovisioned state. The rest is a failure it shows
+/// Project-token proxy: what a trigger node is showing. `{node}` is
+/// the trigger's place, spelled the way a person writes it (`door`,
+/// `one.door` for the `door` inside the file the site `one` includes),
+/// which is the key its entry row is stored under. Resolves that row
+/// → token → the listener's `/live`. Every way of having nothing to
+/// show (no signal row, no live holder, a holder that does not know
+/// the token) is one 404: the caller is the graph's trigger panel,
+/// which draws 404 as "not running, activate it", the way an infra
+/// node draws its unprovisioned state. The rest is a failure it shows
 /// verbatim. Nothing is spun up just to render a display.
-pub async fn display_signal(
+pub async fn live_signal(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((project_id, node_id)): Path<(String, String)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+    Path((project_id, node)): Path<(String, String)>,
+) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
     let id = project_id
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
     authorize_project(&state, &caller.0, id).await?;
-    let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
+    Ok(Json(read_signal_live(&state, id, &node).await?))
+}
+
+/// What a trigger node is showing right now, off the listener holding
+/// its signal. The caller has already been authorized for the project
+/// (the editor by its project token, an outside client by its signal
+/// token), so this is the one implementation both doors share, down to
+/// the 404 they both give for a trigger nothing is holding.
+/// `node` is the trigger's place as the caller spelled it, which is
+/// both the row's key and the only name the refusals use: somebody who
+/// asked for `test.whatsapp` is never told about `Test.whatsapp`, a
+/// name that exists nowhere in their source.
+pub(crate) async fn read_signal_live(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    node: &str,
+) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
+    // The entry registered at this place, read once: it carries the
+    // token the listener is asked by, and the address the caller is
+    // shown. A resume row of the same node is another registration
+    // entirely (a display is what a TRIGGER shows), and the journal
+    // never answers with one here.
+    let entry = state
+        .journal
+        .signal_entry_at(&id.to_string(), node)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
     let not_listening = || {
         (
             StatusCode::NOT_FOUND,
-            format!("no listener holds the trigger '{}'; activate the project to register it", weft_core::project::plain_id(&node_id)),
+            format!("no listener holds the trigger '{node}'; activate the project to register it"),
         )
     };
+    // Where a caller reaches this signal. The row is the authority (it
+    // holds the tenant-namespaced mount path) and `public_url` is the
+    // one place that knows a held-connection kind is served under
+    // `/connect/`; the listener holds only the route pattern its kind
+    // computed, so the finished address is sent to it rather than
+    // assembled there from three things it cannot see.
+    //
+    // The CONFIGURED base, not the reading request's own host: this
+    // address is handed on to a third party (whoever will call the
+    // trigger), and the reader's host says nothing about what that
+    // party reaches.
+    let address = entry.public_url(state.external_base_url());
     let handle = state
         .listeners
-        .resolve_signal(&token, &state.pg_pool)
+        .resolve_signal(&entry.token, &state.pg_pool)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
         .ok_or_else(not_listening)?;
-    let display = crate::listener::display_signal(&handle, &token)
+    // The listener's own text names the route already (`bail_unless_ok`).
+    crate::listener::live_signal(&handle, &entry.token, address.as_deref())
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?
-        .ok_or_else(not_listening)?;
-    Ok(Json(display))
-}
-
-async fn lookup_signal_token_for_node(
-    state: &DispatcherState,
-    project_id: &str,
-    node_id: &str,
-) -> Result<String, (StatusCode, String)> {
-    // Pick the most recent signal for this (project, node). For
-    // entry triggers there's only one; for resumes there could be
-    // many across firings but inspector use is per-trigger today, so
-    // first match is fine.
-    let row = sqlx::query("SELECT token FROM signal WHERE project_id = $1 AND node_id = $2 ORDER BY created_at DESC LIMIT 1")
-        .bind(project_id)
-        .bind(node_id)
-        .fetch_optional(&state.pg_pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("token lookup: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{}'", weft_core::project::plain_id(node_id))))?;
-    row.try_get("token")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the trigger's display: {e}")))?
+        .ok_or_else(not_listening)
 }
 
 #[cfg(test)]
@@ -2848,6 +2883,8 @@ mod can_cancel_tests {
                 name: None,
                 allowed_projects: projects,
                 allowed_tags: tags,
+                allowed_displays: vec![],
+                all_displays: false,
                 created_at: 0,
             },
         }

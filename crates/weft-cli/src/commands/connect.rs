@@ -130,7 +130,7 @@ struct AccessTarget {
     /// The node's id, as the compiler keys it: for a node inside an
     /// included file that carries the file's path (`@src:sweep.key`).
     /// It is the id the structural edit needs to write the pick, and
-    /// nothing else: what a person reads and types is [`Self::spellings`].
+    /// nothing else: what a person reads and types is `spellings`.
     node: String,
     node_type: String,
     input: String,
@@ -140,10 +140,10 @@ struct AccessTarget {
     project_app: Option<AppRegistration>,
     /// What the node's picker field currently holds.
     picked: Pick,
-    /// The include aliases this node's file is reachable through, for
-    /// display ("in sub.weft, included as c and c2"). Empty for
-    /// main.weft's own nodes.
-    included_as: Vec<String>,
+    /// Every way a person names this node: one per place it is at in
+    /// the program (see [`spellings_of`]). A node of the entry file has
+    /// one; a node inside a file included twice has two, and both work.
+    spellings: Vec<String>,
 }
 
 /// The `{id, identity}` handle a node's picker config holds.
@@ -246,8 +246,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     let catalog = weft_compiler::build::build_project_catalog(&root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
     let mut others: Vec<OtherNode> = Vec::new();
-    let targets =
-        access_targets(&root, &project.main_weft(), project.id(), &catalog, &mut others)?;
+    let targets = access_targets(project, &catalog, &mut others)?;
     if targets.is_empty() {
         if opts.list {
             // Nothing to scope the listing to; list the whole store.
@@ -265,7 +264,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         for (i, target) in targets.iter().enumerate() {
             let grants = list_grants(&client, Some(&target.spec.service)).await?;
             if json {
-                all.push(serde_json::json!({ "node": target.spelling(), "file": target.rel_file, "connections": grants }));
+                all.push(serde_json::json!({ "node": target.spelling(), "spellings": target.spellings(), "file": target.rel_file, "connections": grants }));
             } else {
                 if i > 0 {
                     println!();
@@ -310,11 +309,13 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             // One JSON OBJECT per line, per the global --json contract.
             // It names the node it listed for: a caller that passed
             // `--node` still has to see which one answered, spelled the
-            // way the program spells it.
+            // way the program spells it, and every other name the node
+            // has (a file included twice gives it two).
             println!(
                 "{}",
                 serde_json::json!({
                     "node": target.spelling(),
+                    "spellings": target.spellings(),
                     "file": target.rel_file,
                     "connections": grants,
                 })
@@ -525,13 +526,7 @@ fn sweep_picks(
     let swept = (|| -> Result<()> {
         // The sweep only reads picks, so the non-connectable nodes it
         // walks past are nobody's business here.
-        let targets = access_targets(
-            &project.root,
-            &project.main_weft(),
-            project.id(),
-            catalog,
-            &mut Vec::new(),
-        )?;
+        let targets = access_targets(project, catalog, &mut Vec::new())?;
         for target in &targets {
             if target.picked.handle().is_some_and(|p| p.id == id) {
                 Connecting {
@@ -565,11 +560,6 @@ fn sweep_failed(e: &anyhow::Error) {
 
 // ── Target discovery ────────────────────────────────────────────────────────
 
-/// Walk main.weft and every `@include`d file (recursively) and pair
-/// each access node with its service recipe and its currently picked
-/// handle. Each FILE is parsed standalone and visited once: a subgraph
-/// included from two places is one source file, so its access node is
-/// one target and one pick serves every inclusion.
 /// A node that is NOT connectable, kept only so a refusal can tell
 /// "you typed a name that is not here" apart from "that node needs no
 /// connection". Nothing else reads it, which is why it carries the two
@@ -579,73 +569,101 @@ struct OtherNode {
     node_type: String,
 }
 
+/// Walk main.weft and every `@include`d file (recursively) and pair
+/// each access node with its service recipe and its currently picked
+/// handle. Each FILE is parsed standalone and visited once: a subgraph
+/// included from two places is one source file, so its access node is
+/// one target and one pick serves every inclusion. What a person calls
+/// that node comes from the WHOLE program, flattened once here: a node
+/// has one name per place it is at, and the file walk knows nothing
+/// about places (a file reached through a nested include is two sites
+/// deep, and the alias it was reached by is only the innermost).
+///
+/// The flattening is the LENIENT one (lex, parse, includes inlined, no
+/// enrich and no validation), because connecting is what you do to a
+/// program that is not wired up yet: an unmet `MustOverride` or a
+/// mis-typed literal leaves the node list whole, and the places come
+/// from the node list alone. A parse error is refused the way the file
+/// walk refuses one, naming the file and the line.
 fn access_targets(
-    root: &std::path::Path,
-    entry: &std::path::Path,
-    project_id: uuid::Uuid,
+    project: &weft_compiler::project::Project,
     catalog: &weft_catalog::FsCatalog,
     others: &mut Vec<OtherNode>,
 ) -> Result<Vec<AccessTarget>> {
-    let mut out = Vec::new();
-    let mut visited: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>> =
-        Default::default();
-    let root = root
+    let main = project.read_main_weft().map_err(|e| anyhow::anyhow!("read {}: {e}", project.main_weft().display()))?;
+    // ONE spelling of the root for both halves. The compiler keys an
+    // included file by its path under the root it is given, taken from
+    // the file's canonical path, and the file walk below keys the same
+    // file by its path under the root it was given: hand each a
+    // different spelling of one folder (a symlink in the way) and the
+    // two ids disagree, so every node of every included file would be
+    // "at no place".
+    let root = project
+        .root
         .canonicalize()
-        .with_context(|| format!("resolve {}", root.display()))?;
-    collect_targets(
-        entry,
-        &root,
+        .with_context(|| format!("resolve {}", project.root.display()))?;
+    let (program, parse_errors) = weft_compiler::weft_compiler::compile_lenient(
+        &main,
+        project.id(),
+        weft_compiler::CompileFs::disk(&root).anchored_at(Some(&root.join(weft_compiler::project::SRC_DIR))),
+        weft_compiler::weft_compiler::IncludeMode::Full,
         None,
-        project_id,
-        catalog,
-        &mut out,
-        others,
-        &mut visited,
-    )?;
+    );
+    if let Some(first) = parse_errors.first() {
+        bail!(
+            "{} does not parse (line {}: {}); fix it before connecting, or the \
+             pick would be written into a file the compiler cannot read",
+            first.file.clone().unwrap_or_else(|| project.main_weft().display().to_string()),
+            first.span.start_line,
+            first.message
+        );
+    }
+    let mut out = Vec::new();
+    let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
+    collect_targets(&project.main_weft(), &root, &program, catalog, &mut out, others, &mut visited)?;
     Ok(out)
 }
 
 /// One file's pass: parse it standalone (the same per-file view the
 /// editor edits), collect its access nodes, recurse into its includes.
-/// `via` is the include alias this file was reached through (None for
-/// main.weft); a file reached again only records the extra alias on
-/// its existing targets.
+/// A file reached again is one file already collected, so nothing is
+/// added: its every name came from `program` the first time.
 fn collect_targets(
     file: &std::path::Path,
     root: &std::path::Path,
-    via: Option<&str>,
-    project_id: uuid::Uuid,
+    program: &weft_core::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
     out: &mut Vec<AccessTarget>,
     others: &mut Vec<OtherNode>,
-    visited: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
+    visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<()> {
     let canonical = file
         .canonicalize()
         .with_context(|| format!("resolve {}", file.display()))?;
-    if let Some(indices) = visited.get(&canonical) {
-        // Second inclusion of the same file: same source, same pick;
-        // just show the reader both routes to it.
-        if let Some(alias) = via {
-            for &i in indices {
-                out[i].included_as.push(alias.to_string());
-            }
-        }
+    if !visited.insert(canonical.clone()) {
         return Ok(());
     }
     let source = std::fs::read_to_string(&canonical)
         .with_context(|| format!("read {}", canonical.display()))?;
-    let source_id = weft_compiler::source_name::body_id(root, &canonical);
+    // The ids this parse hands out have to be the ones `program` keys
+    // its places by, or `spellings_of` finds nothing. An included file's
+    // nodes are keyed under the file's body id on both sides; the entry
+    // file's are bare on the program side (the build compiles it with
+    // no source id), so the entry is parsed bare here too. A main.weft
+    // wrapped in one top-level group would otherwise come out as
+    // `@src:main.x` against the program's `Untitled.x`.
+    let is_entry = visited.len() == 1;
+    let source_id = (!is_entry).then(|| weft_compiler::source_name::body_id(root, &canonical));
     let base = canonical
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     let (definition, diagnostics) = weft_compiler::parse_only(
         &source,
-        project_id,
+        program.id,
         weft_compiler::CompileFs::disk(root).anchored_at(Some(&base)),
         catalog,
-        Some(&source_id),
+        source_id.as_deref(),
     );
     // The lenient parse answers even on broken source, with a PARTIAL
     // node list; operating on that (and rewriting the file from it)
@@ -664,18 +682,15 @@ fn collect_targets(
             first.message
         );
     }
-    let mut indices = Vec::new();
-    let mut includes: Vec<(String, String)> = Vec::new();
+    let mut includes: Vec<String> = Vec::new();
     for node in &definition.nodes {
         if let Some(path) = &node.include_path {
-            includes.push((node.id.clone(), path.clone()));
+            includes.push(path.clone());
             continue;
         }
+        let spellings = spellings_of(program, &node.id)?;
         let mut note_other = || {
-            others.push(OtherNode {
-                spellings: spellings_of(&node.id, &via.map(str::to_string).into_iter().collect::<Vec<_>>()),
-                node_type: node.node_type.clone(),
-            })
+            others.push(OtherNode { spellings: spellings.clone(), node_type: node.node_type.clone() })
         };
         let Some(meta) = weft_core::node::MetadataCatalog::lookup(catalog, &node.node_type) else {
             note_other();
@@ -712,7 +727,6 @@ fn collect_targets(
                 Err(e) => Pick::Malformed(format!("{e:#}")),
             },
         };
-        indices.push(out.len());
         out.push(AccessTarget {
             root: root.to_path_buf(),
             file: canonical.clone(),
@@ -726,21 +740,11 @@ fn collect_targets(
             project_app: meta.access_apps.get(&spec.service).cloned(),
             spec,
             picked,
-            included_as: via.map(str::to_string).into_iter().collect(),
+            spellings,
         });
     }
-    visited.insert(canonical.clone(), indices);
-    for (alias, path) in includes {
-        collect_targets(
-            &base.join(&path),
-            root,
-            Some(&alias),
-            project_id,
-            catalog,
-            out,
-            others,
-            visited,
-        )?;
+    for path in includes {
+        collect_targets(&base.join(&path), root, program, catalog, out, others, visited)?;
     }
     Ok(())
 }
@@ -769,44 +773,54 @@ fn parse_picked(v: &Value) -> Result<PickedHandle> {
 /// includes the file (`sweep.key`), once per site it is reached
 /// through, because the id it is keyed by carries the file's PATH and
 /// the language calls that spelling unspellable on purpose.
-fn spellings_of(id: &str, included_as: &[String]) -> Vec<String> {
-    let Some(local) = id
-        .strip_prefix('@')
-        .and_then(|rest| rest.split_once('.'))
-        .map(|(_, tail)| tail.to_string())
-    else {
-        return vec![id.to_string()];
-    };
-    if included_as.is_empty() {
-        // No site above it (the file IS the entry, or a standalone
-        // parse): the file's own name carries it.
-        return vec![weft_core::project::plain_id(id)];
-    }
-    included_as.iter().map(|site| format!("{site}.{local}")).collect()
+fn spellings_of(program: &weft_core::ProjectDefinition, id: &str) -> Result<Vec<String>> {
+    let spellings: Vec<String> = weft_core::project::selection::every_place(program)
+        .into_iter()
+        .filter(|place| place.id == id)
+        .map(|place| weft_core::project::address_of(program, &place.id, &place.path))
+        .collect();
+    // Every node the file walk finds is a node of the program, at one
+    // place at least; a node with none is a file the walk reached that
+    // the program does not, and a name made up here would be one no
+    // other command takes.
+    anyhow::ensure!(!spellings.is_empty(), "'{}' is at no place in this program", weft_core::project::plain_id(id));
+    Ok(spellings)
 }
 
 impl AccessTarget {
     /// Every way a person may name this node (see [`spellings_of`]).
-    fn spellings(&self) -> Vec<String> {
-        spellings_of(&self.node, &self.included_as)
+    fn spellings(&self) -> &[String] {
+        &self.spellings
     }
 
-    /// The one spelling to print when only one fits.
+    /// The one spelling to print when only one fits: the first, which
+    /// [`Self::answer_as`] makes the one the person asked by.
     fn spelling(&self) -> String {
-        self.spellings().first().cloned().unwrap_or_else(|| self.node.clone())
+        self.spellings[0].clone()
+    }
+
+    /// Put the spelling the person named this node by first, so every
+    /// line printed about it answers in their words: asked for
+    /// `two.key`, a node a file included twice is `two.key` in the
+    /// answer, never the other call's name.
+    fn answer_as(&mut self, named: &str) {
+        let asked = named.split_once(':').map_or(named, |(_, n)| n);
+        if let Some(at) = self.spellings.iter().position(|s| s == asked) {
+            self.spellings.swap(0, at);
+        }
     }
 }
 
-/// A target's one-line description: node, type, and (for an included
-/// file's node) where it lives and through which aliases.
+/// A target's one-line description: its names, its type, and (for an
+/// included file's node) the file it lives in. The names already say
+/// which sites reach it (`nightly.key or manual.key`).
 fn describe_target(t: &AccessTarget) -> String {
     let mut s = format!("{} ({})", t.spellings().join(" or "), t.node_type);
-    if !t.included_as.is_empty() {
-        s.push_str(&format!(
-            " in {}, included as {}",
-            t.rel_file,
-            t.included_as.join(" and ")
-        ));
+    // The compiler keys a node inside an included file by the file's
+    // path, and that key starts with `@` (`@src:sweep.key`): the one
+    // mark that tells a node not of the entry file apart here.
+    if t.node.starts_with('@') {
+        s.push_str(&format!(" in {}", t.rel_file));
     }
     s
 }
@@ -820,10 +834,12 @@ fn choose_target(
     if let Some(name) = node {
         // Bare id, or root-relative-file-qualified `nodes/a/sub.weft:node`
         // when the same id exists in two files.
+        // Only a name a person writes (a place spelling) matches; the
+        // compiled id resolves nowhere on purpose, here as everywhere.
         let matches_name = |t: &AccessTarget| {
             t.spellings().iter().any(|s| s == name)
                 || name.split_once(':').is_some_and(|(f, n)| {
-                    t.rel_file == f && (t.spellings().iter().any(|s| s == n) || t.node == n)
+                    t.rel_file == f && t.spellings().iter().any(|s| s == n)
                 })
         };
         let count = targets.iter().filter(|t| matches_name(t)).count();
@@ -858,12 +874,14 @@ fn choose_target(
             .map(describe_target)
             .collect::<Vec<_>>()
             .join(", ");
-        return targets
+        let mut found = targets
             .into_iter()
             .find(|t| matches_name(t))
             .with_context(|| {
                 format!("no access node '{name}' in this project (the access nodes are: {known})")
-            });
+            })?;
+        found.answer_as(name);
+        return Ok(found);
     }
     if targets.len() == 1 {
         let t = targets.remove(0);
@@ -1066,11 +1084,11 @@ impl Connecting<'_> {
             },
         };
         // The file's own anon-root id, the same identity the editor edits
-        // it under when navigated into it.
-        let source_id = weft_compiler::source_name::body_id(&self.target.root, file);
+        // it under when navigated into it; the entry file has none.
+        let source_id = weft_compiler::source_name::file_id(Some(&self.target.root), Some(file));
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
-            &source_id,
+            source_id.as_deref(),
             &[op],
             self.registry.clone(),
         )
@@ -2005,8 +2023,37 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    fn sites(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
+    /// The shape an include compiles to: the file `src/sweep.weft` is
+    /// one body, keyed by its path, and each `@include` of it is a call
+    /// site; a node inside it is keyed under the file's path.
+    fn program_including_sweep(sites: &[&str]) -> weft_core::ProjectDefinition {
+        let node = |id: &str, scope: &[&str], boundary: serde_json::Value| {
+            serde_json::json!({
+                "id": id, "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [], "scope": scope, "groupBoundary": boundary,
+            })
+        };
+        let mut nodes = vec![
+            node("db", &[], serde_json::Value::Null),
+            node("@src:sweep__in", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "In" })),
+            node("@src:sweep.key", &["@src:sweep"], serde_json::Value::Null),
+            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"], serde_json::Value::Null),
+            node("@src:sweep__out", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "Out" })),
+        ];
+        let mut groups = vec![
+            serde_json::json!({ "id": "@src:sweep", "kind": "body", "nodeIds": ["@src:sweep.key"] }),
+            serde_json::json!({ "id": "@src:sweep.inner", "kind": "group", "nodeIds": ["@src:sweep.inner.key"] }),
+        ];
+        for site in sites {
+            nodes.push(node(&format!("{site}__in"), &[], serde_json::json!({ "groupId": site, "role": "In" })));
+            nodes.push(node(&format!("{site}__out"), &[], serde_json::json!({ "groupId": site, "role": "Out" })));
+            groups.push(serde_json::json!({ "id": site, "kind": "call", "body": "@src:sweep", "nodeIds": [] }));
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": nodes, "edges": [], "groups": groups,
+        }))
+        .expect("the fixture deserializes")
     }
 
     /// A node inside an included file is keyed by the file's PATH, and
@@ -2016,40 +2063,43 @@ mod tests {
     /// worked was `@src:sweep.key`, which no other command accepts.
     #[test]
     fn an_included_files_node_is_named_through_its_site() {
-        let spelled = spellings_of("@src:sweep.key", &sites(&["sweep"]));
+        let p = program_including_sweep(&["sweep"]);
+        let spelled = spellings_of(&p, "@src:sweep.key").unwrap();
         assert_eq!(spelled, vec!["sweep.key".to_string()]);
         assert!(!spelled[0].contains('@'), "the compiler's id never reaches a person");
     }
 
-    /// One file included twice is one node with two ways to name it,
-    /// and both have to work.
+    /// One file included twice is one node at two places, with a name
+    /// per place, and both have to work.
     #[test]
     fn a_file_included_twice_answers_to_either_site() {
+        let p = program_including_sweep(&["nightly", "manual"]);
         assert_eq!(
-            spellings_of("@src:sweep.key", &sites(&["nightly", "manual"])),
-            vec!["nightly.key".to_string(), "manual.key".to_string()]
+            spellings_of(&p, "@src:sweep.key").unwrap(),
+            vec!["manual.key".to_string(), "nightly.key".to_string()]
         );
     }
 
     /// A node nested in a group inside that file keeps the whole tail.
     #[test]
     fn a_nested_node_keeps_the_rest_of_its_address() {
-        assert_eq!(
-            spellings_of("@src:sweep.inner.key", &sites(&["sweep"])),
-            vec!["sweep.inner.key".to_string()]
-        );
+        let p = program_including_sweep(&["sweep"]);
+        assert_eq!(spellings_of(&p, "@src:sweep.inner.key").unwrap(), vec!["sweep.inner.key".to_string()]);
     }
 
     /// A node of the entry file is already written the way it is read.
     #[test]
     fn a_node_of_the_entry_file_is_its_own_name() {
-        assert_eq!(spellings_of("db", &[]), vec!["db".to_string()]);
+        let p = program_including_sweep(&["sweep"]);
+        assert_eq!(spellings_of(&p, "db").unwrap(), vec!["db".to_string()]);
     }
 
-    /// Reached with no site above it, the file's own name carries it,
-    /// rather than the path the runtime keys it by.
+    /// A node at no place in the program is refused, never given a
+    /// name no other command would take.
     #[test]
-    fn with_no_site_above_it_the_files_name_carries_it() {
-        assert_eq!(spellings_of("@src:lib:sweep.key", &[]), vec!["sweep.key".to_string()]);
+    fn a_node_the_program_does_not_place_is_refused() {
+        let p = program_including_sweep(&[]);
+        let err = spellings_of(&p, "@src:sweep.key").unwrap_err().to_string();
+        assert!(err.contains("'sweep.key' is at no place"), "{err}");
     }
 }

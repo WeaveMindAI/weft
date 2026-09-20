@@ -42,10 +42,11 @@ use weft_core::signal::{EventScope, ProviderEvents, Signal};
 
 use crate::event_context::FireContext;
 use crate::protocol::{ProcessOutcome, ProcessTarget, PushEvent};
-use crate::registry::{RegisteredSignal, TaskGuard, Transport};
+use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct ProviderEventsHandler;
 
@@ -172,9 +173,25 @@ impl KindHandler for ProviderEventsHandler {
     }
 
     /// No register-time snapshot: the trigger's state is LIVE (which
-    /// transport serves it, what the task is doing right now) and is
-    /// served from the registry entry's serving slot via /display,
-    /// never frozen onto the signal row.
+    /// transport serves it, what the task is doing right now). It is
+    /// read off the registry entry's serving slot when the node's
+    /// display is asked for, never frozen onto the signal row.
+    /// Nothing calls in, so there is no address to show: the display
+    /// is what this signal is listening to and whether the loop
+    /// holding it is healthy right now.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let sig = ctx.sig;
+        let cfg = match super::config_for_display::<ProviderEvents>(sig, "Topic") {
+            Ok(cfg) => cfg,
+            Err(feed) => return feed,
+        };
+        // A topic is a provider's own word ("messages", "files"), never
+        // a credential, so it is shown plainly.
+        let mut items = vec![LiveItem::text("Topic", cfg.topic)];
+        items.extend(super::serving_item(sig));
+        LiveFeed::new(items)
+    }
+
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {
         Ok(None)
     }
@@ -213,9 +230,9 @@ impl KindHandler for ProviderEventsHandler {
 
 inventory::submit!(&ProviderEventsHandler as &dyn KindHandler);
 
-/// Write the signal's live serving status where /display reads it.
+/// Write the signal's live serving status where the kind's `live` reads it.
 fn set_status(ctx: &SpawnCtx, status: impl Into<String>) {
-    ctx.serving.lock().status = status.into();
+    super::set_serving_status(ctx, status);
 }
 
 /// Which transport serves a subscription, decided from the recipe,
@@ -372,10 +389,18 @@ struct Subscriber {
     fire: FireContext,
     scope: EventScope,
     provider_account: Option<String>,
+    /// This subscription's own display slot. The shared engine's state
+    /// is fanned out to every subscriber's slot, so each panel says
+    /// what the socket they all ride on is doing.
+    serving: Arc<parking_lot::Mutex<ServingState>>,
 }
 
 struct SocketShare {
     subscribers: Arc<DashMap<String, Subscriber>>,
+    /// The engine's latest report, so a subscription that joins after
+    /// the socket settled (or failed for good) starts from the truth
+    /// rather than from "connecting".
+    last: Arc<parking_lot::Mutex<String>>,
     /// Holds the shared engine alive: the [`TaskGuard`]'s drop aborts
     /// it when the share dies with its last subscriber. Load-bearing
     /// through its drop alone, which is why the lint sees no read.
@@ -418,20 +443,45 @@ async fn serve_socket(
     {
         let share = SOCKETS.entry(key.clone()).or_insert_with(|| {
             let subscribers: Arc<DashMap<String, Subscriber>> = Arc::new(DashMap::new());
+            let last: Arc<parking_lot::Mutex<String>> = Arc::new(parking_lot::Mutex::new(String::new()));
+            // One socket serves every subscription of this topic, so
+            // what it is doing is every subscription's state: each
+            // report lands in every subscriber's slot, and is kept for
+            // whoever joins later.
+            let report: super::ServingReport = {
+                let subscribers = subscribers.clone();
+                let last = last.clone();
+                Arc::new(move |status: String| {
+                    *last.lock() = status.clone();
+                    for subscriber in subscribers.iter() {
+                        subscriber.serving.lock().status = status.clone();
+                    }
+                })
+            };
             let engine = spawn_shared_engine(
                 access.clone(),
                 cfg.topic.clone(),
                 ctx.clone(),
                 subscribers.clone(),
+                report,
             );
-            SocketShare { subscribers, engine: TaskGuard::new(engine) }
+            SocketShare { subscribers, last, engine: TaskGuard::new(engine) }
         });
         share.subscribers.insert(
             ctx.fire.token().to_string(),
-            Subscriber { fire: ctx.fire.clone(), scope: cfg.scope, provider_account },
+            Subscriber {
+                fire: ctx.fire.clone(),
+                scope: cfg.scope,
+                provider_account,
+                serving: ctx.serving.clone(),
+            },
         );
+        // Start from what the socket is doing NOW: a share that already
+        // settled (or gave up for good) has said so, and a join must not
+        // paint "connecting" over it.
+        let seen = share.last.lock().clone();
+        set_status(ctx, if seen.is_empty() { "joining the shared event socket".to_string() } else { seen });
     }
-    set_status(ctx, "holding the event socket");
     // Park until aborted; the guard's drop does the cleanup.
     std::future::pending::<()>().await;
 }
@@ -444,6 +494,7 @@ fn spawn_shared_engine(
     topic_name: String,
     ctx: SpawnCtx,
     subscribers: Arc<DashMap<String, Subscriber>>,
+    report: super::ServingReport,
 ) -> JoinHandle<()> {
     let prepare_ctx = ctx.clone();
     let prepare_access = access.clone();
@@ -550,7 +601,9 @@ fn spawn_shared_engine(
         .boxed()
     });
 
-    socket_engine::spawn(prepare, on_event, "provider_events")
+    // The engine is shared by every subscription of this (connection,
+    // topic); `report` fans its state out to all of them (`serve_socket`).
+    socket_engine::spawn(prepare, on_event, "provider_events", report)
 }
 
 // ---------- Dial-in: the provider subscription lifecycle ----------

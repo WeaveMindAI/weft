@@ -272,7 +272,7 @@ async fn assert_service_running(
     let nodes = infra::status(disp, pid).await?;
     let node = nodes
         .iter()
-        .find(|n| n.node_id() == Some(NODE))
+        .find(|n| n.node() == Some(NODE))
         .ok_or_else(|| anyhow::anyhow!("infra node '{NODE}' missing from status"))?;
     anyhow::ensure!(
         node.status() == Some("running"),

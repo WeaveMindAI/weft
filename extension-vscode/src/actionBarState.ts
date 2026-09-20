@@ -30,6 +30,7 @@
 
 import type {
   ActionBarState,
+  ActionBarActivity,
   ActionBarError,
   ActionBarOverlay,
   ActionAvailability,
@@ -40,6 +41,10 @@ import type {
   BarPhase,
   CliEvent,
   ErrorVerb,
+} from '../../packages/weft-graph/src/protocol';
+import {
+  ACTIVITY_LINE_CAP,
+  ACTIVITY_LINE_CHAR_CAP,
 } from '../../packages/weft-graph/src/protocol';
 import { backendFromSnapshot, parseTransition } from '../../packages/weft-graph/src/status';
 
@@ -70,6 +75,11 @@ interface Slot {
     color: string;
   } | undefined;
   error: ActionBarError | undefined;
+  /// Terminal output of the verb in `cli`, or of the verb that just
+  /// failed. Reset by `cliStart`, dropped on a clean `complete`, kept
+  /// through an error so the details modal can show it under the
+  /// failure.
+  activity: ActionBarActivity | undefined;
 }
 
 function emptySlot(): Slot {
@@ -80,6 +90,7 @@ function emptySlot(): Slot {
     cli: undefined,
     pendingAction: undefined,
     error: undefined,
+    activity: undefined,
   };
 }
 
@@ -206,6 +217,11 @@ export class ActionBarStore {
     const slot = this.slots.get(projectId);
     if (!slot || !slot.error) return;
     slot.error = undefined;
+    // The terminal output that survived the failure was kept FOR the
+    // failure, so it goes with it. Unless a verb is RUNNING: a parse
+    // banner can go up (and be dismissed) in the middle of a build,
+    // and that build's log belongs to the build, not to the banner.
+    if (!slot.cli) slot.activity = undefined;
     this.notifyIfPinned(projectId);
   }
 
@@ -238,6 +254,31 @@ export class ActionBarStore {
     const slot = this.ensureSlot(projectId);
     slot.error = undefined;
     slot.cli = { verb, phase };
+    // The previous verb's terminal output belongs to the previous verb.
+    slot.activity = { verb, lines: [] };
+    this.notifyIfPinned(projectId);
+  }
+
+  /// The running verb printed to the terminal. `text` is a raw chunk
+  /// off the child's stderr (or a stdout line that was not an event),
+  /// so it may hold any number of newlines and may end mid-line; the
+  /// store splits it and keeps the last `ACTIVITY_LINE_CAP` lines.
+  ///
+  /// Ignored when it does not belong to the verb the bar is showing:
+  /// a late chunk from a killed child must not scribble on the next
+  /// verb's log.
+  cliLog(projectId: string, verb: ActionVerb, text: string): void {
+    const slot = this.slots.get(projectId);
+    if (!slot?.activity || slot.activity.verb !== verb) return;
+    const added = splitLogChunk(text);
+    if (added.length === 0) return;
+    const lines = [...slot.activity.lines, ...added];
+    slot.activity = {
+      verb,
+      lines: lines.length > ACTIVITY_LINE_CAP
+        ? lines.slice(lines.length - ACTIVITY_LINE_CAP)
+        : lines,
+    };
     this.notifyIfPinned(projectId);
   }
 
@@ -245,11 +286,16 @@ export class ActionBarStore {
     const slot = this.slots.get(projectId);
     if (!slot || !slot.cli) return;
     // A failure that reached the CLI's main unreported (a refused
-    // spec, a bad flag) is emitted with no verb: it belongs to the
-    // verb running in this slot.
-    if (slot.cli.verb !== ev.verb && !(ev.phase === 'error' && ev.verb === undefined)) return;
+    // spec, a bad flag) is emitted with no verb. The HOST stamps the
+    // verb it spawned onto those before they get here (it is the only
+    // party that knows which child wrote the line), so an event whose
+    // verb is not this slot's is a late word from a verb the bar has
+    // already moved on from.
+    if (slot.cli.verb !== ev.verb) return;
     if (ev.phase === 'complete') {
       slot.cli = undefined;
+      // Nothing went wrong, so nobody needs the build log.
+      slot.activity = undefined;
       this.notifyIfPinned(projectId);
       return;
     }
@@ -270,6 +316,11 @@ export class ActionBarStore {
     details?: ActionErrorDetails,
   ): void {
     const slot = this.ensureSlot(projectId);
+    // A verb that died after the user started a NEXT one: its exit is
+    // real, but the bar has moved on. Reporting it here would kill the
+    // running verb's spinner and hang its output under somebody else's
+    // error.
+    if (slot.cli && slot.cli.verb !== verb) return;
     // The process exiting non-zero after its own `error` event is the
     // same failure twice; the event said what went wrong (`unknown
     // node 'one.trim'`), the exit only says "exited 1". Keep the
@@ -302,11 +353,22 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
-  cliKilled(projectId: string): void {
+  /// The user stopped `verb` (or abandoned it before it spawned): the
+  /// bar goes back to rest and its output goes with it.
+  ///
+  /// Ignored unless `verb` is the one ON the bar. A stop belongs to the
+  /// verb it was aimed at, so it must not wipe the next verb's state,
+  /// and it must not wipe a FAILURE either: the CLI exits non-zero
+  /// after emitting its error, so a Stop pressed while that banner is
+  /// up arrives here with nothing running and would take the message
+  /// the user was reading with it.
+  cliKilled(projectId: string, verb: ActionVerb): void {
     const slot = this.slots.get(projectId);
     if (!slot) return;
+    if (!slot.cli || slot.cli.verb !== verb) return;
     slot.cli = undefined;
     slot.error = undefined;
+    slot.activity = undefined;
     this.notifyIfPinned(projectId);
   }
 
@@ -351,6 +413,9 @@ export class ActionBarStore {
       backend: snapshotFromSlot(slot),
       overlay: overlayFromSlot(slot),
       ...(slot?.error ? { error: slot.error } : {}),
+      ...(slot?.activity && slot.activity.lines.length > 0
+        ? { activity: slot.activity }
+        : {}),
     };
   }
 }
@@ -362,6 +427,7 @@ const DEFAULT_BACKEND: BackendSnapshot = {
   orphanedInfra: false,
   mode: 'unknown',
   infraRollup: 'none',
+  infraBusy: false,
   runningCount: 0,
 };
 
@@ -423,6 +489,27 @@ function computeWatchedRunningColor(slot: Slot): string | undefined {
   let last: string | undefined;
   for (const c of slot.runningColors) last = c;
   return last;
+}
+
+/// Split a raw output chunk into the lines the bar keeps.
+///
+/// A chunk off a pipe ends wherever the OS split it, and a tool that
+/// repaints a progress line (docker, cargo) separates its frames with
+/// carriage returns rather than newlines. Both are cut here, empty
+/// pieces dropped, and each surviving line capped so one runaway line
+/// cannot fill the modal.
+function splitLogChunk(text: string): string[] {
+  const out: string[] = [];
+  for (const piece of text.split(/\r\n|\r|\n/)) {
+    const line = piece.trimEnd();
+    if (!line.trim()) continue;
+    out.push(
+      line.length <= ACTIVITY_LINE_CHAR_CAP
+        ? line
+        : `${line.slice(0, ACTIVITY_LINE_CHAR_CAP)}...`,
+    );
+  }
+  return out;
 }
 
 /// Truncate a string at `maxLen` characters with an explicit suffix

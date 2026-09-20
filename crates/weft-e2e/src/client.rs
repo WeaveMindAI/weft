@@ -193,6 +193,52 @@ impl Dispatcher {
         Ok((status, text))
     }
 
+    /// GET `path` presenting a SIGNAL TOKEN as bearer, returning the raw
+    /// status + body without requiring 2xx. The pair to `get_json_bearer`,
+    /// for the doors whose REFUSAL is the thing under test (a token that was
+    /// never granted a node's display).
+    pub async fn get_raw_bearer(
+        &self,
+        path: &str,
+        bearer: &str,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {bearer}"))
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// POST `path` presenting a SIGNAL TOKEN as bearer, returning the raw
+    /// status + body without requiring 2xx. The pair to `get_raw_bearer`, for
+    /// a door whose REFUSAL is the thing under test (pressing a button on a
+    /// display that carries none).
+    pub async fn post_raw_bearer(
+        &self,
+        path: &str,
+        bearer: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {bearer}"))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
     /// GET `path` and return the raw status + body without requiring 2xx. Used
     /// where the rig must assert on a specific status code (e.g. a 404 after
     /// teardown) rather than treat non-2xx as an error.

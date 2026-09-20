@@ -135,7 +135,7 @@ pub async fn inspect(ctx: Ctx) -> anyhow::Result<()> {
             Registry::Held(held) => {
                 println!("  listener signals:  {}", held.len());
                 for sig in &held {
-                    println!("    - token={}  node={}  kind={}", sig.token, spelled(&sig.node_id), sig.kind);
+                    println!("    - token={}  node={}  kind={}", sig.token, sig.node_id, sig.kind);
                 }
                 if held.is_empty() && row.placed_signals.is_empty() && row.preserved_signals.is_empty() {
                     println!("  (idle: should be reaped on next cleanup tick)");
@@ -157,15 +157,6 @@ pub async fn inspect(ctx: Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A signal's node as a person reads it. Nothing here holds the
-/// project the signal belongs to (one pod carries many), so the
-/// compiler's id is read the way it reads without one: a node inside an
-/// included file shows as the file's own name and the rest
-/// (`sweep.key`), never as the path the runtime keys it by.
-fn spelled(node_id: &str) -> String {
-    weft_core::project::plain_id(node_id)
-}
-
 /// The three ways the table and the pod disagree, each listing only
 /// the signals in it, so the reader chases a token and never a count.
 fn print_drift(drift: &Drift) {
@@ -176,19 +167,19 @@ fn print_drift(drift: &Drift) {
     if !drift.on_pod_not_placed.is_empty() {
         println!("    on the pod with no row behind it (the table forgot it; the pod still serves it):");
         for sig in &drift.on_pod_not_placed {
-            println!("      - token={}  node={}  kind={}", sig.token, spelled(&sig.node_id), sig.kind);
+            println!("      - token={}  node={}  kind={}", sig.token, sig.node_id, sig.kind);
         }
     }
     if !drift.placed_not_on_pod.is_empty() {
         println!("    placed for an active project but missing from the pod (its trigger cannot fire):");
         for sig in &drift.placed_not_on_pod {
-            println!("      - token={}  node={}  project={}", sig.token, spelled(&sig.node_id), sig.project_id);
+            println!("      - token={}  node={}  project={}", sig.token, sig.node_id, sig.project_id);
         }
     }
     if !drift.preserved_on_pod.is_empty() {
         println!("    preserved for a hibernated or parked project yet still on the pod (deactivate told it to forget):");
         for sig in &drift.preserved_on_pod {
-            println!("      - token={}  node={}  project={}", sig.token, spelled(&sig.node_id), sig.project_id);
+            println!("      - token={}  node={}  project={}", sig.token, sig.node_id, sig.project_id);
         }
     }
 }

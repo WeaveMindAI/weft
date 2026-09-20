@@ -73,6 +73,31 @@ project, until you revoke it. So if you are handing one to somebody else,
 narrow it: `--projects` restricts it to specific projects and `--tags` to
 specific task tags, and both flags repeat.
 
+If you want the token to also read what a node is **showing** (the WhatsApp
+bridge's QR code, the password the Postgres node minted), say so:
+
+```bash
+weft token mint --name "my site" --display whatsapp
+weft token mint --name "my site" --display test.whatsapp
+weft token mint --name "my site" --displays
+```
+
+This one reads the other way round from the two above: a token that says
+nothing about displays reads none of them. A QR code pairs the account to
+whoever scans it, so it takes an explicit word. `--displays` opens every
+display in the token's projects.
+
+`--display` opens exactly one, and repeats for several. Name the node the way
+you write it everywhere else: `whatsapp` for one in this file, `test.whatsapp`
+for the `whatsapp` of the file you brought in as `test`. Run it from the
+project's folder, which is where the name means something; outside one, it
+tells you to go stand in the project. `--projects`, when you use it, still
+bounds the grant: a scope narrows, and mint refuses a grant for a project you
+scoped the token out of.
+
+Mint refuses a name no display in that project answers to, and lists the ones
+it has.
+
 ```bash
 weft token ls
 weft token revoke <id>
@@ -81,18 +106,28 @@ weft token revoke <id>
 ### The doors a token opens
 
 If you are writing your own consumer instead of using the extension, the
-token opens three doors on the dispatcher, the token as bearer on the first
-and the last:
+token opens six doors on the dispatcher, the token as bearer on every one
+except the answering door:
 
 | Door | Set it when |
 |---|---|
 | `GET /signal-token/signals` | you want the tasks this token may see: one entry per parked question or registered trigger, form fields included |
 | `POST /signal/{signal token}` | you are answering one; the per-task token in the listing is the credential, no bearer |
-| `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that expired answers a 404 saying so; show that in the image's place rather than a broken picture |
+| `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that is gone answers 410 saying so; show that in the image's place rather than a broken picture |
+| `GET /signal-token/displays` | you want what this token can watch: one entry per display it reaches, carrying its project, its label, and `node`, the node spelled the way a person writes it, which is what the two doors below take as `{node}` |
+| `GET /signal-token/displays/{project}/{node}` | you are drawing one: `{ "items": [...] }`, the same feed the editor's node panel reads. Read it on every render rather than storing it, because a QR code expires in under a minute |
+| `POST /signal-token/displays/{project}/{node}/action` | the reader pressed a button one of those items carried. Send `{ "kind": "<actionKind>", "payload": ... }`; a refusal the node wrote comes back as a 400 with its text |
 
 The files door is scoped like the listing: a task the token lists, a field
 the form declares, a file that belongs to that task's project or run.
 Anything else is a 404, and the storage key never travels.
+
+The display doors are scoped by the `--display` flags above, and only by
+those: tags say which SIGNALS a token sees, and a display is not a signal. A
+token that reaches no display at all gets a 403 naming the flag, so you are
+never left reading an empty list and wondering whether the project has
+nothing to show. For what an item looks like, go and read
+[what your node shows in the graph](../nodes/showing-things-in-the-graph.md).
 
 ## Try it end to end
 

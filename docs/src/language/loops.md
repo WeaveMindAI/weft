@@ -22,6 +22,14 @@ Note the types on the boundary. Outside, `values` is a `List[Number]`. Inside,
 `self.values` is one `Number`. The loop unwraps on the way in and gathers on
 the way out.
 
+Two kinds of line are written for a loop, and they do not mix. The settings in
+the braces (`parallel`, `over`, `carry`, `max_iters`, `trim_on_mismatch`) take
+a written value only: the compiler reads them to build the loop, so nothing
+can drive one over a wire. The loop's ports take a value the way a group's
+do, on their own lines outside (`doubler.values = [1, 2]`). The one port that
+may also sit in the braces is the gate, `_should_flow: false`, exactly as on a
+group.
+
 ## The four port roles
 
 Every port on a loop is in exactly one of four roles, derived from the

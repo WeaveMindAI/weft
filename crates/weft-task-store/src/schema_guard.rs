@@ -1426,11 +1426,12 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
     if let Some(diff) = diff_things(&fresh, "a fresh install", &upgraded, "an upgraded install") {
         panic!(
             "the canonical schema and the migration history disagree:\n{diff}\n\
-             Write the migration that makes this change to an existing database \
-             (./setup.sh --migration <name>) and RELEASE it \
-             (./setup.sh --migration <name> --release) so it lands under \
-             migrations/<group>/. A draft alone stays on your machine \
-             (gitignored), so this test cannot see it until it is released."
+             Write the migration that carries an existing database to this \
+             change, in ONE command: ./setup.sh --migration <name> --release. \
+             It writes the file under migrations/<group>/, runs it on your \
+             database and records it as applied. A DRAFT (the same command \
+             without --release) stays on your machine, gitignored, so this \
+             test cannot see it until it is released."
         );
     }
 }

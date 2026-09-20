@@ -351,6 +351,12 @@ pub fn enrich_collecting(
                 .filter(|gate| !node.inputs.iter().any(|p| p.name == gate.name))
                 .collect();
             node.inputs.extend(gates);
+            // And a value written for one of its ports (`keep.n = 7`)
+            // gets the one home every port constant has, so the editor
+            // shows and edits it like any node's. The build, which
+            // inlines the file, lands the same line on the call site's
+            // boundary.
+            normalize_port_literals(node);
             continue;
         }
 

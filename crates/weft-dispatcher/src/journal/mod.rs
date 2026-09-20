@@ -385,6 +385,18 @@ pub trait Journal: Send + Sync {
     /// Look up a single signal by its token.
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
 
+    /// The ENTRY registered at the place `node` spells in `project_id`
+    /// (`door`, or `one.door` inside the file the site `one` includes),
+    /// or `None` when nothing is armed there. One row at most: entries
+    /// are unique per (project, place) (`idx_signal_entry_node`). A
+    /// resume row of the same node is another registration entirely
+    /// and is never this.
+    async fn signal_entry_at(
+        &self,
+        project_id: &str,
+        node: &str,
+    ) -> anyhow::Result<Option<SignalRegistration>>;
+
     /// Persist a kind's evolving durable state (a delta-poll cursor)
     /// onto its signal row. Two fences: the write is rejected when the
     /// row's placement generation is above `placement_generation` (a
@@ -480,6 +492,14 @@ pub struct SignalRegistration {
     /// `Some(color)` for resume (suspension) signals; `None` for
     /// entry signals registered during trigger setup.
     pub color: Option<Color>,
+    /// The PLACE this registration was made at, spelled the way a
+    /// person writes the node: `door`, or `one.door` for the `door`
+    /// inside the file the site `one` includes. A file called from two
+    /// places registers twice, and the spelling is what tells the two
+    /// rows apart (`task_kinds::register_signal::registered_place`).
+    /// The compiled id behind it is never stored here, so nothing that
+    /// reads a row has to translate before it names the node to a
+    /// person or looks one up by the name a person gave.
     pub node_id: String,
     pub is_resume: bool,
     /// JSON-serialized `SignalSpec`. Stored so a listener
@@ -511,8 +531,9 @@ pub struct SignalRegistration {
     /// listener pod reaped because the payload is on the row.
     pub consumer_payload: Option<serde_json::Value>,
     /// `signal.surface_kind` discriminant: 'public_entry' or
-    /// 'task_callback'. Read by `public_url()` to format the
-    /// activate-response URLs.
+    /// 'task_callback'. Read by `public_url()`, which formats both the
+    /// activate-response URLs and the address a trigger's display
+    /// shows; a change here moves both.
     pub surface_kind: String,
     /// `signal.mount_path`. Some(pattern) for PublicEntry (the
     /// tenant-prefixed route pattern, `/<tenant>/chat/{room}`), None
@@ -756,7 +777,50 @@ pub struct SignalToken {
     /// with no tags do NOT match (the array overlap operator
     /// returns false against an empty signal-side array).
     pub allowed_tags: Vec<String>,
+    /// The displays this token may reach, as `<project id>/<node>`
+    /// pairs, where the node is spelled the way a person writes it
+    /// (`test.whatsapp`). Reaching one means reading its panel AND
+    /// pressing the buttons its items carry.
+    ///
+    /// The pair names one display in one project, because that
+    /// spelling is only a name inside a project. The person types the
+    /// node alone and the CLI fills in the project they are standing
+    /// in. The token's own project scope still applies on top: a scope
+    /// narrows, so a grant can never reach a project
+    /// [`SignalToken::covers_project`] refuses, and mint rejects one
+    /// that would.
+    ///
+    /// This dimension does NOT follow the empty-means-any convention
+    /// the other two use, and deliberately: a display can be a
+    /// credential (a bridge's QR code pairs the account to whoever
+    /// scans it), so a token minted without a word about displays
+    /// reaches none. `--displays` sets [`SignalToken::all_displays`];
+    /// `--display <node>` fills this, one pair per display, and the
+    /// project scope still bounds it.
+    pub allowed_displays: Vec<String>,
+    /// Every display in the token's projects, rather than the named
+    /// ones. What `weft token mint --displays` sets.
+    pub all_displays: bool,
     pub created_at: u64,
+}
+
+impl SignalToken {
+    /// Does this token's project scope cover `project_id`?
+    ///
+    /// Empty means every project of the tenant, the same
+    /// empty-means-any rule `allowed_tags` uses. Every door that reads
+    /// a project asks this, so none of them can spell the containment
+    /// check slightly differently.
+    pub fn covers_project(&self, project_id: &uuid::Uuid) -> bool {
+        self.allowed_projects.is_empty() || self.allowed_projects.contains(project_id)
+    }
+
+    /// Does this token reach any display at all? What the doors use to
+    /// refuse a token that was never given the dimension, with a
+    /// message naming the flag, instead of answering an empty list.
+    pub fn reaches_displays(&self) -> bool {
+        self.all_displays || !self.allowed_displays.is_empty()
+    }
 }
 
 /// One line of a run's log. A `LogLine` a node

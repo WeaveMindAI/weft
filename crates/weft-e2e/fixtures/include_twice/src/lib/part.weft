@@ -1,0 +1,16 @@
+# One anonymous group, included twice by main.weft: a wait a wake resolves,
+# a trigger that registers on activation, and an access node nothing runs.
+Group(text: String) -> (out: String) {
+  hold = Wait { seconds: 3600 }
+  hold.value = self.text
+
+  # Once a year, so it never fires during a test; what matters is that it
+  # registers once per call and shows its schedule once per call.
+  tick = Cron { cron: "0 0 0 1 1 *" }
+
+  # An access node whose connection this project mints itself. Nothing
+  # wires it, so a run never touches it; `weft connect` names it.
+  key = ApiKeyAuth
+
+  self.out = hold.value
+}

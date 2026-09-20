@@ -981,3 +981,73 @@ production never does. It is split off before the envelope is checked.
 A Socket still cannot be fired. Its shape is a conversation over time
 and there is nothing honest to invent for the caller's next message, so
 it says so and points at `weft activate`.
+
+## A node's display has no limits, and every number in it is hardcoded
+
+Reading what a node is showing works and costs nothing at the size a
+local install runs at. Every bound it will need on a real deployment is
+either missing or a literal in the middle of a function, and the doors
+are on the internet-facing surface (the public proxy's allowlist passes
+the whole `/signal-token/` prefix, so a client holding a `--display`
+token reads from anywhere).
+
+**The one that is not about scale.** The dispatcher reads a container's
+`/live` answer with `resp.json::<Value>()` and no byte cap
+(`api/infra.rs`, `read_live`). The only bound is a 3 second deadline on
+the whole exchange, and three seconds of pod-to-pod bandwidth is a lot
+of megabytes landing in the dispatcher's memory. A dispatcher Pod is
+shared across tenants, so one tenant's buggy or hostile container can
+spike the RSS of the Pod serving everybody. This one bites at a single
+user, not at a thousand.
+
+**The knobs, and what they are today.**
+
+| Knob | Today | Wants |
+|---|---|---|
+| Bytes the dispatcher will read from a `/live` answer | unbounded | a cap, with a 502 naming the cap and the node; a `Content-Length` refusal before reading a byte |
+| Deadline on that read | `Duration::from_secs(3)`, a literal in `read_live` | configurable, and probably shorter than the poll interval by construction |
+| Deadline on a display's `/action` press | none at all, on purpose (the work is the container's and the wait the user's) | a cap anyway on the token-facing door, where nobody is watching a spinner and a held connection is just a held connection |
+| Editor poll interval | `liveIntervalMs = 3000`, a literal in `graphView.ts` | configurable, and ideally not a fixed timer at all (see below) |
+| Polling while the graph tab is in the background | keeps running; only a disposed panel stops it | stop, or slow down, when nobody is looking |
+| Rate limit on `/signal-token/displays*` | none, and the dispatcher has no rate limiting anywhere | a limit per token, which is the first such limit the dispatcher would have, so it is a decision about the whole outside surface rather than about displays |
+
+**What it should look like.** Every row above is an option with a
+default that suits a local install, set where the rest of the
+dispatcher's deployment knobs are set, not a literal in a handler. The
+defaults are what a person running `./setup.sh` gets and never thinks
+about; a cluster operator moves them.
+
+Two changes would also cut most of the traffic without touching the
+freshness guarantee, which is that a display is read on every render
+and never stored (a QR code expires in under a minute):
+
+- **Conditional reads.** Hash the feed, answer 304 on `If-None-Match`.
+  The common case is a display that has not changed, and it becomes a
+  few bytes instead of the whole payload.
+- **Coalescing.** A shared entry per project and node with a TTL around
+  a second, so a hundred readers of one bridge cost one container hit
+  rather than a hundred.
+
+For the shape of the load: a display is polled every 3 seconds per open
+graph, whole payload every time. The WhatsApp example has two displays,
+so about 5 MB an hour per open graph to show a picture that changes
+twice. Ten thousand concurrent viewers with five displays each is
+roughly 16,000 requests a second, every one of them a dispatcher to
+container round trip and load on the tenant's own container.
+
+**One documentation gap that comes with the cap.** A `data:` URI in an
+`image` item is fine for something a container generates in memory (a
+300px QR measures about 1.5 KB as a data URI, and base64's 33% on top
+of that is noise). Nothing stops a node author putting a real image
+there instead, and `image` items already accept a plain URL, so the
+stored-file path with its expiring links is the right answer for
+anything big. Once there is a cap to name, say all of that in the
+node-authoring skill with the number in it.
+
+**Open questions.** Whether the poll becomes a push (the dispatcher
+already has an SSE surface) or stays a poll with the two optimizations
+above; whether the cap is per answer or per item, since one oversized
+image among four good items could come back as one unreadable line
+rather than a failed read; and whether a rate limit belongs per token
+or per (token, node), given that one client legitimately watches one
+bridge closely and has no reason to sweep every display it can see.

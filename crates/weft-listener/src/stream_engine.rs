@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use weft_core::signal::Framing;
 
 use crate::kinds::event_source::Backoff;
+use crate::kinds::ServingReport;
 
 pub use crate::socket_engine::PrepareError;
 
@@ -68,20 +69,31 @@ trait Pipe: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Pipe for T {}
 
 /// Run the engine until aborted (or a fatal prepare error). `target`
-/// names the driving kind in every log line.
-pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) -> JoinHandle<()> {
+/// names the driving kind in every log line. `report` is where the
+/// node's display reads what the engine is doing: every turn of the
+/// connect loop reports there (see `socket_engine`).
+pub fn spawn(
+    mut prepare: Prepare,
+    mut on_event: OnEvent,
+    target: &'static str,
+    report: ServingReport,
+) -> JoinHandle<()> {
+    let set_status = move |status: String| report(status);
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
         loop {
+            set_status("connecting".to_string());
             let plan = match prepare().await {
                 Ok(p) => p,
                 Err(PrepareError::Transient(e)) => {
                     warn!(target: "weft_listener::stream_engine", kind = target, error = %format!("{e:#}"), "connect preparation failed; retrying");
+                    set_status(format!("connect preparation failed; retrying: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(PrepareError::Fatal(e)) => {
                     warn!(target: "weft_listener::stream_engine", kind = target, error = %format!("{e:#}"), "connect preparation is misconfigured; giving up on this pipe");
+                    set_status(format!("misconfigured, not retrying: {e:#}"));
                     return;
                 }
             };
@@ -89,17 +101,22 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
             let mut pipe = match dial(&plan).await {
                 Ok(p) => {
                     info!(target: "weft_listener::stream_engine", kind = target, address = %plan.address, "pipe connected");
+                    set_status("connected".to_string());
                     p
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::stream_engine", kind = target, address = %plan.address, error = %format!("{e:#}"), "connect failed; retrying");
+                    set_status(format!("connect failed; retrying: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
             };
             let connected_at = Instant::now();
 
-            run_cycle(&plan, &mut pipe, &mut on_event, target).await;
+            // `run_cycle` returns only when the pipe dropped or
+            // misbehaved, and says which; the loop dials again.
+            let why = run_cycle(&plan, &mut pipe, &mut on_event, target).await;
+            set_status(format!("{why}; reconnecting"));
 
             backoff.reset_if_healthy(connected_at.elapsed());
             backoff.wait_then_climb().await;
@@ -110,13 +127,14 @@ pub fn spawn(mut prepare: Prepare, mut on_event: OnEvent, target: &'static str) 
 /// Drive one connected pipe until it drops or misbehaves; the caller
 /// reconnects on the backoff ladder either way. Dialogue first (with
 /// a periodic breadcrumb naming what it still waits on), then steady
-/// state (heartbeat + fires).
+/// state (heartbeat + fires). Answers WHY the cycle ended, the same
+/// words the log line carries, so the node's display can say it too.
 async fn run_cycle(
     plan: &StreamPlan,
     pipe: &mut Box<dyn Pipe>,
     on_event: &mut OnEvent,
     target: &'static str,
-) {
+) -> String {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut step = 0usize;
     let dialogue_started = Instant::now();
@@ -129,7 +147,7 @@ async fn run_cycle(
     if let Some(first) = plan.script.first() {
         if let Err(e) = pipe.write_all(&first.send).await {
             warn!(target: "weft_listener::stream_engine", kind = target, error = %e, "dialogue send failed; reconnecting");
-            return;
+            return format!("dialogue send failed: {e}");
         }
     }
 
@@ -157,7 +175,7 @@ async fn run_cycle(
                 if let Some(frame) = &plan.heartbeat {
                     if let Err(e) = pipe.write_all(frame).await {
                         warn!(target: "weft_listener::stream_engine", kind = target, error = %e, "heartbeat send failed; reconnecting");
-                        return;
+                        return format!("heartbeat send failed: {e}");
                     }
                 }
             }
@@ -165,12 +183,12 @@ async fn run_cycle(
                 match read {
                     Ok(0) => {
                         info!(target: "weft_listener::stream_engine", kind = target, "pipe closed; reconnecting");
-                        return;
+                        return "pipe closed".to_string();
                     }
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
                     Err(e) => {
                         warn!(target: "weft_listener::stream_engine", kind = target, error = %e, "pipe error; reconnecting");
-                        return;
+                        return format!("pipe error: {e}");
                     }
                 }
                 loop {
@@ -179,13 +197,13 @@ async fn run_cycle(
                         Ok(None) => break,
                         Err(e) => {
                             warn!(target: "weft_listener::stream_engine", kind = target, error = %e, "unframeable stream; reconnecting");
-                            return;
+                            return format!("unframeable stream: {e}");
                         }
                     };
                     buf.drain(..used);
                     if let Err(e) = handle_unit(plan, pipe, &unit, &mut step, on_event).await {
                         warn!(target: "weft_listener::stream_engine", kind = target, error = %e, "reply/dialogue send failed; reconnecting");
-                        return;
+                        return format!("reply/dialogue send failed: {e}");
                     }
                 }
             }

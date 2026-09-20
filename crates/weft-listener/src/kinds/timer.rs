@@ -17,9 +17,36 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct TimerHandler;
+
+/// The schedule in one line, as the person who wrote it would say it.
+fn schedule_line(spec: &TimerSpec) -> String {
+    match spec {
+        TimerSpec::After { duration_ms } => {
+            format!("once, {} after activation", human_duration(*duration_ms))
+        }
+        TimerSpec::At { when } => format!("once, at {}", when.to_rfc3339()),
+        TimerSpec::Cron { expression, timezone } => format!("{expression} ({timezone})"),
+    }
+}
+
+/// Milliseconds as a person reads them. Whole units only: a schedule
+/// written as `30m` should read back as `30m`, not `0h 30m 0s`.
+fn human_duration(ms: u64) -> String {
+    const SECOND: u64 = 1000;
+    const MINUTE: u64 = 60 * SECOND;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    for (unit, name) in [(DAY, "d"), (HOUR, "h"), (MINUTE, "m"), (SECOND, "s")] {
+        if ms >= unit && ms.is_multiple_of(unit) {
+            return format!("{}{name}", ms / unit);
+        }
+    }
+    format!("{ms}ms")
+}
 
 #[async_trait]
 impl KindHandler for TimerHandler {
@@ -109,6 +136,16 @@ impl KindHandler for TimerHandler {
             value: payload,
             target: ProcessTarget::Entry,
         }
+    }
+
+    /// A timer has no address to show, so it shows its schedule:
+    /// somebody looking at the node wants to know when it goes off.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let timer = match super::config_for_display::<Timer>(ctx.sig, "Fires") {
+            Ok(timer) => timer,
+            Err(feed) => return feed,
+        };
+        LiveFeed::new(vec![LiveItem::text("Fires", schedule_line(&timer.spec))])
     }
 
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {
@@ -243,3 +280,44 @@ fn unix_now_ms() -> u64 {
 }
 
 inventory::submit!(&TimerHandler as &dyn KindHandler);
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_reads_back_in_the_unit_it_was_written_in() {
+        // Somebody who wrote `30m` should read `30m`, not `0h 30m 0s`.
+        assert_eq!(human_duration(30 * 60 * 1000), "30m");
+        assert_eq!(human_duration(90 * 60 * 1000), "90m", "not a whole hour, so minutes");
+        assert_eq!(human_duration(2 * 60 * 60 * 1000), "2h");
+        assert_eq!(human_duration(24 * 60 * 60 * 1000), "1d");
+        assert_eq!(human_duration(5000), "5s");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_whole_unit_stays_in_milliseconds() {
+        // Rounding here would tell somebody their timer fires at a time
+        // it does not.
+        assert_eq!(human_duration(1500), "1500ms");
+        assert_eq!(human_duration(500), "500ms");
+        assert_eq!(human_duration(0), "0ms");
+    }
+
+    #[test]
+    fn every_schedule_says_when_it_goes_off() {
+        assert_eq!(
+            schedule_line(&TimerSpec::After { duration_ms: 30 * 60 * 1000 }),
+            "once, 30m after activation"
+        );
+        let line = schedule_line(&TimerSpec::Cron {
+            expression: "0 9 * * 1-5".into(),
+            timezone: "Europe/Paris".into(),
+        });
+        assert_eq!(line, "0 9 * * 1-5 (Europe/Paris)");
+        let when = chrono::DateTime::parse_from_rfc3339("2026-09-19T08:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        assert!(schedule_line(&TimerSpec::At { when }).contains("2026-09-19T08:00:00"));
+    }
+}

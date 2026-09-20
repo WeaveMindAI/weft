@@ -89,8 +89,9 @@ export function diffConfigOps(
  *  rewrites the value where it lives (braces vs statement) and a
  *  same-named config entry is never touched. A key present in `current`
  *  but absent from `updated` is a cleared literal (remove). A value not
- *  yet in source takes the braces form (spelling is never gated; the
- *  author flips it with the form toggle).
+ *  yet in source takes `firstForm`, the node kind's own (a node's
+ *  braces, a container's or include's statement line; see
+ *  `portValueFirstForm`).
  *
  *  The ONE producer for this home: the canvas and every off-canvas
  *  config surface route through it so their ops can never drift. */
@@ -99,11 +100,12 @@ export function diffPortLiteralOps(
   updated: Record<string, unknown>,
   current: Record<string, unknown>,
   spans: Record<string, ConfigFieldSpan>,
+  firstForm: ConfigFieldSpan['origin'],
 ): EditOp[] {
   const ops: EditOp[] = [];
   for (const [key, value] of Object.entries(updated)) {
     if (sameConfigValue(value, current[key])) continue;
-    const form = spans[key]?.origin ?? 'inline';
+    const form = spans[key]?.origin ?? firstForm;
     if (value === undefined || value === null) {
       ops.push({ op: 'removeConfig', node: nodeId, key, form });
     } else {
@@ -112,7 +114,7 @@ export function diffPortLiteralOps(
   }
   for (const key of Object.keys(current)) {
     if (!(key in updated)) {
-      ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? 'inline' });
+      ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? firstForm });
     }
   }
   return ops;

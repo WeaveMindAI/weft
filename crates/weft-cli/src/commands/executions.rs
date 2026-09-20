@@ -153,21 +153,12 @@ impl EventsFilter {
     /// through a site.
     pub fn resolve_node(&mut self, project: &weft_core::ProjectDefinition) -> anyhow::Result<()> {
         if let Some(spelled) = &self.node {
-            if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
-                anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `--node {group}`, and its rows come with it");
-            }
-            if let Some((group, _)) = spelled.rsplit_once(".__in").or_else(|| spelled.rsplit_once(".__out")).filter(|(_, rest)| rest.is_empty()) {
-                anyhow::bail!("'{spelled}' is a boundary the compiler made; name the site, `--node {group}`, and its rows come with it");
-            }
-            let (id, call_path) = weft_core::project::resolve_address(project, spelled);
-            if call_path.is_empty() {
-                if let Some(node) = project.nodes.iter().find(|n| n.id == id) {
-                    if weft_core::project::selection::enclosing_body(project, node).is_some() {
-                        anyhow::bail!("'{spelled}' is inside an included file; name it through the site that includes the file, like `site.{}`",
-                            weft_core::project::address_of(project, &id, &["site".into()]).trim_start_matches("site."));
-                    }
-                }
-            }
+            // A node or a group: `--node gate` names a group, whose own
+            // two boundaries are its rows too (see `keeps`), so a group
+            // is taken here where the daemon-facing commands refuse it.
+            let (id, call_path) = match super::resolve_spelling(project, spelled)? {
+                super::Spelled::Node { id, call_path } | super::Spelled::Group { id, call_path } => (id, call_path),
+            };
             self.node = Some(id);
             self.call_path = call_path;
         }

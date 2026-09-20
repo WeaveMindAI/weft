@@ -62,8 +62,8 @@ pub use types::*;
 pub const NODE_PORTS: std::ops::RangeInclusive<u16> = 30064..=30099;
 
 /// The label `weft.dev/node` on every Kubernetes object an infra node
-/// owns: what a selector reads to find the node's pods (the network
-/// rules between nodes, `weft infra logs --node`, the health loop).
+/// owns: what a selector reads to find the node's pods (`weft infra
+/// logs --node`, the health loop).
 pub const NODE_LABEL: &str = "weft.dev/node";
 
 /// The annotation carrying the node's id as it is, for a person

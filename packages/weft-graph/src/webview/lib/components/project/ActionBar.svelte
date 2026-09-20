@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Square, Zap, Database, Loader2, ChevronUp } from '@lucide/svelte';
+	import { Play, Square, Zap, Database, Loader2, ChevronUp, Terminal } from '@lucide/svelte';
 	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
 	import type {
 		ActionBarState,
@@ -10,8 +10,9 @@
 		BarPhase,
 		SourceLocation,
 	} from '../../../../protocol';
-	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
+	import ActionDetailsModal from './ActionDetailsModal.svelte';
 	import { runLabel } from '../../run-targets';
+	import { isVerbOffered, sourceInfraReady, type VerbInputs } from '../../verb-gates';
 
 	let specMenuOpen = $state(false);
 
@@ -143,28 +144,6 @@
 	const backend = $derived<BackendSnapshot>(barState.backend);
 	const overlay = $derived<ActionBarOverlay>(barState.overlay);
 
-	// STARTER verbs: the ones whose action BUILDS + registers on demand (run,
-	// activate/reactivate, infra_start). These are ALWAYS clickable when the graph
-	// shape permits them (their slot's shape gate below still applies), NEVER greyed
-	// on "no build yet": clicking one does whatever it needs (compile, build, load,
-	// register) to make itself happen. So they do NOT consult `backend.available`
-	// (which is empty on a fresh/unbuilt project); the backend either performs the
-	// verb or returns an error the host surfaces as a toast.
-	const STARTER_VERBS = new Set<ActionVerb>([
-		'run',
-		'activate',
-		'reactivate',
-		'infra_start',
-	]);
-
-	// Whether a verb is currently offered. Starter verbs: always (shape-gated only).
-	// State-dependent verbs (deactivate, cancel_*, resume_active, infra_stop/
-	// terminate/upgrade, resync): gated on the dispatcher's live-lifecycle
-	// `backend.available` (e.g. deactivate only when Active, infra_stop only when
-	// infra is running), which is genuine current state, not a built-artifact check.
-	const isVerbAvailable = (v: ActionVerb): boolean =>
-		STARTER_VERBS.has(v) || backend.available.includes(v);
-
 	// Drift bits. The dispatcher reports three independent signals;
 	// each is resolved by its own verb.
 	//   `binaryDrift`    → `build` (worker image inputs changed)
@@ -183,14 +162,29 @@
 		return !!p && (p.parked + p.suspended) > 0;
 	});
 
-	// Source-derived visibility flags, OR-ed with the backend's live
-	// state. `orphanedInfra` is the never-lose-track guarantee: live
-	// infra whose node was deleted from source keeps the controls
-	// visible (Model 1: it never gates run, so visibility is the only
-	// thing standing between the user and forgotten billed infra).
+	// Infra section visibility, OR-ed with the backend's live state.
+	// `orphanedInfra` is the never-lose-track guarantee: live infra
+	// whose node was deleted from source keeps the controls visible
+	// (Model 1: it never gates run, so visibility is the only thing
+	// standing between the user and forgotten billed infra).
 	const infraExists = $derived(
 		hasInfra || backend.infraRollup !== 'none' || backend.orphanedInfra,
 	);
+
+	/// What the verb gates read: the dispatcher's table plus what the
+	/// source in front of the user says. The rules themselves live in
+	/// `verb-gates.ts`, where they are one pure function with its own
+	/// tests instead of a pile of conditions spread across the slots.
+	const verbInputs = $derived<VerbInputs>({
+		available: backend.available,
+		hasInfra,
+		hasTriggers,
+		infraRollup: backend.infraRollup,
+		status: backend.status,
+		infraBusy: backend.infraBusy,
+	});
+	const infraReady = $derived(sourceInfraReady(verbInputs));
+	const isVerbAvailable = (v: ActionVerb): boolean => isVerbOffered(v, verbInputs);
 
 	// The build-transition axis. While not 'none', the whole bar is in
 	// the unified transitional pattern: the slot that owns the verb
@@ -437,18 +431,23 @@
 	// Source-derived gate: Run is only legal once the infra it
 	// would touch is Running. An aimed run consults only ITS
 	// subgraph's infra nodes (per-node status); the ordinary run
-	// touches everything, so the whole-graph rollup gates it. This
-	// is defense-in-depth on top of the dispatcher's own scoped
-	// pre-flight: the dispatcher gate fails when the project is
-	// unregistered (status fetch errors out), so we re-derive from
-	// the parsed graph + last-known per-node/rollup state. The spec
-	// menu shares the gate: a saved example runs as an ordinary
-	// one-shot from its own starting values.
+	// touches everything, so the whole-graph rollup gates it. The
+	// dispatcher has the same rule, and the bar re-derives it from the
+	// parsed graph because a run's gate is the whole graph on both
+	// sides: whatever the dispatcher has registered, the source in
+	// front of the user is the newer word on which infra a run needs.
+	// The spec menu shares the gate: a saved example runs as an
+	// ordinary one-shot from its own starting values.
 	const runEnabled = $derived.by(() => {
-		const infraReady = (runTargetCount ?? 0) > 0
-			? runTargetsInfraReady
-			: !hasInfra || backend.infraRollup === 'running';
-		return !verbsBlocked && nodeCount > 0 && infraReady && isVerbAvailable('run');
+		// A run waits on the infra IT would touch, and only that. An
+		// aimed run touches its own subgraph, so its per-node answer is
+		// the whole gate: the dispatcher never hears what a run is aimed
+		// at until it is sent, and an unrelated infra node being down
+		// has no bearing on it. An ordinary run touches everything, so
+		// the whole-graph rollup gates it.
+		const infraForThisRun = (runTargetCount ?? 0) > 0 ? runTargetsInfraReady : infraReady;
+		return !verbsBlocked && nodeCount > 0 && infraForThisRun
+			&& isVerbAvailable('run');
 	});
 
 	// Where the spec menu chevron lives. It is glued to the right of
@@ -508,7 +507,8 @@
 					return {
 						kind: 'reactivate',
 						mode: backend.mode,
-						enabled: !verbsBlocked && nodeCount > 0 && isVerbAvailable('reactivate'),
+						enabled: !verbsBlocked && nodeCount > 0
+							&& isVerbAvailable('reactivate'),
 					};
 				}
 				return {
@@ -551,9 +551,24 @@
 	const errorMessage = $derived(barState.error?.message);
 	const errorVerb = $derived(barState.error?.verb);
 	const currentError = $derived(barState.error);
-	let errorModalOpen: boolean = $state(false);
+
+	// What the verb on the bar has printed to the terminal. Present while
+	// it runs and, when it fails, for as long as the failure is up.
+	const activity = $derived(barState.activity);
+	/// Is the verb whose output this is still going? Comparing the verbs
+	/// matters: after one fails and another starts, the bar is running
+	/// something, but not the thing the captured output came from.
+	const activityRunning = $derived(
+		overlay.kind === 'cli_running' && overlay.verb === activity?.verb,
+	);
+	/// The pill's one line: the last thing the verb printed. A build
+	/// spends minutes on one step, so the newest line is the one that
+	/// says where it is.
+	const activityTail = $derived(activity?.lines[activity.lines.length - 1] ?? '');
+
+	let detailsOpen: boolean = $state(false);
 	$effect(() => {
-		if (!currentError) errorModalOpen = false;
+		if (!currentError && !activity) detailsOpen = false;
 	});
 </script>
 
@@ -569,7 +584,7 @@
 				type="button"
 				class="flex items-center gap-2 px-3 py-1.5 text-xs text-red-700 hover:bg-red-100/60 rounded-l-lg"
 				title="Click to see details"
-				onclick={() => (errorModalOpen = true)}
+				onclick={() => (detailsOpen = true)}
 			>
 				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
 				<span class="font-medium">{errorVerb}:</span>
@@ -586,13 +601,39 @@
 				<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 			</button>
 		</div>
-		<ErrorDetailsModal
-			error={barState.error}
-			bind:open={errorModalOpen}
-			onDismissError={() => onDismissError?.()}
-			{onOpenLocation}
-		/>
 	{/if}
+
+	<!-- What the verb is printing to the terminal. Nothing else in the
+	     graph shows it, so it gets its own pill: one line, the newest,
+	     and the whole thing in the same modal on click. It sits UNDER a
+	     failure's banner, because the failure is the headline and this
+	     is the trace behind it. -->
+	{#if activity && activityTail}
+		<button
+			type="button"
+			class="flex items-center gap-2 px-3 py-1 text-[11px] bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg shadow-sm hover:bg-zinc-800 max-w-[560px]"
+			title="Click to see the full output"
+			onclick={() => (detailsOpen = true)}
+		>
+			{#if activityRunning}
+				<Loader2 class="w-3 h-3 shrink-0 animate-spin text-zinc-400" />
+			{:else}
+				<Terminal class="w-3 h-3 shrink-0 text-zinc-400" />
+			{/if}
+			<span class="font-medium text-zinc-400">{activity.verb}</span>
+			<span class="font-mono truncate">{activityTail}</span>
+			<span class="text-[10px] opacity-60 underline shrink-0">details</span>
+		</button>
+	{/if}
+
+	<ActionDetailsModal
+		error={barState.error}
+		{activity}
+		running={activityRunning}
+		bind:open={detailsOpen}
+		onDismissError={() => onDismissError?.()}
+		{onOpenLocation}
+	/>
 
 	<div class="flex items-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md">
 

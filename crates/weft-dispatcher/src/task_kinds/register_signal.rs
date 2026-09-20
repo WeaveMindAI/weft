@@ -132,27 +132,34 @@ pub(crate) fn captured_trigger_address(
     Ok(weft_core::project::address_of(project, node_id, &call_path))
 }
 
-/// The node a registration is for. An entry is armed under its ADDRESS
-/// (`one.door` for the `door` inside the file the site `one` includes;
-/// see [`captured_trigger_address`]): that is what the signal row
-/// carries and what a fire resolves, so the node behind it is the
-/// address resolved back to its id. A resume names its node by id
-/// already (its frames carry the site).
-pub(crate) fn registering_node<'a>(
+/// The place a registration is for, spelled the way a person writes it
+/// (`door`, `one.door` for the `door` inside the file the site `one`
+/// includes), and the node behind it. The spelling is what the signal
+/// row carries as its `node_id` (see `SignalRegistration::node_id`),
+/// for an entry and a resume alike: a node inside a file called from
+/// two places is two places, each with its own registrations, and the
+/// spelling is the one key that tells them apart. A person then names
+/// a registration everywhere (`weft wake`, a display, the task list)
+/// the way they name the node.
+///
+/// An entry arrives already spelled ([`captured_trigger_address`], which
+/// the activate loop hands over with no frames), so the spelling is a
+/// fixed point for it. A resume arrives as the compiled id under the
+/// frames it fired at, and the call sites among those frames place it;
+/// the loop iterations do not, because a place is not an iteration.
+pub(crate) fn registered_place<'a>(
     project: &'a weft_core::ProjectDefinition,
     node_id: &str,
-    is_resume: bool,
-) -> Result<&'a weft_core::project::NodeDefinition> {
-    let id = if is_resume {
-        node_id.to_string()
-    } else {
-        weft_core::project::resolve_address(project, node_id).0
-    };
-    project
+    frames: &LoopFrames,
+) -> Result<(String, &'a weft_core::project::NodeDefinition)> {
+    let (id, mut path) = weft_core::project::resolve_address(project, node_id);
+    path.extend(weft_core::frames::call_path(frames).into_iter().map(str::to_string));
+    let node = project
         .nodes
         .iter()
         .find(|n| n.id == id)
-        .ok_or_else(|| anyhow::anyhow!("node_id='{node_id}' not in project"))
+        .ok_or_else(|| anyhow::anyhow!("node_id='{node_id}' not in project"))?;
+    Ok((weft_core::project::address_of(project, &id, &path), node))
 }
 
 /// Is there a registered route that shares a call with this one and
@@ -240,6 +247,21 @@ impl RegisterSignalExecutor {
         // still an answer once it does not.
         let tenant = owner.tenant;
 
+        // The place this registration is for, spelled: the row's key.
+        // Read off the original program, the one this registration's
+        // node was compiled into, so the spelling is the one that
+        // program's source reads.
+        let project_uuid: uuid::Uuid = project_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
+        let project_def = crate::projection::execution_program(state, color).await?
+            .program().context("register_signal: original program is unavailable")?;
+        let (place, node) = registered_place(&project_def, &payload.node_id, &payload.frames)
+            .with_context(|| format!("register_signal: project_id={project_uuid}"))?;
+        // Tags drive the signal-token enumeration filter; charset
+        // already validated at parse time.
+        let tags = node.tags();
+
         // The reused entry token's previously-persisted kind_state, when
         // the row already exists (reactivate). Handed to the kind's
         // compute_initial_state so cursor-bearing kinds carry their
@@ -272,7 +294,7 @@ impl RegisterSignalExecutor {
                  WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE",
             )
             .bind(&project_id)
-            .bind(&payload.node_id)
+            .bind(&place)
             .fetch_optional(&state.pg_pool)
             .await?;
             match existing {
@@ -294,7 +316,7 @@ impl RegisterSignalExecutor {
         let token_call = token.clone();
         let prior_state_call = prior_kind_state;
         let project_id_call = project_id.clone();
-        let node_id_call = payload.node_id.clone();
+        let node_id_call = place.clone();
         let spec_call = payload.spec.clone();
         let resume_color_owned = resume_color.clone();
         let pool_call = state.pg_pool.clone();
@@ -315,22 +337,6 @@ impl RegisterSignalExecutor {
         // Validate durable source facts before creating a listener subscription.
         let spec_json = serde_json::to_string(&payload.spec)?;
 
-        // Look up the registering node's _tags from the project
-        // definition so the signal row carries them. Tags drive the
-        // signal-token enumeration filter; charset already validated
-        // at parse time.
-        let project_uuid: uuid::Uuid = project_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
-        // Unfold the lookup. Both "project missing" and "node not in
-        // project" used to collapse to empty tags, which downstream
-        // signal-row enumeration filters by tag : so the trigger
-        // would silently never fire. Fail explicitly on either case.
-        let project_def = crate::projection::execution_program(state, color).await?
-            .program().context("register_signal: original program is unavailable")?;
-        let node = registering_node(&project_def, &payload.node_id, payload.is_resume)
-            .with_context(|| format!("register_signal: project_id={project_uuid}"))?;
-        let tags = node.tags();
         let events = state.journal.events_log(color).await?;
         let (program, source_version) = match events.first() {
             Some(weft_journal::ExecEvent::ExecutionStarted { program, source_version, .. }) => (program.clone(), source_version.clone()),
@@ -495,7 +501,7 @@ impl RegisterSignalExecutor {
                     tenant_id: tenant.to_string(),
                     project_id,
                     color: if payload.is_resume { Some(color) } else { None },
-                    node_id: payload.node_id.clone(),
+                    node_id: place,
                     is_resume: payload.is_resume,
                     spec_json,
                     access_id: payload.spec.access.as_ref().map(|a| a.id.clone()),
@@ -613,7 +619,7 @@ impl RegisterSignalExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        ambiguous_route, captured_trigger_address, mount_methods_for, mount_path_for, registering_node,
+        ambiguous_route, captured_trigger_address, mount_methods_for, mount_path_for, registered_place,
         pattern_of_mount_path, RegisteredRoute,
     };
     use weft_core::frames::Frame;
@@ -658,16 +664,26 @@ mod tests {
         );
     }
 
-    /// Arming reads the trigger's tags from the node behind the
-    /// registration: an entry by its address (the captured spelling),
-    /// a resume by its node id.
+    /// A registration is stored under the place it was made at, spelled:
+    /// an entry arrives spelled already, a resume arrives as the compiled
+    /// id under its frames, and both land on the same spelling.
     #[test]
-    fn an_armed_entry_finds_its_node_through_its_address() {
+    fn a_registration_is_stored_under_the_place_it_was_made_at() {
         let p = program_with_included_triggers();
-        assert_eq!(registering_node(&p, "one.door", false).unwrap().id, "Api.door");
-        assert_eq!(registering_node(&p, "top", false).unwrap().id, "top");
-        assert_eq!(registering_node(&p, "Api.work", true).unwrap().id, "Api.work");
-        let err = registering_node(&p, "one.nothing", false).unwrap_err().to_string();
+        let under = |site: &str| vec![Frame::Call { site: site.into() }];
+        let (place, node) = registered_place(&p, "one.door", &Vec::new()).unwrap();
+        assert_eq!((place.as_str(), node.id.as_str()), ("one.door", "Api.door"));
+        let (place, node) = registered_place(&p, "top", &Vec::new()).unwrap();
+        assert_eq!((place.as_str(), node.id.as_str()), ("top", "top"));
+        let (place, node) = registered_place(&p, "Api.work", &under("one")).unwrap();
+        assert_eq!((place.as_str(), node.id.as_str()), ("one.work", "Api.work"));
+        // The same node under the other site is another place.
+        assert_eq!(registered_place(&p, "Api.work", &under("two")).unwrap().0, "two.work");
+        // An iteration is not a place: a resume inside a loop under a
+        // site is spelled by the site alone.
+        let looped = vec![Frame::Call { site: "two".into() }, Frame::Loop { index: 3 }];
+        assert_eq!(registered_place(&p, "Api.work", &looped).unwrap().0, "two.work");
+        let err = registered_place(&p, "one.nothing", &Vec::new()).unwrap_err().to_string();
         assert!(err.contains("'one.nothing' not in project"), "{err}");
     }
 

@@ -121,10 +121,9 @@ port), and `expose`: `ClusterInternal` (default), `TenantPublic{path}`, or
 across stop and upgrade and deleted on terminate unless listed in
 `preserve_pvcs`, or `EmptyDir`, `ConfigMap`, `Secret`.
 
-**`Access`** is ingress rules (`FromWorkers` default, `FromNode`,
-`FromInternet`, `FromCidrs`, `FromLabel`) plus egress (`ToInternet` default,
-`ToNode`, `ToCidrs`), compiled to one NetworkPolicy on top of the namespace
-baseline.
+**`Access`** is ingress rules (`FromWorkers` default, `FromInternet`,
+`FromCidrs`, `FromLabel`) plus egress (`ToInternet` default, `ToCidrs`),
+compiled to one NetworkPolicy on top of the namespace baseline.
 
 A bad spec fails the apply loudly and the node shows `Failed` with the
 reason.
@@ -287,13 +286,15 @@ credential is never `SameNetwork`. That one holds whatever anybody intends.
 | Route | Method | Called by | Contract |
 |---|---|---|---|
 | `/health`, or any path | GET | the readiness probe | return 2xx when ready. Wire it with `Probe::http("/health", port)`. |
-| `/live` | GET | the dispatcher, which proxies the editor's poll | return `{ "items": [{ "type": ..., "label": "...", "data": "..." }] }`, where the type is `text`, `image`, `progress` or `secret`. The editor asks every three seconds while the graph is open. An item may carry a button: `"action": { "label": "Disconnect phone", "actionKind": "unpair", "confirm": "..." }`, and `payload` if the press carries data. |
-| `/action` | POST | the dispatcher, when a `/live` button is pressed | the same envelope sibling nodes use: `{ "action": "<actionKind>", "payload": {...} }` in, `{ "result": {...} }` out. A `result.error` string is your refusal, shown to the user as it is. The dispatcher re-polls `/live` right after, so whatever the press changed (a fresh QR code) shows at once. |
+| `/live` | GET | the dispatcher, which proxies the editor's poll and any client that holds a token for this node's display | return `{ "items": [{ "type": ..., "label": "...", "data": "..." }] }`, where the type is `text`, `image`, `progress` or `secret`. This is the node's **display**, the same shape a trigger's kind serves, and [what your node shows in the graph](showing-things-in-the-graph.md#its-display) has the whole of it. The editor asks every three seconds while the graph is open. An item may carry a button: `"action": { "label": "Disconnect phone", "actionKind": "unpair", "confirm": "..." }`, and `payload` if the press carries data. |
+| `/action` | POST | the dispatcher, when a `/live` button is pressed | the same envelope sibling nodes use: `{ "action": "<actionKind>", "payload": {...} }` in, `{ "result": {...} }` out. A `result.error` string is your refusal, shown to the user as it is. The editor polls `/live` again right after, so whatever the press changed (a fresh QR code) shows at once. |
 | `/outputs` | GET | the declaring node's own `run` | return a flat JSON object; the node folds each key into an output port |
 | `/action`, `/events`, ... | any | sibling nodes, through the wired URL | your own convention |
 
 `/live` and its buttons' `/action` are special because the **dispatcher**
-calls them, so it has to know which endpoint serves them:
+calls them, so it has to know which endpoint serves them. An answer that is
+not that envelope comes back to the reader as an error naming what you sent,
+rather than as an empty panel:
 
 ```json
 "features": { "liveEndpoint": "api" }
@@ -304,7 +305,13 @@ means no live panel.
 
 ## Lifecycle
 
-Everything below acts on one unit at a time.
+Everything below acts on one unit at a time, and every unit belongs to one
+INSTANCE: the node at one place in the program. A node written in
+`src/main.weft` is one instance. A node inside a file the program includes
+runs once per include, so `one = @include("store.weft")` and `two =
+@include("store.weft")` provision two databases, `one.db` and `two.db`, each
+with its own disks, its own endpoint and its own line in `weft infra status`.
+That spelling is how you name an instance to every verb below.
 
 **`weft infra start`** brings down units up to spec, leaving units already up
 alone.
@@ -323,8 +330,8 @@ new spec; NoOp units stayed up through the stop, so start leaves them frozen at
 their current version. If you want to update a frozen one, force it:
 
 ```bash
-weft infra node-stop <node_id> --force   # ignores on_stop
-weft infra start                          # recreate at the new spec
+weft infra node-stop <node> --force   # ignores on_stop
+weft infra start                       # recreate at the new spec
 ```
 
 `--force` is the conscious "I accept the downtime", which is why the graph's

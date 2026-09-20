@@ -22,7 +22,8 @@ use crate::socket_engine::PrepareError;
 use crate::stream_engine::{self, PlanReply, PlanStep, StreamPlan};
 
 use super::socket_listen::interpolate_frame;
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct StreamListenHandler;
 
@@ -66,11 +67,30 @@ impl KindHandler for StreamListenHandler {
             }
             .boxed()
         });
-        Ok(Some(stream_engine::spawn(prepare, on_event, "stream_listen")))
+        Ok(Some(stream_engine::spawn(prepare, on_event, "stream_listen", super::serving_sink(&ctx))))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
         ProcessOutcome { value: payload, target: ProcessTarget::Entry }
+    }
+
+    /// Nothing calls in, so there is no address to show: the display
+    /// is what this signal is listening to and whether the loop
+    /// holding it is healthy right now.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let sig = ctx.sig;
+        let cfg = match super::config_for_display::<StreamListen>(sig, "Listening to") {
+            Ok(cfg) => cfg,
+            Err(feed) => return feed,
+        };
+        // The address is masked (it can carry `user:pass@`); whether the
+        // pipe is encrypted is not a credential, and it is what somebody
+        // checks at a glance, so it gets its own plain line.
+        let mut items: Vec<LiveItem> =
+            super::configured_url_item("Listening to", &cfg.address).into_iter().collect();
+        items.push(LiveItem::text("TLS", if cfg.tls { "on" } else { "off" }));
+        items.extend(super::serving_item(sig));
+        LiveFeed::new(items)
     }
 
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {

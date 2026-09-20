@@ -1827,7 +1827,7 @@ async fn drive(
                 // orphan.
                 if let Some(err) = feed_error {
                     retire_consumer_streams(
-                        &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                        project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
                     )
                     .await;
                     handle_node_failure(
@@ -1860,7 +1860,7 @@ async fn drive(
                     if !generator_ports.is_empty() {
                         let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                         retire_consumer_streams(
-                            &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                            project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
                         )
                         .await;
                     }
@@ -1896,11 +1896,21 @@ async fn drive(
                     .map(|p| (p.name.clone(), p.port_type.clone()))
                     .collect();
             let wake_payload = kick_payloads.remove(&FiringLocation::new(node_id.clone(), group.frames.clone()));
+            // Where this firing runs, spelled: the node under the call
+            // sites on its frames (`one.db` inside the file the site
+            // `one` includes). What a person is told, and what an infra
+            // node's row is keyed by.
+            let place = {
+                let call_path: Vec<String> =
+                    weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
+                weft_core::project::address_of(project, &node_id, &call_path)
+            };
             let mut runner = RunnerHandle::new(
                 exec_id.to_string(),
                 project.id.to_string(),
                 group.color,
                 node_id.clone(),
+                place.clone(),
                 node_def.node_type.clone(),
                 group.frames.clone(),
                 clients.clone(),
@@ -1979,7 +1989,7 @@ async fn drive(
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(
-                        &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                        project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
                     )
                     .await;
                 }
@@ -2032,7 +2042,7 @@ async fn drive(
             let is_infra_setup_provision =
                 matches!(phase, weft_core::context::Phase::InfraSetup) && node_def.requires_infra;
             let provision_project_id = project.id.to_string();
-            let provision_node_id = node_id.clone();
+            let provision_place = place;
             let provision_tenant_id = tenant_id.to_string();
             let provision_namespace = namespace.to_string();
             let provision_clients = clients.clone();
@@ -2041,7 +2051,7 @@ async fn drive(
                     // 1. Call the node's provision body.
                     let infra_ctx = weft_core::infra::InfraProvisionContext::new(
                         provision_project_id.clone(),
-                        provision_node_id.clone(),
+                        provision_place.clone(),
                         provision_namespace.clone(),
                         provision_tenant_id.clone(),
                     );
@@ -2083,7 +2093,7 @@ async fn drive(
                         provision_clients.infra_state.as_ref(),
                         provision_clients.clock.as_ref(),
                         &provision_project_id,
-                        &provision_node_id,
+                        &provision_place,
                         &spec,
                     )
                     .await
@@ -3487,7 +3497,7 @@ async fn route_stream_pulses(
                     // The feed retired since the scan (its consumer
                     // terminated earlier in this batch): the item can
                     // never be taken.
-                    let reason = consumer_gone_reason(&loc.node_id);
+                    let reason = consumer_gone_reason(project, &loc);
                     consume_stream_pulses(
                         &[pulse], &loc, color, pulses, journal, pod_name, stream_rt,
                         AbsorbKind::Skipped { reason: &reason },
@@ -3522,7 +3532,7 @@ async fn route_stream_pulses(
                         // resolver fires with a generic message) and
                         // unregisters the markers.
                         retire_consumer_streams(
-                            &loc, color, pulses, journal, pod_name, stream_rt,
+                            project, &loc, color, pulses, journal, pod_name, stream_rt,
                         )
                         .await;
                         let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
@@ -3673,7 +3683,7 @@ async fn route_stream_pulses(
                 }
             }
             RouteAction::Drop { loc, pulse, closed } => {
-                let reason = consumer_gone_reason(&loc.node_id);
+                let reason = consumer_gone_reason(project, &loc);
                 // A late END for a gone consumer carries nothing to
                 // deliver, so it absorbs as taken (no gate ever waits
                 // on a closure); a dropped ITEM fails its waiting
@@ -3707,9 +3717,19 @@ fn loc_of(node_id: &str, frames: &weft_core::frames::LoopFrames) -> FiringLocati
 
 
 /// The one user-facing sentence for "this consumer ended and the item
-/// can never be taken", shared by every path that says it.
-fn consumer_gone_reason(node_id: &str) -> String {
-    format!("the consumer '{}' finished without taking this stream item", weft_core::project::plain_id(node_id))
+/// can never be taken", shared by every path that says it. The consumer
+/// is named by its place (`one.hold` for the `hold` of the file the site
+/// `one` includes), which is how a person reads every other message.
+fn consumer_gone_reason(project: &ProjectDefinition, loc: &FiringLocation) -> String {
+    format!("the consumer '{}' finished without taking this stream item", place_of(project, loc))
+}
+
+/// A firing's place, spelled the way a person writes the node: the
+/// node under the call sites on its frames.
+fn place_of(project: &ProjectDefinition, loc: &FiringLocation) -> String {
+    let call_path: Vec<String> =
+        weft_core::frames::call_path(&loc.frames).into_iter().map(str::to_string).collect();
+    weft_core::project::address_of(project, &loc.node_id, &call_path)
 }
 
 fn set_pulse_status(
@@ -3817,6 +3837,7 @@ async fn apply_stream_item_taken(
 /// producers fail loudly.
 #[allow(clippy::too_many_arguments)]
 async fn retire_consumer_streams(
+    project: &ProjectDefinition,
     loc: &FiringLocation,
     color: Color,
     pulses: &mut PulseTable,
@@ -3828,7 +3849,7 @@ async fn retire_consumer_streams(
     if leftover.is_empty() {
         return;
     }
-    let reason = consumer_gone_reason(&loc.node_id);
+    let reason = consumer_gone_reason(project, loc);
     consume_stream_pulses(
         &leftover, loc, color, pulses, journal, pod_name, stream_rt,
         AbsorbKind::Skipped { reason: &reason },
@@ -4148,7 +4169,7 @@ async fn apply_one_emission(
     // Drop them; a delivery wait on one fails loudly.
     if firing_already_terminal(executions, &msg.loc.node_id, color, &msg.loc.frames) {
         if let Some(gate) = &delivery {
-            gate.fail(format!("the firing of '{}' already failed", weft_core::project::plain_id(&msg.loc.node_id)));
+            gate.fail(format!("the firing of '{}' already failed", place_of(project, &msg.loc)));
         }
         return;
     }
@@ -4349,7 +4370,7 @@ async fn apply_one_task_msg(
         }
         TaskMsg::Terminal { loc, color: tcolor, outcome } => match outcome {
             NodeTaskOutcome::Completed => {
-                retire_consumer_streams(&loc, tcolor, pulses, journal, pod_name, stream_rt)
+                retire_consumer_streams(project, &loc, tcolor, pulses, journal, pod_name, stream_rt)
                     .await;
                 // The engine may have already TERMINATED this firing
                 // mid-flight (a bad-shape or buffer-overrun emission
@@ -4381,7 +4402,7 @@ async fn apply_one_task_msg(
                 ship_node_completed(journal, pod_name, tcolor, &loc.node_id, &loc.frames).await;
             }
             NodeTaskOutcome::Failed(err) => {
-                retire_consumer_streams(&loc, tcolor, pulses, journal, pod_name, stream_rt)
+                retire_consumer_streams(project, &loc, tcolor, pulses, journal, pod_name, stream_rt)
                     .await;
                 // Same stale-terminal guard as the Completed arm: the
                 // engine's mid-flight failure already terminated the

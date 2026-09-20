@@ -11,11 +11,12 @@
 //! An external consumer (a client that listens for + answers a project's
 //! waiting nodes) hits:
 //!   - `POST /signal-tokens` (mint), `GET /signal-tokens` (list),
-//!     `DELETE /signal-tokens/{id}` (revoke) — tenant-authenticated admin.
+//!     `DELETE /signal-tokens/{id}` (revoke): tenant-authenticated admin.
 //!   - `GET /signal-token/signals`, `DELETE /signal-token/signals`,
-//!     `GET /signal-token/health` — the token itself authenticates, via
-//!     `Authorization: Bearer wft-...` (never in the URL, where proxies and
-//!     access logs would capture it).
+//!     `GET /signal-token/health`, and the node displays under
+//!     `/signal-token/displays` (`api/display.rs`): the token itself
+//!     authenticates, via `Authorization: Bearer wft-...` (never in the
+//!     URL, where proxies and access logs would capture it).
 //!   - `POST /signal/{token}` (fire), `DELETE /signal/{token}` (cancel):
 //!     per-SIGNAL fire tokens, a separate credential whose whole job is to
 //!     be a paste-able URL.
@@ -39,6 +40,13 @@ pub struct MintTokenBody {
     pub allowed_projects: Vec<uuid::Uuid>,
     #[serde(default, rename = "allowedTags")]
     pub allowed_tags: Vec<String>,
+    /// The display dimension, which does NOT take the wildcard-on-empty
+    /// rule: a token says which node displays it may read, or reads
+    /// none. `allDisplays` is the wildcard within the token's projects.
+    #[serde(default, rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(default, rename = "allDisplays")]
+    pub all_displays: bool,
 }
 
 /// The mint response: the ONLY place the full token value ever appears.
@@ -52,13 +60,17 @@ pub struct MintedToken {
     pub name: Option<String>,
     /// The paste-able connect string for clients that take one URL
     /// (`<public-base>/signal-token/<token>`): clients PARSE it into base +
-    /// token and present the token via `Authorization: Bearer` — the wire
+    /// token and present the token via `Authorization: Bearer`; the wire
     /// requests never carry it in a path.
     pub url: String,
     #[serde(rename = "allowedProjects")]
     pub allowed_projects: Vec<uuid::Uuid>,
     #[serde(rename = "allowedTags")]
     pub allowed_tags: Vec<String>,
+    #[serde(rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(rename = "allDisplays")]
+    pub all_displays: bool,
 }
 
 /// A listed token: metadata + recognizer only, no secret.
@@ -73,6 +85,10 @@ pub struct TokenSummary {
     pub allowed_projects: Vec<uuid::Uuid>,
     #[serde(rename = "allowedTags")]
     pub allowed_tags: Vec<String>,
+    #[serde(rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(rename = "allDisplays")]
+    pub all_displays: bool,
 }
 
 /// Build a token's paste-able connect string from the dispatcher's public base.
@@ -100,6 +116,20 @@ pub async fn mint_token(
         return Err((StatusCode::BAD_REQUEST, format!("allowed_tags: {e}")));
     }
 
+    // A display grant that cannot reach anything is refused HERE, with
+    // the flag still in the person's hand, rather than minting a token
+    // that answers 404 forever. What comes back is what gets stored:
+    // the node exactly as the person spelled it, under a project id in
+    // one canonical form.
+    let allowed_displays = crate::api::display::canonical_display_grants(
+        &state,
+        caller.0.as_str(),
+        &body.allowed_projects,
+        &body.allowed_displays,
+        body.all_displays,
+    )
+    .await?;
+
     let token = names::generate_token();
     let signal_token = crate::journal::SignalToken {
         id: uuid::Uuid::new_v4(),
@@ -109,6 +139,8 @@ pub async fn mint_token(
         name: name.clone(),
         allowed_projects: body.allowed_projects,
         allowed_tags: body.allowed_tags,
+        allowed_displays,
+        all_displays: body.all_displays,
         // Stamp the mint time here (the canonical wall clock) and store it
         // verbatim, so both the postgres and mock journals agree instead of one
         // stamping now() and the other keeping a placeholder.
@@ -129,6 +161,8 @@ pub async fn mint_token(
         url,
         allowed_projects: signal_token.allowed_projects,
         allowed_tags: signal_token.allowed_tags,
+        allowed_displays: signal_token.allowed_displays,
+        all_displays: signal_token.all_displays,
     }))
 }
 
@@ -151,6 +185,8 @@ pub async fn list_tokens(
                 created_at_unix: t.created_at,
                 allowed_projects: t.allowed_projects,
                 allowed_tags: t.allowed_tags,
+                allowed_displays: t.allowed_displays,
+                all_displays: t.all_displays,
             })
             .collect(),
     ))

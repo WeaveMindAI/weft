@@ -335,11 +335,26 @@ fn pick_free_port() -> Result<u16> {
     Ok(port)
 }
 
+/// The one HTTP client this module talks to listener Pods with: one
+/// connection pool for the process, so a door that is polled (a
+/// trigger's display, every few seconds per open graph) reuses its
+/// connections rather than opening a fresh pool per call. Admin URLs
+/// are inside the cluster and answer in place, so no redirect is
+/// followed, the same policy as the dispatcher's client for containers.
+fn admin_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a default reqwest client builds")
+    });
+    &CLIENT
+}
+
 async fn wait_for_health(admin_url: &str) -> Result<()> {
-    let client = reqwest::Client::new();
     let health = format!("{}/health", admin_url.trim_end_matches('/'));
     for _ in 0..50 {
-        if client.get(&health).send().await.is_ok() {
+        if admin_http().get(&health).send().await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -380,7 +395,7 @@ pub async fn register_signal(
     placement_generation: i64,
     source: weft_listener::protocol::RegisterSource,
 ) -> Result<(weft_core::primitive::SignalRouting, Value)> {
-    let client = reqwest::Client::new();
+    let client = admin_http();
     let url = format!("{}/register", handle.admin_url.trim_end_matches('/'));
     // Use the typed wire struct so a new required field (e.g. tenant_id)
     // is a compile error here, not a runtime deserialize failure on the
@@ -401,25 +416,36 @@ pub async fn register_signal(
     Ok((body.routing, body.kind_state))
 }
 
-/// The signal's display as its holder serves it, or `None` when the
-/// pod answers that it does not hold this token (its registry lost
-/// the entry; the durable row still names the pod). To the person
-/// looking at the trigger that is the same as no holder at all:
-/// nothing is listening until the project is activated again.
-pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/display", handle.admin_url.trim_end_matches('/'));
-    let resp = client
+/// What the trigger's kind is showing, off the Pod holding its signal,
+/// or `None` when the pod answers that it does not hold this token
+/// (its registry lost the entry; the durable row still names the pod).
+/// To the person looking at the trigger that is the same as no holder
+/// at all: nothing is listening until the project is activated again.
+///
+/// `address` is where an outside caller reaches this signal, which the
+/// listener cannot work out on its own (see `LiveRequest::address`).
+pub async fn live_signal(
+    handle: &ListenerHandle,
+    token: &str,
+    address: Option<&str>,
+) -> Result<Option<weft_core::live::LiveFeed>> {
+    let url = format!("{}/live", handle.admin_url.trim_end_matches('/'));
+    // The listener's own request type, so a renamed field fails to
+    // compile here rather than arriving as a silently absent address.
+    let resp = admin_http()
         .post(&url)
-        .json(&serde_json::json!({ "token": token }))
+        .json(&weft_listener::protocol::LiveRequest {
+            token: token.to_string(),
+            address: address.map(str::to_string),
+        })
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let resp = bail_unless_ok(resp, "/display").await?;
-    let body: weft_listener::protocol::DisplayResponse = resp.json().await?;
-    Ok(Some(body.display))
+    let resp = bail_unless_ok(resp, "/live").await?;
+    let body: weft_listener::protocol::LiveResponse = resp.json().await?;
+    Ok(Some(body.live))
 }
 
 
@@ -428,7 +454,7 @@ pub async fn process_signal(
     token: &str,
     payload: &Value,
 ) -> Result<weft_listener::protocol::ProcessOutcome> {
-    let client = reqwest::Client::new();
+    let client = admin_http();
     let url = format!("{}/process", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -453,7 +479,7 @@ pub async fn match_push(
     push: &weft_listener::protocol::PushEvent,
     tokens: &[String],
 ) -> Result<Vec<weft_listener::protocol::MatchedPush>> {
-    let client = reqwest::Client::new();
+    let client = admin_http();
     let url = format!("{}/match_push", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -479,7 +505,7 @@ pub async fn match_push(
 /// payload is a kind's own shape, and minting one here would put a
 /// second tier in the business of knowing what a timer says.
 pub async fn wake_by_hand(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
-    let client = reqwest::Client::new();
+    let client = admin_http();
     let url = format!("{}/wake_by_hand", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -494,7 +520,7 @@ pub async fn wake_by_hand(handle: &ListenerHandle, token: &str) -> Result<Option
 }
 
 pub async fn render_signal(handle: &ListenerHandle, token: &str) -> Result<Value> {
-    let client = reqwest::Client::new();
+    let client = admin_http();
     let url = format!("{}/render", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -508,17 +534,15 @@ pub async fn render_signal(handle: &ListenerHandle, token: &str) -> Result<Value
 /// Tell a listener pod to reconcile its in-memory registry with the
 /// durable signal table (the signals placed on it). Idempotent.
 pub async fn rehydrate(handle: &ListenerHandle) -> Result<()> {
-    let client = reqwest::Client::new();
     let url = format!("{}/rehydrate", handle.admin_url.trim_end_matches('/'));
-    let resp = client.post(&url).send().await?;
+    let resp = admin_http().post(&url).send().await?;
     bail_unless_ok(resp, "/rehydrate").await?;
     Ok(())
 }
 
 pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<()> {
-    let client = reqwest::Client::new();
     let url = format!("{}/unregister", handle.admin_url.trim_end_matches('/'));
-    let resp = client
+    let resp = admin_http()
         .post(&url)
         .json(&serde_json::json!({ "token": token }))
         .send()
@@ -528,9 +552,8 @@ pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<(
 }
 
 async fn load_report(handle: &ListenerHandle) -> Result<weft_listener::protocol::LoadReport> {
-    let client = reqwest::Client::new();
     let url = format!("{}/load", handle.admin_url.trim_end_matches('/'));
-    let resp = client.get(&url).send().await?;
+    let resp = admin_http().get(&url).send().await?;
     let resp = bail_unless_ok(resp, "/load").await?;
     Ok(resp.json::<weft_listener::protocol::LoadReport>().await?)
 }
