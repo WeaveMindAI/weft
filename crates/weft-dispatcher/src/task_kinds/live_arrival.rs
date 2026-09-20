@@ -74,7 +74,7 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
         tracing::info!(
             target: "weft_dispatcher::live_arrival",
             color = %claims.color, pod = %pod.pod_name,
-            node = %weft_core::project::plain_id(&route.node_id),
+            node = %route.node_id,
             "live caller arrived; execution born on its pod"
         );
         Ok(serde_json::to_value(LiveArrivalResult {

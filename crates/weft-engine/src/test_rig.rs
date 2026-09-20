@@ -204,6 +204,7 @@ impl LiveTestRunner {
                 project_id.clone(),
                 color,
                 node_id.to_string(),
+                node_id.to_string(),
                 node_type,
                 weft_core::frames::LoopFrames::default(),
                 clients.clone(),

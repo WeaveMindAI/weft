@@ -2,7 +2,7 @@
 //! running in the tenant's k8s namespace.
 //!
 //! Endpoints (network-trusted; only reachable from `weft-system`):
-//!   POST /register, /unregister, /process, /render, /display,
+//!   POST /register, /unregister, /process, /render, /live,
 //!   /rehydrate; GET /signals, /load, /health.
 //! Held-connection loops per stateful kind (Timer, SSE) enqueue a
 //! `FireSignal` task through the broker when their event fires; the

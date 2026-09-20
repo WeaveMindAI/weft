@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
-	import { isLoopNodeType, containerHasConfigStrip } from "../../types";
+	import { isLoopNodeType, containerHasConfigStrip, ownValue } from "../../types";
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
+	import { isFilledIn } from '../../utils/port-specs';
 	import { getPortTypeColor } from "../../constants/colors";
 	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx, expandedContainerMinPx } from "../../constants/container-layout";
 	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
@@ -32,9 +33,11 @@
 			/// per side (+ inner dots for children, + loop index/done).
 			simplified?: boolean;
 			config: Record<string, unknown>;
-			/// Body-set PORT values. A container's only entry today is
+			/// The values the source writes for this container's ports:
 			/// its gate (`_should_flow` or `_should_not_flow`, whichever
-			/// spelling it carries), written as a literal in its braces.
+			/// spelling it carries, in the braces or on a line outside)
+			/// and any interface port given a value on its own line
+			/// (`g.tone = "formal"`). Each one is a field in the strip.
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
@@ -79,19 +82,19 @@
 	const edgesState = useEdges();
 	// `_should_flow` decides whether the whole container runs, so it docks
 	// as an arrow in the top-left corner instead of joining the interface
-	// ports. Filled means something answers it: a wire, or a literal
-	// written in the braces.
+	// ports. Filled means something answers it: a wire, or a written
+	// value (the one notion of "has a value", `isFilledIn`).
 	const flowConnected = $derived(
 		edgesState.current.some((e) => e.target === id && isGatePort(e.targetHandle ?? ''))
-			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_FLOW_PORT] !== undefined
-			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
+			|| isFilledIn(ownValue(data.portLiterals as Record<string, unknown> | undefined, SHOULD_FLOW_PORT))
+			|| isFilledIn(ownValue(data.portLiterals as Record<string, unknown> | undefined, SHOULD_NOT_FLOW_PORT))
 	);
 	/// Which way round this container's gate reads. A container gates
 	/// everything inside it, so the inverted spelling means the whole
 	/// group runs when the thing wired here did not happen.
 	const flowInverted = $derived(
 		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_NOT_FLOW_PORT)
-			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_NOT_FLOW_PORT] !== undefined
+			|| isFilledIn(ownValue(data.portLiterals as Record<string, unknown> | undefined, SHOULD_NOT_FLOW_PORT))
 	);
 	const outputs = $derived((data.outputs ?? []) as PortDefinition[]);
 	// Simplified view draws a dot only when an edge attaches to it: structure
@@ -146,6 +149,7 @@
 	/// Field definitions for the loop config strip. over and carry no
 	/// longer live in the strip: their values are derived from the per-port
 	/// role chosen via right-click on each port, so the strip only shows
+	/// the remaining settings.
 	const loopFields: FieldDefinition[] = $derived(isLoop ? LOOP_CONFIG_FIELDS : []);
 
 	const portLiterals = $derived((data.portLiterals as Record<string, unknown> | undefined) ?? {});
@@ -157,12 +161,17 @@
 		Object.keys(portLiterals).map((key) => {
 			if (isGatePort(key)) return gateField(key, 'container');
 			const port = inputs.find((p) => p.name === key);
-			return port
-				? fieldForInput(port)
-				: ({ key, label: key, type: 'textarea', portDriven: true } as FieldDefinition);
+			// A container's ports are its header: the compiler refuses a
+			// value on any other name, and the projection throws on one,
+			// so a key with no port here is a broken invariant, not a
+			// field to improvise.
+			if (!port) throw new Error(`'${id}' has a value for '${key}', which is not one of its ports`);
+			return fieldForInput(port);
 		}),
 	);
-	const stripFields: FieldDefinition[] = $derived([...portFields, ...loopFields]);
+	/// Settings first, then the ports the source gave a value: the order
+	/// the loop's source reads in (its braces, then the lines outside).
+	const stripFields: FieldDefinition[] = $derived([...loopFields, ...portFields]);
 	const hasConfigStrip = $derived(
 		!data.simplified && containerHasConfigStrip(data.nodeType, portLiterals),
 	);
@@ -351,7 +360,7 @@
 				// with the port; the gather output itself stays.
 				const carry = (lc.carry as string[] | undefined ?? []).filter(n => n !== portName);
 				const newInputs = inputs.filter(p => p.name !== portName);
-				data.onUpdate({ config: { ...lc, carry }, inputs: newInputs });
+				data.onUpdate({ config: { ...lc, carry }, inputs: newInputs, ...valueGoneWith(portName) });
 			} else if (current.role === 'gather') {
 				// Only the carry list changes: the paired input is DERIVED (the
 				// compiler synthesizes it on parse, the projection on apply), so
@@ -488,6 +497,17 @@
 		data.onUpdate({ inputs: currentInputs, outputs: currentOutputs });
 	}
 
+	/// The port-value update that goes with removing the input `name`:
+	/// the value the source wrote for it leaves with the port, in the
+	/// same batch. The compiler refuses a value on a name the signature
+	/// no longer declares, and the strip would have no port to show it
+	/// on (it throws on one). Nothing when the port had no value.
+	function valueGoneWith(name: string): Pick<NodeDataUpdates, 'portLiterals'> {
+		if (!isFilledIn(ownValue(portLiterals, name))) return {};
+		const { [name]: _gone, ...rest } = portLiterals;
+		return { portLiterals: rest };
+	}
+
 	function removePort(side: 'input' | 'output', name: string) {
 		if (!data.onUpdate) return;
 		// Deleting the synthesized carry-input is equivalent to converting
@@ -498,7 +518,7 @@
 			if (port?.synthesizedFromCarry && isLoop) {
 				const lc = (data.config as Record<string, unknown>) ?? {};
 				const carry = (lc.carry as string[] | undefined ?? []).filter(n => n !== name);
-				data.onUpdate({ config: { ...lc, carry } });
+				data.onUpdate({ config: { ...lc, carry }, ...valueGoneWith(name) });
 				return;
 			}
 			// `name_collision` case: a non-synthesized input shares its
@@ -513,7 +533,7 @@
 				const carry = (lc.carry as string[] | undefined ?? []);
 				if (carry.includes(name)) {
 					const currentInputs = inputs.filter(p => p.name !== name);
-					data.onUpdate({ inputs: currentInputs });
+					data.onUpdate({ inputs: currentInputs, ...valueGoneWith(name) });
 					return;
 				}
 			}
@@ -531,14 +551,24 @@
 				// Deleting a carry output: also drop its synthesized input.
 				currentInputs = currentInputs.filter(p => !(p.name === name && p.synthesizedFromCarry));
 			}
+			// The written value goes only when the INPUT of that name is
+			// gone (the one deleted, or the synthesized twin of a deleted
+			// carry output). A declared input that merely shares its name
+			// with a deleted carry output survives, and so does its value.
+			const inputGone = !currentInputs.some(p => p.name === name);
 			data.onUpdate({
 				inputs: currentInputs,
 				outputs: currentOutputs,
 				config: { ...lc, over, carry },
+				...(inputGone ? valueGoneWith(name) : {}),
 			});
 			return;
 		}
-		data.onUpdate({ inputs: currentInputs, outputs: currentOutputs });
+		data.onUpdate({
+			inputs: currentInputs,
+			outputs: currentOutputs,
+			...(side === 'input' ? valueGoneWith(name) : {}),
+		});
 	}
 
 	function handlePortKeydown(e: KeyboardEvent, side: 'input' | 'output') {

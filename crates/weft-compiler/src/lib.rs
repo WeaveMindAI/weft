@@ -207,8 +207,8 @@ pub fn compile_checked(
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
 ) -> CompileResult<ProjectDefinition> {
-    // Build path: a real project with a named main group (no anonymous root), so
-    // the source name is irrelevant; `None` falls back to `Untitled`, unused.
+    // Build path: the ENTRY file, which may hold no anonymous root (`None`
+    // is what makes the compiler refuse one there).
     let (project, diagnostics) = compile_strict(source, project_id, fs, catalog, mode, None);
     bail_on_errors(diagnostics)?;
     Ok(project)

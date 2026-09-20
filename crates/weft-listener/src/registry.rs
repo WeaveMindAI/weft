@@ -23,7 +23,7 @@ pub enum Transport {
 
 /// The LIVE, per-pod serving state of one signal: what its background
 /// task is doing right now and the transport it decided on. Written
-/// by the kind's serving task, read by the /display surface. An empty
+/// by the kind's serving task, read by the node's display. An empty
 /// status with no transport means the kind reports nothing live.
 #[derive(Debug, Default)]
 pub struct ServingState {
@@ -58,16 +58,16 @@ pub struct RegisteredSignal {
     pub task: Option<Arc<TaskGuard>>,
     /// Routing+auth metadata computed by the kind impl at register
     /// time (or reconstructed from the durable row at rehydrate).
-    /// The dispatcher copies this onto the signal row; `/display`
-    /// reads it to show what mount_path / auth_kind the signal is
-    /// using. Always set: both register and rehydrate paths
+    /// The dispatcher copies this onto the signal row; the kind's
+    /// `live` reads it to show what mount_path / auth_kind the signal
+    /// is using. Always set: both register and rehydrate paths
     /// populate it, so downstream readers don't need to handle a
     /// None case.
     pub routing: SignalRouting,
     /// The live serving state (see [`ServingState`]), created at
     /// registration and shared with the kind's background task so
-    /// status updates land where /display reads them. Dies with the
-    /// entry.
+    /// status updates land where the kind's `live` reads them. Dies
+    /// with the entry.
     pub serving: Arc<Mutex<ServingState>>,
 }
 

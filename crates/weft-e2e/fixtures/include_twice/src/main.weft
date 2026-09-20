@@ -1,0 +1,23 @@
+# One file, two calls. Every node of the file is two PLACES in the program,
+# named through the site that reaches it, and each place is its own thing:
+#
+#   one.hold / two.hold   two waits in one run; `weft wake` resolves one at a time
+#   one.tick / two.tick   two registered triggers, each with its own display
+#   one.key  / two.key    the two names of the file's one access node
+#
+# The compiler's own key for a node of the file (`@src:lib:part.hold`) is
+# refused everywhere a person types a name.
+
+src = Text { value: "hello" }
+
+one = @include("lib/part.weft")
+one.text = src.value
+
+two = @include("lib/part.weft")
+two.text = src.value
+
+first = Debug
+first.data = one.out
+
+second = Debug
+second.data = two.out

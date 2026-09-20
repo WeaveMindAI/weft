@@ -48,6 +48,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::task::JoinHandle;
+use weft_core::live::{LiveFeed, LiveItem};
 use weft_core::primitive::{SignalRouting, SignalSpec};
 
 use parking_lot::Mutex;
@@ -78,9 +79,23 @@ pub struct SpawnCtx {
     /// own state can ever lose the fence version.
     pub state_seq: i64,
     /// The signal's live serving state, shared with the registry
-    /// entry so status a serving task writes lands where /display
-    /// reads it.
+    /// entry so status a serving task writes lands where the node's
+    /// display reads it.
     pub serving: Arc<Mutex<ServingState>>,
+}
+
+/// Everything a kind needs to render what it is showing. Bundled
+/// rather than passed as two arguments, because one of them (the
+/// address) comes from the dispatcher rather than from the listener's
+/// own state, and a named field says so where a positional argument
+/// would not.
+pub struct LiveCtx<'a> {
+    pub sig: &'a RegisteredSignal,
+    /// The address an outside caller reaches this signal at, as the
+    /// dispatcher computed it (host, tenant segment and `/connect/`
+    /// prefix included). `None` for a signal nothing calls in to, and
+    /// for a caller that did not supply one.
+    pub address: Option<&'a str>,
 }
 
 /// Per-kind handler. One unit struct per kind, registered with the
@@ -199,8 +214,14 @@ pub trait KindHandler: Send + Sync {
         None
     }
 
-    /// Render the consumer-facing payload for this signal. Returns
-    /// `Ok(None)` for kinds with no consumer surface (Timer,
+    /// Render what a consumer needs to ANSWER this signal: a form's
+    /// fields and their prefills, for the listing at
+    /// `GET /signal-token/signals`. Not to be confused with `live`
+    /// below, which is what the node SHOWS: a form is answered through
+    /// this one, and what it shows through that one is what it is
+    /// asking.
+    ///
+    /// Returns `Ok(None)` for kinds nobody answers by hand (Timer,
     /// SseSubscribe) and `Err` for malformed specs (so the caller
     /// surfaces a 400 instead of silently rendering empty).
     fn render(&self, token: &str, sig: &RegisteredSignal) -> Result<Option<Value>>;
@@ -217,6 +238,27 @@ pub trait KindHandler: Send + Sync {
     ) {
     }
 
+    /// What this kind SHOWS on the node's body, and to any client that
+    /// reads the node's display: what the listener answers on its
+    /// `POST /live`, in the same shape an infra node's container serves
+    /// on its `GET /live`.
+    ///
+    /// The kind owns this, not the node that declared the trigger. The
+    /// surface and the auth are computed here at register, so this is
+    /// the only place that knows them.
+    ///
+    /// The default is the address: where a caller sends a request and
+    /// how they get past the door. Every kind with a public entry gets
+    /// that for free and adds its own lines by calling `address_items`
+    /// and extending. A kind that fires from inside the runtime gets
+    /// nothing from the default and says what it is doing instead.
+    ///
+    /// Read-only, unlike an infra node's display: a trigger's panel has
+    /// no buttons, because nothing about a registration is the reader's
+    /// to change from here.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        LiveFeed::new(address_items(ctx))
+    }
 }
 
 inventory::collect!(&'static dyn KindHandler);
@@ -459,7 +501,9 @@ pub fn match_push(push: &PushEvent, tokens: &[String], registry: Arc<Registry>) 
     matched
 }
 
-/// Render the consumer-facing payload for a registered signal.
+/// Render what a consumer needs to answer a registered signal (see
+/// [`KindHandler::render`]); `compute_live` is the other question,
+/// what the node shows.
 pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
     let signal = registry
         .get(token)
@@ -468,33 +512,181 @@ pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
     handler.render(token, &signal)
 }
 
-/// Display payload returned to the inspector: the routing (surface +
-/// auth), the kind and its config, and the LIVE serving state for the
-/// kinds whose task reports one (which transport serves the signal,
-/// what it is doing right now).
-pub fn compute_display(sig: &RegisteredSignal) -> Value {
-    let serving = {
-        let s = sig.serving.lock();
-        if s.status.is_empty() && s.transport.is_none() {
-            Value::Null
-        } else {
-            serde_json::json!({
-                "state": s.status,
-                "transport": s.transport.as_ref().map(|t| match t {
-                    Transport::Socket => "socket",
-                    Transport::Webhook => "webhook",
-                    Transport::Unservable(_) => "unservable",
-                }),
-            })
-        }
+/// What a registered signal shows: its kind's `live` answer.
+///
+/// The listener serves this on `POST /live`, and what comes back is the
+/// same shape an infra node's container serves on its own `/live`, so
+/// whoever reads a node's display draws one thing whichever produced it.
+pub fn compute_live(ctx: &LiveCtx<'_>) -> LiveFeed {
+    match lookup(&ctx.sig.spec.kind) {
+        Some(handler) => handler.live(ctx),
+        // An unknown kind is a listener older than the program that
+        // registered the signal. Say that, rather than showing an
+        // empty panel that reads as "nothing to report".
+        None => LiveFeed::new(vec![LiveItem::text(
+            "Display",
+            format!("this listener does not know the kind '{}'", ctx.sig.spec.kind),
+        )]),
+    }
+}
+
+/// A trigger's display is read-only: no door carries a press to a
+/// listener, so a button on one would be a button the reader cannot
+/// use. A kind that puts one there has a bug, and it is said at the
+/// door (`/live` answers 500 with this), rather than drawn as a button
+/// that fails on the click.
+pub fn read_only_display(kind: &str, live: &LiveFeed) -> Result<(), String> {
+    match live.items.iter().find(|item| item.action.is_some()) {
+        Some(item) => Err(format!(
+            "the kind '{kind}' put a button on '{}', and a trigger's display is read-only: no door \
+             carries a press to a listener. If a trigger kind needs a button, open an issue on \
+             weft's repository to discuss it before wiring one",
+            item.label
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The address lines every public-entry kind shows: where a caller
+/// sends a request, and how they get past the door.
+///
+/// The address is the dispatcher's to compute and is shown verbatim,
+/// because only the dispatcher knows the host it answers on, the
+/// tenant segment the path is stored under, and whether the kind is
+/// served under `/connect/`. Without one, the line falls back to the
+/// route pattern the kind itself holds, which is a fragment of the
+/// real address and says so, rather than reading as somewhere to send.
+///
+/// Nothing secret is ever here. A gated route names the CONNECTION
+/// that holds the material, and the broker answers the check; the
+/// listener never sees a key.
+///
+/// A kind whose surface is internal (a timer, a poll) has no address,
+/// and gets no lines from here.
+pub fn address_items(ctx: &LiveCtx<'_>) -> Vec<LiveItem> {
+    use weft_core::primitive::{SignalAuth, SignalSurface};
+    let sig = ctx.sig;
+    let SignalSurface::PublicEntry { path, methods } = &sig.routing.surface else {
+        return Vec::new();
     };
-    serde_json::json!({
-        "surface": sig.routing.surface,
-        "auth": sig.routing.auth,
-        "kind": sig.spec.kind,
-        "config": sig.spec.config,
-        "serving": serving,
+    // The methods ride WITH the address rather than on a line of their
+    // own: "POST https://..." is one thing a person copies, and a
+    // route that serves any method says nothing rather than "ANY".
+    let verbs = if methods.is_empty() { String::new() } else { format!("{} ", methods.join("/")) };
+    let mut items = vec![match ctx.address {
+        Some(address) => LiveItem::text("Address", format!("{verbs}{address}")),
+        None => LiveItem::text(
+            "Route (partial)",
+            format!("{verbs}/{}", path.trim_start_matches('/')),
+        ),
+    }];
+    items.push(match sig.routing.auth {
+        // "open" is about the door, not about who knows the address.
+        SignalAuth::None => LiveItem::text("Auth", "open (anyone with the URL)"),
+        SignalAuth::Connection => {
+            // `compute_routing` writes `service` alongside `access_id` on
+            // every gated route, so a missing one is a broken
+            // registration. Say that instead of inventing a name for it.
+            match sig.routing.auth_config.get("service").and_then(Value::as_str) {
+                Some(service) => LiveItem::text(
+                    "Auth",
+                    format!("checked against the wired {service} connection"),
+                ),
+                None => LiveItem::text(
+                    "Auth",
+                    "gated, but this registration names no connection to check against",
+                ),
+            }
+        }
+    });
+    items
+}
+
+/// A URL the user configured, as a line their display can carry.
+///
+/// A configured URL is the one place a trigger's display can hold a
+/// credential: a Telegram poll loop carries its bot token in the PATH
+/// (`/bot<token>/getUpdates`), an SSE feed carries `?access_token=`,
+/// and any of them can carry `user:pass@`. So the whole URL is shown
+/// as a SECRET: the reader sees it masked, and reveals or copies it
+/// when they actually need it. The label is the kind's own word for
+/// what the URL is ("Polling", "Listening to").
+///
+/// An empty URL is not a line at all. A socket that dials an address
+/// minted per connection has none to show, and a blank box reads as a
+/// bug in the display rather than as the truth about the signal.
+pub fn configured_url_item(label: &str, url: &str) -> Option<LiveItem> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    Some(LiveItem::secret(label, url))
+}
+
+/// Read a kind's own config for its display, or the line that says why
+/// it could not be read.
+///
+/// Register refuses a spec that does not parse, so a signal whose
+/// config fails here is one registered by a program older or newer than
+/// this listener, or a row that rotted. Either way the reader gets the
+/// serde error itself, not a shrug: it names the field and the shape,
+/// which is the whole difference between "something is wrong" and
+/// something anybody can act on. One line, so the rest of the display
+/// still renders.
+pub fn config_for_display<T: serde::de::DeserializeOwned>(
+    sig: &RegisteredSignal,
+    label: &str,
+) -> Result<T, LiveFeed> {
+    serde_json::from_value::<T>(sig.spec.config.clone()).map_err(|e| {
+        LiveFeed::new(vec![LiveItem::text(
+            label,
+            format!("this listener cannot read the '{}' config: {e}", sig.spec.kind),
+        )])
     })
+}
+
+/// One line for what a kind's background task is doing right now
+/// (connected, retrying, unservable), or nothing when the kind keeps
+/// no such task. Kinds that hold a connection add it to their display.
+pub fn serving_item(sig: &RegisteredSignal) -> Option<LiveItem> {
+    // Copy out and drop the guard: the kind's serving task writes this
+    // slot, and nothing it writes should wait on a `format!` here.
+    let (status, transport) = {
+        let s = sig.serving.lock();
+        (s.status.clone(), s.transport.clone())
+    };
+    if status.is_empty() && transport.is_none() {
+        return None;
+    }
+    let transport = match transport {
+        Some(Transport::Socket) => " (socket)".to_string(),
+        Some(Transport::Webhook) => " (webhook)".to_string(),
+        Some(Transport::Unservable(why)) => format!(" (unservable: {why})"),
+        None => String::new(),
+    };
+    let status = if status.is_empty() { "serving" } else { status.as_str() };
+    Some(LiveItem::text("State", format!("{status}{transport}")))
+}
+
+/// Write what a kind's serving task is doing right now where its
+/// display reads it (`serving_item`). The one home for the write, so
+/// every kind that holds a connection or a loop reports the same way.
+pub fn set_serving_status(ctx: &SpawnCtx, status: impl Into<String>) {
+    ctx.serving.lock().status = status.into();
+}
+
+/// Where an engine that holds a connection reports what it is doing.
+/// The usual sink is the one registration's slot (`serving_sink`); an
+/// engine that serves several registrations at once (a provider socket
+/// shared by every subscription of one topic) fans one report out to
+/// every slot it serves, so no panel says "holding" while the socket
+/// is down.
+pub type ServingReport = Arc<dyn Fn(String) + Send + Sync>;
+
+/// The report that writes to this registration's own slot.
+pub fn serving_sink(ctx: &SpawnCtx) -> ServingReport {
+    let serving = ctx.serving.clone();
+    Arc::new(move |status| serving.lock().status = status)
 }
 
 /// Run a removed signal's kind-specific EXTERNAL teardown (anything
@@ -547,6 +739,229 @@ mod tests {
             handled, shipped,
             "every signal kind weft-core ships needs a handler here, and a handler here \
              needs a kind in core; whichever side is longer is the side that moved"
+        );
+    }
+
+    // ----- What a trigger shows -------------------------------------
+    //
+    // The kind owns its display, so these prove what a public entry
+    // says about itself: the address a caller uses (the dispatcher's,
+    // verbatim) and the door, which names a connection and never a
+    // secret.
+
+    fn signal(surface: weft_core::primitive::SignalSurface, auth_config: Value) -> RegisteredSignal {
+        use weft_core::primitive::SignalAuth;
+        let auth = if auth_config.is_null() { SignalAuth::None } else { SignalAuth::Connection };
+        RegisteredSignal {
+            spec: SignalSpec {
+                kind: "timer".into(),
+                config: Value::Object(Default::default()),
+                consumer_kind: None,
+                access: None,
+                match_predicates: Vec::new(),
+            },
+            node_id: "ask".into(),
+            tenant_id: "t".into(),
+            is_resume: false,
+            color: None,
+            placement_generation: 0,
+            task: None,
+            routing: SignalRouting { surface, auth, auth_config },
+            serving: Arc::new(Mutex::new(ServingState::default())),
+        }
+    }
+
+    fn public(path: &str, methods: &[&str]) -> weft_core::primitive::SignalSurface {
+        weft_core::primitive::SignalSurface::PublicEntry {
+            path: path.into(),
+            methods: methods.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    fn ctx<'a>(sig: &'a RegisteredSignal, address: Option<&'a str>) -> LiveCtx<'a> {
+        LiveCtx { sig, address }
+    }
+
+    #[test]
+    fn a_public_entry_shows_the_address_a_caller_actually_uses() {
+        // The dispatcher's address, verbatim: it carries the host, the
+        // tenant segment and the `/connect/` prefix, none of which the
+        // listener's own route pattern has.
+        let sig = signal(public("hooks/x", &[]), Value::Null);
+        let items = address_items(&ctx(&sig, Some("https://w.example/local/hooks/x")));
+        assert_eq!(
+            items,
+            vec![
+                LiveItem::text("Address", "https://w.example/local/hooks/x"),
+                LiveItem::text("Auth", "open (anyone with the URL)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_methods_ride_with_the_address() {
+        // One thing to copy. A route that serves any method says
+        // nothing rather than "ANY".
+        let sig = signal(public("chat/{room}", &["POST", "PUT"]), Value::Null);
+        let items = address_items(&ctx(&sig, Some("https://w.example/local/chat/{room}")));
+        assert_eq!(
+            items[0],
+            LiveItem::text("Address", "POST/PUT https://w.example/local/chat/{room}")
+        );
+    }
+
+    #[test]
+    fn a_gated_route_names_the_connection_and_nothing_secret() {
+        let sig = signal(
+            public("chat", &[]),
+            serde_json::json!({ "access_id": "acc-1", "service": "api_key_auth" }),
+        );
+        let items = address_items(&ctx(&sig, Some("https://w.example/local/chat")));
+        assert_eq!(
+            items[1],
+            LiveItem::text("Auth", "checked against the wired api_key_auth connection")
+        );
+        // The material lives on the connection; the listener has none
+        // of it and the display must not imply otherwise.
+        let shown = serde_json::to_string(&items).expect("items serialize");
+        assert!(!shown.contains("acc-1"), "{shown}");
+    }
+
+    #[test]
+    fn without_an_address_the_line_says_it_is_only_a_fragment() {
+        // Nobody can send to this, so it must not read like somewhere
+        // to send. Only a caller that skipped the dispatcher sees it.
+        let sig = signal(public("hooks/x", &[]), Value::Null);
+        let items = address_items(&ctx(&sig, None));
+        assert_eq!(items[0], LiveItem::text("Route (partial)", "/hooks/x"));
+    }
+
+    #[test]
+    fn a_signal_that_nothing_calls_into_has_no_address_to_show() {
+        let sig = signal(weft_core::primitive::SignalSurface::Internal, Value::Null);
+        assert!(address_items(&ctx(&sig, Some("https://w.example/x"))).is_empty());
+    }
+
+    #[test]
+    fn a_button_on_a_triggers_display_is_refused_at_the_door() {
+        // Nothing carries a press to a listener, so a kind that puts a
+        // button on its display has shipped one the reader cannot use;
+        // the door says so instead of drawing it.
+        let with_button = LiveFeed::new(vec![LiveItem::text("Phone", "paired")
+            .with_action(weft_core::live::LiveAction::new("Disconnect", "unpair"))]);
+        let why = read_only_display("poll_endpoint", &with_button).expect_err("a button is refused");
+        assert!(why.contains("poll_endpoint") && why.contains("Phone") && why.contains("read-only"), "{why}");
+        let plain = LiveFeed::new(vec![LiveItem::text("Phone", "paired")]);
+        assert!(read_only_display("poll_endpoint", &plain).is_ok());
+    }
+
+    #[test]
+    fn a_kind_this_listener_does_not_know_says_that_rather_than_showing_nothing() {
+        let mut sig = signal(weft_core::primitive::SignalSurface::Internal, Value::Null);
+        sig.spec.kind = "from_a_newer_program".into();
+        let feed = compute_live(&ctx(&sig, None));
+        assert_eq!(feed.items.len(), 1);
+        assert!(
+            feed.items[0].data.as_str().unwrap().contains("from_a_newer_program"),
+            "{:?}",
+            feed.items[0]
+        );
+    }
+
+    /// A registered signal of one kind, carrying the config a test wants
+    /// its display computed from.
+    fn with_config(kind: &str, config: Value) -> RegisteredSignal {
+        let mut sig = signal(weft_core::primitive::SignalSurface::Internal, Value::Null);
+        sig.spec.kind = kind.into();
+        sig.spec.config = config;
+        sig
+    }
+
+    #[test]
+    fn a_poll_url_carrying_a_token_is_masked_not_printed() {
+        // The kind's own motivating case: a bot token lives in the PATH,
+        // so there is no query string to strip and no part of the URL
+        // that is safe to show.
+        let sig = with_config(
+            "poll_endpoint",
+            serde_json::json!({
+                "url": "https://api.telegram.org/bot12345:SECRET/getUpdates",
+                "interval_secs": 30
+            }),
+        );
+        let feed = compute_live(&ctx(&sig, None));
+        assert_eq!(feed.items[0].kind, weft_core::live::LiveItemKind::Secret);
+        assert_eq!(feed.items[0].label, "Polling");
+        assert_eq!(feed.items[1], LiveItem::text("Every", "30s"));
+        // Masked, and still there for the reader who needs it: the
+        // panel reveals a secret on a click and copies the real value.
+        assert_eq!(feed.items[0].data.as_str().unwrap(), "https://api.telegram.org/bot12345:SECRET/getUpdates");
+    }
+
+    /// A configured URL is the one place a trigger's display can hold a
+    /// credential, so every kind that shows one masks it.
+    #[test]
+    fn every_kind_that_shows_a_configured_url_masks_it() {
+        let cases = [
+            ("sse_subscribe", serde_json::json!({
+                "url": "https://feed.example/stream?access_token=SECRET",
+                "event_name": "tick"
+            })),
+            ("socket_listen", serde_json::json!({
+                "url": "wss://gw.example/socket?token=SECRET"
+            })),
+            ("stream_listen", serde_json::json!({
+                "address": "user:pass@stream.example:9000",
+                "tls": true,
+                "framing": { "kind": "delimiter", "bytes": "\r\n" },
+                "fire": ".*"
+            })),
+        ];
+        for (kind, config) in cases {
+            let sig = with_config(kind, config);
+            let feed = compute_live(&ctx(&sig, None));
+            assert_eq!(
+                feed.items[0].kind,
+                weft_core::live::LiveItemKind::Secret,
+                "{kind} shows its url in the clear"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_with_no_configured_url_says_where_it_dials_instead() {
+        // A dynamic gateway mints the address per connection, so there
+        // is none to show; an empty box would read as a broken display.
+        let sig = with_config("socket_listen", serde_json::json!({ "url": "" }));
+        let feed = compute_live(&ctx(&sig, None));
+        assert_eq!(
+            feed.items[0],
+            LiveItem::text("Listening to", "an address minted for each connection")
+        );
+    }
+
+    #[test]
+    fn a_config_this_listener_cannot_read_says_what_is_wrong_with_it() {
+        // Register refuses a spec that does not parse, so this is a row
+        // from another version. The serde error names the field, which
+        // is the difference between a shrug and something actionable.
+        let sig = with_config("timer", serde_json::json!({ "spec": { "kind": "hourly" } }));
+        let feed = compute_live(&ctx(&sig, None));
+        assert_eq!(feed.items.len(), 1);
+        assert_eq!(feed.items[0].label, "Fires");
+        let said = feed.items[0].data.as_str().unwrap();
+        assert!(said.contains("timer"), "{said}");
+        assert!(said.contains("hourly") || said.contains("unknown variant"), "{said}");
+    }
+
+    #[test]
+    fn a_gated_route_with_no_connection_named_says_so() {
+        let mut sig = signal(public("chat", &[]), serde_json::json!({ "access_id": "acc-1" }));
+        sig.routing.auth = weft_core::primitive::SignalAuth::Connection;
+        let items = address_items(&ctx(&sig, Some("https://w.example/local/chat")));
+        assert_eq!(
+            items[1],
+            LiveItem::text("Auth", "gated, but this registration names no connection to check against")
         );
     }
 

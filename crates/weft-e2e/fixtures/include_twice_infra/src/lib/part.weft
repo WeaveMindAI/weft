@@ -1,0 +1,8 @@
+# One anonymous group around one infra node: the sidecar, and a node that
+# reads its status once it is up.
+Group() -> (status: String) {
+  svc = MiniService
+  after = Debug
+  after.data = svc.status
+  self.status = svc.status
+}

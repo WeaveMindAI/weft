@@ -2490,6 +2490,26 @@ fn include_requires_single_group() {
     assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "errs: {errs:?}");
 }
 
+/// The entry file is the program, and an anonymous `Group(...) { }` is an
+/// included file's interface: one in the entry file is refused, in the
+/// build (no source name) and in the editor's parse of `src/main.weft`
+/// alike, rather than being named after the file behind the user's back.
+#[test]
+fn the_entry_file_refuses_an_anonymous_top_level_group() {
+    let source = "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n";
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.message.contains("the entry file's top-level group must be named")),
+        "errs: {errs:?}"
+    );
+    let (_, errs) = compile_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("must be named")), "the editor's parse refuses it too: {errs:?}");
+    // A named one is the ordinary shape of a program.
+    let named = "main = Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n";
+    let (_, errs) = compile_lenient(named, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
 #[test]
 fn include_rejects_loose_nodes() {
     let dir = tempfile::tempdir().unwrap();
@@ -2530,18 +2550,40 @@ fn duplicate_config_key_is_loud() {
     assert!(errs2.iter().any(|e| e.message.contains("duplicate config field 'value'")), "two body fields dup: {errs2:?}");
 }
 
+/// The same rule inside a container's braces: a loop setting or the
+/// gate written twice is refused, never last-write-wins. Each braces
+/// field is lowered on its own, so the guard is the braces walk's.
+#[test]
+fn a_duplicate_setting_or_gate_in_a_containers_braces_is_loud() {
+    let loop_twice = "l = Loop(items: List[String]) -> (out: List[String | Null]) {\n  parallel: true\n  parallel: false\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\n";
+    let (_p, errs) = compile_lenient(loop_twice, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("duplicate config field 'parallel'")), "two settings: {errs:?}");
+
+    let gate_twice = "g = Group(x: String) -> (y: String) {\n  _should_flow: false\n  _should_flow: true\n  self.y = self.x\n}\n";
+    let (_p2, errs2) = compile_lenient(gate_twice, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(errs2.iter().any(|e| e.message.contains("duplicate config field '_should_flow'")), "two gates: {errs2:?}");
+
+    // A wired setting on a plain group is refused in the group's own
+    // words: a group has no settings to advertise.
+    let wired_on_group = "s = Text { value: \"x\" }\ng = Group(x: String) -> (y: String) {\n  tone: s.value\n  self.y = self.x\n}\n";
+    let (_p3, errs3) = compile_lenient(wired_on_group, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    let said = errs3.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(said.contains("groups take no settings in the braces"), "{said}");
+    assert!(!said.contains("parallel: true"), "a group is not told about loop settings: {said}");
+}
+
 #[test]
 fn literal_to_non_node_port_is_loud() {
-    // A literal is the "visual config" sugar that only a NODE has. Assigning one
-    // to a port with no node config behind it is meaningless and previously
-    // produced a phantom edge with an EMPTY source and no diagnostic. All such
-    // targets must fail loud: a group boundary (`self.out`), and a group/include
-    // alias port (`c.raw`). A node config fill (`n.port = "v"`) and an inline
-    // node (`c.raw = Text{...}.value`) are still valid.
+    // A literal fills a port of something declared in scope (a node's
+    // config, a container's or include alias's interface port). One
+    // written for anything else previously produced a phantom edge with
+    // an EMPTY source and no diagnostic; it must fail loud: a group's own
+    // boundary from inside (`self.out`). An inline node
+    // (`c.raw = Text{...}.value`) is wiring and stays valid.
     let assert_loud = |src: &str, fs: CompileFs, what: &str| {
         let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), fs, IncludeMode::Interface, None);
         assert!(
-            errs.iter().any(|e| e.message.contains("only a node's own port takes a literal config value")),
+            errs.iter().any(|e| e.message.contains("is not a port of anything declared here")),
             "{what}: literal to a non-node port must be loud: {errs:?}"
         );
         assert!(!p.edges.iter().any(|e| e.source.is_empty()), "{what}: no empty-source edge: {:?}", p.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>());
@@ -2558,7 +2600,7 @@ fn literal_to_non_node_port_is_loud() {
         "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n",
         uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None,
     );
-    assert!(!errs.iter().any(|e| e.message.contains("only a node's own port takes")), "inline node to a group port is valid: {errs:?}");
+    assert!(!errs.iter().any(|e| e.message.contains("cannot assign a literal")), "inline node to a group port is valid: {errs:?}");
 }
 
 #[test]
@@ -3007,7 +3049,7 @@ fn a_value_lands_on_an_input_and_nowhere_else() {
     refused(
         "s = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: s.value\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\n",
         "wire on a loop knob",
-        &["not valid loop config values"],
+        &["a setting in the braces takes a written value only", "l.<port> = ..."],
     );
     refused(
         "g = Group(x: String) -> (y: String) {\n  self.x = \"hi\"\n  self.y = self.x\n}\n",
@@ -3324,6 +3366,41 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
     assert!(errs.is_empty(), "{errs:?}");
     let node = p2.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
     assert_eq!(node.config.get("raw"), Some(&serde_json::json!("hi")));
+}
+
+/// A container names its ports in its signature, so a port called
+/// `label` (or `mock`) is just a port there: the reserved vocabulary is a
+/// node's. A value written for it lands on the boundary, on a group, on a
+/// loop and on an include alias in both modes, while the same key on a
+/// node is still the renamed-key refusal.
+#[test]
+fn a_container_port_may_be_called_label() {
+    let group = "g = Group(label: String, mock: String) -> (y: String) {\n  self.y = self.label\n}\ng.label = \"hi\"\ng.mock = \"m\"\nout = Debug {}\nout.data = g.y\n";
+    let p = compile(group, uuid::Uuid::new_v4(), CompileFs::none()).expect("a group port called label");
+    let pt_in = p.nodes.iter().find(|n| n.id == "g__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("label"), Some(&serde_json::json!("hi")));
+    assert_eq!(pt_in.port_literals.get("mock"), Some(&serde_json::json!("m")));
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mark.weft"),
+        "Group(label: String) -> (y: String) {\n  self.y = self.label\n}\n").unwrap();
+    let src = "m = @include(\"mark.weft\")\nm.label = \"hi\"\nout = Debug {}\nout.data = m.y\n";
+    let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("an include port called label");
+    let pt_in = p.nodes.iter().find(|n| n.id == "m__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("label"), Some(&serde_json::json!("hi")));
+    let (p2, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "{errs:?}");
+    let node = p2.nodes.iter().find(|n| n.id == "m").expect("opaque include node");
+    assert_eq!(node.config.get("label"), Some(&serde_json::json!("hi")));
+
+    // On a node the key is still the node's reserved vocabulary, on a
+    // connection line as in the braces.
+    let node = "n = Debug {}\nn.label = \"hi\"\n";
+    let err = compile(node, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("a node's label key");
+    assert!(format!("{err:?}").contains("'label' was renamed to '_label'"), "got {err:?}");
+    let node = "n = Debug { label: \"hi\" }\n";
+    let err = compile(node, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("a node's label key");
+    assert!(format!("{err:?}").contains("'label' was renamed to '_label'"), "got {err:?}");
 }
 
 /// `name?: Type` is the one optional spelling: the `?` on the name once

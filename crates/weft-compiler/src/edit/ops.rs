@@ -1037,23 +1037,27 @@ fn set_config(
     let decl = resolve(view, node_id)?;
     // A container takes values on its INTERFACE PORTS, which is what this
     // op writes. Its loop knobs are a different home and ride
-    // `SetLoopConfig` / `RemoveLoopConfig`. An include alias has neither.
-    if let Decl::Include(_) = &decl {
-        return Err(kind_mismatch("SetConfig/RemoveConfig", node_id, "Node", &decl));
-    }
-    if matches!(decl, Decl::Group(_) | Decl::Loop(_)) {
+    // `SetLoopConfig` / `RemoveLoopConfig`. An include alias is a
+    // container too: its ports are the included file's, and it has no
+    // braces at all, so every value is the statement `alias.key = value`.
+    if matches!(decl, Decl::Group(_) | Decl::Loop(_) | Decl::Include(_)) {
         // Inside the braces, the only key a container reads is
         // `_should_flow`: an ordinary key there is a loop knob or an
         // error, never a port value. Every other port is written as a
-        // `g.key = value` statement.
-        if !weft_core::exec::skip::is_gate_port(key) {
+        // `g.key = value` statement, and on an include alias, which has
+        // no braces, the gate is too.
+        if !weft_core::exec::skip::is_gate_port(key) || matches!(decl, Decl::Include(_)) {
             // Only a DECLARED in-port may be written as `g.key = value`:
             // anything else would emit source the compiler then rejects.
             // Loop knobs (`over`, `parallel`, ...) are not ports and ride
             // `SetLoopConfig`; refuse them here with a pointer. Checked
             // BEFORE the braces-form refusal, so a typo'd key is named a
-            // non-port rather than "one of its ports".
-            if !header_in_port_names(&decl).iter().any(|p| p == key) {
+            // non-port rather than "one of its ports". An include alias
+            // declares nothing in this file (its ports are in the
+            // included one), so its keys are taken as written: the
+            // editor offers only the ports the compiled interface has,
+            // and a stray key is the compiler's refusal at the next parse.
+            if !matches!(decl, Decl::Include(_)) && !header_in_port_names(&decl).iter().any(|p| p == key) {
                 return Err(EditError::InvalidArgument(match &decl {
                     Decl::Loop(_) => format!(
                         "'{key}' is not a port of the loop '{node_id}'; loop knobs ride \
@@ -1063,10 +1067,20 @@ fn set_config(
                 }));
             }
             if form == Some(super::ValueForm::Inline) {
-                return Err(EditError::InvalidArgument(format!(
-                    "'{node_id}' is a container: '{key}' is one of its ports, written `{node_id}.{key} = ...`, and has no braces form"
-                )));
+                return Err(EditError::InvalidArgument(match &decl {
+                    Decl::Include(_) => format!(
+                        "'{node_id}' is an include: a value for '{key}' is written `{node_id}.{key} = ...` and has no braces form"
+                    ),
+                    _ => format!(
+                        "'{node_id}' is a container: '{key}' is one of its ports, written `{node_id}.{key} = ...`, and has no braces form"
+                    ),
+                }));
             }
+            // A port driven by an inline expression on this line
+            // (`g.key = Text {...}.value`) is not a value line, so a
+            // write would add a second driver beside it: extract that
+            // expression as its own node first, as the node path does.
+            deinline_value_holder(view, &decl, key)?;
             return match (find_connection_origin_field(view, &decl, key), value) {
                 (Some(conn), Some(v)) => replace_connection_rhs(&conn, v),
                 (Some(conn), None) => { detach_with_leading_ws(&conn); Ok(()) }
@@ -2413,7 +2427,7 @@ fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Ve
     crate::weft_compiler::compile_lenient(
         &view.file().syntax().to_string(), uuid::Uuid::nil(),
         crate::file_reader::CompileFs::none(), crate::weft_compiler::IncludeMode::Full,
-        Some(view.source_id()),
+        view.source_id(),
     )
 }
 

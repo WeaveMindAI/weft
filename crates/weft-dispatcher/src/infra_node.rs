@@ -1,7 +1,13 @@
 //! Per-project infra registry, backed by Postgres `infra_node` rows.
 //!
-//! One row per `(project_id, infra_node_id)` pair tracking the
-//! desired-vs-applied state of one infra node. The supervisor pod
+//! One row per `(project_id, node_id)` pair tracking the
+//! desired-vs-applied state of one infra INSTANCE, where `node_id` is
+//! the node's PLACE spelled the way a person writes it (`db`, or
+//! `one.db` inside the file the site `one` includes). A file included
+//! twice holds two instances, one row each, and the spelling is what
+//! tells them apart; it is also what every reader prints and every
+//! verb takes, so nothing translates on the way in or out. The
+//! compiled id behind a place is never stored here. The supervisor pod
 //! writes status transitions as it executes a claimed
 //! `infra_lifecycle_command`, and writes runtime events (Flaky /
 //! Recovered) and may flip status as part of that execution.
@@ -26,6 +32,7 @@ pub use weft_broker_client::protocol::{FailureStage, InfraNodeStatus, UnitRuntim
 #[derive(Debug, Clone)]
 pub struct InfraNodeRow {
     pub project_id: String,
+    /// The instance's place, spelled (see the module doc).
     pub node_id: String,
     /// Stable per-apply id (Deployment name etc). Empty string when
     /// status is `Failed` and the apply never produced one.

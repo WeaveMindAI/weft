@@ -135,9 +135,13 @@ plumbing." Then read the key with dots, narrow the port to the shape it
 carries, declare the ports on the consumer, or wire `_should_flow` (under
 Reserved keys).
 
-A branch, a loop or a call is real work, and Python is the right answer for
-it: filtering a list on a condition, parsing what no type describes, calling
-a library.
+Calling a library, parsing what no type describes, reshaping a list in
+memory: that is processing, and Python is the right answer for it. A branch
+or a loop that decides what the program does next (whether a step runs,
+which service is called, a call made once per item) is coordination, and it
+belongs in the graph, where each step is visible and journaled: a `Switch`
+with `_should_flow` for the branch, a `Loop` for the repetition, one node
+per call.
 
 Building an object out of values you already hold (a reply body, a payload)
 is the case you will meet most, and it has its own node: wire a value onto
@@ -719,7 +723,9 @@ the answer is those three groups.
 
 Reuse across files: `triage = @include("triage.weft")`, where the included
 file is exactly one anonymous top-level group and nothing else; its ports
-become `triage`'s:
+become `triage`'s. That shape is for included files only: an anonymous
+group in `src/main.weft` is a compile error, the entry file's groups carry
+names:
 
 ```weft
 # src/triage.weft: sorts a message into a lane
@@ -748,7 +754,12 @@ addressed through the site, the way the source reads. `weft events <run>
 node that way, `weft run --group triage` runs the call, and a cut inside the
 file is spelled the same (`--from triage.classify`, `--target
 triage.classify`) and runs inside that one call. The same file included
-twice reads apart (`triage.classify`, `again.classify`).
+twice reads apart (`triage.classify`, `again.classify`) and runs apart: each
+call has its own runs and waits, its triggers register once per call, and
+its infra is provisioned once per call (`weft infra status` lists `triage.db`
+and `again.db`, each with its own disks and endpoint). An alias's ports take
+a value the way a group's do, on their own lines (`triage.tone = "formal"`):
+the alias has no braces to write in.
 
 ## Loops
 
@@ -764,6 +775,12 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   self.results = step.out
 }
 ````
+
+The settings in the braces (`parallel`, `over`, `carry`, `max_iters`,
+`trim_on_mismatch`) take a written value only, never a wire: the compiler
+reads them to build the loop. A loop's ports take a value the way a group's
+do, on their own lines outside (`doubler.values = [1, 2]`), never in the
+braces.
 
 Four port roles, derived from the config:
 

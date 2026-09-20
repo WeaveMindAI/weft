@@ -13,7 +13,7 @@ describe('parseStatusPayload', () => {
       running_count: 3,
       available_actions: ['deactivate'],
       fires_deadline_unix: 123,
-      infra: [{ node_id: 'n1', node_type: 'pg', status: 'running' }],
+      infra: [{ node: 'n1', node_type: 'pg', status: 'running' }],
       preservation: { parked: 2, suspended: 1 },
     });
     expect(snap.projectStatus).toBe('active');
@@ -25,7 +25,7 @@ describe('parseStatusPayload', () => {
     expect(snap.orphanedInfra).toBe(true);
     expect(snap.runningCount).toBe(3);
     expect(snap.firesDeadlineUnix).toBe(123);
-    expect(snap.infraNodes).toEqual([{ nodeId: 'n1', nodeType: 'pg', status: 'running' }]);
+    expect(snap.infraNodes).toEqual([{ node: 'n1', nodeType: 'pg', status: 'running' }]);
     expect(snap.preservation).toEqual({ parked: 2, suspended: 1 });
   });
 

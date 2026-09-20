@@ -249,10 +249,10 @@ The complete set, `hidden` aside, which only catalog nodes use:
 | `isTrigger` | this node starts executions from outside |
 | `optionalCustomInputs` | ports created by a wire on this node are optional by default |
 | `customInputType` | the type every WIRED created port takes; a shared variable (`T`) makes them one type. A port created by a config literal takes the literal's own inferred type instead, so a non-string literal on a `String`-typed node is caught at run time by the node, loudly |
-| `liveEndpoint` | names the endpoint serving `/live` for an infra node |
+| `liveEndpoint` | names the endpoint serving `/live` for an infra node, which is what opts the node into having a [display](showing-things-in-the-graph.md#its-display) |
 | `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. This is how a node takes an open-ended set of values (`ExecPython`, `Format`, `PostgresExecuteQuery`); never a `List` input the author has to assemble. |
 | `canAddOutputPorts` | the same for outputs |
-| `showDebugPreview` | the editor renders the node's latest output inline on its body |
+| `showDebugPreview` | the editor renders the node's latest output inline on its body (what flowed in, for a node that declares no outputs, like `Debug`) |
 | `oneOfRequired` | groups of ports where at least one of each group has to arrive, or the node is **skipped**. `[["message", "attachment"]]` means a send needs one or the other. |
 | `castPorts` | this node converts a named input into a named output's declared type, checked against the conversion table at compile time |
 

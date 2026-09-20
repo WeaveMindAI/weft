@@ -19,7 +19,10 @@ triage.email = inbox.message
 alert.data = triage.severity
 ```
 
-The included file must be exactly one anonymous top-level group:
+The included file must be exactly one anonymous top-level group. That shape
+belongs to included files only: an anonymous group in `src/main.weft` is a
+compile error, because the entry file is the program and its top-level
+groups carry names.
 
 ```weft
 # triage.weft

@@ -364,9 +364,9 @@ pub fn compile_lenient(
     // Parse (the parser already builds a partial ParseState alongside errors).
     // The file's identity: derived from the filename for an anonymous top-level
     // group (`Group(){...}`), so the file's anon root has the same id at parse,
-    // edit, and render. `None`/an unsaved buffer falls back to `Untitled`.
-    let source_id = source_name.unwrap_or("Untitled");
-    let mut state = parse_weft(source, source_id);
+    // edit, and render. `None` is the project's ENTRY file, which may hold no
+    // anonymous group at all: the lowering refuses one there.
+    let mut state = parse_weft(source, source_name);
     errors.append(&mut state.errors);
     // Resolve `@include` declarations (Full inlines, Interface emits opaque
     // nodes), collecting errors.
@@ -389,7 +389,7 @@ fn parse_checked(
     source: &str,
     source_id: &str,
 ) -> Result<ParseState, Vec<CompileError>> {
-    let state = parse_weft(source, source_id);
+    let state = parse_weft(source, Some(source_id));
     if !state.errors.is_empty() {
         return Err(state.errors);
     }
@@ -550,14 +550,23 @@ fn apply_pending_literals(
 
 /// The same values, landing on the opaque node an interface-mode include
 /// resolves to: that node carries the group's ports, so they are its
-/// config fields.
+/// config fields. Its keys are the file's signature ports, never a node's
+/// config vocabulary, so a port called `label` is filled like any other,
+/// and a name outside the signature is refused here exactly as the build's
+/// full mode refuses it on the call site's boundary.
 fn apply_pending_literals_to_node(
     inc: &ParsedInclude,
     node: &mut ParsedNode,
     errors: &mut Vec<CompileError>,
 ) {
     for fill in &inc.pending_literals {
-        apply_literal_fill(fill, &mut node.config, &mut node.config_spans, errors);
+        if !container_port_declared(&fill.target_id, &fill.port, &node.in_ports, fill.span, errors) {
+            continue;
+        }
+        let Some(value) = &fill.value else { continue };
+        if let Some(k) = store_literal(&fill.port, value.clone(), &mut node.config, fill.span, errors) {
+            node.config_spans.insert(k, ConfigFieldSpan::connection(fill.span));
+        }
     }
 }
 
@@ -1029,7 +1038,9 @@ fn content_start(node: &crate::cst::SyntaxNode) -> rowan::TextSize {
 
 /// Parse source into the `ParseState` AST via the CST. The single parser: it
 /// reads raw text once (the CST), and lowers that tree into `ParseState`.
-fn parse_weft(source: &str, source_id: &str) -> ParseState {
+/// `source_id` is the id an anonymous top-level group takes (an included
+/// file's body id); `None` is the entry file, where one is refused.
+fn parse_weft(source: &str, source_id: Option<&str>) -> ParseState {
     use crate::cst::nodes::{Decl as CstDecl, WeftFile};
     let root = crate::cst::parse(source);
     let li = LineIndex::new(source);
@@ -1184,6 +1195,11 @@ fn detect_structural_errors(node: &crate::cst::SyntaxNode, li: &LineIndex, error
 struct LiteralFill {
     target_id: String,
     port: String,
+    /// The RHS read as a value where the line is recognised, not where
+    /// the target is known: a `@file("x", Alias)` marker names a type
+    /// in the file's lexical scope, and that scope is gone by the time
+    /// an include alias's pending values land. `None` when the text was
+    /// no value (its error is already pushed).
     value: Option<serde_json::Value>,
     /// Span of the whole connection (the config field's source range).
     span: Span,
@@ -1214,17 +1230,47 @@ fn literal_config_fill(conn: &crate::cst::SyntaxNode, li: &LineIndex, errors: &m
 
 /// Apply a recognized literal fill to a node's config maps (value + a
 /// connection-origin span). The two-line store, shared so the span origin and
-/// value parsing can't diverge between scopes.
+/// value parsing can't diverge between scopes. The key rules are a node's
+/// (`node_config_key_ok`), so they are asked here, once the target is known
+/// to be one, and not where the line was recognised.
 fn apply_literal_fill(
     fill: &LiteralFill,
     config: &mut serde_json::Map<String, serde_json::Value>,
     config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
     errors: &mut Vec<CompileError>,
 ) {
+    if !node_config_key_ok(&fill.port, fill.span, errors) {
+        return;
+    }
     let Some(value) = &fill.value else { return };
     if let Some(k) = store_literal(&fill.port, value.clone(), config, fill.span, errors) {
         config_spans.insert(k, ConfigFieldSpan::connection(fill.span));
     }
+}
+
+/// Whether a value may be written for `port` on a container or an include
+/// alias whose signature declares `in_ports`: one of those ports, or the
+/// gate. The one rule for every place a container's ports are filled (a
+/// group or loop in this file, an include in either mode), so the build
+/// and the editor's parse refuse the same lines. Pushes its own error.
+fn container_port_declared(
+    target_id: &str,
+    port: &str,
+    in_ports: &[ParsedPort],
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) -> bool {
+    if in_ports.iter().any(|p| p.name == port) || weft_core::exec::skip::is_gate_port(port) {
+        return true;
+    }
+    errors.push(CompileError::at(
+        span,
+        format!(
+            "'{target_id}' has no input port '{port}'. Its ports are the ones in its signature, \
+             plus the gate (`_should_flow` or `_should_not_flow`)"
+        ),
+    ));
+    false
 }
 
 /// Apply a recognized literal fill to a CONTAINER's interface port
@@ -1236,16 +1282,7 @@ fn apply_container_literal_fill(
     group: &mut ParsedGroup,
     errors: &mut Vec<CompileError>,
 ) {
-    let declared = group.in_ports.iter().any(|p| p.name == fill.port)
-        || weft_core::exec::skip::is_gate_port(&fill.port);
-    if !declared {
-        errors.push(CompileError::at(
-            fill.span,
-            format!(
-                "'{}' has no input port '{}'. Its ports are the ones in its signature, plus `_should_flow`",
-                fill.target_id, fill.port
-            ),
-        ));
+    if !container_port_declared(&fill.target_id, &fill.port, &group.in_ports, fill.span, errors) {
         return;
     }
     let Some(value) = &fill.value else { return };
@@ -1255,11 +1292,12 @@ fn apply_container_literal_fill(
 }
 
 /// Lower a top-level CONNECTION. A literal RHS (`node.port = "v"`) fills that
-/// NODE's config, and the same written on a group or loop's interface port
-/// fills the container. A literal to anything else (an include alias, an
-/// undeclared target) has nothing to fill: it falls through to
-/// `lower_connection`, which rejects the bare literal loudly. Otherwise (an
-/// endpoint or inline-expr RHS) it is an edge / node synthesis.
+/// NODE's config, the same written on a group or loop's interface port
+/// fills the container, and on an include alias it waits for the include
+/// to resolve. A literal to an undeclared target has nothing to fill: it
+/// falls through to `lower_connection`, which rejects the bare literal
+/// loudly. Otherwise (an endpoint or inline-expr RHS) it is an edge / node
+/// synthesis.
 fn lower_top_level_connection(conn: &crate::cst::SyntaxNode, li: &LineIndex, state: &mut ParseState, inline: &mut InlineScope) {
     if let Some(fill) = literal_config_fill(conn, li, &mut state.errors) {
         if let Some(node) = state.nodes.iter_mut().find(|n| n.id == fill.target_id) {
@@ -1274,9 +1312,9 @@ fn lower_top_level_connection(conn: &crate::cst::SyntaxNode, li: &LineIndex, sta
             inc.pending_literals.push(fill);
             return;
         }
-        // Neither: a literal can't fill an include alias or an undeclared
-        // port. Fall through; `lower_connection` emits the single "cannot
-        // assign a literal" error (no phantom empty-source edge).
+        // None of them: an undeclared target. Fall through;
+        // `lower_connection` emits the single "cannot assign a literal"
+        // error (no phantom empty-source edge).
     }
     // No enclosing group, so an inline-expr RHS synthesizes its anon node at the
     // file root (scope None).
@@ -1316,12 +1354,13 @@ fn connection_rhs_text(conn: &crate::cst::SyntaxNode) -> String {
 
 /// Lower one CST declaration into the ParseState (node / group / include),
 /// scoped under `parent` (None = top level). `source_id` is the file's identity
-/// (filename-derived; `Untitled` if unsaved), used as the id of an anonymous
-/// top-level `Group(){...}`.
+/// (an included file's body id, or the filename-derived id of a standalone
+/// file), used as the id of an anonymous top-level `Group(){...}`; `None` is
+/// the entry file, which may hold no anonymous group.
 fn lower_decl(
     decl: &crate::cst::nodes::Decl,
     parent: Option<&str>,
-    source_id: &str,
+    source_id: Option<&str>,
     li: &LineIndex,
     state: &mut ParseState,
     inline: &mut InlineScope,
@@ -1875,6 +1914,13 @@ fn lower_config_field(
     // Otherwise a literal value: reconstruct the value text after the colon.
     let value_text = field_value_text(field);
     if field.kind() == K::LABEL_FIELD {
+        // The parser wraps both spellings so neither falls into config, and
+        // the old one is refused here the way it is on a connection line
+        // (`node_config_key_ok`): a hard break, never a silent alias.
+        if key == "label" {
+            errors.push(CompileError::at(span, "'label' was renamed to '_label' (reserved internal key)"));
+            return;
+        }
         // The label has ONE home (`node.label`); set twice is a loud error, the
         // same rule `store_value_text` enforces for config keys.
         if out.label.is_some() {
@@ -2107,6 +2153,9 @@ fn store_value_text(
     span: Span,
     errors: &mut Vec<CompileError>,
 ) -> Option<String> {
+    if !node_config_key_ok(key, span, errors) {
+        return None;
+    }
     let value = parse_config_literal(key, value, span, errors)?;
     store_literal(key, value, config, span, errors)
 }
@@ -2202,21 +2251,20 @@ fn lower_connection(
         return None;
     }
     // RHS = a second endpoint (`src.port`): a plain edge. If there is NO second
-    // endpoint, the RHS is a LITERAL. A literal is the "visual config" sugar that
-    // only a NODE has: `node.port = "v"` fills that node's config. The valid
-    // node-config case is peeled off upstream (`literal_config_fill` + node
-    // lookup) before reaching here, so a literal arriving in `lower_connection`
-    // targets something with no config: a group boundary (`self.port`), a
-    // group/include alias port, or an undeclared target. All are invalid: a port
-    // that isn't a node's own config is driven by WIRING (`= src.out`, or an
-    // inline node `= Text { value: "v" }.value`), never a bare constant. Reject
-    // loudly instead of emitting a phantom edge with an empty source.
+    // endpoint, the RHS is a LITERAL. A literal fills a port of something
+    // declared in scope: a node's config, a group's, loop's or include
+    // alias's interface port. Every one of those is peeled off upstream
+    // (`literal_config_fill` + the target lookup) before reaching here, so a
+    // literal arriving in `lower_connection` targets something that takes
+    // none: a group's own boundary from inside (`self.port`, driven from
+    // outside) or a name declared nowhere. Reject loudly instead of emitting
+    // a phantom edge with an empty source.
     let Some(src_ep) = eps.get(1) else {
         let target_desc = if t_port.is_empty() { t_id.clone() } else { format!("{t_id}.{t_port}") };
         // Span the TARGET endpoint (the culprit), not the whole line.
         errors.push(CompileError::at(
             li.span_of(target),
-            format!("cannot assign a literal to '{target_desc}': only a node's own port takes a literal config value. Drive this port by wiring (`{target_desc} = source.out`) or an inline node (`{target_desc} = Text {{ value: \"...\" }}.value`)."),
+            format!("cannot assign a literal to '{target_desc}': it is not a port of anything declared here (a group's own input is given its value from outside, on the group's name). Drive it by wiring (`{target_desc} = source.out`) or an inline node (`{target_desc} = Text {{ value: \"...\" }}.value`)."),
         ));
         return None;
     };
@@ -2249,12 +2297,12 @@ fn endpoint_id_port(ep: &crate::cst::SyntaxNode) -> (String, String) {
 }
 
 /// Lower a GROUP_DECL recursively into a ParsedGroup. `source_id` is the file's
-/// filename-derived identity, used as the local id of a top-level anonymous
-/// `Group(){...}` (`Untitled` for an unsaved buffer).
+/// identity, used as the local id of a top-level anonymous `Group(){...}`;
+/// `None` is the entry file, where an anonymous group is refused.
 fn lower_group(
     g: &crate::cst::nodes::GroupDecl,
     parent: Option<&str>,
-    source_id: &str,
+    source_id: Option<&str>,
     li: &LineIndex,
     errors: &mut Vec<CompileError>,
 ) -> Option<ParsedGroup> {
@@ -2282,7 +2330,24 @@ fn lower_group(
         errors.push(CompileError::at(header_span, "a nested group must be named (`name = Group(...)`); only a file's top-level group may be anonymous"));
         return None;
     }
-    let local_id = if anonymous { source_id.to_string() } else { local_id };
+    let local_id = match (anonymous, source_id) {
+        (false, _) => local_id,
+        (true, Some(source_id)) => source_id.to_string(),
+        // The entry file is the program, and an anonymous group is a
+        // FILE's interface (the thing an `@include` of it brings in), so
+        // one here would be a program with no name for its own root and
+        // a spelling nobody can write. Refused, never named after the
+        // file.
+        (true, None) => {
+            errors.push(CompileError::at(
+                header_span,
+                "the entry file's top-level group must be named (`name = Group(...) { ... }`); an \
+                 anonymous `Group(...) { ... }` is an included file's interface, so move it to a \
+                 file and `@include` it",
+            ));
+            return None;
+        }
+    };
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("group", &id, &one_of_required, header_span, errors);
@@ -2316,7 +2381,7 @@ fn lower_group(
 fn lower_loop(
     l: &crate::cst::nodes::LoopDecl,
     parent: Option<&str>,
-    source_id: &str,
+    source_id: Option<&str>,
     li: &LineIndex,
     errors: &mut Vec<CompileError>,
 ) -> Option<ParsedGroup> {
@@ -2392,7 +2457,7 @@ fn lower_grouplike_body(
     group: &mut ParsedGroup,
     body: Option<crate::cst::nodes::Body>,
     parent: Option<&str>,
-    source_id: &str,
+    source_id: Option<&str>,
     in_ports: Vec<ParsedPort>,
     header_span: Span,
     li: &LineIndex,
@@ -2418,7 +2483,7 @@ fn lower_grouplike_body_in_scope(
     group: &mut ParsedGroup,
     body: &crate::cst::nodes::Body,
     parent: Option<&str>,
-    source_id: &str,
+    source_id: Option<&str>,
     mut in_ports: Vec<ParsedPort>,
     header_span: Span,
     li: &LineIndex,
@@ -2432,6 +2497,11 @@ fn lower_grouplike_body_in_scope(
     // Defer connections so child nodes exist first: a `child.field = <lit>`
     // connection is a config-origin field on that child, not an edge.
     let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
+    // Every key written in these braces, so a second `parallel:` or a
+    // second gate is refused the way a node's duplicate field is: each
+    // field is lowered into its own scratch body below, so the store's
+    // own duplicate guard never sees the earlier one.
+    let mut braces_keys: std::collections::BTreeSet<String> = Default::default();
     for child in body.syntax().children() {
         match child.kind() {
             K::CONFIG_FIELD => {
@@ -2460,15 +2530,41 @@ fn lower_grouplike_body_in_scope(
                     group.connections.extend(std::mem::take(&mut tmp_inline.connections));
                 }
                 if !tmp_inline.nodes.is_empty() || !tmp_inline.connections.is_empty() {
-                    // Everything else: an inline expression as a config
-                    // value would synthesize helper nodes that nothing
-                    // wires up, and the value itself would disappear.
-                    errors.push(CompileError::at(
-                        field_span,
-                        format!("{noun} '{id}': inline expressions are not valid {noun} config values"),
-                    ));
+                    // Everything else: a wire or an inline expression in
+                    // the braces. A loop's settings are read by the
+                    // compiler to build the loop, before anything runs,
+                    // so nothing can drive one; a plain group has no
+                    // settings at all. Either way the helper nodes it
+                    // would synthesize would hang wired to nothing.
+                    let message = match (&group.loop_config, &group.kind) {
+                        (Some(_), _) => format!(
+                            "{noun} '{id}': a setting in the braces takes a written value only \
+                             (`parallel: true`, `over: [\"items\"]`), never a wire or an expression. \
+                             To feed one of its ports, write it outside on its name (`{id}.<port> = ...`)"
+                        ),
+                        // An included file's own top-level group: its ports
+                        // are fed from the file that includes it, on the
+                        // alias, because its id is nothing a person writes.
+                        (None, GroupKind::Body) => format!(
+                            "{noun} '{id}': the file's top-level group takes no settings in its braces, \
+                             only `_should_flow`. To feed one of its ports, write it in the file that \
+                             includes this one, on the include alias (`alias.<port> = ...`)"
+                        ),
+                        (None, _) => format!(
+                            "{noun} '{id}': {noun}s take no settings in the braces, only `_should_flow`. \
+                             To feed one of its ports, write it outside on its name (`{id}.<port> = ...`)"
+                        ),
+                    };
+                    errors.push(CompileError::at(field_span, message));
                 }
                 for (key, value) in tmp_body.config {
+                    if !braces_keys.insert(key.clone()) {
+                        errors.push(CompileError::at(
+                            field_span,
+                            format!("duplicate config field '{key}': it may be set only once"),
+                        ));
+                        continue;
+                    }
                     if weft_core::exec::skip::is_gate_port(key.as_str()) {
                         group.port_literal_spans
                             .insert(key.clone(), ConfigFieldSpan::inline(field_span));
@@ -3029,18 +3125,17 @@ fn quote_markers(raw: &str) -> String {
 }
 
 
-fn parse_config_literal(
-    key: &str,
-    raw: &str,
-    span: Span,
-    errors: &mut Vec<CompileError>,
-) -> Option<serde_json::Value> {
-    let raw = raw.trim();
-
+/// Whether `key` may be a NODE's config key. The reserved vocabulary
+/// (`_label`, `_tags`, the gates) and the removed keys are a node's
+/// concern only: a group, a loop or an included file names its ports in
+/// its signature, so a port there called `label` is just a port, and a
+/// value written for it never comes through here (the container fill
+/// checks the signature instead). Pushes its own error.
+fn node_config_key_ok(key: &str, span: Span, errors: &mut Vec<CompileError>) -> bool {
     // Reject removed config keys
     if key == "mock" || key == "mocked" {
         errors.push(CompileError::at(span, format!("'{}' is not a valid config key. Use test configs for mocking.", key)));
-        return None;
+        return false;
     }
 
     // Hard break: pre-arch4 keys were renamed to leading-underscore
@@ -3048,7 +3143,7 @@ fn parse_config_literal(
     // up the old behavior silently.
     if key == "label" {
         errors.push(CompileError::at(span, "'label' was renamed to '_label' (reserved internal key)"));
-        return None;
+        return false;
     }
     // `_is_output` used to mark the nodes a run existed to feed. There
     // is no such set any more: every node the run reaches runs, and a
@@ -3058,18 +3153,18 @@ fn parse_config_literal(
             span,
             "`_is_output` no longer exists: every reached node runs; use `--target` to narrow a run",
         ));
-        return None;
+        return false;
     }
 
     // `_label` is NOT a config value: it is the node's LABEL, set ONLY via the
     // body `_label: "..."` field (which routes through `parse_label_value` into
-    // `node.label`, never here). Reaching this parser with `_label` means a
+    // `node.label`, never here). Reaching this check with `_label` means a
     // connection-origin `node._label = ...`, which would misroute the label into
     // `config["_label"]` where nothing reads it. Reject loud so a label has one
     // home (`node.label`) and one syntax (the body field).
     if key == "_label" {
         errors.push(CompileError::at(span, "a node's label is set with a body field `_label: \"...\"`, not a connection `node._label = ...`".to_string()));
-        return None;
+        return false;
     }
     // The other reserved keys ARE config keys (read from `config`
     // downstream); anything else with a leading underscore is rejected so
@@ -3083,9 +3178,23 @@ fn parse_config_literal(
                  Allowed reserved keys: {}",
                 RESERVED_CONFIG_KEYS.join(", ")
             )));
-            return None;
+            return false;
         }
     }
+    true
+}
+
+/// The value a literal's source text stands for. `key` names the field
+/// in the messages only; whether the key itself is allowed is the
+/// target's question (`node_config_key_ok` for a node, the signature
+/// for a container), asked where the target is known.
+fn parse_config_literal(
+    key: &str,
+    raw: &str,
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) -> Option<serde_json::Value> {
+    let raw = raw.trim();
 
     let mut value = if let Some(text) = unescape_heredoc(raw) {
         serde_json::Value::String(text)

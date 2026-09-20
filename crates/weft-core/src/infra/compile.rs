@@ -1101,13 +1101,6 @@ fn compile_network_policy(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
                     }
                 }]
             }),
-            IngressRule::FromNode { node_id } => json!({
-                "from": [{
-                    "podSelector": {
-                        "matchLabels": { super::NODE_LABEL: super::node_label_value(node_id) }
-                    }
-                }]
-            }),
             IngressRule::FromInternet => json!({
                 "from": [{
                     "ipBlock": { "cidr": "0.0.0.0/0" }
@@ -1179,13 +1172,6 @@ fn compile_network_policy(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
         egress_rules.push(match rule {
             EgressRule::ToInternet => json!({
                 "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }]
-            }),
-            EgressRule::ToNode { node_id } => json!({
-                "to": [{
-                    "podSelector": {
-                        "matchLabels": { super::NODE_LABEL: super::node_label_value(node_id) }
-                    }
-                }]
             }),
             EgressRule::ToCidrs(cidrs) => json!({
                 "to": cidrs.iter().map(|c| json!({
@@ -1599,11 +1585,13 @@ mod tests {
         }
     }
 
-    /// A node inside an included file has an id (`@src:setup.store`) a
-    /// label cannot hold. Every object still carries it, on the
-    /// annotation, and every label and selector carries the value that
-    /// stands for it, so the network rule between two nodes matches the
-    /// pods it means. Before this the apply died on the label.
+    /// An instance is compiled under its place (`setup.store`, or a
+    /// spelling with characters a label cannot hold; the old compiled
+    /// id `@src:setup.store` is kept here as the worst case). Every
+    /// object still carries the string as given, on the annotation, and
+    /// every label and selector carries the value that stands for it,
+    /// so `weft infra logs --node` and the health loop find the pods
+    /// they mean. Before this the apply died on the label.
     #[test]
     fn an_included_files_node_id_is_legal_on_every_object_it_owns() {
         let ctx = CompileContext { node_id: "@src:setup.store", ..ctx() };
@@ -1614,15 +1602,11 @@ mod tests {
                 containers: vec![Container::new("c", Image::Upstream { reference: "x:1".into() })],
                 ..Default::default()
             }],
-            access: super::super::types::NetworkAccess {
-                ingress: vec![IngressRule::FromNode { node_id: "@src:setup.api".into() }],
-                egress: vec![EgressRule::ToNode { node_id: "@src:setup.api".into() }],
-            },
             ..Default::default()
         };
         let out = compile(&spec, &ctx).expect("compile ok");
         let legal = |s: &str| s.len() <= 63 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        let mut selectors = 0;
+        let mut labelled = 0;
         for m in &out {
             assert_eq!(m["metadata"]["annotations"]["weft.dev/node-id"], "@src:setup.store");
             let text = m.to_string();
@@ -1630,16 +1614,13 @@ mod tests {
                 if path.contains("labels") || path.contains("matchLabels") {
                     assert!(legal(&value), "{path} = {value:?} in {text}");
                 }
-                if path.contains("matchLabels") && path.ends_with("weft.dev/node") {
-                    assert_eq!(value, super::super::node_label_value("@src:setup.api"));
-                    selectors += 1;
-                }
             }
             if let Some(labels) = m["metadata"]["labels"].as_object() {
                 assert_eq!(labels["weft.dev/node"], super::super::node_label_value("@src:setup.store"));
+                labelled += 1;
             }
         }
-        assert_eq!(selectors, 2, "the ingress and the egress rule each select by the label value");
+        assert!(labelled > 0, "every object the instance owns carries the node label");
     }
 
     /// Every string leaf of a JSON value with its path, for asserting

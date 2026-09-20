@@ -18,7 +18,8 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct PollEndpointHandler;
 
@@ -63,6 +64,22 @@ impl KindHandler for PollEndpointHandler {
         ProcessOutcome { value: payload, target: ProcessTarget::Entry }
     }
 
+    /// A poll has no address either: what somebody wants to see is
+    /// what it is reading and how often, plus whether the loop is
+    /// currently healthy.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let sig = ctx.sig;
+        let poll = match super::config_for_display::<PollEndpoint>(sig, "Polling") {
+            Ok(poll) => poll,
+            Err(feed) => return feed,
+        };
+        let mut items: Vec<LiveItem> =
+            super::configured_url_item("Polling", &poll.url).into_iter().collect();
+        items.push(LiveItem::text("Every", format!("{}s", poll.interval_secs)));
+        items.extend(super::serving_item(sig));
+        LiveFeed::new(items)
+    }
+
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {
         Ok(None)
     }
@@ -94,8 +111,12 @@ fn spawn_loop(
         // HTML) escalates to an error so a misconfigured trigger is
         // never indistinguishable from a quiet feed.
         let mut consecutive_failures: u32 = 0;
-        fn fail(streak: &mut u32, url: &str, what: &str, detail: String) {
+        // Every miss is written where the node's display reads it, so a
+        // person looking at a trigger that stopped firing sees why.
+        let serving = ctx.serving.clone();
+        let fail = move |streak: &mut u32, url: &str, what: &str, detail: String| {
             *streak += 1;
+            serving.lock().status = format!("{what}: {detail} (failed {streak} in a row)");
             if *streak >= POLL_FAILURE_ESCALATION {
                 tracing::error!(
                     target: "weft_listener::poll_endpoint",
@@ -107,7 +128,8 @@ fn spawn_loop(
             } else {
                 warn!(target: "weft_listener::poll_endpoint", %url, error = %detail, "{what}; will retry next tick");
             }
-        }
+        };
+        super::set_serving_status(&ctx, "polling");
         loop {
             ticker.tick().await;
             // Signed-in polls resolve the connection PER CYCLE: the
@@ -164,6 +186,7 @@ fn spawn_loop(
             let Some(delta) = &poll.delta else {
                 // Plain mode: every poll fires the whole response.
                 consecutive_failures = 0;
+                super::set_serving_status(&ctx, "polling");
                 let payload = super::event_source::coerce_text_payload(body);
                 // Plain mode has no replay cursor; the delivery
                 // outcome is already logged by the fire path.
@@ -198,6 +221,7 @@ fn spawn_loop(
                 }
             };
             consecutive_failures = 0;
+            super::set_serving_status(&ctx, "polling");
             // The first successful poll PRIMES the cursor silently
             // (activation means "from now on"); `delta_advance`
             // returns no fires for it by construction. Each fire

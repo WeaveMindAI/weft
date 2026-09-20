@@ -79,15 +79,16 @@ one was still waiting for.
 
 `weft stop <color>` cancels a running execution.
 
-## `the canonical schema changed with no migration to match`
+## `the canonical schema changed and this database does not hold the shape it declares`
 
 This one only reaches you if you are changing weft itself. You edited a table's
 `CREATE TABLE`, and the Postgres volume survives `./setup.sh` runs, so the
 tables on disk are still the old shape and nothing was written to carry them
 across.
 
-`./setup.sh --migration <name>` writes the migration for what you changed, and
-the next start applies it and keeps everything that was in the database.
+`./setup.sh --migration <name> --release` writes the migration for what you
+changed, applies it, and keeps everything that was in the database. One
+command; there is no second step.
 
 The error also prints the SQL to drop just the tables it named, if you would
 rather throw that data away than carry it across.

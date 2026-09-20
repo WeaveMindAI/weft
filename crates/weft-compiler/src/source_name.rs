@@ -65,11 +65,22 @@ pub fn display_name(group_id: &str) -> String {
 /// The anonymous-root id a file is parsed under: the body id when the
 /// file sits in a project (the compiler gives an `@include` of it the
 /// same id, so the editor's standalone view of the file and the journal
-/// rows agree), else the filename-derived id.
-pub fn file_id(root: Option<&Path>, file: Option<&Path>) -> String {
+/// rows agree), else the filename-derived id. `None` for the project's
+/// ENTRY file, which has no anonymous root: an anonymous group is a
+/// file other files include, and the build compiles the entry with no
+/// source name for the same reason, so the editor's parse of it and
+/// the build refuse the same source.
+pub fn file_id(root: Option<&Path>, file: Option<&Path>) -> Option<String> {
     match (root, file) {
-        (Some(root), Some(file)) => body_id(root, file),
-        _ => derive_id(file),
+        (Some(root), Some(file)) => {
+            let entry = root.join(crate::project::SRC_DIR).join(crate::project::ENTRY_FILE);
+            let is_entry = match (file.canonicalize(), entry.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => file == entry,
+            };
+            (!is_entry).then(|| body_id(root, file))
+        }
+        _ => Some(derive_id(file)),
     }
 }
 
@@ -142,7 +153,12 @@ mod tests {
         assert_eq!(body_id(&root, &root.join("a__in.weft")), "@a_in");
         assert_eq!(body_id(&root, &root.join("a---in.weft")), "@a_in");
         assert!(!weft_core::is_rust_identifier("@src:lib:clean"));
-        assert_eq!(file_id(None, Some(&PathBuf::from("my-cleaner.weft"))), "MyCleaner");
+        assert_eq!(file_id(None, Some(&PathBuf::from("my-cleaner.weft"))).as_deref(), Some("MyCleaner"));
+        // Inside a project, an included file is parsed under its body
+        // id; the entry file under none, because it has no anonymous
+        // root to name (the compiler refuses one there).
+        assert_eq!(file_id(Some(&root), Some(&root.join("src/lib/clean.weft"))).as_deref(), Some("@src:lib:clean"));
+        assert_eq!(file_id(Some(&root), Some(&root.join("src/main.weft"))), None);
     }
     /// A body id is a path, so it reads as the file; a nested group
     /// reads as its own segment; a plain name is already one.

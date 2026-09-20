@@ -6,7 +6,8 @@
 //! - `/projects/*`: project registration, run, stop, logs.
 //! - `/executions/*`: execution state queries and control.
 //! - `/events/*`: SSE streams for project and execution state.
-//! - `/signal-token*`: signal-token minting + token-scoped signal access.
+//! - `/signal-token*`: signal-token minting, token-scoped signal access,
+//!   and token-scoped reads of what a node is showing (`/displays`).
 //!
 //! The dispatcher does NO node-aware work: parse, validate, and
 //! catalog introspection are client-side (the CLI reads the project's
@@ -35,6 +36,7 @@ mod provider_events;
 mod signal_token;
 mod signal_token_names;
 mod infra;
+mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
 // helpers (`append_parked_fire` and siblings) are the dispatcher's
 // correctness-critical SQL that the db-test rig in `tests/db_lifecycle.rs`
@@ -105,13 +107,16 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))
         // Per-node verbs for partial-state recovery.
-        .route("/projects/{id}/infra/nodes/{node_id}/stop", post(infra::stop_node))
-        .route("/projects/{id}/infra/nodes/{node_id}/terminate", post(infra::terminate_node))
+        // `{node}` on every per-node infra route is the instance's
+        // PLACE as a person spells it (`one.db`): an infra node inside
+        // a file included twice is two instances with two names.
+        .route("/projects/{id}/infra/nodes/{node}/stop", post(infra::stop_node))
+        .route("/projects/{id}/infra/nodes/{node}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
         .route("/projects/{id}/infra/doors", get(infra::doors))
         .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
-        .route("/projects/{id}/infra/nodes/{node_id}/live", get(infra::live))
-        .route("/projects/{id}/infra/nodes/{node_id}/action", post(infra::action))
+        .route("/projects/{id}/infra/nodes/{node}/live", get(infra::live))
+        .route("/projects/{id}/infra/nodes/{node}/action", post(infra::action))
         .route("/executions/resolve/{prefix}", get(execution::resolve_color))
         .route("/executions/{color}/cancel", post(execution::cancel))
         // Resolve a pure time wait now (`weft wake`).
@@ -176,12 +181,14 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             "/projects/{id}/node-tests/runs/{task}",
             get(node_tests::status),
         )
-        // Inspector proxy: project-scoped read of signal display
-        // info (mount_path, auth, kind config while the listener still
-        // holds it, etc). Project-token gated.
+        // What a trigger node is showing (its address and how a
+        // caller gets past its door), off the kind holding the signal.
+        // `{node}` is the trigger's place as a person spells it.
+        // Read-only: a trigger's display carries no buttons.
+        // Project-token gated.
         .route(
-            "/projects/{id}/signals/{node_id}/display",
-            get(signal::display_signal),
+            "/projects/{id}/signals/{node}/live",
+            get(signal::live_signal),
         )
         .layer(cors)
         .merge(outside_caller_routes())
@@ -220,6 +227,23 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             get(signal::signal_file_for_token),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
+        // What a node is SHOWING, for a client built on top of a weft
+        // program (a website that renders the bridge's QR code rather
+        // than sending its user to the editor). The same two feeds the
+        // editor reads under `/projects/{id}/...`, behind the signal
+        // token. See `api/display.rs` for what a token may see.
+        .route("/signal-token/displays", get(display::list_displays))
+        .route(
+            "/signal-token/displays/{project_id}/{node}",
+            get(display::read_display),
+        )
+        .route(
+            "/signal-token/displays/{project_id}/{node}/action",
+            // Capped like every other body this surface accepts: a press
+            // carries a small payload at most, and the caller is on the
+            // open internet.
+            post(display::press_display).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
+        )
         // The public file relay: an external consumer fetches a minted
         // media link here; the unguessable expiring token in the path
         // is the credential (see api/storage.rs public_file).

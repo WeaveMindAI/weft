@@ -19,7 +19,7 @@
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
@@ -36,12 +36,12 @@
 	import { diffPortLiteralOps, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
 	import { classifyUpdate } from "../../projection/update-classify";
 	import { copiedPortSigs, headerPortSigs, headerWorthy, partitionRemovals, portRequired, removedPortNames, type HeaderPortLike } from "../../projection/header-ports";
-	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, type PortEntryDef } from "../../utils/port-specs";
+	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, isFilledIn, type PortEntryDef } from "../../utils/port-specs";
 	import { ProjectionEngine } from "../../projection/engine.svelte";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { nodeBodyFeedKind, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -84,10 +84,10 @@
 		hasTriggersInGraph = false,
 		executionState,
 		autoOrganizeOnMount = false,
-		infraFeedByNode,
-		signalFeedByNode,
+		displayByNode,
 		onOpenInclude = () => {},
 		callPath = [],
+		interactive = true,
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
@@ -115,6 +115,13 @@
 		// the rows under this path are shown. The Return button itself lives
 		// in the GraphToolbar (App level), not here.
 		callPath?: string[];
+		// Whether this view is a place in the program at all (the entry
+		// file, or a file walked into from it). A file opened on its own
+		// is no place: a node in it may run under several calls, so no
+		// action bar is drawn, no run can be started or aimed from here,
+		// and the host hands in an empty `executionState` and polls no
+		// trigger display. The graph itself stays editable.
+		interactive?: boolean;
 		// Resolved content of @file targets, keyed by the marker's relative
 		// path. The display value for file-backed fields (config holds only
 		// the `@file(...)` marker, never the resolved content).
@@ -147,21 +154,26 @@
 		onStopInfra?: () => void;
 		onTerminateInfra?: () => void;
 		/// Per-node infra lifecycle. The graph's node context-menu
-		/// emits these when the user right-clicks an infra node.
-		/// Routed through the host's CLI verb path so the action
-		/// bar's `cli_running` overlay covers them.
-		onInfraNodeStop?: (nodeId: string) => void;
-		onInfraNodeTerminate?: (nodeId: string) => void;
+		/// emits these when the user right-clicks an infra node, with
+		/// the instance's PLACE (`addressOf(callPath, id)`, so `one.db`
+		/// for the `db` of the call this view walked into). Routed
+		/// through the host's CLI verb path so the action bar's
+		/// `cli_running` overlay covers them.
+		onInfraNodeStop?: (node: string) => void;
+		onInfraNodeTerminate?: (node: string) => void;
 		onUpgradeInfra?: () => void;
 		// Action-bar state machine (host-owned single source of
 		// truth) and drift snapshot. Passed straight through to
 		// the ActionBar component; nothing in this file decides.
 		actionBarState: import('../../../../protocol').ActionBarState;
 		drift: import('../../../../protocol').ActionAvailability | undefined;
-		// Per-node infra status, keyed by node_id. Used by the
-		// graph node decorations (badge under each infra node);
-		// independent of the action bar's infra rollup.
-		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
+		// Per-instance infra status, keyed by PLACE (`node` is the spelling
+		// `addressOf(callPath, id)` gives the node on screen): a file
+		// included twice provisions twice, and this view shows the
+		// instance of the call it walked into. Used by the graph node
+		// decorations (badge under each infra node); independent of the
+		// action bar's infra rollup.
+		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
@@ -173,12 +185,10 @@
 		// Independent of action-bar state.
 		executionState?: import('../../types').ExecutionState;
 		autoOrganizeOnMount?: boolean;
-		/// Per-node infra /live tick state. Read for nodes whose
-		/// `requiresInfra` flag is true; ignored otherwise.
-		infraFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
-		/// Per-node listener /display tick state. Read for nodes whose
-		/// `features.isTrigger` flag is true; ignored otherwise.
-		signalFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
+		/// What each node is showing, keyed by node id. Read for the
+		/// nodes that have a display (an infra node serving `/live`, a
+		/// trigger); ignored for the rest.
+		displayByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 	} = $props();
 
 	// VS Code embedding: dashboard chrome (right sidebar, code
@@ -635,15 +645,32 @@
 			}
 			const literal = literals[from];
 			if (literal !== undefined) {
-				ops.push({ op: 'removeConfig', node: nodeId, key: from });
 				// The written forms mirror each other: `_should_flow: false`
 				// and `_should_not_flow: true` both mean "never run this".
-				ops.push({
-					op: 'setConfig',
-					node: nodeId,
-					key: to,
-					value: String(literal) === 'false' ? 'true' : 'false',
-				});
+				// Through the one producer for port values, so the ops carry
+				// the written form (the old value's line, and for the new
+				// one the node kind's first form: a statement on a
+				// container or an include).
+				const foldNode = fold.project.nodes.find((n) => n.id === nodeId);
+				if (!foldNode) {
+					toast.error(`Cannot flip the gate: '${nodeId}' is not in the current project state`);
+					return;
+				}
+				// The producer diffs WHOLE maps (a key missing from the next
+				// map is a cleared value), so the next map is every value the
+				// node has, with the old gate cleared first and the new one
+				// set last: the clear is emitted before the set, so the
+				// source never holds two gates at once.
+				const current = (foldNode.portLiterals as Record<string, unknown> | undefined) ?? {};
+				const { [from]: _old, ...kept } = current;
+				const next: Record<string, unknown> = { [from]: null, ...kept, [to]: String(literal) === 'false' };
+				ops.push(...diffPortLiteralOps(
+					nodeId,
+					next,
+					current,
+					foldNode.portLiteralSpans ?? {},
+					portValueFirstForm(foldNode.nodeType),
+				));
 			}
 			// Nothing drives the gate, so there is nothing to flip and no
 			// edit to record: an empty op list would still cost a reparse.
@@ -916,11 +943,20 @@
 				// (the same truth the fields render from) through the shared
 				// producer, so every surface emits identical ops for this home.
 				const foldNode = fold.project.nodes.find((n) => n.id === nodeId);
+				if (!foldNode) {
+					// A value gesture on a node the projection does not know
+					// cannot be applied truthfully (its written form and its
+					// current values are unknown); swallowing it would lose
+					// the user's edit with no trace.
+					toast.error(`Cannot edit values: '${nodeId}' is not in the current project state`);
+					return;
+				}
 				ops.push(...diffPortLiteralOps(
 					nodeId,
 					updates.portLiterals,
-					(foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {},
-					foldNode?.portLiteralSpans ?? {},
+					(foldNode.portLiterals as Record<string, unknown> | undefined) ?? {},
+					foldNode.portLiteralSpans ?? {},
+					portValueFirstForm(foldNode.nodeType),
 				));
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
@@ -1445,6 +1481,10 @@
 					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
 					portLiteralSpans: n.portLiteralSpans,
 					features: n.features,
+					// What the compiler said about this node, so the role
+					// predicates read the instance before the catalog, the
+					// way the host does before it starts a poller.
+					requiresInfra: n.requiresInfra,
 					// The unconnected-access pin (view state, never config):
 					// ProjectNode draws the body open and disables collapse.
 					pinnedOpen: pinnedIds.has(n.id),
@@ -1494,6 +1534,14 @@
 				));
 			}
 			if (outcome !== 'destroyed') canvasReady = true;
+		}).catch((err) => {
+			// `runAutoOrganize` turns an ELK refusal into 'failed', but a
+			// throw around it (the measure loop, the layout write) rejects
+			// here. The canvas is revealed whatever happened: a blank,
+			// unclickable editor with only a console line to say why is
+			// the one outcome nobody can recover from.
+			console.error('[auto-organize] layout of unplaced nodes failed', err);
+			if (!destroyed) canvasReady = true;
 		}).finally(() => {
 			organizeInFlight = null;
 			if (!organizeRecheck || destroyed) return;
@@ -1711,8 +1759,7 @@
 		runTerminal: import('../../types').ExecutionTerminal | undefined;
 		infraNodes: typeof infraNodes;
 		fileContents: typeof fileContents;
-		infraFeedByNode: typeof infraFeedByNode;
-		signalFeedByNode: typeof signalFeedByNode;
+		displayByNode: typeof displayByNode;
 		showInfraSubgraph: boolean;
 		showTriggerSubgraph: boolean;
 		/// Output nodes the run is aimed at. Read here rather than straight
@@ -1758,8 +1805,7 @@
 			runTerminal: state?.terminal,
 			infraNodes,
 			fileContents,
-			infraFeedByNode,
-			signalFeedByNode,
+			displayByNode,
 			showInfraSubgraph,
 			showTriggerSubgraph,
 			runTargets,
@@ -1996,22 +2042,21 @@
 						? (loopEventsByGroup[execKey(n.id)] ?? [])
 						: [];
 
-					// Per-node infra badge (status snapshot from the host).
-					const backendNode = ctx.infraNodes?.find(inf => inf.nodeId === n.id);
+					// Per-node infra badge (status snapshot from the host): the
+					// instance at this view's place, through the one lookup.
+					const backendNode = infraStatusOf(n.id);
 
-					// Per-node body-panel feed. Each node consumes AT MOST ONE feed
-					// based on its role: infra nodes get infra /live ticks, trigger
-					// nodes get listener /display ticks, anything else gets nothing.
-					const role = nodeBodyFeedKind({
+					// What this node is showing, if it shows anything. Own-property
+					// read: node ids come off the wire, and a node literally named
+					// 'constructor' would otherwise resolve a prototype function
+					// as its display.
+					const bodyFeed = nodeHasDisplay({
 						nodeType,
-						features: n.data.features as { isTrigger?: boolean } | undefined,
-					});
-					// Own-property reads: node ids come off the wire, and a
-					// node literally named 'constructor' would otherwise
-					// resolve a prototype function as its feed.
-					const bodyFeed =
-						role === 'infra' ? ownValue(ctx.infraFeedByNode, n.id)
-						: role === 'signal' ? ownValue(ctx.signalFeedByNode, n.id)
+						requiresInfra: n.data.requiresInfra as boolean | undefined,
+						features: n.data.features as
+							{ isTrigger?: boolean; liveEndpoint?: string } | undefined,
+					})
+						? ownValue(ctx.displayByNode, n.id)
 						: undefined;
 
 					// Subgraph highlight wins the class slot while active; the
@@ -2183,8 +2228,8 @@
 			liveRunTargets,
 			fold.project.nodes.map((n) => ({
 				id: n.id,
-				isTrigger: nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
-				isInfra: nodeRequiresInfra({ nodeType: n.nodeType, requiresInfra: undefined }),
+				isTrigger: nodeIsTrigger(n),
+				isInfra: nodeRequiresInfra(n),
 				parentId: n.parentId,
 			})),
 			fold.project.edges,
@@ -2195,12 +2240,27 @@
 	/// subgraph reports running. Infra elsewhere in the project has no
 	/// say: a targeted run never touches it.
 	const runTargetsInfraReady = $derived(
-		runTargetFactsLive.infraIds.every(
-			(id) => infraNodes?.find((inf) => inf.nodeId === id)?.status === 'running',
-		),
+		runTargetFactsLive.infraIds.every((id) => infraStatusOf(id)?.status === 'running'),
 	);
 
+	/// The infra instance behind a node on screen: the one at THIS view's
+	/// place (`addressOf(callPath, id)`), never another call's. A view
+	/// that is no place names no instance, whatever the status holds.
+	function infraStatusOf(nodeId: string) {
+		if (!interactive) return undefined;
+		const place = addressOf(callPath, nodeId);
+		return infraNodes?.find((inf) => inf.node === place);
+	}
+
+	/// The one funnel every "run" gesture goes through (the action bar's
+	/// button, Ctrl+Enter), so the place check lives here and not on
+	/// each gesture: a view that is no place in the program cannot start
+	/// a run, and says so rather than starting one silently.
 	function runWithTargets(): void {
+		if (!interactive) {
+			toast.error('This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.');
+			return;
+		}
 		onRun?.(liveRunTargets);
 	}
 
@@ -2217,6 +2277,13 @@
 	}
 	$effect(() => {
 		if (!specDialogOpen) specDialogInitial = null;
+	});
+	// The dialog runs a spec spelled for the view it opened in. A view
+	// that stops being a place (another file picked in the explorer
+	// while it is open) has no run to start, and the spec's addresses
+	// belong to the file that is gone, so the dialog closes with it.
+	$effect(() => {
+		if (!interactive) specDialogOpen = false;
 	});
 	/// The followed run's version differs from the files on disk.
 	const versionMismatch = $derived.by(() => {
@@ -2540,28 +2607,76 @@
 		// this right by waiting externally; doing it HERE makes every caller
 		// correct (collapse/expand, mount, manual) with one wait. Cap at 2s.
 		{
-			// Wait until sizes are not just present but STABLE across two polls. A
+			// Wait until sizes are not just present but STABLE across two reads. A
 			// bare "every node has a measured size" check breaks too early right after
 			// a view toggle: the nodes still carry the PREVIOUS view's measured sizes
 			// (builder boxes) until Svelte re-renders the squares and the ResizeObserver
 			// catches up, so ELK would run on stale sizes and the first simplified open
 			// looks wrong. Requiring the size signature to repeat means the DOM has
 			// settled into the CURRENT view before we read it.
+			//
+			// One read per animation FRAME, because that is the cadence the sizes
+			// themselves move on: the browser lays out, the ResizeObserver fires,
+			// xyflow writes `measured`, all inside one frame. A graph already at
+			// rest is therefore through this wait in two frames. Sampling on a
+			// timer instead just made every organize wait out the timer.
 			const deadline = Date.now() + 2000;
-			let prevSig = '';
+			// A frame OR the rest of the cap, whichever comes first. A
+			// hidden webview is served no animation frames at all, so a
+			// bare `requestAnimationFrame` wait there never resolves:
+			// the organize hangs, and with it the promise the canvas
+			// waits on to become visible. Open a .weft, switch tabs, come
+			// back to a blank graph.
+			const nextFrame = () => new Promise<void>(resolve => {
+				let done = false;
+				let cap: ReturnType<typeof setTimeout> | undefined;
+				const settle = () => {
+					if (done) return;
+					done = true;
+					// The cap timer outlives a frame that came first by up to
+					// the whole deadline; one per iteration adds up to a pile.
+					if (cap !== undefined) clearTimeout(cap);
+					resolve();
+				};
+				requestAnimationFrame(settle);
+				cap = setTimeout(settle, Math.max(0, deadline - Date.now()));
+			});
+			const sizeOf = (n: (typeof nodes)[number]) => `${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`;
+			let prevSizes = new Map<string, string>();
 			let settled = false;
+			let unmeasured: string[] = [];
+			let moving: string[] = [];
 			while (Date.now() < deadline) {
 				await tick();
-				const allMeasured = nodes.every(n => n.hidden || (n.measured?.width && n.measured?.height));
-				const sig = nodes.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`).join('|');
-				if (allMeasured && sig === prevSig) { settled = true; break; }
-				prevSig = sig;
-				await new Promise(resolve => setTimeout(resolve, 50));
+				unmeasured = nodes
+					.filter(n => !n.hidden && !(n.measured?.width && n.measured?.height))
+					.map(n => n.id);
+				const sizes = new Map(nodes.map(n => [n.id, sizeOf(n)]));
+				moving = [...sizes]
+					.filter(([id, size]) => prevSizes.has(id) && prevSizes.get(id) !== size)
+					.map(([id, size]) => `${id} (${prevSizes.get(id)} -> ${size})`);
+				const sameShape = sizes.size === prevSizes.size && moving.length === 0
+					&& [...sizes.keys()].every(id => prevSizes.has(id));
+				if (unmeasured.length === 0 && sameShape) { settled = true; break; }
+				prevSizes = sizes;
+				await nextFrame();
 			}
+			// The cap is a cap: a graph that never settles lays out on
+			// what is there rather than holding the canvas hostage.
+
 			// Fail loud (breadcrumb): the wait's whole point is to feed ELK a SETTLED
 			// DOM. If sizes never stabilized within the cap, ELK runs on whatever's
 			// there, which can be a wrong layout; surface it instead of failing silent.
-			if (!settled) console.warn(`[auto-organize] node sizes never settled within 2s (${nodes.length} nodes); laying out on unstable sizes.`);
+			// Name the culprits: a node the DOM never gave a size to and a node whose
+			// size keeps moving are different bugs, and this line is what tells them
+			// apart after the fact.
+			if (!settled) {
+				console.warn(
+					`[auto-organize] node sizes never settled within 2s (${nodes.length} nodes); `
+					+ `laying out on unstable sizes. Never measured: ${unmeasured.join(', ') || 'none'}. `
+					+ `Still resizing: ${moving.join(', ') || 'none'}.`,
+				);
+			}
 		}
 		const sizes = new Map<string, { width: number; height: number }>();
 		for (const n of nodes) {
@@ -2692,7 +2807,13 @@
 			setTimeout(() => { doFitView(); canvasReady = true; }, 100);
 		} else if (everyNodePlaced && autoOrganizeOnMount) {
 			// The host asked for a layout on open (no layout file at all).
-			void runAutoOrganize(true).then(() => { canvasReady = true; });
+			// The canvas is revealed whatever happens: an organize that
+			// throws (ELK refusing a graph, say) would otherwise leave a
+			// blank, unclickable editor with only a console line to say
+			// why. A bad layout the user can see and fix beats none.
+			void runAutoOrganize(true)
+				.catch((err) => console.error('[auto-organize] layout on open failed', err))
+				.finally(() => { canvasReady = true; });
 		}
 		// Otherwise buildNodes already queued the organize, which fits and
 		// reveals the canvas when it lands.
@@ -2978,7 +3099,7 @@
 		const targetPort = (targetHandle || 'value').replace(/__inner$/, '');
 		const targetNode = fold.project.nodes.find((n) => n.id === target);
 		const literal = ownValue(targetNode?.portLiterals as Record<string, unknown> | undefined, targetPort);
-		if (literal === undefined || literal === null) return false;
+		if (!isFilledIn(literal)) return false;
 		toast.error(`'${targetPort}' is driven by a config assignment; unset it first to drive it with an edge.`);
 		return true;
 	}
@@ -3588,7 +3709,7 @@
 	 *  The one source of truth for "infra actions present", used both to decide
 	 *  whether to open the menu in simplified view and to render the infra section. */
 	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
-		const infra = nodeId ? infraNodes?.find(n => n.nodeId === nodeId) : undefined;
+		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
 		const stop = !!infra && (infra.status === 'running' || infra.status === 'flaky');
 		const terminate = !!infra && infra.status !== 'terminating';
 		return { stop, terminate, has: stop || terminate };
@@ -3707,15 +3828,32 @@
 					: { op: 'setConfig', node: scopedId, key, value: formatConfigValue(value) });
 			}
 		};
+		// Copy a decl's written PORT values onto its copy, each in the form
+		// the original wrote it (or the node kind's first form), through
+		// the one producer for that home.
+		const copyPortLiterals = (orig: { data: Record<string, unknown> }, scopedId: string, nodeType: string) => {
+			const literals = (orig.data.portLiterals as Record<string, unknown> | undefined) ?? {};
+			const spans = (orig.data.portLiteralSpans as Record<string, import('../../../../protocol').ConfigFieldSpan> | undefined) ?? {};
+			ops.push(...diffPortLiteralOps(scopedId, literals, {}, spans, portValueFirstForm(nodeType)));
+		};
 
 		// Build the whole batch before recording anything, and surface a
 		// build failure (e.g. a config value the source formatter rejects)
 		// as a toast: an uncaught throw out of a click handler would leave
 		// the Duplicate button silently dead. The batch is atomic or
 		// absent, never half-recorded.
+		// An include card is one `alias = @include("file")` line and no edit
+		// op copies one, so it is left out of the batch by name and the
+		// rest of the selection still duplicates: one include card must not
+		// cancel the copies of everything selected beside it.
+		const includesLeftOut: string[] = [];
 		try {
 			for (const orig of originals) {
 				const nodeType = orig.data.nodeType as string;
+				if (isIncludeNodeType(nodeType)) {
+					includesLeftOut.push(orig.id);
+					continue;
+				}
 				const isContainer = orig.type === 'group' || orig.type === 'groupCollapsed';
 				const isLoop = isContainer && containerKindOf(nodeType) === 'Loop';
 				const parentId = (orig.data.config as Record<string, string> | undefined)?.parentId;
@@ -3744,7 +3882,15 @@
 							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
 							: { op: 'updateGroupPorts', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
 					}
-					if (isLoop) copyConfig(config, scopedId, true);
+					if (isLoop) {
+						copyConfig(config, scopedId, true);
+					} else if (typeof config?.description === 'string' && config.description) {
+						// A group's description rides its `config` on the node
+						// data (host-bridge puts it there for the card) and has
+						// its own op; a loop's travels with its settings above.
+						ops.push({ op: 'setGroupDescription', group: scopedId, description: config.description });
+					}
+					copyPortLiterals(orig, scopedId, nodeType);
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
 				} else {
 					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
@@ -3777,6 +3923,7 @@
 					}
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y));
 					copyConfig(config, scopedId, false);
+					copyPortLiterals(orig, scopedId, nodeType);
 					if (orig.data.label) {
 						ops.push({ op: 'setLabel', node: scopedId, label: orig.data.label as string });
 					}
@@ -3785,6 +3932,13 @@
 		} catch (e) {
 			toast.error(`Cannot duplicate: ${e instanceof Error ? e.message : String(e)}`);
 			return;
+		}
+		if (includesLeftOut.length > 0) {
+			toast.info(
+				`An include card is not duplicated (${includesLeftOut.join(', ')}): write another `
+				+ `\`alias = @include("file")\` line in the source to call the file again.`,
+			);
+			if (ops.length === 0) return;
 		}
 
 		// Select the new copies once the projection rebuilds (they don't exist
@@ -4001,6 +4155,10 @@
 			</div>
 		{/if}
 
+		<!-- Everything from here to the action bar belongs to a PLACE in
+		     the program (a run, the project's lifecycle): a file opened on
+		     its own has none, so none of it is drawn (see `interactive`). -->
+		{#if interactive}
 		<!-- Drift banner. A redundant surfacing of the action-bar
 		     affordance, in case the user misses the button. The verb
 		     it names must match whichever button is actually showing:
@@ -4073,6 +4231,7 @@
 			{showTriggerSubgraph}
 			nodeCount={nodes.length}
 		/>
+		{/if}
 	</div>
 	{#if specDialogInitial && resolveSpec && onRunSpec}
 		<RunSpecDialog
@@ -4145,7 +4304,7 @@
 				{@const targetNodeId = contextMenu.nodeId}
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
-				{@const infraInfo = infraNodes?.find(n => n.nodeId === targetNodeId)}
+				{@const infraInfo = infraStatusOf(targetNodeId)}
 				{@const infraActions = nodeInfraActions(targetNodeId)}
 				{@const canNodeStop = infraActions.stop}
 				{@const canNodeTerminate = infraActions.terminate}
@@ -4183,6 +4342,10 @@
 								<span>Tags…</span>
 							</button>
 						{/if}
+						<!-- Aiming a run names a PLACE (`addressOf` spells the node
+						     under this view's calls), so a view that is no place
+						     offers none of it. -->
+						{#if interactive}
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
 							onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
@@ -4206,6 +4369,7 @@
 								<span>Run this group…</span>
 							</button>
 						{/if}
+						{/if}
 						{#if hasInfraActions}
 							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
 							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
@@ -4214,7 +4378,7 @@
 							{#if canNodeStop && onInfraNodeStop}
 								<button
 									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; onInfraNodeStop?.(id); }}
+									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeStop?.(place); }}
 								>
 									<span class="text-muted-foreground text-xs">⏸</span>
 									<span>Stop this node</span>
@@ -4223,7 +4387,7 @@
 							{#if canNodeTerminate && onInfraNodeTerminate}
 								<button
 									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; onInfraNodeTerminate?.(id); }}
+									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeTerminate?.(place); }}
 								>
 									<span class="text-xs">✕</span>
 									<span>Terminate this node</span>

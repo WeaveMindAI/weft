@@ -77,10 +77,10 @@
 		hasTriggersInGraph = false,
 		executionState,
 		autoOrganizeOnMount = false,
-		infraFeedByNode,
-		signalFeedByNode,
+		displayByNode,
 		onOpenInclude = () => {},
 		callPath = [],
+		interactive = true,
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
@@ -91,6 +91,7 @@
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		onOpenInclude?: (path: string, alias: string) => void;
 		callPath?: string[];
+		interactive?: boolean;
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		onRun?: (targets: string[]) => void;
 		specs?: import('../../../../run-spec').RunSpec[];
@@ -118,22 +119,20 @@
 		/// Per-node lifecycle, used by the graph's right-click menu
 		/// on a single infra node. The parent dispatches the HTTP
 		/// call through the extension host's CLI verb path.
-		onInfraNodeStop?: (nodeId: string) => void;
-		onInfraNodeTerminate?: (nodeId: string) => void;
+		onInfraNodeStop?: (node: string) => void;
+		onInfraNodeTerminate?: (node: string) => void;
 		onUpgradeInfra?: () => void;
 		actionBarState: import('../../../../protocol').ActionBarState;
 		drift: import('../../../../protocol').ActionAvailability | undefined;
-		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
+		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
 		executionState?: import('../../types').ExecutionState;
 		autoOrganizeOnMount?: boolean;
-		/// Per-node infra /live tick state. Only consumed for nodes
-		/// with `requiresInfra: true`.
-		infraFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
-		/// Per-node listener /display tick state. Only consumed for
-		/// nodes with `features.isTrigger`.
-		signalFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
+		/// What each node is showing, keyed by node id. Consumed by the
+		/// nodes that have a display: an infra node serving `/live`, and
+		/// a trigger (its kind serves one through the listener).
+		displayByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 	} = $props();
 </script>
 
@@ -179,10 +178,10 @@
 		{hasTriggersInGraph}
 		{executionState}
 		{autoOrganizeOnMount}
-		{infraFeedByNode}
-		{signalFeedByNode}
+		{displayByNode}
 		{onOpenInclude}
 		{callPath}
+		{interactive}
 		{fileContents}
 	/>
 </SvelteFlowProvider>

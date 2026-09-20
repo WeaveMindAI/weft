@@ -188,6 +188,12 @@
   let navDepth = $state(0);
   let navFileName = $state('');
   let callPath = $state<string[]>([]);
+  // Whether this view is a place in the program (see `navState`). A file
+  // opened on its own is drawn and nothing else: no runs, no trigger
+  // displays, no action bar, no aiming a run at its nodes. The host that
+  // owns include navigation sends it; a host without one has only entry
+  // files, which is what the default says.
+  let interactive = $state(true);
   // The raw source text of the CURRENTLY ACTIVE file (the entry file at depth 0,
   // or the included sub-file after navigation). Set from every `parseResult`'s
   // `source`, so it tracks include navigation. Exposed on `EditorContext` for
@@ -239,6 +245,12 @@
     };
   }
   let executionState = $state<ExecutionState>(emptyExecutionState(false));
+  // The run this view paints: the followed one, or nothing when the view
+  // is no place (a run's rows belong to a call, and a file opened on its
+  // own names none). ONE gate, here, so the editor, the toolbar's follow
+  // controls, the caller panel and the slot context all read the same
+  // answer instead of each checking for itself.
+  const shownExecutionState = $derived(interactive ? executionState : emptyExecutionState(false));
 
   // Dedup keys for append-only inspector logs. The execution follower
   // subscribes to the live SSE stream BEFORE replaying the journal
@@ -254,16 +266,19 @@
   let seenLoopKeys = new Set<string>();
   let seenCallerOffsets = new Set<string>();
 
-  // Per-node body-panel feeds. Each node ID maps to AT MOST ONE
-  // feed depending on type:
-  //   - infra nodes (requires_infra=true)  → infraFeedByNode
-  //   - trigger nodes (features.isTrigger) → signalFeedByNode
-  //   - debug nodes  (features.showDebugPreview) → executionState.nodeOutputs
-  //   - everything else → no body-panel; modal inspector only.
-  // Each feed entry is `NodeFeedState`: ok with items, or error with a
-  // message. NEVER a fallback to execution data on the wrong feed.
-  let infraFeedByNode = $state<Record<string, NodeFeedState>>(bareRecord());
-  let signalFeedByNode = $state<Record<string, NodeFeedState>>(bareRecord());
+  // What each node is showing, keyed by node id. An infra node's
+  // container and the listener kind holding a trigger's signal both
+  // serve the same shape, so there is one map for both.
+  //
+  //   - a node with a display (infra serving /live, or a trigger)
+  //     → displayByNode
+  //   - debug nodes (features.showDebugPreview)
+  //     → executionState.nodeOutputs
+  //   - everything else → no body panel; modal inspector only.
+  //
+  // Each entry is `NodeFeedState`: ok with items, absent, or error
+  // with a message. NEVER a fallback to execution data.
+  let displayByNode = $state<Record<string, NodeFeedState>>(bareRecord());
 
   // Source-derived flags: does the project DECLARE infra / trigger
   // nodes. Driven by every truth carrier (parseResult, editApplied,
@@ -316,6 +331,7 @@
       orphanedInfra: false,
       mode: 'unknown',
       infraRollup: 'none',
+      infraBusy: false,
       runningCount: 0,
     },
     overlay: { kind: 'idle' },
@@ -328,23 +344,25 @@
   let statusSnapshot = $state<ActionAvailability | undefined>(undefined);
 
   onMount(() => {
-    // Bubble-up listener for per-node action buttons (e.g. the
-    // Regenerate-API-key button on a trigger node). ProjectNode
-    // dispatches a `weft-signal-action` CustomEvent; we forward
-    // to the host which calls /projects/{id}/signals/{node_id}/action.
-    const onSignalAction = (e: Event) => {
+    // Bubble-up listener for the buttons a node's display items
+    // carry (an infra container's "disconnect phone", say).
+    // ProjectNode dispatches a `weft-display-action` CustomEvent; we
+    // forward it to the host, which posts to the container's own
+    // door at /projects/{id}/infra/nodes/{place}/action. A
+    // trigger's display is read-only and carries no button.
+    const onDisplayAction = (e: Event) => {
       const ce = e as CustomEvent<{ nodeId: string; actionKind: string; payload?: unknown; confirm?: string }>;
       const detail = ce.detail;
       if (!detail || typeof detail.nodeId !== 'string' || typeof detail.actionKind !== 'string') return;
       send({
-        kind: 'signalAction',
+        kind: 'displayAction',
         nodeId: detail.nodeId,
         actionKind: detail.actionKind,
         payload: detail.payload,
         confirm: detail.confirm,
       });
     };
-    window.addEventListener('weft-signal-action', onSignalAction as EventListener);
+    window.addEventListener('weft-display-action', onDisplayAction as EventListener);
     const unsub = onMessage((msg) => {
       // editApplied and sourceResynced replies are consumed by the shared
       // hostRequest correlator (see requestEdit/requestResync above), not
@@ -367,6 +385,7 @@
         navDepth = msg.depth;
         navFileName = msg.fileName;
         callPath = msg.callPath;
+        interactive = msg.interactive;
         return;
       }
       if (msg.kind === 'fileContents') {
@@ -639,8 +658,8 @@
         // Debug preview (`features.showDebugPreview`) reads its
         // last output from `executionState.nodeOutputs[id]`. Update
         // it on completion. Earlier this rode the liveData channel;
-        // now it taps the exec event directly so the body-panel
-        // feeds (infra / signal display) cannot interfere.
+        // now it taps the exec event directly so a node's display
+        // cannot interfere.
         if (state === 'completed' && e.output !== undefined) {
           executionState.nodeOutputs = bareRecord(executionState.nodeOutputs, {
             [e.nodeId]: e.output,
@@ -786,26 +805,21 @@
         statusSnapshot = msg.snapshot;
         return;
       }
-      if (msg.kind === 'infraLive') {
-        // Sidecar /live tick for one infra node. Always overwrite
-        // the previous tick: pollers are independent, errors are
-        // user-visible, no fallback.
-        const { nodeId, ...feed } = msg;
-        infraFeedByNode = bareRecord(infraFeedByNode, { [nodeId]: feed });
-        return;
-      }
-      if (msg.kind === 'signalDisplay') {
-        // Listener /display tick for one trigger node. Overwrite
-        // semantics same as infraLive.
-        const { nodeId, ...feed } = msg;
-        signalFeedByNode = bareRecord(signalFeedByNode, { [nodeId]: feed });
+      if (msg.kind === 'nodeDisplay') {
+        // One node's /live tick. Always overwrite the previous one:
+        // pollers are independent, errors are user-visible, no
+        // fallback to what the last tick said.
+        // `kind` is how the message got here, not part of what the
+        // node is showing.
+        const { kind: _kind, nodeId, ...feed } = msg;
+        displayByNode = bareRecord(displayByNode, { [nodeId]: feed });
         return;
       }
     });
     send({ kind: 'ready' });
     return () => {
       unsub();
-      window.removeEventListener('weft-signal-action', onSignalAction as EventListener);
+      window.removeEventListener('weft-display-action', onDisplayAction as EventListener);
       // The whole editor is going away: settle every in-flight host request
       // so nothing awaits a reply that will never be consumed.
       cancelPendingHostRequests('the editor closed');
@@ -993,11 +1007,11 @@
     if (projectIsActive) { deactivationIntent = 'infraTerminate'; return; }
     send({ kind: 'infraTerminate' });
   }
-  function onInfraNodeStop(nodeId: string) {
-    send({ kind: 'infraNodeStop', nodeId });
+  function onInfraNodeStop(node: string) {
+    send({ kind: 'infraNodeStop', node });
   }
-  function onInfraNodeTerminate(nodeId: string) {
-    send({ kind: 'infraNodeTerminate', nodeId });
+  function onInfraNodeTerminate(node: string) {
+    send({ kind: 'infraNodeTerminate', node });
   }
   function onUpgradeInfra() {
     if (projectIsActive) { deactivationIntent = 'infraUpgrade'; return; }
@@ -1016,7 +1030,7 @@
     get activeFileName() { return navFileName; },
     get navDepth() { return navDepth; },
     get callPath() { return callPath; },
-    get executionState() { return executionState; },
+    get executionState() { return shownExecutionState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
     get sourceOpen() { return sourceOpen; },
@@ -1096,6 +1110,7 @@
             sourceOpen={sourceOpen}
             {navDepth}
             {navFileName}
+            {interactive}
             {onNavigateBack}
           >
             {#snippet leading()}
@@ -1110,7 +1125,7 @@
                    than inside a node's inspector: there is one caller per
                    run and the exchange is the same whichever node you
                    open. Nothing is drawn for a run that had no caller. -->
-              {#if executionState.callerLog.length > 0}
+              {#if shownExecutionState.callerLog.length > 0}
                 <button
                   type="button"
                   onclick={() => (callerPanelOpen = !callerPanelOpen)}
@@ -1126,10 +1141,10 @@
               {/if}
             {/snippet}
           </GraphToolbar>
-          {#if callerPanelOpen && executionState.callerLog.length > 0}
+          {#if callerPanelOpen && shownExecutionState.callerLog.length > 0}
             <div class="absolute top-24 left-3 z-30 pointer-events-auto">
               <CallerPanel
-                events={executionState.callerLog}
+                events={shownExecutionState.callerLog}
                 onClose={() => (callerPanelOpen = false)}
               />
             </div>
@@ -1168,6 +1183,7 @@
       {onResyncSource}
       {onOpenInclude}
       {callPath}
+      {interactive}
       {fileContents}
       {autoOrganizeOnMount}
       {onRun}
@@ -1201,9 +1217,8 @@
       infraNodes={statusSnapshot?.infraNodes}
       {hasInfraInGraph}
       {hasTriggersInGraph}
-      {executionState}
-      {infraFeedByNode}
-      {signalFeedByNode}
+      executionState={shownExecutionState}
+      {displayByNode}
     />
     </svelte:boundary>
     {/key}

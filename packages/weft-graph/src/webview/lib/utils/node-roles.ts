@@ -1,15 +1,16 @@
-// Single source of truth for "does this node want a body-panel
-// feed, and which one." Every place that needs to know whether a
-// node is infra-backed or trigger-backed uses these helpers; do
+// Single source of truth for "is this node infra-backed or a
+// trigger". Every place that needs to know uses these helpers; do
 // NOT inline the lookup elsewhere or the catalog/instance dual-
 // path will drift again.
 //
-// The flags can come from EITHER the parsed NodeInstance or the
-// catalog template (some are populated only on one side; the
-// compiler enrich pass mirrors metadata onto the instance, but
-// the webview also registers catalog entries from the dispatcher's
-// describe-nodes endpoint with the raw metadata shape). Always
-// check both.
+// Every flag has two possible sources, and ONE order of precedence:
+// the parsed instance first (the compiler mirrors the catalog's
+// metadata onto every node it parses), and the catalog template only
+// when the instance says nothing (a node added in the editor and not
+// yet parsed). The host reads the parse the same way before it starts
+// a poller (`graphView.ts syncDisplayPollers`), so the two cannot
+// disagree about which nodes get a display.
+// SYNC: role precedence <-> extension-vscode/src/graphView.ts syncDisplayPollers
 
 import { NODE_TYPE_CONFIG } from '../nodes';
 import type { IncludedContents } from '../../../protocol';
@@ -18,21 +19,20 @@ import type { IncludedContents } from '../../../protocol';
 /// the full type from `../types` so this file stays focused.
 interface RoleNodeShape {
   nodeType: string;
-  features?: { isTrigger?: boolean } | undefined;
+  requiresInfra?: boolean;
+  features?: { isTrigger?: boolean; liveEndpoint?: string } | undefined;
 }
 
-
-/// True iff the node is infra-backed (`/live` poller applies).
-export function nodeRequiresInfra(node: RoleNodeShape & { requiresInfra?: boolean }): boolean {
-  if (node.requiresInfra) return true;
-  return !!NODE_TYPE_CONFIG[node.nodeType]?.requiresInfra;
+/// True iff the node is infra-backed (its container is what serves
+/// the node's display, and its infra verbs apply).
+export function nodeRequiresInfra(node: RoleNodeShape): boolean {
+  return node.requiresInfra ?? !!NODE_TYPE_CONFIG[node.nodeType]?.requiresInfra;
 }
 
-/// True iff the node is a trigger (`/display` poller applies).
+/// True iff the node is a trigger (its listener kind is what serves
+/// the node's display).
 export function nodeIsTrigger(node: RoleNodeShape): boolean {
-  if (node.features?.isTrigger) return true;
-  const catalog = NODE_TYPE_CONFIG[node.nodeType];
-  return !!catalog?.features?.isTrigger;
+  return node.features?.isTrigger ?? !!NODE_TYPE_CONFIG[node.nodeType]?.features?.isTrigger;
 }
 
 /// The two PROJECT-level questions, which are not the same as the
@@ -58,16 +58,24 @@ export function projectHasTriggers(nodes: readonly ProjectRoleNode[]): boolean {
   return nodes.some((n) => nodeIsTrigger(n) || !!n.includeContents?.hasTrigger);
 }
 
-/// Which body-panel feed a node consumes, or undefined if none.
-/// Mutually exclusive: a node is infra OR trigger OR neither, never
-/// both (current catalog enforces this; the helper picks infra
-/// first so a future overlap stays deterministic).
-export type NodeBodyFeedKind = 'infra' | 'signal';
+/// Does this node show a display on its body?
+///
+/// The same question the host asks before it starts a poller, so the
+/// two cannot disagree about which nodes get one. A trigger always
+/// does (the listener kind holding its signal serves it). An infra
+/// node does only when its metadata NAMES the endpoint serving it: a
+/// node that speaks only TCP has nothing to serve one on, and one that
+/// answered true here with nothing ever polling it would sit forever
+/// under an empty panel.
+///
+/// Both kinds answer in the same shape through the same channel, so
+/// the caller needs the question answered, not which of the two it was.
+export function nodeHasDisplay(node: RoleNodeShape): boolean {
+  if (nodeRequiresInfra(node)) return nodeServesLive(node);
+  return nodeIsTrigger(node);
+}
 
-export function nodeBodyFeedKind(
-  node: RoleNodeShape & { requiresInfra?: boolean },
-): NodeBodyFeedKind | undefined {
-  if (nodeRequiresInfra(node)) return 'infra';
-  if (nodeIsTrigger(node)) return 'signal';
-  return undefined;
+/// Does this node's container serve `/live`, per its metadata?
+function nodeServesLive(node: RoleNodeShape): boolean {
+  return (node.features?.liveEndpoint ?? NODE_TYPE_CONFIG[node.nodeType]?.features?.liveEndpoint) != null;
 }

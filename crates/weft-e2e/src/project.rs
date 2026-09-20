@@ -289,9 +289,9 @@ impl Project {
             .type_registry();
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
-            // `main.weft`'s anonymous root takes the "Main" id; SetConfig
-            // resolves the node against that, matching the lowering.
-            "Main",
+            // The entry file has no anonymous root (the compiler refuses
+            // one), so there is no id to resolve one under.
+            None,
             &[weft_compiler::edit::EditOp::SetConfig {
                 node: node.to_string(),
                 key: key.to_string(),

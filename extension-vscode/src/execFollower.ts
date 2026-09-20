@@ -8,8 +8,8 @@
 // completed / failed / ...).
 //
 // The follower does NOT post node-body panel content. That panel is
-// fed by graphView's `/live` (infra) and `/display` (trigger)
-// pollers, which run independently of execution.
+// a node's display, fed by graphView's `/live` pollers, which run
+// independently of execution.
 //
 // A single follower tracks a single color at a time. Switching
 // follows (the user picks a different past execution in the

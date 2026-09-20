@@ -1268,11 +1268,16 @@ pub struct RunnerHandle {
     project_id: String,
     color: Color,
     node_id: String,
-    /// The node as a person reads it (`weft_core::project::plain_id`
-    /// of `node_id`): what every message this handle writes for a
-    /// person names the node by. The id itself is internal, and a
-    /// node inside an included file has one no person would write.
-    name: String,
+    /// The PLACE this firing runs at, spelled the way a person writes
+    /// the node (`store`, or `one.store` inside the file the site `one`
+    /// includes): the node under the call sites on its frames. Two
+    /// things read it. Every message this handle writes for a person
+    /// names the node by it, because the id itself is internal and a
+    /// node inside an included file has one no person would write. And
+    /// the infra row of an infra node is keyed by it, because a file
+    /// included twice provisions twice, so `endpoint_url` asks for the
+    /// instance at THIS place.
+    place: String,
     /// The node's catalog type, sent with runtime-key / cost-provision
     /// requests so the runtime's policy + audit trail name the exact
     /// node kind asking.
@@ -1427,6 +1432,7 @@ impl RunnerHandle {
         project_id: String,
         color: Color,
         node_id: String,
+        place: String,
         node_type: String,
         node_frames: weft_core::frames::LoopFrames,
         clients: EngineClients,
@@ -1444,7 +1450,7 @@ impl RunnerHandle {
             execution_id,
             project_id,
             color,
-            name: weft_core::project::plain_id(&node_id),
+            place,
             node_id,
             node_type,
             node_frames,
@@ -1665,7 +1671,7 @@ impl RunnerHandle {
                     "node '{}' tried to emit on undeclared output port '{}'. \
                      Declare it in metadata.json's outputs list, or correct \
                      the port name in the node body.",
-                    self.name, port_name
+                    self.place, port_name
                 )));
             }
         }
@@ -1697,7 +1703,7 @@ impl RunnerHandle {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' yielded on stream port '{}' after closing it; a close \
                      ends the stream, nothing can follow it.",
-                    self.name, port_name
+                    self.place, port_name
                 )));
             }
             if claims.mentioned.contains(port_name) && !self.is_generator_output(port_name) {
@@ -1706,7 +1712,7 @@ impl RunnerHandle {
                      Each output port can be emitted or closed AT MOST ONCE per \
                      firing; release ports incrementally (e.g. a bus marker early, \
                      a `done` flag at the end) but never re-emit or re-close a port.",
-                    self.name, port_name
+                    self.place, port_name
                 )));
             }
         }
@@ -1997,7 +2003,7 @@ impl ContextHandle for RunnerHandle {
         // anyway: it stays warm and uses bus.recv() instead.
         if !self.lock_port_claims().mentioned.is_empty() {
             return Err(WeftError::NodeExecution(
-                weft_core::context::emitted_then_await_signal_error(&self.name),
+                weft_core::context::emitted_then_await_signal_error(&self.place),
             ));
         }
         // A stream CONSUMER cannot durably suspend either: the resume
@@ -2005,7 +2011,7 @@ impl ContextHandle for RunnerHandle {
         // pulls consumed were delivered live and cannot be replayed.
         if self.has_generator_input {
             return Err(WeftError::NodeExecution(
-                weft_core::context::stream_consumer_await_signal_error(&self.name),
+                weft_core::context::stream_consumer_await_signal_error(&self.place),
             ));
         }
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
@@ -2145,7 +2151,7 @@ impl ContextHandle for RunnerHandle {
         .map_err(|error| WeftError::NodeExecution(format!(
             "could not save result of '{name}' for node '{}': {error}. \
              The action may already have happened; inspect this run before repeating it.",
-            self.name,
+            self.place,
         )))
     }
 
@@ -2349,10 +2355,12 @@ impl ContextHandle for RunnerHandle {
     }
 
     async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
+        // By place (see `name`): the instance provisioned for THIS call
+        // of the file, never another call's.
         let endpoint = self
             .clients
             .infra
-            .endpoint_url(&self.project_id, &self.node_id, name)
+            .endpoint_url(&self.project_id, &self.place, name)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         let url = endpoint.ok_or_else(|| {
@@ -2360,7 +2368,7 @@ impl ContextHandle for RunnerHandle {
                 "endpoint '{}' for node '{}' is not available; either the infra isn't running \
                  or the endpoint name is not declared. Check `weft infra status` and the node's \
                  InfraSpec.endpoints list.",
-                name, self.name
+                name, self.place
             ))
         })?;
         self.wait_until_routable_logging(&url, &format!("endpoint '{name}'")).await?;
@@ -2447,7 +2455,7 @@ impl ContextHandle for RunnerHandle {
             return Err(WeftError::Config(format!(
                 "node '{}' called ctx.register_signal more than once; \
                  entry triggers are one-per-node-per-TriggerSetup",
-                self.name
+                self.place
             )));
         }
         let reply = enqueue_register_signal_task(
@@ -2481,15 +2489,17 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<weft_core::access::Access> {
         let spec = self.published_spec()?;
         let service = spec.service.clone();
+        // Keyed and labelled by PLACE (see `name`): a node inside a file
+        // included twice publishes one connection per call, each the
+        // instance that call brought up, and the connection list names
+        // it the way a person writes that call.
         let req = weft_broker_client::protocol::PublishAccessRequest {
             color: self.color.to_string(),
-            node_id: self.node_id.clone(),
+            node_id: self.place.clone(),
             service: service.clone(),
             spec,
             values,
-            // The connection list's middle column. The node id reads
-            // as what it is: the thing in this project that opened it.
-            label: Some(self.node_id.clone()),
+            label: Some(self.place.clone()),
         };
         let resp = self.clients.access_broker.publish_access(&req).await.map_err(|e| {
             WeftError::NodeExecution(format!("publish the '{service}' connection: {e:#}"))
@@ -2505,7 +2515,8 @@ impl ContextHandle for RunnerHandle {
         let service = self.published_spec()?.service.clone();
         let req = weft_broker_client::protocol::PublishedAccessRequest {
             color: self.color.to_string(),
-            node_id: self.node_id.clone(),
+            // By place, the key `publish_access` wrote under.
+            node_id: self.place.clone(),
             service: service.clone(),
         };
         let resp = self.clients.access_broker.published_access(&req).await.map_err(|e| {
@@ -2692,14 +2703,14 @@ impl ContextHandle for RunnerHandle {
         for (port, value) in output.outputs {
             // A wire carries values, never bytes: a value over the cap
             // fails the call outright, naming where the bytes belong.
-            weft_core::storage::check_wire_value(&self.node_id, &port, &value)
+            weft_core::storage::check_wire_value(&self.place, &port, &value)
                 .map_err(WeftError::NodeExecution)?;
             match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
                 Some((_, Some(element))) if !type_accepts(element, &value) => {
                     return Err(WeftError::NodeExecution(format!(
                         "node '{}' yielded a value on stream port '{}' that the element \
                          type '{}' does not accept (got {})",
-                        self.name,
+                        self.place,
                         port,
                         element,
                         WeftType::infer(&value),
@@ -2709,7 +2720,7 @@ impl ContextHandle for RunnerHandle {
                     return Err(WeftError::NodeExecution(format!(
                         "node '{}' emitted a value on port '{}' that its declared type '{}' \
                          does not accept (got {})",
-                        self.name,
+                        self.place,
                         port,
                         declared,
                         WeftType::infer(&value),
@@ -2738,7 +2749,7 @@ impl ContextHandle for RunnerHandle {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}' called yield_downstream but nothing was emitted (the output \
                  was empty); there is nothing whose delivery could be awaited",
-                self.name
+                self.place
             )));
         }
         let gate = DeliveryGate::new();
@@ -2752,14 +2763,14 @@ impl ContextHandle for RunnerHandle {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}' called set_max_buffered_items on '{port}', which is not a \
                  Generator output it declares",
-                self.name
+                self.place
             )));
         }
         if items == 0 {
             return Err(WeftError::NodeExecution(format!(
                 "node '{}': set_max_buffered_items(0) on '{port}'; a cap of 0 could never \
                  accept even the first item",
-                self.name
+                self.place
             )));
         }
         // Clone-on-write into a fresh Arc: emissions snapshot the Arc
@@ -2793,7 +2804,7 @@ impl ContextHandle for RunnerHandle {
             if !claims.ended_streams.insert(port.clone()) {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' closed stream port '{}' twice; a stream ends once.",
-                    self.name, port
+                    self.place, port
                 )));
             }
             // Also recorded as a mention so the no-emission-before-a-
@@ -2809,7 +2820,7 @@ impl ContextHandle for RunnerHandle {
         let handle = self
             .bus_coordinator
             .new_bus(opts, self.firing_location())
-            .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.name)))?;
+            .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.place)))?;
         let marker = handle.marker();
         Ok((handle, marker))
     }
@@ -2820,7 +2831,7 @@ impl ContextHandle for RunnerHandle {
             .map_err(|e| {
                 WeftError::Input(format!(
                     "ctx.bus on node '{}': {e}",
-                    self.name
+                    self.place
                 ))
             })
     }
@@ -3131,6 +3142,7 @@ mod replay_tests {
             "00000000-0000-0000-0000-000000000000".into(),
             uuid::Uuid::nil(),
             "node-x".into(),
+            "node-x".into(),
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
@@ -3199,6 +3211,7 @@ mod replay_tests {
             "exec-1".into(),
             "00000000-0000-0000-0000-000000000000".into(),
             uuid::Uuid::nil(),
+            "node-x".into(),
             "node-x".into(),
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
@@ -3464,6 +3477,7 @@ mod replay_tests {
             color.to_string(),
             "project-1".into(),
             color,
+            "node-x".into(),
             "node-x".into(),
             "OpensConnection".into(),
             weft_core::frames::LoopFrames::default(),
@@ -4037,12 +4051,16 @@ pub async fn apply_via_supervisor(
     infra_state: &dyn InfraStateClient,
     clock: &dyn weft_platform_traits::Clock,
     project_id: &str,
-    node_id: &str,
+    place: &str,
     spec: &weft_core::infra::InfraSpec,
 ) -> anyhow::Result<()> {
+    // `place` is the node spelled the way a person writes it (`one.db`
+    // inside the file the site `one` includes), which is what the
+    // `infra_node` row and every resource the supervisor makes for it
+    // are keyed by: a file included twice is provisioned twice.
     let spec_json = serde_json::to_value(spec)?;
     let cmd_id = infra_state
-        .enqueue_apply(project_id, node_id, spec_json)
+        .enqueue_apply(project_id, place, spec_json)
         .await?;
     let started = clock.now();
     let mut next_report = started + Duration::from_secs(30);
@@ -4061,7 +4079,7 @@ pub async fn apply_via_supervisor(
                     tracing::info!(
                         target: "weft_engine::context",
                         project_id,
-                        node_id,
+                        node = place,
                         reason,
                         "supervisor apply cancelled; no longer applicable"
                     );
@@ -4084,7 +4102,7 @@ pub async fn apply_via_supervisor(
         }
         if clock.now() >= next_report {
             tracing::info!(
-                project_id, node_id, command_id = cmd_id,
+                project_id, node = place, command_id = cmd_id,
                 elapsed_secs = clock.now().duration_since(started).as_secs(),
                 "infrastructure apply is still running; inspect it with `weft infra status`"
             );

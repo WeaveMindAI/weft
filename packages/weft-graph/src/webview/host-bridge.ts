@@ -218,6 +218,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     inputs: n.inputs.map(copyPort),
     outputs: n.outputs.map(copyPort),
     features: n.features,
+    requiresInfra: n.requiresInfra,
     scope: n.scope,
     groupBoundary: n.groupBoundary ?? undefined,
     includePath: n.includePath,

@@ -44,16 +44,22 @@ to the dispatcher at `http://localhost:9999` (setting `weft.dispatcherUrl`).
 - **Wires** are arrows colored by the source port's type.
 - **Groups** are large boxes ("GROUP" header) holding child nodes;
   collapsed they become a chip with the label, an expand button, and the
-  description line. **Loops** render violet with a rotate icon, their
-  config knobs in a strip under the header, implicit `index` and `done`
-  ports on the rails, carry ports marked ↻. **@include blocks** are violet
-  with the filename; their "Open" button navigates into that file and the
-  toolbar grows a "Return · <file>" button.
+  description line. A group grows a "Config" strip under its header once
+  the source gives one of its ports a value (`g.tone = "formal"`): the
+  field edits that line, and the strip is gone when no port has one.
+  **Loops** render violet with a rotate icon, their settings in that strip
+  always, followed by any port the source gave a value, implicit `index`
+  and `done` ports on the rails, carry ports marked ↻. **@include blocks**
+  are violet with the filename; their body fields hold the values written
+  on their ports (`keep.n = 7`) and edit those lines in place (no `{ }`
+  toggle: an alias has no braces); their "Open" button navigates into
+  that file and the toolbar grows a "Return · <file>" button.
 - **Access nodes** (TelegramAccess and friends) show a "Connect
   <Service>..." button in their body; one with a required, unpicked
   connection pins open (expanded, collapse disabled, "Pick a connection
-  first") until a connection is picked. **Trigger nodes** show a live feed
-  (mount URLs, minted API keys, progress). **Infra nodes** carry a status
+  first") until a connection is picked. **Trigger nodes** show their display
+  (the address a caller sends to and how the door checks them, or a
+  timer's schedule; never a key). **Infra nodes** carry a status
   pill (running, stopped, failed...) and a body feed of what the service
   prints.
 - **Debug nodes** render their latest value inline; media nodes render the

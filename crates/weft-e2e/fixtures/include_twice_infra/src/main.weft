@@ -1,0 +1,16 @@
+# One file holding an infra node, included twice. An infra node is one
+# INSTANCE per place, so `one.svc` and `two.svc` are two sidecars with two
+# rows, two endpoints and two lines in `weft infra status`, and each call's
+# nodes reach their own call's instance.
+#
+# The MiniService node is copied in from the `infra_min` fixture by the
+# test (`add_node_from_fixture`), the way the lifecycle suite does.
+
+one = @include("lib/part.weft")
+two = @include("lib/part.weft")
+
+first = Debug
+first.data = one.status
+
+second = Debug
+second.data = two.status

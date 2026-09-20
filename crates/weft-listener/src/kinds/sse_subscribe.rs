@@ -20,7 +20,8 @@ use crate::registry::RegisteredSignal;
 use super::event_source::Backoff;
 use async_trait::async_trait;
 
-use super::{KindHandler, SpawnCtx};
+use super::{KindHandler, LiveCtx, SpawnCtx};
+use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct SseSubscribeHandler;
 
@@ -61,6 +62,22 @@ impl KindHandler for SseSubscribeHandler {
             value: payload,
             target: ProcessTarget::Entry,
         }
+    }
+
+    /// Nothing calls in, so there is no address to show: the display
+    /// is what this signal is listening to and whether the loop
+    /// holding it is healthy right now.
+    fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
+        let sig = ctx.sig;
+        let cfg = match super::config_for_display::<SseSubscribe>(sig, "Listening to") {
+            Ok(cfg) => cfg,
+            Err(feed) => return feed,
+        };
+        let mut items: Vec<LiveItem> =
+            super::configured_url_item("Listening to", &cfg.url).into_iter().collect();
+        items.push(LiveItem::text("Event", cfg.event_name));
+        items.extend(super::serving_item(sig));
+        LiveFeed::new(items)
     }
 
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {
@@ -152,12 +169,16 @@ fn spawn_loop(
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
         loop {
+            // Every turn of this loop writes what it is doing where the
+            // node's display reads it (`serving_item`).
+            super::set_serving_status(&ctx, "connecting");
             // Signed-in streams resolve the connection PER CONNECT so
             // a reconnect always subscribes with a fresh credential.
             let client = match crate::listener_access::client_for(&access, &ctx).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "connection resolve failed; retrying");
+                    super::set_serving_status(&ctx, format!("connection resolve failed; retrying: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -170,15 +191,18 @@ fn spawn_loop(
             {
                 Ok(r) if r.status().is_success() => {
                     info!(target: "weft_listener::sse_subscribe", %url, token = %ctx.fire.token(), "SSE connected");
+                    super::set_serving_status(&ctx, "connected");
                     r
                 }
                 Ok(r) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, status = %r.status(), "non-success; retrying");
+                    super::set_serving_status(&ctx, format!("the endpoint answered {}; retrying", r.status()));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, error = %e, "connect failed; retrying");
+                    super::set_serving_status(&ctx, format!("connect failed; retrying: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -241,6 +265,7 @@ fn spawn_loop(
             // endpoint (accepts then immediately resets) doesn't get
             // hammered at a fixed 1/s. A connection that stayed up long
             // enough to be healthy resets the ladder.
+            super::set_serving_status(&ctx, "stream dropped; reconnecting");
             backoff.reset_if_healthy(connected_at.elapsed());
             backoff.wait_then_climb().await;
         }

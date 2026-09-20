@@ -17,13 +17,42 @@ import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
-import { exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
+import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
-import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
+import { isLiveDataItem } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
+
+/// What a parse answers for a project the dispatcher has never seen.
+const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
+
+/// One node's display poller: the interval, and the route it polls.
+///
+/// The route rides WITH the timer because it is a fact of the poller,
+/// decided when the parse started it. An in-flight tick compares it
+/// against what the map holds to know whether its answer still belongs
+/// to anything on screen.
+interface DisplayPoller {
+  path: string;
+  timer: NodeJS.Timeout;
+}
+
+/// The line that stands in for an item no renderer can draw.
+///
+/// The dispatcher already reads a container's answer into the display
+/// shape and rewrites what it cannot, so reaching here means an item
+/// crossed a process boundary and still does not fit. Dropping it would
+/// leave a display quietly short of what the node meant to show, which
+/// is the one failure nobody can see.
+function unrenderableItem(item: unknown): LiveDataItem {
+  return {
+    type: 'text',
+    label: 'Unreadable item',
+    data: JSON.stringify(item) ?? String(item),
+  };
+}
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
@@ -112,26 +141,23 @@ export class GraphViewController {
   /// race the webview's listener registration and get dropped on
   /// VS Code restart with a .weft already open.
   private readyHandler: (() => void) | undefined;
-  // One entry per (project, infra node) we're polling /live for.
-  // Keyed by nodeId. Cleared on parseResult and dispose. Posts
-  // `infraLive` messages to the webview.
-  private liveTimers: Map<string, NodeJS.Timeout> = new Map();
-  /// The infra nodes whose container serves `/live` (and `/action`), as
-  /// of the last parse: a press on one of their buttons goes to the
-  /// container, every other button to the listener holding a signal.
-  /// Every infra node of the parsed project. This is what says WHERE a
-  /// body-panel button goes (the container behind `/infra`, or the
-  /// listener holding a signal), which is a fact of the node.
+  /// One poller per node that shows a display, keyed by node id.
+  /// Reconciled against every parse (a poller whose route is unchanged
+  /// keeps ticking), emptied when the view stops being a place, when
+  /// the document changes, and on dispose. Each tick posts a
+  /// `nodeDisplay` message to the webview.
+  ///
+  /// Two kinds of node have one and each serves it from its own
+  /// place, but both answer `/live` in the same shape, so one map of
+  /// timers covers them: the URL is the only thing that differs.
+  private displayTimers: Map<string, DisplayPoller> = new Map();
+  /// Every infra node of the parsed project: the nodes whose display
+  /// carries buttons a press can reach (the container behind `/infra`
+  /// serves `/action`). A trigger's display is read-only, so a press
+  /// on a node outside this set has nowhere to go.
   private infraNodeIds: Set<string> = new Set();
-  // Same shape, for trigger nodes' signal display info (mount URL,
-  // freshly-minted api keys, etc). Keyed by nodeId. Polls
-  // `/projects/{id}/signals/{node_id}/display` and posts
-  // `signalDisplay` messages. A node is either infra OR trigger;
-  // never both, so a node never has both timers.
-  private signalDisplayTimers: Map<string, NodeJS.Timeout> = new Map();
-  // Interval between polls for infra /live. 3s matches v1; the
-  // /live is cheap (returns current state snapshot), so
-  // this is fine.
+  // Interval between display polls. 3s matches v1; `/live` is cheap
+  // (it returns the current state), so this is fine.
   private readonly liveIntervalMs = 3000;
   // Action bar state, drift, and per-node infra status come from
   // the host's `weft status --json` calls (handled by extension.ts'
@@ -291,19 +317,18 @@ export class GraphViewController {
 
   async open(doc: vscode.TextDocument, projectId?: string, keepNavStack = false): Promise<void> {
     // A fresh open (sidebar, command) resets include-navigation; only
-    // navigateInto/navigateBack preserve the stack.
-    if (!keepNavStack && this.navStack.length > 0) {
-      this.navStack = [];
-      this.sendNavState();
-    }
+    // navigateInto/navigateBack preserve the stack. The webview learns
+    // the new place with the parse result (`applyParseResult`).
+    if (!keepNavStack) this.navStack = [];
     // Resolve the project id for this file. Explicit caller arg
     // wins (sidebar pin path); otherwise walk up from the .weft
-    // file looking for a `weft.toml` that declares an id. Falling
-    // back to undefined leaves the panel without a project id, which
-    // breaks every /projects/{id}/... dispatcher endpoint for this
-    // panel (live poll, infra status, trigger status).
-    const resolved = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
-    if (resolved) this.watchedProjectId = resolved;
+    // file looking for a `weft.toml` that declares an id. A file that
+    // belongs to no project leaves the panel without one, and every
+    // /projects/{id}/... call then stays quiet, which is right: the
+    // previous file's id carried forward would poll and act on a
+    // project this file has nothing to do with (the tab-switch path
+    // clears it for the same reason).
+    this.watchedProjectId = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
     // A banner about another project's run goes now, before the graph
     // under it changes.
     if (this.execVersionFor !== undefined && this.execVersionFor !== this.watchedProjectId) {
@@ -316,6 +341,11 @@ export class GraphViewController {
     // iframe (microsoft/vscode#141001).
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Active);
+      // The pollers were asking about the previous file's nodes; the
+      // next parse starts the new file's. Left running, they would
+      // paint the old file's displays onto same-named nodes of the new
+      // one until that parse lands, and forever if it fails.
+      if (doc !== this.watchedDoc) this.stopAllLivePollers();
       this.watchedDoc = doc;
       this.watchNodesDir(doc);
       this.watchSelfFile(doc);
@@ -396,12 +426,16 @@ export class GraphViewController {
           // its target before this fires, so that case sees no change here).
           const isDifferentDoc = ed.document !== this.watchedDoc;
           // Drop any include back-stack so the Return button / call path don't
-          // dangle against an unrelated graph.
-          if (isDifferentDoc && this.navStack.length > 0) {
+          // dangle against an unrelated graph, and the old graph's display
+          // pollers with it: they were asking about the old file's nodes.
+          // The place the webview is told about is computed from the
+          // watched doc, so it is sent once that doc is the new one.
+          if (isDifferentDoc) {
             this.navStack = [];
-            this.sendNavState();
+            this.stopAllLivePollers();
           }
           this.watchedDoc = ed.document;
+          if (isDifferentDoc) this.sendNavState();
           // Re-resolve project id for the new file: different
           // .weft files can belong to different projects, and
           // the old watchedProjectId must not leak into the
@@ -738,6 +772,12 @@ export class GraphViewController {
       // shows the correct fresh result.
       if (seq !== this.parseSeq) return;
       const message = err instanceof Error ? err.message : String(err);
+      // The place still moves with the file, parse or no parse: a
+      // broken file walked into or opened on its own must not keep the
+      // last good file's call path and its action bar, nor its display
+      // pollers (nothing is on screen for them to paint).
+      this.stopAllLivePollers();
+      this.sendNavState();
       this.post({
         kind: 'parseError',
         error: message,
@@ -774,8 +814,7 @@ export class GraphViewController {
     // Latch the parsed project id as the authoritative watch id when we don't
     // already have one (weft.toml lookup failed on open but the parse returns a
     // real uuid, e.g. a project the CLI knows from its own weft.toml).
-    const nilUuid = '00000000-0000-0000-0000-000000000000';
-    if (response.project.id && response.project.id !== nilUuid && !this.watchedProjectId) {
+    if (response.project.id && response.project.id !== NIL_PROJECT_ID && !this.watchedProjectId) {
       this.watchedProjectId = response.project.id;
     }
     // Update referenced-file state (fileBaseDir/fileRelPaths + watchers) before
@@ -800,163 +839,167 @@ export class GraphViewController {
     // reply instead (one message, no double render); only parse-fed renders
     // (which carry the layout) post `parseResult`.
     if (layout) {
+      // The place first, the graph second: a fresh mount looks its
+      // execution values up by the call path and gates what it draws on
+      // whether the view is a place at all, so both have to be current
+      // when the graph lands, whichever way this file was opened.
+      this.sendNavState();
       this.post({ kind: 'parseResult', response, source, layoutCode: layout.code, freshMount: this.freshMount });
     }
     this.freshMount = false;
-    this.syncInfraLivePollers(response);
-    this.syncSignalDisplayPollers(response);
+    this.syncDisplayPollers(response);
   }
 
-  /** Compare the latest parse to the set of infra nodes we're
-   *  currently polling `/live` for. Start pollers for any newly-
-   *  introduced infra nodes, stop those that no longer exist. The
-   *  dispatcher answers 404 cleanly when `weft infra up` hasn't run
-   *  yet, so starting a poller is harmless either way.
+  /** Compare the latest parse to the nodes we are currently polling a
+   *  display for: start one for each node that now has a display, stop
+   *  the ones whose node is gone.
    *
-   *  Also drives the ActionBar's infra + trigger status pollers
-   *  based on which node families the project contains.
+   *  Two kinds of node show one. An infra node's container serves it,
+   *  and only when the node's metadata names the endpoint; one that
+   *  speaks only TCP has nothing to serve it on. A trigger's listener
+   *  kind always serves one. The dispatcher
+   *  answers 404 cleanly while there is nothing behind either yet (the
+   *  infra is not up, the project is not activated), so starting a
+   *  poller early is harmless.
    */
-  private syncInfraLivePollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
+  private syncDisplayPollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
     const projectId = response.project.id;
-    if (!projectId) {
+    // The nil id is what a parse answers for a project the dispatcher
+    // has never registered. Polling it asks about a project that does
+    // not exist, every 3s, forever, and paints an error on every node
+    // that would have a display.
+    if (!projectId || projectId === NIL_PROJECT_ID) {
       this.stopAllLivePollers();
-      // Nothing is parsed any more, so the set describes nothing.
-      // Leaving it behind would route this project's buttons by the
-      // last project's answers.
-      this.infraNodeIds = new Set();
       return;
     }
+    // Where this view stands (see `viewPlace`). A display belongs to a
+    // PLACE: an infra node's container is one per place (a file included
+    // twice provisions twice) and a trigger's registration is one per
+    // place, so a file opened on its own (no place) polls nothing:
+    // nothing says which call's instance is meant.
+    const { callPath, interactive } = this.viewPlace();
+    if (!interactive) {
+      this.stopAllLivePollers();
+      return;
+    }
+    const nodes = response.project.nodes;
+    // The parsed node first, the catalog only when it says nothing: the
+    // same precedence the webview's role predicates use, so the host
+    // never polls a node the webview draws no panel for, or the reverse.
+    // SYNC: role precedence <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts
     const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
       n.requiresInfra ?? response.catalog[n.nodeType]?.requires_infra ?? false;
-    this.infraNodeIds = new Set(response.project.nodes.filter(isInfraNode).map((n) => n.id));
-    // Only poll /live for infra nodes whose catalog metadata names a
-    // `features.liveEndpoint`. TCP-only infra (Postgres, Redis) leaves
-    // it unset and would otherwise return 502 on every tick.
-    const infraNodeIds = new Set(
-      response.project.nodes
-        .filter((n) => {
-          if (!isInfraNode(n)) return false;
-          const liveEndpoint = response.catalog[n.nodeType]?.features?.liveEndpoint
-            ?? n.features?.liveEndpoint;
-          return liveEndpoint != null;
-        })
-        .map((n) => n.id),
-    );
-    // Stop pollers for nodes no longer in the project (or no longer
-    // requires_infra).
-    for (const [id, timer] of this.liveTimers.entries()) {
-      if (!infraNodeIds.has(id)) {
-        clearInterval(timer);
-        this.liveTimers.delete(id);
+    const isTriggerNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
+      n.features?.isTrigger ?? response.catalog[n.nodeType]?.features?.isTrigger ?? false;
+    const servesLive = (n: ParseResponse['project']['nodes'][number]): boolean =>
+      (n.features?.liveEndpoint ?? response.catalog[n.nodeType]?.features?.liveEndpoint) != null;
+
+    this.infraNodeIds = new Set(nodes.filter(isInfraNode).map((n) => n.id));
+    // One decision per node, made HERE, from the parse that answers it:
+    // where this node's display lives. Re-deriving the route later from
+    // the mutable infra set let a node that changed type keep polling
+    // its old endpoint while its buttons went to the new one, because a
+    // node keeps its id when its type changes.
+    const showing = new Map<string, string>();
+    for (const n of nodes) {
+      // An infra node's container serves the display, and only when
+      // the node's metadata names the endpoint. One that speaks only
+      // TCP has nothing to serve it on, and polling it anyway would
+      // answer 502 on every tick.
+      // Both doors take the place spelled the way a person writes it
+      // (`one.door` for the `door` inside the file the site `one`
+      // includes): the node under the calls this view descended through.
+      if (isInfraNode(n)) {
+        if (servesLive(n)) {
+          showing.set(n.id, `/projects/${projectId}/infra/nodes/${addressOf(callPath, n.id)}/live`);
+        }
+        continue;
+      }
+      if (isTriggerNode(n)) {
+        showing.set(n.id, `/projects/${projectId}/signals/${addressOf(callPath, n.id)}/live`);
       }
     }
-    // Start pollers for new infra nodes.
-    for (const id of infraNodeIds) {
-      if (this.liveTimers.has(id)) continue;
-      this.liveTimers.set(id, this.startLivePoller(projectId, id));
-    }
 
+    for (const [id, poller] of this.displayTimers.entries()) {
+      // Gone, or serving from somewhere else than when it started.
+      if (showing.get(id) === poller.path) continue;
+      clearInterval(poller.timer);
+      this.displayTimers.delete(id);
+    }
+    for (const [id, path] of showing) {
+      if (this.displayTimers.has(id)) continue;
+      this.startDisplayPoller(id, path);
+    }
   }
 
-  private startLivePoller(projectId: string, nodeId: string): NodeJS.Timeout {
-    // Fire one poll immediately so the user doesn't wait 3s to see
-    // the QR on first activation, then repeat on the interval.
+  /// Poll one node's display and post each tick to the webview.
+  ///
+  /// The first poll fires immediately, so the user does not wait 3s to
+  /// see the QR code on a first activation, then it repeats.
+  ///
+  /// `path` is decided once, by the parse that put this node in the
+  /// polling set, and a node whose display moves gets a new poller
+  /// rather than a re-derived URL.
+  ///
+  /// Registering the poller is THIS function's job, not its caller's:
+  /// the first tick fires before it returns and has to find itself in
+  /// the map.
+  private startDisplayPoller(nodeId: string, path: string): void {
+    // Compared by identity, never by path: pressing a button replaces
+    // this poller with a fresh one on the SAME path, and a tick that
+    // was already in flight would otherwise pass a path check and
+    // repaint the value the press just changed.
+    let poller: DisplayPoller;
+    const stillMine = () => this.displayTimers.get(nodeId) === poller;
     const tick = async () => {
       try {
-        const body = await this.client.get<{ items: unknown[] }>(
-          `/projects/${projectId}/infra/nodes/${nodeId}/live`,
+        const body = await this.client.get<{ items: unknown[] }>(path);
+        // An item the guard rejects is one no renderer can draw. It
+        // becomes a visible line saying so: a display quietly missing
+        // a line is the one failure nobody can see.
+        const items = (Array.isArray(body.items) ? body.items : []).map((item) =>
+          isLiveDataItem(item) ? item : unrenderableItem(item),
         );
-        const items = Array.isArray(body.items)
-          ? body.items.filter(isLiveDataItem)
-          : [];
-        this.post({ kind: 'infraLive', nodeId, state: 'ok', items });
+        if (!stillMine()) return;
+        this.post({ kind: 'nodeDisplay', nodeId, state: 'ok', items });
       } catch (err) {
-        // 404 = the infra endpoint does not exist for this node yet
-        // (not provisioned). A distinct RESTING state, never collapsed
-        // into a healthy empty list: the webview renders it as its own
-        // affordance, and stale items from a previous run clear.
+        // A poller stopped while this tick was in flight (the node is
+        // gone, the parse broke, another project opened, a press
+        // restarted it): its answer belongs to nothing on screen.
+        if (!stillMine()) return;
+        // 404 = there is nothing serving it yet: the infra is not
+        // provisioned, or the signal is not registered (the project
+        // was never activated, or its trigger setup failed). A
+        // distinct RESTING state, never collapsed into a healthy empty
+        // list: the webview renders it with its own affordance, and
+        // stale items from a previous run clear.
         // Anything else (BAD_GATEWAY, network) is a real failure;
         // surface the underlying message.
         if (err instanceof HttpError && err.status === 404) {
-          this.post({ kind: 'infraLive', nodeId, state: 'absent' });
+          this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
           return;
         }
         const error = err instanceof Error ? err.message : String(err);
-        this.post({ kind: 'infraLive', nodeId, state: 'error', error });
+        this.post({ kind: 'nodeDisplay', nodeId, state: 'error', error });
       }
     };
+    poller = {
+      path,
+      timer: setInterval(() => void tick(), this.liveIntervalMs),
+    };
+    // Registered before the first tick runs, so that tick's own
+    // still-mine check finds it.
+    this.displayTimers.set(nodeId, poller);
     void tick();
-    return setInterval(() => void tick(), this.liveIntervalMs);
   }
 
   private stopAllLivePollers(): void {
-    for (const timer of this.liveTimers.values()) clearInterval(timer);
-    this.liveTimers.clear();
-    for (const timer of this.signalDisplayTimers.values()) clearInterval(timer);
-    this.signalDisplayTimers.clear();
-  }
-
-  /** Mirror of `syncInfraLivePollers` for trigger nodes. Starts a
-   *  /display poller per trigger node so the inspector shows the
-   *  signal's mount URL + minted plaintext key. The dispatcher
-   *  returns 404 until activate registers the signal; we render an
-   *  empty items list in that case so the inspector clears stale
-   *  data instead of showing it forever.
-   */
-  private syncSignalDisplayPollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
-    const projectId = response.project.id;
-    if (!projectId) {
-      for (const timer of this.signalDisplayTimers.values()) clearInterval(timer);
-      this.signalDisplayTimers.clear();
-      return;
-    }
-    const triggerNodeIds = new Set(
-      response.project.nodes
-        .filter((n) => {
-          const entry = response.catalog[n.nodeType];
-          return n.features?.isTrigger ?? entry?.features?.isTrigger ?? false;
-        })
-        .map((n) => n.id),
-    );
-    for (const [id, timer] of this.signalDisplayTimers.entries()) {
-      if (!triggerNodeIds.has(id)) {
-        clearInterval(timer);
-        this.signalDisplayTimers.delete(id);
-      }
-    }
-    for (const id of triggerNodeIds) {
-      if (this.signalDisplayTimers.has(id)) continue;
-      this.signalDisplayTimers.set(id, this.startSignalDisplayPoller(projectId, id));
-    }
-  }
-
-  private startSignalDisplayPoller(projectId: string, nodeId: string): NodeJS.Timeout {
-    const tick = async () => {
-      try {
-        const body = await this.client.get<Record<string, unknown>>(
-          `/projects/${projectId}/signals/${nodeId}/display`,
-        );
-        const items = signalDisplayToLiveItems(body);
-        this.post({ kind: 'signalDisplay', nodeId, state: 'ok', items });
-      } catch (err) {
-        // 404 = nothing is listening for this trigger: the project is
-        // not activated, its trigger setup never registered, or the
-        // listener that held it is gone or has forgotten it (the
-        // dispatcher folds all of those into one 404). A distinct
-        // RESTING state, never collapsed into a healthy empty list;
-        // stale items from a previous activation clear. Anything else
-        // (the dispatcher unreachable, BAD_GATEWAY) is a real failure;
-        // surface it.
-        if (err instanceof HttpError && err.status === 404) {
-          this.post({ kind: 'signalDisplay', nodeId, state: 'absent' });
-          return;
-        }
-        const error = err instanceof Error ? err.message : String(err);
-        this.post({ kind: 'signalDisplay', nodeId, state: 'error', error });
-      }
-    };
-    void tick();
-    return setInterval(() => void tick(), this.liveIntervalMs);
+    for (const poller of this.displayTimers.values()) clearInterval(poller.timer);
+    this.displayTimers.clear();
+    // The set describes a parse that is no longer on screen, and
+    // leaving it behind would route this project's buttons by the last
+    // project's answers.
+    this.infraNodeIds = new Set();
   }
 
   /** Architecture-4 / control-plane unification: every action-bar
@@ -966,23 +1009,32 @@ export class GraphViewController {
    *  reduced to button-routing; the host's ActionBarStore owns all
    *  state transitions and surfaces them via actionBarState.
    */
-  /// Trigger a kind-specific action on a signal (e.g. regenerate
-  /// an api key). Hits the dispatcher's per-project action proxy;
-  /// the listener's kind impl owns the action's payload schema.
-  /// On success, force an immediate /display poll so the inspector
-  /// reflects the updated state without waiting for the next tick.
+  /// Press a button one of a node's display items carries (log a
+  /// phone out, rotate a key). Only an INFRA node's display has
+  /// buttons: the container serving `/live` serves `/action` too and
+  /// owns the payload schema, so the press goes to its proxy. A
+  /// trigger's display is read-only, and a press on one is dropped
+  /// here rather than sent to a door that would refuse it.
+  ///
+  /// On success, force an immediate display poll so the panel shows
+  /// what the press changed without waiting for the next tick.
   ///
   /// When `confirm` is set, asks the user via VS Code's QuickPick
   /// before invoking. Same UX as the deactivate-mode picker so the
   /// experience stays consistent across destructive actions.
-  private async runSignalAction(
+  private async pressDisplayAction(
     nodeId: string,
     actionKind: string,
     payload: unknown,
     confirm: string | undefined,
   ): Promise<void> {
     const projectId = this.watchedProjectId;
-    if (!projectId) return;
+    if (!projectId) {
+      void vscode.window.showErrorMessage(
+        `Action '${actionKind}' has nowhere to go: this file belongs to no project the daemon knows.`,
+      );
+      return;
+    }
     if (confirm) {
       const choice = await vscode.window.showQuickPick(
         [
@@ -994,38 +1046,39 @@ export class GraphViewController {
       if (!choice || !choice.value) return;
     }
     // A button belongs to an infra node's own container, reached
-    // behind `/live`. Triggers used to have one too, for regenerating
-    // a key the listener minted; that whole mechanism is gone (a key
-    // now lives on a connection), so a signal has no action to press
-    // and the dispatcher no longer offers a door for one.
-    if (!this.infraNodeIds.has(nodeId)) return;
+    // behind `/live`; a trigger's display is read-only and the
+    // dispatcher offers no door for a press on one. A press that
+    // lands here on any other node (a stale webview, a view that just
+    // stopped being a place) is said, never dropped.
+    if (!this.infraNodeIds.has(nodeId)) {
+      void vscode.window.showErrorMessage(
+        `Action '${actionKind}' on '${nodeId}' has nowhere to go: only an infra node's display takes a press.`,
+      );
+      return;
+    }
+    // The button was pressed on the node as this view shows it, so the
+    // press goes to the instance at this view's place.
+    const place = addressOf(this.viewPlace().callPath, nodeId);
     try {
       await this.client.post(
-        `/projects/${projectId}/infra/nodes/${nodeId}/action`,
+        `/projects/${projectId}/infra/nodes/${place}/action`,
         { kind: actionKind, payload: payload ?? null },
       );
       // Force-refresh the node's poller so what the press changed (a
-      // fresh QR code, a new address) shows up immediately.
-      const timer = this.liveTimers.get(nodeId);
-      if (timer) {
-        clearInterval(timer);
-        this.liveTimers.set(nodeId, this.startLivePoller(projectId, nodeId));
+      // new plaintext key, a fresh QR code) shows up immediately.
+      const poller = this.displayTimers.get(nodeId);
+      if (poller) {
+        clearInterval(poller.timer);
+        this.displayTimers.delete(nodeId);
+        this.startDisplayPoller(nodeId, poller.path);
       }
     } catch (err) {
-      // 409 means the signal's queue already has the maximum
-      // submission this token accepts (today: resume signals are
-      // capped at one pending answer). Show the user a clean
-      // "already received" message instead of a generic HTTP error
-      // toast.
-      if (err instanceof HttpError && err.status === 409) {
-        void vscode.window.showInformationMessage(
-          `This submission was already received and is being processed.`,
-        );
-      } else {
-        void vscode.window.showErrorMessage(
-          `Action '${actionKind}' failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+      // The container's own refusal arrives as a 400 with its text;
+      // anything else is the door or the network. Both are shown as
+      // they are.
+      void vscode.window.showErrorMessage(
+        `Action '${actionKind}' failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -1046,11 +1099,12 @@ export class GraphViewController {
   }
 
   /// Per-node infra verb (stop / terminate) for partial-state
-  /// recovery from the graph context menu. Confirms via QuickPick
-  /// then dispatches the CLI verb, which gives the action bar the
-  /// usual cli_running overlay + spinner.
+  /// recovery from the graph context menu. `node` is the instance's
+  /// PLACE as a person spells it (`one.db`), which is what the CLI
+  /// verb takes. Confirms via QuickPick then dispatches the CLI verb,
+  /// which gives the action bar the usual cli_running overlay + spinner.
   private async confirmAndDispatchPerNodeVerb(
-    nodeId: string,
+    node: string,
     verb: 'stop' | 'terminate',
   ): Promise<void> {
     const confirm = await vscode.window.showQuickPick(
@@ -1071,7 +1125,7 @@ export class GraphViewController {
     // Per-node stop from the graph forces: the user explicitly picked
     // one node to take down, so NoOp units come down too (otherwise a
     // right-click stop on a NoOp-only node would silently do nothing).
-    const args = verb === 'stop' ? ['node-stop', nodeId, '--force'] : ['node-terminate', nodeId];
+    const args = verb === 'stop' ? ['node-stop', node, '--force'] : ['node-terminate', node];
     void this.dispatchVerb('infra', args);
   }
 
@@ -1242,10 +1296,10 @@ export class GraphViewController {
         // bar's `cli_running` overlay fires (gives us the spinner +
         // label). The CLI proxies to the dispatcher's per-node
         // endpoint.
-        void this.confirmAndDispatchPerNodeVerb(msg.nodeId, 'stop');
+        void this.confirmAndDispatchPerNodeVerb(msg.node, 'stop');
         break;
       case 'infraNodeTerminate':
-        void this.confirmAndDispatchPerNodeVerb(msg.nodeId, 'terminate');
+        void this.confirmAndDispatchPerNodeVerb(msg.node, 'terminate');
         break;
       case 'activateProject':
         void this.dispatchVerb('activate', []);
@@ -1268,8 +1322,8 @@ export class GraphViewController {
       case 'resumeActive':
         void this.runResumeActive();
         break;
-      case 'signalAction':
-        void this.runSignalAction(msg.nodeId, msg.actionKind, msg.payload, msg.confirm);
+      case 'displayAction':
+        void this.pressDisplayAction(msg.nodeId, msg.actionKind, msg.payload, msg.confirm);
         break;
       case 'dismissError':
         this.dismissErrorHandler?.();
@@ -2004,11 +2058,9 @@ export class GraphViewController {
     }
     this.navStack.push({ doc: current, alias });
     this.freshMount = true;
-    // Send navState BEFORE the parse it depends on: open() posts parseResult
-    // (freshMount), which remounts the editor and looks up execution values via
-    // the call path. navState (computed from the now-updated navStack) must arrive
-    // first so that lookup uses the correct prefix on the first render.
-    this.sendNavState();
+    // The place is sent by `applyParseResult`, right before the parse
+    // result it belongs to, once `open` has made the target the watched
+    // doc: sent here it would pair the new call path with the old file.
     await this.open(target, undefined, true);
   }
 
@@ -2174,25 +2226,51 @@ export class GraphViewController {
     const previous = this.navStack.pop();
     if (!previous) return;
     this.freshMount = true;
-    // navState (from the popped navStack) before the parse it feeds, same as
-    // navigateInto.
-    this.sendNavState();
+    // The place goes out with the parse result, once the previous file
+    // is the watched doc again (see `navigateInto`).
     await this.open(previous.doc, undefined, true);
   }
 
-  /// Push the current navigation depth, file name, and call path to the
-  /// webview. The call path is the chain of call sites descended through
-  /// (each the site's own id, `c` then `C.inner`), so the webview shows
-  /// the rows of the one call on screen. The executions view is told the
-  /// same place as a group address (`c.inner`).
+  /// Where in the program this view stands. The call path is the chain
+  /// of call sites descended through (each the site's own id, `c` then
+  /// `C.inner`), and it names the ONE call on screen: the webview shows
+  /// that call's rows, and a trigger's display is asked for under it.
+  ///
+  /// A view is interactive when it is a place at all: the project's
+  /// entry file (`src/main.weft`, the one the CLI reads), or a file
+  /// walked into from there through its includes. An included file
+  /// opened on its own is the same graph with no call above it, and a
+  /// file included twice runs as two places, so nothing says which one
+  /// is meant: such a view draws the graph and nothing that belongs to
+  /// a place (runs, displays, the action bar). A `.weft` outside any
+  /// project is its own entry.
+  private viewPlace(): { callPath: string[]; interactive: boolean } {
+    const callPath = this.navStack.map((f) => f.alias);
+    // The call path is a place only when it starts at the entry file:
+    // the ROOT of the walk is what decides, so walking into an include
+    // from a file opened on its own does not conjure a place out of a
+    // chain that starts nowhere.
+    const rootDoc = this.navStack[0]?.doc ?? this.watchedDoc;
+    // Nothing watched is nothing on screen, so nothing to interact with.
+    if (!rootDoc) return { callPath, interactive: false };
+    const root = findProjectRoot(rootDoc.uri.fsPath);
+    // SYNC: the entry file's path <-> crates/weft-compiler/src/project.rs SRC_DIR / ENTRY_FILE
+    const isEntry = !root || nodePath.resolve(rootDoc.uri.fsPath) === nodePath.join(root, 'src', 'main.weft');
+    return { callPath, interactive: isEntry };
+  }
+
+  /// Push the current navigation depth, file name, and place (see
+  /// `viewPlace`) to the webview. The executions view is told the same
+  /// place as a group address (`c.inner`).
   private sendNavState(): void {
     const fileName = this.watchedDoc?.uri.fsPath.split(/[\\/]/).pop() ?? '';
-    const callPath = this.navStack.map((f) => f.alias);
+    const { callPath, interactive } = this.viewPlace();
     void this.panel?.webview.postMessage({
       kind: 'navState',
       depth: this.navStack.length,
       fileName,
       callPath,
+      interactive,
     });
     this.navHandler?.(groupOfCallPath(callPath));
   }
@@ -2332,5 +2410,5 @@ function dialogFiltersForAccept(
   }
 }
 
-// isLiveDataItem + signalDisplayToLiveItems live in the shared weft-graph
+// isLiveDataItem lives in the shared weft-graph
 // package (imported above), so both hosts use one copy.

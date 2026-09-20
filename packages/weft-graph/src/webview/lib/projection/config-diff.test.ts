@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { diffConfigOps } from './config-diff';
+import { diffConfigOps, diffPortLiteralOps } from './config-diff';
+import type { ConfigFieldSpan } from '../../../protocol';
 
 describe('diffConfigOps', () => {
 	it('a full-config spread with nothing changed emits ZERO ops (the toggle regression)', () => {
@@ -50,5 +51,24 @@ describe('diffConfigOps', () => {
 			.toEqual([{ op: 'setLoopConfig', loopId: 'MyLoop', key: 'parallel', value: 'true' }]);
 		expect(diffConfigOps('MyLoop', { max_iters: null }, { max_iters: 5 }, true))
 			.toEqual([{ op: 'removeLoopConfig', loopId: 'MyLoop', key: 'max_iters' }]);
+	});
+});
+
+describe('diffPortLiteralOps', () => {
+	const span = (origin: ConfigFieldSpan['origin']): ConfigFieldSpan =>
+		({ origin, span: { startLine: 1, startColumn: 0, endLine: 1, endColumn: 1 } });
+
+	it('a value already in source keeps its written form, whatever the first form is', () => {
+		expect(diffPortLiteralOps('n', { text: 'new' }, { text: 'old' }, { text: span('connection') }, 'inline'))
+			.toEqual([{ op: 'setConfig', node: 'n', key: 'text', value: '"new"', form: 'connection' }]);
+		expect(diffPortLiteralOps('n', {}, { text: 'old' }, { text: span('inline') }, 'connection'))
+			.toEqual([{ op: 'removeConfig', node: 'n', key: 'text', form: 'inline' }]);
+	});
+
+	it('a first write takes the node kind\'s form: braces on a node, a statement line on an include', () => {
+		expect(diffPortLiteralOps('n', { text: 'hi' }, {}, {}, 'inline'))
+			.toEqual([{ op: 'setConfig', node: 'n', key: 'text', value: '"hi"', form: 'inline' }]);
+		expect(diffPortLiteralOps('keep', { n: 7 }, {}, {}, 'connection'))
+			.toEqual([{ op: 'setConfig', node: 'keep', key: 'n', value: '7', form: 'connection' }]);
 	});
 });

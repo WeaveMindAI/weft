@@ -71,13 +71,17 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// Named one by one rather than matched by the diagnostic, so adding a
 /// fixture that genuinely does not compile fails here instead of
 /// quietly joining a category.
-const FILLED_IN_BY_THE_RIG: [&str; 6] = [
+const FILLED_IN_BY_THE_RIG: [&str; 7] = [
     "access_s3",
     "access_telegram",
     "audio_transcribe",
     "config_media",
     "email_send",
     "fetch_once",
+    // `MiniService` is copied in from `infra_min` by the test
+    // (`add_node_from_fixture`), so the committed source names a node
+    // this parse cannot see.
+    "include_twice_infra",
 ];
 
 #[test]

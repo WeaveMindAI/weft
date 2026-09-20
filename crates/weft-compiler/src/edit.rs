@@ -203,10 +203,12 @@ pub struct TextEdit {
 /// the original source. CST editing is purely structural and reads no file:
 /// an `@include` is an opaque marker token, so no filesystem view is taken.
 ///
-/// `source_id` is the file's identity (e.g. `MyCleaner` from `my-cleaner.weft`,
-/// `Untitled` for an unsaved buffer). It's the id an anonymous top-level group
-/// takes, so the editor resolves a scoped id (`MyCleaner.child`) against the
-/// SAME prefix the lowering renders, with no rename pass between the two.
+/// `source_id` is the file's identity (an included file's body id, `MyCleaner`
+/// for a standalone `my-cleaner.weft`, `Untitled` for an unsaved buffer). It's
+/// the id an anonymous top-level group takes, so the editor resolves a scoped
+/// id (`MyCleaner.child`) against the SAME prefix the lowering renders, with no
+/// rename pass between the two. `None` is the project's entry file, which may
+/// hold no anonymous group.
 ///
 /// `registry` is the project's type registry: edit ops validate written
 /// TYPE strings (a declared name in a port override is valid exactly
@@ -214,7 +216,7 @@ pub struct TextEdit {
 /// on each caller, so no entry point can forget it.
 pub fn apply_edits(
     source: &str,
-    source_id: &str,
+    source_id: Option<&str>,
     ops: &[EditOp],
     registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
 ) -> Result<(String, TextEdit), EditError> {
@@ -223,7 +225,7 @@ pub fn apply_edits(
 
 fn apply_edits_inner(
     source: &str,
-    source_id: &str,
+    source_id: Option<&str>,
     ops: &[EditOp],
 ) -> Result<(String, TextEdit), EditError> {
     // Parse to a mutable CST. The root is always a WEFT_FILE (the parser is

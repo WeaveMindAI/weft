@@ -451,19 +451,14 @@ pub async fn get(
 
 /// One wait a parked run holds: the node, the token that answers it,
 /// and the signal kind (a `timer` is woken, anything else expects a
-/// value).
-///
-/// The node is here twice on purpose, because two different questions
-/// are asked of it. `id` is what the runtime keys the wait by, which
-/// for a node inside an included file carries the file's path
-/// (`@src:sweep.key`) and is never shown to anyone. `node` is that same
-/// node the way the program spells it, and it is the one on the wire:
-/// this rides the run summary that `weft ps` prints and that an agent
-/// reads through `--json`.
+/// value). Rides `GET /executions/{color}` as `waiting`, which is what
+/// `wake` matches a `weft wake <color> <node>` against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParkedWait {
-    #[serde(skip)]
-    pub id: String,
+    /// The waiting node's place, spelled the way a person writes it
+    /// (`one.review` inside the file the site `one` includes): the
+    /// signal row's own key, so it is both what a reader is shown and
+    /// what `weft wake` names.
     pub node: String,
     pub token: String,
     pub kind: String,
@@ -482,12 +477,7 @@ fn waits_of(signals: &[crate::journal::SignalRegistration], color: Color) -> any
         .filter(|s| s.is_resume && s.color == Some(color))
         .map(|s| {
             let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&s.spec_json)?;
-            Ok(ParkedWait {
-                id: s.node_id.clone(),
-                node: weft_core::project::plain_id(&s.node_id),
-                token: s.token.clone(),
-                kind: spec.kind,
-            })
+            Ok(ParkedWait { node: s.node_id.clone(), token: s.token.clone(), kind: spec.kind })
         })
         .collect()
 }
@@ -794,16 +784,14 @@ pub async fn wake(
     let waits = parked_waits(&state, color)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
-    // Either spelling of the node reaches its wait: the CLI resolves to
-    // the runtime's id before it calls, and anything addressing this
-    // endpoint on its own has only ever seen the spelled form.
-    let Some(wait) = waits.into_iter().find(|w| w.id == node || w.node == node) else {
+    // The node is named the way a person writes it (`one.review`), which
+    // is the key its wait is registered under: one spelling, on the wire
+    // and in the row, so nothing here translates.
+    let Some(wait) = waits.into_iter().find(|w| w.node == node) else {
         // Bounded, like every other caller string this surface echoes: the
         // node name is a raw path segment, so an enormous one would come
-        // straight back in the body. Then read as a person reads it: the
-        // caller may have sent the compiler's id, and the message names a
-        // command whose `--node` takes the spelling the program uses.
-        let node = weft_core::project::plain_id(&weft_core::truncate_user_string(&node, 256));
+        // straight back in the body.
+        let node = weft_core::truncate_user_string(&node, 256);
         return Err((
             StatusCode::NOT_FOUND,
             format!("'{node}' is not waiting on anything in {color}; `weft events {color} --node {node}` shows what it did"),
@@ -833,7 +821,7 @@ pub async fn wake(
             StatusCode::CONFLICT,
             format!(
                 "'{}' is waiting on a {} signal, which expects a value; answer it (its form, in the browser extension or through its signal URL) instead of waking it",
-                weft_core::project::plain_id(&node),
+                wait.node,
                 wait.kind
             ),
         ));
@@ -994,26 +982,28 @@ mod waits_tests {
         assert_eq!(
             waits,
             vec![
-                ParkedWait { id: "hold".into(), node: "hold".into(), token: "a".into(), kind: "timer".into() },
-                ParkedWait { id: "review".into(), node: "review".into(), token: "c".into(), kind: "form".into() },
+                ParkedWait { node: "hold".into(), token: "a".into(), kind: "timer".into() },
+                ParkedWait { node: "review".into(), token: "c".into(), kind: "form".into() },
             ]
         );
     }
 
-    /// A wait on a node inside an included file is keyed by the file's
-    /// path, which nobody can be asked to type. The list carries both:
-    /// the id stays off the wire for the match, the spelling goes out
-    /// for whoever reads the run.
+    /// A wait inside an included file was registered under its place,
+    /// spelled (`sweep.key`), and goes out exactly as the row holds it:
+    /// the same file under another site is another wait with another
+    /// spelling, and nothing here has to tell them apart.
     #[test]
-    fn a_wait_inside_an_included_file_goes_out_spelled() {
+    fn a_wait_inside_an_included_file_goes_out_as_its_place() {
         let mine = Color::new_v4();
-        let signals = vec![signal("a", Some(mine), "@src:sweep.key", true, "timer")];
+        let signals = vec![
+            signal("a", Some(mine), "sweep.key", true, "timer"),
+            signal("b", Some(mine), "again.key", true, "timer"),
+        ];
         let waits = waits_of(&signals, mine).unwrap();
-        assert_eq!(waits[0].id, "@src:sweep.key", "the match key is the runtime's");
-        assert_eq!(waits[0].node, "sweep.key", "what goes out is what the program says");
+        let out: Vec<&str> = waits.iter().map(|w| w.node.as_str()).collect();
+        assert_eq!(out, vec!["sweep.key", "again.key"]);
         let wire = serde_json::to_value(&waits[0]).unwrap();
         assert_eq!(wire["node"], "sweep.key");
-        assert!(wire.get("id").is_none(), "the internal id never reaches the wire");
     }
 }
 

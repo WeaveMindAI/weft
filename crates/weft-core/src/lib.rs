@@ -23,6 +23,7 @@ pub mod generator;
 #[cfg(feature = "runtime")]
 pub mod in_flight;
 pub mod infra;
+pub mod live;
 #[cfg(feature = "runtime")]
 pub mod liveness;
 #[cfg(feature = "runtime")]

@@ -16,7 +16,7 @@ fn apply_edits(
 ) -> Result<(String, TextEdit), EditError> {
     super::apply_edits(
         source,
-        source_id,
+        Some(source_id),
         ops,
         std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
     )
@@ -3515,6 +3515,51 @@ fn set_config_refuses_a_key_that_is_not_a_container_port() {
         matches!(&err, EditError::InvalidArgument(m) if m.contains("SetLoopConfig")),
         "loop knobs are named to their real home: {err:?}"
     );
+}
+
+/// An include alias is a container with no braces: a value for one of
+/// its ports is the statement `alias.key = value` and nothing else. The
+/// braces form is refused, a rewrite finds the statement, clearing
+/// removes it, the gate goes the same way, and the form toggle has
+/// nothing to flip.
+#[test]
+fn set_config_writes_an_include_port_value_as_a_statement() {
+    let src = "keep = @include(\"store.weft\")\nout = Debug {}\nout.data = keep.stored\n";
+
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "keep".into(), key: "n".into(), value: "7".into(), form: Some(crate::edit::ValueForm::Connection),
+    }]);
+    assert!(out.contains("keep.n = 7"), "statement form beside the alias: {out}");
+
+    let out2 = apply(&out, vec![EditOp::SetConfig {
+        node: "keep".into(), key: "n".into(), value: "8".into(), form: None,
+    }]);
+    assert!(out2.contains("keep.n = 8"), "{out2}");
+    assert_eq!(out2.matches("keep.n =").count(), 1, "one statement, not two: {out2}");
+
+    let out3 = apply(&out2, vec![EditOp::SetConfig {
+        node: "keep".into(), key: "_should_flow".into(), value: "false".into(), form: None,
+    }]);
+    assert!(out3.contains("keep._should_flow = false"), "the gate is a statement too: {out3}");
+
+    let out4 = apply(&out3, vec![EditOp::RemoveConfig {
+        node: "keep".into(), key: "n".into(), form: Some(crate::edit::ValueForm::Connection),
+    }]);
+    assert!(!out4.contains("keep.n"), "cleared: {out4}");
+
+    let err = apply_edits(src, "Untitled", &[EditOp::SetConfig {
+        node: "keep".into(), key: "n".into(), value: "7".into(), form: Some(crate::edit::ValueForm::Inline),
+    }])
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditError::InvalidArgument(m) if m.contains("has no braces form")),
+        "{err:?}"
+    );
+    let err = apply_edits(&out, "Untitled", &[EditOp::SetValueForm {
+        node: "keep".into(), key: "n".into(), form: crate::edit::ValueForm::Inline,
+    }])
+    .unwrap_err();
+    assert!(matches!(&err, EditError::InvalidArgument(_)), "no toggle on an include: {err:?}");
 }
 
 /// A loop's carry seed is a PORT even when the header never declares

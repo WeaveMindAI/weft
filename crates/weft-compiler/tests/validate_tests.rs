@@ -11,8 +11,16 @@ fn catalog() -> FsCatalog {
     FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib catalog")
 }
 
+/// The sources here are validated as a COMPONENT file (parsed under a
+/// source name), so the ones written as one anonymous top-level group,
+/// an included file's shape, compile; the entry file refuses that shape,
+/// which `parser_tests` covers and nothing here is about.
+const COMPONENT: Option<&str> = Some("Component");
+
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
-    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let mut project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Full, COMPONENT)
+        .expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     project
 }
@@ -520,7 +528,7 @@ fn added_llm_output_ports_without_parse_json_are_a_structural_error() {
 
 fn parse_enrich_lenient(source: &str) -> (weft_core::ProjectDefinition, Vec<weft_compiler::weft_compiler::CompileError>) {
     use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
-    let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, COMPONENT);
     // Use lenient enrich so an unknown type doesn't bail before validate runs.
     let _ = weft_compiler::enrich::enrich_with_policy(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Lenient);
     (project, errs)

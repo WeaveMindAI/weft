@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
-  "version": "0.2.241",
+  "version": "0.2.244",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -54,7 +54,11 @@
         "extensions": [
           ".weft"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./media/weft-file-icon.png",
+          "dark": "./media/weft-file-icon.png"
+        }
       }
     ],
     "grammars": [

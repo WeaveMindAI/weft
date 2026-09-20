@@ -14,10 +14,7 @@ export function extractInfraSubgraph(
 	edges: Edge[],
 ): SubgraphResult {
 	return extractSubgraph(nodes, edges, {
-		// NodeInstance carries no `requiresInfra` flag (it lives on the catalog
-		// template), so nodeRequiresInfra resolves it from NODE_TYPE_CONFIG by
-		// nodeType. Passing only nodeType is exact, not lossy.
-		seedFilter: (n) => nodeRequiresInfra({ nodeType: n.nodeType }),
+		seedFilter: (n) => nodeRequiresInfra(n),
 		validateNode: (n) => {
 			if (nodeIsTrigger(n)) {
 				return (

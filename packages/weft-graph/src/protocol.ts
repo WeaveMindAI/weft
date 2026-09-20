@@ -88,6 +88,7 @@ export interface InputDefinition extends PortDefinition {
 // SYNC: ConfigFieldSpan <-> crates/weft-core/src/project.rs ConfigFieldSpan
 export interface ConfigFieldSpan {
   span: Span;
+  // SYNC: origin <-> crates/weft-core/src/project.rs ConfigOrigin
   origin: 'inline' | 'connection';
   /// The file the span's coordinates live in; absent = the compiled
   /// source. An interface-port fill written in an including file
@@ -524,7 +525,7 @@ export interface NodeFeaturesWire {
   isTrigger?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
-  /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
+  /// body panel polls. Unset for a node that speaks only TCP
   /// so the panel doesn't show a broken eye.
   liveEndpoint?: string;
 }
@@ -580,7 +581,7 @@ export interface NodeDefinition {
 /// Kept apart from the node's own `requiresInfra` / `features.isTrigger`
 /// because those two drive real per-node work (an infra node gets a
 /// provisioned slot and a `/live` poller, a trigger gets a mount URL and
-/// a `/display` poller), and the include alias is not the node that does
+/// a display poller), and the include alias is not the node that does
 /// any of it. It only contains them.
 // SYNC: IncludedContents <-> crates/weft-core/src/project.rs IncludedContents
 export interface IncludedContents {
@@ -1427,13 +1428,22 @@ export type CorruptionSite =
   /// beside the run, not inside a node.
   | 'MissingProgram';
 
-/// One item rendered in a node's body panel. Two distinct feeds
-/// produce items: infra `/live` (infra-pod telemetry) and signal
-/// `/display` (trigger URL + auth metadata). The two feeds flow
-/// through SEPARATE message channels (`infraLive`, `signalDisplay`)
-/// keyed by node id; they never cross. Adding a new presentation
-/// kind: add a string to the union and a branch in ProjectNode's
-/// rendering.
+/// Every kind a node's display can draw, written down once for
+/// TypeScript: `LiveDataItem['type']` reads from this array, so a
+/// fifth kind cannot be added to one and missed by the other.
+///
+/// Adding one: the string here, a variant on `LiveItemKind` in Rust,
+/// and a render branch in ProjectNode.svelte.
+// SYNC: LIVE_DATA_TYPES <-> crates/weft-core/src/live.rs LiveItemKind
+export const LIVE_DATA_TYPES = ['text', 'image', 'progress', 'secret'] as const;
+export type LiveDataType = (typeof LIVE_DATA_TYPES)[number];
+
+/// One line of a node's display: what it shows about itself while it
+/// runs. Two things produce one, and both serve it on `GET /live` in
+/// this shape: an infra node's own container, and the listener kind
+/// holding a trigger's signal. One channel (`nodeDisplay`) carries
+/// both, keyed by node id.
+// SYNC: LiveDataItem <-> crates/weft-core/src/live.rs LiveItem, crates/weft-e2e/src/display.rs
 export interface LiveDataItem {
   /// - `text`: plain copyable string in a code-style box.
   /// - `image`: `data` is a data URI; rendered inline.
@@ -1442,17 +1452,17 @@ export interface LiveDataItem {
   ///   clicks the eye icon to reveal. Copy still works on the
   ///   underlying value. Use for API keys, signed URLs, anything
   ///   that shouldn't sit on screen by default.
-  type: 'text' | 'image' | 'progress' | 'secret';
+  type: LiveDataType;
   label: string;
   data: string | number;
-  /// Optional action button rendered next to the item. Click
-  /// posts a `signalAction` message; the host routes it to
-  /// `/projects/{id}/infra/nodes/{node_id}/action` for an infra
-  /// node (the container behind `/live` serves `/action`) and to
-  /// `/projects/{id}/signals/{node_id}/action` for a trigger (the
-  /// listener's kind impl). Whoever serves the action owns its
-  /// payload schema. Generic so node authors can add buttons
-  /// without changing the inspector.
+  /// Optional action button rendered next to the item. Click posts a
+  /// `displayAction` message, which the host sends to
+  /// `/projects/{id}/infra/nodes/{place}/action` for the node at this
+  /// view's place: the container behind `/live` serves `/action`, and
+  /// it owns the payload schema. Only an INFRA node's display carries
+  /// one; the listener refuses to serve a trigger's display with a
+  /// button. Generic, so a node author adds buttons without changing
+  /// the panel.
   action?: {
     label: string;
     actionKind: string;
@@ -1461,11 +1471,11 @@ export interface LiveDataItem {
   };
 }
 
-/// State of one node's body feed. Pollers emit one of these per
-/// tick: `ok` carries the rendered items, `error` carries a
-/// short user-facing message the webview shows in place of the
-/// items. There is NO silent fallback: if the poller can't reach
-/// the backend, the user sees the error verbatim.
+/// State of one node's display. The poller emits one of these per
+/// tick: `ok` carries the items, `error` carries a short
+/// user-facing message the webview shows in their place. There is NO
+/// silent fallback: if the poller cannot reach the backend, the user
+/// sees the error verbatim.
 export type NodeFeedState =
   | { state: 'ok'; items: LiveDataItem[] }
   // The feed's SOURCE does not exist yet (infra not provisioned, the
@@ -1571,30 +1581,16 @@ export interface ActionAvailability {
   /// deactivating-state UI: shows "draining N executions...".
   runningCount: number;
   /// Infra rollup.
-  infraRollup:
-    | 'none'
-    | 'stopped'
-    | 'partial'
-    | 'running'
-    | 'failed'
-    | 'flaky'
-    | 'stopping'
-    | 'terminating'
-    | 'provisioning';
-  /// Per-node infra status. Used by graph decorations (badges
-  /// under each infra node), independent of the rollup.
-  infraNodes: Array<{
-    nodeId: string;
-    nodeType: string;
-    /// Possible values:
-    ///   "provisioning" | "running" | "stopped" | "flaky" | "failed"
-    ///   | "stopping"   | "terminating"
-    status: string;
-    /// Set when status=failed: which stage of the apply pipeline
-    /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
-    failureStage?: string;
-    failureMessage?: string;
-  }>;
+  infraRollup: InfraRollup;
+  /// An infra operation is in flight that the rollup cannot see yet.
+  /// The dispatcher offers only `infra_cancel` in this window, so a
+  /// client deciding from the rollup alone would offer a button that
+  /// can only fail.
+  infraBusy: boolean;
+  /// Per-instance infra status. Used by graph decorations (badges
+  /// under each infra node), independent of the rollup. One entry per
+  /// PLACE: a file included twice provisions its infra twice.
+  infraNodes: InfraInstanceStatus[];
   /// Counts of preserved state, for the reactivate-time dialog.
   preservation: {
     /// Resume signals with parked_payload set (queued submissions).
@@ -1711,7 +1707,36 @@ export type ActionBarState = {
   backend: BackendSnapshot;
   overlay: ActionBarOverlay;
   error?: ActionBarError;
+  activity?: ActionBarActivity;
 };
+
+/// What the verb currently on the bar has printed to the terminal.
+///
+/// The host mirrors its `Weft` output channel here: the command line it
+/// spawned, then everything the CLI wrote to stderr (cargo, docker, the
+/// supervisor's progress) and any stdout line that was not an NDJSON
+/// event. That is the part of a verb nobody can see from the graph. A
+/// run's execution log is NOT in here: it arrives over SSE and the graph
+/// already paints it.
+///
+/// Set when a verb starts, appended to as it prints, dropped when the
+/// verb completes cleanly. A verb that FAILED keeps its output, so the
+/// details modal can show it under the error.
+export interface ActionBarActivity {
+  verb: ActionVerb;
+  /// Oldest line first. Capped at `ACTIVITY_LINE_CAP`, keeping the
+  /// tail: a build that failed says why in its last lines.
+  lines: string[];
+}
+
+/// How many terminal lines the bar keeps per verb. A `cargo --verbose`
+/// or a docker build with many layers prints megabytes; the reader wants
+/// the end of it.
+export const ACTIVITY_LINE_CAP = 500;
+
+/// Longest single line kept. One `docker build` progress line can be
+/// tens of kilobytes of carriage-return repainting.
+export const ACTIVITY_LINE_CHAR_CAP = 2000;
 
 /// Verbs that can carry an error to the action bar. Includes every
 /// CLI verb the user can click PLUS the system-side error sources
@@ -1794,21 +1819,48 @@ export type BackendSnapshot = {
   /// "deactivating" | "registered". Rendered as a chip and used
   /// by the trigger slot to pick the Reactivate / Activate variant.
   mode: string;
-  infraRollup:
-    | 'none'
-    | 'stopped'
-    | 'partial'
-    | 'running'
-    | 'failed'
-    | 'flaky'
-    | 'stopping'
-    | 'terminating'
-    | 'provisioning';
+  infraRollup: InfraRollup;
+  /// See `ActionAvailability.infraBusy`.
+  infraBusy: boolean;
   /// Drain progress when status='deactivating'.
   runningCount: number;
   /// Hibernate-grace deadline, when present.
   firesDeadlineUnix?: number;
 };
+
+/// One infra INSTANCE's status, as `weft status` reports it.
+// SYNC: InfraInstanceStatus <-> crates/weft-dispatcher/src/api/project.rs ProjectInfraEntry, packages/weft-graph/src/status.ts RawStatusPayload.infra
+export interface InfraInstanceStatus {
+  /// The instance's place spelled the way a person writes it (`db`,
+  /// `one.db`), which is what a view matches against the node under
+  /// the calls it walked into (`addressOf(callPath, id)`) and what the
+  /// per-node verbs take.
+  node: string;
+  nodeType: string;
+  /// Possible values:
+  ///   "provisioning" | "running" | "stopped" | "flaky" | "failed"
+  ///   | "stopping"   | "terminating"
+  status: string;
+  /// Set when status=failed: which stage of the apply pipeline
+  /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
+  failureStage?: string;
+  failureMessage?: string;
+}
+
+/// The project-wide infra state the dispatcher rolls up from its
+/// per-node rows. A closed set, named here once so nothing that
+/// compares against it can compare against a typo.
+// SYNC: InfraRollup <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (infra_rollup)
+export type InfraRollup =
+  | 'none'
+  | 'stopped'
+  | 'partial'
+  | 'running'
+  | 'failed'
+  | 'flaky'
+  | 'stopping'
+  | 'terminating'
+  | 'provisioning';
 
 export type ActionBarOverlay =
   | { kind: 'idle' }
@@ -1864,7 +1916,13 @@ export type HostMessage =
   /// whatever site called them; which call a row belongs to is the call
   /// frames it carries, so the view keeps the rows whose call frames are
   /// this path.
-  | { kind: 'navState'; depth: number; fileName: string; callPath: string[] }
+  /// `interactive` is whether this view IS a place in the program: the
+  /// entry file, or a file walked into through its includes from there.
+  /// A `.weft` opened on its own (an included file picked from the
+  /// explorer) is a graph with no place: nothing says which call of it
+  /// is meant, so the view shows no runs and no action bar, and the
+  /// person walks in from the entry file when they want those.
+  | { kind: 'navState'; depth: number; fileName: string; callPath: string[]; interactive: boolean }
   /// The run reached a terminal. A cancel carries WHY (`reason` is the
   /// text, `cause` the structured value), so a run stopped by a sibling
   /// through `ctx.stop_tagged` reads as that, never as a bare failure.
@@ -1942,12 +2000,10 @@ export type HostMessage =
   /// webview groups by execution color and renders the list
   /// behind a collapsed disclosure.
   | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
-  /// Infra `/live` poll result for one infra node. Routed to
-  /// the node's body panel iff the node has `requiresInfra: true`.
-  | ({ kind: 'infraLive'; nodeId: string } & NodeFeedState)
-  /// Listener `/display` poll result for one trigger node. Routed
-  /// to the node's body panel iff `features.isTrigger: true`.
-  | ({ kind: 'signalDisplay'; nodeId: string } & NodeFeedState)
+  /// What one node is showing, off its `/live`: the container's for an
+  /// infra node, the listener kind's for a trigger. Routed to that
+  /// node's body panel.
+  | ({ kind: 'nodeDisplay'; nodeId: string } & NodeFeedState)
   | { kind: 'followStatus'; status: FollowStatus }
   /// The live execution SSE stream ended or broke before the
   /// execution reached a terminal state. `reason` is 'closed' (server
@@ -2093,10 +2149,12 @@ export type WebviewMessage =
   | { kind: 'infraCancel' }
   /// Cancel the in-flight build (transition=building).
   | { kind: 'cancelBuild' }
-  /// Per-node Stop (graph menu, partial-state recovery).
-  | { kind: 'infraNodeStop'; nodeId: string }
-  /// Per-node Terminate (graph menu, partial-state recovery).
-  | { kind: 'infraNodeTerminate'; nodeId: string }
+  /// Per-node Stop (graph menu, partial-state recovery). `node` is the
+  /// instance's PLACE as a person spells it (`one.db`), the node under
+  /// the calls the view walked into: what `weft infra node-stop` takes.
+  | { kind: 'infraNodeStop'; node: string }
+  /// Per-node Terminate (graph menu, partial-state recovery); see above.
+  | { kind: 'infraNodeTerminate'; node: string }
   | { kind: 'activateProject' }
   /// Deactivate with the shared picker's spec (mode + runningPolicy +
   /// grace). The picker lives in the SHARED webview so both hosts get
@@ -2163,13 +2221,16 @@ export type WebviewMessage =
   ///   - execution_running -> POST /executions/{color}/cancel.
   ///   - any other state   -> ignored (button shouldn't be shown).
   | { kind: 'stopAction' }
-  /// User clicked a per-signal action button on a trigger node's
-  /// inspector (e.g. "Regenerate API key"). The host POSTs to
-  /// `/projects/{id}/signals/{node_id}/action` with this payload.
-  /// Action `kind` strings are listener-defined per signal kind.
+  /// User pressed a button one of a node's display items carries
+  /// (an infra container's "disconnect phone", say). The host POSTs to
+  /// `/projects/{id}/infra/nodes/{place}/action`, the node spelled at
+  /// this view's place. Only an INFRA node's display has buttons, and
+  /// the container serving `/live` serves `/action` too, so the action
+  /// `kind` strings are that node author's, not weft's. A press on a
+  /// node that is not infra is reported to the user, never dropped.
   /// `confirm`, when set, is the host's prompt text for a VS Code
-  /// QuickPick; the action runs only on explicit confirmation.
-  | { kind: 'signalAction'; nodeId: string; actionKind: string; payload?: unknown; confirm?: string }
+  /// QuickPick; the press happens only on explicit confirmation.
+  | { kind: 'displayAction'; nodeId: string; actionKind: string; payload?: unknown; confirm?: string }
   /// User dismissed the action-bar error banner. The host clears
   /// the slot's `error` field; the bar stops rendering the banner.
   /// Errors otherwise survive auto-refreshes so the user has time

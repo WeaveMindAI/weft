@@ -215,6 +215,7 @@ impl Span {
 /// to rewrite a field in place: an inline field (`n = Type { k: v }`) is
 /// rewritten as `k: v`, a connection-line field (`n.k = v`) keeps its
 /// `n.k = ` prefix.
+// SYNC: ConfigOrigin <-> packages/weft-graph/src/protocol.ts ConfigFieldSpan.origin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigOrigin {
@@ -799,28 +800,43 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
 }
 
-/// For every `requires_infra` node, find every trigger whose
-/// upstream-closure includes it. Returns `(infra_node_id,
-/// trigger_node_id)` pairs sorted by `(infra, trigger)`.
+/// What an ARMED trigger keeps depending on: for every infra PLACE,
+/// every trigger place whose data path runs through it. Returns
+/// `(infra, trigger)` pairs, each spelled the way a person writes the
+/// place (`svc`, or `one.svc` inside the file the site `one` includes),
+/// sorted by `(infra, trigger)`.
 ///
-/// Used by:
-///   - dispatcher's per-node stop/terminate safety check (refuse if a
-///     trigger depends on the targeted infra node);
-///   - broker's `supervisor_trigger_deps` endpoint so the supervisor
-///     can make the same decision when reacting to flaky/recovered
-///     events.
+/// Per place, because that is what runs: a file included twice holds
+/// two infra instances and two registered triggers, and the trigger
+/// under `one` reads its address off the instance under `one` alone.
+/// The spelling is the key every infra row and signal row is stored
+/// under, so a reader compares this against those directly.
 ///
-/// Pure walk over `ProjectDefinition`; no I/O. The copy in
-/// `weft-core` is the only one: neither side maintains a mirror.
+/// This is the STAY-RUNNING question, and it is not the same as
+/// [`infra_triggers_depend_on`], which answers the BEFORE-ARMING one.
+/// A registered trigger holds an address it read off the node feeding
+/// it, so stopping that node breaks a signal that is live right now.
+/// Infra that only fed the GATE deciding whether the trigger's group
+/// flows was read once, during activation, and the armed registration
+/// does not touch it again: stopping it later breaks nothing, and
+/// refusing that stop would trap the user into deactivating first.
+/// Hence the plain data walk here (`selection::upstream_by_wires`),
+/// and the run-shaped one there.
+///
+/// Read by:
+///   - the dispatcher's per-node infra stop/terminate guard;
+///   - the broker's `supervisor_trigger_deps` endpoint, so the
+///     supervisor decides the same way when infra goes flaky.
+///
+/// Pure walk over `ProjectDefinition`; no I/O.
 pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
-    let edge_idx = EdgeIndex::build(project);
-    let triggers = trigger_ids(project);
+    let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
     let mut out: Vec<(String, String)> = Vec::new();
-    for trigger in &triggers {
-        let upstream = upstream_closure(project, &edge_idx, std::slice::from_ref(trigger));
-        for infra in project.nodes.iter().filter(|n| n.requires_infra) {
-            if upstream.contains(&infra.id) {
-                out.push((infra.id.clone(), trigger.clone()));
+    for trigger in trigger_places(project) {
+        let spelled_trigger = address_of(project, &trigger.id, &trigger.path);
+        for place in selection::upstream_by_wires(project, std::slice::from_ref(&trigger)) {
+            if is_infra(&place) {
+                out.push((address_of(project, &place.id, &place.path), spelled_trigger.clone()));
             }
         }
     }
@@ -836,17 +852,40 @@ pub fn direct_scope_of(node: &NodeDefinition) -> Option<&str> {
     node.scope.last().map(String::as_str)
 }
 
-/// A node named the way a person reads the program, through the call
-/// sites: `auth.check` is the node `check` of the file the site `auth`
-/// includes, and `auth.billing.inner.deep` walks two sites. The answer
-/// is the node's id in the compiled definition (`Auth.check`) and the
-/// call path that use of it runs under (`["auth"]`, or `["auth",
-/// "Auth.billing.inner"]`), which is what its journal rows carry as
-/// call frames. A spelling that crosses no site is the id itself with
-/// an empty path, so an ordinary node keeps its ordinary address.
 #[cfg(test)]
 mod address_tests {
     use super::*;
+
+    #[test]
+    fn an_empty_spelling_is_a_miss_and_never_a_panic() {
+        // This takes whatever a person or a URL hands it (`--from`, a
+        // path segment), and it used to pop an empty call path. What it
+        // answers is the empty name, which no node answers to, so every
+        // caller reads it as the miss it is.
+        let project = ProjectDefinition {
+            id: Uuid::nil(),
+            nodes: vec![],
+            edges: vec![],
+            groups: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let (node, path) = resolve_address(&project, "");
+        assert_eq!(node, "");
+        assert!(path.is_empty());
+        assert!(!project.nodes.iter().any(|n| n.id == node), "no node answers to it");
+    }
+
+    /// A spelling with an empty segment is no address, and it comes back
+    /// as the miss it is rather than as the nearest thing it resembles:
+    /// `auth.` used to resolve to the site `auth` itself.
+    #[test]
+    fn an_empty_segment_is_a_miss_not_the_nearest_address() {
+        let p = program();
+        for malformed in ["auth.", ".check", "auth..check", "."] {
+            assert_eq!(resolve_address(&p, malformed), (malformed.to_string(), vec![]), "{malformed}");
+        }
+    }
 
     fn program() -> ProjectDefinition {
         serde_json::from_value(serde_json::json!({
@@ -945,33 +984,53 @@ pub fn plain_id(id: &str) -> String {
 /// body's boundaries read as the site that called it (`one`). What
 /// happened at the boundary (entered, left, skipped) is the record's
 /// kind, not its name.
+///
+/// The editor spells the same thing for the nodes and groups it shows
+/// (a trigger's display poll is keyed by this spelling), so the two
+/// are kept the same function; the boundary arms exist only here,
+/// because the editor never addresses a boundary.
+// SYNC: address_of <-> packages/weft-graph/src/run-spec.ts addressOf
 pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -> String {
     if let Some(group) = project.groups.iter().find(|g| id == boundary_in_id(&g.id) || id == boundary_out_id(&g.id)) {
         return group_address(project, &group.id, call_path);
     }
     let Some((first, rest)) = call_path.split_first() else { return id.to_string() };
+    // The body a site or node sits in is the prefix its scope chain
+    // starts with, which is the id's first segment; what is left is its
+    // local name. A boundary never gets here (the arm above spells it
+    // as its group), so every id has a segment to strip or is bare.
     let local = |scoped: &str| -> String {
-        // The body a site or node sits in: the prefix its scope chain
-        // starts with, which is the same as the id's first segment. A
-        // body's own boundary (`@lib:clean__in`) has no segment: its
-        // local name is the half (`__in`).
         match scoped.split_once('.') {
             Some((_, local)) => local.to_string(),
-            None => match scoped.rsplit_once("__") {
-                Some((_, half)) if scoped.starts_with('@') => format!("__{half}"),
-                _ => scoped.to_string(),
-            },
+            None => scoped.to_string(),
         }
     };
-    let _ = project;
     let mut parts = vec![first.clone()];
     parts.extend(rest.iter().map(|s| local(s)));
     parts.push(local(id));
     parts.join(".")
 }
 
+/// A node named the way a person reads the program, through the call
+/// sites: `auth.check` is the node `check` of the file the site `auth`
+/// includes, and `auth.billing.inner.deep` walks two sites. The answer
+/// is the node's id in the compiled definition (`Auth.check`) and the
+/// call path that use of it runs under (`["auth"]`, or `["auth",
+/// "Auth.billing.inner"]`), which is what its journal rows carry as
+/// call frames. A spelling that crosses no site is the id itself with
+/// an empty path, so an ordinary node keeps its ordinary address.
+///
+/// The inverse of [`address_of`]. A miss is never an error here: the
+/// spelling comes back as given with an empty path, and it then names
+/// no node, which is what every caller checks for. A spelling that is
+/// no address at all (empty, or with an empty segment like `one.`)
+/// is a miss the same way, rather than being read as the nearest
+/// thing it resembles.
 pub fn resolve_address(project: &ProjectDefinition, spelled: &str) -> (String, Vec<String>) {
     let segments: Vec<&str> = spelled.split('.').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return (spelled.to_string(), Vec::new());
+    }
     let mut call_path = Vec::new();
     let mut scope_prefix = String::new();
     let mut pos = 0;
@@ -995,7 +1054,11 @@ pub fn resolve_address(project: &ProjectDefinition, spelled: &str) -> (String, V
     if rest.is_empty() {
         // The spelling ends on a site: the address is the site itself,
         // which fires in its caller's frames, under the calls above it.
-        let site = call_path.pop().expect("a site was matched");
+        // Nothing left and no site matched cannot happen: an empty
+        // spelling was refused above as an empty segment.
+        let Some(site) = call_path.pop() else {
+            return (spelled.to_string(), Vec::new());
+        };
         return (site, call_path);
     }
     if rest.starts_with("__") {
@@ -1071,6 +1134,19 @@ pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     selection::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
+/// Every infra INSTANCE the program declares, each spelled the way a
+/// person writes its place (`db`, or `one.db` inside the file the site
+/// `one` includes): the key its `infra_node` row is stored under. THE
+/// set every reader of those rows checks the rows against (what is
+/// missing, what is an orphan, what counts in the rollup), so they
+/// cannot disagree on what the program declares.
+pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::BTreeSet<String> {
+    infra_places(project)
+        .iter()
+        .map(|place| address_of(project, &place.id, &place.path))
+        .collect()
+}
+
 
 /// Every node `seeds` depend on by following wires backward, seeds
 /// included, over the whole program (no run selection, so the frames
@@ -1094,6 +1170,331 @@ pub fn upstream_closure(
         }
     }
     seen
+}
+
+/// The infra a trigger DEPENDS ON, each PLACE named once, spelled the
+/// way a person writes it (`svc`, `one.svc`): the key its infra row is
+/// stored under, so a reader compares this against the rows directly.
+///
+/// Infra and triggers are independent lifetimes, joined by one rule: a
+/// trigger needs the infra feeding it to be RUNNING. A WhatsApp receive
+/// node takes the bridge's address off the bridge node feeding it, so
+/// arming it before the bridge is up would register a signal against an
+/// address that does not answer. Infra DOWNSTREAM of a trigger belongs
+/// to the run a fire starts and is gated there instead, so the project
+/// arms either way. Nothing here ever starts infra: that is the user's
+/// own verb.
+///
+/// What must be RUNNING before this project's triggers can be armed.
+///
+/// Arming them is a run: the TriggerSetup pass evaluates everything the
+/// registration needs, including the gate deciding whether a trigger's
+/// group flows at all. So this walks the way that run walks
+/// (`RunSelection::dependencies`, which is `RunSelection::setup` minus
+/// its validations), and the answer covers every infra node that run
+/// touches: the bridge whose address a trigger reads, and the node
+/// feeding a gate the setup has to evaluate.
+///
+/// Reading ports and call frames is what keeps it honest in the other
+/// direction: infra wired into a group port no trigger consumes is not
+/// in it, and does not hold an activation back.
+///
+/// The STAY-RUNNING question is [`compute_trigger_deps`], and it is a
+/// different set on purpose: once a trigger is armed, the gate's infra
+/// has already done its job. Changing one of these two to match the
+/// other is how the system starts contradicting itself; they answer
+/// different questions about different moments.
+///
+/// Empty when the project has no trigger.
+pub fn infra_triggers_depend_on(
+    project: &ProjectDefinition,
+) -> std::collections::BTreeSet<String> {
+    let reached = selection::RunSelection::dependencies(project, &trigger_places(project));
+    reached
+        .nodes
+        .iter()
+        .filter(|place| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra))
+        .map(|place| address_of(project, &place.id, &place.path))
+        .collect()
+}
+
+#[cfg(test)]
+mod infra_triggers_depend_on_tests {
+    use super::*;
+    use crate::NodeFeatures;
+
+    fn node(id: &str, is_trigger: bool, requires_infra: bool) -> NodeDefinition {
+        NodeDefinition {
+            id: id.into(),
+            node_type: "Any".into(),
+            label: None,
+            config: Value::Object(Default::default()),
+            position: Position { x: 0.0, y: 0.0 },
+            scope: vec![],
+            group_boundary: None,
+            inputs: vec![],
+            outputs: vec![],
+            features: NodeFeatures { is_trigger, ..Default::default() },
+            requires_infra,
+            images: vec![],
+            published_service: None,
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+            optional_ports: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
+            include_contents: None,
+            fires_with: Default::default(),
+            source_file: None,
+        }
+    }
+
+    fn wire(source: &str, target: &str) -> Edge {
+        Edge {
+            id: format!("e-{source}-{target}"),
+            source: source.to_string(),
+            target: target.to_string(),
+            source_handle: None,
+            target_handle: None,
+            path: Vec::new(),
+            span: None,
+            source_file: None,
+        }
+    }
+
+    fn project(nodes: Vec<NodeDefinition>, edges: Vec<Edge>) -> ProjectDefinition {
+        ProjectDefinition {
+            id: Uuid::nil(),
+            nodes,
+            edges,
+            groups: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn ids(set: std::collections::BTreeSet<String>) -> Vec<String> {
+        set.into_iter().collect()
+    }
+
+    #[test]
+    fn an_infra_node_feeding_a_trigger_counts() {
+        // bridge -> receive(trigger) -> reply
+        let p = project(
+            vec![
+                node("bridge", false, true),
+                node("receive", true, false),
+                node("reply", false, false),
+            ],
+            vec![wire("bridge", "receive"), wire("receive", "reply")],
+        );
+        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+    }
+
+    #[test]
+    fn an_infra_node_the_trigger_reaches_through_another_node_counts() {
+        // bridge -> conf -> receive(trigger): the dependency is just as
+        // real one hop further out.
+        let p = project(
+            vec![
+                node("bridge", false, true),
+                node("conf", false, false),
+                node("receive", true, false),
+            ],
+            vec![wire("bridge", "conf"), wire("conf", "receive")],
+        );
+        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+    }
+
+    #[test]
+    fn an_infra_node_downstream_of_a_trigger_stays_out() {
+        // The database the fired run writes to belongs to the run, not
+        // to arming the trigger; the run is what waits on it.
+        let p = project(
+            vec![node("receive", true, false), node("db", false, true)],
+            vec![wire("receive", "db")],
+        );
+        assert!(infra_triggers_depend_on(&p).is_empty());
+    }
+
+    #[test]
+    fn an_infra_node_on_another_branch_stays_out() {
+        let p = project(
+            vec![
+                node("receive", true, false),
+                node("reply", false, false),
+                node("svc", false, true),
+                node("svc_out", false, false),
+            ],
+            vec![wire("receive", "reply"), wire("svc", "svc_out")],
+        );
+        assert!(infra_triggers_depend_on(&p).is_empty());
+    }
+
+    #[test]
+    fn a_project_with_no_trigger_reaches_nothing() {
+        let p = project(vec![node("svc", false, true)], vec![]);
+        assert!(infra_triggers_depend_on(&p).is_empty());
+    }
+
+    /// A group boundary is where the walk's port-precision earns its
+    /// keep: the trigger sits inside the group and reads the In's `x`,
+    /// so infra feeding the In's `y` never reaches it and must not hold
+    /// the activation back. A cruder walk (every wire into the
+    /// boundary) would name `svc` here and grey out Activate over infra
+    /// the triggers never touch.
+    #[test]
+    fn infra_feeding_a_group_port_the_trigger_does_not_read_stays_out() {
+        let node = |id: &str, scope: &[&str], boundary: Value, infra: bool| serde_json::json!({
+            "id": id, "nodeType": "T", "label": null, "config": {},
+            "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
+            "features": { "isTrigger": id == "receive" }, "scope": scope,
+            "groupBoundary": boundary, "requiresInfra": infra
+        });
+        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
+            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
+            "sourceHandle": sp, "targetHandle": tp
+        });
+        let p: ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("bridge", &[], Value::Null, true),
+                node("svc", &[], Value::Null, true),
+                node("g__in", &[], serde_json::json!({ "groupId": "g", "role": "In" }), false),
+                node("receive", &["g"], Value::Null, false),
+                node("other", &["g"], Value::Null, false)
+            ],
+            "edges": [
+                edge("bridge", "out", "g__in", "x"),
+                edge("svc", "out", "g__in", "y"),
+                edge("g__in", "x", "receive", "in"),
+                edge("g__in", "y", "other", "in")
+            ],
+            "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive", "other"] }]
+        })).expect("the fixture deserializes");
+        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        // The stay-running walk is port-precise at the boundary too.
+        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+    }
+
+    /// The two questions part company at the GATE: infra deciding
+    /// whether the trigger's group flows is evaluated by the arming run
+    /// and holds the activation back, but the armed trigger never reads
+    /// it again, so stopping it later breaks nothing and the stay-running
+    /// walk leaves it out.
+    #[test]
+    fn gate_infra_holds_the_activation_back_and_nothing_after() {
+        let node = |id: &str, scope: &[&str], boundary: Value, infra: bool| serde_json::json!({
+            "id": id, "nodeType": "T", "label": null, "config": {},
+            "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
+            "features": { "isTrigger": id == "receive" }, "scope": scope,
+            "groupBoundary": boundary, "requiresInfra": infra
+        });
+        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
+            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
+            "sourceHandle": sp, "targetHandle": tp
+        });
+        let p: ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("bridge", &[], Value::Null, true),
+                node("gate", &[], Value::Null, true),
+                node("g__in", &[], serde_json::json!({ "groupId": "g", "role": "In" }), false),
+                node("receive", &["g"], Value::Null, false),
+                node("g__out", &[], serde_json::json!({ "groupId": "g", "role": "Out" }), false)
+            ],
+            "edges": [
+                edge("bridge", "out", "g__in", "x"),
+                edge("gate", "out", "g__in", "_should_flow"),
+                edge("g__in", "x", "receive", "in")
+            ],
+            "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive"] }]
+        })).expect("the fixture deserializes");
+        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string(), "gate".to_string()]);
+        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+    }
+
+
+    #[test]
+    fn a_cycle_upstream_of_a_trigger_terminates() {
+        let p = project(
+            vec![
+                node("receive", true, false),
+                node("db", false, true),
+                node("loopy", false, false),
+            ],
+            vec![wire("db", "loopy"), wire("loopy", "db"), wire("db", "receive")],
+        );
+        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["db".to_string()]);
+    }
+
+    /// The shape an include compiles to: one body (`Bridge`) holding an
+    /// infra node feeding a trigger, called from the sites `one` and
+    /// `two`; a top-level infra node wired into `one`'s door alone.
+    fn program_with_two_sites() -> ProjectDefinition {
+        let node = |id: &str, scope: &[&str], boundary: Value, is_trigger: bool, requires_infra: bool| {
+            serde_json::json!({
+                "id": id, "nodeType": "T", "label": null, "config": {}, "position": {"x": 0, "y": 0},
+                "inputs": [], "outputs": [], "features": {"isTrigger": is_trigger},
+                "scope": scope, "groupBoundary": boundary, "requiresInfra": requires_infra
+            })
+        };
+        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
+            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
+            "sourceHandle": sp, "targetHandle": tp
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("top_db", &[], Value::Null, false, true),
+                node("one__in", &[], serde_json::json!({"groupId": "one", "role": "In"}), false, false),
+                node("one__out", &[], serde_json::json!({"groupId": "one", "role": "Out"}), false, false),
+                node("two__in", &[], serde_json::json!({"groupId": "two", "role": "In"}), false, false),
+                node("two__out", &[], serde_json::json!({"groupId": "two", "role": "Out"}), false, false),
+                node("Bridge__in", &[], serde_json::json!({"groupId": "Bridge", "role": "In"}), false, false),
+                node("Bridge.svc", &["Bridge"], Value::Null, false, true),
+                node("Bridge.door", &["Bridge"], Value::Null, true, false),
+                node("Bridge__out", &[], serde_json::json!({"groupId": "Bridge", "role": "Out"}), false, false),
+            ],
+            "edges": [
+                edge("top_db", "out", "one__in", "seed"),
+                edge("one__in", "seed", "Bridge__in", "seed"),
+                edge("two__in", "seed", "Bridge__in", "seed"),
+                edge("Bridge__in", "seed", "Bridge.door", "seed"),
+                edge("Bridge.svc", "out", "Bridge.door", "address"),
+            ],
+            "groups": [
+                {"id": "one", "kind": "call", "body": "Bridge", "nodeIds": []},
+                {"id": "two", "kind": "call", "body": "Bridge", "nodeIds": []},
+                {"id": "Bridge", "kind": "body", "nodeIds": ["Bridge.svc", "Bridge.door"]}
+            ]
+        })).expect("the fixture deserializes")
+    }
+
+    /// Both questions are answered per PLACE, spelled: the trigger under
+    /// `one` depends on the instance under `one` and on the top-level
+    /// node wired into `one`'s door; the trigger under `two` depends on
+    /// its own instance alone, because the top-level node feeds only
+    /// `one`.
+    #[test]
+    fn a_file_included_twice_depends_per_call() {
+        let p = program_with_two_sites();
+        assert_eq!(
+            compute_trigger_deps(&p),
+            vec![
+                ("one.svc".to_string(), "one.door".to_string()),
+                ("top_db".to_string(), "one.door".to_string()),
+                ("two.svc".to_string(), "two.door".to_string()),
+            ]
+        );
+        assert_eq!(
+            ids(infra_triggers_depend_on(&p)),
+            vec!["one.svc".to_string(), "top_db".to_string(), "two.svc".to_string()]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1337,8 +1738,15 @@ mod selection_setup_tests {
             .collect();
         let e_json: Vec<serde_json::Value> = edges
             .iter()
+            // `sourceHandle` / `targetHandle` are the names `Edge`
+            // reads; the older `sourcePort` spelling was dropped
+            // silently (no `deny_unknown_fields`) and left every wire
+            // default -> default. One port name on both ends, because a
+            // boundary's port keeps its name across it (a group's `v`
+            // enters `g__in.v` and leaves `g__in.v`), and these tests are
+            // about scopes and wires, not about which port feeds which.
             .map(|(s, t)| serde_json::json!({
-                "id": format!("e_{s}_{t}"), "source": s, "sourcePort": "out", "target": t, "targetPort": "in",
+                "id": format!("e_{s}_{t}"), "source": s, "sourceHandle": "v", "target": t, "targetHandle": "v",
             }))
             .collect();
         let groups: Vec<_> = nodes.iter().filter_map(|(id, _, _, _)| id.strip_suffix("__in"))

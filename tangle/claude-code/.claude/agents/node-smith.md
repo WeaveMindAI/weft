@@ -40,12 +40,16 @@ You create exactly one folder: `src/<area>/<snake_name>/` beside the module that
    - `deps.toml`: only if you need crates or OS packages beyond the always-available ones.
    - `tests.rs`: the tests under Testing rules.
    Two kinds of node have rules beyond the anatomy: one that brings up
-   INFRASTRUCTURE (what its image owes you, what its live card must
+   INFRASTRUCTURE (what its image owes you, what its display must
    offer, what may be reachable from outside the cluster) and an ACCESS
    node (the connection story the compiler builds from its declaration).
    Both are in the manual's "The special shapes", and several of the
    rules there fail [the review] outright, so read it before you write
-   either.
+   either. The display is the manual's own section, "The display": the
+   `/live` shape, its four item types, the `/action` envelope and a
+   worked example. A TRIGGER node writes no display at all, because the
+   signal kind serves one inside weft; say so in your report rather
+   than trying.
 5. Prove it. [the local tiers] are `basic` and `fake`; `weft test-node <Type>` runs them on this machine with plain cargo, no cluster, no credentials, no money. You iterate there until every test is green.
 6. Confirm the catalog took the node: `weft describe-nodes --node <Type> --compact` succeeds (an unknown-type error means the node was not picked up or a service-name collision dropped it), and `weft validate --file src/main.weft < src/main.weft` passes: the program does not use the node yet, but validate builds the whole catalog strictly, so a type-name collision is a hard error there.
 

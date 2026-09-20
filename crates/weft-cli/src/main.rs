@@ -652,9 +652,9 @@ enum TangleAction {
 #[derive(Debug, Subcommand)]
 enum TokenAction {
     /// Mint a new signal token. A signal token grants scoped access
-    /// to the dispatcher's signal enumeration + reply surface. All
-    /// scope flags are optional; an unscoped token sees every signal
-    /// in the tenant.
+    /// to the dispatcher's signal enumeration + reply surface, and to
+    /// what a node is showing. An unscoped token sees every signal in
+    /// the tenant and no node display.
     Mint {
         /// Optional human label, pure metadata (never part of the
         /// token value). Shown by `weft token ls`.
@@ -669,6 +669,19 @@ enum TokenAction {
         /// Tag charset: [A-Za-z0-9_-]{1,64}.
         #[arg(long, value_name = "tag")]
         tags: Vec<String>,
+        /// Let the token reach one node's display (the bridge's QR
+        /// code, a database's minted credential): read it, and press
+        /// the buttons its items carry. Takes the node the way you
+        /// write it anywhere else (`whatsapp`, `test.whatsapp` for a
+        /// node of an included file), resolved against the project you
+        /// are standing in. Repeat for several. Unlike the flags
+        /// above, saying nothing here grants nothing: a display can be
+        /// a credential.
+        #[arg(long = "display", value_name = "node")]
+        displays: Vec<String>,
+        /// Let the token reach EVERY node display in its projects.
+        #[arg(long = "displays")]
+        all_displays: bool,
     },
     /// List existing signal tokens (metadata + recognizer; the full
     /// value is shown only once, at mint).
@@ -680,8 +693,14 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, projects, tags } => {
-                commands::token::TokenAction::Mint { name, projects, tags }
+            TokenAction::Mint { name, projects, tags, displays, all_displays } => {
+                commands::token::TokenAction::Mint {
+                    name,
+                    projects,
+                    tags,
+                    displays,
+                    all_displays,
+                }
             }
             TokenAction::Ls => commands::token::TokenAction::Ls,
             TokenAction::Revoke { id } => commands::token::TokenAction::Revoke { id },
@@ -774,9 +793,11 @@ enum InfraAction {
     /// every infra node, or one node's. Lines are prefixed with the pod
     /// and container they came from.
     Logs {
-        /// The infra node to read; unset reads every infra node of the project.
-        #[arg(value_name = "node_id")]
-        node_id: Option<String>,
+        /// The infra instance to read, named as `weft infra status` lists
+        /// it (`db`, or `one.db` for the `db` inside the file the site
+        /// `one` includes); unset reads every infra node of the project.
+        #[arg(value_name = "node")]
+        node: Option<String>,
         /// Number of lines to print, counted from the end.
         #[arg(long, default_value_t = 200)]
         tail: usize,
@@ -784,12 +805,14 @@ enum InfraAction {
         #[arg(long, short = 'f', default_value_t = false)]
         follow: bool,
     },
-    /// Per-node stop. Targets one infra node by id, leaves the rest
-    /// of the project's infra untouched. Used from the graph's per-
-    /// node menu (the trash icon's siblings).
+    /// Per-instance stop. Targets one infra instance, named as `weft
+    /// infra status` lists it (`db`, or `one.db` for the `db` inside
+    /// the file the site `one` includes), and leaves the rest of the
+    /// project's infra untouched. Used from the graph's per-node menu
+    /// (the trash icon's siblings).
     NodeStop {
-        #[arg(value_name = "node_id")]
-        node_id: String,
+        #[arg(value_name = "node")]
+        node: String,
         /// Force scale-to-zero every unit, ignoring each unit's
         /// `on_stop`. Takes down units that would normally stay up
         /// (NoOp) so you can update them on the next start. You accept
@@ -797,11 +820,11 @@ enum InfraAction {
         #[arg(long)]
         force: bool,
     },
-    /// Per-node terminate. Same scope as `node-stop` but deletes
+    /// Per-instance terminate. Same scope as `node-stop` but deletes
     /// resources instead of scaling to 0.
     NodeTerminate {
-        #[arg(value_name = "node_id")]
-        node_id: String,
+        #[arg(value_name = "node")]
+        node: String,
     },
 }
 
@@ -930,16 +953,16 @@ impl InfraAction {
                 (commands::infra::InfraAction::ListDoors, Default::default())
             }
             InfraAction::Cancel => (commands::infra::InfraAction::Cancel, Default::default()),
-            InfraAction::NodeStop { node_id, force } => (
-                commands::infra::InfraAction::NodeStop { node_id, force },
+            InfraAction::NodeStop { node, force } => (
+                commands::infra::InfraAction::NodeStop { node, force },
                 Default::default(),
             ),
-            InfraAction::NodeTerminate { node_id } => (
-                commands::infra::InfraAction::NodeTerminate { node_id },
+            InfraAction::NodeTerminate { node } => (
+                commands::infra::InfraAction::NodeTerminate { node },
                 Default::default(),
             ),
-            InfraAction::Logs { node_id, tail, follow } => (
-                commands::infra::InfraAction::Logs { node_id, tail, follow },
+            InfraAction::Logs { node, tail, follow } => (
+                commands::infra::InfraAction::Logs { node, tail, follow },
                 Default::default(),
             ),
         }

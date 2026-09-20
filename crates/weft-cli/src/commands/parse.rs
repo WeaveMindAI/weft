@@ -91,9 +91,10 @@ fn do_parse(
 ) -> ParseResponse {
     // An anonymous top-level group takes the file's body id (its path from
     // the project root), so the file's root carries the same id at parse,
-    // edit, render and in the journal. A flat program ignores it.
+    // edit, render and in the journal. The entry file gets none: it may
+    // not hold an anonymous group, and the parse says so.
     let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file);
-    let (project, diagnostics) = weft_compiler::parse_only(source, id, anchor.fs(), catalog, Some(&source_id));
+    let (project, diagnostics) = weft_compiler::parse_only(source, id, anchor.fs(), catalog, source_id.as_deref());
     let catalog_map = collect_catalog(&project, catalog);
     ParseResponse { project, catalog: catalog_map, diagnostics }
 }
@@ -346,7 +347,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             };
             let (new_source, inverse) = match weft_compiler::edit::apply_edits(
                 &req.source,
-                &source_id,
+                source_id.as_deref(),
                 &req.ops,
                 registry,
             ) {
@@ -596,7 +597,7 @@ fn do_validate(
         anchor.fs(),
         catalog,
         mode,
-        Some(&source_id),
+        source_id.as_deref(),
     );
     ValidateResponse { diagnostics }
 }

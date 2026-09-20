@@ -379,9 +379,10 @@ pub enum Image {
     Upstream { reference: String },
 
     /// Build from a directory listed in `metadata.images`. The CLI
-    /// hashes the directory and tags as `weft-infra-{name}:{hash}`.
-    /// The dispatcher's `InfraProvisionContext::image_for(name)`
-    /// resolves the name to its concrete tag.
+    /// hashes the directory and tags as `weft-infra-{name}:{hash}`,
+    /// and ships the tag per infra instance in `/infra/sync`'s
+    /// `imageHashes`; the supervisor resolves the name to that tag
+    /// when it compiles the spec (`infra::compile::resolve_image`).
     Local { name: String },
 }
 
@@ -753,10 +754,6 @@ fn default_egress() -> Vec<EgressRule> {
 pub enum IngressRule {
     /// Workers in this project.
     FromWorkers,
-    /// Another infra node in this project (compiled to a pod selector
-    /// matching `weft.dev/node=<node_label_value(node_id)>`, the
-    /// label-safe form of the id, never the id itself).
-    FromNode { node_id: String },
     /// 0.0.0.0/0. Typically paired with `Expose::TenantPublic`.
     FromInternet,
     /// Specific source CIDR list.
@@ -769,10 +766,6 @@ pub enum IngressRule {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EgressRule {
     ToInternet,
-    /// Another infra node in this project (matches `weft.dev/node`
-    /// against `node_label_value(node_id)`, the label-safe form of the
-    /// id, never the id itself).
-    ToNode { node_id: String },
     /// Specific destination CIDR list.
     ToCidrs(Vec<String>),
 }
@@ -950,7 +943,12 @@ fn default_stabilization_seconds() -> u32 { 60 }
 #[derive(Debug, Clone)]
 pub struct InfraProvisionContext {
     pub project_id: String,
-    pub node_id: String,
+    /// The node being provisioned, spelled the way the program writes
+    /// it (`db`, or `one.db` inside the file the site `one` includes).
+    /// One per INSTANCE: a file included twice provisions its infra
+    /// once per call, and this is the name that tells the two apart,
+    /// in the runtime's rows and in `weft infra status` alike.
+    pub node: String,
     /// The project namespace (`wft-project-{tenant}-{project}`).
     pub namespace: String,
     pub tenant_id: String,
@@ -959,13 +957,13 @@ pub struct InfraProvisionContext {
 impl InfraProvisionContext {
     pub fn new(
         project_id: String,
-        node_id: String,
+        node: String,
         namespace: String,
         tenant_id: String,
     ) -> Self {
         Self {
             project_id,
-            node_id,
+            node,
             namespace,
             tenant_id,
         }
@@ -1077,7 +1075,7 @@ mod tests {
             "x".into(),
         );
         assert_eq!(ctx.project_id, "proj");
-        assert_eq!(ctx.node_id, "node");
+        assert_eq!(ctx.node, "node");
         assert_eq!(ctx.namespace, "wft-project-x-y");
         assert_eq!(ctx.tenant_id, "x");
     }

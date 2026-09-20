@@ -804,6 +804,22 @@ impl Journal for MockJournal {
         Ok(self.inner.lock().unwrap().signals.get(token).map(|s| s.row.clone()))
     }
 
+    async fn signal_entry_at(
+        &self,
+        project_id: &str,
+        node: &str,
+    ) -> anyhow::Result<Option<SignalRegistration>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .signals
+            .values()
+            .map(|s| &s.row)
+            .find(|s| !s.is_resume && s.project_id == project_id && s.node_id == node)
+            .cloned())
+    }
+
     async fn signal_update_kind_state(
         &self,
         token: &str,

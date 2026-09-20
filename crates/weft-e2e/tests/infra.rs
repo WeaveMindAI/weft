@@ -3,7 +3,7 @@
 #![cfg(feature = "e2e")]
 
 use serde_json::json;
-use weft_e2e::{ensure, infra, project::Project, run, SettledRun};
+use weft_e2e::{display, ensure, infra, project::Project, run, SettledRun};
 
 #[tokio::test]
 async fn infra_node_provisions_runs_and_terminates() -> anyhow::Result<()> {
@@ -34,6 +34,28 @@ out.data = scope.status
     SettledRun::observe(project.dispatcher(), *setups.iter().next().unwrap()).await?.completed()?
         .assert_completed("scope.enabled")?.assert_completed("scope.ready")?.assert_completed("scope.svc")?
         .assert_untouched("scope.after")?.assert_untouched("scope.unrelated")?.assert_untouched("out")?;
+
+    // An infra node has a display only when its metadata NAMES the
+    // endpoint serving `/live`. MiniService names none, so it has
+    // nothing to show, and the doors say so the same way they would
+    // for a node that does not exist. A node that speaks only TCP is
+    // the real case: polling one would 502 every tick.
+    let pid = project.id();
+    let watcher =
+        display::mint_display_token(project.dispatcher(), &pid, "weft-e2e-all", &[], true).await?;
+    let listed = display::list_for_token(project.dispatcher(), &watcher).await?;
+    // The listing carries every node that HAS a display; this project's
+    // only infra node has none, and it declares no trigger, so there is
+    // nothing to carry.
+    anyhow::ensure!(
+        listed.is_empty(),
+        "an infra node with no liveEndpoint must not be listed as showing anything, got {listed:?}"
+    );
+    let status = display::read_status(project.dispatcher(), &watcher, &pid, "scope.svc").await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::NOT_FOUND,
+        "reading a display that does not exist must be 404, got {status}"
+    );
 
     // With infra running, a run resolves the endpoint, reads /outputs, and emits
     // status="ready" to Debug.

@@ -311,6 +311,8 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
         name: None,
         allowed_projects: vec![],
         allowed_tags: vec![],
+        allowed_displays: vec![],
+        all_displays: false,
         created_at: 0,
     }
 }
