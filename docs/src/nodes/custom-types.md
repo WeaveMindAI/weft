@@ -1,117 +1,86 @@
 # Custom types
 
-If several nodes pass the same kind of record around, give it a name.
-A `SupportTicket` input tells you more than `JsonDict`: it says which
-record this node expects, and the declaration says which fields belong in it.
-
-## Declare a type and use it on a port
-
-Add a `types` block to a node's metadata or its package's shared metadata,
-at the top level:
+Give a shape a name and every node can use it.
 
 ```json
 "types": {
-  "SupportTicket": "{ id: String, question: String, screenshot?: Image }",
-  "TicketBatch": "List[SupportTicket]"
+  "ChatMessage": "{ role: String, content: String }",
+  "ChatHistory": "List[ChatMessage]"
 }
 ```
 
-Then use the name on a port, as an entry in the `inputs` array:
+Then in any node's ports, including other people's:
 
 ```json
-{
-  "name": "ticket",
-  "type": "SupportTicket",
-  "required": true
-}
+"inputs": [ { "name": "history", "type": "ChatHistory", "required": true } ]
 ```
 
-![A record port carrying a typed object](../img/record-port.png)
+## They are global, and compared by name
 
-Metadata types are available throughout the project's catalog and in its
-`.weft` source. Put the declaration beside the node or package that owns
-the concept.
+Every `metadata.json` in the project contributes its `types` to one table
+before anything else is parsed, so a name declared by one package is usable by
+every node.
 
-Two packages can repeat the same name with an identical body. Different
-bodies under one name fail catalog loading, so two implementations cannot
-quietly disagree about what `SupportTicket` contains.
+The comparison is by **name**, not shape. `CustomerId` declared as `String` is
+a different type from `String`, and wiring one into the other is a mismatch.
+That is the point: a customer id should not land in a port that wanted any old
+string.
 
-Records reject undeclared fields. Use `?` for a field that may be absent,
-and include every field you intend to carry. For example, adding an
-`assignee` property to a value requires adding it to the declaration too.
+A named type flows **into** its shape for free, because the name falls away
+when it is not needed. Going the other way, from a plain shape to a named one,
+needs a `Cast`, which checks the value really has that shape.
 
-If you use [package defaults](metadata.md#package-defaults), remember that
-a member's own `types` object replaces the inherited object as a whole.
+## What travels
 
-## What the name checks
+The name carries its shape with it. A port typed `ChatMessage` stores as
+`ChatMessage={ role: String, content: String }`, so anything reading a saved
+project or a journal row understands it with no table to consult, and a run
+that started yesterday keeps the shape it started with even if you edit the
+declaration today.
 
-A `SupportTicket` output can feed a `SupportTicket` input.
-An unnamed object does not become a ticket merely because its fields look
-right. To accept an object from an untyped source, use `Cast` and declare
-the target type. The conversion checks its fields at run time.
+## Where to put them
 
-A named value can flow out to a compatible structural type.
-`SupportTicket` can feed its record shape or `JsonDict`;
-`TicketBatch` can feed a compatible list. A list is not a `JsonDict`.
+A package root's `metadata.json` can declare the types its nodes share, once,
+and every node in it inherits them.
 
-The check establishes the declared structure. It does not prove that
-ticket `"T-42"` exists or that its question was answered correctly.
+Two packages declaring the same name with the same shape is fine and absorbs.
+Two declaring it with different shapes names both, and a port that restates a
+declared name with a different shape is the `named-type-conflict` error. A
+named type has one body everywhere.
 
-For casts and source-level type declarations, read
-[Types](../language/types.md).
+Nothing shadows. A name already visible cannot be redeclared, not even to the
+same thing.
 
-## Files inside a record
+## Cast
 
-The optional `screenshot` above is an `Image` field. When it holds a
-stored-file reference, the graph carries that reference instead of copying
-the image bytes into the record.
+Any node can declare itself a cast:
 
-A provider may need a URL or inline data instead. The storage helpers can
-convert all file positions in a typed value, including files nested inside
-lists and records. You still need to call the helper at the provider
-boundary; declaring a type does not make the request for you.
-
-For example, inside a node that declares a `ticket` output:
-
-```rust
-use weft::storage::{StorageScope, media::ExternalizePolicy};
-
-let ty = ctx.output_type("ticket")
-    .ok_or_else(|| weft::node_error("The ticket output type is missing"))?;
-let storage = ctx.storage(StorageScope::Execution);
-
-let provider_value = storage
-    .externalize(&ticket, &ty, ExternalizePolicy::urls())
-    .await?;
+```json
+"features": { "castPorts": { "input": "value", "output": "value" } }
 ```
 
-Here `ticket` is the JSON value you are preparing to send.
-`urls()` requests public links for stored files and uses inline data when
-no public link can be served. Use `ExternalizePolicy::inline()` when the
-consumer requires inline data.
+The compiler reads the declaration, never the node's name, so this is a thing
+any node can be rather than one built-in.
 
-The converted object is for that provider call. Its file fields now hold
-external strings, so keep the original typed value for the graph.
+At compile time, the resolved pair of types has to be a conversion that exists:
 
-If a response contains media URLs or data URLs in the same declared shape,
-bring those files into storage:
+| From | Into |
+|---|---|
+| `String` | A number, a boolean, or any object shape, parsed as JSON and then checked |
+| Anything that is not a file or a live handle | `String` |
+| `Number` | `Boolean`, and back |
+| Any object shape | A record or a named type, checked against the declared shape |
 
-```rust
-let stored_ticket = storage.internalize(&response, &ty, None).await?;
-ctx.pulse_downstream(
-    NodeOutput::new().set("ticket", stored_ticket),
-).await?;
+Anything else is refused at compile time:
+
+```text
+no cast from JsonDict into Number; a cast parses text, stringifies data, or
+validates an object shape against a declared type
 ```
 
-`internalize` stores raw media and replaces those positions with file
-references; already-stored references pass through. It does not validate
-unrelated response fields. Your node still needs to check that the provider
-returned the result it promised.
+At run time, the check names the field that was wrong, like
+`messages[2].role: expected String, got Number`, rather than failing with a
+shrug.
 
-Here `None` leaves newly stored files eligible for cleanup after the
-execution. Pass `Some(KeepTtl::Default)` to keep them for the default
-retention period; import `KeepTtl` from `weft::storage`.
-
-For retention and conversion policies, read [Storage](storage.md).
-For an existing example with nested media, read the
-[chat type declarations](https://github.com/WeaveMindAI/weft/blob/mvp/catalog/ai/llm/metadata.json).
+Stored files, buses and connections do not turn into text, so those casts do
+not exist.

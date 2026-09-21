@@ -1,194 +1,126 @@
 # Reading inputs, emitting outputs
 
-Read incoming values from `ctx.inputs` and send results with
-`ctx.pulse_downstream`. The body uses the same input API whether a value
-came from a wire, a literal or a metadata default.
+What the methods are is on [the ctx](ctx.md). This page is what happens around
+them: how a value gets into your bag, and what the runtime does with what you
+send.
 
-```rust
-let text: String = ctx.inputs.get("text")?;
-ctx.pulse_downstream(NodeOutput::new().set("value", text)).await?;
-```
+## Where an input's value comes from
 
-## One bag
+Wired data and design-time settings live in one bag, under the port's name.
+Three things can fill a port, in this order:
 
-`ctx.inputs` is a `ValueBag`: named JSON values with typed accessors.
-A trigger's event payload lives in a separate bag, `ctx.wake`, with the
-same read methods. For the event's shape, read
-[Writing a trigger](writing-triggers.md).
-
-A supplied value takes precedence over the metadata default. A wire that
-closes without a value does not get replaced by that default.
-
-## The accessors
-
-```rust
-let name: String = ctx.inputs.get("name")?;
-let alias: Option<String> = ctx.inputs.opt("alias")?;
-let limit: u32 = ctx.inputs.get_or("limit", 50)?;
-let raw = ctx.inputs.raw("payload");
-```
-
-| Method | Missing or null | Wrong type |
-|---|---|---|
-| `get::<T>(name)` | Missing is an error; null must deserialize into `T` | Error naming the input |
-| `opt::<T>(name)` | `None` | Error |
-| `get_or(name, default)` | The supplied default | Error |
-| `raw(name)` | Missing is `None`; present null stays a JSON value | No conversion |
-
-Use `get_or` for a fallback. `get(...).unwrap_or(...)` would also hide a
-type error, making a broken input look like an omitted setting.
-
-For a required value you want to inspect as JSON, use
-`ctx.inputs.get::<serde_json::Value>("payload")?`.
-
-### One or several values
-
-`ctx.inputs.list::<T>("attachments")?` accepts an array or a single
-value. An absent or null input becomes an empty list. Every item still has
-to deserialize into `T`; a bad item fails the read.
-
-### Reading a nested object
-
-```rust
-let options = ctx.inputs.nested("options")?;
-let model: String = options.get_or("model", "default-model".into())?;
-```
-
-An object becomes another bag. An absent or null value becomes an empty
-bag; a present value that is not an object produces an error.
-
-This is how a node can read an options object supplied by another node.
-The framework passes the object through; the consuming node chooses which
-fields it needs.
-
-### Iterating
-
-| Method | Values it visits |
+| Rank | Source |
 |---|---|
-| `iter()` | All named values |
-| `declared()` | Inputs declared by the node type's metadata |
-| `custom()` | Extra inputs on this instance, including config-derived ports |
-| `in_order()?` | Present values in the node's port order |
+| 1 | A value that arrived on a wire |
+| 2 | A value written into the node's body, if nothing arrived |
+| 3 | The `default` from the node's metadata, if the port is still empty |
 
-For a script node, `custom()` can collect variables while leaving out the
-metadata-declared `code` input.
+Four rules around that, each of which exists to stop a quiet wrong answer.
 
-`in_order()` follows port order, not arrival time. A created port's place
-comes from where the author wrote it. Closed inputs are absent.
-The method errors on a nested bag or wake bag because those have no port
-list.
+**A closure kills the default.** If a wire arrived closed, meaning upstream
+produced nothing, the default does **not** fill in. A closure means something
+did not happen, and substituting a default would hide that.
 
-### The whole bag at once
+**A delivered `null` is a value only where the type allows it.** On a port
+whose type admits `Null`, `null` is data. Anywhere else it reads as nothing
+arrived, and the default fills.
 
-```rust
-let object = ctx.inputs.object()?;
-```
+**A wrong type fails the firing**, required or not. It is never quietly dropped
+so the default can take over.
 
-`object()` borrows the JSON object; `record()` returns an owned JSON
-value. The inputs bag always has an object. On `ctx.wake`, these methods
-fail if no event object was delivered, so a missing event cannot pass as
-an empty record.
+**A number outside its declared range fails too.** A poll interval of `0` on a
+port with a minimum never quietly becomes `30`.
 
-### Files
+Two ports get special handling before your code sees them. A connection input
+arrives as a full `Access` value carrying the service, rather than the id the
+editor stored. And the gate ports are stripped out entirely, so your node never
+finds a `_should_flow` it did not declare.
 
-A file input can be read as `FileHandle`:
-
-```rust
-let file = ctx.inputs.get::<weft::storage::FileHandle>("image")?;
-```
-
-For fetching its bytes or sending it to a provider, read [Storage](storage.md).
+A trigger is different again: on a real firing, its ports replay the values
+that were frozen when the trigger was set up, and written literals fill
+whatever is left.
 
 ## Emitting
 
-Build a `NodeOutput` with one entry per output you want to send:
+`ctx.pulse_downstream` is the only way out.
 
-```rust
-ctx.pulse_downstream(
-    NodeOutput::new()
-        .set("count", count)
-        .set("text", text),
-).await?;
+**Once per port, per firing.** Emitting or closing the same port twice is an
+error naming it:
+
+```text
+node 'reply' touched port 'text' twice in one firing. Each output port can be
+emitted or closed AT MOST ONCE per firing
 ```
 
-Each `.set` takes a value convertible to JSON. The example assumes the
-node declares both output ports. A second `.set` for the same name in
-this object replaces the first value.
+**Several calls are fine if they touch different ports.** That is how you
+release a bus marker early and a `done` flag at the end. If any port in one
+call collides, nothing in that call is recorded, so a failed call is a clean
+no-op rather than half an emission.
 
-An ordinary output can emit at most once per firing. A `Generator[T]`
-output can emit repeatedly, with each emission supplying another item.
+**A stream port is the exception.** A `Generator[T]` output takes as many
+emissions as you like, one per item, until you close it. After the close,
+nothing can follow.
 
-If you already have a JSON object,
-`NodeOutput::new().extend_from_object(&value)` copies its keys to output
-names. Use `ctx.fan_declared(&value)` to keep only keys declared as
-outputs; provider response fields you do not expose are then ignored.
+**Anything you never mention is closed for you** when the body returns. That
+closure is the signal everything downstream is waiting for. A node that decides
+it has nothing to say does not need to do anything special: it just returns,
+and the branch behind it skips.
 
-### Explicit closure
+**A node that fails closes whatever it had not already sent.** What it did send
+stays sent. weft cannot unsend a message your node already put on Slack.
 
-You can emit `count` now and `text` later. Omitting `text` from the
-first emission leaves it open. When the body finishes, the runtime closes
-ordinary outputs it never emitted and ends any remaining generator outputs.
+**An undeclared port is caught first**, before the once-only rule, so a typo
+reads as the real problem:
 
-To close one early:
-
-```rust
-ctx.close_port("text").await?;
+```text
+node 'reply' tried to emit on undeclared output port 'txet'. Declare it in
+metadata.json's outputs list, or correct the port name in the node body.
 ```
 
-![Journal events showing a port emitted, then closed](../img/emission-events.png)
+**A value over 100 KB fails the call**, naming the port. Put bytes in
+[storage](storage.md) and send the marker.
 
-An ordinary port cannot emit after closure. On a generator, closure ends
-the sequence after the items already emitted.
+## Waiting for the value to be taken
 
-An ordinary required input receiving closure causes its node to skip;
-an optional input can remain absent. For the complete readiness rules,
-including generators, read
-[The closed pulse](../language/mental-model.md#how-a-branch-stops-the-steps-after-it).
+`pulse_downstream` sends and carries on. `yield_downstream` waits until the
+value was actually taken, which is what you want when you are producing faster
+than the consumer reads.
 
-### Waiting for the value to be taken
+It fails rather than waiting forever when delivery becomes impossible, for
+instance because the consumer skipped or the run finished. An unwired port
+counts as delivered immediately.
+
+## Building the output
 
 ```rust
-ctx.yield_downstream(output).await?;
+NodeOutput::new()
+    .set("count", words.len() as f64)
+    .set("longest", longest)
 ```
 
-For an ordinary output, this waits until the consumer is dispatched.
-For a generator item, it waits until the consumer pulls that item.
-It does not wait for the consumer to finish its work.
+`set` takes anything that turns into JSON. If you already have a `Value`, it
+passes through rather than being wrapped again.
 
-If delivery becomes impossible, for example because the consumer skipped
-or finished without taking the value, the call fails. An unwired output
-has no consumer to wait for.
+For a dynamic object whose keys should land on same-named ports,
+`ctx.fan_declared(&value)` matches them against the ports your node actually
+declares and skips the rest. That matters after a paid call: an extra key in a
+provider's response should not fail your node when you already spent the money.
 
-For buffering and complete generator examples, read
-[Streams and buses in Rust](streams-and-buses.md).
+`NodeOutput::stored_file(stored)` fills the four ports a stored file travels
+as: `file`, `filename`, `mimeType` and `sizeBytes`.
 
 ## Errors
 
-Import `weft::NodeErrExt` to add an explanation to another library's
-failure:
+| You want | Write |
+|---|---|
+| To wrap somebody else's error | `result.node_err("reading the reply")?` |
+| To say what was missing when an `Option` was `None` | `option.node_err("the response had no body")?` |
+| To fail on something you worked out | `weft::node_bail!("pick a channel or a user")` |
+| The same, as an expression | `node_error(format!("..."))` |
 
-```rust
-let body = response.json::<serde_json::Value>()
-    .await
-    .node_err("decoding the response")?;
-```
+Your node never names a weft error type. Those, plus `?` on anything the ctx
+returns, are the whole story.
 
-On a `Result`, `.node_err("decoding the response")` prefixes the
-underlying error with that context. On an `Option`, `None` becomes an
-error containing the supplied message.
-
-For a condition your node detects itself:
-
-```rust
-if destinations.is_empty() {
-    weft::node_bail!("Choose a destination before sending the message.");
-}
-```
-
-For an expression such as `ok_or_else`, use
-`weft::node_error("The response has no message ID")`.
-
-A failed body closes ordinary outputs that have not already emitted.
-Their optional consumers can handle the missing result. A generator output
-that is still open ends with the producer's failure. Its consumer receives
-an error after any buffered items, rather than a successful end.
+Write the message as an instruction to whoever is building the program, because
+that is who reads it. "pick a destination: a channel or a user" beats "invalid
+configuration".

@@ -1,9 +1,10 @@
 # The commandments of plumbing
 
-The docs keep telling you a node does no plumbing, and then never tell you what
-plumbing actually is. So here it is.
+A node does its own job and nothing else. Everything underneath it, the
+credentials, the listening, the storage, the record of what happened, belongs to
+weft.
 
-This is where the line sits today.
+Here is where that line sits today, and what it means in practice.
 
 **The test underneath all of them:** if every node that needs a mechanism would
 need the same answer, the mechanism belongs in weft. If two good nodes would do
@@ -30,8 +31,8 @@ them. Sockets, reconnects, acks and backpressure are already written.
 **IV. Thou shalt not build control flow in Rust.**
 
 Looping, branching, retrying, fanning out, gathering results: you decide all of
-it, in the graph, where it's journaled and someone can actually read it. Not
-buried in one node's body where nobody can.
+it, in the graph, where it is journaled and somebody can read it. Not buried in
+one node's body where nobody can.
 
 **V. Thou shalt not save your own state.**
 
@@ -70,7 +71,7 @@ one fails before it reaches your code.
 No log file, no print so you can work out later what went on, no audit trail of
 your own. Every event is journaled as it happens, and that journal is what the
 runtime replays to bring an execution back, so a record you keep on the side is
-one the runtime can't restore from anyway.
+one the runtime cannot restore from anyway.
 
 **XI. Thou shalt not report to the human.**
 
@@ -79,31 +80,32 @@ firing makes something worth looking at, declare a `display` and the editor
 renders it on the node. You never hand-deliver information to whoever is
 watching.
 
-These commandments are also aspirational. A commandment can be right, and weft
-can still not cover your case yet, or be missing an option you need. If you
-think the line should move, tell us about that one on
-[Discord](https://discord.com/invite/FGwNu6mDkU).
-
 ---
 
-## What's left is yours
+These are also aspirational. A commandment can be right and weft can still not
+cover your case yet, or be missing an option you need. If you think the line
+should move, come and tell us about that one on
+[Discord](https://discord.com/invite/FGwNu6mDkU).
 
-Your own logic and nothing else: building this call's request body, reading this
-reply, knowing what this provider's errors mean, doing the actual work.
+## What is left is yours
 
-It's a small job on purpose. Everything hard sits behind the ctx, and when
+Your own logic: building this call's request body, reading this reply, knowing
+what this provider's errors mean, doing the actual work.
+
+It is a small job on purpose. Everything hard sits behind the ctx, and when
 something back there goes wrong, it fails loudly.
 
 ## Moving the line
 
 The line sits where it does because of the nodes people have written so far.
 
-If you're about to write something you think is plumbing and belongs in weft,
-come say so on [Discord](https://discord.com/invite/FGwNu6mDkU) or in an issue.
-Bring the node you're building and the code you'd otherwise have to stuff in its
-body. Or build the general version yourself and send a PR, which is usually
-faster and always welcome (ask on Discord first so you don't waste your time).
+If you are about to write something you think is plumbing and belongs in weft,
+come and say so on [Discord](https://discord.com/invite/FGwNu6mDkU) or in an
+issue. Bring the node you are building and the code you would otherwise have to
+stuff in its body. Or build the general version yourself and send a PR, which is
+usually faster and always welcome; ask on Discord first so you do not waste your
+time.
 
 Same if a commandment holds but what weft gives you falls short: socket handling
-that doesn't fit your protocol, a display that can't show your kind of result, a
-scope that doesn't last long enough. Tell us what you hit.
+that does not fit your protocol, a display that cannot show your kind of result,
+a scope that does not last long enough. Tell us what you hit.

@@ -17,7 +17,7 @@ edit-url-template = "https://github.com/WeaveMindAI/weft/edit/mvp/docs/{path}"
 site-url = "/weft/"
 no-section-label = true
 additional-css = ["theme/weft.css"]
-additional-js = ["theme/highlight-weft.js", "theme/inline-code.js", "theme/copy-markdown.js"]
+additional-js = ["theme/highlight-weft.js", "theme/inline-code.js", "theme/copy-markdown.js", "mermaid.min.js", "mermaid-init.js"]
 
 [output.html.fold]
 enable = true

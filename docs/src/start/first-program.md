@@ -1,6 +1,28 @@
 # Your first program
 
-Make a project and run it:
+Making a project takes one command, and it has one choice in it: which AI
+assistant you use. Pass `--assistant` with your row from this table and weft
+copies Tangle into the project. Tangle is a persona that teaches your assistant
+the language, and it reads the catalog on your disk rather than trusting what
+it remembers.
+
+| You use | Pass |
+|---|---|
+| Claude Code | `--assistant claude-code`, or `cc` |
+| Kilo Code | `--assistant kilo-code`, or `kc` |
+| Cursor | `--assistant cursor`, or `cu` |
+| Codex | `--assistant codex`, or `cx` |
+| GitHub Copilot | `--assistant github-copilot`, or `gh` |
+| Gemini CLI | `--assistant gemini-cli`, or `gc` |
+| Cline | `--assistant cline`, or `cl` |
+| OpenCode | `--assistant opencode`, or `oc` |
+| Devin Desktop | `--assistant devin-desktop`, or `dd` |
+| Junie | `--assistant junie`, or `ju` |
+| Something else | `--assistant agents`, which writes a plain `AGENTS.md` |
+| Nothing | `--assistant none` |
+
+If you use more than one, pass `--assistant` once for each. Whichever you pick
+is remembered, so your next `weft new` installs the same one with no flag.
 
 ```bash
 weft new hello --assistant claude-code
@@ -8,154 +30,79 @@ cd hello
 weft run
 ```
 
-`--assistant claude-code` installs Tangle: instructions that teach your AI
-assistant how weft works. Once it is in place, you can ask for changes in plain
-English and it will make them. If you use Kilo Code, write `--assistant
-kilo-code` instead. If you use neither, run `weft new hello --assistant none`
-and skip [Ask Tangle](#ask-tangle). You can also install both at once:
-`--assistant claude-code --assistant kilo-code`.
-Whichever you pick is remembered, so your next `weft new` installs the same
-one with no flag at all, until you pass `--assistant <name>` to change it or
-`--assistant none` to stop.
+It prints the project's id, then the run's id, then a timestamped line for
+every step as it starts and finishes, then a tick:
 
-If `weft run` says it cannot reach the runtime, start it with
-`weft daemon start` and try again.
-
-The terminal prints `registered hello` and the project id, then `started color`
-and a long id, then a line or two for each step as it starts and finishes. That
-long id is a **color**, and the last line, `✓ completed color=`, repeats its
-first eight characters. A color is how you point at one particular run later.
-
-## See the program as a graph
-
-Open the `hello` folder in VS Code and open `src/main.weft`. The text opens on the
-left and the graph opens beside it: two boxes joined by an arrow. This is the
-same file both ways:
-
-```weft
-greeting = Text { value: "hello world" }
-out = Debug
-
-out.data = greeting.value
+```text
+registered hello (3f2a1c4e-9b81-4d0a-8e55-7c2f1a6b30de)
+started color 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d
+→ started color=9b81d0a2 entry=greeting
+  …
+✓ completed color=9b81d0a2
 ```
 
-`greeting` and `out` are names, and you can change them to anything.
-`Text` and `Debug` say what kind of step each one is. The last line is the
-arrow: `greeting.value` flows into `out.data`.
+That long id after `started color` is the run's **color**, and it is how you
+point at this one run later. Everything that reads a run takes it, and the
+first eight characters are enough as long as they name only one.
 
-## Change it
+If `weft` is not found, open a new terminal; the installer's `PATH` line only
+takes effect in a fresh one. If the run stops saying it cannot reach the
+runtime, run `weft daemon status` and go back to [Install](install.md).
 
-Now suppose you want it to greet a person by name.
+## See it as a graph
 
-The step for that is `Format`. It fills in a template: you write `{{name}}`
-wherever a value should go, and you give the box an input with the same name so
-the value has somewhere to land. Every placeholder needs an input of the same
-name, or the step fails and tells you which is missing.
+Open the `hello` folder in VS Code, click the **Weft** icon in the bar down the
+left edge, and click your project under **Projects**. The source opens on the
+left and the graph opens beside it. (If you opened `src/main.weft` yourself,
+click **Open Graph to the Side** in the file's title bar.)
 
-There are three ways to make this change. Pick whichever you like.
+Type in either pane and the other updates.
+![The greeting source on the left and its graph on the right](../img/graph-split-view.png)
 
-### Ask Tangle
 
-Open the project in your assistant and tell it:
-
-> Greet a person by name, with the name as its own input so I can change it
-> without touching the text. Run it and show me the result.
-
-Tangle makes the change and runs it for you.
-
-![Tangle building the greeting, with the finished graph and its result beside it](../img/first_program.png)
-
-You end up with three boxes, and the last one shows `"data": "Hello, Ada!"`.
-The name sits in its own box. Tangle picked its own names for the boxes here, so
-yours may read differently.
-
-### Build it in the graph
-
-Press `Ctrl+P`, type `Format`, and pick it. Double-click the new box's title and
-rename it to `sentence`.
-
-A new `Format` box arrives with one input, `template`. The value you want to
-drop into the sentence needs an input of its own, so make that first. Underneath
-the box's inputs there is a small **+ input** button. Click it, type `name`, and
-press Enter.
-
-Now right-click that new `name` dot. A menu opens with a row reading
-`✎ Type: MustOverride`. Click it and the row turns into a text box with
-`MustOverride` already selected, so type `String` over it and press Enter.
-`MustOverride` is weft's way of saying nobody has decided this type yet, and the
-build stops until you do.
-
-Open the box. Its body has a **Template** field: click that and type
-`Hello, {{name}}!`.
-
-Now connect the boxes. Drag from the `value` dot on the right of `greeting` to
-the `name` dot you just made, then from the `text` dot on the right of `sentence`
-to `data` on `out`.
-
-One thing left: `greeting` still holds `hello world`. Open it and change that to
-`Ada`. Then click empty canvas so the box is no longer being typed into, and
-press `Ctrl+Enter` to run.
-
-### Write it
-
-Go to the text (if you closed it, the code button at the top right of the
-graph brings it back) and replace the file with this:
+This is what `weft new` wrote, and what you just ran:
 
 ```weft
-greeting = Text { value: "Ada" }
-
-sentence = Format(name: String) {
-  template: "Hello, {{name}}!"
-  name: greeting.value
-}
-
-out = Debug
-out.data = sentence.text
+greeting = Text { value: "Hello, World!" }
+out = Debug { data: greeting.value }
 ```
 
-Then press `Ctrl+Enter` to run it.
+Two boxes and an arrow. A box is one step, which weft calls a **node**. The
+dots down its left edge are what it takes in, the dots down its right edge are
+what it sends out, and each dot is coloured by the kind of value it carries, so
+two dots of the same colour fit together.
 
-## See what each box received
+The arrow is `greeting.value` sitting where `out`'s `data` input goes. Writing
+a source and a port where a value belongs is how you connect two steps, and it
+is the only wiring syntax there is.
 
-Once the program has run, a small magnifying glass appears in the top right of
-every box. Click the one on `sentence` and a panel shows what went in, the
-template along with `"name": "Ada"`, and what came out: `"Hello, Ada!"`.
+While a run is going, each box glows: amber while it works, cyan while it waits
+for something, green when it finished, red when it failed. Click the magnifying
+glass on a box to see exactly what went in and what came out.
+![A run in progress: working, waiting, finished and failed](../img/graph-status.png)
 
-Change `Ada` to another name and run again.
 
-## What is in the folder
+For adding a box and drawing an arrow yourself, go and read
+[working in the graph](../build/the-graph.md).
 
-| File or directory | What it is for |
+## What `weft new` made
+
+| File or directory | What it is |
 |---|---|
 | `src/main.weft` | The program |
-| `weft.toml` | The project's name and its permanent id |
-| `nodes/` | The code for every kind of step it can use |
-| `CLAUDE.md`, `.claude/` (or `kilo.json`, `.kilo/`) | Tangle's instructions, for whichever assistant you picked |
-| `layouts/` | Where you dragged the boxes. It turns up the first time you move a box. |
-| `.weft/` | Build files, generated |
+| `weft.toml` | Its name and its permanent id |
+| `nodes/base_catalog/` | Every step weft ships, copied in so the build never reaches outside your project. `weft catalog update` replaces this folder wholesale after you update weft, so keep nothing of your own in here |
+| `nodes/` (anywhere else) | Steps you write yourself |
+| `CLAUDE.md`, `.claude/` | Tangle, for whichever assistant you picked |
+| `.weft/` | Build state, generated |
 
-`weft new` also starts a git repository and writes a `.gitignore` for you.
+Two more folders turn up later rather than now: `layouts/`, the first time you
+drag a box, and `assets/`, when something needs a prompt or a script kept in a
+file of its own.
 
-The Tangle files are copied in, so they get committed with the rest and
-somebody who clones your project gets Tangle without a weft checkout. After
-updating weft, `weft tangle update` re-copies them.
+`weft new` also runs `git init` and writes a `.gitignore`. Tangle's files are
+ordinary project files, so they commit with the rest and anyone who clones your
+project gets Tangle without installing weft.
 
-If you write a step of your own, put it anywhere under `nodes/` except
-`base_catalog/`. That folder holds the standard steps, and `weft catalog update`
-wipes it and copies fresh ones in, deleting anything you left there.
-
-If you want a step that does something new, check whether one already exists
-before you write it. `weft describe-nodes --list` prints every step in the
-project, one line each. Once a name looks promising,
-`weft describe-nodes --node Text --compact` prints what that one takes in and
-gives back.
-
-## Where to go next
-
-If you already have something you want to build, ask for it now. Ask for one
-small piece at a time, run it against a real input, then say what is wrong with
-it before you ask for the next. For more on working that way, read
-[Sequential Diffusion Programming](../thinking/sdp.md).
-
-If you would rather keep reading, go and read
-[Reading and building the graph](reading-the-graph.md) next.
+Next, [the three lifecycles](lifecycles.md): what starts on its own and what
+does not.

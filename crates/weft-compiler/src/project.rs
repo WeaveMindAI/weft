@@ -300,9 +300,12 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
     // `# Project:` header: the project name is authoritative in `weft.toml` (and
     // the folder), so a name comment in the source would just be a stale
     // duplicate. The source carries only the graph.
-    let main_weft = "greeting = Text { value: \"hello world\" }\n\
-         out = Debug\n\n\
-         out.data = greeting.value\n";
+    //
+    // The connection is written inline, in the body of the node that consumes
+    // it, because that is the spelling the book teaches and every example uses.
+    // The first file a new user opens shows them the form they should write.
+    let main_weft = "greeting = Text { value: \"Hello, World!\" }\n\
+         out = Debug { data: greeting.value }\n";
     Ok(vec![
         ("weft.toml".to_string(), toml.into_bytes()),
         (format!("{SRC_DIR}/{ENTRY_FILE}"), main_weft.as_bytes().to_vec()),

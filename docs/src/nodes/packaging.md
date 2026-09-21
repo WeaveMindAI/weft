@@ -1,141 +1,130 @@
 # Packaging
 
-A node works on its own, so start with a standalone node. Reach for a package
-when several nodes share code or dependencies: the package gives them one home,
-while each node keeps its own metadata and implementation.
-
-## A standalone node
-
-A standalone node is a directory containing `metadata.json` and `mod.rs`:
+Several nodes that belong together, sharing code and dependencies.
 
 ```text
-nodes/reply/
-  metadata.json
-  mod.rs
-  deps.toml
-  tests.rs
-```
-
-`deps.toml` and `tests.rs` are optional. For the node files themselves,
-follow [Your first node](your-first-node.md).
-
-## A package
-
-A package is a directory with a `package.toml`. Its immediate subdirectories
-containing `metadata.json` become member nodes:
-
-```text
-nodes/my_service/
+slack/
   package.toml
-  api.rs
-  metadata.json
+  api.rs                shared code
+  metadata.json         optional defaults for every node here
+  access/
+    metadata.json
+    mod.rs
   send_message/
     metadata.json
     mod.rs
-    tests.rs
-  receive_message/
-    metadata.json
-    mod.rs
+    deps.toml
 ```
 
-![A package folder with its shared files and member nodes](../img/package-layout.png)
-
-For example:
+`package.toml` is short:
 
 ```toml
 [package]
-name = "my_service"
+name = "slack"
 
 [dependencies]
-uuid = { version = "1", features = ["v4"] }
+# cargo deps every node here gets
 ```
 
-The dependency is shared by the members. A member can use `super::api`
-to reach `api.rs` at the package root. This is also where you can place a
-[provider meter](../connections/meters.md) shared by the service's nodes.
+Its presence is what makes the folder a package, and the members are found by
+looking rather than listed.
 
-The root `metadata.json` is optional and contains defaults inherited by
-members. For how fields combine, read
-[Package defaults](metadata.md#package-defaults).
+## Shared code
 
-## Nesting and discovery
+Any `.rs` at the package root becomes a module, and a node reaches it as
+`super`:
 
-The catalog searches recursively until it reaches a directory containing
-`package.toml` or `metadata.json`. That directory is a package or a
-standalone node; discovery then follows that unit's layout.
-You can organize packages under category directories, but cannot hide
-another package inside a package member.
+```rust
+use super::api;
+```
 
-Symlinks are followed. Broken links and cycles report errors.
-Directories named `target`, `node_modules`, `.git`, and `.weft` are
-excluded. If different nodes declare the same type name, catalog loading
-reports a collision.
+That is where the request-building and the error-reading for one service goes,
+written once instead of in every node that talks to it.
 
-## What gets compiled
+Each package compiles as its own crate, so a node sees its own package's shared
+files and nothing else. Another package's code is never on your path.
 
-The compiler reads node metadata first, without compiling the node
-implementations ([metadata.json](metadata.md) covers the full statement). That
-lets it check a graph before building its worker.
+It also means editing one node recompiles that package and relinks, rather than
+rebuilding the world.
 
-For the build, it includes the nodes the program references, plus their
-packages' shared Rust files and dependencies. An unused sibling node is
-left out; a shared root module is still included. The generated worker
-registers the selected implementations explicitly.
+A shared file whose name is not a valid Rust identifier fails at build time
+naming the file.
 
-## Dependencies
+## Defaults
 
-Put node-specific dependencies in `deps.toml` beside `mod.rs`:
+A `metadata.json` at the package root is a partial document every node
+inherits, key by key, with the node's own value winning.
+
+Put `types`, `tags`, an `icon`, a `color` or a `service` recipe there once.
+
+`type`, `label` and `description` can never be defaults. They are one node's
+identity, and the compiler refuses a package file carrying any of them:
+
+```text
+package-level metadata.json must not set `type`: it is one node's identity,
+not a package default
+```
+
+The merge is shallow: a node's `types` replaces the package's rather than
+adding to it.
+
+## deps.toml
+
+Per node, and every section is optional.
 
 ```toml
 [dependencies]
-uuid = { version = "1", features = ["v4"] }
-```
-
-The generated package already provides `weft`, `weft-providers`,
-`tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, and
-`tracing`. Declare other crates your code uses, and comment dependencies
-whose purpose would be unclear to the next reader.
-
-### Build scripts and system packages
-
-If your code needs native libraries, declare the build and runtime
-requirements separately. For example, these are dependency-file fragments
-for an image using `apt`:
-
-```toml
-[build-dependencies]
-cc = "1"
-
-[system.build.apt]
-default = ["pkg-config", "libssl-dev"]
+reqwest = { workspace = true }
 
 [system.runtime.apt]
-default = ["ca-certificates"]
+default = ["ffmpeg"]
+
+[system.build.apt]
+debian_12 = ["pkg-config", "libssl-dev"]
 
 [build.env]
 SOME_PATH = "{{catalog_path}}/vendor"
 ```
 
-The `system.build` packages are installed in the builder image;
-`system.runtime` packages go in the worker image.
+| Section | What it is for |
+|---|---|
+| `[dependencies]` | Cargo crates this node needs |
+| `[build-dependencies]` | Cargo build-deps, for the package's own `build.rs` |
+| `[system.build.<manager>]` | OS packages needed to **compile**, thrown away before the runtime image is sealed |
+| `[system.runtime.<manager>]` | OS packages needed to **run** |
+| `[build.env]` | Environment during `cargo build`. `{{catalog_path}}` expands to your node's folder inside the builder |
 
-A system-package table can use a distro key such as `debian_12` in place
-of `default`. weft selects the matching distro entry, then falls back to
-`default` if one exists. In build environment values,
-`{{catalog_path}}` expands to the node's staged directory.
+Managers are `apt`, `apk`, `yum` and `brew`. Under each, a key per distribution
+like `debian_12` or `alpine_3_19`, or `default` for all of them. weft looks for
+the exact key, falls back to `default`, and fails only when neither is there.
 
-A build script runs at build time, before your node ever executes. For a
-standalone node, place `build.rs` beside `mod.rs` and declare its crates
-under `[build-dependencies]` in `deps.toml`. The same works for a named
-package: put the build script at the package root. In both layouts the
-entry point must be `pub fn main()`: weft copies the script into the
-generated build script of the emitted worker and calls it from there, and
-the `[build-dependencies]` you declared in `deps.toml` are available to it.
+`[build.env]` is deliberately narrow. Real build logic goes in a `build.rs`.
 
-## Sharing a package
+## What you get without asking
 
-Copy the package folder into another project's `nodes/` directory.
-Include its shared files and any assets its code or build script needs.
-If you used symlinks, their targets must remain available or be copied too.
+`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow` and `tracing`
+are always there. So is `weft-providers`.
 
-The build also needs weft and the declared Rust and system dependencies.
+`weft` also re-exports `serde_json`, `reqwest`, `reqwest_middleware`,
+`async_trait` and `inventory`, so you can name those types without declaring a
+dependency on them.
+
+## Local images
+
+An infra node's containers are built from Dockerfiles in its own folder:
+
+```text
+postgres/database/
+  metadata.json       "images": ["images/credential"]
+  mod.rs
+  images/credential/
+    Dockerfile
+    bootstrap.py
+```
+
+The path is relative to **the node's own directory**, and the last segment
+becomes the name you reference in the spec.
+
+(The doc comment on that field in the source says the package root. The code
+uses the node's directory, which is what the shipped catalog does and what
+works.)

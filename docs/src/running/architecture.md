@@ -1,131 +1,147 @@
 # How the runtime is built
 
-Four kinds of process, one job each. The **worker** runs your program. The
-**dispatcher** decides what runs where. **Listeners** wait for events. The
-**supervisor** looks after any service your program asked for. Anything that
-has to survive a crash goes into Postgres, and all four read it back from
-there.
+Four kinds of process, one job each.
+
+| | What it does | What it never does |
+|---|---|---|
+| **Worker** | Runs your compiled program | Nothing else. It is your program |
+| **Dispatcher** | Decides what runs where, and answers every request about a project or a run | Run your step code |
+| **Listener** | Holds the timers, the open sockets and the subscriptions | Run your step code, or know which project it serves |
+| **Supervisor** | Runs kubectl for the containers your program asked for | Run your step code, or share a project with another supervisor |
+
+Anything that has to survive a crash goes into Postgres, and all four read it
+back from there.
 
 ```mermaid
 flowchart TD
     UI["CLI / editor / webhooks"] --> D["Dispatcher"]
     D --> L["Listener"]
     D -.->|"queued work"| S["Infrastructure supervisor"]
-    D -.->|"queued work"| W["Worker: compiled project"]
+    D -.->|"queued work"| W["Worker: your compiled program"]
     C["Live caller"] --> G["Live gateway"] --> W
+    D --> PG[("Postgres")]
     L --> B["Broker"]
     S --> B
     W --> B
-    D --> PG[("Postgres")]
     B --> PG
 ```
 
-The dotted arrows are rows in a table, not calls. Workers and supervisors
-claim that work through the broker.
+The dotted arrows are rows in a table, not calls. The dispatcher never phones a
+worker. It writes the job down, and a worker claims it.
+
+## Why it is rows and not calls
+
+A row in a table survives the process that wrote it. If the dispatcher dies
+between deciding a job and a worker taking it, the job is still there. If a
+worker dies holding a job, its claim expires and another worker picks it up.
+
+Claiming is `FOR UPDATE SKIP LOCKED`, so two workers never take the same job.
+A claim lasts 60 seconds and the holder renews it every 15. Every job carries a
+key that makes a duplicate a no-op, so the same work queued twice runs once.
+
+That last part is why everything the runtime does has to be safe to redo.
 
 ## What happens when an event arrives
 
-A listener holding a timer or a subscription reports the event through the
-broker. The dispatcher works out which run it belongs to and makes sure a
-worker exists.
+A listener holding a timer or a subscription reports the event. The dispatcher
+works out which run it belongs to and makes sure a worker exists. The worker
+claims the job, fetches your program by its hash, and runs the graph, writing
+what happens into [the journal](the-journal.md) as it goes.
 
-The worker claims the job, fetches the project definition by its hash, and
-runs the graph, writing what happens into [the journal](the-journal.md) as it
-goes.
+An HTTP or WebSocket caller takes a different road. It arrives at the live
+gateway, which routes it to the one worker holding that conversation and keeps
+the connection open while your program runs. For that, go and read
+[putting it on a URL](../build/public-address.md).
 
-An HTTP or WebSocket caller takes a different road: it reaches the worker
-through the live gateway, which holds the caller's connection open while the
-program runs. For that, read [an HTTP endpoint](../start/on-a-url.md).
+## The worker
 
-## Dispatcher
+One compiled program, running as a pod, serving as many runs at once as it can.
+The image is named after a hash of its contents, so two projects that compile
+to the same thing share an image.
 
-The dispatcher answers every request about a project or a run, and decides
-which worker runs what and when workers start and stop. It writes tasks to the
-database rather than calling any particular worker.
+When a project's workers get close to their memory limit, weft starts another
+pod. A worker with nothing left to claim shuts itself down after 30 seconds. It
+caches every program it fetches, keyed by hash, so a restart is cheap.
 
-It never runs your step code. The CLI reads your local catalog and compiles
-the program before submitting it, so the dispatcher never needs to see your
-`nodes/` directory.
+A worker never touches Postgres. Everything it needs goes through the broker.
+
+## The dispatcher
+
+It answers every request about a project or a run, and it decides which worker
+runs what and when workers start and stop.
+
+It never sees your `nodes/` directory. Your CLI reads your local catalog and
+compiles the program before submitting it, so the dispatcher only ever handles
+a compiled definition.
 
 Anything shared lives in Postgres, because the next request may land on a
 different dispatcher pod with nothing in memory.
 
-## Listener
+## The listener
 
-A listener holds the timers, the open sockets and the other event sources.
-When something arrives, it turns that into a message the dispatcher knows how
-to route. Listeners are the only tier that tells one kind of event source from
-another, so a new kind of trigger is listener code and nothing else. They
-never run your step code.
+One pool serves every project on the installation. A listener holds the timers,
+the sockets and the subscriptions, and turns whatever arrives into a message
+the dispatcher can route.
 
-One listener pool serves every project on the installation, and each listener
-reports how close it is to its memory limit, so weft knows where to put the
-next event source.
+Listeners are the only tier that tells one kind of event source from another.
+So a new kind of trigger is listener code and nothing else, and no other tier
+grows a branch for it. Each listener reports how close it is to its memory
+limit, and weft puts the next event source on the one with room.
 
-## Infrastructure supervisor
+## The supervisor
 
-The supervisor applies your infrastructure specs and watches whether what it
-created is healthy. Before it issues any cluster command it takes a lease on
-the project, and it keeps renewing that lease for as long as the work runs. If
-the lease expires, another supervisor picks the project up.
+It applies your infrastructure and watches whether what it created is healthy.
+
+Before it issues any cluster command it takes an exclusive lease on the
+project, because two processes running kubectl against the same namespace
+corrupt each other. It keeps renewing that lease while the work runs, and if it
+expires another supervisor picks the project up.
 
 A supervisor can still die between changing the cluster and recording that it
-did, so the next one works out what to do from what the cluster actually looks
-like rather than trusting the record. For what the verbs do, read
-[infrastructure nodes](../nodes/infrastructure.md).
+did. The next one works out what to do from what the cluster actually looks
+like, rather than trusting the record.
 
-## Worker
+## The broker, and who may talk to what
 
-A worker is one compiled project binary running as a pod, serving as many runs
-at once as it can. When a project's workers get close to their memory limit,
-weft adds another pod to the pool. Going the other way, a worker with nothing
-left to claim shuts itself down after 30 seconds.
+The dispatcher and the broker reach Postgres directly. Everything else goes
+through the broker: listeners, supervisors and workers.
 
-It caches every project definition it fetches, keyed by hash.
-
-A suspension can leave a worker free to exit, though other live work or a held
-caller keeps it up. For that difference, read [surviving a
-restart](../nodes/durable-execution.md).
-
-## Who is allowed to talk to what
-
-The dispatcher and the broker talk to Postgres directly. Everything else goes
-through the broker: listeners, supervisors and workers. The broker asks
-Kubernetes to verify the caller's service-account token, then checks what that
-particular service account is allowed to touch.
+The broker checks every request. It asks Kubernetes to verify the caller's
+service-account token, resolves that to a tenant and a role, and then checks
+whether that particular caller is allowed to touch the thing it asked for. Your
+program's worker runs untrusted node code, so it never gets a database
+connection.
 
 The broker also handles storage and connection work, including OAuth exchanges
-and subscription setup. A worker calls the provider itself, so a slow provider
+and subscription setup. Your worker calls providers itself, so a slow provider
 never queues up behind the broker.
 
-Network policies limit where the broker can go, with explicit holes for
-Postgres and the Kubernetes API. If your object store sits on a private range
-those rules cannot work out, set `WEFT_STORE_ALLOW_CIDR` to it and the broker
-gets a hole for exactly that.
+Network policies limit where the broker can go, with holes for Postgres and the
+Kubernetes API. If your object store sits on a private range those rules cannot
+work out, set `WEFT_STORE_ALLOW_CIDR` to it.
 
-The local management API has no authentication of its own, so whoever can
-reach it can do anything a project owner can. Keep it off any interface you do
-not control. For the rest of the boundaries, read the [security
-policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
+The local management API has no authentication of its own, so whoever can reach
+it can do anything a project owner can. Keep it on an interface you control.
+For the rest of the boundaries, go and read the
+[security policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
 
-## Recovery
+## What happens when something dies
 
-Ownership records expire unless their holder keeps renewing them, so a
-replacement can claim expired work without needing anything the dead pod had
-in memory.
+Ownership is a lease with an expiry, so a replacement claims expired work
+without needing anything the dead process had in memory.
 
 Journal writes carry the identity of the worker that made them, and the
-database rejects writes from a worker whose registration has been removed,
-which is what stops an evicted worker carrying on.
+database rejects a write from a worker whose registration has been removed.
+That is what stops an evicted worker carrying on and writing history for a run
+somebody else has taken over.
 
-Recovery reads the saved events, and what it cannot recover is an external
-action whose result never got written down. For that boundary, read [the
-execution guarantee](the-journal.md#the-execution-guarantee).
+Recovery reads the saved events. What it cannot recover is an external action
+whose result never got written down. For that boundary, go and read
+[the execution guarantee](the-journal.md#the-execution-guarantee).
 
-## Swapping pieces out
+## Running it on something other than Kubernetes
 
-If you are putting weft on something other than Kubernetes, these are the
-seven traits you implement. Nothing else in the runtime changes:
+Seven traits. Implement them and nothing else in the runtime changes.
 
 | Interface | Decides |
 |---|---|
@@ -135,4 +151,8 @@ seven traits you implement. Nothing else in the runtime changes:
 | `SandboxPolicy` | Which runtime class it gets |
 | `WorkerBackend` | How worker pods get created |
 | `ImageBuilder` | How staged source becomes a runnable image |
-| `Journal` | Which store execution events are written to and read back from |
+| `Journal` | Where execution events are written and read back |
+
+Today there is one implementation of each, against a local kind cluster. The
+daemon refuses to start against a cluster it did not build, and says so, rather
+than half-working on something nobody has tested.

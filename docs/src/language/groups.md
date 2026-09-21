@@ -1,184 +1,126 @@
 # Groups
 
-Put the steps that do one job in a group. The graph can then show that job as
-a single box, with inputs and outputs you can look at before opening it.
+A group holds several steps under one name and folds shut like a folder. Its
+signature says what the outside can see.
 
 ```weft
-message = Text { value: "  hello  " }
-
-clean_text = Group(raw: String) -> (result: String) {
-  # Remove whitespace around the message
-  trim = ExecPython(text: String) -> (out: String) {
-    text: self.raw
-    code: "return {'out': text.strip()}"
+credit = Group(db: Access, user: String) -> (paid: Boolean, refusal: String) {
+  # Take one credit off this account, or say why we cannot
+  debit = PostgresExecuteQuery(telegram_id: String) {
+    query: @file("assets/sql/spend_credit.sql")
+    account: self.db
+    telegram_id: self.user
   }
-  self.result = trim.out
-}
 
-clean_text.raw = message.value
-show = Debug { data: clean_text.result }
+  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal: String) {
+    code: @file("assets/scripts/outcome.py")
+    rows: debit.rows
+  }
+
+  self.paid = read.paid
+  self.refusal = read.refusal
+}
+credit.db = pg.access
+credit.user = ask.user
 ```
 
-From outside, `clean_text` takes a string and gives back a string. Inside,
-`trim` does the work. You can add more steps in there later without the
-outside changing at all.
+`self` is the group's own interface. On the right of an arrow it means the
+values coming in from outside; on the left it means the values going out. It is
+always the innermost scope, so inside a loop inside a group, `self` is the
+loop.
 
-## The interface
+Set the group's inputs from outside, on its name, as `credit.db` does. You
+cannot write a literal onto `self.port`: a group's input is given its value
+from outside.
 
-The signature says what the rest of the graph can see:
+A plain comment as the first thing in the body becomes the group's description,
+which is what the graph shows when it is folded shut.
+
+## They do not exist when the program runs
+
+The compiler turns every group into two nodes, one holding its inputs and one
+holding its outputs, and hands the runtime one flat graph with the scope
+written on each node.
+
+So folding a group in the editor costs nothing, nesting five deep costs
+nothing, and a group is never a thing the runtime has to step through. It is a
+way of writing and reading, and it is gone by the time anything runs.
+
+## Why a required group input does not skip the group
+
+This is the part that surprises people.
+
+You declare `db: Access` without a `?`, so it is required. Then the thing
+feeding it closes. You would expect the whole group to skip.
+
+It does not. The closure goes **inside**, and whichever step actually needed
+that value skips there, and the skip cascades from that step outward. Every
+port on a group's boundary is optional, and the requiredness you declared is
+enforced by the node that consumes it.
+
+That is deliberate. A group is usually several jobs, and one missing input
+often only kills one of them. Skipping the whole group would throw away work
+that had everything it needed.
+
+It also means `@require_one_of` is refused on a group. Put it on the step
+inside that needs one of those values.
+
+A loop is the exception, for the ports it iterates or threads: with no list to
+walk, there is no iteration to launch.
+
+## Skipping the whole thing
+
+`_should_flow` goes inside the braces, and when it skips a group it skips
+**everything** in it, however deep, including nested groups. One line guards a
+whole subgraph.
 
 ```weft
-clean_text = Group(raw: String) -> (result: String) {
+brief = Group(request: String) -> (prompt: String) {
   ...
 }
+brief.request = ask.text
+brief._should_flow = credit.paid
 ```
 
-Inside the body, `self.raw` is the group's input. `self.result = trim.out`
-sends a child's output back out, right to left like any other connection.
+The gate is consumed at the boundary. The steps inside never see it, and they
+do not each get to decide: they take the group's decision as a whole.
 
-Children can wire to each other and to `self`. They cannot reach straight into
-another group's insides, or past `self` to anything outside. The compiler
-checks that. If a child needs something from outside, expose it as a port so
-the connection is visible from out there.
+Only the incoming side takes a gate. The outgoing side has nothing to decide,
+because a group that did not run has nothing to forward.
 
-Set a group's inputs on their own lines, from an arrow or a written value:
+## What crosses the boundary
 
-```weft
-clean_text.raw = "  hello  "
-```
+| Thing | Crosses? |
+|---|---|
+| Ordinary values, connections, file markers, bus markers | Yes |
+| A closure | Yes, and it cascades to whatever inside needed the value |
+| `_should_flow` and `_should_not_flow` | No. Consumed at the boundary |
+| A stream (`Generator[T]`) | **No** |
+| A wire from inside to outside that skips the interface | No |
 
-That value reaches every child wired to `self.raw`. The braces hold the
-children, so ordinary input values do not go in there.
+A stream is a live edge between two running nodes, so both ends have to be in
+the same scope. If you need a stream to cross, either move the consumer in, or
+have a node read the stream and emit ordinary values. A loop is the one thing
+that takes a stream across its edge, through its own `over`.
 
-## Names and nesting
+That last row is the `scope-reachability` error. A value crossing the line has
+to appear on the interface, where somebody reading the group can see it.
 
-Groups can hold groups. Each body has its own scope, so two groups can both
-have a child called `trim` without arguing.
+## Names you cannot use
 
-Name a group after the job the rest of the graph wants done. A support program
-might have `understand_request`, `find_answer` and `review_reply`. Somebody
-reading the top level can see what `find_answer` gave back without first
-reading how the search works.
+`Group`, `Loop`, `Passthrough`, `LoopIn`, `LoopOut` and `self` are the
+language's. So is any name containing a double underscore, which is the
+compiler's own separator.
 
-## The readable size
+Naming a group or a node after a node type is also refused, because
+`Ticket.body` would then read as an inline node rather than a reference. That
+is the `reserved-name` error.
 
-A level of the graph is what somebody takes in at one look: the file itself,
-or the inside of one group. Keep about six items on it. Past fifteen you get a
-`level-too-large` warning. It is only a warning: the program still builds and
-runs.
+## How big a level should be
 
-At the top level of a file the count is per branch, not per file: one wire
-walk, plus the infra nodes it touches. So two pipelines that never meet, or
-that only share a database, each answer for their own width. The database
-counts as a node of the branch that reaches it, and a group holding one is
-an item like any other.
+Six items on one level is what the language asks for. The compiler warns past
+fifteen, names the level, and tells you to group.
 
-When a level grows, nest instead of spreading out. Find the steps cooperating
-on one job, put them in a group, and the level is back to one item where it
-had six. Groups nest, so a group holding nothing but two more groups is a
-perfectly normal thing to have.
-
-## Which children start on their own
-
-When a group starts, weft also starts any child with nothing wired into it. So
-a group can contain a `Text` or anything else that needs no upstream value.
-Children that do have arrows follow the usual [readiness
-rules](mental-model.md).
-
-A child belongs to its group: it runs when the group runs, and stops when the
-group is skipped. Inside a loop, the same group and its children run once per
-iteration.
-
-A group is not a function call. It runs once, in place, just as the steps
-inside it would have. If you want repeated work, go and read
-[Loops](loops.md).
-
-## Turning a whole group off
-
-`_should_flow` decides whether any work inside a group starts at all:
-
-```weft
-escalation = Group(question: String) -> (answer: String) {
-  _should_flow: route.needs_a_person
-  ...
-}
-```
-
-You can write the same gate from outside as `escalation._should_flow =
-route.needs_a_person`, or just give it true or false.
-
-A false or closed gate skips every child, including nested groups, and closes
-the group's outputs. The inspector records the skipped scope as the reason.
-Downstream, those closures behave like any other closure, so a step with
-another input to fall back on can still run.
-
-If one of the group's ordinary inputs closes, the group does not shut down. If
-`question` closes, that closure reaches the children wired to `self.question`,
-and a child that requires it skips while another child may carry on. The
-boundary does not insist on all its inputs before it lets any child work. If
-you want all or nothing, gate it with `_should_flow`.
-
-`@require_one_of` goes on a child, never on the group, and the compiler says
-so if you try. For what the directive does, go and read [needing one of
-several inputs](syntax.md#needing-one-of-several-inputs).
-
-## A group that hands nothing back
-
-The arrow is optional. A group whose job ends inside it, writing the row,
-sending the message, uploading the file, has nothing to hand its caller, so
-it takes inputs and stops there:
-
-```weft
-archive = Group(db: Access, ready: Number) {
-  # Write the finished order to the warehouse
-  ...
-}
-```
-
-It still works like any other group. Its `_should_flow` still turns the whole
-thing off, and the compiler still builds the same two boundary nodes, the
-outgoing one simply carrying nothing.
-
-A loop has the same shape with its own name, the side-effect loop, over in
-[Loops](./loops.md).
-
-## The description line
-
-A plain comment at the very start of a body becomes the group's description,
-with only whitespace allowed before it. The graph shows that text when the
-group is folded shut.
-
-In the example above it is "Remove whitespace around the message". Describe
-the result the caller wants, and leave the details to the steps inside.
-
-## Finding the first wrong value
-
-Say a support reply quotes the wrong price. Look at the outputs of
-`find_answer` and `review_reply`. If the price is already wrong coming out of
-`find_answer`, open that group and look at its children. If it was right
-there, the damage happened later.
-
-Keep going into nested groups until you reach the step that introduced it. The
-boundaries give you intermediate values to check, even in a program you did
-not write. For the editor controls, read [reading and building the
-graph](../start/reading-the-graph.md).
-
-## What actually runs
-
-Groups do not exist at run time. For what the compiler turns them into, go and
-read [How a weft program runs](mental-model.md).
-
-## Reusing a group from another file
-
-A file you want to reuse is written as one group with no name wrapped around
-the whole thing. Pull it in under a local name:
-
-```weft
-clean_text = @include("clean-text.weft")
-clean_text.raw = message.value
-```
-
-Its ports become `clean_text`'s ports, and you wire it like any node. The
-file is compiled once and each `@include` of it is a call, the same way a
-loop body is compiled once and every iteration runs it. For the file format
-and the path rules, read [files and reuse](files-and-reuse.md).
+A group counts as **one** item on its parent's level, whatever is inside it. So
+a program grows downward into nested folders rather than sideways into a wall,
+and every level stays something you can hold in your head.

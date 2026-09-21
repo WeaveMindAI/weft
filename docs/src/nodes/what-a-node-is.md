@@ -1,83 +1,115 @@
 # What a node is
 
-A node is a step you can drop in a weft graph. It might count words, call a
-model, or wait for somebody to reply. Its declaration says what it takes in and
-what it can send out, and its Rust does the work.
-
-You do not learn another language for the work itself. weft is a framework for
-the inside of a node, and a language for arranging nodes into a program.
-
-## Decide what the node is for first
-
-Say you are building a support assistant. Investigating the problem, checking
-the proposed answer, and sending it are three good nodes, because somebody
-might want to change the checker without touching the investigator, or put a
-person in front of the send.
-
-Inside the investigator, a loop reading fields off an API response is just
-Rust. It belongs in the graph when the person writing the program needs to wire
-it, look at its result, or swap it out.
-
-That is also what makes a node a job you can hand to an assistant: give it the
-inputs, the outputs, and a test or two, and it can build and check that on its
-own. The port types say how the piece fits back in. Your
-instructions and tests are the only thing saying what good work looks like.
-
-## The files
-
-A node lives under your project's `nodes/`:
+A folder with two files in it.
 
 ```text
-nodes/word_count/
-  metadata.json       name, inputs, outputs, how it looks in the editor
-  mod.rs              the Rust
-   tests.rs            its tests, if it has any
-   deps.toml           extra crates, if it needs any
+word_count/
+  metadata.json    what it takes and what it gives back
+  mod.rs           what it does
 ```
 
-![A node folder with metadata.json and mod.rs open in the editor](../img/node-files.png)
+The `metadata.json` is what makes the folder a node. Put one anywhere under
+your project's `nodes/` directory and weft finds it.
 
-The compiler reads `metadata.json` to check the graph without compiling any
-Rust, and pulls in the implementation of whatever you actually used when it
-builds the program.
+| File | Needed | What it is |
+|---|---|---|
+| `metadata.json` | Yes | The declared surface: ports, types, settings. Go and read [metadata.json](metadata.md) |
+| `mod.rs` | Yes, to run | The Rust: one `impl Node` |
+| `deps.toml` | No | Extra crates, system packages, build environment |
+| `tests.rs` | No | Its own tests. Go and read [testing a node](testing.md) |
+| `images/<name>/Dockerfile` | Infra nodes only | A container this node needs built |
 
-Several nodes can share helpers and dependencies in a package. For that, read
-[packaging](packaging.md).
+## A folder with metadata and no code
 
-## Inside
+That is not an error. weft finds it, reports it as pending, and leaves it out
+of the build. A program that never names it builds fine, and a program that
+does gets told which folder is waiting for its Rust.
 
-You implement the `Node` trait's `run`. It gets an `ExecutionContext`, called
-`ctx` everywhere, which is your inputs and everything weft provides.
+So writing the interface first and the body second is a supported way to work.
+It is also worth knowing when a node you are sure exists comes back as an
+unknown type: check whether its `mod.rs` is there.
 
-Read the inputs, do the work, emit through the ctx. Returning `Ok(())` just
-ends the body: it does not send anything back to the graph, so a word counter
-has to emit its number on its `count` output explicitly.
+## Packages
 
-A body can also stay alive and swap messages with other nodes. Ordinary outputs
-emit once per firing; generator ports emit a sequence. For those, read
-[streams and buses](streams-and-buses.md).
+Drop a `package.toml` in a folder and it becomes a package. Every subfolder
+holding a `metadata.json` is then one of its nodes, found automatically. There
+is no list to maintain.
 
-Two kinds of node have a second method:
+```text
+slack/
+  package.toml        [package] name = "slack", plus shared dependencies
+  api.rs              shared code, reached from a node as `super::api`
+  metadata.json       optional defaults every node here inherits
+  access/
+    metadata.json
+    mod.rs
+  send_message/
+    metadata.json
+    mod.rs
+```
 
-- A **trigger** implements `setup_trigger` to register what should start a run,
-  and its `run` handles each event that arrives. See
-  [writing a trigger](writing-triggers.md).
-- An **infrastructure node** implements `provision_infra` to describe the
-  service it needs, and weft has that running before it calls `run`. See
-  [infrastructure nodes](infrastructure.md).
+Package defaults merge key by key, and a node's own value wins. `type`, `label`
+and `description` can never be defaults, because they are one node's identity,
+and the compiler refuses a package file carrying any of them.
 
-## Use what is already there
+Two nodes with the same `type` fail loudly rather than one shadowing the other.
 
-A node that posts a message has to build the request and check the provider
-took it. Opening the account connection and signing the request is not its
-job, so use the ctx's client for that part.
+## The trait
 
-The same ctx gives you storage, durable waits and the rest. Before building one
-of those yourself, check [the ctx](the-ctx.md). If what you need is missing, propose it or bring it
-to [Discord](https://discord.com/invite/FGwNu6mDkU). For where that line sits,
-read [the commandments of plumbing](../thinking/plumbing.md).
+```rust
+#[async_trait]
+pub trait Node: NodeManifest + Send + Sync {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    // everything below has a default
+    fn node_type(&self) -> &'static str;
+    async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag) -> WeftResult<InfraSpec>;
+    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    fn tests(&self) -> Vec<NodeTest>;
+}
+```
 
-The compiler will catch a connection with the wrong type. It has no idea
-whether your word counter counts correctly. That is what the tests are for.
+`run` is the only one you have to write.
 
-Next, [write your first node](your-first-node.md).
+`provision_infra` and `setup_trigger` have defaults that fail loudly, naming
+your node, if your metadata said you implement them and you did not. So
+`requires_infra: true` without a `provision_infra` is an error you get told
+about, not a silent nothing.
+
+You never check which phase you are in. The engine reads your metadata and
+calls the right body. For a plain node that means `run` is called in every
+phase, including while a trigger is being set up, because a value feeding a
+trigger's settings has to be produced then too. For a trigger, `run` only fires
+on a real event, with the payload on `ctx.wake`.
+
+## How it gets into the binary
+
+There is no registration file. The compiler walks your `nodes/` folder, finds
+the metadata, and generates the lookup table. Adding a node is adding a folder.
+
+It only generates what your program references, and it emits one cargo crate
+per package, so editing one node recompiles that package and relinks rather
+than rebuilding everything.
+
+Your program's definition is not baked into the binary. The worker fetches it
+by hash at run time, which is why rewiring your graph without touching any Rust
+is a cache hit on the image.
+
+## The one macro
+
+```rust
+#[derive(NodeManifest)]
+pub struct TextNode;
+```
+
+That reads the `metadata.json` sitting beside your file and attaches it to your
+type. It reads the package defaults too, so what your code sees at run time is
+the same merged document the compiler saw.
+
+It checks at compile time that the file is there, is valid JSON, is an object,
+and has a string `type`. Editing the JSON rebuilds the crate.
+
+The struct's name is how it finds the file, so `TextNode` has to live in the
+same folder as its metadata. By convention the struct is the node's `type` with
+`Node` on the end.
+
+Next, [write one](your-first-node.md).

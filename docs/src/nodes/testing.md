@@ -1,224 +1,125 @@
 # Testing a node
 
-You can test a node's Rust body without building a graph or starting the weft
-runtime. Give it inputs, run it with a test context, and check what it emits.
-The tests live beside the implementation, so whoever changes the node can
-check it on its own.
+Tests live beside the node, in a `tests.rs` in its own folder.
 
-## Write a test
-
-For the `WordCount` from [Your first node](your-first-node.md), add this
-declaration to `nodes/word_count/mod.rs`, outside the trait implementation:
+`tests.rs`:
 
 ```rust
-#[cfg(feature = "node-tests")]
-mod tests;
-```
-
-Inside `impl Node for WordCountNode`, add:
-
-```rust
-#[cfg(feature = "node-tests")]
-fn tests(&self) -> Vec<weft::NodeTest> {
-    tests::tests()
-}
-```
-
-Keep the existing `run` method. The feature guard includes these tests in the
-test build and leaves them out of the program's normal build.
-
-Create `nodes/word_count/tests.rs`:
-
-```rust
-use serde_json::json;
-use weft::{FakeRig, NodeTest, WeftResult};
-use super::WordCountNode;
-
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("counts_whitespace_separated_words", counts_words)]
+    vec![NodeTest::fake("counts_words", counts_words)]
 }
 
 async fn counts_words(rig: FakeRig) -> WeftResult<()> {
-    for (text, expected) in [
-        ("hello from weft", 3),
-        ("  \n\t", 0),
-        ("one,two  three", 2),
-    ] {
-        let outcome = rig
-            .run(&WordCountNode, json!({ "text": text }))
-            .await
-            .ok()?;
-        assert_eq!(outcome.outputs["count"], json!(expected), "input: {text:?}");
-    }
+    let outcome = rig.run(&WordCountNode, json!({ "text": "one two three" })).await.ok()?;
+    assert_eq!(outcome.outputs["count"], json!(3.0));
     Ok(())
 }
 ```
 
-The cases pin down what "word" means: blank text has no words, repeated
-whitespace does not add words, and a comma does not split one.
+`mod.rs` bridges it in:
 
-Run it from the project root:
+```rust
+#[cfg(feature = "node-tests")]
+mod tests;
 
-```bash
-weft test-node WordCount --test counts_whitespace_separated_words
+#[async_trait]
+impl Node for WordCountNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+    // ...
+}
 ```
 
-![weft test-node reporting a passing node test](../img/node-test-output.png)
+There is no registry and no list to maintain. The runner walks the nodes the
+binary already has and asks each one for its tests.
 
-This compiles the test on your machine, so you need a Rust toolchain. It does
-not need the daemon. After changing the node, run all its tests with
-`weft test-node WordCount`.
+```bash
+weft test-node WordCount        # one node
+weft test-node slack            # one package
+weft test-node                  # everything
+```
 
-An assertion panic fails that test and appears in the report. Use assertions
-that catch the mistake you care about. A fake provider response can prove your
-parser handled that response; a live call checks whether the provider still
-speaks the protocol you expect.
+## Three tiers
 
-## Choose what the test exercises
-
-| Tier | Use it for | What runs |
+| Tier | What it gets | Costs |
 |---|---|---|
-| `basic` | A parser or other helper with no context | A Rust function and its assertions |
-| `fake` | The node body, including the requests it builds | The body with canned responses and in-memory services |
-| `live` | Checking the integration against a real provider | The body through the runtime's connection path |
+| `basic` | Nothing. A plain function testing your own logic | Nothing |
+| `fake` | Canned HTTP, in-memory storage, canned signals, fake connections | Nothing |
+| `live` | The real runtime: real connections, real calls, real metering | Real money |
 
-A basic test looks like
-`NodeTest::basic("parses_the_answer", || { /* assertions */ Ok(()) })`.
-Fake tests receive a `FakeRig`, as the word counter does. A live test declares
-the service it needs:
-`NodeTest::live("sends_a_message", "telegram", sends_a_message)`.
-Its function receives a `LiveRig`.
+Basic and fake run by default. **Live never runs unless you ask**, and the
+runner confirms before it does.
 
-Basic tests take a plain `fn` and fake tests take an async one, and the runner
-drives both inside tokio. So never build a runtime inside a basic test:
-`Runtime::new().block_on(...)` there panics with "Cannot start a runtime from
-within a runtime". Anything async, a bus included, goes on the fake tier. A
-fake test that never finishes fails by name after 30 seconds rather than
-stalling the suite, and the message names the usual cause: a cursor reading a
-bus nothing closes.
+Basic and fake compile and run right there with cargo, so no docker, no
+cluster, no daemon, and only the packages you targeted get built.
 
-If you want to check recovery or interactions between nodes, that mechanism
-has its own runtime test. For the distinction and the repository test
-commands, read
-[Contributing](https://github.com/WeaveMindAI/weft/blob/mvp/CONTRIBUTING.md#tests).
+Two things to know. A `basic` test is a plain sync function and the runner is
+already inside an async runtime, so building one inside it panics. And for a
+trigger or an infra node, `fake` is the top tier: the live rig drives a plain
+`run` body, so a live test on those is refused.
 
-## Fake provider calls and events
+A fake test that never finishes fails by name after 30 seconds, and tells you
+where to look:
 
-A fake test does not reach the real network. Before running a node that calls
-a service, register a response with the rig:
-
-```rust
-rig.respond("POST", "/api/send", json!({ "ok": true, "id": "m1" }));
+```text
+test 'reads the stream' did not finish within 30s. Something in it is waiting
+for what it never gets: a cursor reading a bus nothing closes, a caller nobody
+attaches, a signal nobody answers.
 ```
 
-Give the node `rig.access("myservice")` on its connection input. Calls through
-the context's HTTP clients are answered by the fake routes; unmatched requests
-fail. You can inspect the request with `rig.requests()` or assert that it
-happened with `rig.assert_sent("POST", "/api/send")`.
+## The fake rig
 
-The interception covers only the framework's clients. Arbitrary Rust that
-creates its own client is outside it, which is another reason to use the
-framework's clients in your node.
-
-| If the test needs… | Use |
+| You want | Call |
 |---|---|
-| An HTTP error response | `rig.respond_status(method, path, status, body)` |
-| A non-JSON body | `rig.respond_raw(method, path, status, content_type, bytes)` |
-| Stored connection values | `rig.connection_value(service, name, value)` |
-| Known granted scopes | `rig.connection_permissions(service, granted)` |
-| A durable wait's next payload | `rig.signal(payload)` |
-| An event delivered to a trigger's body | `rig.wake(payload)` |
-| The trigger registration method | `rig.run_setup_trigger(node, inputs)` |
-| An infrastructure declaration | `rig.run_provision_infra(node, inputs)` |
-| A file input | `rig.store_file(filename, mime, bytes)` |
-| A type normally resolved from the graph | `rig.output_type(port, type)` |
-| A bus to drive a node's bus INPUT | `rig.seed_bus(opts)`, which hands back the writer and the marker you pass in |
-| The bus a node EMITTED, behind its marker | `rig.bus(&outcome.outputs["port"])` |
+| Run the node | `rig.run(&node, json!({...}))` |
+| Run its trigger setup, or its infra | `rig.run_setup_trigger(...)`, `rig.run_provision_infra(...)` |
+| Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)` |
+| Check what it sent | `rig.requests()`, `rig.assert_sent(method, path)` |
+| A connection | `rig.access("slack")`, `rig.connection_value(...)`, `rig.connection_permissions(...)` |
+| A trigger's event | `rig.wake(payload)`, `rig.signal(payload)` |
+| A live caller | `rig.attach_caller(conn)` |
+| A bus going in | `rig.seed_bus(opts)`, giving you a writer and a marker |
+| A bus it emitted | `rig.bus(&outcome.outputs["channel"])` |
+| A stored file | `rig.store_file(filename, mime, bytes)`, `rig.stored_meta(key)` |
+| An infra endpoint | `rig.declare_endpoint(name, url)`, `rig.answer_endpoint(...)`, `rig.refuse_endpoint(...)` |
+| What it asked for | `rig.registered_signals()`, `rig.awaited_signals()`, `rig.logs()`, `rig.execution_tags()`, `rig.stops()` |
+| A port's type, for a node that takes added ports | `rig.output_type(port, ty)`, `rig.input_type(port, ty)` |
 
-Response matching tries the path with its query string first, then the bare
-path. The rig does not simulate redirects: register the final response
-directly. Declaring a 3xx response panics.
+The outcome gives you `.ok()` for the happy path, `.failure()` for the error
+string, `.output(port)` for one port, `.infra_spec()` for an infra run, and
+`.outputs` for the map.
 
-A `Generator[T]` input takes a JSON array; the rig presents its items as an
-already-finished stream.
+Note the last group: in a fake test nothing is really stopped and nothing is
+really tagged. The rig records what your node **asked for**, and that is what
+you assert on.
 
-You can inspect registrations with `rig.registered_signals()`, log entries
-with `rig.logs()`, and steering requests with `rig.execution_tags()` and
-`rig.stops()`. A fake stop records the request; it has no other executions to
-stop.
-
-Storage lives in memory. There is no durable journal, so `ctx.run` always
-runs its closure and saves nothing.
-
-## Run a live test deliberately
-
-Live tests use a real account and can create resources or incur provider
-charges. Use a test account and small inputs, and clean up the resources your
-test creates. If a message or email is the intended result, choose a recipient
-who expects it.
-
-A live test uses `rig.access(service)` and `rig.run` like the fake test. Use
-`rig.connect()` when the test itself needs a connection for setup or cleanup.
-Assertions should check the behavior you need without depending on an exact
-response that the provider is free to vary.
-
-To supply the account:
-
-- Connect it in the editor. The runner can use that stored connection. If
-  there are several, select one with `--connection service=grant-id`. A bare
-  grant ID also works when the selected tests need exactly one service.
-- For a key-based service, pass `--key service` to enter a temporary key. The
-  runner deletes the temporary connection afterwards. If cleanup fails, it
-  prints the command to remove it.
-- For an unattended run, set the credential fields as
-  `WEFT_NODE_TEST_<SERVICE>_<FIELD>`, such as `WEFT_NODE_TEST_EXA_KEY`. This
-  also uses a temporary connection.
-
-The CLI loads the nearest `.env` while walking up from the working directory.
-Keep files containing credentials out of Git.
-
-### Giving the live tier what it needs
-
-A live test may need something it cannot create, such as a destination chat.
-Declare that fixture on the test:
-
-```rust
-NodeTest::live("one_real_send", "telegram", live_send)
-    .with_fixture(weft::fixture_spec(
-        "TELEGRAM_CHAT_ID",
-        "Chat id",
-        "The chat the test sends into.",
-    ))
-```
-
-Read it inside the test with `rig.fixture("TELEGRAM_CHAT_ID")?`. Supply it as
-`WEFT_NODE_TEST_TELEGRAM_CHAT_ID`. The CLI checks required fixtures before
-launching the live tests and reports missing values together.
-
-If the fixture should use the same picker as a node input,
-`fixture_spec_like(manifest, input_name, fixture_name)` copies that input's
-declaration.
-
-## Select the tests to run
+## Live tests
 
 ```bash
-weft test-node WordCount
-weft test-node slack
-weft test-node SlackSendMessage --test posts_to_a_channel_and_emits_the_permalink
-weft test-node web --tier live
-weft test-node web --tier fake --tier live
+weft test-node SlackSendMessage --tier live
 ```
 
-Without `--tier`, the runner selects basic and fake. Supplying `--tier`
-replaces that default, so `--tier live` runs only live tests. Repeat the
-option when you want several tiers.
+The runner tells you it will spend money and asks. `--yes` skips that, and it
+can remember your answer.
 
-Live runs ask for confirmation unless you have saved the preference to skip it
-or pass `--yes` for that invocation. Test bodies should get their inputs from
-fixtures or setup code; they should not prompt the person running them.
+For credentials, `--connection slack=<grant-id>` uses one you already have, and
+`--key slack` takes a throwaway one: each field comes from
+`WEFT_NODE_TEST_SLACK_<FIELD>` if it is set, or a prompt, never from the
+command line where other processes can read it. The grant is deleted
+afterwards.
 
-Use `--parallel N` to limit concurrent tests to `N`. Bare `--parallel` removes
-the concurrency limit. Local packages still run one at a time; tests within
-the package can run together. Reports keep declaration order. If you omit the
-target entirely, the command selects all test-declaring packages in the
-project's catalog.
+Every prompt happens before any credential exists and before any signal handler
+is armed, so Ctrl+C at a prompt leaks nothing.
+
+`--fixture` values, declared with `.with_fixture(...)` on a live test, are how
+a test names the real thing it needs: a channel it may post in, an account it
+may read. Read them with `rig.fixture("NAME")`.
+
+## What to write
+
+Ship a `fake` test for every node. If it talks to a provider, ship a `live` one
+on the cheapest real path you can find.
+
+A panic fails that test, carrying its message, and never takes the runner down.

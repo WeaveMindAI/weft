@@ -337,6 +337,10 @@ money or with work, will be added to [THANKS.md](THANKS.md). I will remove this
 as soon as we are self-sustainable. If you have experience founding a similar
 open source project, please reach out!
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=WeaveMindAI/weft&type=date&legend=top-left)](https://www.star-history.com/?repos=WeaveMindAI%2Fweft&type=date&legend=top-left)
+
 ## License
 
 Copyright © 2026, WeaveMind, Inc. Weft uses the [O'Saasy License](LICENSE).

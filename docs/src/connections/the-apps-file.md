@@ -1,95 +1,137 @@
 # The apps file
 
-`access-apps.json` is where an operator puts the apps and API keys their
-installation offers as shared connections. Whatever is in there shows up in
-everyone's connection panel.
+`access-apps.json` is where the operator puts the applications and keys this
+installation offers as one-click connections. Whatever is in it shows up in
+everybody's connect panel.
 
-It maps a service name to a list of credentials. A runtime OpenRouter key:
+Start from the example and keep what you want:
+
+```bash
+cp access-apps.example.json access-apps.json
+```
+
+Fill in the services you expect to use often. A service you set up here is one
+click forever after, and one you skip asks each person to bring their own the
+first time they need it, which is fine for something you touch once.
+
+## The shape
+
+A service name maps to a **list**, always, even with one entry. Keys starting
+with `_` are ignored, which is how the example file carries its own notes.
 
 ```json
 {
   "openrouter": [{
     "kind": "api_key",
     "label": "Runtime key",
-    "key": "REPLACE_WITH_YOUR_KEY"
+    "key": "sk-or-..."
   }]
 }
 ```
 
-Keep the file private: calls on that key spend money on its account. For what
-weft records about that, read [measuring what a call costs](meters.md).
+### A pasted key
 
-Start the daemon from the directory holding the file, or point at it:
+| Key | What it is |
+|---|---|
+| `kind` | `"api_key"` |
+| `label` | The name the connection list shows |
+| `key` | The credential. At most one `api_key` per service |
+
+This is what "use ours" hands out. Calls on it spend money on that account, so
+keep the file private.
+
+### An OAuth application
+
+```json
+{
+  "slack": [{
+    "kind": "oauth_app",
+    "label": "Slack",
+    "covers": ["chat:write", "channels:read", "channels:history"],
+    "auth_url": "https://slack.com/oauth/v2/authorize",
+    "token_url": "https://slack.com/api/oauth.v2.access",
+    "client_id": "...",
+    "client_secret": "...",
+    "events": { "signing_secret": "..." }
+  }]
+}
+```
+
+| Key | What it is |
+|---|---|
+| `label` | Unique within the service |
+| `covers` | Exactly the permissions this app asks for, by their ids from the service's catalogue |
+| `auth_url`, `token_url` | The provider addresses this app signs in against, copied from the recipe |
+| `client_id`, `client_secret` | From the provider. `client_secret` is absent for a public PKCE app |
+| `events` | Only if this app receives pushes. Whatever the recipe needs to verify them, like a signing secret |
+
+**Permissions are fixed per app.** People pick an application rather than
+ticking boxes, which is why you can list several for one service: a cheap tier
+that avoids a provider's review process, and a fuller one beside it. Each shows
+up as its own labelled choice with its permissions listed.
+
+The addresses are pinned here, and a recipe that tries to substitute a
+different sign-in address is refused. A connection through a registered app
+only ever talks to the addresses you wrote.
+
+You also have to register the callback URL the connect panel shows you as the
+app's redirect URL, and re-register it whenever your public address changes.
+Some providers, Slack among them, only accept https callbacks.
+
+## Making it take effect
+
+The installer hands the file to the runtime, so `./setup.sh` picks it up. After
+that:
 
 ```bash
-export WEFT_ACCESS_APPS_FILE='/path/to/access-apps.json'
 weft daemon start
 ```
 
-The daemon copies it into the cluster, so an edit only takes effect after
-another `weft daemon start`. Nothing reads your local disk at run time.
+That re-applies it and restarts the piece holding it, in a few seconds.
 
-For more services, start from
-[access-apps.example.json](https://github.com/WeaveMindAI/weft/blob/mvp/access-apps.example.json)
-and keep the entries you want. If there is no file and no
-`WEFT_ACCESS_APPS_FILE`, you simply have no operator-configured apps.
+If the file is gone, the runtime keeps the keys it already has and tells you
+so. To actually empty them, `weft daemon start --clear-access-apps`.
 
-## OAuth apps
+Nothing reads your local disk at run time. The file is copied in, so an edit
+does nothing until you re-apply it.
 
-An `oauth_app` entry is the application users grant access to. It needs a
-`label`, a `client_id`, a `client_secret` if there is one, and a pinned
-`token_url`. Browser-consent apps need a pinned `auth_url` too.
-
-Its `covers` list is the permission set weft asks for, and a recipe that tries
-to substitute a different sign-in address is refused.
-
-You can configure several apps for one service. Each shows up as its own
-labelled choice with its permissions listed, so people can pick the one that
-suits what their program does.
-
-If the app receives webhooks, its `events` block carries whatever the recipe
-needs to verify them, such as a signing secret. For that side, read
-[events from a service](events.md).
+To keep it somewhere else, point `WEFT_ACCESS_APPS_FILE` at it. A file named
+that way and unreadable is a hard error rather than a silent nothing, because
+shipping no apps quietly shows up later as a service nobody can connect on a
+node the operator thought was configured.
 
 ## What it refuses
 
-Every service value has to be a list, even with one entry. Every entry needs a
-`kind` and a label that is unique within that service, and there can be only
-one `api_key` per service.
+- A service whose value is not a list
+- An entry with no `kind`
+- Two entries with the same label in one service
+- More than one `api_key` for a service
+- An OAuth app with no `covers`
+- A permission in `covers` that the service's catalogue does not have
+- An `events` block on a service with no webhook transport
+- Invalid JSON, or a file you configured that is not there
 
-An OAuth app has to declare `covers`, and an empty list means it asks for
-nothing. Those entries are checked against the service's permission catalog.
-An `events` block on a service with no webhook transport is refused. So are
-invalid JSON and a configured file that is not there.
+## Apps a node ships
 
-![The apps check command's output](../img/apps-check.png)
+A node's own `metadata.json` can declare `accessApps` for public applications
+with no secret. Those need PKCE, and metadata carrying a `client_secret` is
+refused: node metadata is source, and source never holds secrets.
 
-## Apps that ship with a step
-
-Step metadata can declare `accessApps`, including through package defaults.
-That is for public OAuth apps with no client secret; metadata carrying a
-`client_secret` is rejected. Browser consent uses PKCE according to the
-recipe's `pkce` setting, which is on unless it says otherwise.
+An application with a secret belongs in this file.
 
 ## Encryption
 
-Stored secrets are encrypted with `CREDENTIAL_ENCRYPTION_KEY`, which is 32
+Everything stored is sealed under `CREDENTIAL_ENCRYPTION_KEY`, which is 32
 bytes in base64:
 
 ```bash
 openssl rand -base64 32
 ```
 
-Keep it somewhere safe and supply it every time you start the daemon:
-
-```bash
-export CREDENTIAL_ENCRYPTION_KEY='paste-the-generated-key'
-weft daemon start
-```
-
-Without one, weft uses a public development key and warns you. It protects a
+Set it before you store a credential you care about. Without it weft uses a
+public development key from its own source and warns you once, which protects a
 database dump from nobody.
 
-Changing the key does not re-encrypt what is already stored. Those records
-simply fail to open under the new key, and putting the old one back reads them
-again. Lose it and you reconnect the accounts. There is no rotation procedure.
+Keep it. There is no rotation: change the key and everything sealed under the
+old one is unreadable until you put it back. Lose it and you reconnect
+everything.

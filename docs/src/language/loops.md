@@ -1,240 +1,118 @@
 # Loops
 
-A `Loop` runs what is inside it once for each item in a list or a stream. It
-can also just keep going until something inside says stop.
+A loop runs what is inside it once per item of a list, or until the body says
+stop.
 
 ```weft
-double = Loop(values: List[Number]) -> (results: List[Number | Null]) {
-  over: ["values"]
+grade = Loop(cards: List[JsonDict], rubric: String) -> (scores: List[Number | Null]) {
+  over: ["cards"]
 
-  step = ExecPython(n: Number) -> (out: Number) {
-    n: self.values
-    code: "return {'out': n * 2}"
+  mark = LlmInference -> (response: String) {
+    prompt: self.rubric
+    ...
   }
-  self.results = step.out
+  self.scores = Cast { value: mark.response }.value
 }
-double.values = [1, 2, 3]
-show = Debug { data: double.results }
+grade.cards = pull.rows
 ```
 
-Outside the loop, `values` is a list. Inside, `self.values` is whichever number
-this iteration got. `self.results` takes one result per iteration, and
-`double.results` hands back the gathered list, `[2, 4, 6]`.
+Like a group, a loop is gone before anything runs. The compiler turns it into a
+pair of boundary nodes and the runtime drives the iterations.
 
-Two kinds of line are written for a loop, and they do not mix. The settings in
-the braces (`parallel`, `over`, `carry`, `max_iters`, `trim_on_mismatch`) take
-a written value only: the compiler reads them to build the loop, so nothing
-can drive one over a wire. The loop's ports take a value the way a group's
-do, on their own lines outside (`double.values = [1, 2, 3]` above). The one port
-that may also sit in the braces is the gate, `_should_flow: false`, exactly as
-on a group.
+## The five settings
 
-## When the next iteration starts
+They go in the body as ordinary lines. Anything else starting with a letter is
+a node, and anything else that looks like a setting is a hard error, because a
+typo like `max_itres: 10` silently running your loop uncapped is exactly what
+the language refuses to allow.
 
-Loops go one at a time unless you say otherwise. The next iteration starts once
-this one's connections to the output boundary have settled, which in the
-example above means `step.out` has produced something or closed.
-
-Other work inside the body can still be going. If a step emits its result and
-then carries on doing something, the loop moves on while that is still running.
-A branch with no connection to a loop output holds nothing up.
-
-So if you need an action to actually finish first, wire an output that the
-action emits *after* it finishes into a loop output or into `self.done`.
-Sequential on its own does not make work in a disconnected branch wait.
-
-Set `parallel: true` to launch the iterations together. Gathered results still
-come back in input order even when later ones finish first. There is no setting
-for how many may run at once; `max_iters` caps the total launched, not the
-width.
+| Setting | Default | What it does |
+|---|---|---|
+| `over: ["cards"]` | `[]` | Which inputs to iterate. Each has to be a `List[T]` or a `Generator[T]` |
+| `carry: ["total"]` | `[]` | Values threaded from one iteration to the next |
+| `parallel: true` | `false` | Launch every iteration at once, rather than one at a time |
+| `max_iters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
+| `trim_on_mismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
 
 ## The four kinds of port
 
-What a port does depends on the signature plus the `over` and `carry` lists:
+Which kind a port is depends on where it is and whether you named it.
 
-| Port | Outside the loop | Inside the body |
+| Kind | Outside the loop | Inside the loop |
 |---|---|---|
-| Input named in `over` | `List[T]` or `Generator[T]` | The current item, a `T` |
-| Any other input | Its declared type | The same value, every iteration |
-| Output named in `carry` | Seed goes in, final value comes out, same type | Read the previous value, write the next |
-| Any other output | `List[T \| Null]` | Write one `T` for this iteration |
+| **Iterated**, named in `over` | `List[T]` or `Generator[T]` | One `T`, a different one each iteration |
+| **Broadcast**, any other input | `T` | The same `T`, every iteration |
+| **Gathered**, any output not in `carry` | `List[T \| Null]`, one slot per iteration | You write one `T` per iteration |
+| **Carried**, named in `carry` | The seed goes in, the final value comes out | The running value in, the new one out |
 
-That last row is a **gather**. Each iteration gets a slot, in index order, and a
-wired output that closes leaves `null` in its slot. So the signature has to
-allow `Null`, or you get `gather-output-must-be-nullable`.
+A gathered output **has** to allow null, because an iteration that failed
+leaves an empty slot. That is the `gather-output-must-be-nullable` error.
 
-![The loop inspector showing each iteration](../img/loop-iterations.png)
+The list that comes out is built for every gathered port, even one that no
+iteration ever wrote, because a port that produces nothing at all would leave
+whatever is downstream waiting forever.
 
-The loop also gives you `self.index`, the iteration number counting from zero,
-and `self.done`, which you write into to stop a sequential loop. Do not declare
-an input called `index` or an output called `done` yourself.
+A carried value that an iteration does not write keeps what it had. If you do
+not wire a seed, it starts at the zero for its type: `0` for a number, `""` for
+a string, `[]` for a list.
 
-## Carrying a value between iterations
+## Two implicit ports
 
-Name an output in `carry` and it becomes an accumulator. The compiler makes a
-matching input for the starting value:
+`self.index` is a `Number`, readable inside, and it is which iteration you are
+in, counting from zero.
 
-```weft
-sum = Loop(values: List[Number]) -> (total: Number) {
-  over: ["values"]
-  carry: ["total"]
+`self.done` is a `Boolean` you can write inside, and it is how the body votes
+to stop.
 
-  add = ExecPython(n: Number, previous: Number) -> (next: Number) {
-    n: self.values
-    previous: self.total
-    code: "return {'next': previous + n}"
-  }
-  self.total = add.next
-}
-sum.values = [1, 2, 3]
-sum.total = 0
-show = Debug { data: sum.total }
-```
+Both only appear if you did not declare a port of that name yourself. And
+`index` as an input name, or `done` as an output name, is the
+`reserved-port-name` error.
 
-`self.total` sees `0`, then `1`, then `3` across the three iterations, and
-`sum.total` hands back `6`. A carry is a single value, so it does not need the list type a gather
-does. Carry only works in sequential mode.
+## One at a time, or all at once
 
-If a carry write closes, the previous value stays. The seed input the compiler
-makes is required, so a closed seed skips the whole loop; you can declare that
-seed optional yourself, and an absent optional seed uses the type's zero value,
-`0` or `""` or `[]`.
+Sequential is the default. Each iteration finishes before the next launches,
+which is what makes `carry` possible: the next iteration reads the value the
+last one wrote.
 
-A `null` seed gets replaced by that zero value too. Actual `null` writes later
-on stay as values if the carry type allows them, and they are not the same as a
-closed write.
+`parallel: true` launches every iteration up front. Three things it refuses:
 
-## Stopping from inside
+- **with `carry`**, because carrying means each turn feeds the next, and that
+  is sequential by definition
+- **without `over`**, because there is nothing to spread out
+- **with `self.done`**, because a vote to stop means nothing when everything
+  already started
 
-Write a true or false value into `self.done`:
+## How a loop ends
 
-```weft
-attempts = Loop() -> (last: Number) {
-  carry: ["last"]
-  max_iters: 10
+- It runs out of items in `over`.
+- It hits `max_iters`.
+- The body writes `self.done = true`, on a sequential loop.
 
-  step = ExecPython(previous: Number) -> (next: Number, finished: Boolean) {
-    previous: self.last
-    code: "n = previous + 1; return {'next': n, 'finished': n >= 3}"
-  }
-  self.last = step.next
-  self.done = step.finished
-}
-attempts.last = 0
-show = Debug { data: attempts.last }
-```
+A sequential loop with none of those is the
+`loop-unbounded-no-termination` error, refused at compile time rather than
+left to run forever.
 
-That stops after the third iteration and gives back `3`. A `true` stops another
-iteration starting. `false`, nothing at all, or a closed wire all mean carry on.
+With several `over` lists of different lengths, the default trims to the
+shortest. Set `trim_on_mismatch: false` and a mismatch fails the run instead,
+naming the lengths.
 
-A sequential loop needs something that can end it: a list in `over` to run out
-of, a `max_iters` cap, or a wire into `self.done`. The compiler checks one of
-those exists. It cannot check that your condition will ever come true.
+## When an iteration fails
 
-`max_iters` runs from `0` up to `4294967295`. The compiler currently accepts
-bigger integers than that and they fail at run time. A cap of zero launches
-nothing, and so does an empty input list; both give you empty gather lists and
-the carry values you started with.
+The run carries on. That iteration's slot in every gathered list is `null`, and
+a carried value keeps what it had.
 
-## Several lists at once
+So a loop over a hundred rows where three fail gives you a hundred slots with
+three nulls in them, rather than nothing at all. Whatever reads that list
+decides what a null means.
 
-Put more than one list input in `over` and they are read together:
+## What cannot go in one
 
-```text
-over: ["names", "ages"]
-```
+A trigger and an infra node are both refused inside a loop, with
+`trigger-in-loop` and `infra-in-loop`. A trigger registers once for the
+project, and infrastructure is provisioned once for the project, so a
+per-iteration one is not a thing.
 
-Iteration zero gets `names[0]` and `ages[0]`, iteration one gets the next pair,
-and so on. It stops at the shortest list unless you set
-`trim_on_mismatch: false`, which makes different lengths a failure instead.
+## Cutting a run inside one
 
-An input left out of `over` is available unchanged in every iteration, which is
-what you want for a prompt or a service connection.
-
-## Looping over a stream
-
-Declare a `Generator[T]` input and name it in `over`. `Range`, for instance,
-emits a `Generator[Number]` that can feed a loop one number at a time.
-
-A sequential stream loop takes the next item when the previous iteration
-reaches the output boundary. A parallel one launches an iteration per arriving
-item. The end of the stream replaces running out of list as the normal way to
-stop, and an empty stream is fine.
-
-Only one stream can be in `over`, and it has to be the only thing there. A
-generator cannot be a shared input handed to every iteration. If the producer
-fails, the loop fails.
-
-If the loop stops early while the producer is waiting for an item to be taken,
-that delivery fails. For coordinating an early stop, read
-[the stream termination rules](live-channels.md#stopping-early-can-fail-the-run).
-
-## Results can leave before the body is done
-
-A loop can hand back its gathered results while work it started is still
-running. Each iteration might start an agent that emits a `Bus` handle and then
-waits for messages: the loop gathers those handles into `List[Bus | Null]`, and
-a coordinator outside talks to the agents.
-
-```mermaid
-flowchart LR
-    loop["Loop over agent prompts"] --> handles["Gathered bus handles"]
-    handles --> coordinator["Coordinator"]
-    loop -.-> agentA["Agent 0 still running"]
-    loop -.-> agentB["Agent 1 still running"]
-    coordinator <-.->|bus| agentA
-    coordinator <-.->|bus| agentB
-```
-
-The loop waits for its iterations to settle their output-boundary connections
-and no further. It does not kill what they left running, and the run as a whole
-still waits for that work. If the next iteration depends on the current one
-finishing, wire a completion output.
-
-### Unconnected outputs currently fail
-
-A loop with nothing connected to its output boundary can start that boundary
-with the wrong iteration context. At the top level the error reads
-`LoopOut ... fired with empty frame stack`. A declared gather or carry input
-left unwired can also fail with `neither closed nor present in input bag`, even
-when another boundary input is wired.
-
-So wire every declared output from something in the body. For a loop that only
-exists for a side effect, wire a boolean completion output into `self.done`,
-where `false` carries on and `true` stops. These are current limitations rather
-than the ordinary business of a branch closing.
-
-## Skips and failures
-
-`_should_flow` gates a loop the same way it
-[gates a group](groups.md#turning-a-whole-group-off). A closed required list
-input or carry seed also skips it. A closed ordinary shared input reaches the
-body, where each child decides for itself.
-
-A failed branch can close a gather write, leaving `null` in that slot. The
-failure is still in the run, and the null does not turn it into a success.
-Closed carry writes keep the previous value, and closed done writes do not stop
-anything.
-
-The compiler rejects these outright:
-
-| What you wrote | The complaint |
-|---|---|
-| Parallel with a carry | `parallel-with-carry` |
-| Parallel with a done connection | `parallel-with-done` |
-| Parallel with no `over` input | `parallel-without-over` |
-| A port in both `over` and `carry` | `over-and-carry-overlap` |
-| Nothing that could ever end it | `loop-unbounded-no-termination` |
-
-Unknown configuration keys and wrong value types are errors too. The full list
-is in [diagnostics](diagnostics.md).
-
-## Nested loops
-
-The compiler makes one set of body steps. weft tells iterations apart by their
-position in the nested loop stack, so values from separate iterations stay
-separate without copying the graph.
-
-It still tracks what was launched, what has been gathered, the carry state and
-the termination. An outer loop emitting outwards does not cancel a nested loop
-that is still working.
+You cannot. `weft run --target` stops at a loop's edge and brings the whole
+loop along, because half an iteration is not a state the runtime has.

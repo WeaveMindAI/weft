@@ -1,188 +1,141 @@
 # Streams and buses in Rust
 
-If you want your node to send items while it is still working, emit them on a
-`Generator[T]` output. If you want it to swap messages with other running
-nodes, open a bus. For choosing between the two when connecting nodes, read
-[Live channels](../language/live-channels.md).
+For which of the two you want, go and read
+[streams and buses](../language/streams-and-buses.md). This is the Rust on both
+sides.
 
 ## Producing a stream
 
-A `Generator[T]` output accepts repeated emissions. Emit items with the call
-you already use, keep your state in ordinary local variables, and the stream
-ends when your body returns.
+Declare a `Generator[T]` output, then emit as many times as you like:
 
 ```rust
-// metadata.json: { "name": "rows", "type": "Generator[Row]" }
-
-for row in read_rows(&file) {
-    if keep(&row) {
-        ctx.yield_downstream(
-            NodeOutput::new().set("rows",
-                serde_json::to_value(row).node_err("encoding the row")?)
-        ).await?;
-    }
+for chunk in response_chunks {
+    ctx.pulse_downstream(NodeOutput::new().set("chunk", chunk)).await?;
 }
-// body returns: the engine closes the stream
 ```
 
-If your body returns an error instead, the stream closes as **failed**, and
-the consumer's pull gets your error rather than a clean end.
+Each emission is one item, checked against the element type. When your body
+returns, the port closes and that is the end of the stream. To end it early,
+`ctx.close_port("chunk")`. After a close, nothing can follow.
 
-![An LLM answer arriving one chunk at a time](../img/llm-stream.gif)
+`pulse_downstream` sends and carries on. If you are producing faster than the
+consumer reads, use `yield_downstream`, which waits until each item is taken.
 
-### Yield or pulse
-
-```rust
-ctx.yield_downstream(output).await?;    // returns once the item was pulled
-ctx.pulse_downstream(output).await?;    // returns immediately, item buffers
-```
-
-`yield_downstream` is lock step. Your body waits on each item until the
-consumer takes it, so a producer yielding one item at a time keeps at most
-one untaken item per connection. Taking an item does not confirm that the
-consumer processed it successfully.
-
-`pulse_downstream` lets the producer continue while items wait for the
-consumer. Each connection buffers up to 4096 untaken items by default;
-exceeding that limit fails the producer.
-
-If your producer needs to buffer more than 4096 items, raise its limit:
-
-```rust
-ctx.set_max_buffered_items("rows", 100_000)?;
-```
-
-Call this on a `Generator` output before or between emissions. The limit
-must be greater than zero and applies to subsequent emissions.
-
-### Which one to use
-
-Ask what should happen if the consumer stops early.
-
-With `pulse_downstream`, queued items are dropped when the consumer finishes.
-Use it when the consumer may abandon the remaining items; the producer keeps
-going.
-
-A yielded item whose consumer finishes without taking it **fails your body**,
-which is what you want when your producer must know its items landed.
-
-### Ending early
-
-To end the stream before your body returns, call
-`ctx.close_port("rows").await?`, even if you have emitted no items. For closing
-other outputs, read [Explicit closure](values-and-emission.md#explicit-closure).
+If you do neither and run far ahead, you hit the cap at 4096 un-taken items and
+the emit fails, telling you the three ways out: yield instead of pulse, let the
+consumer catch up, or `ctx.set_max_buffered_items("chunk", n)`.
 
 ## Consuming a stream
 
-The consumer reads the stream from the input bag. It runs once, after all
-its wired inputs are ready. The stream supplies either its first item or
-its closure; the consumer pulls subsequent items itself.
+Read the port like any input, then pull:
 
 ```rust
-let rows = ctx.inputs.get::<Generator<Row>>("rows")?;
+let rows: Generator<Row> = ctx.inputs.get("rows")?;
+
 while let Some(row) = rows.next().await? {
-    // one item at a time
+    // one row at a time
 }
 ```
 
-On the handle:
+Your body starts when the first item arrives, so you are running while the
+producer is still producing.
 
-| Call | Answers |
-|---|---|
-| `next()` | Waits for the next item; returns `Some(item)`, `None` when the stream ends cleanly, or an error if it fails |
-| `try_next()` | Returns `TryNext::Item(item)`, `TryNext::Empty` while open with no buffered item, or `TryNext::Finished`; returns an error if the stream fails |
-| `drain()` | The whole stream as a `Vec`, erroring on a failed end rather than handing back a truncated list |
-| `end()` | `None` while open; otherwise `Finished` or `Failed(error)`, even if buffered items remain to be read |
+`next()` waits for the next item and gives you `None` once, at a clean end.
+`try_next()` is the same without waiting, answering `Item`, `Empty` or
+`Finished`. `drain()` takes the lot and waits for the end. `end()` tells you
+whether the producer finished or failed, or `None` while it is still open.
 
-A pull can also become impossible to satisfy, when every remaining node is
-waiting on one of the others. The engine's stuck check spots that and fails the
-stream, so it reaches you through `?` like any producer failure rather than
-hanging.
+The `?` matters. If the producer failed, that is where you find out, rather
+than getting a clean end you would mistake for an empty stream. `drain` errors
+without handing back the partial list, for the same reason.
 
-An **empty stream still runs your node**. A producer that closes without
-yielding delivers a stream whose first `next()` answers `None`, so your
-post-loop code runs the same over zero rows as over one.
+Reading the port twice gives you two handles over one stream, sharing a
+position, not two copies.
 
-To wait until an ordinary port's consumer starts, read
-[Waiting for the value to be taken](values-and-emission.md#waiting-for-the-value-to-be-taken).
+**Your node cannot durably suspend.** A stream cannot be replayed, so
+`ctx.await_signal` in a stream consumer is refused. Do the waiting upstream or
+downstream.
 
-## Buses
-
-One node creates the channel and emits its marker; others resolve the marker
-and exchange messages.
+## Hosting a bus
 
 ```rust
-// Producer. The returned guard closes the bus when dropped.
 let bus = ctx.open_bus("channel", BusOptions::default(), "host").await?;
-bus.wait_for("guest").await.node_err("waiting for guest")?;
-bus.send("msg", json!("hello")).node_err("sending on the bus")?;
-drop(bus);   // the close IS the end-of-stream signal
+bus.send(MessageKind::Json, json!({ "text": "hello" }))?;
+```
 
-// Consumer that participates: registers, and closes on exit.
-let bus = ctx.join_bus("channel", "guest")?;
+`open_bus` does the whole producer move: makes the bus, emits the marker on
+that port, and registers your name. The guard closes the bus when it drops, so
+every way out of your function, including a panic, ends the channel instead of
+leaving readers parked forever.
+
+## Joining one
+
+```rust
+let bus = ctx.join_bus("channel", "translator")?;
+bus.wait_for("host")?;
+
 let mut cursor = bus.cursor();
-while let Some((from, value)) =
-    cursor.next_json("msg").await.node_err("reading the bus")? {
+while let Some(msg) = cursor.next().await {
     // ...
 }
-
-// Observer that must NOT close the bus (a debug tap).
-let bus = ctx.bus_from_input("channel")?;
 ```
 
-`open_bus` creates the bus, registers the host and emits its handle.
-The host waits for the guest to register before sending the message.
-Without that wait, the message could be sent before the guest is listening.
+`join_bus` resolves the bus on that input and registers your name, with the
+same close-on-drop guard.
 
-Both `open_bus` and `join_bus` return a guard that closes the whole bus when
-dropped, including when the node exits with an error. Use `bus_from_input`
-for an observer whose departure should not end the conversation.
+For an observer that must **not** close the bus, a debug tap that comes and
+goes, use `ctx.bus_from_input("channel")` instead.
 
-### Where reading starts
+Registering is the "I am here and ready" moment. A node with a slow warmup
+should hold the bus and register when it is genuinely ready, because that is
+what everybody else's `wait_for` is waiting on.
 
-A registered participant's `cursor()` starts at its own join event, so it
-can read messages sent after joining even if it creates the cursor later.
-An observer's `cursor()` starts at the current end of the bus.
+Each reader has its own cursor. Reading does not consume, so ten readers all
+see everything.
 
-Use `cursor_from_start()` to read from the earliest retained entry, or
-`cursor_at(offset)` for a specific absolute position. Neither retrieves
-evicted messages from the journal. In both journaled and ephemeral mode,
-a reader behind the retained window skips to the oldest entry still in
-memory.
+`wait_for(name)` parks until that name is live, or returns an error if the bus
+closed first. You never have to decide whether a name will ever turn up: the
+engine watches the run, and when a wait can no longer be satisfied it closes
+the bus and every waiting cursor wakes.
 
-### `BusOptions`
+## Choosing options
 
-Declare these when creating the bus. Consumers read its settings through
-the resolved handle.
+```rust
+BusOptions::default()
+    .ephemeral(true)
+    .window(256)
+    .payload(BusPayload::Bytes)
+```
 
-| Option | Meaning |
-|---|---|
-| `payload` | JSON values (the default) for chat-shaped traffic, or raw bytes for media frames, raw end to end with no base64 between nodes |
-| `meta` | creator-declared stream metadata, such as sample rate and encoding, read via `bus.meta()` |
-| `ephemeral` | keeps payloads out of the journal; metadata is still recorded |
-| `window` | target number of retained messages, 64 by default; journaled messages awaiting persistence can exceed it |
-| `journal_window` | Groups messages into journal rows over this interval; defaults to one second |
+| Option | Default | What it decides |
+|---|---|---|
+| `ephemeral` | `false` | Whether payloads are recorded, or only counts |
+| `window` | 64 messages | How far back a reader can reach |
+| `payload` | JSON | JSON or bytes. Frozen at creation; sending the other shape is refused |
+| `journal_window` | 1 second | How often the record is written |
+| `meta` | nothing | Details every reader can read off the marker: a sample rate, dimensions. Keep it small, it rides the marker |
 
-Choose JSON or bytes when creating the bus; sending the other kind returns
-an error. `journal_window` controls how messages are grouped for storage.
-For the contents of those journal rows, read
-[The journal](../running/the-journal.md#what-is-in-it).
+Ephemeral is for a firehose. Video frames should not stall because a reader is
+slow, and should not end up in permanent storage either. A slow reader on an
+ephemeral bus silently skips to the oldest message still held, because there is
+no backpressure: the camera does not wait.
 
-These last three, the mode, the window and the aggregation, are the same
-decision a live caller conversation makes, answered by the same code, so a
-bus and a route cannot disagree about where a payload gets trimmed or about
-what ephemeral means. If you change one, you have changed both.
+On a journaled bus, a send is refused if the record cannot be written, before
+anything is appended. On an ephemeral one it never is, because its record is
+notes rather than the data.
 
-## Keep bus work on your own task
+In both, who joined and who left is always kept, so nothing a reader needs can
+hide in a gap.
 
-Keep bus reads and waits directly in your node body. Do not move a bus handle or
-cursor into a `tokio::spawn`ed background task.
+## What a send tells you
 
-The engine detects stuck conversations by tracking whether each node is
-waiting or working. A background task using the same handle reports its
-waits as belonging to your node. The engine can then mistake a waiting
-background task for a waiting node and close a conversation while the node
-is still working.
+Failures are values, never silent drops: the bus was closed, you never
+registered, you sent the wrong payload shape, or the record is degraded.
 
-If you need concurrent work, model it as another node and exchange with it over
-the bus.
+## The one thing to remember
+
+A bus lives exactly as long as its worker. It is not rebuilt when a worker
+restarts, and a marker resolved afterwards fails saying the bus is unknown.
+
+It is for nodes that are alive together right now. Anything that has to survive
+goes in [storage](storage.md), or through a step that ends.

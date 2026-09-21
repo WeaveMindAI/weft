@@ -1,83 +1,92 @@
 # Files at run time
 
-A picture a program made can still be there in an old run months later, or it
-can be gone in five minutes. Which one depends on where the step put it and
-whether anything asked to keep it.
+A value on a wire is capped at 100 KB, so anything bigger is stored and what
+travels is a marker saying where it is.
 
-## Find one
+This page is about the files a running program leaves behind and what to do
+with them. For putting one there from a node, go and read
+[storage](../nodes/storage.md).
+
+## Where they live
+
+| Space | Holds | Gone when |
+|---|---|---|
+| Execution | What one run made | Five minutes after the run ends, so its output is still downloadable, unless something kept it |
+| Project | Things that outlive a run | `weft clean` or `weft rm` |
+| Shared | Things several projects meet in, by name | You remove them |
+| Assets | Your `@asset` copies | They follow your source |
+
+The five minute window matters. A run that makes a picture and ends has not
+thrown it away yet, and a link you handed somebody still works for a little
+while.
+
+## Keeping something
+
+A node stores a file with a keep policy, and that is what saves it from the
+sweep: thirty days by default, a span you choose, or forever.
+
+Reading a file postpones its expiry, so one that is still in use stays.
+
+There is no un-keep. A file marked to survive survives until somebody removes
+it.
+
+## Looking at them
 
 ```bash
 weft files ls
-weft files inspect <key>
-weft files download <key> --output picture.png
+weft files ls project/
+weft files inspect exec/9b81d0a2/chart.png
 weft files usage
 ```
 
-The key is the space heading plus the file id underneath it, so
-`project/<project-id>/<file-id>`. Without `--output` you get the stored
-filename. These work from anywhere, not just inside a project. The editor has a
-browser for the same thing, which can also pick a file for a program input.
+`ls` groups by space and shows the size, the filename, and whether a file is
+kept and when it expires. `usage` is the total.
 
-![The files list with a stored file and its size](../img/files-panel.png)
+## Getting one out
 
-`weft files rm <key>` deletes one, after asking. A key ending in `/` means a
-whole space, so read it twice before confirming.
+```bash
+weft files download exec/9b81d0a2/chart.png
+weft files download exec/9b81d0a2/chart.png -o ~/Desktop/chart.png
+```
 
-## How long they last
+It streams straight from storage into a temporary file and renames it only
+after the size checks out, so a download that fails never leaves you a
+plausible half file, and never overwrites a good copy with a broken one.
 
-| Where it was written | How long it lives |
-|---|---|
-| Execution, not kept | Cleaned up once that run ends |
-| Execution, kept | The keep period, or forever |
-| Project | Until you delete it, or the project |
-| Shared | Until you delete it, even if the project goes |
+## Removing them
 
-Unkept execution files get a five minute grace period before a sweep takes
-them, so do not count on them when you open an old run.
+```bash
+weft files rm exec/9b81d0a2/chart.png
+weft files rm project/
+```
 
-The default keep is 30 days, and it resets whenever the file is read through
-weft or a fresh download link is made. Listing files, looking at their
-metadata, or reusing a link you already have does not reset anything.
+The second form removes a whole space, **including files somebody deliberately
+kept**. It tells you how many of those there are before it does anything:
 
-To keep an execution file after the fact, put a `KeepFile` step in. Its
-`ttl_days` is 30 by default and zero means forever. Its `scope` input decides
-where the copy lands: the default `execution` keeps the file on this run, and
-`project` copies it out so later runs can use it too. The two inputs do not
-combine: `ttl_days` set together with `scope: project` is refused, because
-project files have their own lifetime. It only applies to
-execution files: project and shared files have their own lifetimes and refuse
-it.
+```text
+About to remove the whole space 'project/': 48 file(s), 12 of them KEPT
+(persisted on purpose).
+Type 'yes' to confirm:
+```
 
-For choosing where to write in the first place, read
-[storage](../nodes/storage.md).
+`--yes` skips the question, and is required when there is no terminal to ask.
 
-## Files your source refers to
+## Links
 
-Before a build, weft uploads any local asset that is new or changed, and it
-protects whatever the current program points at.
+Three kinds, for three audiences, and a node picks the right one:
 
-Swapping a picture in your source does not delete the old upload straight away,
-because old runs still refer to that version. Uploads nothing points at any
-more get a 30 day expiry, reset by reads through weft or fresh links. Deleting
-the project takes its assets with it.
+- a temporary signed link, about fifteen minutes by default
+- a link the open internet can fetch, when this install serves a public address
+- a link a caller of this install can fetch, which is what a route's answer
+  carries in place of a file
 
-For the markers and when each is read, read
-[files and reuse](../language/files-and-reuse.md).
+They all expire, which is why a stored file travels as a marker rather than a
+URL. The marker keeps working; a link does not.
 
-## Handing a file to somebody else
+## When a file goes missing
 
-A step can ask for a temporary link. `presign` gives one the step can use,
-though whether it works from the internet depends on the installation.
-`public_link` gives one that does, or nothing at all if the installation cannot
-provide it.
+If a download or a node says a key is not there, it was almost certainly swept:
+an execution-scoped file that nothing kept, past its window.
 
-Links last 15 minutes by default and seven days at most. A signed bucket URL
-can outlive the file it points at. A public relay link extends the file's own expiry only while the link is
-alive; it does not keep the file for good.
-
-So keep the file *reference* in your program's outputs and make a link at the
-moment you hand it over. Save the link as the output instead and every old run
-is left pointing at something expired.
-
-For setting up the public relay, read
-[a public address](../connections/public-address.md).
+`weft files ls` tells you what is actually there. If a program's output needs
+to outlive its run, the node that made it has to say so when it stores it.

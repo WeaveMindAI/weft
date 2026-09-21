@@ -2,79 +2,77 @@
 
 [Introduction](introduction.md)
 
-# Getting started
+# Set it up
 
 - [Install](start/install.md)
 - [Your first program](start/first-program.md)
-- [Reading and building the graph](start/reading-the-graph.md)
-- [Putting it on a URL](start/on-a-url.md)
-- [Putting a person in the loop](start/a-person-in-the-loop.md)
-- [A bigger example](start/a-bigger-example.md)
-- [When something goes wrong](start/troubleshooting.md)
+- [The three lifecycles](start/lifecycles.md)
+- [Talking to Tangle](start/tangle.md)
+
+# Build something real
+
+- [Working in the graph](build/the-graph.md)
+- [Connecting an account](build/connections.md)
+- [A public address](build/public-address.md)
+- [Putting a person in the loop](build/a-person-in-the-loop.md)
 
 # The language
 
-- [How a weft program runs](language/mental-model.md)
+- [How a program runs](language/how-a-program-runs.md)
 - [Syntax](language/syntax.md)
 - [Types](language/types.md)
 - [Groups](language/groups.md)
 - [Loops](language/loops.md)
-- [Live channels: streams and buses](language/live-channels.md)
-- [Triggers](language/triggers.md)
-- [Building an API](language/building-an-api.md)
+- [Streams and buses](language/streams-and-buses.md)
+- [Triggers and routes](language/triggers-and-routes.md)
 - [Files and reuse](language/files-and-reuse.md)
 - [What the compiler refuses](language/diagnostics.md)
-
-# Connecting services
-
-- [How connections work](connections/overview.md)
-- [Connect an account](connections/connect-an-account.md)
-- [Events from a service](connections/events.md)
-- [A public address](connections/public-address.md)
-- [The apps file](connections/the-apps-file.md)
-
-# Running programs
-
-- [The CLI](running/cli.md)
-- [The browser extension](running/browser-extension.md)
-- [The journal](running/the-journal.md)
-- [Versions, seeded runs and frozen examples](running/versions.md)
-- [Files at run time](running/files.md)
-- [How the runtime is built](running/architecture.md)
 
 # Writing nodes
 
 - [What a node is](nodes/what-a-node-is.md)
 - [Your first node](nodes/your-first-node.md)
-- [Testing a node](nodes/testing.md)
 - [metadata.json](nodes/metadata.md)
-- [The ctx](nodes/the-ctx.md)
+- [The ctx](nodes/ctx.md)
 - [Reading inputs, emitting outputs](nodes/values-and-emission.md)
 - [Custom types](nodes/custom-types.md)
-- [What your node shows in the graph](nodes/showing-things-in-the-graph.md)
+- [Showing something in the graph](nodes/display.md)
 - [Storage](nodes/storage.md)
 - [Surviving a restart](nodes/durable-execution.md)
-- [Writing a trigger](nodes/writing-triggers.md)
+- [Writing a trigger](nodes/triggers.md)
 - [Talking to a live caller](nodes/live-callers.md)
 - [Streams and buses in Rust](nodes/streams-and-buses.md)
-- [Cancellation](nodes/cancellation.md)
-- [Stopping other runs](nodes/steering-executions.md)
+- [Cancelling and steering runs](nodes/cancellation-and-steering.md)
 - [Infrastructure nodes](nodes/infrastructure.md)
+- [Testing a node](nodes/testing.md)
 - [Packaging](nodes/packaging.md)
 
-# Connections in a node
+# Connections
 
-- [Using a connection in a node](connections/using-a-connection.md)
-- [Declaring a service](connections/writing-a-service.md)
+- [How connections work](connections/how-they-work.md)
+- [The apps file](connections/the-apps-file.md)
+- [Using a connection in a node](connections/using-one-in-a-node.md)
+- [Declaring a service](connections/declaring-a-service.md)
+- [Events from a service](connections/events.md)
 - [Measuring what a call costs](connections/meters.md)
 
-# The thinking
+# Running programs
+
+- [The CLI](running/cli.md)
+- [Starting and stopping things](running/lifecycles.md)
+- [The journal](running/the-journal.md)
+- [Versions, seeds and frozen examples](running/versions.md)
+- [Files at run time](running/files.md)
+- [The browser extension](running/browser-extension.md)
+- [How the runtime is built](running/architecture.md)
+
+# Why it is shaped this way
 
 - [Things people say to me](thinking/objections.md)
 - [Sequential Diffusion Programming](thinking/sdp.md)
 - [The commandments of plumbing](thinking/plumbing.md)
-- [The three fronts](thinking/how-we-decide.md)
 - [Design principles](thinking/design-principles.md)
+- [The three fronts](thinking/how-we-decide.md)
 - [How I think about AI safety](thinking/safety.md)
 
 # Appendix
