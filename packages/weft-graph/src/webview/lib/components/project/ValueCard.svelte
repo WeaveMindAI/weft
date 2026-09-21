@@ -82,6 +82,9 @@
 	function selectAll(event: MouseEvent) {
 		if (!body) return;
 		event.preventDefault();
+		// Inside a graph node the same double-click would reach the
+		// canvas and zoom it, so the selection would flash and vanish.
+		event.stopPropagation();
 		const range = document.createRange();
 		range.selectNodeContents(body);
 		const selection = window.getSelection();
