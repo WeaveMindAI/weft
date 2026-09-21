@@ -683,7 +683,7 @@ impl Journal for MockJournal {
         Ok(out)
     }
 
-    async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
+    async fn delete_execution(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut g = self.inner.lock().unwrap();
         g.trigger_setups.retain(|_, setup| *setup != color);
         g.events.retain(|e| e.color() != color);
@@ -692,10 +692,19 @@ impl Journal for MockJournal {
         // Dropping every signal bound to the color made a trigger
         // registration vanish here and survive in production, so a leak
         // of those rows could never be caught by a test.
-        g.signals.retain(|_, s| !(s.row.color == Some(color) && s.row.is_resume));
+        let keys: Vec<String> = g
+            .signals
+            .iter()
+            .filter(|(_, s)| s.row.color == Some(color) && s.row.is_resume)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let removed = keys
+            .into_iter()
+            .filter_map(|k| g.signals.remove(&k).map(|s| s.row))
+            .collect();
         g.execution_colors.remove(&color);
         g.execution_tags.retain(|(c, _), _| *c != color);
-        Ok(())
+        Ok(removed)
     }
 
     async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64> {
@@ -1006,6 +1015,32 @@ mod tests {
         .unwrap();
         assert!(j.consume_suspension("tok-e").await.unwrap().is_none());
         assert!(j.signal_get("tok-e").await.unwrap().is_some(), "entry rows stay");
+    }
+
+    /// Erasing a run answers the questions it was parked on, holder
+    /// included, so the caller can tell that pod to let go. A plain
+    /// delete left the pod serving a form for a run that no longer
+    /// existed (`weft listener inspect` called it drift). The project's
+    /// entry signal is not the run's and stays.
+    #[tokio::test]
+    async fn delete_execution_hands_back_the_resume_signals_it_removed() {
+        let j = MockJournal::new();
+        let placement =
+            SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 };
+        let run = weft_core::Color::new_v4();
+        let mut parked = registration("tok-form");
+        parked.color = Some(run);
+        parked.is_resume = true;
+        j.signal_insert(&parked, &placement).await.unwrap();
+        j.signal_insert(&registration("tok-entry"), &placement).await.unwrap();
+
+        let removed = j.delete_execution(run).await.unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].token, "tok-form");
+        assert_eq!(removed[0].listener_pod.as_deref(), Some("listener-abc"));
+        assert!(j.signal_get("tok-form").await.unwrap().is_none());
+        assert!(j.signal_get("tok-entry").await.unwrap().is_some(), "entry rows stay");
+        assert!(j.delete_execution(run).await.unwrap().is_empty(), "a second erase has nothing left");
     }
 
     /// The kind_state conflict fence mirrors Postgres: a re-insert

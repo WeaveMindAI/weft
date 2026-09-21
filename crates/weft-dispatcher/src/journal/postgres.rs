@@ -1396,11 +1396,11 @@ impl Journal for PostgresJournal {
         Ok(out)
     }
 
-    async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
+    async fn delete_execution(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut tx = self.pool.begin().await?;
-        erase_colors(&mut tx, &[color]).await?;
+        let removed = erase_colors(&mut tx, &[color]).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(removed)
     }
 
     async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64> {
@@ -1418,6 +1418,10 @@ impl Journal for PostgresJournal {
             .into_iter()
             .map(|(c,)| c.parse().map_err(|e| anyhow::anyhow!("bad color in execution_color: {e}")))
             .collect::<anyhow::Result<_>>()?;
+        // The signals these runs were parked on come back too, but
+        // there is nothing to tell a pod: `weft rm` deactivates before
+        // it erases, and that already stripped and unregistered every
+        // signal of the project.
         erase_colors(&mut tx, &colors).await?;
         tx.commit().await?;
         Ok(colors.len() as u64)
@@ -1678,9 +1682,15 @@ impl Journal for PostgresJournal {
 /// leaves tag and index rows whose journal is empty, which is exactly
 /// the row set the live tag read selects for, and a later stop writes
 /// fresh cancel rows into a deleted journal, resurrecting a ghost run.
-async fn erase_colors(tx: &mut sqlx::PgConnection, colors: &[Color]) -> anyhow::Result<()> {
+/// Every row of these colors, in one transaction. Answers the resume
+/// signals it removed, because a listener pod holds each of those in
+/// RAM and only the caller can tell it to let go.
+async fn erase_colors(
+    tx: &mut sqlx::PgConnection,
+    colors: &[Color],
+) -> anyhow::Result<Vec<SignalRegistration>> {
     if colors.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let ids: Vec<String> = colors.iter().map(|c| c.to_string()).collect();
     sqlx::query("DELETE FROM trigger_setup WHERE color = ANY($1)")
@@ -1691,8 +1701,17 @@ async fn erase_colors(tx: &mut sqlx::PgConnection, colors: &[Color]) -> anyhow::
         weft_journal::tags::delete_for_color(&mut *tx, *color).await?;
     }
     // Resume tokens for these colors: signal rows with is_resume=true.
-    sqlx::query("DELETE FROM signal WHERE color = ANY($1) AND is_resume = TRUE")
-        .bind(&ids).execute(&mut *tx).await?;
+    // Returned, not just dropped: the pod each one names as its holder
+    // still serves it (`weft listener inspect` reports the drift as
+    // "the table forgot it; the pod still serves it"), and a plain
+    // DELETE here is exactly what left a deleted run's question
+    // answerable on the pod.
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_RESUME_BY_COLORS_RETURNING)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .context("erase colors: read a resume signal row")?;
+    let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
     // execution_color is the denormalized (color, project_id,
     // tenant_id) index seeded at ExecutionStarted time. Without this
     // delete the row outlives the journal it indexes, and
@@ -1705,7 +1724,7 @@ async fn erase_colors(tx: &mut sqlx::PgConnection, colors: &[Color]) -> anyhow::
     // The run's row in the version tree belongs to the version store,
     // not here. For one color `clean_execution` drops it alongside this;
     // for a whole project the project's removal already took the tree.
-    Ok(())
+    Ok(removed)
 }
 
 pub(crate) async fn remove_project_signals<'e>(
@@ -1776,6 +1795,11 @@ const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));
+
+const SIGNAL_DELETE_RESUME_BY_COLORS_RETURNING: &str = concat!(
+    "DELETE FROM signal WHERE color = ANY($1) AND is_resume = TRUE RETURNING ",
+    signal_columns!("")
+);
 
 const SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING: &str = concat!(
     "DELETE FROM signal WHERE token = $1 AND is_resume = TRUE RETURNING ",

@@ -198,6 +198,9 @@ export class AutoFollowController {
       ev.kind === 'execution_completed' ||
       ev.kind === 'execution_failed' ||
       ev.kind === 'execution_cancelled' ||
+      // A deleted run was preserved state until now (a run parked on a
+      // question counts), so the verb set moves with it.
+      ev.kind === 'execution_deleted' ||
       ev.kind === 'infra_status_changed' ||
       ev.kind === 'infra_flaky' ||
       ev.kind === 'infra_recovered' ||

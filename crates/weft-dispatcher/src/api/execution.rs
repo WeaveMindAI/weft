@@ -867,7 +867,8 @@ pub async fn delete_execution(
 
 /// THE removal of one execution (`weft clean <color>`, and each run a
 /// prune drops): its storage folder, then its journal, its tags, its
-/// resume tokens, and its row in the version tree, together.
+/// resume tokens (on the pod that served them too), and its row in
+/// the version tree, together; then the word to every client.
 pub(crate) async fn clean_execution(
     state: &DispatcherState,
     caller: &crate::tenant::TenantId,
@@ -915,11 +916,22 @@ pub(crate) async fn clean_execution(
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    state
+    let removed = state
         .journal
         .delete_execution(color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // The questions the run was parked on went with its rows, and the
+    // listener pod holding each one still serves it until told: a
+    // client with a signal token could list and answer a form
+    // belonging to a run that no longer exists. Same call as a cancel.
+    state.listeners.unregister_many(&state.pg_pool, &removed).await;
+    // Every window learns the run is gone the way it learns a cancel.
+    // NOTIFY, not the journal: the journal is what was just erased.
+    state
+        .events
+        .publish(DispatcherEvent::ExecutionDeleted { color, project_id: owner.project_id.clone() })
+        .await;
     // This may have been the last run keeping a removed project's code
     // and tree rows on file. A failure here leaves rows nobody reads and
     // nothing else, and the reaper's `retired_rows` sweep comes back for

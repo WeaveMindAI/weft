@@ -16,7 +16,7 @@
 //! ends up publishing the same events to its local broadcast). The
 //! NOTIFY channel only carries the smaller cross-cutting events that
 //! don't sit on the journal path: ProjectRegistered, ProjectActivated,
-//! ProjectDeactivated, TriggerUrlChanged. These fit inside Postgres
+//! ProjectDeactivated, TriggerUrlChanged, ExecutionDeleted. These fit inside Postgres
 //! NOTIFY's 8000-byte payload cap with room to spare.
 
 use std::collections::HashMap;
@@ -105,6 +105,13 @@ pub enum DispatcherEvent {
     /// the tags on the run. `tags` is this call's list, not the run's
     /// cumulative set.
     ExecutionTagged { color: Color, project_id: String, tags: Vec<String>, at_unix: u64 },
+    /// The run was erased (`weft clean`, a prune, the editor's delete):
+    /// its journal, its storage and the wake signals it was parked on
+    /// are gone. Rides NOTIFY rather than the journal, since the
+    /// journal is what just went; every client drops the run from its
+    /// lists and re-reads the project's verbs, because a run parked on
+    /// a question counted as preserved state until now.
+    ExecutionDeleted { color: Color, project_id: String },
     /// Every node event carries `inherited_from` when the firing was
     /// not this run's own but taken from the run it was seeded from
     /// (`weft run --seed`): the row is the seed's, painted here so the
@@ -363,6 +370,7 @@ impl DispatcherEvent {
             | Self::ExecutionFailed { project_id, .. }
             | Self::ExecutionCancelled { project_id, .. }
             | Self::ExecutionTagged { project_id, .. }
+            | Self::ExecutionDeleted { project_id, .. }
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
@@ -405,6 +413,7 @@ impl DispatcherEvent {
             | Self::ExecutionFailed { color, .. }
             | Self::ExecutionCancelled { color, .. }
             | Self::ExecutionTagged { color, .. }
+            | Self::ExecutionDeleted { color, .. }
             | Self::NodeStarted { color, .. }
             | Self::NodeSuspended { color, .. }
             | Self::NodeResumed { color, .. }
@@ -505,8 +514,10 @@ impl EventBus {
 
     /// Push locally AND issue NOTIFY so sibling pods receive it.
     /// Used for the events that don't ride the journal:
-    /// ProjectRegistered/Activated/Deactivated and TriggerUrlChanged.
-    /// Execution events use only the journal bridge, preserving their
+    /// ProjectRegistered/Activated/Deactivated, TriggerUrlChanged and
+    /// ExecutionDeleted (the one execution event with no journal row
+    /// to ride, the journal being what was deleted). Every other
+    /// execution event uses only the journal bridge, preserving its
     /// identity across history and live delivery.
     pub async fn publish(&self, event: DispatcherEvent) {
         let event = IdentifiedEvent::transient(event);

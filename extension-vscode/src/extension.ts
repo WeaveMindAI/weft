@@ -127,6 +127,13 @@ export function activate(context: vscode.ExtensionContext) {
         ev.kind === 'execution_cancelled'
       ) {
         actionBar.markExecutionFinished(ev.project_id, ev.color);
+      } else if (ev.kind === 'execution_deleted') {
+        // Another window (or the CLI) erased a run. If it is the one on
+        // screen, stop showing it; a run that no longer exists cannot
+        // be followed. The local delete already did this before its
+        // request went out, so this is a no-op for it.
+        actionBar.markExecutionFinished(ev.project_id, ev.color);
+        if (autoFollow.currentColor() === ev.color) stopShowingRun();
       } else if (ev.kind === 'project_transition_changed') {
         // The event carries the transition; apply it directly so the
         // bar flips without waiting for the status round-trip.
@@ -1204,7 +1211,12 @@ export function activate(context: vscode.ExtensionContext) {
       void vscode.window.showErrorMessage(`Delete failed: ${err}`);
       deleted = false;
     }
-    await executionsProvider.refresh();
+    // The dispatcher's execution_deleted event reaches every window,
+    // this one included; the direct re-reads are for this window to
+    // see the result at once rather than after the stream's debounce.
+    // The bar is part of it: a run parked on a question was preserved
+    // state, and its Run button was hidden behind that until now.
+    await Promise.all([executionsProvider.refresh(), refreshActionBarFromStatus()]);
     return deleted;
   }
 

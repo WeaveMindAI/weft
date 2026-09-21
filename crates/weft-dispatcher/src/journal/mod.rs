@@ -453,7 +453,12 @@ pub trait Journal: Send + Sync {
     // ----- Administrative ---------------------------------------------
 
     /// Delete all data for a color. Called only by `weft clean`.
-    async fn delete_execution(&self, color: Color) -> anyhow::Result<()>;
+    ///
+    /// Answers the resume signals the run was parked on, which went
+    /// with it: a listener pod still holds each one in RAM and keeps
+    /// answering for a run that no longer exists until the caller
+    /// unregisters it there (`unregister_many`), the way a cancel does.
+    async fn delete_execution(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// Delete all data for every execution of a project, and say how
     /// many went. Called by `weft rm`.
