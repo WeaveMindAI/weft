@@ -1,169 +1,137 @@
 # Storage
 
-A running node reads and writes files through `ctx.storage`. Every write takes
-a **scope**, and the scope decides where the file lives and **how long it
-lives**. Pick it by how long you need the file to survive.
-
-## The scopes
-
-| Scope | Lives under | Lifetime |
-|---|---|---|
-| `StorageScope::Execution` | `exec/<run>/` | one run, unless flagged kept |
-| `StorageScope::Project` | `project/<project_id>/` | as long as the project |
-| `StorageScope::Shared { name }` | `shared/<name>/` | as long as the owner |
-| `StorageScope::Asset` | the project's `@asset` files | read-only; a worker write to it is refused |
-
-**`Execution`** is the default, and it is for scratch: intermediate files,
-temporary downloads, anything nothing cares about once the run ends. It sweeps
-itself up.
-
-**`Project`** is for a project's own persistent state: a cache, an index,
-accumulated outputs. It outlives individual runs and is shared across the
-project's executions, and it is **deleted when the project is deleted**.
-
-**`Shared { name }`** is tied to the owner rather than any project. It
-survives runs and project deletion both. Projects naming the same `name` meet
-in the same space, and first use auto-grants it.
-
-So if you want a file to survive deleting the project, that is the scope
-argument and nothing else: `Project` means no, `Shared` means yes. Changing
-that one argument is the whole knob.
-
-Reach for `Shared` when it is a dataset the owner reuses across projects, a
-model they paid to build, or anything they would be upset to lose while
-tidying up.
-
-## The verbs
+A value on a wire is capped at 100 KB. Anything bigger goes into storage, and
+what travels the wire is a small marker saying where it is.
 
 ```rust
-let storage = ctx.storage(StorageScope::Project);
-
-storage.put(bytes, mime, filename, keep).await?;
-storage.put_stream(stream, mime, filename, keep).await?;
-storage.put_response(resp, what, mime, filename, keep).await?;  // straight from an HTTP response
-storage.put_from_url(url, filename, keep).await?;               // the runtime fetches it
-storage.identified("whatsapp:m1").put_from_url(url, None, None).await?; // once per identity, see below
-
-storage.get(&handle).await?;
-storage.get_bytes(&handle).await?;
-storage.get_range(&handle, range).await?;
-
-storage.delete(&handle).await?;
-storage.list().await?;
-
-storage.keep(&handle, KeepTtl::Default).await?;
-storage.presign(&handle, ttl_secs).await?;      // a temporary link, always fetchable from your body
-storage.public_link(&handle, ttl_secs).await?;  // an internet-reachable link, or None
+let storage = ctx.storage(StorageScope::Execution);
+let stored = storage.put(bytes, "image/png", "chart.png", None).await?;
+ctx.pulse_downstream(NodeOutput::stored_file(stored)).await
 ```
 
-A stored file arriving on one of your inputs already carries a `url` inside
-its marker, minted for this firing (an hour): the runtime links every file
-input before your body runs, so a body that hands the value to something
-that only fetches URLs needs no call of its own. The link is the
-internet-reachable one when the install serves one (a public address, or a
-bucket declared public), so a provider can fetch it too. Otherwise it is
-signed for the cluster's own address: your body can fetch it, nothing
-outside can, and a node that hands a file to something outside asks
-`public_link` and inlines the bytes when it answers `None`. It is stripped
-from everything you emit, park, or memoize, so the stored form is what
-travels and the journal never holds a link.
+## The four scopes
 
-Scope governs writes and lists. Key-addressed verbs act on the key's own
-scope, so reading a handle works regardless of which scope you asked for.
+The scope decides where new files go, and how long they live.
 
-If you pull a thing by a stable id (a message, a document at a provider),
-name it: `.identified("<service>:<id>")` before the put. The same identity in
-the same scope is then one file, however many runs ask for it: a
-`put_from_url` asks the store first and fetches nothing when the file is
-there, and two runs fetching at once cannot both land (the second sees a
-conflict and retries). Pair it with `Project` scope so the copy outlives the
-run that first pulled it. The identity is a label, scoped to the scope you
-put in; choose one that names the source, never the content.
+| Scope | Lives | Gone when |
+|---|---|---|
+| `Execution` (the default) | This run | Five minutes after the run ends, so its output is still downloadable, unless you kept it |
+| `Project` | Across runs of this project | `weft clean` or `weft rm` |
+| `Shared { name }` | Across projects that name the same space | Explicit removal only |
+| `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
 
-## The keep rule
+The scope governs **writes and lists**. Reading, deleting, keeping and signing
+act on whatever scope the key itself belongs to, so a later node can `get` a
+file without knowing where it came from. `copy` is the one that does both,
+reading from the key's scope and writing into yours, which is how a file
+crosses.
 
-**An Execution-scoped file your node emits must be kept.**
+## Keeping a file
 
-Every Execution write takes `keep: Option<KeepTtl>`. `None` means the file is
-swept shortly after the run ends.
+An execution-scoped file is swept shortly after the run ends. That is right for
+scratch and wrong for anything a person will open later.
 
-That is right for scratch and wrong for anything you pulse downstream, because
-an emitted reference lands in the journal and renders in the editor long after
-the run, where a swept file shows up as "media expired". So:
-
-- A node producing a user-facing artifact (a generated image, synthesized
-  speech, received media) passes `Some(KeepTtl::Default)`. That is 30 days,
-  and **every access bumps the clock**, so artifacts still in use never expire
-  while abandoned ones age out.
-- A node whose file is cheaply re-fetchable, such as a plain download, may
-  expose a `keep` boolean config input defaulting to off, and pass
-  `keep.then_some(KeepTtl::Default)`, letting the user decide.
-
-The `KeepFile` node extends or pins an execution file's lifetime after the
-fact. Kept or not, an execution file stays walled to its run; with
-`scope: project` the node instead copies it into the project scope and emits
-the copy, the only form a later run can read.
-
-## Files from the graph
-
-A user-supplied file arrives as an ordinary typed input.
-
-```json
-"inputs": [
-  { "name": "image", "type": "Image", "required": true }
-]
+```rust
+storage.put(bytes, "image/png", "chart.png", Some(KeepTtl::Default)).await?;
 ```
 
-The type drives the editor's file filter and is what gets written into source;
-a `"widget": { "kind": "file_drop", "accept": "image/png" }` narrows it
-further. Your node reads it with `ctx.inputs.get::<FileHandle>("image")?`.
+| `KeepTtl` | Meaning |
+|---|---|
+| `Default` | 30 days |
+| `Secs { secs }` | That long |
+| `Never` | No expiry. Only `weft files rm` or `weft clean` removes it |
 
-What lands in source is one clean line:
+Every read pushes the expiry back, so a file something still uses does not
+vanish underneath it.
 
-```weft
-send = TelegramSendMedia {
-  file: @asset("assets/photo.png", Image)
-}
+`keep` is additive and there is no un-keep. And it only applies to execution
+scope: project and shared files have no expiry, so asking to keep one there is
+refused rather than quietly ignored.
+
+## Storing
+
+| Call | Use it when |
+|---|---|
+| `put(bytes, mime, filename, keep)` | You have the bytes |
+| `put_stream(stream, mime, filename, keep)` | You do not want the whole file in memory |
+| `put_response(resp, what, mime, filename, keep)` | You already made an authenticated request and want its body |
+| `put_from_url(url, filename, keep)` | A plain URL, fetched straight in |
+| `copy(&file, keep)` | A file that already exists, into this scope |
+
+### Storing the same thing twice
+
+```rust
+let storage = ctx.storage(StorageScope::Project).identified("slack:F123456");
 ```
 
-The [asset sync](../language/files-and-reuse.md#the-asset-sync) runs before
-every build and uploads what the code references. Current source files stay;
-replaced or removed uploads expire after 30 days without access. Your node never
-sees any of it: at run time the value is a normal media value, and `get` and
-`get_bytes` read its bytes whichever handle it carries.
+`identified` names what the file is a copy **of**. Put it twice and it stores
+once, and with `put_from_url` a source you already have costs no request at
+all.
 
-## Media in typed values
+Name the source, like `<service>:<id>`, not the content.
 
-For converting whole typed values at a provider boundary, see
-[Custom types](custom-types.md#media-inside-a-custom-type).
+## Reading
 
-## The marker stays inside weft
+| Call | Gives you |
+|---|---|
+| `get(&file)` | The bytes, as a stream |
+| `get_range(&file, range)` | Part of them |
+| `get_bytes(&file)` | The whole thing in memory. Small files only |
+| `list()` | Everything in this scope |
+| `delete(&file)` | Gone. Stored files only, not URL-backed ones |
 
-The `__weft_image__` / `__weft_audio__` / `__weft_blob__` wrapper is how a
-file travels between nodes: it carries the storage key the runtime reads
-by. Anything you hand to something that is not weft (a provider's request
-body, a bridge's action payload, a form spec a browser renders, a live
-item) gets the plain thing that consumer reads: a URL string, a `data:`
-URL, or a plain `{ url, mimeType, filename }` object. `externalize` does
-this for a typed value, `public_link` and `presign` for one file. Wrapping
-a link in a marker and sending it out puts weft's internal shape in an
-external contract, and the consumer, which reads `value.url`, shows
-nothing. The form image field did exactly that once, and the tasks app
-rendered "(no image)" over a link that worked. A link you hand out also has
-a life, so never store one: a form parks the stored file itself, and the
-person who opens it gets a link minted at that moment through the
-signal-token files door, however long the form waited.
+## Handing a file out
 
-## Reaching files outside the editor
+Three ways, for three audiences.
 
-The stored files are addressable independently of the editor:
+| Call | The link reaches |
+|---|---|
+| `presign(&file, ttl)` | Whoever you give it to, for about 15 minutes by default |
+| `public_link(&file, ttl)` | The open internet, or `None` when this install serves no public address |
+| `caller_link(&file, ttl)` | A caller of this install. This is what a route's answer carries in place of a file |
 
-```bash
-weft files ls
-weft files inspect <key>
-weft files download <key>
-weft files rm <key>
-weft files usage
-```
+`public_link` returning `None` is not a failure. It means the store is private
+and nothing is relaying it, so hand out the bytes instead.
 
-So data a project wrote in `Shared` stays reachable after the project is gone.
+## Whole values full of files
+
+A chat history with three images in it is a typed value with three file markers
+buried inside it. Two calls handle that.
+
+`externalize(&value, &ty, policy)` walks every file slot the type names, at any
+depth, and turns each into a link or inline bytes depending on what the
+consumer takes. A provider that accepts image URLs but only inline audio gets
+exactly that.
+
+`internalize(&value, &ty, keep)` is the reverse: it takes a value full of
+`data:` URLs and external links and stores them, giving you back something you
+can emit and that will still work tomorrow.
+
+The rule that makes it safe: **the link never leaves your node, and the marker
+never leaves weft.** Anything you emit, park on, or memoize is stripped back to
+the stored form for you. What `externalize` gives you is no longer a value of
+that type, because presigned links expire, so hand it to whoever asked and do
+not store it.
+
+## What a stored file looks like
+
+It is a marker naming its kind, and the kind comes from the mime type when it
+was stored.
+
+| Weft type | For |
+|---|---|
+| `Image` | `image/*` |
+| `Video` | `video/*` |
+| `Audio` | `audio/*` |
+| `Blob` | Everything else: a PDF, a zip |
+
+Inside is the key, the mime type, the size and the filename. **No URL**, which
+is deliberate: a link expires and a marker does not, so the marker is what goes
+on wires and into the journal.
+
+`File` is shorthand for all four and `Media` is shorthand for the first three.
+Both are fine on a port. Neither can be the type on an `@asset`, because a
+value carries exactly one marker and those leave it open.
+
+`NodeOutput::stored_file(stored)` fills the four ports a file travels as at
+once: `file`, `filename`, `mimeType` and `sizeBytes`.

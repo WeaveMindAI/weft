@@ -383,12 +383,20 @@
 	// That covers the "deleted the trigger from source but backend
 	// still has it active" case: the user needs Deactivate (and
 	// Resync) to bring backend back in line with source.
+	//
+	// Preserved state alone does not light it. A plain run parked on a
+	// question is a preserved signal too, and it belongs to the run,
+	// not to activation: with no trigger anywhere the dispatcher
+	// offers only `run`, and lighting the slot on the count hid Run
+	// behind an Activate the dispatcher refuses. The slot lights on
+	// preserved state only when the dispatcher offers Reactivate for
+	// it, which is what says the state is a trigger's.
 	const triggerSlotVisible = $derived(
 		hasTriggers
 			|| backend.status === 'active'
 			|| backend.status === 'activating'
 			|| backend.status === 'deactivating'
-			|| hasPreservedState
+			|| (hasPreservedState && isVerbAvailable('reactivate'))
 	);
 
 	const middleSlot = $derived.by((): MiddleSlotState => {
@@ -417,7 +425,7 @@
 		// No execution in flight: the one-click Run only when the
 		// trigger slot is hidden. Whenever the trigger slot is visible
 		// (source has triggers, or backend still has them active /
-		// deactivating / preserved), the trigger lifecycle is the
+		// deactivating / preserved for a Reactivate), the trigger lifecycle is the
 		// right entry point and a bare Run would conflict. The
 		// exception is an aimed run that walks through no trigger (a
 		// hand-fired maintenance branch): that run is an ordinary

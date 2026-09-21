@@ -2,11 +2,9 @@
 	import { Search } from '@lucide/svelte';
 	import type { ExecutionTerminal, NodeExecution } from '../../types';
 	import { frameText, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
-	import { parseFileValue } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
 	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
-	import ValueCard from './ValueCard.svelte';
-	import FileCard from './FileCard.svelte';
+	import PayloadCards from './PayloadCards.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
 
@@ -387,25 +385,13 @@
 						<CopyButton text={inputJson} />
 					{/if}
 				</div>
-				<div class="overflow-auto flex-1 p-2.5 space-y-2 bg-zinc-50/40">
-					{#if selected.input && typeof selected.input === 'object' && Object.keys(selected.input as Record<string, unknown>).length > 0}
-						{#each Object.entries(selected.input as Record<string, unknown>) as [key, value]}
-							{@const file = parseFileValue(value)}
-							{@const note = portOrigin(selected, key, true) ?? undefined}
-							{#if file}
-								<FileCard label={key} {file} {note} />
-							{:else}
-								<ValueCard label={key} {value} {note} />
-							{/if}
-						{/each}
-					{:else if selected.input !== null && selected.input !== undefined && typeof selected.input !== 'object'}
-						<ValueCard label="value" value={selected.input} />
-					{:else if !selected.closedPorts || selected.closedPorts.length === 0}
-						<div class="px-1 py-2 text-xs text-zinc-400 italic">No input data</div>
-					{/if}
-					{#each selected.closedPorts ?? [] as port}
-						<ValueCard label={port} closed />
-					{/each}
+				<div class="overflow-auto flex-1 p-2.5 bg-zinc-50/40">
+					<PayloadCards
+						payload={selected.input}
+						closedPorts={selected.closedPorts ?? []}
+						noteFor={(port) => portOrigin(selected, port, true) ?? undefined}
+						empty="No input data"
+					/>
 				</div>
 			</div>
 
@@ -416,21 +402,8 @@
 						<CopyButton text={outputJson} />
 					{/if}
 				</div>
-				<div class="overflow-auto flex-1 p-2.5 space-y-2 bg-zinc-50/40">
-					{#if selected.output && typeof selected.output === 'object' && Object.keys(selected.output as Record<string, unknown>).length > 0}
-						{#each Object.entries(selected.output as Record<string, unknown>) as [key, value]}
-							{@const file = parseFileValue(value)}
-							{#if file}
-								<FileCard label={key} {file} />
-							{:else}
-								<ValueCard label={key} {value} />
-							{/if}
-						{/each}
-					{:else if selected.output !== null && selected.output !== undefined}
-						<ValueCard label="value" value={selected.output} />
-					{:else}
-						<div class="px-1 py-2 text-xs text-zinc-400 italic">No output</div>
-					{/if}
+				<div class="overflow-auto flex-1 p-2.5 bg-zinc-50/40">
+					<PayloadCards payload={selected.output} empty="No output" />
 				</div>
 			</div>
 		</div>

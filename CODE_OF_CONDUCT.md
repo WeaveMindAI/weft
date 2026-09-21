@@ -2,15 +2,15 @@
 
 ## Before the standard text, a note on how we run arguments
 
-Weft runs on **constructive confrontation**. We believe that productive technical disagreement, even heated, is how the project moves forward, and that polite avoidance is how projects quietly rot. Anger aimed at **a decision, a pattern, a bug, or a blocker** is welcome here. Swearing at a problem is welcome. Saying "this approach is broken, here is why" with real heat behind it is welcome.
+Weft runs on **constructive confrontation**. We believe that productive technical disagreement, even heated, is how the project moves forward, and that polite avoidance is how projects quietly rot. Anger aimed at **a decision, a pattern, a bug, or a blocker** is welcome here. Swearing at a problem is welcome. Saying "I think this part is stupid because..." is fine as long as it is properly justified and not overblown.
 
 Anger aimed at **a person** is not. Insults, name-calling, attacks on someone's character, competence, background, or identity are not part of this project and never will be.
 
 The test is simple: after the argument, does everyone involved understand the problem better, or does one side just feel worse? If it is the first, we are doing it right. If it is the second, someone crossed the line and we will step in.
 
-One more thing. Heat is calibrated to context. A design argument between people who have been working together for a year can run hot. A code review of a first-time contributor should not. Same respect, different temperature, because the trust bandwidth is different. Read the room.
+One more thing, heat should be calibrated to context: A design argument between people who have been working on the codebase for a while can run hot. A code review of a first-time contributor should not. If a contributor express discomfort, also turn down the heat, read the room.
 
-The rest of this document is the standard [Contributor Covenant][homepage] version 2.1. It defines the floor (what is never acceptable). The paragraphs above define the ceiling (what kind of heat is welcome above that floor). Both apply.
+The rest of this document is the standard [Contributor Covenant][homepage] version 2.1 which we abide by on all other situations.
 
 ---
 

@@ -53,6 +53,10 @@ export type DispatcherEvent = { event_id: string } & (
   | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
   | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
   | { kind: 'execution_tagged'; color: string; project_id: string; tags: string[]; at_unix: number }
+  // The run was erased (weft clean, a prune, the editor's delete), its
+  // journal and the questions it was parked on with it. No at_unix:
+  // nothing was journaled, the journal is what went.
+  | { kind: 'execution_deleted'; color: string; project_id: string }
   // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
   // from supervisor-written rows; drive action-bar refresh so
   // transient `stopping` / `terminating` states show up in the UI.
@@ -414,6 +418,10 @@ export class ExecutionFollower implements vscode.Disposable {
         break;
       case 'execution_tagged':
         this.post({ kind: 'execTags', color: e.color, tags: e.tags });
+        break;
+      case 'execution_deleted':
+        // Nothing to paint: the host drops the follow if this was the
+        // run on screen, and the tree and the bar re-read.
         break;
       case 'bus_joined':
         // Forward `offset` on every bus event so the inspector can

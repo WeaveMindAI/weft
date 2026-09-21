@@ -27,8 +27,8 @@ into `mvp` through a PR, and the merge is what publishes.
    CLI binaries, the `.vsix` and the browser zips, updates the rolling
    `mvp-latest` release, and then publishes to each store.
 
-CI runs on `pull_request` into `mvp` only. Five checks: `extension
-versions bumped` (PRs only), `build`,
+CI runs on `pull_request` into `mvp` only. Six checks: `extension
+versions bumped` (PRs only), `build`, `public proxy routes`,
 `cargo test + clippy`, `cargo test --features db-tests`, and
 `graph + editor`.
 

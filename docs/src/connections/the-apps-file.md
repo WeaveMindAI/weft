@@ -1,110 +1,137 @@
-# The shared-credentials file
+# The apps file
 
-`WEFT_ACCESS_APPS_FILE` names one JSON file holding every credential this weft
-offers as a **shared** connection, whatever its shape. Start from
-`access-apps.example.json`.
+`access-apps.json` is where the operator puts the applications and keys this
+installation offers as one-click connections. Whatever is in it shows up in
+everybody's connect panel.
 
-It is keyed by service, and each service holds a **list** of entries, even for
-one. Every entry declares its `kind`.
+Start from the example and keep what you want:
 
-```jsonc
+```bash
+cp access-apps.example.json access-apps.json
+```
+
+Fill in the services you expect to use often. A service you set up here is one
+click forever after, and one you skip asks each person to bring their own the
+first time they need it, which is fine for something you touch once.
+
+## The shape
+
+A service name maps to a **list**, always, even with one entry. Keys starting
+with `_` are ignored, which is how the example file carries its own notes.
+
+```json
 {
-  "_readme": "keys starting with _ are comments and are ignored",
-
-  "google": [
-    {
-      "kind": "oauth_app",
-      "_setup": "console.cloud.google.com -> credentials -> add the callback URL",
-      "label": "Google Drive",
-      "covers": [
-        "https://www.googleapis.com/auth/drive.file"
-      ],
-      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
-      "token_url": "https://oauth2.googleapis.com/token",
-      "client_id": "…",
-      "client_secret": "…",
-      "events": {
-        "signing_secret": "…"
-      }
-    }
-  ],
-
-  "openrouter": [
-    { "kind": "api_key", "label": "Runtime key", "key": "sk-or-…" }
-  ]
+  "openrouter": [{
+    "kind": "api_key",
+    "label": "Runtime key",
+    "key": "sk-or-..."
+  }]
 }
 ```
 
-## The two kinds
+### A pasted key
 
-**`oauth_app`** is one OAuth application this weft signs users in with. Its
-`auth_url` and `token_url` are **pinned**: a shared connect whose recipe names
-any other address is refused, so these credentials only ever go where you wrote.
+| Key | What it is |
+|---|---|
+| `kind` | `"api_key"` |
+| `label` | The name the connection list shows |
+| `key` | The credential. At most one `api_key` per service |
 
-**`api_key`** is the runtime's own key for a pasted-key service, and it is what
-the "use the runtime's key" door hands the credential source. At most one per
-service.
+This is what "use ours" hands out. Calls on it spend money on that account, so
+keep the file private.
 
-How that key is handed out, directly to the worker or swapped for a stand-in
-behind a relay, is decided by the deployment's credential source and
-**deliberately never by a field in this file**. A typo in here must not be able
-to change who gets the raw key.
+### An OAuth application
 
-## The rules
+```json
+{
+  "slack": [{
+    "kind": "oauth_app",
+    "label": "Slack",
+    "covers": ["chat:write", "channels:read", "channels:history"],
+    "auth_url": "https://slack.com/oauth/v2/authorize",
+    "token_url": "https://slack.com/api/oauth.v2.access",
+    "client_id": "...",
+    "client_secret": "...",
+    "events": { "signing_secret": "..." }
+  }]
+}
+```
 
-Every one is checked loudly, because a typo must never silently remove a
-one-click door.
+| Key | What it is |
+|---|---|
+| `label` | Unique within the service |
+| `covers` | Exactly the permissions this app asks for, by their ids from the service's catalogue |
+| `auth_url`, `token_url` | The provider addresses this app signs in against, copied from the recipe |
+| `client_id`, `client_secret` | From the provider. `client_secret` is absent for a public PKCE app |
+| `events` | Only if this app receives pushes. Whatever the recipe needs to verify them, like a signing secret |
 
-- Every service's value is a list, and every entry declares its `kind`.
-- Every entry has a non-empty `label`, unique within its service.
-- On an `oauth_app`, **`covers` is mandatory.** Empty means "may ask for
-  nothing", never "everything". Every entry in it must exist in that service's
-  permission catalogue, which is checked at the door probe and at every shared
-  connect. An `api_key` entry carries only a `label` and a `key`.
-- An `events` block on a service whose recipe declares no webhook transport is
-  refused. That is configured receiving for pushes that can never arrive.
-- A malformed file is a loud error on every lookup.
-- If `WEFT_ACCESS_APPS_FILE` names a file that is not there, that is an error
-  too. It is only when the variable is unset, and the default
-  `access-apps.json` is absent, that this quietly means "no apps" and hides the
-  shared doors.
+**Permissions are fixed per app.** People pick an application rather than
+ticking boxes, which is why you can list several for one service: a cheap tier
+that avoids a provider's review process, and a fuller one beside it. Each shows
+up as its own labelled choice with its permissions listed.
 
-The broker rereads the file on every lookup, but it reads a copy packed into
-the cluster at daemon-apply time, so editing `access-apps.json` on your machine
-changes nothing until you re-run `weft daemon start`.
+The addresses are pinned here, and a recipe that tries to substitute a
+different sign-in address is refused. A connection through a registered app
+only ever talks to the addresses you wrote.
 
-## Several apps per service
+You also have to register the callback URL the connect panel shows you as the
+app's redirect URL, and re-register it whenever your public address changes.
+Some providers, Slack among them, only accept https callbacks.
 
-Each registered app is its own one-click option in the connect panel, labelled,
-with its `covers` shown as a fixed set.
+## Making it take effect
 
-That is how a cheap permission tier avoids a provider's review process, and how
-one service gets product-shaped options ("Google Drive", "Google Calendar")
-while staying one account underneath.
+The installer hands the file to the runtime, so `./setup.sh` picks it up. After
+that:
 
-## Apps a project ships
+```bash
+weft daemon start
+```
 
-A project may ship a **public** app, meaning PKCE and secretless, under
-`accessApps` in its metadata, inherited from the package root like any other
-key.
+That re-applies it and restarts the piece holding it, in a few seconds.
 
-An entry carrying a `client_secret` fails the metadata load, because project
-metadata is source and source never holds secrets.
+If the file is gone, the runtime keeps the keys it already has and tells you
+so. To actually empty them, `weft daemon start --clear-access-apps`.
+
+Nothing reads your local disk at run time. The file is copied in, so an edit
+does nothing until you re-apply it.
+
+To keep it somewhere else, point `WEFT_ACCESS_APPS_FILE` at it. A file named
+that way and unreadable is a hard error rather than a silent nothing, because
+shipping no apps quietly shows up later as a service nobody can connect on a
+node the operator thought was configured.
+
+## What it refuses
+
+- A service whose value is not a list
+- An entry with no `kind`
+- Two entries with the same label in one service
+- More than one `api_key` for a service
+- An OAuth app with no `covers`
+- A permission in `covers` that the service's catalogue does not have
+- An `events` block on a service with no webhook transport
+- Invalid JSON, or a file you configured that is not there
+
+## Apps a node ships
+
+A node's own `metadata.json` can declare `accessApps` for public applications
+with no secret. Those need PKCE, and metadata carrying a `client_secret` is
+refused: node metadata is source, and source never holds secrets.
+
+An application with a secret belongs in this file.
 
 ## Encryption
 
-Everything sealed at rest goes through `CREDENTIAL_ENCRYPTION_KEY`: base64 of
-32 bytes.
+Everything stored is sealed under `CREDENTIAL_ENCRYPTION_KEY`, which is 32
+bytes in base64:
 
 ```bash
 openssl rand -base64 32
 ```
 
-Unset, a built-in development key is used and a warning is logged. Set a real
-one before you store a credential you care about.
+Set it before you store a credential you care about. Without it weft uses a
+public development key from its own source and warns you once, which protects a
+database dump from nobody.
 
-**Set it once and do not change it.** Every sealed row is opened with the key
-that sealed it, so a different key means every connection you have stops
-opening, and the way back is reconnecting each account by hand. There is no
-rotation ceremony, and the failure surfaces the first time something tries to
-use a credential rather than at boot.
+Keep it. There is no rotation: change the key and everything sealed under the
+old one is unreadable until you put it back. Lose it and you reconnect
+everything.

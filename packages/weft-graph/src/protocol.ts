@@ -2015,12 +2015,6 @@ export type HostMessage =
   /// (which IS the run finishing) and from execReset (a fresh follow).
   | { kind: 'followLost'; color: string; reason: 'closed' | 'error' }
   | { kind: 'execReset' }
-  /// Whether the watched .weft source is currently visible in
-  /// some editor tab. The webview uses this to swap the "Source"
-  /// button into an active/dark state when the source is on
-  /// screen, so the user can see at a glance whether clicking it
-  /// reveals an existing tab vs opens a new one.
-  | { kind: 'sourceState'; open: boolean }
   /// Pushed from the host whenever the action-bar state machine
   /// transitions. The webview is a pure renderer that reads the
   /// latest state from this message. State transitions come from
@@ -2210,11 +2204,11 @@ export type WebviewMessage =
   /// follow. A host that surfaces past executions another way (the VS Code
   /// extension has its own history) leaves this unhandled.
   | { kind: 'replayExecution'; color: string | null }
-  /// User clicked the "open .weft source" button on the graph, or a
-  /// diagnostic's file:line:column in the error details modal. Host
-  /// opens the watched document in a side editor; with a `location`
-  /// it opens THAT file and puts the cursor on the position.
-  | { kind: 'openSource'; location?: SourceLocation }
+  /// User clicked a diagnostic's file:line:column in the error details
+  /// modal. Host opens that file as a text tab beside the graph with the
+  /// cursor on the position; a tab already showing the file is revealed
+  /// wherever it is instead of a second one being opened.
+  | { kind: 'openSource'; location: SourceLocation }
   /// User clicked the action bar's Stop / Cancel affordance. The
   /// host inspects the current ActionBarState to decide:
   ///   - cli_running       -> SIGTERM the spawned CLI process group.

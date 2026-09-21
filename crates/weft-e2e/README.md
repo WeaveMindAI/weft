@@ -30,7 +30,7 @@ ends), and an S3 endpoint (the daemon's SeaweedFS container, whose bucket stays
 across runs because it belongs to the daemon rather than to the suite). You set
 nothing for those.
 
-What is left is the genuinely external services, which come from the
+What is left is the external services, which come from the
 environment. The runner reads the repo-root `.env`, which is gitignored, and
 anything you already exported wins over what it would provision.
 
@@ -47,7 +47,7 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 
 A test whose variables are absent **skips** rather than fails, through
 `env_or_skip` / `env_group_or_skip`, so a partial `.env` still gets you a
-useful run. Which also means a green suite does not prove the skipped ones
+useful run. It also means a green suite does not prove the skipped ones
 work: check the output for what skipped before you trust it.
 
 This is a different mechanism from the node self-tests, which read
@@ -73,8 +73,8 @@ machine and CI end up with the same working system you have.
 execution and stored credential on the machine with it. It is not the way to
 apply a change.
 
-If a test needs a capability the toolkit lacks, extend the toolkit (see "Add a
-test"). Never patch a test to tolerate the wrong state.
+If a test needs a capability the toolkit lacks, see "Add a test". Never patch
+a test to tolerate the wrong state.
 
 ## Add a test
 
@@ -127,8 +127,9 @@ SQL, kubectl) lives in the toolkit so it stays DRY and reviewable.
 Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 `activate` + `live::http_post`; **WebSocket** `activate` + `live::open_ws`;
 **human form** `human::wait_for_form_by_node` + `answer_form`; **dial-out
-(SSE/poll/socket)** a `fakes::*` + `substitute_in_main` + `wait_for_triggered_
-execution`; **infra** `infra::start_and_wait_running` + `terminate_and_wait_gone`.
+(SSE/poll/socket)** a `fakes::*` + `substitute_in_main` +
+`wait_for_triggered_execution`; **infra** `infra::start_and_wait_running` +
+`terminate_and_wait_gone`.
 
 ## Platform layer
 
@@ -144,6 +145,5 @@ reliability only (crash/restart/reap on one machine). The API-driving toolkit is
 auth-agnostic (via the `AuthProvider` seam), so a harness that needs tokens can
 reuse it.
 
-No silent retries (a transient failure is a real bug, surfaced). Always end a
-passing test with `project.finish()`. A bug found in the system is the rig
-working: fix it at the source.
+No silent retries (a transient failure is a real bug). Always end a
+passing test with `project.finish()`.

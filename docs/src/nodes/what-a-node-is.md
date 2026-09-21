@@ -1,139 +1,115 @@
 # What a node is
 
-A node does one thing: calls an API, transcribes a piece of audio, writes a
-row, renders a PDF.
+A folder with two files in it.
 
-It takes its inputs, does that one thing, emits its result, and returns.
-
-## The node does not orchestrate
-
-Looping, retrying, branching, fanning out, gathering results, waiting for a
-person between two steps: all of that is the graph's job, expressed
-declaratively, and the engine gives you per-iteration journaling,
-resumability, and cancellation for free.
-
-When you feel the urge to write one of these in Rust, stop and reach for the
-graph instead:
-
-| The urge | The graph's answer |
-|---|---|
-| a `for` loop driving a multi-step process | a weft `Loop`, firing your node once per iteration |
-| retry with backoff around a call | express the retry in the graph |
-| "call A, then depending on the result call B or C" | wire A's outputs to both, and let each branch's `_should_flow` decide. A node that is told not to run closes its outputs, which skips everything behind it: [the closure rule](../language/mental-model.md#the-closed-pulse) |
-| "work, then wait for a human, then more work" | three nodes |
-
-A node that owns a loop with a wait inside it is a small workflow engine hiding
-inside a node, and it has to solve by hand every problem weft already solved.
-[Durable execution](durable-execution.md#a-loop-with-a-wait-inside-a-node) has
-the survival guide for when a genuine constraint forces that shape on you.
-
-## The node does not do plumbing
-
-A node body contains its own logic and nothing else. No transport choice, no
-credential handling, no acknowledgement protocol, no subscription lifecycle, no
-retry bookkeeping. Those belong to the language, implemented once and hardened
-once, which is why a real node body is usually under a hundred lines. The full
-list of what falls on which side is
-[the commandments of plumbing](../thinking/plumbing.md).
-
-A node that sends a Slack message reads its inputs, builds the request body,
-posts it on the client it was handed, and emits the message id. It has no way
-to find out how the token was acquired, whether the call was measured, or whose
-money paid for it.
-
-Everything it needs arrives through one object: [the ctx](the-ctx.md).
-
-## When the ctx does not have what you need
-
-**First, check it is missing.** The surface is large, and things are named for
-what the caller receives rather than for how they work, so what you want is
-often sitting there under a name you would not have guessed. Skim
-[The ctx](the-ctx.md), or just ask in Discord and save yourself the reading.
-
-**If it really is missing, you are still not blocked.** A node in your own
-project's `nodes/` is nobody's business but yours, so write the workaround
-there and ship it today. The higher bar is for the shared catalog, because that is vocabulary
-everyone inherits.
-
-**Then come and argue for the mechanism.** Whether a thing is weft's job or
-yours is a line we drew and are willing to move, and
-[the commandments of plumbing](../thinking/plumbing.md) is where that line
-is written down, along with how to argue with it.
-
-If it can be expressed as declared data, it becomes declared data. If it
-cannot, it becomes a closed typed variant, added deliberately and
-shared by every service.
-
-`StreamListen` is the example worth knowing. Someone needed a trigger that
-watches a mailbox, and IMAP speaks neither HTTP nor WebSocket. Instead of an
-IMAP branch in the listener, what shipped describes the conversation as data,
-and it now serves IMAP, MQTT, Redis and XMPP alike:
-[the signal kinds](writing-triggers.md#outbound-event-sources).
-
-## One node, one process
-
-A node embodies exactly one user expectation. When one capability answers two
-different questions, build two nodes, even when the machinery underneath is
-identical. The test is what the **user** expects, not what the code does:
-
-- `GoogleSheetsRead` signed in, versus reading a public share link, is **one
-  node**. The expectation is "read this sheet's rows" either way; only the
-  mechanics differ.
-- `SlackReceiveMessage` (your bot, your workspace, a channel you picked)
-  versus `SlackAppMessages` (you own the app; every workspace that installed
-  it) are **two nodes**. Same event stream, different questions, different
-  inputs, different outputs.
-
-Which **transport** serves a capability is never a node split, because the
-expectation is the same either way and the environment decides. Which **scope**
-it operates at always is.
-
-## Why this shape
-
-**It saves the plumbing.** Credential handling, retry logic and cost
-accounting are the bulk of what an integration usually costs to write, and none
-of it is in the node.
-
-**It makes node-building an independent task.** One job, a small context, a
-[test rig](testing.md) that forces the author to prove the node works before it
-ships. That is exactly the task shape a model is good at.
-
-Once a node exists, composition cannot misuse it: the compiler enforces its
-declared contract, and the API call lives inside it.
-
-## The anatomy
-
-A node is a directory:
-
-```
-nodes/my_node/
-  mod.rs              the Rust: a `Node` trait impl
-  metadata.json       the declared surface: ports, config, presentation
-  deps.toml           optional: extra cargo crates this node needs
-  tests.rs            optional: the node's own tests
+```text
+word_count/
+  metadata.json    what it takes and what it gives back
+  mod.rs           what it does
 ```
 
-The trait has three bodies, and the engine picks which to call from the
-manifest. A node never inspects the lifecycle phase itself.
+The `metadata.json` is what makes the folder a node. Put one anywhere under
+your project's `nodes/` directory and weft finds it.
+
+| File | Needed | What it is |
+|---|---|---|
+| `metadata.json` | Yes | The declared surface: ports, types, settings. Go and read [metadata.json](metadata.md) |
+| `mod.rs` | Yes, to run | The Rust: one `impl Node` |
+| `deps.toml` | No | Extra crates, system packages, build environment |
+| `tests.rs` | No | Its own tests. Go and read [testing a node](testing.md) |
+| `images/<name>/Dockerfile` | Infra nodes only | A container this node needs built |
+
+## A folder with metadata and no code
+
+That is not an error. weft finds it, reports it as pending, and leaves it out
+of the build. A program that never names it builds fine, and a program that
+does gets told which folder is waiting for its Rust.
+
+So writing the interface first and the body second is a supported way to work.
+It is also worth knowing when a node you are sure exists comes back as an
+unknown type: check whether its `mod.rs` is there.
+
+## Packages
+
+Drop a `package.toml` in a folder and it becomes a package. Every subfolder
+holding a `metadata.json` is then one of its nodes, found automatically. There
+is no list to maintain.
+
+```text
+slack/
+  package.toml        [package] name = "slack", plus shared dependencies
+  api.rs              shared code, reached from a node as `super::api`
+  metadata.json       optional defaults every node here inherits
+  access/
+    metadata.json
+    mod.rs
+  send_message/
+    metadata.json
+    mod.rs
+```
+
+Package defaults merge key by key, and a node's own value wins. `type`, `label`
+and `description` can never be defaults, because they are one node's identity,
+and the compiler refuses a package file carrying any of them.
+
+Two nodes with the same `type` fail loudly rather than one shadowing the other.
+
+## The trait
 
 ```rust
 #[async_trait]
 pub trait Node: NodeManifest + Send + Sync {
-    /// Infra nodes only. The desired shape of the long-running service.
-    async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag)
-        -> WeftResult<InfraSpec> { /* default: error */ }
-
-    /// Triggers only. Register the wake signal. Called INSTEAD of `run`
-    /// at registration time.
-    async fn setup_trigger(&self, ctx: ExecutionContext)
-        -> WeftResult<()> { /* default: error */ }
-
-    /// The normal body. The only way to fire downstream is
-    /// `ctx.pulse_downstream(output)`.
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    // everything below has a default
+    fn node_type(&self) -> &'static str;
+    async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag) -> WeftResult<InfraSpec>;
+    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    fn tests(&self) -> Vec<NodeTest>;
 }
 ```
 
-Most nodes implement only `run`.
+`run` is the only one you have to write.
 
-Next: [your first node](your-first-node.md).
+`provision_infra` and `setup_trigger` have defaults that fail loudly, naming
+your node, if your metadata said you implement them and you did not. So
+`requires_infra: true` without a `provision_infra` is an error you get told
+about, not a silent nothing.
+
+You never check which phase you are in. The engine reads your metadata and
+calls the right body. For a plain node that means `run` is called in every
+phase, including while a trigger is being set up, because a value feeding a
+trigger's settings has to be produced then too. For a trigger, `run` only fires
+on a real event, with the payload on `ctx.wake`.
+
+## How it gets into the binary
+
+There is no registration file. The compiler walks your `nodes/` folder, finds
+the metadata, and generates the lookup table. Adding a node is adding a folder.
+
+It only generates what your program references, and it emits one cargo crate
+per package, so editing one node recompiles that package and relinks rather
+than rebuilding everything.
+
+Your program's definition is not baked into the binary. The worker fetches it
+by hash at run time, which is why rewiring your graph without touching any Rust
+is a cache hit on the image.
+
+## The one macro
+
+```rust
+#[derive(NodeManifest)]
+pub struct TextNode;
+```
+
+That reads the `metadata.json` sitting beside your file and attaches it to your
+type. It reads the package defaults too, so what your code sees at run time is
+the same merged document the compiler saw.
+
+It checks at compile time that the file is there, is valid JSON, is an object,
+and has a string `type`. Editing the JSON rebuilds the crate.
+
+The struct's name is how it finds the file, so `TextNode` has to live in the
+same folder as its metadata. By convention the struct is the node's `type` with
+`Node` on the end.
+
+Next, [write one](your-first-node.md).

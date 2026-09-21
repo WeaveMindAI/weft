@@ -1,128 +1,126 @@
 # Packaging
 
-A node is either a folder on its own or a member of a package. You want a
-package when several nodes share code.
+Several nodes that belong together, sharing code and dependencies.
 
-## A bare node
-
-A directory with a `metadata.json` at its root. It stands alone.
-
-```
-nodes/reply/
-  metadata.json
-  mod.rs
-  deps.toml        optional
-  tests.rs         optional
-```
-
-## A package
-
-A directory with a `package.toml` at its root. Its members are **auto-detected**:
-every immediate subdirectory holding a `metadata.json`. Adding a node is adding
-a folder.
-
-```
-nodes/slack/
+```text
+slack/
   package.toml
-  api.rs                      shared code, reached as `super::api`
-  metadata.json               optional PARTIAL: defaults every member inherits
+  api.rs                shared code
+  metadata.json         optional defaults for every node here
+  access/
+    metadata.json
+    mod.rs
   send_message/
     metadata.json
     mod.rs
-    tests.rs
-  receive_message/
-    metadata.json
-    mod.rs
+    deps.toml
 ```
 
-`package.toml` carries the package name and the cargo dependencies its members
-share:
+`package.toml` is short:
 
 ```toml
 [package]
 name = "slack"
 
 [dependencies]
-async-trait = "0.1"
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+# cargo deps every node here gets
 ```
 
-Any `.rs` file at the package root is shared code, reached from a member as
-`use super::<filename>;`. That is where the API wrapper goes, and where a
-package defines its own [provider meter](../connections/meters.md) when its
-nodes call a paid service weft does not ship.
+Its presence is what makes the folder a package, and the members are found by
+looking rather than listed.
 
-## Nesting and discovery
+## Shared code
 
-The catalog walk recurses until it hits a **unit**, meaning a directory with
-either a `metadata.json` or a `package.toml`, and then stops descending. So
-units may sit at any depth (`catalog/ai/llm/anthropic/`), and a unit never
-nests inside a unit.
+Any `.rs` at the package root becomes a module, and a node reaches it as
+`super`:
 
-Symlinks are never followed, and `target`, `node_modules`, `.git` and `.weft`
-are skipped. Two units declaring the same node type is a loud collision rather
-than a last-one-wins.
+```rust
+use super::api;
+```
 
-## What gets compiled
+That is where the request-building and the error-reading for one service goes,
+written once instead of in every node that talks to it.
 
-Only what your program actually uses.
+Each package compiles as its own crate, so a node sees its own package's shared
+files and nothing else. Another package's code is never on your path.
 
-The compiler reads every node's `metadata.json` **without compiling any node
-Rust**, which is what makes the editor's live feedback fast. Codegen then emits
-one cargo crate per **referenced** package, containing only the referenced
-nodes, plus a registry mapping node type names to implementations.
+It also means editing one node recompiles that package and relinks, rather than
+rebuilding the world.
 
-So a project using three nodes out of the whole catalog compiles three nodes.
-Nothing scans the filesystem at run time; the generated code names exactly what
-it needs.
+A shared file whose name is not a valid Rust identifier fails at build time
+naming the file.
 
-## Dependencies
+## Defaults
 
-`deps.toml` next to a `mod.rs`, for that one node:
+A `metadata.json` at the package root is a partial document every node
+inherits, key by key, with the node's own value winning.
+
+Put `types`, `tags`, an `icon`, a `color` or a `service` recipe there once.
+
+`type`, `label` and `description` can never be defaults. They are one node's
+identity, and the compiler refuses a package file carrying any of them:
+
+```text
+package-level metadata.json must not set `type`: it is one node's identity,
+not a package default
+```
+
+The merge is shallow: a node's `types` replaces the package's rather than
+adding to it.
+
+## deps.toml
+
+Per node, and every section is optional.
 
 ```toml
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
-
-[build-dependencies]
-cc = "1"
-
-[system.build.apt]
-default = ["pkg-config", "libssl-dev"]
+reqwest = { workspace = true }
 
 [system.runtime.apt]
-default = ["ca-certificates"]
+default = ["ffmpeg"]
+
+[system.build.apt]
+debian_12 = ["pkg-config", "libssl-dev"]
 
 [build.env]
 SOME_PATH = "{{catalog_path}}/vendor"
 ```
 
-Always available without declaring anything: `weft`, `tokio`, `serde`,
-`serde_json`, `async-trait`, `anyhow`, `tracing`, `uuid`.
+| Section | What it is for |
+|---|---|
+| `[dependencies]` | Cargo crates this node needs |
+| `[build-dependencies]` | Cargo build-deps, for the package's own `build.rs` |
+| `[system.build.<manager>]` | OS packages needed to **compile**, thrown away before the runtime image is sealed |
+| `[system.runtime.<manager>]` | OS packages needed to **run** |
+| `[build.env]` | Environment during `cargo build`. `{{catalog_path}}` expands to your node's folder inside the builder |
 
-`[system.*]` entries declare OS packages the node needs, keyed by package
-manager and optionally by distro version. That is what lets a node carry a
-native dependency without every user hand-installing it.
+Managers are `apt`, `apk`, `yum` and `brew`. Under each, a key per distribution
+like `debian_12` or `alpine_3_19`, or `default` for all of them. weft looks for
+the exact key, falls back to `default`, and fails only when neither is there.
 
-Comment each dependency with why it is there.
+`[build.env]` is deliberately narrow. Real build logic goes in a `build.rs`.
 
-## Package-level metadata
+## What you get without asking
 
-A package root may hold a **partial** `metadata.json` of defaults every member
-inherits, which is how a package's nodes share a `types` block or a provider
-name: [Package defaults](metadata.md#package-defaults).
+`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow` and `tracing`
+are always there. So is `weft-providers`.
 
-## Sharing a package
+`weft` also re-exports `serde_json`, `reqwest`, `reqwest_middleware`,
+`async_trait` and `inventory`, so you can name those types without declaring a
+dependency on them.
 
-Copy the folder. A package is self-contained on disk, so putting one in your
-project's `nodes/` is the whole install.
+## Local images
 
-Nothing pulls a package from git for you yet. That command is an open
-contribution slot, and the shape it should take is in
-[CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#pulling-somebodys-nodes-from-git-up-for-grabs).
+An infra node's containers are built from Dockerfiles in its own folder:
 
-Whatever gets built has to hold one property. A project's `nodes/` is the
-complete list of what its programs can do, and nothing outside the project
-folder is reached during a build. That is what makes a project directory
-portable, and what stops an upgrade changing what an existing program does.
+```text
+postgres/database/
+  metadata.json       "images": ["images/credential"]
+  mod.rs
+  images/credential/
+    Dockerfile
+    bootstrap.py
+```
+
+The path is relative to **the node's own directory**, not the package root, and
+the last segment becomes the name you reference in the spec.

@@ -1,179 +1,146 @@
 # Glossary
 
-Terms weft uses in a specific way. If a page used a word and you were not sure
-it meant what you assumed, it is here.
+**Access.** The port type for permission to call a service. One access node
+holds the connection and emits an `Access`; every node that calls that service
+takes one as an input. Nothing secret is in it.
 
-**Access.** The port type for the authorized ability to call a third party. One
-type for every service. What flows on the wire is a small reference, never a
-credential. See [How connections work](../connections/overview.md).
+**Access node.** The node that owns the connection for one service. Its body is
+one line; everything it does is declared in its
+[service recipe](../connections/declaring-a-service.md).
 
-**Access node.** The node that owns the connect for one service and emits an
-`Access` value. Its whole body is one macro.
+**Activation.** Turning a project's triggers on. It runs each trigger's setup,
+which registers subscriptions with providers and dials sockets, then leaves the
+listeners running. `weft activate`.
 
-**Activation.** Turning a project's triggers on: registers every trigger and
-mints its address. One that cannot be served refuses here, loudly.
+**Asset.** A file pulled into your project at build time with `@asset`. Never
+written back to.
 
-**Broker.** The scoped HTTP front door to the database that every tenant-side
-component uses. The dispatcher bypasses it. See
-[How the runtime is built](../running/architecture.md).
+**Bake.** A trigger's settings, prepared and saved without anything listening.
+`weft bake`. What you want while building.
 
-**Bus.** A live channel between nodes alive at the same time. Any number of
-participants, any direction. See
-[Live channels](../language/live-channels.md).
+**Broker.** The scoped front door to the database that every tenant-side
+process uses. Workers, listeners and supervisors ask it; only it and the
+dispatcher touch Postgres.
 
-**Closed pulse.** A pulse carrying no value, meaning "nothing will ever arrive
-here, at this color, at these frames". On a required input it skips the node
-and cascades. This is how branching works. See
-[the closure rule](../language/mental-model.md#the-closed-pulse).
+**Bus.** A live channel between nodes that are running at the same time. Any
+number of participants, each with its own position. It lives exactly as long as
+its worker.
+
+**Closure.** A pulse carrying no value, meaning nothing will ever arrive here
+for this run. It is how a step says no rather than saying nothing. Not `null`,
+which is data.
 
 **Color.** One execution. A re-run is a new color, so "per color" always means
-per execution.
+per run. The first eight characters are enough to name one.
 
-**Connection.** An account somebody hooked up to a service. It lives in the
-access store and holds everything secret. A project's source holds a bare id.
+**Connection.** One account somebody connected to a service. Its credential
+lives in weft's store, sealed, and never in your program.
 
-**Dispatcher.** The control plane. Routes events, manages lifecycle, owns the
-journal, hosts every public URL. Never runs user code.
+**Dispatcher.** The control plane. It routes events, decides what runs where,
+and answers every request about a project or a run.
 
-**Door.** How a connection is obtained. `shared` means a credential this weft
-holds; `own` means the user brings or creates their own.
+**Door.** How a connection is obtained. `shared` uses a credential weft holds;
+`own` means you bring your own.
 
-**Example.** A run spec saved as `examples/<name>.json`: which part of the
-graph to run, what to hand it, and which trigger to fire. `weft run <name>`
-runs it again. See [Versions, seeded runs and frozen
-examples](../running/versions.md).
+**Drift.** Your source having moved ahead of what is running. `weft status`
+names which kind and which verb fixes it.
 
-**Firing.** One call to a node's body, at one color and one frame stack. A node
-can be firing several times at once inside a parallel loop.
+**Example.** A run's starting parameters, saved as `examples/<name>.json`. A
+**frozen** example also holds the outputs you accept as right.
 
-**Frames.** A stack of loop iteration indices. Two pulses only meet at a node
-if their frames match, which is what keeps iterations from mixing.
+**Firing.** One go at one step, identified by its run, its step and its
+frames.
 
-**Frozen example.** Saved starting parameters plus accepted output history
-in `expected`, with optional nodes to focus on during review. Run it on
-current code, then inspect its diff. See
-[Freezing an accepted run](../running/versions.md#freezing-an-accepted-run).
+**Frames.** The stack of loop iteration numbers a firing sits inside. weft only
+combines inputs whose run and frames match, which is what stops iteration three
+eating iteration four's answer.
 
-**Gather port.** A loop output that collects one value per iteration. Typed
-`List[T | Null]`, because an iteration can fail to write.
+**Gather port.** A loop output that collects one value per iteration. It has to
+be `List[T | Null]`, because a failed iteration leaves an empty slot.
 
-**Generator[T].** A typed one-way terminating stream. Exactly one producer,
-exactly one consumer.
+**Generator.** A stream: one producer, one consumer, ordered, typed, and it
+ends. A closure on one is its end rather than a skip.
 
-**Group.** A subgraph with typed boundary ports, behaving as one node from
-outside. See [Groups](../language/groups.md).
+**Group.** Several steps under one name, with declared inputs and outputs. It
+does not exist when the program runs.
 
-**HEAD.** The version your next checkpoint or run is recorded beneath, and
-`weft branch` moves it too. It is also where `--seed` starts looking: see the
-**Seed** entry.
+**head.** The version your next checkpoint sits under, and the run a `--seed`
+inherits from.
 
-**Infra node.** A node that needs a long-running process, declared as a typed
-spec that the supervisor compiles to Kubernetes manifests.
+**Infra node.** A node that needs a container of its own. Nothing starts it for
+you.
 
-**Journal.** The append-only record of an execution: one row per event. Not a
-log. It is the state, in replayable form. See
-[The journal](../running/the-journal.md).
+**Journal.** The append-only record of a run, one row per event. It is what the
+graph shows you and what rebuilds a run that was interrupted.
 
-**Listener.** The tier that holds live event sources. The only tier that knows
-about signal kinds. Never touches the database.
+**Keep.** Marking a file to survive the sweep that clears a run's storage.
+Additive, and there is no un-keep.
 
-**Meter.** The per-provider code that computes the real cost of a paid call
-from the bytes. A node never states a cost.
+**Listener.** The tier that holds the timers, the sockets and the
+subscriptions. The only tier that tells one kind of event source from another.
 
-**Pulse.** One emission travelling to one input port, carrying a value, a
-color, and a frame stack. The only thing that moves in a running program.
+**Meter.** The code that works out what one provider's call really cost. A node
+never states a cost.
 
-**Provided.** A backup input supplied at a `--from` or `--group` start,
-or an output supplied through `--emit`. Real execution input takes
-precedence over a backup. Changed supplied values invalidate affected reuse.
+**Node.** One step of a program. On disk, a folder with a `metadata.json` and a
+`mod.rs`.
+
+**Pulse.** One emission travelling to one input, carrying a value, a color and
+a frame stack. The only thing that moves in a running program.
 
 **Recipe.** The `service` block in an access node's metadata: how a credential
-is acquired, how a request is signed, what the permissions are, how events
+is obtained, how a request is signed, what the permissions are, how events
 arrive.
 
-**Registered app.** One OAuth application this weft signs users in with, living
-in the operator's trusted apps file. A recipe may use one and can never extract
-from it.
+**Registered app.** One OAuth application this installation signs people in
+with, living in the operator's apps file. Its secret never leaves the store.
 
-**Root.** A node no wire feeds. A manual run kicks ordinary roots in its
-selection. Triggers require an explicit fire or supplied outputs.
+**Resync.** Deactivate and re-activate in one go, against your current program.
+What you run after editing anything a live trigger reads.
 
-**Scope** (run). Which part of the graph a run executes, set by `--from`,
-`--emit`, `--target`, `--before` or `--group`, or by saved parameters. See
-[Running one group, or one node onward](../running/versions.md#running-one-group-or-one-node-onward).
+**Root.** A step no wire feeds. A manual run starts every root at the top
+level, plus every trigger.
 
-**Scope** (storage). Which of `Execution`, `Project`, or `Shared` a file is
-written under. It is a lifetime contract, not a folder name.
+**Scope (run).** Which part of the graph a run covers, set by `--from`,
+`--target`, `--before`, `--group` or `--fire`.
 
-**Seed.** The run a `--seed` run inherits from. By default it is head's run,
-once that run has finished or parked on a signal; if head has no run, it is
-the newest finished or parked run on head's version, or on the nearest
-ancestor version that has one. For which of its nodes are taken and which run
-again, go and read the **Stale** entry below; for how weft picks a seed when
-head has no run, go and read
-[Seeding](../running/versions.md#seeding-run-only-what-changed).
+**Scope (storage).** Which of execution, project, shared or asset a file
+belongs to. It decides where new files go and how long they live.
 
-**Signal.** A wake source: a timer, a form, an endpoint, a subscription, a held
-socket. Registered by a trigger, or awaited mid-flow.
-
-**Slice.** A node plus everything upstream of it, hashed together. A seeded
-run compares each node's slice against the seed's and re-runs the ones that
-differ.
-
-<span id="stale"></span>**Stale.** A node a seeded run must run itself
-rather than inherit. A node is stale when:
-
-- you edited it, or anything upstream of it;
-- it is new since the seed, or the seed's run never covered it;
-- it is a root whose kick payload changed, or one the seed never kicked;
-- its supplied starting inputs changed;
-- the seed ran it but it failed, was cancelled, is still running, or is
-  parked waiting on somebody: the question it asked belongs to the seed's
-  run, so answering it would wake the seed rather than this run, and the
-  node asks again;
-- it fired several times inside a loop and did not complete or get skipped
-  in every one of them;
-- it is beyond the permitted `--seed-before` or `--seed-until` boundary;
-- its output contains a live handle tied to the earlier run.
-
-Anything downstream of a stale node is stale, and a loop goes stale whole
-the moment any node inside it does.
-
-**Supervisor.** The tier that runs kubectl for user infrastructure. One holds a
-lease per project.
-
-**Suspension.** A parked firing waiting on a signal. The worker exits. The
-execution costs rows and no compute.
-
-**Trigger.** A node whose firing starts from outside. Two phases: setup at
-activation, then a fire per event.
-
-**Unit.** One pod template inside an infra spec. Each has its own status and
-its own stop behavior, and the infra verbs act on one at a time.
-
-**Version.** The project's program files (`src/`, `weft.toml`, `nodes/`,
-`assets/`, `examples/`, plus the installed
-weft's own version), named by a hash of their contents, so the same code is
-always the same version however many times you run it. Your `layouts/` and
-your notes are not in it. The seeded `nodes/base_catalog/` is not listed file
-by file, but its content hash rides along with the installed weft's version,
-so upgrading the catalog changes the version like any edit. Every run and
-every checkpoint records one.
-
-**Worker.** The compiled project binary, running as a pod, multiplexing
-executions and shutting down when idle.
-
----
-
-## Two words used in a particular sense
-
-**Egregore.** What emerges from a weft program. An egregore is a thing that
-emerges from a collective's structure, and a weft program is a small collective
-of models, people and long-lived nodes behaving as one thing. It does not have
-to contain a model:
-[what is actually being coordinated](../thinking/design-principles.md#0-what-is-actually-being-coordinated).
+**Seed.** The run a `--seed` run inherits from. By default head's run.
 
 **Sequential Diffusion Programming.** Building a program stage by stage against
-a real example, then a second, then a third, until new inputs just work. Named
-for the way the program sharpens pass after pass, the way an image sharpens out
-of noise. See [the chapter](../thinking/sdp.md).
+a real case, rather than describing the whole thing and hoping.
+
+**Signal.** Something that wakes a step: a timer, a form, an endpoint, a
+subscription, a held socket. Registered by a trigger, or awaited mid-flow.
+
+**Slug.** The stable name on a compiler finding, like `type-mismatch`. The slug
+names the rule; the message names the fix.
+
+**Stuck.** A run where steps are holding values that will never add up to
+enough to fire them, and nothing is parked on a signal. Nobody can answer, so
+weft ends it and names every step involved.
+
+**Supervisor.** The tier that runs kubectl for your infrastructure. One holds
+an exclusive lease per project.
+
+**Tag.** A label a run puts on itself, which another run can use to stop it.
+
+**Tangle.** The weft specialist `weft new --assistant` copies into your
+project.
+
+**Trigger.** A node that starts a run from outside. Two bodies: setup, which
+runs once at activation, and run, which fires on each event.
+
+**Unit.** One pod template inside an infrastructure spec. Most nodes have
+exactly one.
+
+**Version.** A snapshot of your project's files, recorded on every run and by
+`weft checkpoint`.
+
+**Waiting for input.** A run parked on a person or a service. The worker shuts
+down and costs nothing, and a fresh one picks the run up when the answer lands.
+
+**Worker.** Your compiled program, running as a pod, serving as many runs at
+once as it can. It shuts itself down 30 seconds after it has nothing left.

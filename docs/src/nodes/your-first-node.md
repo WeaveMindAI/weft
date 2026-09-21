@@ -1,33 +1,28 @@
 # Your first node
 
-The smallest node in the standard library, near enough in full.
+Here is the smallest node in the catalog, whole. `Text` takes a string you
+typed and sends it on.
 
-## `metadata.json`
+`catalog/basic/text/metadata.json`:
 
 ```json
 {
   "type": "Text",
   "label": "Text",
-  "description": "Emit a literal string configured at design time.",
-  "tags": ["basic"],
+  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
+  "tags": ["literal", "string"],
   "icon": "Type",
   "color": "#64748b",
   "inputs": [
-    { "name": "value", "type": "String", "required": true,
-      "label": "Value", "description": "The string to emit." }
+    { "name": "value", "type": "String", "widget": { "kind": "textarea" },
+      "required": true, "label": "Value" }
   ],
-  "outputs": [
-    { "name": "value", "type": "String",
-      "description": "The configured string." }
-  ]
+  "outputs": [ { "name": "value", "type": "String" } ],
+  "requires_infra": false
 }
 ```
 
-`"required": true` is there because `Text` cannot run without a string. For
-every key you can write, and when each one earns its place, go and read
-[metadata.json](metadata.md).
-
-## `mod.rs`
+`catalog/basic/text/mod.rs`:
 
 ```rust
 //! Text: emit a literal string configured at design time.
@@ -49,114 +44,150 @@ impl Node for TextNode {
 }
 ```
 
-That is a working node. Drop that folder under `nodes/` and `Text` is
-available to every program in the project.
+Read an input, send an output. That is the shape of every node.
 
-## The four things to notice
+## Write one
 
-**Everything imports from `weft`.** One crate name, one place to look. It is
-the only author-facing name.
+Make a folder under your project's `nodes/`, anywhere except
+`nodes/base_catalog/`, which gets replaced when you update weft.
 
-**`#[derive(NodeManifest)]` reads the JSON.** At compile time it finds the
-`metadata.json` sitting next to this source file and embeds it. The node's
-type name comes from the JSON's `type` field. You never write `node_type` or
-build a metadata struct by hand, and a missing or malformed JSON is a compile
-error, so the two files cannot drift.
+```text
+nodes/word_count/
+  metadata.json
+  mod.rs
+```
 
-**Reads go through `ctx.inputs`.** One bag, one accessor. It does not matter
-whether the value arrived on a wire, as a literal in the braces, or from the
-input's declared default; the node reads it the same way.
+`metadata.json`:
 
-**`pulse_downstream` is the only way out.** Returning a value does nothing.
-Emitting is an explicit call, because a node may emit on several ports, may
-emit repeatedly on a stream port, and may deliberately emit on none.
+```json
+{
+  "type": "WordCount",
+  "label": "Count words",
+  "description": "Count the words in a piece of text.",
+  "tags": ["text"],
+  "inputs": [
+    { "name": "text", "type": "String", "required": true, "label": "Text" }
+  ],
+  "outputs": [
+    { "name": "count", "type": "Number" },
+    { "name": "longest", "type": "String" }
+  ]
+}
+```
 
-## Naming
-
-Two conventions the codebase holds to everywhere:
-
-- The `type` in metadata is PascalCase: `Text`, `SlackSendMessage`.
-- The struct is that plus `Node`: `TextNode`, `SlackSendMessageNode`.
-- The folder is snake_case: `text/`, `send_message/`.
-- Ports are camelCase: `threadTs`, `postAt`, `scheduledId`.
-
-## A node that actually does something
-
-Here is the shape almost every real node has. It reads a connection, calls a
-service, and emits what came back.
+`mod.rs`:
 
 ```rust
-//! Post a message to a Slack channel and emit its timestamp.
-//!
-//! Emitting the permalink is best-effort: a failure to read it back is
-//! logged and the node still succeeds, because failing here would invite
-//! a retry that double-posts.
+//! Count the words in a piece of text, and find the longest one.
 
 use async_trait::async_trait;
 
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
-pub struct SlackSendMessageNode;
+pub struct WordCountNode;
 
 #[async_trait]
-impl Node for SlackSendMessageNode {
+impl Node for WordCountNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let account: Access = ctx.inputs.get("account")?;
-        let channel: String = ctx.inputs.get("channel")?;
         let text: String = ctx.inputs.get("text")?;
 
-        let slack = ctx.client(&account).await?;
-
-        let posted = slack
-            .post("https://slack.com/api/chat.postMessage")
-            .json(&serde_json::json!({ "channel": channel, "text": text }))
-            .send()
-            .await
-            .node_err("posting the message")?
-            .json::<serde_json::Value>()
-            .await
-            .node_err("decoding Slack's reply")?;
-
-        let ts = posted["ts"].as_str()
-            .ok_or_else(|| weft::node_error("Slack accepted the post but returned no timestamp"))?;
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let longest = words.iter().max_by_key(|w| w.len()).copied().unwrap_or("");
 
         ctx.pulse_downstream(
             NodeOutput::new()
-                .set("ts", ts)
-                .set("channel", channel),
+                .set("count", words.len() as f64)
+                .set("longest", longest)
         ).await
     }
 }
 ```
 
-Everything in it is this node's own business. The token, the refresh, the
-signing, the measurement and whose account is paying all happen below
-`ctx.client(&account)`, where this code cannot see them.
+Now use it. The type name from your metadata is the name you write:
 
-## The header comment
-
-Look at the `//!` block above, and write yours the same way.
-
-A file header states the module's **responsibility in prose** and records the
-**why** behind anything non-obvious. Not a summary of what the code does: what
-you cannot read from the code is why the permalink failure is swallowed, and
-that is what the comment is for.
-
-## Adding dependencies
-
-`deps.toml` next to `mod.rs`:
-
-```toml
-[dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+```weft
+words = WordCount { text: draft.answer }
+show = Debug { data: words.count }
 ```
 
-`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, `tracing` and
-`uuid` are there already, so a `deps.toml` only names what those do not cover.
-More about it, including how to pull in an OS package:
-[Packaging](packaging.md#dependencies).
+`weft run` compiles your node into the program and runs it.
 
-Next: [metadata.json](metadata.md) for the full declared surface, or
-[the ctx](the-ctx.md) for everything a running node can reach.
+## Four things that would have bitten you
+
+**Do not check your inputs.** No asserting that `text` is really a string, no
+unwrapping something you were already promised. Every wire was checked before
+anything ran. A wrong value fails before it reaches your code.
+
+**Do not use `.get(...).unwrap_or(...)`.** That turns a real type error into
+your default and you never find out. `ctx.inputs.get_or("limit", 10)` is the
+same shape and fails honestly.
+
+**Emit each port at most once.** Several calls are fine if they touch different
+ports, which is how you release a value early and a `done` flag at the end.
+Touching one port twice is an error naming it. Anything you never mention is
+closed for you when the body returns, and that closure is what tells everything
+downstream to stop waiting.
+
+**Keep values small.** A value over 100 KB fails the emit, naming the port.
+Bytes go in [storage](storage.md), and what travels the wire is the marker
+saying where they are.
+
+## Failing well
+
+```rust
+let body = response.text().await.node_err("reading the reply")?;
+```
+
+`.node_err("...")` wraps somebody else's error with what you were doing. On an
+`Option`, the message is what the reader sees when it was `None`, so say what
+was missing.
+
+```rust
+weft::node_bail!("pick a destination: a channel or a user");
+```
+
+`node_bail!` is for something your own code worked out. Write the message as an
+instruction, because it is going in front of whoever is building the program.
+
+Your node never names a weft error type. Those two, plus `?` on anything the
+ctx hands back, cover it.
+
+## Then a test
+
+```rust
+#[cfg(feature = "node-tests")]
+mod tests;
+```
+
+and in your `impl Node`:
+
+```rust
+#[cfg(feature = "node-tests")]
+fn tests(&self) -> Vec<weft::NodeTest> {
+    tests::tests()
+}
+```
+
+`tests.rs`:
+
+```rust
+pub fn tests() -> Vec<NodeTest> {
+    vec![NodeTest::fake("counts_words", counts_words)]
+}
+
+async fn counts_words(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig.run(&WordCountNode, json!({ "text": "one two three" })).await.ok()?;
+    assert_eq!(outcome.outputs["count"], json!(3.0));
+    assert_eq!(outcome.outputs["longest"], json!("three"));
+    Ok(())
+}
+```
+
+```bash
+weft test-node WordCount
+```
+
+For the tiers, the rig and what a live test costs, go and read
+[testing a node](testing.md).

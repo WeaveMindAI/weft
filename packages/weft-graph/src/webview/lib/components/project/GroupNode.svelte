@@ -9,7 +9,7 @@
 	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
-	import { portMarkerStyle } from '../../utils/port-marker';
+	import { innerMarkerStyle, portMarkerStyle } from '../../utils/port-marker';
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
@@ -22,6 +22,13 @@
 	// enforced in enrichment's validate_required_ports). Pass an empty set to
 	// portMarkerStyle so they never render as 'empty-dotted'.
 	const noLiteralFilled = new Set<string>();
+
+	/// A boundary port seen from INSIDE the container: the port's colour,
+	/// a size down from the outer handle so the two never read as the
+	/// same dot, and placed in the flow of the port row rather than on
+	/// the box edge.
+	const innerMarker = (color: string) =>
+		innerMarkerStyle(color, '!relative !inset-auto !transform-none');
 
 	let { data, id, selected }: {
 		id: string;
@@ -735,8 +742,8 @@
 						type="source"
 						position={Position.Right}
 						id="{input.name}__inner"
-						style="background-color: {getPortTypeColor(input.portType)};"
-						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
+						style={innerMarker(getPortTypeColor(input.portType)).style}
+						class={innerMarker(getPortTypeColor(input.portType)).class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
 					/>
 				</div>
@@ -778,8 +785,8 @@
 						type="source"
 						position={Position.Right}
 						id="index__inner"
-						style="background-color: {LOOP_COLOR};"
-						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
+						style={innerMarker(LOOP_COLOR).style}
+						class={innerMarker(LOOP_COLOR).class}
 					/>
 				</div>
 			</div>
@@ -839,8 +846,8 @@
 						type="target"
 						position={Position.Left}
 						id="{output.name}__inner"
-						style="background-color: {getPortTypeColor(output.portType)};"
-						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
+						style={innerMarker(getPortTypeColor(output.portType)).style}
+						class={innerMarker(getPortTypeColor(output.portType)).class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}
 					/>
 					<!-- External handle (source), outside connections -->
@@ -890,8 +897,8 @@
 						type="target"
 						position={Position.Left}
 						id="done__inner"
-						style="background-color: {LOOP_COLOR};"
-						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
+						style={innerMarker(LOOP_COLOR).style}
+						class={innerMarker(LOOP_COLOR).class}
 					/>
 				</div>
 			</div>

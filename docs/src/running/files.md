@@ -1,82 +1,92 @@
 # Files at run time
 
-Two different things are called "files" in weft.
+A value on a wire is capped at 100 KB, so anything bigger is stored and what
+travels is a marker saying where it is.
 
-**Project assets** live with your source: an image you dropped onto a node, a
-prompt in its own file, a CSV a program reads. They are referenced with
-`@asset` or `@file` and they are part of the project.
+This page is about the files a running program leaves behind and what to do
+with them. For putting one there from a node, go and read
+[storage](../nodes/storage.md).
 
-**Runtime files** are written by running programs: a generated image, a
-transcription, a cache a project builds.
+## Where they live
 
-The [asset sync](../language/files-and-reuse.md#the-asset-sync) is the bridge:
-before every build it makes storage mirror exactly what the code references.
-
-## How long a runtime file lasts
-
-If you want to know when something you wrote will disappear, look at the
-[scope](../nodes/storage.md) it was written with.
-
-| Scope | Path | Deleted when |
+| Space | Holds | Gone when |
 |---|---|---|
-| Execution | `exec/<run>/` | shortly after the run ends, unless kept |
-| Project | `project/<project_id>/` | the project is deleted |
-| Shared | `shared/<name>/` | the owner deletes it |
+| Execution | What one run made | Five minutes after the run ends, so its output is still downloadable, unless something kept it |
+| Project | Things that outlive a run | `weft clean` or `weft rm` |
+| Shared | Things several projects meet in, by name | You remove them |
+| Assets | Your `@asset` copies | They follow your source |
 
-If you want a file your node emits to survive its own run, mark it kept.
-Otherwise it is swept shortly afterwards and turns up in the editor weeks later
-as expired media.
+The five minute window matters. A run that makes a picture and ends has not
+thrown it away yet, and a link you handed somebody still works for a little
+while.
 
-`KeepTtl::Default` is 30 days and every access bumps the clock, so artifacts
-still in use never expire while abandoned ones age out. The rule and the
-`KeepFile` node are in [Storage](../nodes/storage.md#the-keep-rule).
+## Keeping something
 
-## Finding one afterwards
+A node stores a file with a keep policy, and that is what saves it from the
+sweep: thirty days by default, a span you choose, or forever.
 
-If you want to see what a project has written, or pull one file down:
+Reading a file postpones its expiry, so one that is still in use stays.
+
+There is no un-keep. A file marked to survive survives until somebody removes
+it.
+
+## Looking at them
 
 ```bash
 weft files ls
-weft files inspect <key>
-weft files download <key>
-weft files rm <key>
+weft files ls project/
+weft files inspect exec/9b81d0a2/chart.png
 weft files usage
 ```
 
-The editor has the same thing as a browser, and if you want a stored file's
-address in your source, its picker will paste it in for you.
+`ls` groups by space and shows the size, the filename, and whether a file is
+kept and when it expires. `usage` is the total.
 
-## Public links
+## Getting one out
 
-If you want somebody outside weft to be able to fetch a stored file, whether
-that is a person you are sharing a generated image with or a provider you are
-handing media to, there are two ways and they are for different jobs.
+```bash
+weft files download exec/9b81d0a2/chart.png
+weft files download exec/9b81d0a2/chart.png -o ~/Desktop/chart.png
+```
 
-- **Presigned**, a signed URL carrying its own credentials. This is the one for
-  handing a provider bytes during a single call.
-- **A public link**, a shorter address protected by an unguessable token and
-  served through the same filtered surface as the trigger paths. This is the
-  one for sharing with a person. See
-  [what the proxy passes](../connections/events.md#what---public-url-actually-does).
+It streams straight from storage into a temporary file and renames it only
+after the size checks out, so a download that fails never leaves you a
+plausible half file, and never overwrites a good copy with a broken one.
 
-Both take a time to live and **both expire**: 15 minutes if you do not say, 7
-days at the most. So never emit either on a port, because the URL outlives its
-own validity in the journal and turns into a broken artifact later. Emit the
-stored file itself and mint the link where it is used.
+## Removing them
 
-## Media inside typed values
+```bash
+weft files rm exec/9b81d0a2/chart.png
+weft files rm project/
+```
 
-If your type has file-shaped fields inside it, you do not have to walk it. The
-runtime converts the whole value at a provider boundary, which is what keeps a
-conversation carrying forty images cheap to journal.
+The second form removes a whole space, **including files somebody deliberately
+kept**. It tells you how many of those there are before it does anything:
 
-See [media inside a custom type](../nodes/custom-types.md#media-inside-a-custom-type).
+```text
+About to remove the whole space 'project/': 48 file(s), 12 of them KEPT
+(persisted on purpose).
+Type 'yes' to confirm:
+```
 
-## The object store
+`--yes` skips the question, and is required when there is no terminal to ask.
 
-Underneath, files live in an S3-compatible object store. Locally that is a
-container the installer runs; elsewhere it is whatever S3 endpoint is
-configured.
+## Links
 
-Nothing in the language or the node API depends on which, because a node writes
-through `ctx.storage` and never names a bucket.
+Three kinds, for three audiences, and a node picks the right one:
+
+- a temporary signed link, about fifteen minutes by default
+- a link the open internet can fetch, when this install serves a public address
+- a link a caller of this install can fetch, which is what a route's answer
+  carries in place of a file
+
+They all expire, which is why a stored file travels as a marker rather than a
+URL. The marker keeps working; a link does not.
+
+## When a file goes missing
+
+If a download or a node says a key is not there, it was almost certainly swept:
+an execution-scoped file that nothing kept, past its window.
+
+`weft files ls` tells you what is actually there. If a program's output needs
+to outlive its run, the node that made it has to say so when it stores it.

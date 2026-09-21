@@ -1,125 +1,117 @@
 # Events from a service
 
-Some triggers fire when something happens at an outside service: a Slack
-message lands, a Drive file changes, an email arrives.
+A trigger that waits for a Slack message, a new row in a sheet, a page changing
+in Notion. The service has something to tell you, and there are two roads it
+can travel.
 
-## The two directions
+## The two roads
 
-Every service delivers events in one of two directions, and some offer both.
+**Dial out.** weft makes an authenticated call that hands back a socket
+address, connects out, and holds the line. Nothing needs to reach your machine,
+so this works from a laptop behind a router.
 
-**Your weft calls the service and keeps a line open.** Weft signs in, asks for
-a private connection address, connects out, and holds that line while the
-service sends each event down it. Because your weft made the call, this works
-anywhere with ordinary internet access, including a laptop behind a home
-router.
+**Dial in.** The service posts each event to an address you published. That
+needs [a public address](../build/public-address.md), and it is the only road a
+shared application can use, and the only road most services offer at all.
 
-**The service sends each event to your weft.** The service is given an address
-and posts every event to it, the way any webhook works. That address has to be
-reachable from the internet, which a laptop normally is not.
+You never choose. You name a connection and a filter, and the transport follows
+from what the service declares and what your environment can serve. Dial out
+wins when it is available, because it needs nothing from you.
 
-## A trigger never asks you to pick
+## What a topic declares
 
-It looks at the connection you wired in and uses what that connection can do.
+A service declares a map of topics, because one provider can genuinely report
+along several independent channels at once.
 
-| Trigger | What it uses |
+| Key | What it says |
 |---|---|
-| **Slack Receive Message** (your bot, your workspace) | if your connection is through your own Slack app and you pasted its app-level token, weft holds a line open and nothing is exposed. Otherwise Slack must send events in. |
-| **Slack App Messages** (you own the app; every workspace that installed it) | always the held line, always through your app's app-level token, never a public address |
-| **Google Drive changes** | Google only sends. There is no line to hold. This always needs your weft reachable. |
-| **Email arrivals** | the mailbox is watched over IMAP, a line weft dials out, so no public address is ever needed |
+| `fields` | The named facts of one event, and where each lives in the payload. A dotted path, or `header:X-Some-Header` |
+| `account` | Which stored value names the account on a connection, and where the same id sits on an event. That pair is what routes a shared application's events to the right connection |
+| `socket` | Present when the service offers dial out |
+| `webhook` | Present when the service dials in |
 
-Slack App Messages is a separate node from Slack Receive Message because it
-answers a different question: not "what lands in my channel" but "what lands
-anywhere my app is installed". See
-[one node, one process](../nodes/what-a-node-is.md#one-node-one-process).
+Everything downstream works on the **names**. Subscriptions filter on them and
+triggers fan them out, so neither a filter nor a trigger node ever writes a
+provider's path.
 
-<!-- SYNC: this section <-> crates/weft-access-store/src/subscriptions.rs (no_public_url_error) -->
-## "requires your weft to be reachable from the internet"
+## Receiving a push
 
-When you activate a project whose trigger needs events sent in, and your weft
-has no public address, activation stops with that message.
+A `webhook` topic declares how the provider's pushes are handled:
 
-**Use the direction that needs no public address**, where the service offers
-one. For Slack: connect through your own app and paste its app-level token on
-the connection.
+| Key | What it is |
+|---|---|
+| `verify` | How a push is proved real: an HMAC, an Ed25519 or ECDSA signature, an API key, OIDC, or a token weft minted |
+| `handshake` | The one-off proof of ownership: echo a field from the body, echo a query parameter, or call a URL back |
+| `event_path` | Where the event sits inside the envelope |
+| `route_by` | Whether the event names the provider account, or an id weft minted |
+| `decode` | For an event wrapped in base64 or a form encoding |
+| `subscribe` | The calls that create, renew and cancel the subscription |
 
-**Or give your weft a public address**, covering exactly its trigger
-surface:
+**The secret is never in the recipe.** Every scheme is a protocol with holes,
+and the material comes from the operator's application config, or from a token
+weft minted. That is what lets a recipe live in source.
 
-```bash
-./setup.sh --public-url
+## What activation does
+
+For a dial-in topic, **the first subscribe happens then**. So a missing public
+address or a provider refusing is that activation's error, not a mystery three
+days later:
+
+```text
+this trigger cannot be served on the 'slack' connection: the service declares
+no transport for this topic
 ```
 
-Then activate the project again.
+And the one you are most likely to meet:
 
-## What `--public-url` actually does
-
-Two small pieces start inside your local cluster.
-
-An **outbound tunnel**: your machine dials out to a relay service and receives a
-random public `https://` address. The relay forwards what arrives there back
-down the same connection. Nothing on your machine starts listening for inbound
-connections, and no router configuration is involved.
-
-A **filtering proxy** between the tunnel and weft. Four addresses pass through
-it, and nothing else does:
-
-- `/events/...`, where services deliver event pushes. Every push is verified
-  (a signature, a secret only the real service and your weft share) before
-  anything acts on it.
-- `/signal/...`, the per-signal fire links weft mints, each protected by its
-  own unguessable token.
-- `/public/files/...`, the share links you mint yourself for stored files. A
-  link carries its own unguessable token, expires, and only ever serves the one
-  file it names. See [Files](../running/files.md).
-- `/access/oauth/callback`, exactly that path, where a provider hands back the
-  code at the end of a sign-in you started.
-
-Plus the root, which shows a small weft page, and the icon on it. Every other
-address answers "not found", so your projects, executions, and settings are not
-reachable through the tunnel, and it cannot be used to browse or operate your
-weft.
-
-The address is printed when the install finishes, and `weft daemon status`
-prints it any time after.
-
-## Two things to know about the address
-
-**It is random, and it changes whenever the tunnel reconnects.** A reboot, a
-cluster restart, a dropped connection. Anything registered against the old
-address at a provider (Slack's event request URL, an OAuth redirect URL) stops
-working until you re-register it.
-
-When it changes, run `./setup.sh --public-url` again so active triggers are
-re-pointed at the new address, then update the provider-side registrations. If
-you own any domain, give your weft a permanent hostname instead and the
-registrations never rot: [A public address](public-address.md).
-
-**Anyone who knows the address can send requests at those four addresses**,
-which is what they are built for: every push is signature-verified and every
-fire link carries its own unguessable token. When you no longer need triggers
-delivered from outside, close it:
-
-```bash
-./setup.sh --no-public-url
+```text
+this trigger needs 'slack' to deliver events TO your weft, which requires your
+weft to be reachable from the internet, and it is not. If you accept making its
+public trigger surface reachable, rerun ./setup.sh --public-url and re-activate;
+or use a connection that supports dialing out (your own provider app), where
+the service offers one.
 ```
 
-## Per-service setup notes
+A decision that a trigger cannot be served is final for that registration.
+Retrying would work out the same facts again. Reconnecting the account
+re-registers it and works them out afresh.
 
-**Slack, through your own app** (no public address needed): in your app's
-settings, enable Socket Mode and mint an app-level token with the
-`connections:write` scope, under Basic Information then App-Level Tokens. Paste
-it in the connection's app token field.
+If a topic is not in the connection's snapshot, the account predates it:
 
-**Slack, events sent to your weft**: under Event Subscriptions, set the Request
-URL to `<your public address>/events/slack/messages`, subscribe the bot to
-`message.channels`, and put the app's Signing Secret in your `access-apps.json`
-under that app's `events` block.
+```text
+'slack' declares no event topic named 'reactions'; reconnect the account (an
+older connection may predate the topic)
+```
 
-**Google Drive watch**: Google only pushes to addresses on domains verified in
-the app's Google console, so register your public address's domain there. Weft
-renews the watch automatically while the trigger is active.
+## Renewal
 
-**Email**: nothing to set up. The `email` package watches the inbox over IMAP,
-a connection weft dials out, so it works with no public address on any provider
-serving IMAP. With Gmail or Outlook, use an app password.
+Most providers expire a subscription. The recipe says the margin, and weft
+re-subscribes before the deadline.
+
+**A renewal is a fresh subscribe**, with a new id and a new token, because the
+providers surveyed have no extend verb, and reusing the token would make the
+old and new channels impossible to tell apart.
+
+If a topic declares no unsubscribe, deactivating cannot hurry it and the
+subscription lapses on its own expiry.
+
+## An application-wide subscription
+
+Some apps want every install's events rather than one account's. That only
+works over dial out, because a push receiver routes each event to one account's
+connections and could never deliver "every install of your app".
+
+```text
+an app-wide subscription only works over a dial-out transport, and this topic
+declares none
+```
+
+## Which triggers need a public address
+
+Only the ones where the provider pushes. A timer, a poller, a socket weft dials
+out to and a form somebody fills in all work with nothing reachable from
+outside.
+
+For the address itself, go and read
+[a public address](../build/public-address.md). For declaring a topic, go and
+read [declaring a service](declaring-a-service.md).

@@ -1,450 +1,151 @@
 # Infrastructure nodes
 
-Some capabilities need a long-running process the user cannot easily run
-themselves: a WhatsApp bridge holding a phone session, a headless browser, a
-local model server, a database.
+Some nodes need something running: a database, a model server, a bridge that
+holds a session open. Your node returns a description of it, and the supervisor
+makes the cluster match.
 
-Weft calls those **infra nodes**. The node returns a typed spec describing what
-should run, the supervisor compiles it to Kubernetes manifests and applies
-them, and the node talks to the running pods over HTTP at fire time.
-
-You never write YAML. You build the spec with typed Rust structs, and the
-compiler turns it into Deployments, Services, PVCs, NetworkPolicies, and
-autoscalers, stamping every label it needs.
-
-## Two methods
-
-An infra node sets `requires_infra: true` in its metadata and implements two
-bodies.
-
-**`provision_infra(ctx, input) -> InfraSpec`** returns the desired shape. It
-emits no pulses, it just describes what should run, and its context carries
-`project_id`, `node_id`, `namespace` and `tenant_id`.
-
-**`run(ctx)`** is the node's actual logic. By the time it executes, the
-infrastructure is applied and it can resolve its endpoints.
-
-## Return the same spec every time
-
-`provision_infra` runs on `weft infra start` and `weft infra upgrade`, and on
-nothing else. The supervisor compares what you returned against what is already
-applied: identical, it does nothing; different, it changes the cluster.
-
-So build the spec **only** from your inputs and your node's identity. No
-clocks, no random values, no generated passwords.
-
-If your service needs a password, the container generates it on first boot and
-keeps it on its own volume, and `run` asks the container for it. A password in
-the spec would be a different password on every start, while the container
-keeps answering to the first one, and no restart would ever fix it.
+```json
+"requires_infra": true,
+"images": ["images/credential"],
+"publishes": "postgres"
+```
 
 ```rust
-async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: ValueBag)
+async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag)
     -> WeftResult<InfraSpec>
 {
-    const PORT: u16 = 8090;
+    let database: String = input.get("database")?;
     Ok(InfraSpec {
         units: vec![Unit {
-            name: "bridge".into(),
-            on_upgrade: UpgradeBehavior::Recreate,
-            containers: vec![
-                Container::new("whatsapp", Image::Local { name: "bridge".into() })
-                    .with_env(vec![EnvEntry::Literal {
-                        name: "PORT".into(), value: PORT.to_string() }])
-                    .with_ports(vec![ContainerPort {
-                        name: "http".into(), port: PORT, protocol: Protocol::Tcp }])
-                    .with_readiness(Probe::http("/health", PORT).with_initial_delay(5)),
-            ],
+            name: "db".into(),
+            containers: vec![Container { /* image, env, ports, probes */ }],
             ..Default::default()
         }],
-        endpoints: vec![Endpoint {
-            name: "api".into(), unit: "bridge".into(), container: "whatsapp".into(),
-            port: "http".into(), expose: Expose::ClusterInternal,
-        }],
+        volumes: vec![Volume { /* the disk */ }],
+        endpoints: vec![Endpoint { name: "sql".into(), /* ... */ }],
         ..Default::default()
     })
 }
 ```
 
-## The spec
+Declaring `requires_infra: true` without writing `provision_infra` is an error
+naming your node, rather than a silent nothing.
 
-`InfraSpec` has all-defaulted fields, so `InfraSpec::default()` is valid.
+## The spec
 
 | Field | What it holds |
 |---|---|
-| `units` | pod templates. Most nodes have one. |
-| `volumes` | PVCs, emptyDirs, mounted ConfigMaps and Secrets |
-| `config` | Secrets and ConfigMaps to create, inline or by reference |
-| `endpoints` | named ports exposed through Services |
-| `access` | network policy: ingress and egress. Default is workers in, internet out. |
-| `lifecycle` | terminate policy, including which PVCs to preserve |
+| `units` | Pod templates. Most nodes have exactly one |
+| `volumes` | Disks, kept across upgrades by name |
+| `config` | Secrets and configmaps, inline or by name |
+| `endpoints` | Named ports, which is how your node and other nodes reach it |
+| `access` | Network rules on top of the project's default-deny |
+| `lifecycle` | What stop, upgrade and terminate mean for this node |
 
+Each unit has containers, init containers, pod options, and its own replica
+count. The count is on the unit rather than the node, because one node can want
+a primary at one replica beside three of something else.
 
-### `Unit`
+## The spec has to be stable
 
-One pod template, and the **operational** unit: each has its own status and
-its own stop behavior.
+**Write the same spec every time, for the same inputs.** weft compares what you
+return against what is running, and re-applies when they differ.
 
-| Field | Meaning |
+So never generate a password inside `provision_infra`. Every call would produce
+a different spec, and your database would be redeployed on every check.
+
+If your container mints its own credential on first boot, that is what
+`ctx.publish_access` is for: the container makes it, your node publishes it
+once, and `ctx.published_access()` reads it back afterwards.
+
+## Local images
+
+A Dockerfile in your node's own folder, named in `images`:
+
+```text
+postgres/database/
+  metadata.json       "images": ["images/credential"]
+  images/credential/
+    Dockerfile
+```
+
+The last path segment is the name you reference in the spec. The path is
+relative to your node's directory.
+
+An upstream image reference passes through exactly as you wrote it, and **a
+mutable tag is not resolved to a digest**. So `postgres:16` rolling underneath
+you produces no change in the spec and no re-apply. Pin by digest if you want
+an image change to actually land.
+
+## Reaching it
+
+```rust
+let endpoint = ctx.endpoint("sql").await?;
+let (host, port) = endpoint.host_and_port()?;
+```
+
+`ctx.endpoint(name)` resolves one of your declared endpoints and waits until
+something actually answers there, rather than handing you an address the
+moment Kubernetes says the pod is ready.
+
+| Call | Gives you |
 |---|---|
-| `name` | required |
-| `kind` | `Deployment` (default), `StatefulSet`, `DaemonSet`, `Job` |
-| `containers`, `init_containers`, `pod_options` | the pod's contents |
-| `scaling` | `replicas`, plus an optional autoscaler. Per unit. |
-| `on_upgrade` | `Rolling{...}` (default) or `Recreate`. Honored for Deployments. |
-| `on_stop` | `ScaleToZero` (default) or `NoOp`. See lifecycle below. |
-| `health` | per-unit flaky and recovery windows. Unset means the supervisor's default of 30 seconds. |
+| `url()` | The address, cached, no round trip |
+| `host_and_port()` | The two apart, for a client that wants them that way |
+| `call(method, path, body)` | An HTTP request against it, retried once through a routing gap |
 
-### `Container`
+It works during provisioning after the apply, and in every later phase once the
+infrastructure is running. If the endpoint is not declared, or the
+infrastructure is down, the error says which and points at `weft infra status`.
 
-No `Default`, because the image is mandatory. Build with
-`Container::new(name, image)` and chain:
+## A live panel
 
-`.with_env` `.with_ports` `.with_resources` `.with_mounts` `.with_readiness`
-`.with_liveness` `.with_startup` `.with_command` `.with_args`
-`.with_security_context` `.with_pre_stop`
-
-`pre_stop` is a Kubernetes preStop hook. **Weft calls no Rust callback at stop
-time**; graceful shutdown lives entirely in the container.
-
-### The rest
-
-**`Image`** is `Image::Local { name }`, built from a directory listed in the
-node's `images` and hash-tagged by the CLI, or `Image::Upstream { reference }`
-such as `"postgres:18"`.
-
-**`Endpoint`** is `name`, `unit`, `container`, `port` (the named container
-port), and `expose`: `ClusterInternal` (default), `TenantPublic{path}`, or
-`NodePort{port}`. The unit-container-port chain is validated at compile time.
-
-**`Volume`** is `Persistent { size, storage_class?, access_modes }`, preserved
-across stop and upgrade and deleted on terminate unless listed in
-`preserve_pvcs`, or `EmptyDir`, `ConfigMap`, `Secret`.
-
-**`Access`** is ingress rules (`FromWorkers` default, `FromInternet`,
-`FromCidrs`, `FromLabel`) plus egress (`ToInternet` default, `ToCidrs`),
-compiled to one NetworkPolicy on top of the namespace baseline.
-
-A bad spec fails the apply loudly and the node shows `Failed` with the
-reason.
-
-## Talking to your infrastructure
-
-```rust
-let api = ctx.endpoint("api").await?;
-let out = api.call(EndpointMethod::Get, "/outputs", None).await?;
-let url = api.url();                        // the bare service URL
-let (host, port) = api.host_and_port()?;    // for a client that stores them apart
-```
-
-**`ctx.endpoint` does not return until something answers on that address.**
-
-An address exists as soon as the infrastructure is accepted, which is before
-your container has finished starting. So this waits out the gap and your first
-call never lands on a refused connection.
-
-There is no time limit, because a first boot takes as long as it takes. A wait that is taking a while
-says so in the node's log every few seconds, and `weft stop` ends the run.
-
-The endpoint resolves only when the **whole node** is running, meaning all its
-units. An endpoint is a front door to the node, so a request must not land
-while a sibling unit is degraded.
-
-### Only the declaring node
-
-`ctx.endpoint(name)` works only for the node that **declared** the endpoint. A
-sibling node gets the URL by the declaring node exporting it as an output port
-and wiring it downstream:
-
-```rust
-// the bridge node, in run:
-let api = ctx.endpoint("api").await?;
-ctx.pulse_downstream(NodeOutput::new().set("apiUrl", api.url())).await
-
-// the send node, in run:
-let base: String = ctx.inputs.get("apiUrl")?;
-let resp = post(format!("{}/action", base.trim_end_matches('/')), body).await?;
-```
-
-The author chooses what to send downstream, and with several endpoints exports
-each by name.
-
-## Letting a client outside the cluster in
-
-Everything above is for a node talking to its own infrastructure, and by
-default that is the only thing that can reach it: an endpoint is a ClusterIP,
-and the network policy lets workers in and nobody else.
-
-Sometimes that is not enough. A frontend needs the program's Postgres for its
-own sign-in tables. You want a `psql` session to see what a run wrote. A
-dashboard wants to read the same database the program writes. All of those are
-one thing: a client that is not a weft node, speaking the service's own
-protocol.
-
-If your endpoint can serve such a client, say so:
-
-```rust
-Endpoint {
-    name: "sql".into(),
-    unit: "db".into(),
-    container: "postgres".into(),
-    port: "sql".into(),
-    expose: Expose::SameNetwork,
-}
-```
-
-That is the whole of it. The endpoint says it is reachable and it is, the same
-way a volume you declare is a volume you get. Nothing opens a door after the
-fact, and nothing in the project's source can open one your node did not
-declare, so reading the node tells you what is reachable.
-
-"The same network" means the machine on a local install, where the door binds
-to loopback so nothing else on your network can reach it, and the cluster's
-own subnet in a deployed one. It never means the internet. No `Expose` reaches
-the internet except `TenantPublic`, which is HTTP and goes through the ingress.
-
-### Let the author decide, with an input
-
-A door is rarely something every user of your node wants, so make it theirs to
-choose. `provision_infra` runs with your node's inputs already computed, so
-you branch on one like any other decision:
-
-```rust
-let reachable: bool = input.get("reachable")?;
-...
-expose: if reachable { Expose::SameNetwork } else { Expose::ClusterInternal },
-```
-
-That is how `PostgresDatabase` does it, with a `reachable` input that is off
-by default. The lever is an ordinary port with a label and a description, it
-shows up in the graph next to the disk size, and whether a database is
-reachable reads as part of what the program is.
-
-### Finding the address
-
-The port is not yours and not the author's: the cluster allocates it, so that
-two projects can each have a door without colliding. So the address is not in
-the source, and asking the runtime is how anyone learns it:
-
-```
-$ weft infra list-doors
-db.sql  127.0.0.1:30080
-```
-
-That command only ever reports. There is nothing to open or close, because the
-node already said.
-
-### The rule: never a credential endpoint
-
-If you write only one thing down from this page, write this one.
-
-**An endpoint that hands out a credential is never `SameNetwork`.** Not when
-it would be convenient, not when it is guarded by a token, not when it only
-answers once.
-
-`PostgresDatabase` is the worked example, because it has one of each. Postgres
-itself listens on `sql`, and reaching it still costs you a password, so that
-endpoint is `SameNetwork`. Beside it runs a small server that mints that
-password, on `credential`, and that one stays `ClusterInternal` for ever. A
-door onto it would hand the database away to anything that could reach the
-port.
-
-The test on your own node: if reaching this port gives somebody something they
-could not already have, it is not `SameNetwork`.
-
-### Which connection the door hands out
-
-A door is half of letting a client in. The other half is what that client
-connects AS.
-
-The simple answer, and the one you get for free, is the connection your node
-already publishes: the same one the program's own nodes use. That is what a
-door carries unless you do something about it, and for plenty of services it
-is the only answer there is.
-
-It is worth doing something about it when your service can express a narrower
-identity AND the wider one can destroy things the program depends on. A
-database is the clear case: the connection your node publishes owns the
-tables, and the client coming through the door is usually somebody's frontend,
-written fast, which should not be one typo from dropping them. Where the
-service supports it, a node can mint a second identity for the door (a
-database role with its own schema, a broker user scoped to its own topics) and
-publish that instead.
-
-Two things to hold on to. This is a capability, not a rule: a service with no
-notion of a second identity has nothing to mint, and a node that publishes one
-connection is not wrong. And like the door itself, it is a choice you give the
-author rather than one you make for them: a second input, branched on in the
-same body, so a program that wants the full connection through the door says
-so and gets it.
-
-The rule that IS absolute is the one above: an endpoint that hands out a
-credential is never `SameNetwork`. That one holds whatever anybody intends.
-
-## The routes your container serves
-
-| Route | Method | Called by | Contract |
-|---|---|---|---|
-| `/health`, or any path | GET | the readiness probe | return 2xx when ready. Wire it with `Probe::http("/health", port)`. |
-| `/live` | GET | the dispatcher, which proxies the editor's poll and any client that holds a token for this node's display | return `{ "items": [{ "type": ..., "label": "...", "data": "..." }] }`, where the type is `text`, `image`, `progress` or `secret`. This is the node's **display**, the same shape a trigger's kind serves, and [what your node shows in the graph](showing-things-in-the-graph.md#its-display) has the whole of it. The editor asks every three seconds while the graph is open. An item may carry a button: `"action": { "label": "Disconnect phone", "actionKind": "unpair", "confirm": "..." }`, and `payload` if the press carries data. |
-| `/action` | POST | the dispatcher, when a `/live` button is pressed | the same envelope sibling nodes use: `{ "action": "<actionKind>", "payload": {...} }` in, `{ "result": {...} }` out. A `result.error` string is your refusal, shown to the user as it is. The editor polls `/live` again right after, so whatever the press changed (a fresh QR code) shows at once. |
-| `/outputs` | GET | the declaring node's own `run` | return a flat JSON object; the node folds each key into an output port |
-| `/action`, `/events`, ... | any | sibling nodes, through the wired URL | your own convention |
-
-`/live` and its buttons' `/action` are special because the **dispatcher**
-calls them, so it has to know which endpoint serves them. An answer that is
-not that envelope comes back to the reader as an error naming what you sent,
-rather than as an empty panel:
+If your container serves `/live`, name that endpoint and the editor shows the
+panel on your node:
 
 ```json
 "features": { "liveEndpoint": "api" }
 ```
 
-Naming the endpoint **is** opting in. There is no separate flag, and unset
-means no live panel.
+That is how a bridge shows the QR code you have to scan. Go and read
+[showing something in the graph](display.md).
 
-## Lifecycle
+## What the supervisor does
 
-Everything below acts on one unit at a time, and every unit belongs to one
-INSTANCE: the node at one place in the program. A node written in
-`src/main.weft` is one instance. A node inside a file the program includes
-runs once per include, so `one = @include("store.weft")` and `two =
-@include("store.weft")` provision two databases, `one.db` and `two.db`, each
-with its own disks, its own endpoint and its own line in `weft infra status`.
-That spelling is how you name an instance to every verb below.
+It takes an exclusive lease on the project, applies your spec, and watches
+whether what it created is healthy. If it dies between changing the cluster and
+recording that it did, the next one works out what to do from what the cluster
+looks like rather than trusting the record.
 
-**`weft infra start`** brings down units up to spec, leaving units already up
-alone.
+A unit that was healthy and drops below its readiness threshold is marked
+flaky, and the supervisor restarts it with a backoff.
 
-**`weft infra stop`** takes units down per their `on_stop`:
+There is no time limit on coming up, because a model server pulling weights can
+take a long time. Somebody waiting on yours reads `weft infra logs <node>` and
+cancels if it will never come.
 
-- `ScaleToZero` (default): scale the workloads to 0. PVCs and Services are
-  kept, so the endpoint URL stays stable and a later start is fast.
-- `NoOp`: the unit **stays up**. For a unit expensive or slow to recreate (a
-  model that took an hour to download, a license server with live sessions)
-  that downstream work depends on. Only terminate, or an explicit force-stop,
-  takes a NoOp unit down.
+## Two things a user has to do themselves
 
-**`weft infra upgrade`** is stop then start. ScaleToZero units cycle onto the
-new spec; NoOp units stayed up through the stop, so start leaves them frozen at
-their current version. If you want to update a frozen one, force it:
+Nothing starts your infrastructure for them. Not a run, not a build, not
+activation. `weft infra start` is a verb they type, because a container costs
+money and weft will not spend it on a click that did not mention one.
 
-```bash
-weft infra node-stop <node> --force   # ignores on_stop
-weft infra start                       # recreate at the new spec
+And `weft infra stop` keeps the disk while `weft infra terminate` deletes it.
+If your node has data worth keeping, say so in the `lifecycle` and the volume,
+because that is what decides whether a terminate takes it.
+
+## Testing one
+
+```rust
+let outcome = rig.run_provision_infra(&PostgresNode, json!({ "database": "app" })).await.ok()?;
+let spec = outcome.infra_spec()?;
+assert_eq!(spec.units[0].name, "db");
 ```
 
-`--force` is the conscious "I accept the downtime", which is why the graph's
-per-node right-click stop uses it automatically.
+`fake` is the top tier here too, and the rig will answer or refuse an endpoint
+so you can test both roads:
 
-**`weft infra terminate`** deletes everything for the node, PVCs included
-unless listed in `lifecycle.on_terminate.preserve_pvcs`. Deleting a node from
-the graph terminates it on the next sync; removing a single unit from a spec
-terminates that unit's workloads on the next apply.
-
-## Health
-
-The supervisor watches each unit's replicas. A unit continuously below its
-readiness threshold for `flaky_after_seconds` is marked flaky; continuously
-ready for `recovery_after_seconds` returns it to running. Both default to 30
-seconds and are overridable per unit through `Unit.health`.
-
-Health is per unit, so one flaky sidecar does not drag a healthy primary down,
-and a project's health protocols can target a specific unit for remediation:
-bounce pods, scale, park triggers.
-
-## Security and resources are yours
-
-The compiler stamps labels and namespaces and adds **no security context or
-resource limits on your behalf**. Isolation between namespaces comes from the
-namespace boundary and the baseline network policies; what happens inside your
-own namespace is yours to set.
-
-Set resource requests and limits, and a security context that satisfies the
-Kubernetes restricted baseline: run as non-root, read-only root filesystem,
-drop capabilities, default seccomp. Your image has to cooperate by running as
-the chosen user and tolerating a read-only filesystem, and if it cannot, leave
-the security context off. Without limits a runaway container can starve its own
-node.
-
-## Every state has a way out from the graph
-
-A service reaches states only its operator can leave: a phone whose pairing
-died half way, a password that was handed over once and lost, a session a
-provider revoked. If the only way out is `weft infra terminate`, the user
-loses the disk to fix a login, and that is a dead end the node put them in.
-
-So for every state your container can sit in, name the action that leaves
-it, and put that action on the node's card as a button on a `/live` item
-(the contract is in the routes table above). The WhatsApp bridge offers
-**Disconnect phone** in every state, which drops the pairing and shows a
-fresh QR code; the Postgres node offers **Reset password**, which mints a
-new one over the database's own socket and makes it readable again. A
-button works whether the service is healthy, stuck, or half way through
-something, because the stuck state is the one that needs it. The test:
-walk your container's states and ask, for each, what a user does from the
-graph to leave it. If the answer is "restart the infra" or "delete the
-disk", that state needs a button.
-
-## Nothing fails quietly
-
-Your container is a service other nodes lean on, and its pod log is the only
-place anyone can read what it did. Two rules, and they are what makes a
-problem inside your image findable at all.
-
-**Every failure writes a line.** Anything that goes wrong writes one line to
-the container's stdout or stderr, with the cause, so `weft infra logs <node>`
-shows it. A library logger set to silent is the same as no log: set it to
-warn or up. A dependency that is optional at install time is a failure
-waiting to be silent (a step that quietly skips when the package is
-missing), so pin it in the image.
-
-**A success is earned or it is an error.** Answer the node that asked with an
-error whenever the thing it asked for did not fully happen, and let the node
-fail on it. A message id for a message the recipient will never see, a
-partial result with no mention of what is missing, a step that could not run
-and was skipped: each of those is an error to the caller, however the
-underlying library reports it. When the library reports it only through its
-own logger, check the outcome yourself before answering.
-
-The WhatsApp bridge is the example that fixed the rule: a voice note went out
-stamped with a mime WhatsApp accepts and never shows, the bridge's Baileys
-logger was silent, and the node got a message id for a message that never
-arrived. Nothing anywhere said so.
-
-## Two behaviors to know
-
-**Mutable upstream tags do not trigger drift.** `Image::Upstream` with a tag
-like `:latest` passes through verbatim and is never resolved to a digest. If
-the tag rolls underneath you, the spec hash does not change, so nothing
-surfaces an available upgrade. `weft infra upgrade` still re-applies if you
-know there is a new version. Use a digest for reproducibility.
-
-**`/outputs` against your declared output ports is a convention**, not
-enforced. Keep them in sync by hand.
-
-## Packaging
-
+```rust
+rig.declare_endpoint("sql", "http://localhost:5432");
+rig.answer_endpoint("sql", "/health", json!({ "ok": true }));
 ```
-nodes/whatsapp/
-  package.toml
-  bridge/
-    mod.rs
-    metadata.json         requires_infra, images, features, ports
-    deps.toml
-    images/bridge/        a Dockerfile and its source
-```
-
-```json
-{
-  "type": "WhatsAppBridge",
-  "requires_infra": true,
-  "images": ["images/bridge"],
-  "outputs": [{ "name": "apiUrl", "type": "String" }],
-  "features": { "liveEndpoint": "api" }
-}
-```
-
-Each entry in `images` is a directory relative to the package root containing
-a `Dockerfile`. Its basename is the `Image::Local { name }`. The CLI hashes the
-directory, tags the image, and loads it into the local cluster.

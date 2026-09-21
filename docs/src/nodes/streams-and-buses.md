@@ -1,171 +1,141 @@
 # Streams and buses in Rust
 
-The graph-level story is in [Live channels](../language/live-channels.md).
-This page is the node author's side.
+For which of the two you want, go and read
+[streams and buses](../language/streams-and-buses.md). This is the Rust on both
+sides.
 
 ## Producing a stream
 
-A `Generator[T]` output accepts repeated emissions. Emit items with the call
-you already use, keep your state in ordinary local variables, and the stream
-ends when your body returns.
+Declare a `Generator[T]` output, then emit as many times as you like:
 
 ```rust
-// metadata.json: { "name": "rows", "type": "Generator[Row]" }
-
-for row in read_rows(&file) {
-    if keep(&row) {
-        ctx.yield_downstream(
-            NodeOutput::new().set("rows",
-                serde_json::to_value(row).node_err("encoding the row")?)
-        ).await?;
-    }
+for chunk in response_chunks {
+    ctx.pulse_downstream(NodeOutput::new().set("chunk", chunk)).await?;
 }
-// body returns: the engine closes the stream
 ```
 
-An open connection, a paging cursor, a decoder's state: all of it is just
-locals across the loop, because the producer body stays alive for the whole
-stream.
+Each emission is one item, checked against the element type. When your body
+returns, the port closes and that is the end of the stream. To end it early,
+`ctx.close_port("chunk")`. After a close, nothing can follow.
 
-If your body returns an error instead, the stream closes as **failed**, and
-the consumer's pull gets your error rather than a clean end.
+`pulse_downstream` sends and carries on. If you are producing faster than the
+consumer reads, use `yield_downstream`, which waits until each item is taken.
 
-### Yield or pulse
-
-```rust
-ctx.yield_downstream(output).await?;    // returns once the item was pulled
-ctx.pulse_downstream(output).await?;    // returns immediately, item buffers
-```
-
-`yield_downstream` is lock step. Your body waits on each item until the
-consumer takes it, so the buffer never grows past one and you always know your
-items landed.
-
-`pulse_downstream` runs ahead. Items buffer on the edge, bounded at 4096 by
-default, and an emission past the bound **fails your node loudly** rather than
-growing until the pod runs out of memory.
-
-A producer that deliberately runs far ahead raises its own bound:
-
-```rust
-ctx.set_max_buffered_items("rows", 100_000)?;
-```
-
-Only legal on a `Generator` output, refused for 0, and it applies to the
-emissions that follow the call. Before or between emissions both work.
-
-### Which one to use
-
-Ask what should happen if the consumer stops early.
-
-Fire-and-forget items are **dropped** harmlessly when the consumer finishes,
-which is usually what you want for a stream the consumer is allowed to abandon.
-
-A yielded item whose consumer finishes without taking it **fails your body**,
-which is what you want when your producer must know its items landed.
-
-Getting this backwards produces a confusing failure at the end of a run that
-otherwise worked.
-
-### Ending early
-
-`ctx.close_port("rows").await?` ends the stream, legal after any number of
-yields. See [Explicit closure](values-and-emission.md#explicit-closure).
+If you do neither and run far ahead, you hit the cap at 4096 un-taken items and
+the emit fails, telling you the three ways out: yield instead of pulse, let the
+consumer catch up, or `ctx.set_max_buffered_items("chunk", n)`.
 
 ## Consuming a stream
 
-The consumer reads the stream from the input bag like any other input. Its
-node fires once, on the first item, and pulls the rest itself.
+Read the port like any input, then pull:
 
 ```rust
-let rows = ctx.inputs.get::<Generator<Row>>("rows")?;
+let rows: Generator<Row> = ctx.inputs.get("rows")?;
+
 while let Some(row) = rows.next().await? {
-    // one item at a time
+    // one row at a time
 }
 ```
 
-On the handle:
+Your body starts when the first item arrives, so you are running while the
+producer is still producing.
 
-| Call | Answers |
-|---|---|
-| `next()` | waiting take: `Some(item)`, `None` on a clean end, the producer's error on a failed one |
-| `try_next()` | no wait; distinguishes "nothing buffered yet" from "finished" |
-| `drain()` | the whole stream as a `Vec`, erroring on a failed end rather than handing back a truncated list |
-| `end()` | the end marker, once the producer's side ended |
+`next()` waits for the next item and gives you `None` once, at a clean end.
+`try_next()` is the same without waiting, answering `Item`, `Empty` or
+`Finished`. `drain()` takes the lot and waits for the end. `end()` tells you
+whether the producer finished or failed, or `None` while it is still open.
 
-A pull can also become impossible to satisfy, when every remaining node is
-waiting on one of the others. The engine's stuck check spots that and fails the
-stream, so it reaches you through `?` like any producer failure rather than
-hanging.
+The `?` matters. If the producer failed, that is where you find out, rather
+than getting a clean end you would mistake for an empty stream. `drain` errors
+without handing back the partial list, for the same reason.
 
-An **empty stream still runs your node**. A producer that closes without
-yielding delivers a stream whose first `next()` answers `None`, so your
-post-loop code runs the same over zero rows as over one.
+Reading the port twice gives you two handles over one stream, sharing a
+position, not two copies.
 
-`yield_downstream` also works on an ordinary port, where it waits for the
-consumer to be dispatched:
-[Waiting for the value to be taken](values-and-emission.md#waiting-for-the-value-to-be-taken).
+**Your node cannot durably suspend.** A stream cannot be replayed, so
+`ctx.await_signal` in a stream consumer is refused. Do the waiting upstream or
+downstream.
 
-## Buses
-
-One node creates the channel and emits its marker; others resolve the marker
-and exchange messages.
+## Hosting a bus
 
 ```rust
-// Producer. The returned guard closes the bus when dropped.
 let bus = ctx.open_bus("channel", BusOptions::default(), "host").await?;
-bus.send("msg", json!("hello")).node_err("sending on the bus")?;
-drop(bus);   // the close IS the end-of-stream signal
+bus.send(MessageKind::Json, json!({ "text": "hello" }))?;
+```
 
-// Consumer that participates: registers, and closes on exit.
-let bus = ctx.join_bus("channel", "guest")?;
+`open_bus` does the whole producer move: makes the bus, emits the marker on
+that port, and registers your name. The guard closes the bus when it drops, so
+every way out of your function, including a panic, ends the channel instead of
+leaving readers parked forever.
+
+## Joining one
+
+```rust
+let bus = ctx.join_bus("channel", "translator")?;
+bus.wait_for("host")?;
+
 let mut cursor = bus.cursor();
-while let Some((from, value)) =
-    cursor.next_json("msg").await.node_err("reading the bus")? {
+while let Some(msg) = cursor.next().await {
     // ...
 }
-
-// Observer that must NOT close the bus (a debug tap).
-let bus = ctx.bus_from_input("channel")?;
 ```
 
-The producer ritual (create, emit the marker, register a name, close on
-**every** exit path) is one call, and so is the consuming side. A bus left open
-parks its readers forever, so the API closes it for you.
+`join_bus` resolves the bus on that input and registers your name, with the
+same close-on-drop guard.
 
-### `BusOptions`
+For an observer that must **not** close the bus, a debug tap that comes and
+goes, use `ctx.bus_from_input("channel")` instead.
 
-Declared at creation, read back by every consumer off the handle or the
-marker.
+Registering is the "I am here and ready" moment. A node with a slow warmup
+should hold the bus and register when it is genuinely ready, because that is
+what everybody else's `wait_for` is waiting on.
 
-| Option | Meaning |
-|---|---|
-| `payload` | `Json` (default) for chat-shaped traffic, or `Bytes` for media frames, raw end to end with no base64 between nodes |
-| `meta` | creator-declared stream metadata, such as sample rate and encoding, read via `bus.meta()` |
-| `ephemeral` | keeps payloads out of the journal entirely; a consumer that falls behind resumes at the oldest frame still in the window |
-| `window` | how many frames the bus keeps for a consumer that falls behind, 64 by default |
-| `journal_window` | how coarsely the trail is recorded: one row per bus per window, one second by default |
+Each reader has its own cursor. Reading does not consume, so ten readers all
+see everything.
 
-`payload` is frozen at creation and the wrong shape is refused loudly.
-`journal_window` affects only how the trail is stored, never what travels the
-bus: what a window row contains is in
-[The journal](../running/the-journal.md#what-the-journal-costs).
+`wait_for(name)` parks until that name is live, or returns an error if the bus
+closed first. You never have to decide whether a name will ever turn up: the
+engine watches the run, and when a wait can no longer be satisfied it closes
+the bus and every waiting cursor wakes.
 
-These last three, the mode, the window and the aggregation, are the same
-decision a live caller conversation makes, answered by the same code, so a
-bus and a route cannot disagree about where a payload gets trimmed or about
-what ephemeral means. If you change one, you have changed both.
+## Choosing options
 
-## Keep bus work on your own task
+```rust
+BusOptions::default()
+    .ephemeral(true)
+    .window(256)
+    .payload(BusPayload::Bytes)
+```
 
-Nothing enforces this one, so you have to hold it yourself. Do all of a bus's
-reads and waits directly in your node body, and never move a bus handle or
-cursor into a `tokio::spawn`ed background task.
+| Option | Default | What it decides |
+|---|---|---|
+| `ephemeral` | `false` | Whether payloads are recorded, or only counts |
+| `window` | 64 messages | How far back a reader can reach |
+| `payload` | JSON | JSON or bytes. Frozen at creation; sending the other shape is refused |
+| `journal_window` | 1 second | How often the record is written |
+| `meta` | nothing | Details every reader can read off the marker: a sample rate, dimensions. Keep it small, it rides the marker |
 
-The engine decides "every node is stuck, close the buses" by tracking whether
-each node execution is waiting or working, and it assumes those waits happen on
-the node's own task. A wait on a task you spawned is invisible to that
-accounting, so the engine can wrongly tear down a live conversation, or hang.
+Ephemeral is for a firehose. Video frames should not stall because a reader is
+slow, and should not end up in permanent storage either. A slow reader on an
+ephemeral bus silently skips to the oldest message still held, because there is
+no backpressure: the camera does not wait.
 
-If you need concurrent work, model it as another node and exchange with it over
-the bus.
+On a journaled bus, a send is refused if the record cannot be written, before
+anything is appended. On an ephemeral one it never is, because its record is
+notes rather than the data.
+
+In both, who joined and who left is always kept, so nothing a reader needs can
+hide in a gap.
+
+## What a send tells you
+
+Failures are values, never silent drops: the bus was closed, you never
+registered, you sent the wrong payload shape, or the record is degraded.
+
+## The one thing to remember
+
+A bus lives exactly as long as its worker. It is not rebuilt when a worker
+restarts, and a marker resolved afterwards fails saying the bus is unknown.
+
+It is for nodes that are alive together right now. Anything that has to survive
+goes in [storage](storage.md), or through a step that ends.

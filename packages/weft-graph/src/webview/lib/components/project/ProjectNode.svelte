@@ -22,6 +22,7 @@
 	import { portDeleteAction } from "../../projection/header-ports";
 	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
+	import PayloadCards from './PayloadCards.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
 	import FileDropField from './FileDropField.svelte';
@@ -107,9 +108,9 @@
 			/// two kinds that have one (an infra node whose container
 			/// serves `/live`, and a trigger, whose signal kind serves
 			/// one). Other nodes get undefined and render no body panel
-			/// here. Distinct from `debugData`, which is the JSON
-			/// preview chip Debug-style nodes show under the body
-			/// from the last execution's output.
+			/// here. Distinct from `debugData`, which is the value
+			/// preview Debug-style nodes show under the body, drawn as
+			/// the same cards as the execution inspector.
 			bodyFeed?: NodeFeedState;
 		};
 		id: string;
@@ -257,11 +258,10 @@
 	}
 
 
-	/// The debug preview's text: the node's latest output, as JSON.
-	const debugDataJson = $derived.by(() => {
-		if (data.debugData === undefined || data.debugData === null) return null;
-		return JSON.stringify(data.debugData, null, 2);
-	});
+	/// Is there a latest value to preview? The preview itself is drawn
+	/// by `PayloadCards`, the same component the execution inspector
+	/// uses, so a port reads the same in both places.
+	const hasDebugData = $derived(data.debugData !== undefined && data.debugData !== null);
 
 	// The node's declared inline file display (`features.display`):
 	// the named port's value from the latest firing, read off the side
@@ -309,7 +309,7 @@
 	const isTriggerNode = $derived(
 		nodeIsTrigger({ nodeType: data.nodeType, features: data.features }),
 	);
-	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
+	const showDebugDisplay = $derived(!!typeConfig.features?.showDebugPreview && hasDebugData);
 	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
 	// Simplified view: a node with anything to show (its display, a
 	// debug preview, an image/file preview) is drawn as a card showing
@@ -1443,6 +1443,16 @@
 	{/if}
 {/snippet}
 
+<!-- The Debug-style preview: the node's latest payload, one card per
+     port, drawn by the same component as the execution inspector. The
+     box scrolls and resizes; the flow classes keep a drag, a pan or a
+     wheel inside it from moving the canvas instead. -->
+{#snippet debugDisplay()}
+	<div class="debug-data-cards nodrag nopan nowheel">
+		<PayloadCards payload={data.debugData} empty="Nothing arrived" />
+	</div>
+{/snippet}
+
 {#snippet bodyFeedDisplay()}
 	{#if data.bodyFeed}
 		{#if data.bodyFeed.state === 'error'}
@@ -1530,14 +1540,7 @@
      bodyFeed markup is shared via {@render bodyFeedDisplay}. -->
 {#snippet liveDisplay()}
 	{#if showBodyFeed}{@render bodyFeedDisplay()}{/if}
-	<!-- Gate on the nullable value itself (not just the flag) so the type narrows
-	     to non-null at the use site; the flag stays the card-vs-square authority. -->
-	{#if showDebugDisplay && debugDataJson}
-		<div class="relative">
-			<CopyButton text={debugDataJson} class="absolute top-1 right-1 z-10 nodrag" />
-			<pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
-		</div>
-	{/if}
+	{#if showDebugDisplay}{@render debugDisplay()}{/if}
 	{#if showFileDisplay && displayedFileValue}
 		<FilePreview file={displayedFileValue} mode={typeConfig.display?.kind === 'media' ? 'media' : 'link'} />
 	{/if}
@@ -2220,11 +2223,8 @@
 
 			<!-- Debug Data Preview (expanded) - any node can use this by setting features.showDebugPreview = true -->
 			{#if typeConfig.features?.showDebugPreview}
-				{#if debugDataJson}
-					<div class="relative">
-						<CopyButton text={debugDataJson} class="absolute top-1 right-1 z-10 nodrag" />
-						<pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
-					</div>
+				{#if hasDebugData}
+					{@render debugDisplay()}
 				{:else if displayedStatus === 'completed'}
 					<div class="debug-placeholder completed">
 						<span>✓</span>
@@ -2308,23 +2308,13 @@
 	   once in `app.css`; this component only picks which class goes on
 	   (`glowClass`). */
 
-	/* Debug node data display - single resizable box */
-	.debug-data-container {
-		margin: 0;
-		background: #f8fafc;
-		border: 1px solid #e2e8f0;
-		border-radius: 6px;
-		padding: 8px;
-		min-height: 60px;
+	/* Debug node data display: the stack of value cards, in a box the
+	   reader can scroll and drag taller. The cards bring their own
+	   background, so the box itself is only the frame. */
+	.debug-data-cards {
 		max-height: 400px;
 		overflow: auto;
-		font-family: ui-monospace, 'SF Mono', Monaco, monospace;
-		font-size: 10px;
-		line-height: 1.4;
-		white-space: pre-wrap;
-		word-break: break-word;
 		resize: vertical;
-		color: #334155;
 	}
 
 	.debug-placeholder {

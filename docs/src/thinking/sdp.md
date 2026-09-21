@@ -1,100 +1,70 @@
 # Sequential Diffusion Programming
 
-This is how to get the most out of weft. It is also why the editor looks the
-way it does.
+If you already know exactly what you want, ask your assistant for the whole
+thing and see how far it gets. Sometimes that is the end of it.
 
-## Start with the thing you are actually doing
+This page is for when it goes wrong in one particular way: the program looks
+convincing, and it keeps getting real cases wrong.
 
-You are building a system that turns some input into some output through a
-sequence of transformations: an email becomes a classification becomes a
-decision becomes a message.
+The reflex then is to write a longer, more careful description of what you
+meant. That rarely helps. Give it one real case instead.
 
-The normal way to build that is to design it, write it, and then find out what
-the real data looks like. You write the parser against the API docs, then you
-run it and the API sends something else.
+We call building this way **Sequential Diffusion Programming**. The program gets
+sharper on every pass, and every pass has an actual input going in and an answer
+you can judge coming out.
 
-Weft is built for the other way: **against a real example, one stage at a
-time**.
+## Start with one real input
 
-Take one real input, an actual email rather than a made-up one, and build the
-first step. Run it, click the node, and look at the value that came out. When
-that step produces what you want, grow the next one and run it again.
+Say you are turning incoming emails into support tickets. Take an email you
+actually received. Ask Tangle to pull the customer's problem out of it, run just
+that piece, and click **Inspect execution** on the step that produced the
+answer.
 
-Once the whole chain works end to end, feed in a **second** real example and
-fix whichever stages break while the earlier ones keep passing. Then a third.
-By about the third the stages that still break are usually only the parsing
-ones.
+Now read it properly, before you build anything else. Did it find the problem,
+or did it summarise the signature at the bottom? If there was an order number in
+there, is it still there?
 
-We call it **Sequential Diffusion Programming**, because the program sharpens
-pass after pass the way an image sharpens out of noise, and each pass is
-anchored to a concrete case.
+Whatever went wrong, hand that back:
 
-## Why now
+> This email is asking for a replacement, but the extracted problem says the
+> customer wants a refund. Improve the prompt for this step.
 
-Repeated passes over a whole program used to be wasteful. When humans wrote
-every line, a full pass was expensive, so code had to be grown carefully into
-the right shape from the start, and designing up front was cheaper than
-iterating.
+Now you have a real extracted request to test the next step against, rather than
+something you made up. Keep going until you can follow that first email all the
+way to the answer you wanted.
 
-An AI pass over a weft program is fast and cheap, and once passes are nearly
-free, refining against reality beats designing correctness up front.
+You can do the same to a finished draft somebody handed you. Start at its
+output, find what is wrong, and walk backwards to the step that introduced it.
 
-Weft is built for it specifically:
+## Keep the cases that taught you something
 
-- Programs are **short**, because the orchestration is declarative rather than
-  glue.
-- The compiler catches structural mistakes before a run, so a pass costs a
-  compile rather than a debugging session.
-- Every value from every run is in the journal, so "look at what actually came
-  out" is one click.
-- Groups mean a pass can touch one stage without disturbing the rest.
+Try a second email that asks for something different. When it breaks something,
+fix it, then run the first one again. Otherwise the assistant can make today's
+example pass by quietly breaking yesterday's.
 
-## Debugging is the same motion, backwards
+## Find the mistake without reading everything
 
-Something breaks in production three weeks later.
-
-You open the failed run, look at the top-level groups, and find the one whose
-output is already wrong. Descend into it and repeat, each level leaving you a
-smaller piece. When you reach the step whose value went wrong, you are holding
-a concrete failing case, which is exactly what you needed to iterate on that
-step.
-
-## Why the tree does so much work
-
-Because a group is a typed contract, building a branch is a **delegable task**.
-"Build the thing that turns a raw email into a normalised ticket, here are its
-input and output types" is complete and self-contained. Whoever builds it,
-person or model, never needs to see the rest of the program, and whoever wires
-it in only has to check the boundary.
-
-So several agents can build parts of one program at once without talking to
-each other, because the boundaries already say everything they would have had
-to agree on.
-
-It also makes each of those tasks a better task, because whoever builds it sees
-two types and one job instead of a repository.
+If the program has groups, start with them shut. Look at the output of the group
+that produced the bad answer, then open it and look at the boxes inside. Keep
+going until you reach the step where a good input became a bad output.
 
 ## The verbs a pass uses
 
-`weft run --seed` reuses compatible completed work while you iterate.
-Changed code and inputs invalidate the affected work and its consumers.
+| If you want to | Run |
+|---|---|
+| Re-run without redoing what did not change | `weft run --seed`. Changed code and inputs invalidate the affected work and everything downstream of it |
+| Exercise one step with values you supply | `weft run --from node='{"port":value}'` |
+| Run up to a step, including it | `weft run --target node` |
+| Run up to a step, excluding it | `weft run --before node` |
+| Run one group on its own | `weft run --group group='{"port":value}'` |
+| Try a trigger without switching the listening on | `weft bake`, then `weft run --fire trigger='<json>'` |
 
-To exercise one piece, `--from node='{"port":value}'` starts at that node
-with backup inputs. `--target` includes an endpoint; `--before` excludes
-it. `--group group='{"port":value}'` runs a whole group alone.
-For a trigger, `weft bake` prepares its settings without listening,
-then `weft run --fire trigger='<wake-json>'` fires that one trigger.
+When a run comes out right, `weft freeze <name>` keeps its starting parameters
+and its accepted outputs. After a change, `weft run <name>` runs the current code
+with those parameters, and `weft diff <color> example:<name>` shows you what
+moved, for you or Tangle to judge. Freezing the new run replaces the accepted
+example.
 
-When a run comes out right, `weft freeze <name>` preserves its starting
-parameters and accepted outputs. After a change, `weft run <name>` runs
-the current code with those parameters. Inspect the result with
-`weft diff <color> example:<name>`: you or Tangle judge whether the
-change is acceptable. Freezing the new run replaces the accepted example.
-For the commands and their boundaries, read [Versions,
-seeded runs and frozen examples](../running/versions.md).
-
-## What is landing next
-
-- The editor will let you descend into a group, fix one stage there and come
-  back out.
-- Several agents will be able to build branches in parallel under one plan.
+For the full rules and every refusal, go and read
+[versions, seeds and frozen examples](../running/versions.md). What is landing
+next is on [the roadmap](../appendix/roadmap.md).

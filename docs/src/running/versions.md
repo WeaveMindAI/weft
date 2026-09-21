@@ -1,205 +1,129 @@
-# Versions, seeded runs and frozen examples
+# Versions, seeds and frozen examples
 
-Every run records the code and parameters it used. You can reuse compatible
-completed work while developing, or run the current code with a saved use case
-and inspect how its answers changed.
+Every run records the code it ran, so you can go back and look, run something
+again against a change, and see what moved.
 
-## The tree
+## A version
 
-`weft tree` shows source versions and their runs. A color identifies one
-execution. Freeze and diff also accept an unambiguous prefix of that color.
-Each version records the project's source files by content hash.
+A snapshot of your project's files, taken whenever you run, activate, or type
+`weft checkpoint`.
 
-| Command | Effect |
+| In it | Not in it |
 |---|---|
-| `weft checkpoint [label]` | Record the current files without building or running, and move head to that version. |
-| `weft branch <version\|label\|color>` | Restore that version's files and move head. A color also selects that run as the next seed. |
-| `weft tree` | Show versions, runs and head. `--json` includes the version matching disk. |
-| `weft checkpoint --root` / `weft run --root` | Record a source version without a parent. Refuses if that version already has a parent. On run, root disables seeding. |
-| `weft prune <version>` | Remove the subtree and its runs after confirmation. |
+| Every `.weft` file, at any depth | Anything hidden at the top: `.git`, `.env`, `.weft` |
+| `weft.toml` | `layouts/`, because dragging a box is not a change to your program |
+| `nodes/**` | `nodes/base_catalog/`, which belongs to the installed weft. A version records which weft that was instead |
+| `assets/**`, `prompts/**`, `scripts/**`, `sql/**` | `target/` at the root, and `node_modules` anywhere |
+| `examples/**`, so going back restores the examples that existed then | |
 
-Head is shared per project. Checkpoint clears head's selected run; a later seed
-looks for a settled run on that version or its nearest ancestor.
-Branch refuses to overwrite unkept edits; checkpoint them first.
-`--discard` explicitly permits replacing them.
+A file identical to one an earlier version held costs nothing to store.
 
-Prune refuses when head, an activated listener, running work or a frozen
-example still needs the source history. Unused bakes belonging to explicitly
-pruned versions are removed too. Source files still referenced by a registered
-build or surviving history remain retained.
+## head
 
-## Running one group, or one node onward
+**head** is where you are: the version your next checkpoint sits under, and the
+run a `--seed` inherits from.
 
-Run builds automatically. Keep the graph intact and select the work to exercise:
-
-```bash
-weft run --from classify='{"text":"the invoice is wrong"}' --target reply --save invoice --detach
-weft run --group triage='{"text":"the invoice is wrong"}' --detach
-weft run --from triage='{"text":"the invoice is wrong"}' --before publish --detach
-```
-
-| Flag | Meaning |
+| Command | What it does |
 |---|---|
-| `--from node='{"port":value}'` | Start at the node with backup inputs. A bare node supplies no backup. Repeat for several starts. |
-| `--emit node='{"port":value}'` | Supply that node's outputs without executing its body, then continue downstream. |
-| `--target node-or-group` | Include this endpoint and stop propagation beyond the cut. A group or loop name includes its whole body. Repeat for several endpoints. |
-| `--before node-or-group` | Stop before this endpoint. A group or loop name excludes its whole body. Repeat for several endpoints. |
-| `--group group='{"port":value}'` | Run a whole group or loop alone, using its input ports. An included file uses its group alias. |
+| `weft tree` | The whole tree: every version with what changed against its parent, its runs beneath it, head marked |
+| `weft checkpoint [<label>]` | Records the files as a version. No run, no build |
+| `weft branch <version>` | Puts those files back and moves head |
+| `weft branch <color>` | The same, and points head's run at that one, so the next seed inherits from it |
 
-Downstream work brings the other producers it needs. The upstream walk stops
-at each `--from`, `--emit`, and trigger. For A feeding C and B also feeding C,
-`--from A` includes B; `--from C` stops before both producers and uses C's
-supplied backups or normal closed-input behaviour. Unrelated branches stay out.
-A cut selecting no work or output evidence is refused before building an image.
+`weft branch` refuses on a dirty tree and names the files, rather than throwing
+your work away:
 
-`--group` is a complete selection: it cannot combine with from, emit,
-target or before. `--from group=...` starts at the whole group and continues
-downstream instead. Cuts inside ordinary groups stay at the named node.
-Their `_should_flow` gates still apply, and a true gate dispatches only
-selected work. Loops are indivisible: select the whole loop or move the cut
-outside it. Trigger setup and infra preparation follow the same restrictions.
-
-Supplied inputs are backups at the named starts. The runtime waits for real
-producers first. A real value wins, including null; a clean closure without
-a value permits the backup. An error or invalid real value remains an error.
-Inputs at arbitrary interior nodes are not part of the run parameters.
-
-For a generator output, `--emit batches='{"items":["first","second"]}'`
-emits those items in order and closes the port. An empty array closes it
-without an item. An ordinary list port receives its array as one value.
-Read the port type before supplying it.
-
-## Preparing and firing triggers
-
-```bash
-weft bake
-weft run --fire incoming='{"event":"the trigger wake payload"}' --detach
-weft run --emit incoming='{"message":"the emitted output value"}' --detach
+```text
+the tree has changes since head a1b2c3d:
+  src/main.weft
+`weft checkpoint` keeps them as a version, or `--discard` throws them away
 ```
 
-Bake runs preparation and saves the resulting trigger settings without arming
-listeners. A fire uses those settings and gives exactly one trigger its wake
-payload. An emit supplies declared outputs without executing that trigger.
-
-The payload you type is checked against what that trigger declares it wakes
-with, before anything is built or started, and the check is exact: a missing
-field is refused, and so is a field the trigger does not declare, each named.
-`weft run --fire` prints the shape it wanted, which is the quickest way to see
-what a trigger takes ([`firesWith`](../nodes/metadata.md#fireswith)).
-The same trigger cannot use both forms. Trigger inputs are prepared through
-bake; a trigger cannot be a from start.
-
-The bake must match the code and configuration being run. Bake again after
-changes. Closed group gates can leave triggers unprepared; inspect preparation
-events when fire refuses. `weft bake <project-id>` uses the registered build.
-Builds include the whole catalog by default. If using `--referenced`, use it
-for both bake and run so their code identities match.
-
-`weft activate` prepares and arms listeners. Each real event starts its own
-run from its one trigger, using the program that prepared that listener.
-
-## Seeding: run only what changed
-
-`weft run --seed` reuses eligible completed work from head's selected run.
-When head names only a version, it finds a settled run there or on the nearest
-ancestor. To select a particular older run, branch to its color first;
-branch also restores its code, so checkpoint edits you want to keep.
-
-`--seed-before node` permits reuse before that node.
-`--seed-until node` also permits reusing the node itself. Both require
-`--seed`. These flags bound reuse; target and before bound execution.
-
-Changed implementations, inputs or dependencies invalidate affected work.
-Failed work and live handles cannot be reused. Loops are reused whole.
-The run reports what was inherited and what ran. A requested reuse boundary
-does not make incompatible results eligible; read the warning and move the
-cut earlier if the old values cannot supply it. A fully inherited run is valid.
-
-`--from` chooses a boundary, not a forced rerun. With `--seed`, unchanged
-work inside that cut can be reused, including identical used backups. Omit
-`--seed` to run it again, or use the seed endpoints to limit reuse.
-
-The unchanged standard library shares a finished worker image across projects.
-Setup prepares it, and releases publish it so a project can pull it without
-compiling. Project names, IDs and graph settings do not change that image.
-Node edits, added nodes, custom build settings, or `--referenced` need their
-own image. Building one compiles only what no earlier build on this machine
-already compiled: every worker build shares one compile cache, and a node
-whose files have not changed is taken from it. Once the standard library has
-been compiled once, a project with one custom node compiles that node and
-links. `weft clean --build-cache` throws that cache away.
-
-Builds include the whole catalog by default. Adding an unchanged catalog node
-or editing graph configuration needs no new image. `--referenced` opts into
-compiling only the graph's node types. Implementation edits still rebuild.
-
-## Freezing an accepted run
-
-`--save name` saves starting parameters to `examples/name.json`.
-`weft run name` runs the current program with those parameters, whether
-the file contains only parameters or a frozen result.
+## Seeding
 
 ```bash
-weft run invoice --detach
-weft events <color> --full
-weft freeze invoice <color> --expect reply
-# After changing the program:
-weft run invoice --detach
-weft diff <new-color> example:invoice --full
-# After accepting the new result:
-weft freeze invoice <new-color> --expect reply
+weft run --seed
 ```
 
-Freeze requires a completed run. It preserves that run's starting parameters
-and observed outputs. A seeded whole run preserves its original starting
-inputs; a carved run preserves its cut and inputs entering it. Interior
-reused results do not become hidden fixed inputs.
+Reuse everything from head's run whose slice of the program did not change, and
+run only the rest. That is the loop when you are iterating on step nine of a
+twelve step program and steps one to eight cost real money.
 
-`expected` holds output history, including finite streams and closures.
-Repeat `--expect node` to focus review on particular outputs.
-Focus affects comparison, not execution. A focused output that disappeared
-remains visible as a difference. Stored media compares by content hash.
+### What will not be reused
 
-Run the example without seed when reviewing the current computation.
-Diff presents changed values for a person or AI to judge; differences do not
-produce a failing exit status. Inspect execution status separately. Run and
-diff leave the accepted file intact; freeze again only after accepting its
-replacement. `weft examples` lists saved parameters and frozen examples.
+| | Why |
+|---|---|
+| Anything whose code or dependencies changed | It is a different thing now. weft says so by name |
+| Anything downstream of something that changed | Its input is different |
+| Anything that never finished: failed, cancelled, still running, or parked on somebody | There is no result to reuse |
+| Anything that emitted a live handle, like a bus | The handle belongs to a worker that is gone |
+| A whole loop, if any iteration of it is invalid | A loop is reused whole or not at all |
+| Anything downstream of an explicit `--emit` or `--fire` | You asked for a fresh event, so its consumers are fresh |
+| Anything past `--seed-before` or `--seed-until` | You said where to stop |
+| A starting value you supplied that differs from the one the earlier run used | Different input, different work |
 
-## Repairing saved parameters after a graph change
+The invalidation spreads: if a step is not reusable, nothing downstream of it
+is either.
 
-Removed input ports are ignored with a warning. Missing starting nodes or
-cut endpoints are errors, so move the cut explicitly:
+### The one that surprises people
+
+A value you hand in at a start is a **backup**. It stands in only when nothing
+upstream supplies that port.
+
+Under a seed the upstream result is usually right there in history, so your
+backup goes unused and the step is reused exactly as it was. The run reports
+success and nothing ran, which is correct and invisible, so weft says it out
+loud:
+
+```text
+'classify.text' keeps the value run 3f2a1111 gave it; the value supplied at
+this start is a backup and only stands in when nothing upstream supplies the
+port. Run without --seed to hand it in.
+```
+
+## Frozen examples
+
+An example is a run you keep: its starting values, the answers people gave, and
+the outputs you accept as right.
 
 ```bash
-weft run invoice --clear from --from new_classifier='{"text":"the invoice is wrong"}' --target reply --detach
-weft run invoice --clear group --from triage='{"text":"the invoice is wrong"}' --before publish --detach
+weft run --from classify='{"text":"..."}' --save angry-customer
+weft freeze angry-customer
 ```
 
-Explicit from, target, before, group and fire flags replace their corresponding
-saved settings. Repeated new from flags form the replacement map.
-Emit flags replace the named ports while retaining other saved emit entries.
-`--clear from|emit|target|before|group|fire` clears a field before edits;
-repeat it for several fields. Duplicate newly supplied ports are errors.
-Use `--save another-name` to preserve revised parameters separately.
+`--save` writes the starting parameters. `freeze` takes a run that completed
+and records its accepted outputs alongside them.
 
-## When a run waits
+Then, after a change:
 
-Frozen examples retain human questions and answers and incoming caller
-messages for inspection. They are not automatic replies. Compare the new
-question with the recorded question and answer before answering the current
-token. For a live connection, send messages through a new connection.
+```bash
+weft run angry-customer
+weft diff <new-color> example:angry-customer
+```
 
-`weft wake <color> <node>` resolves a pure timer wait. A wait expecting a
-value must receive that value.
+`diff` shows what moved on the wires. You, or Tangle, judge whether the change
+is acceptable. Freezing the new run replaces what is accepted.
 
-## Reading the result
+`--expect <node>` marks the outputs that matter, so a later diff leads with
+them rather than burying them.
 
-`weft executions` shows status. `weft logs <color>` shows failures and
-node logs; `weft events <color> --node <id> --full` shows values.
-Inherited history names its original run and is interpreted against its
-original program. Historical costs are not new charges.
-The editor can display the same run on its graph, including inherited work.
+| Command | What it does |
+|---|---|
+| `weft examples` | What is saved, which are frozen, and each one's latest run |
+| `weft freeze <name> [<color>]` | Freeze a run. Without a color, head's run |
+| `weft diff <left> <right>` | Compare two runs. A side is a color or `example:<name>` |
+| `weft run <name>` | Run the current code with that example's parameters |
 
-Completion establishes that execution finished. The output evidence tells
-you whether the program answered the use case.
+A freeze **replaces** the example whole, and says so. Only a completed run can
+be frozen: a failed or cancelled one has nothing to accept.
+
+## Cleaning up
+
+```bash
+weft prune <version>
+```
+
+Deletes that version, every version under it, and every run beneath them.
+
+It refuses on head's version, on any version a frozen example came from, and
+while any run underneath is still going.

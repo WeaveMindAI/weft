@@ -1,123 +1,86 @@
 # Custom types
 
-A `types` key in any `metadata.json`, a node's own or a package root's shared
-partial, declares named types the whole project may use.
+Give a shape a name and every node can use it.
 
 ```json
 "types": {
-  "ChatHistory": "List[ChatMessage]",
-  "ChatMessage": "{ role: String, content: String | List[Part], name?: String }",
-  "Part": "{ type: String, text?: String, image_url?: { url: Image } }"
+  "ChatMessage": "{ role: String, content: String }",
+  "ChatHistory": "List[ChatMessage]"
 }
 ```
 
-## The four rules
+Then in any node's ports, including other people's:
 
-**Declarations are global.** Once any metadata declares `ChatHistory`, every
-node's ports and every `.weft` inline signature may name it. Declare a type
-next to the node that owns the concept.
-
-**Named types are nominal.** Only a same-named value wires in. The value wires
-**out** into `JsonDict` freely, so forgetting the name is always safe. The
-user's escape hatch for a hand-built dict is the `Cast` node, which validates
-at run time, so your node can trust that a named input already fits its
-declared structure.
-
-**Redeclaring an identical body is absorbed silently.** Two packages may ship
-the same shared type without depending on each other. A **different** body
-under the same name fails the catalog load loudly, so drift between two copies
-is a build error.
-
-**Record validation is strict.** A value carrying a key the record does not
-declare is refused. So declare every field the real values carry, with `?` on
-the optional ones. Half-declaring a shape produces a type that rejects real
-data.
-
-## What a name buys you
-
-A named type is a contract that survives being passed around. Without one, a
-chat history is a `JsonDict` and every node that touches it works out the shape
-again for itself, and they do not all reach the same answer.
-
-## Media inside a custom type
-
-A field declared `Image`, `Audio`, `Video`, or `Blob` is a **media slot**. In
-stored form, which is what rides edges and lands in the journal, it holds a
-small stored-file reference, so a conversation carrying forty images stays
-cheap to journal.
-
-A provider wants bytes or URLs. Two storage verbs convert a **whole typed
-value** at that boundary, driven by the declared type, so there is no per-node
-walking code anywhere:
-
-```rust
-use weft::storage::media::{ExternalizePolicy, MediaForm};
-
-let ty = ctx.output_type("history").expect("declared on the port");
-let storage = ctx.storage(StorageScope::Project);
-
-// Going out to a provider: each media slot becomes something it can use.
-let wire = storage.externalize(
-    &value,
-    &ty,
-    ExternalizePolicy { audio: MediaForm::Inline, ..ExternalizePolicy::urls() },
-).await?;
-
-// Coming back: raw media (a data: URL, an external URL) is stored, and every
-// slot becomes a stored-file value again. Already-stored slots pass through.
-let stored = storage.internalize(&response_value, &ty, None).await?;
+```json
+"inputs": [ { "name": "history", "type": "ChatHistory", "required": true } ]
 ```
 
-`MediaForm::Url` is a **preference, not a promise**: a slot becomes a public
-link when an internet-reachable address is configured, and falls back to inline
-base64 bytes when none is. Declare `Inline` only for consumers that accept
-nothing else.
+## They are global, and compared by name
 
-**Emit only the internalized form.** Public links expire, so one sitting in a
-journal row is a broken link when somebody opens that run later.
+Every `metadata.json` in the project contributes its `types` to one table
+before anything else is parsed, so a name declared by one package is usable by
+every node.
 
-The chat nodes in `catalog/ai` are the worked example: `ChatHistory` carries
-media through an arbitrarily long conversation with one externalize per call
-and one internalize per reply.
+The comparison is by **name**, not shape. `CustomerId` declared as `String` is
+a different type from `String`, and wiring one into the other is a mismatch.
+That is the point: a customer id should not land in a port that wanted any old
+string.
 
-## Sharing state across executions
+A named type flows **into** its shape for free, because the name falls away
+when it is not needed. Going the other way, from a plain shape to a named one,
+needs a `Cast`, which checks the value really has that shape.
 
-If you are thinking of reaching for a plain Rust `static` in a node's module,
-know that a worker process multiplexes many executions of the same project, so
-every firing of every node in that file sees the same instance for as long as
-the worker lives.
+## What travels
 
-A worker only ever hosts one project, so nothing of another tenant's can reach
-it. So executions reading and writing each other's state through it is a
-feature: caches, pools, warmed clients, a shared buffer one execution fills
-and others drain.
+The name carries its shape with it. A port typed `ChatMessage` stores as
+`ChatMessage={ role: String, content: String }`, so anything reading a saved
+project or a journal row understands it with no table to consult, and a run
+that started yesterday keeps the shape it started with even if you edit the
+declaration today.
 
-```rust
-/// The process-shared `GeneratorInfo` for a model. Shared because the model's
-/// published rates are cached on the generator, so the price sheet is fetched
-/// once per TTL rather than once per execution.
-fn shared_generator(model: &str) -> GeneratorInfo {
-    static POOL: OnceLock<Mutex<HashMap<String, GeneratorInfo>>> = OnceLock::new();
-    let fresh = GeneratorInfo::openrouter(model);
-    let mut pool = POOL.get_or_init(Mutex::default).lock().expect("generator pool lock");
-    pool.entry(fresh.pricing_key()).or_insert(fresh).clone()
-}
+## Where to put them
+
+A package root's `metadata.json` can declare the types its nodes share, once,
+and every node in it inherits them.
+
+Two packages declaring the same name with the same shape is fine and absorbs.
+Two declaring it with different shapes names both, and a port that restates a
+declared name with a different shape is the `named-type-conflict` error. A
+named type has one body everywhere.
+
+Nothing shadows. A name already visible cannot be redeclared, not even to the
+same thing.
+
+## Cast
+
+Any node can declare itself a cast:
+
+```json
+"features": { "castPorts": { "input": "value", "output": "value" } }
 ```
 
-One rule keeps it sound: **it is a per-process layer, not durable state.** It
-dies with the worker, and workers shut down when idle. Other pods never see
-it. Anything that must survive a restart or be visible across pods belongs in
-the durable primitives (`ctx.run`, buses, storage), with the static as at most
-a warm cache in front.
+The compiler reads the declaration, never the node's name, so this is a thing
+any node can be rather than one built-in.
 
-And hold locks only across map lookups, never across an `.await`.
+At compile time, the resolved pair of types has to be a conversion that exists:
 
-If a piece of state should be private to one execution, key it by
-`ctx.execution_id`.
+| From | Into |
+|---|---|
+| `String` | A number, a boolean, or any object shape, parsed as JSON and then checked |
+| Anything that is not a file or a live handle | `String` |
+| `Number` | `Boolean`, and back |
+| Any object shape | A record or a named type, checked against the declared shape |
 
-The same pattern covers repeated storage reads: a node that inlines the same
-bytes on every firing, such as an audio clip re-sent to a provider each
-conversation turn, can keep a byte cache in a static keyed by the file's
-storage key. Values themselves stay single-form, so the journal replays
-without any cache, which makes this a pure optimization you add when a real
-workload measures slow.
+Anything else is refused at compile time:
+
+```text
+no cast from JsonDict into Number; a cast parses text, stringifies data, or
+validates an object shape against a declared type
+```
+
+At run time, the check names the field that was wrong, like
+`messages[2].role: expected String, got Number`, rather than failing with a
+shrug.
+
+Stored files, buses and connections do not turn into text, so those casts do
+not exist.
