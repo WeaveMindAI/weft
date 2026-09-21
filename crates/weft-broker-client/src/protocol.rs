@@ -128,29 +128,15 @@ wire_enum! {
     }
 }
 
-/// What to do with in-flight Fire-phase executions. Defined once in
-/// weft-core (the CLI's build gate and this wire protocol share the
-/// same concept); re-exported here so the existing
-/// `weft_broker_client::protocol::RunningPolicy` paths keep working.
-pub use weft_core::RunningPolicy;
-
-wire_enum! {
-    /// How a `deactivate` command should treat the project's signal
-    /// table on entry.
-    pub enum DeactivationMode {
-        /// Drop every signal (entries + suspensions) and forget the
-        /// project ever ran. Only legal with `RunningPolicy::Cancel`.
-        Wipe = "wipe",
-        /// Keep DB signal rows; unregister from listener; arm a deadline
-        /// after which the project auto-wipes. Suspended fires are kept
-        /// alive on the gate (visible=false, accepting=true on entry
-        /// signals only) for `grace_minutes`.
-        Hibernate = "hibernate",
-        /// Keep DB signal rows; unregister from listener. No deadline,
-        /// no eventual wipe. Reactivate fully restores.
-        Park = "park",
-    }
-}
+/// The running-work vocabulary (`RunningPolicy`, `RunningChoice`,
+/// `DeactivationMode`, `DeactivateSpec`, the default drain cap) is
+/// defined once in weft-core, where the CLI reaches it too; re-exported
+/// here so the existing `weft_broker_client::protocol::*` paths keep
+/// working.
+pub use weft_core::{
+    default_drain_timeout_secs, DeactivateSpec, DeactivationMode, RunningChoice, RunningPolicy,
+    DEFAULT_DRAIN_TIMEOUT_SECS,
+};
 
 wire_enum! {
     /// Lifecycle-state of an infra node row, written into `infra_node.status`.
@@ -531,6 +517,11 @@ pub struct WorkerPodHeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPodHeartbeatResponse {
     pub renewed: bool,
+    /// Meaningful only when `renewed`: the row says the pod is
+    /// draining, so it exits as soon as the work it holds lands
+    /// instead of keeping the idle grace a warm pod keeps.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -890,25 +881,6 @@ pub struct SupervisorClaimCommandRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorClaimCommandResponse {
     pub command: Option<SupervisorCommandRow>,
-}
-
-/// Default cap on a `RunningPolicy::Wait` drain before the lifecycle
-/// op proceeds anyway (with a loud warning). A parameter everywhere it
-/// applies, and this is only what it means when the request does not
-/// say: the supervisor's stop/terminate drain, the dispatcher's
-/// worker-replacement drain, and the trigger-side deactivate wait
-/// (`DeactivateSpec::drain_timeout_secs`, reachable as
-/// `--drain-timeout` and as the graph picker's "wait at most" box).
-///
-/// A cap rather than an open-ended wait because the person doing this
-/// is answering "how long am I willing to hold", and past it the
-/// remaining executions are cancelled and the op lands, so a
-/// deactivate is never stuck behind one long run nobody is watching.
-// SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> packages/weft-graph/src/protocol.ts DEFAULT_DRAIN_TIMEOUT_SECS
-pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 600;
-
-fn default_drain_timeout_secs() -> u64 {
-    DEFAULT_DRAIN_TIMEOUT_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1364,81 +1336,6 @@ pub struct InfraWaitApplyResponse {
     /// error message; on Cancelled it carries the reason. The
     /// `outcome` discriminant says which.
     pub outcome_message: Option<String>,
-}
-
-/// Payload for a `verb=deactivate` lifecycle command. Stored on
-/// the `infra_lifecycle_command.spec_json` column by the supervisor
-/// when a HealthProtocol fires, and deserialized by the dispatcher's
-/// `lifecycle_claimer` when it claims the row.
-///
-/// Also used as the HTTP request body for the dispatcher's
-/// `/deactivate` endpoint and as the embedded `triggerDeactivation`
-/// field on Sync / Stop / Terminate. One typed shape, no per-endpoint
-/// duplicates.
-///
-/// ONE wire spelling: camelCase (`graceMinutes`, `runningPolicy`).
-/// Every producer goes through this typed struct (the extension/CLI
-/// build JSON bodies in camelCase; the supervisor serializes the
-/// struct itself, which emits camelCase via the renames), so there
-/// is no snake_case producer to tolerate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeactivateSpec {
-    pub mode: DeactivationMode,
-    /// Hibernate window in minutes. Only meaningful when
-    /// `mode = Hibernate`; ignored otherwise. Default 15 keeps the
-    /// wire shape forgiving for clients deactivating with
-    /// Park/Wipe (no grace concept).
-    #[serde(default = "default_grace_minutes", rename = "graceMinutes")]
-    pub grace_minutes: u32,
-    #[serde(rename = "runningPolicy")]
-    pub running_policy: RunningPolicy,
-    /// Cap in seconds on the `wait` drain: how long a deactivation
-    /// sits in `Deactivating` before the remaining executions are
-    /// cancelled and it lands. The user picks it with the wait choice
-    /// (same "wait at most N, then proceed" as the infra drains);
-    /// absent = `DEFAULT_DRAIN_TIMEOUT_SECS`. Ignored with
-    /// `runningPolicy = cancel` (nothing to wait for).
-    #[serde(default, rename = "drainTimeoutSecs", skip_serializing_if = "Option::is_none")]
-    pub drain_timeout_secs: Option<u64>,
-}
-
-fn default_grace_minutes() -> u32 {
-    15
-}
-
-impl DeactivateSpec {
-    /// Verify the (mode, policy) combination is coherent. The
-    /// only illegal combo is `Wipe + Wait`: wipe drops every
-    /// suspended fire, so waiting for them to drain first is
-    /// contradictory. Lives next to the wire type so every caller
-    /// (broker handler, dispatcher's /deactivate, supervisor's
-    /// enqueue path) shares one validator.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.mode == DeactivationMode::Wipe && self.running_policy == RunningPolicy::Wait {
-            return Err(
-                "wipe requires runningPolicy=cancel; waiting before wiping is contradictory",
-            );
-        }
-        Ok(())
-    }
-
-    /// Whether this deactivation waits for the running executions
-    /// before it lands, which ends by cancelling whatever is still
-    /// running at the cap.
-    ///
-    /// The policy decides this and the mode has no say: they are two
-    /// separate questions. The mode is about the SUSPENDED fires and
-    /// the door (drop them, keep them hidden, keep them and stay
-    /// visible); the policy is about what is RUNNING right now. A
-    /// person picking `wait` is answering the second question, so
-    /// `wait` waits under park exactly as it does under hibernate.
-    ///
-    /// `wipe` never gets here: [`Self::validate`] refuses it with
-    /// `wait` up front, so the only combinations that reach this are
-    /// the ones where waiting means something.
-    pub fn drains(&self) -> bool {
-        self.running_policy == RunningPolicy::Wait
-    }
 }
 
 wire_enum! {
@@ -1936,7 +1833,6 @@ mod wire_enum_roundtrips {
     // visible omission in this single list.
     wire_enum_roundtrip_tests!(
         InfraLifecycleVerb,
-        DeactivationMode,
         InfraNodeStatus,
         ProjectStatus,
         FailureStage,
@@ -2891,28 +2787,6 @@ mod supervisor_protocol_tests {
         assert_eq!(back.identity["key"], 2);
     }
 
-    /// The policy decides the wait and the mode has no say. They
-    /// answer two separate questions: the mode is about the
-    /// suspended fires and the door, the policy is about what is
-    /// running right now. So `wait` waits under park exactly as it
-    /// does under hibernate, and `cancel` never waits under either.
-    ///
-    /// `wipe` is the one pair that is refused rather than answered,
-    /// because a wipe drops the suspended fires outright and there is
-    /// nothing coherent for a wait to mean beside it.
-    #[test]
-    fn the_policy_decides_the_wait_whatever_the_mode() {
-        let spec = |mode, running_policy| DeactivateSpec {
-            mode, grace_minutes: 15, running_policy, drain_timeout_secs: None,
-        };
-        for mode in [DeactivationMode::Hibernate, DeactivationMode::Park] {
-            assert!(spec(mode, RunningPolicy::Wait).drains(), "{mode:?} + wait waits");
-            assert!(!spec(mode, RunningPolicy::Cancel).drains(), "{mode:?} + cancel does not");
-            assert!(spec(mode, RunningPolicy::Wait).validate().is_ok(), "{mode:?} + wait is legal");
-        }
-        assert!(!spec(DeactivationMode::Wipe, RunningPolicy::Cancel).drains());
-        assert!(spec(DeactivationMode::Wipe, RunningPolicy::Wait).validate().is_err());
-    }
 }
 
 

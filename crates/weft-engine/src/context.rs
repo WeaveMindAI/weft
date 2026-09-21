@@ -2016,49 +2016,23 @@ impl ContextHandle for RunnerHandle {
         }
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
 
-        // Pop the next pre-loaded entry (if any). Replay vs suspend
+        // Pop the next pre-loaded entry (if any) through the ONE replay
+        // reading (shared with the node-test rig). Replay vs suspend
         // depends on whether its fire already arrived.
-        let next_entry = self.lock_awaited_sequence().pop_front();
-        if let Some(entry) = next_entry {
-            // Sanity-check call_index alignment. If the journal's
-            // sequence disagrees with our counter, something
-            // replayed out of order; the body is non-deterministic
-            // (or the journal is corrupt). Fail the node loudly
-            // rather than masking it as a suspension.
-            if entry.call_index != call_index {
-                return Err(WeftError::NodeExecution(format!(
-                    "await_signal call_index mismatch (counter={call_index}, journal={}). \
-                     This means the node body's call order changed between replays. \
-                     Wrap any non-deterministic logic between awaits in `ctx.run`.",
-                    entry.call_index
-                )));
+        let replayed = weft_core::primitive::replay_await(&mut self.lock_awaited_sequence(), call_index)?;
+        match replayed {
+            Some(weft_core::primitive::ReplayedAwait::Resolved(value)) => return Ok(value),
+            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => {
+                // Pending tail: fire hasn't arrived. Suspend with the
+                // existing token so the dispatcher doesn't re-register.
+                // If a bus is holding the worker alive, the driver's
+                // in-loop resume poll picks up this token's
+                // SuspensionResolved row when it lands and re-dispatches
+                // in process; if not, the worker exits and respawns on
+                // the fire.
+                return Err(WeftError::Suspended { token });
             }
-            match entry.kind {
-                weft_core::primitive::AwaitedEntryKind::Await {
-                    token,
-                    resolved,
-                } => match resolved {
-                    Some(value) => return Ok(value),
-                    None => {
-                        // Pending tail: fire hasn't arrived. Suspend
-                        // with the existing token so the dispatcher
-                        // doesn't re-register. If a bus is holding the
-                        // worker alive, the driver's in-loop resume poll
-                        // picks up this token's SuspensionResolved row
-                        // when it lands and re-dispatches in process; if
-                        // not, the worker exits and respawns on the fire.
-                        return Err(WeftError::Suspended { token });
-                    }
-                },
-                weft_core::primitive::AwaitedEntryKind::Run { name, .. } => {
-                    return Err(WeftError::NodeExecution(format!(
-                        "await_signal at call_index={call_index} but journal has Run('{name}'). \
-                         This means the node body called `ctx.run` here on a previous run \
-                         and `ctx.await_signal` now; non-deterministic bodies are not safe \
-                         to replay. Use `ctx.run` to wrap non-deterministic work."
-                    )));
-                }
-            }
+            None => {}
         }
 
         // Sequence exhausted: this is a fresh await.
@@ -2095,40 +2069,15 @@ impl ContextHandle for RunnerHandle {
     }
 
     /// Replay-side of `ctx.run`. Pops the next entry in the
-    /// (node, frames) sequence; if it's a Run with our call_index,
-    /// return its journaled value. If it's an Await at our index,
-    /// the body's call sequence drifted from the journal: error
-    /// loudly. If the sequence is exhausted, return None to signal
-    /// "fresh path" so the wrapper invokes the closure.
+    /// (node, frames) sequence through the ONE replay reading (shared
+    /// with the node-test rig): a Run at our call_index replays its
+    /// journaled value; an Await there, or another index, is a drifted
+    /// body and fails loudly; an exhausted sequence is the fresh path,
+    /// `None`, so the wrapper invokes the closure.
     async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-        let next_entry = self.lock_awaited_sequence().pop_front();
-        match next_entry {
-            Some(entry) => {
-                if entry.call_index != call_index {
-                    return Err(WeftError::NodeExecution(format!(
-                        "ctx.run('{name}') call_index mismatch (counter={call_index}, journal={}). \
-                         This means the node body's call order changed between replays. \
-                         Wrap any non-deterministic logic in `ctx.run`.",
-                        entry.call_index
-                    )));
-                }
-                match entry.kind {
-                    weft_core::primitive::AwaitedEntryKind::Run { value, .. } => {
-                        Ok((call_index, Some(value)))
-                    }
-                    weft_core::primitive::AwaitedEntryKind::Await { .. } => {
-                        Err(WeftError::NodeExecution(format!(
-                            "ctx.run('{name}') at call_index={call_index} but journal has Await. \
-                             This means the node body called `ctx.await_signal` here on a previous \
-                             run and `ctx.run` now; non-deterministic bodies are not safe to \
-                             replay."
-                        )))
-                    }
-                }
-            }
-            None => Ok((call_index, None)),
-        }
+        let replayed = weft_core::primitive::replay_run(&mut self.lock_awaited_sequence(), name, call_index)?;
+        Ok((call_index, replayed))
     }
 
     async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {

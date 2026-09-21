@@ -421,12 +421,22 @@ pub async fn insert_spawning(
     Ok(())
 }
 
+/// What a heartbeat tells a live pod about itself, read off its own row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerStanding {
+    /// Marked draining: nothing new is admitted to this pod, so it exits
+    /// as soon as the work it holds lands, with none of the idle grace a
+    /// warm pod keeps for the next burst.
+    pub draining: bool,
+}
+
 /// Engine heartbeat. Stamps the freshness time AND the worker's current
 /// memory pressure in one write (the worker reads its own cgroup
 /// pressure each tick and reports it here, the same self-report the
-/// supervisor does on its ownership tick). Returns false if the row no
-/// longer matches (status changed, row deleted) so the worker can exit.
-pub async fn heartbeat(pool: &PgPool, pod_name: &str, mem_pressure: f64) -> Result<bool> {
+/// supervisor does on its ownership tick), and answers the pod's
+/// standing; `None` when the row is no longer alive (marked done or
+/// dead, or deleted), which is the pod's cue to shut down.
+pub async fn heartbeat(pool: &PgPool, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>> {
     // Clamp at the write boundary to a sane [0,1]. The producer
     // (CgroupMemPressure) already clamps, so this only bites a buggy or
     // hostile caller, but placement/scaledown SQL compares `mem_pressure
@@ -449,17 +459,21 @@ pub async fn heartbeat(pool: &PgPool, pod_name: &str, mem_pressure: f64) -> Resu
         );
     }
     let mem_pressure = clamped;
-    let res = sqlx::query(
+    // The row answers back what the pod cannot know on its own: whether
+    // it was marked draining (a replacement or a scale-down decided
+    // nothing new lands on it), which is what shortens its idle grace.
+    let row: Option<(bool,)> = sqlx::query_as(
         r#"UPDATE worker_pod
            SET last_heartbeat_unix = $1, mem_pressure = $3
-           WHERE pod_name = $2 AND status = 'alive'"#,
+           WHERE pod_name = $2 AND status = 'alive'
+           RETURNING draining"#,
     )
     .bind(unix_now())
     .bind(pod_name)
     .bind(mem_pressure)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(res.rows_affected() > 0)
+    Ok(row.map(|(draining,)| WorkerStanding { draining }))
 }
 
 pub async fn mark_done(pool: &PgPool, pod_name: &str) -> Result<()> {
@@ -489,6 +503,17 @@ pub async fn mark_dead(pool: &PgPool, pod_name: &str) -> Result<()> {
     .await?;
     Ok(())
 }
+
+/// THE count of the worker tasks `wp` holds: pending or claimed, and
+/// either claimed by the pod or pinned to it and not yet claimed (a
+/// resume it owns, a live caller's execution). `wp` is the
+/// `worker_pod` row in scope. One spelling for every reader of "what
+/// does this pod still hold" (its own idle exit, the replacement
+/// drain, the reaper's breadcrumb), so the three can never disagree
+/// about what blocks an exit.
+const POD_TASK_COUNT: &str = "(SELECT COUNT(*) FROM task t \
+     WHERE t.target = 'worker' AND t.status IN ('pending', 'claimed') \
+       AND (t.claimed_by = wp.pod_name OR t.target_pod_name = wp.pod_name))";
 
 /// Idle self-exit (worker-driven). Flip this pod's row `alive -> done`
 /// when it has no more work to do. The no-work check and the status flip
@@ -521,19 +546,14 @@ pub async fn mark_dead(pool: &PgPool, pod_name: &str) -> Result<()> {
 /// Both checks read the pod's own row (`pod_name = $1`), never a
 /// caller-supplied project id, so a worker can only ever flip itself.
 pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
-    let res = sqlx::query(
+    let res = sqlx::query(&format!(
         r#"UPDATE worker_pod wp
            SET status = $2, terminal_at_unix = $3
            WHERE wp.pod_name = $1
              AND wp.status = 'alive'
              AND wp.held_until_unix <= $3
              AND CASE WHEN wp.draining THEN
-                 NOT EXISTS (
-                     SELECT 1 FROM task t
-                     WHERE t.target = 'worker'
-                       AND t.status IN ('pending', 'claimed')
-                       AND (t.claimed_by = wp.pod_name OR t.target_pod_name = wp.pod_name)
-                 )
+                 {POD_TASK_COUNT} = 0
              ELSE
                  NOT EXISTS (
                      SELECT 1 FROM task t
@@ -541,8 +561,8 @@ pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
                        AND t.project_id = wp.project_id
                        AND t.status IN ('pending', 'claimed')
                  )
-             END"#,
-    )
+             END"#
+    ))
     .bind(pod_name)
     .bind(PodStatus::Done.as_str())
     .bind(crate::tasks::unix_now())
@@ -597,14 +617,55 @@ pub async fn alive_pods_for_project_full(
     Ok(rows)
 }
 
-/// How many of the named pods are still alive (spawning|alive). The
-/// drain-progress probe for a gated worker replacement: doomed pods
-/// are marked draining, finish their in-flight work and idle-exit;
-/// this counts the stragglers.
+/// How much the named pods still hold: every worker task one of them
+/// has claimed or is pinned to (a resume it owns, a live caller's
+/// execution), PLUS every pod still promised to a caller who has not
+/// arrived (`held_until_unix`).
+///
+/// The drain-progress probe for a gated worker replacement: a doomed
+/// pod is marked draining so nothing new lands on it, and the
+/// replacement waits for THIS to reach zero, then kills it. A pod that
+/// is merely alive and idle holds nothing and does not delay anyone,
+/// which is the whole point: a replacement used to wait out the full
+/// cap on a pod that had finished everything and was inside its idle
+/// grace.
+///
+/// The promise counts for the same reason it blocks an idle exit. A
+/// caller is handed a ticket naming one exact pod and then takes a
+/// moment to arrive (a DNS wait, a round trip), and for that moment
+/// the pod holds no task at all. Killing it there hands somebody a
+/// ticket to a machine that is already gone, which is the failure the
+/// hold exists to prevent, so the drain honours it as the work it is.
+/// Nothing NEW can be promised to a doomed pod meanwhile: the
+/// reservation re-asserts the admittable predicate, which a draining
+/// pod fails.
+pub async fn count_in_flight_named(pool: &PgPool, pod_names: &[String], now_unix: i64) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(&format!(
+        r#"SELECT COALESCE(SUM({POD_TASK_COUNT} + CASE WHEN wp.held_until_unix > $2 THEN 1 ELSE 0 END), 0)::bigint
+           FROM worker_pod wp
+           WHERE wp.pod_name = ANY($1) AND wp.status IN ('spawning', 'alive')"#
+    ))
+    .bind(pod_names)
+    .bind(now_unix)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// How many of the named pods are still alive. The second wait of a
+/// gated worker replacement: once a doomed pod's work has landed it
+/// exits on its own (its heartbeat tells it it is draining, so it skips
+/// the idle grace), and its own exit is the only one that honours the
+/// bookkeeping the dispatcher cannot see (a metered call's cost still
+/// being written down lives in pod memory). This counts the pods that
+/// have not left yet. `spawning` pods are not counted: a pod that never
+/// registered alive heartbeats nothing, so it can never learn it is
+/// draining nor exit on its own, and waiting on it would hold the whole
+/// cap for a pod that ran nothing; the kill after the wait takes it.
 pub async fn count_alive_named(pool: &PgPool, pod_names: &[String]) -> Result<i64> {
     let (count,): (i64,) = sqlx::query_as(
         r#"SELECT COUNT(*) FROM worker_pod
-           WHERE pod_name = ANY($1) AND status IN ('spawning', 'alive')"#,
+           WHERE pod_name = ANY($1) AND status = 'alive'"#,
     )
     .bind(pod_names)
     .fetch_one(pool)
@@ -794,30 +855,48 @@ pub async fn set_draining(pool: &PgPool, pod_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A draining pod's breadcrumb input: `(pod_name, project_id,
-/// drained_at_unix, in_flight_tasks)` for every pod currently draining.
-/// `in_flight_tasks` is the count of pending/claimed worker tasks the pod
-/// still owns (claimed by it or pinned to it), the same set
+/// One [`DrainingBreadcrumb`] for every pod currently draining: how
+/// long it has been draining, the pending/claimed worker tasks it still
+/// owns (claimed by it or pinned to it), and whether it is still
+/// promised to a caller who has not arrived, the same set
 /// `mark_done_if_idle`'s draining branch waits on, so the breadcrumb says
 /// exactly what the drain is blocked on. Used only for periodic logging;
 /// a drain has no deadline.
-pub async fn draining_breadcrumbs(pool: &PgPool) -> Result<Vec<(String, String, i64, i64)>> {
-    let rows: Vec<(String, String, Option<i64>, i64)> = sqlx::query_as(
+pub async fn draining_breadcrumbs(pool: &PgPool, now_unix: i64) -> Result<Vec<DrainingBreadcrumb>> {
+    let rows: Vec<(String, String, Option<i64>, i64, bool)> = sqlx::query_as(&format!(
         r#"SELECT wp.pod_name, wp.project_id, wp.drained_at_unix,
-                  (SELECT COUNT(*) FROM task t
-                   WHERE t.target = 'worker'
-                     AND t.status IN ('pending', 'claimed')
-                     AND (t.claimed_by = wp.pod_name OR t.target_pod_name = wp.pod_name)
-                  )::bigint
+                  {POD_TASK_COUNT}::bigint,
+                  wp.held_until_unix > $1
            FROM worker_pod wp
-           WHERE wp.status = 'alive' AND wp.draining"#,
-    )
+           WHERE wp.status = 'alive' AND wp.draining"#
+    ))
+    .bind(now_unix)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(pod, project, drained, n)| (pod, project, drained.unwrap_or(0), n))
+        .map(|(pod_name, project_id, drained_at_unix, in_flight_tasks, promised)| DrainingBreadcrumb {
+            pod_name,
+            project_id,
+            drained_at_unix: drained_at_unix.unwrap_or(0),
+            in_flight_tasks,
+            promised,
+        })
         .collect())
+}
+
+/// One draining pod as the reaper reports it: how long it has been
+/// draining and exactly what its exit is blocked on, the same two facts
+/// the replacement drain waits on (`count_in_flight_named`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainingBreadcrumb {
+    pub pod_name: String,
+    pub project_id: String,
+    pub drained_at_unix: i64,
+    /// Worker tasks it has claimed or that are pinned to it.
+    pub in_flight_tasks: i64,
+    /// Still promised to a live caller who has not arrived.
+    pub promised: bool,
 }
 
 /// Worker rows only: a node-test row's liveness is owned by its

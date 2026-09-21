@@ -345,6 +345,11 @@ pub async fn run_pod(
 ) -> Result<()> {
     weft_core::net::install_crypto_provider();
     let shutdown = Arc::new(AtomicBool::new(false));
+    // Set by the heartbeat once the row says so; read by the picker to
+    // drop its idle grace. The pod cannot know it is draining any other
+    // way: the decision is made on its row by a replacement or a
+    // scale-down, never by the pod.
+    let draining = Arc::new(AtomicBool::new(false));
     let cancel_registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     worker_pods
@@ -354,6 +359,7 @@ pub async fn run_pod(
         worker_pods.clone(),
         pod_name.clone(),
         shutdown.clone(),
+        draining.clone(),
         weft_platform_traits::CgroupMemPressure::new(),
     );
 
@@ -427,6 +433,7 @@ pub async fn run_pod(
         shutdown.clone(),
         idle_exit,
         WORKER_IDLE_EXIT,
+        draining,
         background.clone(),
     )
     .await;
@@ -521,6 +528,7 @@ fn spawn_heartbeat(
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
     shutdown: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     mem_pressure: Arc<dyn weft_platform_traits::MemPressure>,
 ) {
     let interval = Duration::from_secs(weft_task_store::HEARTBEAT_INTERVAL_SECS);
@@ -543,10 +551,17 @@ fn spawn_heartbeat(
             // there is no cgroup limit, so one worker until squeezed).
             let pressure = mem_pressure.fraction();
             match worker_pods.heartbeat(&pod_name, pressure).await {
-                Ok(true) => {
+                Ok(Some(standing)) => {
                     consecutive_errors = 0;
+                    if standing.draining && !draining.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            target: "weft_engine::run_pod",
+                            %pod_name,
+                            "this pod is draining: nothing new lands here, it exits once its work lands"
+                        );
+                    }
                 }
-                Ok(false) => {
+                Ok(None) => {
                     tracing::warn!(
                         target: "weft_engine::run_pod",
                         %pod_name,

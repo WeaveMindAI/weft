@@ -730,6 +730,102 @@ async fn draining_pod_still_claims_pinned_to_it(pool: PgPool) {
     assert_eq!(claimed.color.as_deref(), Some(color.as_str()));
 }
 
+/// What a worker replacement waits on before killing a doomed pod: the
+/// work that pod still holds. Claimed work counts, work pinned to it
+/// and not yet claimed counts, and an idle pod (however alive) counts
+/// for nothing, so a replacement never waits on a pod with nothing to
+/// finish.
+#[sqlx::test]
+async fn in_flight_of_named_pods_is_their_claimed_and_pinned_work(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-doomed").await;
+    alive_pod(&pool, "pod-idle").await;
+    alive_pod(&pool, "pod-fresh").await;
+    let doomed = vec!["pod-doomed".to_string(), "pod-idle".to_string()];
+    let now = now_unix();
+    assert_eq!(
+        worker_pod::count_in_flight_named(&pool, &doomed, now).await.expect("count"),
+        0,
+        "alive and idle holds nothing"
+    );
+
+    let pool_ref = &pool;
+    let enqueue = |target_pod: Option<&str>| {
+        let target_pod = target_pod.map(str::to_string);
+        async move {
+            tasks::enqueue(
+                pool_ref,
+                tasks::NewTask {
+                    kind: TaskKind::Execute.into(),
+                    target: TaskTarget::Worker,
+                    project_id: Some(PROJECT.to_string()),
+                    dedup_key: None,
+                    color: Some(Uuid::new_v4().to_string()),
+                    tenant_id: TENANT.map(str::to_string),
+                    target_pod_name: target_pod,
+                    binary_hash: None,
+                    payload: json!({ "live_connection": Value::Null }),
+                },
+            )
+            .await
+            .expect("enqueue")
+        }
+    };
+    // One task the doomed pod claims, one pinned to it and still pending,
+    // one pinned to the fresh sibling (not ours to wait on).
+    enqueue(None).await;
+    claim_one(&pool, "pod-doomed", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+        .await
+        .expect("claim")
+        .expect("the unpinned task");
+    enqueue(Some("pod-doomed")).await;
+    enqueue(Some("pod-fresh")).await;
+
+    assert_eq!(
+        worker_pod::count_in_flight_named(&pool, &doomed, now).await.expect("count"),
+        2,
+        "the claimed task and the pinned pending task, and nothing of the sibling's"
+    );
+}
+
+/// A pod promised to a live caller who has not arrived yet holds no
+/// task at all, and killing it there would hand somebody a ticket to a
+/// machine that is already gone. So the promise counts as work until
+/// it lapses, the same fact that keeps the pod from idle-exiting.
+#[sqlx::test]
+async fn a_pod_still_promised_to_a_caller_counts_as_busy(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-promised").await;
+    let doomed = vec!["pod-promised".to_string()];
+    let now = now_unix();
+    assert_eq!(
+        worker_pod::count_in_flight_named(&pool, &doomed, now).await.expect("count"),
+        0,
+        "nothing promised, nothing running"
+    );
+
+    // What the live handshake does: pick the pod and promise it to the
+    // caller in one statement, before the caller arrives with a task.
+    let (picked, _) = worker_pod::reserve_pod_for_caller(&pool, PROJECT, SAT, None, now + 120)
+        .await
+        .expect("reserve")
+        .expect("a pod to promise");
+    assert_eq!(picked, "pod-promised");
+    assert_eq!(
+        worker_pod::count_in_flight_named(&pool, &doomed, now).await.expect("count"),
+        1,
+        "the promise is the work, though no task exists yet"
+    );
+
+    // Past the promise it counts for nothing again: a caller who never
+    // arrived cannot hold a replacement for ever.
+    assert_eq!(
+        worker_pod::count_in_flight_named(&pool, &doomed, now + 121).await.expect("count"),
+        0,
+        "a lapsed promise holds nobody"
+    );
+}
+
 // ----- color-ownership binding (claim trigger) -----------------------------
 
 /// Claiming a color-bearing task atomically stamps the color's owner to

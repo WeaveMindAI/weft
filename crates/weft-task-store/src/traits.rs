@@ -22,6 +22,7 @@ use serde_json::Value;
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
+use crate::worker_pod::WorkerStanding;
 use crate::tasks::{
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
 };
@@ -65,7 +66,9 @@ pub trait WorkerPodClient: Send + Sync {
     /// Heartbeat + self-reported memory pressure ([0,1]) in one call.
     /// The worker reads its own cgroup pressure each tick and reports it
     /// so the dispatcher places / scales workers by real memory load.
-    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool>;
+    /// Answers the pod's standing off its own row (`None`: the row is no
+    /// longer alive, the pod shuts down). See `worker_pod::heartbeat`.
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>>;
 
     async fn mark_done(&self, pod_name: &str) -> Result<()>;
 
@@ -150,7 +153,7 @@ impl WorkerPodClient for PostgresWorkerPodClient {
         .await
     }
 
-    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool> {
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>> {
         crate::worker_pod::heartbeat(&self.pool, pod_name, mem_pressure).await
     }
 

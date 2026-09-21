@@ -34,7 +34,7 @@ use crate::progress::Progress;
 /// running execs. The type lives in weft-core (one definition shared
 /// with the broker/dispatcher wire protocol); re-exported here so
 /// every CLI verb keeps importing it from the gate that consumes it.
-pub use weft_core::RunningPolicy;
+pub use weft_core::{RunningChoice, RunningPolicy};
 
 /// Parse an optional `--running-policy` CLI flag value, mapping an
 /// unrecognized value to a uniform error. `None` stays `None` (the
@@ -48,6 +48,38 @@ pub fn parse_running_policy_flag(flag: Option<&str>) -> Result<Option<RunningPol
             .ok_or_else(|| {
                 anyhow::anyhow!("invalid --running-policy '{s}'; expected 'wait' or 'cancel'")
             }),
+    }
+}
+
+/// The running-policy answer a verb puts on the wire: the flag parsed
+/// (cancel unless it says wait) and the drain cap, which only ever
+/// rides a wait. A `--drain-timeout` beside cancel is refused rather
+/// than dropped: it would bound nothing, and a flag that changes
+/// nothing is one the person believes did. One reading for every verb
+/// that takes the pair (`activate`, `deactivate`, `resync`, the infra
+/// verbs), so they cannot disagree about what the cap means.
+pub fn parse_running_choice(
+    policy: Option<&str>,
+    drain_timeout: Option<u64>,
+) -> Result<(RunningPolicy, Option<u64>)> {
+    let policy = parse_running_policy_flag(policy)?.unwrap_or_default();
+    if policy == RunningPolicy::Cancel && drain_timeout.is_some() {
+        anyhow::bail!(
+            "--drain-timeout bounds a wait, and the running policy is cancel (the default); \
+             pass `--running-policy wait` with it, or drop it"
+        );
+    }
+    Ok((policy, drain_timeout))
+}
+
+/// The running-work answer as the request fields every verb sends:
+/// `runningPolicy` always (so the wire never guesses), `drainTimeoutSecs`
+/// when a cap was given. One spelling, the wire type's own.
+pub fn running_choice_fields(policy: RunningPolicy, drain_timeout: Option<u64>) -> serde_json::Map<String, serde_json::Value> {
+    let choice = RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout };
+    match serde_json::to_value(choice).expect("a wire struct serializes") {
+        serde_json::Value::Object(fields) => fields,
+        other => unreachable!("a struct serializes to an object, got {other}"),
     }
 }
 
@@ -333,9 +365,16 @@ pub async fn register_compiled(
     )
     .await
     .context("worker image")?;
+    // The build used the files as they were when it started; recording
+    // that version now would put the project one edit behind its own
+    // disk, and the next edit would look already live. So it stops
+    // here and asks for a second run, which is short (the image is
+    // content-addressed and the parts that did not move are cached).
     anyhow::ensure!(
         super::versions::local_manifest(project)? == manifest,
-        "project files changed while building; run the command again to build and record the same sources"
+        "project files changed while building, so the version this would record is already \
+         behind your disk; nothing was deployed. Run the command again (it rebuilds only what \
+         moved). If several people or agents edit at once, wait for them to finish first"
     );
     // Send the already compiled + enriched definition (built above for
     // the infra hash). The dispatcher can't compile it: the nodes live

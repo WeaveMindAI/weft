@@ -456,13 +456,15 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
                     }
                 }
             }
-            // Keep the pod's identity row fresh so the reaper never
-            // mistakes a long test for a dead worker. `Ok(false)`
+            // Keep the pod's identity row fresh: its heartbeat is what
+            // `weft ps` and the breadcrumbs read as "still here" (the
+            // reaper's stale sweep only looks at worker rows, so a long
+            // test is never mistaken for a dead worker). `Ok(None)`
             // means the row went non-alive under us (another actor is
             // cleaning this pod up): loud, never swallowed.
             match weft_task_store::worker_pod::heartbeat(&state.pg_pool, &pod_name, 0.0).await {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::warn!(
                     target: "weft_dispatcher::run_node_test",
                     pod = %pod_name,
                     "the test pod's identity row is no longer alive; another actor \

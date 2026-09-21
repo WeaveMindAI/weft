@@ -1098,24 +1098,21 @@ export interface ParseResponse {
   diagnostics: Diagnostic[];
 }
 
-// SYNC: NodeExecutionStatus <-> crates/weft-core/src/exec/execution.rs NodeExecutionStatus
-/// Adding a state requires adding it on both sides; the UI lookup
-/// tables in `webview/lib/utils/status.ts` exhaust this union so
-/// drift compiles as an error. The earlier shape had ghost variants
-/// (`pending` / `suspended` / `accumulating`) the dispatcher never
-/// emitted; they painted states the engine could not produce and
-/// `suspended` doubled-up with the real `waiting_for_input` event.
 /// Why a firing did not run. A DECISION (the author's `_should_flow` said no)
 /// reads differently from a CONSEQUENCE (an input it needed never arrived), so
 /// the journal carries which one it was.
 // SYNC: SkipReason <-> crates/weft-core/src/exec/skip.rs SkipReason
+/// `failure` on a closure-caused reason is the error the closure carried:
+/// the node skipped because something before it BROKE rather than
+/// declined, and its own closures went out with that error.
 export type SkipReason =
   | { kind: 'did_not_flow' }
-  | { kind: 'flow_closed' }
+  | { kind: 'flow_closed'; failure?: string }
   | { kind: 'did_flow' }
-  | { kind: 'required_input_closed'; port: string }
-  | { kind: 'every_input_closed' }
-  | { kind: 'one_of_group_closed'; ports: string[] }
+  | { kind: 'watched_node_failed'; error: string }
+  | { kind: 'required_input_closed'; port: string; failure?: string }
+  | { kind: 'every_input_closed'; failure?: string }
+  | { kind: 'one_of_group_closed'; ports: string[]; failure?: string }
   | { kind: 'scope_skipped'; scope: string };
 
 /// Why an execution was cancelled: a person, a sibling run's
@@ -1150,6 +1147,13 @@ export function isGatePort(name: string): boolean {
   return name === SHOULD_FLOW_PORT || name === SHOULD_NOT_FLOW_PORT;
 }
 
+// SYNC: NodeExecutionStatus <-> crates/weft-core/src/exec/execution.rs NodeExecutionStatus
+/// Adding a state requires adding it on both sides; the UI lookup
+/// tables in `webview/lib/utils/status.ts` exhaust this union so
+/// drift compiles as an error. The earlier shape had ghost variants
+/// (`pending` / `suspended` / `accumulating`) the dispatcher never
+/// emitted; they painted states the engine could not produce and
+/// `suspended` doubled-up with the real `waiting_for_input` event.
 export type NodeExecutionStatus =
   | 'running'
   | 'waiting_for_input'
@@ -1513,9 +1517,12 @@ export type ProjectTransition = 'none' | 'building' | 'cancelling_build';
 /// upgrade on an Active project). `wipe` forces `runningPolicy:
 /// 'cancel'` (waiting before wiping is contradictory); `graceMinutes`
 /// only applies to `hibernate`.
-// SYNC: DeactivationSpec <-> crates/weft-broker-client/src/protocol.rs DeactivateSpec
+// SYNC: DeactivationSpec <-> crates/weft-core/src/running_policy.rs DeactivateSpec
 export interface DeactivationSpec {
+  // SYNC: mode <-> crates/weft-core/src/running_policy.rs DeactivationMode
   mode: 'wipe' | 'hibernate' | 'park';
+  // SYNC: runningPolicy <-> crates/weft-core/src/running_policy.rs RunningPolicy (its
+  // `#[default]`, cancel, is what DeactivationPicker.svelte opens on)
   runningPolicy: 'wait' | 'cancel';
   graceMinutes?: number;
   /// Cap in seconds on a `wait` drain: "wait at most N, then proceed"
@@ -1529,8 +1536,8 @@ export interface DeactivationSpec {
 
 /// The server's default `wait` drain cap, mirrored so the picker can
 /// prefill its input.
-// SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> crates/weft-broker-client/src/protocol.rs DEFAULT_DRAIN_TIMEOUT_SECS
-export const DEFAULT_DRAIN_TIMEOUT_SECS = 600;
+// SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> crates/weft-core/src/running_policy.rs DEFAULT_DRAIN_TIMEOUT_SECS
+export const DEFAULT_DRAIN_TIMEOUT_SECS = 60;
 
 // SYNC: ActionAvailability <-> crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse
 export interface ActionAvailability {

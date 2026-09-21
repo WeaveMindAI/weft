@@ -35,7 +35,7 @@ use crate::context::{ContextHandle, EndpointMethod, ExecutionContext, LogLevel, 
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::node::{InputSpec, Node, NodeMetadata, NodeOutput};
-use crate::primitive::SignalSpec;
+use crate::primitive::{replay_await, replay_run, AwaitedEntry, AwaitedEntryKind, ReplayedAwait, SignalSpec};
 use crate::weft_type::WeftType;
 
 // ----- The test declaration ------------------------------------------
@@ -569,6 +569,10 @@ impl SentRequest {
 struct CannedResponse {
     status: u16,
     content_type: String,
+    /// Response headers beyond the content type, as declared (a
+    /// provider that answers with the created id in a header, an
+    /// ETag, a `Location`).
+    headers: Vec<(String, String)>,
     body: bytes::Bytes,
 }
 
@@ -721,6 +725,20 @@ struct FakeState {
     endpoint_answers: Mutex<BTreeMap<(String, EndpointMethod, String), VecDeque<CannedAnswer>>>,
     /// Every endpoint call the node made, in order.
     endpoint_calls: Mutex<Vec<EndpointCall>>,
+    /// The fake's journal of each body's replayable calls: every
+    /// `ctx.run` step and every `ctx.await_signal`, in one sequence
+    /// with one counter, exactly as production journals them (a body
+    /// that awaits then runs journals the run at index 1). Keyed the
+    /// way production keys its journal, per node body (a node's run
+    /// and its trigger setup are two executions there, and two node
+    /// types never share one), and it lives on the RIG, not on one
+    /// run's handle, so a second `rig.run(..)` of the same node on the
+    /// same rig is a resume: it replays what the first recorded, a
+    /// step's value and a signal's payload alike, and refuses (through
+    /// the same reading production uses) when the body's call order
+    /// changed between the two. That is what lets a test prove a node's
+    /// exactly-once step: a post that must not go out twice.
+    journal: Mutex<BTreeMap<String, Vec<AwaitedEntry>>>,
     cancellation: Arc<CancellationFlag>,
 }
 
@@ -782,6 +800,7 @@ impl FakeState {
             endpoints: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
             endpoint_calls: Mutex::new(Vec::new()),
+            journal: Mutex::new(BTreeMap::new()),
             cancellation: Arc::new(CancellationFlag::new()),
         })
     }
@@ -840,6 +859,23 @@ impl FakeRig {
         content_type: &str,
         body: impl Into<bytes::Bytes>,
     ) {
+        self.respond_with_headers(method, path, status, content_type, &[], body);
+    }
+
+    /// [`Self::respond_raw`] with response headers, for a provider whose
+    /// answer lives partly outside the body: a create that hands the new
+    /// id back in a header (`x-restli-id`), an `ETag`, a `Location`.
+    /// `headers` are `(name, value)` pairs; the content type is its own
+    /// argument and must not be repeated here.
+    pub fn respond_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: impl Into<bytes::Bytes>,
+    ) {
         // Production's client follows redirects, so a node never sees
         // a 3xx; handing one out raw would exercise a path production
         // does not have.
@@ -848,6 +884,28 @@ impl FakeRig {
             "the fake rig does not model redirects; declare the final response's \
              route directly"
         );
+        assert!(
+            !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-type")),
+            "the content type is the `content_type` argument; declaring it again as a \
+             header would give the response two"
+        );
+        // Checked here, at declaration, naming the header and the route:
+        // left to the response builder, a bad name surfaces only when a
+        // request hits the route, as the node's own HTTP error, and a
+        // route no request hits never reports it at all.
+        for (name, value) in headers {
+            assert!(
+                http::header::HeaderName::from_bytes(name.as_bytes()).is_ok(),
+                "'{name}' is not a valid header name (declared on {method} {path})"
+            );
+            // `from_bytes`, as the response builder and the real client
+            // read one: a provider may send a latin-1 value, and a rig
+            // that refused it would refuse what production serves.
+            assert!(
+                http::header::HeaderValue::from_bytes(value.as_bytes()).is_ok(),
+                "the value of header '{name}' is not a valid header value (declared on {method} {path})"
+            );
+        }
         // Keys are canonical (decoded, order-normalized query
         // multiset), so two spellings of one route collide here
         // instead of shadowing each other at match time.
@@ -867,6 +925,10 @@ impl FakeRig {
         self.state.routes.lock().unwrap().insert(key, CannedResponse {
             status,
             content_type: content_type.to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
             body: body.into(),
         });
     }
@@ -1074,7 +1136,7 @@ impl FakeRig {
         // resolvable) and unregisters them when the body returns.
         // Binding it bare `_` would drop it immediately and every
         // `ctx.inputs.get::<Generator<T>>` read would fail "not live".
-        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, inputs) {
+        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, RUN_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
@@ -1115,7 +1177,7 @@ impl FakeRig {
     /// wake signal). Assert on [`Self::registered_signals`] after.
     pub async fn run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
         // Keeps the run's generator feeds registered (see `run`).
-        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, inputs) {
+        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, SETUP_TRIGGER_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
@@ -1125,9 +1187,19 @@ impl FakeRig {
         handle.into_outcome(result)
     }
 
+    /// The journal a body of `node` replays and records: what
+    /// production keys by (color, node, frames), here one sequence per
+    /// node TYPE and body kind, because a rig runs one instance of a
+    /// type at a time (`NODE_UNDER_TEST_ID` is every node's id here).
+    /// Two structs returning one manifest are one node to the rig.
+    fn journal_key(node: &dyn Node, body: &str) -> String {
+        format!("{}/{body}", node.manifest().node_type)
+    }
+
     fn build_ctx(
         &self,
         node: &dyn Node,
+        body: &str,
         inputs: Value,
     ) -> WeftResult<(CaptureBox, ExecutionContext, RegisteredFeeds)> {
         let manifest = node.manifest();
@@ -1163,6 +1235,15 @@ impl FakeRig {
         for (port, ty) in self.state.output_types.lock().unwrap().iter() {
             outputs.insert(port.clone(), ty.clone());
         }
+        // A resume loads the body's journal, exactly as the execution
+        // driver seeds a firing's awaited sequence from the fold: in
+        // call-index order, whatever order the records landed in (two
+        // steps started together record in completion order, and the
+        // fold sorts them the same way).
+        let journal_key = Self::journal_key(node, body);
+        let mut awaited_sequence =
+            self.state.journal.lock().unwrap().get(&journal_key).cloned().unwrap_or_default();
+        awaited_sequence.sort_by_key(|entry| entry.call_index);
         let handle = Arc::new(TestHandle {
             state: self.state.clone(),
             capture: Capture::new(outputs),
@@ -1170,7 +1251,9 @@ impl FakeRig {
             wake,
             publishes: manifest.publishes.clone(),
             has_generator_input: manifest.has_generator_input(),
-            run_step_index: AtomicU32::new(0),
+            journal_key,
+            awaited_sequence: Mutex::new(awaited_sequence.into()),
+            next_call_index: AtomicU32::new(0),
         });
         let ctx = test_context(manifest, bag, handle.clone());
         Ok((CaptureBox::Fake(handle), ctx, feeds))
@@ -1282,6 +1365,19 @@ impl FakeRig {
     /// Every `ctx.log` line, in order.
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.state.logs.lock().unwrap().clone()
+    }
+
+    /// Every replayable call recorded on this rig, in call order: each
+    /// `ctx.run` step with its value and each `ctx.await_signal` with the
+    /// payload it got, in call order with the call index each landed
+    /// at, for `node`'s run body. A second `rig.run(..)` of the node on
+    /// the same rig replays them instead of running the step's work or
+    /// popping a new signal, the way a resumed execution replays its
+    /// journal: run the node twice and this list still holds one entry
+    /// per call, and the request log shows the provider was called
+    /// once.
+    pub fn recorded_steps(&self, node: &dyn Node) -> Vec<AwaitedEntry> {
+        self.state.journal.lock().unwrap().get(&Self::journal_key(node, RUN_BODY)).cloned().unwrap_or_default()
     }
 
     /// Every tag the node put on its execution, one list per
@@ -1687,13 +1783,23 @@ struct TestHandle {
     /// Whether the node under test declares a Generator input, so the
     /// rig refuses `await_signal` exactly where an execution would.
     has_generator_input: bool,
-    /// `ctx.run` memo-step counter. There is no journal here, so every
-    /// step is fresh; the counter only keeps the call/record indices
-    /// aligned with the trait contract.
-    run_step_index: AtomicU32,
+    /// Which of the rig's journals this body records into.
+    journal_key: String,
+    /// What the body has left to replay: the journal it started from,
+    /// popped in call order by the same reading production uses.
+    awaited_sequence: Mutex<VecDeque<AwaitedEntry>>,
+    /// The call counter for THIS run, advanced by `ctx.run` and
+    /// `ctx.await_signal` alike, as production numbers them: one
+    /// sequence across both, never keyed on a step's name.
+    next_call_index: AtomicU32,
 }
 
 impl TestHandle {
+    /// Append one replayable call to this body's journal on the rig.
+    fn record(&self, entry: AwaitedEntry) {
+        self.state.journal.lock().unwrap().entry(self.journal_key.clone()).or_default().push(entry);
+    }
+
     /// The service the node under test declares it publishes, or the
     /// same refusal production gives a node that declares none.
     fn published_service(&self) -> WeftResult<String> {
@@ -1730,6 +1836,21 @@ impl ContextHandle for TestHandle {
                 crate::context::stream_consumer_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
+        // One counter with `ctx.run` and the one replay reading, as
+        // production: a resume (a second run of this node on this rig)
+        // replays the payload this index got the first time, and a
+        // drifted body is refused with production's own words.
+        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
+        match replay_await(&mut self.awaited_sequence.lock().unwrap(), call_index)? {
+            Some(ReplayedAwait::Resolved(payload)) => return Ok(payload),
+            Some(ReplayedAwait::Pending { token }) => {
+                return Err(WeftError::NodeExecution(format!(
+                    "the rig's journal holds an unanswered await ({token}) at call_index={call_index}, \
+                     which it never records: every await it journals was answered when it was made"
+                )));
+            }
+            None => {}
+        }
         // Record the ATTEMPT before popping, so a test can see a park
         // that found no queued payload (otherwise "parked on nothing"
         // and "never awaited" would look the same).
@@ -1741,6 +1862,13 @@ impl ContextHandle for TestHandle {
                 spec.kind
             ))
         })?;
+        self.record(AwaitedEntry {
+            call_index,
+            kind: AwaitedEntryKind::Await {
+                token: format!("rig-{}-{call_index}", spec.kind),
+                resolved: Some(payload.clone()),
+            },
+        });
         Ok(payload)
     }
 
@@ -1812,12 +1940,23 @@ impl ContextHandle for TestHandle {
         }
     }
 
-    async fn run_step(&self, _name: &str) -> WeftResult<(u32, Option<Value>)> {
-        // No journal, no replay: every memoized step runs fresh.
-        Ok((self.run_step_index.fetch_add(1, Ordering::SeqCst), None))
+    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
+        // The rig's journal replayed by the one reading production
+        // uses: a step an earlier run of this node recorded is replayed
+        // by call index, name unread; an await there, or another index,
+        // is the drift production refuses.
+        let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
+        let replayed = replay_run(&mut self.awaited_sequence.lock().unwrap(), name, call_index)?;
+        Ok((call_index, replayed))
     }
 
-    async fn run_record(&self, _name: &str, _call_index: u32, _value: &Value) -> WeftResult<()> {
+    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {
+        // Appended in the order the records land, as production's
+        // journal rows are; the index travels on the entry.
+        self.record(AwaitedEntry {
+            call_index,
+            kind: AwaitedEntryKind::Run { name: name.to_string(), value: value.clone() },
+        });
         Ok(())
     }
 
@@ -2285,9 +2424,13 @@ impl reqwest_middleware::Middleware for CannedAnswerMiddleware {
                 query.map(|q| format!("?{q}")).unwrap_or_default(),
             )));
         };
-        let response = http::Response::builder()
+        let mut response = http::Response::builder()
             .status(canned.status)
-            .header(http::header::CONTENT_TYPE, canned.content_type.as_str())
+            .header(http::header::CONTENT_TYPE, canned.content_type.as_str());
+        for (name, value) in &canned.headers {
+            response = response.header(name.as_str(), value.as_str());
+        }
+        let response = response
             .body(canned.body.to_vec())
             .map_err(|e| {
                 reqwest_middleware::Error::Middleware(anyhow::anyhow!(
@@ -2313,6 +2456,11 @@ pub enum HandleRole<'a> {
     /// drives, not the body).
     Harness { node_type: &'static str },
 }
+
+/// The two bodies a rig runs for a node, each with a journal of its
+/// own on the rig, as each is its own execution in production.
+const RUN_BODY: &str = "run";
+const SETUP_TRIGGER_BODY: &str = "setup_trigger";
 
 /// The firing id every [`HandleRole::NodeUnderTest`] handle runs as.
 /// One definition: the runtime's parked-body watchdog keys its
@@ -2865,6 +3013,254 @@ mod tests {
         let outcome = rig.run(&ProbeNode, json!({"account": rig.access("probe")})).await;
         let err = outcome.result.expect_err("403 surfaces").to_string();
         assert!(err.contains("403"), "{err}");
+    }
+
+    /// A node whose provider answers with the created id in a HEADER
+    /// and an empty body (LinkedIn's rest.li create is the shipped
+    /// case): the happy path is only testable if the rig can say so.
+    struct HeaderReadingNode;
+    impl crate::node::NodeManifest for HeaderReadingNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for HeaderReadingNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let access: Access = ctx.inputs.get("account")?;
+            let client = ctx.client(&access).await?;
+            let resp = client
+                .post("https://provider.example/api/create")
+                .send()
+                .await
+                .map_err(node_error)?;
+            let id = resp
+                .headers()
+                .get("x-restli-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .ok_or_else(|| node_error("the create answered without an id header"))?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", json!({"id": id})).set("done", true))
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_canned_response_can_carry_headers() {
+        let rig = FakeRig::new();
+        rig.respond_with_headers(
+            "POST",
+            "/api/create",
+            201,
+            "application/json",
+            &[("x-restli-id", "urn:li:share:42")],
+            Vec::new(),
+        );
+        let outcome = rig
+            .run(&HeaderReadingNode, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("the node reads the header");
+        assert_eq!(outcome.outputs["reply"], json!({"id": "urn:li:share:42"}));
+    }
+
+    #[test]
+    #[should_panic(expected = "content type")]
+    fn a_content_type_header_is_refused_beside_the_content_type_argument() {
+        let rig = FakeRig::new();
+        rig.respond_with_headers(
+            "GET",
+            "/page",
+            200,
+            "application/json",
+            &[("Content-Type", "text/plain")],
+            Vec::new(),
+        );
+    }
+
+    /// A node that publishes through `ctx.run`, the exactly-once step:
+    /// the provider call is the step's work, and the emitted id is
+    /// whatever the step answered.
+    struct PublishingNode;
+    impl crate::node::NodeManifest for PublishingNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for PublishingNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let access: Access = ctx.inputs.get("account")?;
+            let client = ctx.client(&access).await?;
+            let published = ctx
+                .run("publish", || async {
+                    crate::access::client::post_json(
+                        &client,
+                        "https://provider.example/api/send",
+                        &json!({"text": "hello"}),
+                        "publish the post",
+                    )
+                    .await
+                })
+                .await?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", published).set("done", true))
+                .await
+        }
+    }
+
+    /// The rig's recorded steps are the journal: a second run on the
+    /// same rig is a resume, and the provider is not called again. This
+    /// is the property a node that posts on somebody's behalf exists to
+    /// keep, and the one its tests could not prove before.
+    #[tokio::test]
+    async fn a_recorded_step_is_replayed_by_the_next_run_on_the_same_rig() {
+        let rig = FakeRig::new();
+        rig.respond("POST", "/api/send", json!({"id": "post-1"}));
+        let first = rig
+            .run(&PublishingNode, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("first run publishes");
+        let second = rig
+            .run(&PublishingNode, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("second run replays");
+
+        assert_eq!(first.outputs["reply"], json!({"id": "post-1"}));
+        assert_eq!(second.outputs["reply"], first.outputs["reply"], "the replay answers the same");
+        assert_eq!(rig.requests().len(), 1, "the provider was called once across two runs");
+        assert_eq!(
+            rig.recorded_steps(&PublishingNode),
+            vec![AwaitedEntry {
+                call_index: 0,
+                kind: AwaitedEntryKind::Run { name: "publish".into(), value: json!({"id": "post-1"}) },
+            }]
+        );
+    }
+
+    /// Two node types on one rig are two executions in production, with
+    /// a journal each: the second never replays the first's steps.
+    #[tokio::test]
+    async fn another_node_on_the_same_rig_has_its_own_journal() {
+        let rig = FakeRig::new();
+        rig.respond("POST", "/api/send", json!({"id": "post-1"}));
+        rig.signal(json!({"ok": true}));
+        rig.run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("the asking node parks, is answered, publishes");
+        let other = rig
+            .run(&PublishingNode, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("a different node runs its own body, replaying nothing");
+        assert_eq!(other.outputs["reply"], json!({"id": "post-1"}));
+        assert_eq!(rig.requests().len(), 2, "each node made its own call");
+        assert!(rig.recorded_steps(&PublishingNode).iter().all(|entry| matches!(entry.kind, AwaitedEntryKind::Run { .. })));
+    }
+
+    /// A body that parks on a signal and then publishes: production
+    /// numbers the await and the run on one counter, and a resume
+    /// replays both. The rig does the same, so the second run needs no
+    /// second signal, calls the provider once, and a body whose call
+    /// order changed is refused where production would refuse it.
+    struct AskThenPublishNode {
+        /// `false` is the same node with its await edited out: the
+        /// drifted body a resume must refuse.
+        ask: bool,
+    }
+    impl crate::node::NodeManifest for AskThenPublishNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            asking_manifest()
+        }
+    }
+    fn asking_manifest() -> &'static NodeMetadata {
+        static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+        MANIFEST.get_or_init(|| {
+            let mut m = manifest().clone();
+            m.node_type = "RigAsker".into();
+            m
+        })
+    }
+    #[async_trait::async_trait]
+    impl Node for AskThenPublishNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let access: Access = ctx.inputs.get("account")?;
+            let client = ctx.client(&access).await?;
+            let answer = if self.ask {
+                ctx.await_signal(crate::signal::timer::Timer {
+                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
+                })
+                .await?
+            } else {
+                json!(true)
+            };
+            let published = ctx
+                .run("publish", || async {
+                    crate::access::client::post_json(
+                        &client,
+                        "https://provider.example/api/send",
+                        &json!({"approved": answer}),
+                        "publish the post",
+                    )
+                    .await
+                })
+                .await?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", published).set("done", true))
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_await_and_a_run_share_one_index_and_both_replay() {
+        let rig = FakeRig::new();
+        rig.respond("POST", "/api/send", json!({"id": "post-1"}));
+        rig.signal(json!({"ok": true}));
+        rig.run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("first run parks, is answered, publishes");
+        // No second signal queued: the resume replays the first answer.
+        let second = rig
+            .run(&AskThenPublishNode { ask: true }, json!({"account": rig.access("probe")}))
+            .await
+            .ok()
+            .expect("second run replays the answer and the publish");
+        assert_eq!(second.outputs["reply"], json!({"id": "post-1"}));
+        assert_eq!(rig.requests().len(), 1, "one provider call across the two runs");
+        let steps = rig.recorded_steps(&AskThenPublishNode { ask: true });
+        assert_eq!(steps.len(), 2, "one entry per call, replays add none: {steps:?}");
+        assert!(
+            matches!(&steps[0].kind, AwaitedEntryKind::Await { resolved: Some(payload), .. } if payload == &json!({"ok": true}))
+                && steps[0].call_index == 0,
+            "the await is index 0, as production numbers it: {steps:?}"
+        );
+        assert_eq!(
+            steps[1],
+            AwaitedEntry {
+                call_index: 1,
+                kind: AwaitedEntryKind::Run { name: "publish".into(), value: json!({"id": "post-1"}) },
+            },
+            "and the run index 1"
+        );
+
+        // The same node with its await edited out runs where it awaited:
+        // a drifted body, refused with production's own words.
+        let err = rig
+            .run(&AskThenPublishNode { ask: false }, json!({"account": rig.access("probe")}))
+            .await
+            .result
+            .expect_err("a run where an await was journaled is a drifted body")
+            .to_string();
+        assert!(err.contains("journal has Await"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid header name")]
+    fn a_bad_header_name_is_refused_at_declaration() {
+        let rig = FakeRig::new();
+        rig.respond_with_headers("GET", "/page", 200, "application/json", &[("no spaces allowed", "x")], Vec::new());
     }
 
     struct DoubleEmitNode;

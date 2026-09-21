@@ -1421,6 +1421,73 @@ fn compact_wiring_view(value: &mut serde_json::Value) {
             }
         }
     }
+    // The long-list cut runs at the TYPED sites only, like the other
+    // presentation passes: each input's own widget, and the widgets
+    // under `portsFromConfig` (the one subtree where a `widget` key is
+    // always a Widget). A `default`, a rule's `equals` payload or a
+    // declared type is free-form data and is never walked.
+    if let Some(ports) = map.get_mut("portsFromConfig") {
+        elide_long_option_lists(ports);
+    }
+    if let Some(entries) = map.get_mut("inputs") {
+        for entry in entries.as_array_mut().into_iter().flatten() {
+            if let Some(widget) = entry.get_mut("widget") {
+                elide_long_options(widget);
+            }
+        }
+    }
+}
+
+/// How many of a select's options the compact view shows before it
+/// says how many more there are.
+const COMPACT_OPTIONS_SHOWN: usize = 8;
+
+/// Cut a `select` / `multiselect` widget's options list past
+/// [`COMPACT_OPTIONS_SHOWN`] entries to that many plus a `moreOptions`
+/// count. The compact view is read to WIRE a node, and eight zones say
+/// "an IANA time zone" as well as six hundred do (Cron's timezone
+/// picker alone was 11 KB of the view); the full list is on the node's
+/// plain `describe-nodes --node <Type>` output. Anything that is not a
+/// select is left untouched.
+fn elide_long_options(widget: &mut serde_json::Value) {
+    let Some(widget) = widget.as_object_mut() else { return };
+    if !matches!(widget.get("kind").and_then(|k| k.as_str()), Some("select" | "multiselect")) {
+        return;
+    }
+    let hidden = match widget.get_mut("options") {
+        Some(serde_json::Value::Array(options)) if options.len() > COMPACT_OPTIONS_SHOWN => {
+            let hidden = options.len() - COMPACT_OPTIONS_SHOWN;
+            options.truncate(COMPACT_OPTIONS_SHOWN);
+            Some(hidden)
+        }
+        _ => None,
+    };
+    if let Some(hidden) = hidden {
+        widget.insert("moreOptions".into(), serde_json::Value::from(hidden));
+    }
+}
+
+/// [`elide_long_options`] on every `widget` under the `portsFromConfig`
+/// subtree, the same walk `strip_widget_noise` makes and safe for the
+/// same reason: that subtree holds no free-form value a `widget` key of
+/// the user's own could hide in.
+fn elide_long_option_lists(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(widget) = map.get_mut("widget") {
+                elide_long_options(widget);
+            }
+            for inner in map.values_mut() {
+                elide_long_option_lists(inner);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                elide_long_option_lists(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// [`PORTS_PRESENTATION_KEYS`] out at every depth of the
@@ -2434,6 +2501,10 @@ pub struct OutputSpec {
 /// inspector: every input has exactly one effective widget (declared, or
 /// derived from the type via [`Widget::default_for_type`]).
 // SYNC: Widget <-> packages/weft-graph/src/protocol.ts Widget/WidgetKind
+// The compact wiring view (`NodeMetadata::compact_json`) is a read-only
+// projection of this: it may cut a long `options` list and add a
+// `moreOptions` count, so its output is never parsed back into a
+// `Widget` (which denies unknown fields).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Widget {
@@ -4344,6 +4415,7 @@ mod package_defaults_tests {
 #[cfg(test)]
 mod compact_view_tests {
     use super::*;
+    use serde_json::json;
 
     /// The keep/drop lists must cover the WHOLE top-level schema, both
     /// directions: a struct key nobody classified is schema growth
@@ -4400,6 +4472,58 @@ mod compact_view_tests {
                 "drop-list names a key the schema does not have: `{key}`"
             );
         }
+    }
+
+    /// A select with more options than anyone reads at a glance is cut
+    /// to a sample and a count in the compact view; a short one and the
+    /// plain metadata keep every option.
+    #[test]
+    fn compact_json_cuts_a_long_options_list_to_a_sample() {
+        let zones: Vec<String> = (0..600).map(|i| format!("Zone/{i}")).collect();
+        let metadata: NodeMetadata = serde_json::from_value(json!({
+            "type": "Cron",
+            "label": "Cron",
+            "description": "Fire on a schedule.",
+            "inputs": [
+                { "name": "timezone", "type": "String",
+                  "widget": { "kind": "select", "options": zones } },
+                { "name": "unit", "type": "String",
+                  "widget": { "kind": "select", "options": ["sec", "min"] } }
+            ],
+            "outputs": []
+        }))
+        .expect("metadata");
+
+        let compact = metadata.compact_json();
+        let timezone = &compact["inputs"][0]["widget"];
+        assert_eq!(timezone["options"].as_array().map(Vec::len), Some(COMPACT_OPTIONS_SHOWN));
+        assert_eq!(timezone["options"][0], json!("Zone/0"));
+        assert_eq!(timezone["moreOptions"], json!(600 - COMPACT_OPTIONS_SHOWN));
+        let unit = &compact["inputs"][1]["widget"];
+        assert_eq!(unit["options"], json!(["sec", "min"]), "a short list is whole");
+        assert!(unit.get("moreOptions").is_none(), "and says nothing about more");
+
+        let plain = serde_json::to_value(metadata.resolved()).expect("serializes");
+        assert_eq!(plain["inputs"][0]["widget"]["options"].as_array().map(Vec::len), Some(600));
+
+        // Free-form data is never walked: a `default` that happens to
+        // hold a select-shaped object under a `widget` key keeps every
+        // entry and gains nothing.
+        let zones: Vec<String> = (0..20).map(|i| format!("Zone/{i}")).collect();
+        let metadata: NodeMetadata = serde_json::from_value(json!({
+            "type": "FormLike",
+            "label": "Form",
+            "description": "Holds a form spec as data.",
+            "inputs": [
+                { "name": "spec", "type": "JsonDict",
+                  "default": { "widget": { "kind": "select", "options": zones } } }
+            ],
+            "outputs": []
+        }))
+        .expect("metadata");
+        let compact = metadata.compact_json();
+        assert_eq!(compact["inputs"][0]["default"]["widget"]["options"].as_array().map(Vec::len), Some(20));
+        assert!(compact["inputs"][0]["default"]["widget"].get("moreOptions").is_none());
     }
 
     /// What `compact_json` keeps on a node carrying the interesting

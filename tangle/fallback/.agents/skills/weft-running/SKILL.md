@@ -41,34 +41,28 @@ line, joined by `&&`: `weft resync --mode wipe && curl ...`. Run them
 separately and a resync that failed leaves the next command talking to the
 old code, which reads as a bug in what you just wrote.
 
-Every command you run carries a timeout, and you copy it from this table
-rather than estimating one.
+**You never sit on a quiet command.** Thirty seconds is the most you wait
+without looking. At thirty seconds you check whether the thing is still
+moving: new lines from a build, a changed `weft status --json`, a new line
+in `weft daemon logs`. Moving, you give it thirty more and look again;
+quiet for thirty seconds, it is stuck, and you get out and find out why.
+Nothing weft does while you are building is silent for that long when it
+is healthy, so silence is the finding. Reads (`status`, `executions`,
+`events`, `logs`, `connect`, `describe-nodes`) get fifteen seconds; `weft
+run` gets `--detach` and a check later; a dev server starts in the
+background. Check what unit your own tool wants before you type a number.
+Some take seconds and some take milliseconds, and getting it backwards is
+the difference between thirty seconds and two days.
 
-| If you are running | wait at most |
-|---|---|
-| `status`, `executions`, `events`, `logs`, `connect`, `describe-nodes` | 15 seconds |
-| `weft validate` | 30 seconds |
-| a build, warm | 45 seconds |
-| a build, the first time in this project | 3 minutes |
-| `weft test-node` | 1 minute |
-| `activate`, `deactivate`, `resync`, `infra start` | 2 minutes |
-| a frontend `pnpm install` | 3 minutes |
-| a frontend build or type check | 1 minute |
-| `weft run` | its own expected length, or `--detach` and check later |
-| a frontend dev server | nothing: start it in the background |
-
-Check what unit your own tool wants before you type one of these. Some take
-seconds and some take milliseconds, and getting it backwards is the
-difference between three minutes and two days.
-
-Nothing on this table is over three minutes, and neither is anything you
-type. If the number you are about to write is longer than its row, the row is
-right.
-
-A timeout that trips is a finding, never a number to raise. Read what the
-command printed before it was killed, work out why this run is longer than
-its shape says, and report that. You raise the number only once you can say
-what is taking the extra time.
+Getting out is cheap and safe: Ctrl+C on the CLI (nothing weft was doing
+is left half done; the daemon finishes or rolls back on its own). Then read
+`weft daemon logs`, which is where a wait says what it is waiting on. The
+one wait that used to hide here was `activate` sitting behind a worker
+from an older build; it no longer waits by default (see `--running-policy`
+under the command map), and `weft status` reports an activation still in
+flight, which `weft cancel-activate` ends before you run the verb again.
+You raise a number only once you can say what is taking the extra time,
+and a run that is longer than its shape says is something you report.
 
 If you want to wait on something long (a build, [the daemon] coming up, a run
 settling), start it detached and check its state between other steps instead
@@ -142,7 +136,7 @@ status` and the graph print back.
 | `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is a [color], its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
 | `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
 | `weft examples` | list saved parameters and frozen examples; inspect them, rerun one with `weft run <name>`, then compare with `weft diff` |
-| `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming |
+| `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming. Takes `--running-policy` like `activate` (the setup runs on a worker, and a stale one is replaced first) |
 | `weft wake <color> <node>` | resolve a pure time wait now; refused for a wait expecting a value, naming its kind |
 | `weft prune <version>` | delete a version, everything under it, and their runs; asks first, `--yes` for scripts. Refuses on head's version, under a frozen example's origin, and while a run in the subtree is running |
 | `weft stop <color>` | cancel an execution |
@@ -152,7 +146,7 @@ status` and the graph print back.
 | `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
 | `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
-| `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project needs `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes) and takes `--running-policy <wait\|cancel>`, default `wait` |
+| `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project needs `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes). Both take `--running-policy <cancel\|wait>`, default `cancel`: on `activate` it says what happens to a worker still up from an older build (cancel what it runs and replace it now, or `wait` for its executions to land, up to `--drain-timeout` seconds); on `deactivate` the same for the project's running executions |
 | `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only for an ACTIVE project (a parked or hibernated one refuses: `weft activate` first), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
 | `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` / `logs` | the project's [infra] (see The infra verbs) |
 | `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension. `mint` prints the connect URL, then the bare token on its own line for a script |
@@ -232,12 +226,14 @@ command lands at once. `hibernate` and `park` exist for a program people are
 actually using: pass one when the user says so, or when `weft executions`
 shows a run parked on a person you would be throwing away.
 
-`--running-policy wait` (the default) lets executions already running finish
-first, new fires held meanwhile; `cancel` stops them now, and `wipe` implies
-it. `wait` only ever waits under `hibernate`, and it ends by cancelling
-whatever is still running at its cap: under `park` the running executions are
-left exactly as they are and the command lands at once, because park promises
-they stay alive. With no `--mode` and no terminal (which is every command you run) the mode
+`--running-policy cancel` (the default) stops the executions already running
+now; `wait` lets them finish first, new fires held meanwhile, and you pass
+it only when the user asked for the running work to land. A `wait` waits
+under `hibernate` and `park` alike (the mode says what happens to the parked
+work, the policy what happens to the running work: two separate answers),
+and it ends by cancelling whatever is still running at its cap
+(`--drain-timeout`, 60 seconds unless set); under `wipe` waiting is refused.
+With no `--mode` and no terminal (which is every command you run) the mode
 is `wipe`. That is the right answer while you are building, so you rarely
 type it; you type `--mode hibernate` or `--mode park` when the program is one
 people are using and the work in flight has to survive.
@@ -258,6 +254,10 @@ restarts. You pick the verb by what you want to keep:
 - **If you want it off for a while and the data kept** (a paired WhatsApp
   session, a database's rows): `weft infra stop`. The containers go, the
   disks stay, and `weft infra start` brings it back with everything in it.
+  Stop and terminate cancel the project's running executions first, because
+  they may be using this infra; `--running-policy wait` lets them land
+  instead, up to `--drain-timeout` seconds, on an active project and an
+  inactive one alike.
 - **If you want it gone** (the database and its rows, the bridge and its
   pairing): `weft infra terminate`. Every resource is deleted, disks included
   unless the node's own spec preserves them. There is no undo: a database

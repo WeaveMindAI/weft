@@ -6,7 +6,11 @@
 	// Owns the business rules:
 	//   - wipe forces runningPolicy = cancel (waiting before wiping is
 	//     contradictory);
-	//   - graceMinutes applies to hibernate only.
+	//   - graceMinutes applies to hibernate only;
+	//   - cancel is the running-policy the picker opens on: waiting on
+	//     somebody's running work is the choice a person makes, never
+	//     the one they get by clicking through (the CLI's default is
+	//     the same).
 	// Produces a `DeactivationSpec`; the host just forwards it.
 	import type { DeactivationSpec } from '../../../../protocol';
 	import { DEFAULT_DRAIN_TIMEOUT_SECS } from '../../../../protocol';
@@ -26,7 +30,8 @@
 	} = $props();
 
 	let mode = $state<DeactivationSpec['mode']>('park');
-	let runningPolicy = $state<DeactivationSpec['runningPolicy']>('wait');
+	// SYNC: the opening value <-> crates/weft-core/src/running_policy.rs RunningPolicy `#[default]`
+	let runningPolicy = $state<DeactivationSpec['runningPolicy']>('cancel');
 	// `number | null`: an emptied number input binds as null, and the
 	// confirm below reads that as "not chosen" rather than as zero.
 	let graceMinutes = $state<number | null>(15);
@@ -58,15 +63,15 @@
 		detail: string;
 	}> = [
 		{
+			value: 'cancel',
+			label: 'Cancel running executions',
+			detail: 'Kills every running, non-suspended execution right away.',
+		},
+		{
 			value: 'wait',
 			label: 'Wait for running executions',
 			detail:
 				'New fires park immediately; in-flight runs drain naturally. You can cancel running anytime.',
-		},
-		{
-			value: 'cancel',
-			label: 'Cancel running executions',
-			detail: 'Kills every running, non-suspended execution right away.',
 		},
 	];
 

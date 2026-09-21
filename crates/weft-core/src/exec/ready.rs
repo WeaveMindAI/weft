@@ -442,6 +442,13 @@ pub struct FiringInput {
     /// feed, not a structural "nothing arrived" (see the skip module
     /// doc).
     pub closed_ports: Vec<String>,
+    /// The subset of `closed_ports` whose closure carries WHY: the
+    /// producer failed (or was cancelled) rather than declining to emit,
+    /// keyed by port, with the error text. A boundary forwarding a
+    /// closure keeps this on the same-named output, so "broke" never
+    /// reads as "nothing there" one scope level up (the inverted gate
+    /// tells the two apart).
+    pub closed_with_error: BTreeMap<String, String>,
     pub type_errors: Vec<String>,
     pub provided_ports: Vec<String>,
     pub backup_ports: Vec<String>,
@@ -503,6 +510,14 @@ pub fn firing_input(
         .map(|p| p.to_string())
         .collect();
     closed_ports.sort();
+    let closed_with_error: BTreeMap<String, String> = closed_ports
+        .iter()
+        .filter_map(|port| {
+            resolve_port_value(group_pulses, port)
+                .and_then(|p| p.close_error.clone())
+                .map(|error| (port.clone(), error))
+        })
+        .collect();
 
     let mut provided_ports = Vec::new();
     let mut backup_ports = Vec::new();
@@ -514,7 +529,7 @@ pub fn firing_input(
             if let Some(origin) = winner.inherited_from { inherited_ports.insert(port.to_string(), origin); }
         }
     }
-    FiringInput { input: obj, closed_ports, type_errors, provided_ports, backup_ports, inherited_ports }
+    FiringInput { input: obj, closed_ports, closed_with_error, type_errors, provided_ports, backup_ports, inherited_ports }
 }
 
 /// Runtime type enforcement on input ports: the single check point

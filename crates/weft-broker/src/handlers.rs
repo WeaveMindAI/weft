@@ -651,12 +651,15 @@ pub async fn worker_pod_heartbeat(
     require_worker(&caller)?;
     require_pod_name_matches(&caller, &req.pod_name)?;
     require_worker_pod_owned_by(&state, &caller, &req.pod_name).await?;
-    let renewed = state
+    let standing = state
         .worker_pods
         .heartbeat(&req.pod_name, req.mem_pressure)
         .await
         .map_err(internal)?;
-    Ok(Json(WorkerPodHeartbeatResponse { renewed }))
+    Ok(Json(WorkerPodHeartbeatResponse {
+        renewed: standing.is_some(),
+        draining: standing.is_some_and(|s| s.draining),
+    }))
 }
 
 pub async fn worker_pod_mark_done(
@@ -1717,7 +1720,7 @@ pub async fn supervisor_enqueue_lifecycle(
             .await?;
     // Verify the typed spec's (mode, policy) combo is coherent
     // before persisting. The rule lives next to `DeactivateSpec`
-    // in `weft-broker-client::protocol` so every caller (this
+    // in `weft_core::running_policy` so every caller (this
     // handler, dispatcher /deactivate, supervisor's enqueue
     // construction) shares one validator. Today the supervisor
     // is the only caller and its three construction sites build

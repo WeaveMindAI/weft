@@ -363,6 +363,7 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
                             &state,
                             &project_id,
                             None,
+                            weft_core::exec::CancelCause::User,
                         )
                         .await
                     {
@@ -616,16 +617,15 @@ async fn sweep_worker_scaledown(state: DispatcherState) -> anyhow::Result<()> {
         // spam) and before planning so a pod that has been draining
         // since a prior tick is reported even if no new drain happens.
         let now = crate::lease::now_unix();
-        for (pod, project, drained_at, in_flight) in
-            weft_task_store::worker_pod::draining_breadcrumbs(&state.pg_pool).await?
-        {
+        for crumb in weft_task_store::worker_pod::draining_breadcrumbs(&state.pg_pool, now).await? {
             tracing::info!(
                 target: "weft_dispatcher::reaper",
-                project = %project,
-                pod = %pod,
-                draining_for_secs = now.saturating_sub(drained_at),
-                in_flight_tasks = in_flight,
-                "worker still draining (no deadline; will idle-exit when its in-flight work finishes)"
+                project = %crumb.project_id,
+                pod = %crumb.pod_name,
+                draining_for_secs = now.saturating_sub(crumb.drained_at_unix),
+                in_flight_tasks = crumb.in_flight_tasks,
+                promised_to_a_caller = crumb.promised,
+                "worker still draining (no deadline; it exits when the work it holds lands)"
             );
         }
         let projects =

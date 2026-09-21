@@ -18,7 +18,7 @@ Three reads, in this order, all local and instant (they read `nodes/` on disk, n
    weft describe-nodes --list | grep -i 'image\|photo\|picture'
    ```
 
-   Every search starts here, including the ones where you think you already know the answer. You grep the capability's own words first, then the words a node would use (a picture is `Image`, a webhook is a trigger, a database is `postgres`); the tags sit on the same line, so they match too. When a few tries matched nothing, you read the listing whole: it is 40 KB, reading it is fine, and that is what it is for. Hidden types never appear, in any form of this command.
+   Every search starts here, including the ones where you think you already know the answer. You grep the capability's own words first, then the words a node would use (a picture is `Image`, a webhook is a trigger, a database is `postgres`); the tags sit on the same line, so they match too. When a few tries matched nothing, you read the listing whole: one sentence per node, a few kilobytes, and that is what it is for. Hidden types never appear, in any form of this command.
 
 2. **[the wiring view]**, `weft describe-nodes --node <Type> --compact`. One node's resolved ports, their types, what each accepts (a literal in the source, a wire from another node, or both), the widget kind, and the features that change how it wires. A few kilobytes per node, and it is the view that decides whether your wire compiles, so you read it for every node you are about to use, the familiar ones included. Three candidates is three calls, one per type. You never send a subagent to compare nodes: these calls are the comparison.
 

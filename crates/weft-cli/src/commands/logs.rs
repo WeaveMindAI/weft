@@ -11,6 +11,48 @@
 
 use super::{local_time, resolve_project_id, Ctx};
 
+/// The nodes a run skipped, with why, spelled the way the program
+/// reads them (`keep.db` for the db of an included file) when the cwd
+/// is the project. What `weft logs` prints for a run that wrote
+/// nothing, so the reader learns why nothing happened without a second
+/// command.
+async fn skipped_nodes(ctx: &Ctx, color: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let definition = ctx.project().ok()
+        .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
+        .map(|(definition, _)| definition);
+    let replay: serde_json::Value =
+        ctx.client().get_json(&format!("/executions/{color}/replay")).await?;
+    let rows = replay
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {replay}"))?;
+    let mut skipped = Vec::new();
+    for row in rows {
+        if row.get("kind").and_then(|v| v.as_str()) != Some("node_skipped") {
+            continue;
+        }
+        // Spelled exactly as `weft events` spells it, including the rows
+        // it drops (an included file's own boundary has no place in the
+        // program a person wrote, so neither command prints it).
+        let row = match &definition {
+            Some(definition) => match super::executions::spell_node(row.clone(), definition) {
+                Some(row) => row,
+                None => continue,
+            },
+            None => row.clone(),
+        };
+        let node = row.get("node").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        // The reason is the engine's own, rendered by its own words;
+        // a row an older dispatcher wrote without one says so.
+        let reason = row
+            .get("reason")
+            .cloned()
+            .and_then(|r| serde_json::from_value::<weft_core::exec::skip::SkipReason>(r).ok())
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "(no reason recorded)".to_string());
+        skipped.push((format!("{node}{}", frames_suffix(&row)), reason));
+    }
+    Ok(skipped)
+}
 
 /// The loop iteration a line was written in, as `#3` (or `#3.0` for a
 /// loop inside a loop). Empty at the root.
@@ -47,10 +89,11 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     };
 
     let query = limit.map(|n| format!("?limit={n}")).unwrap_or_default();
-    let logs: serde_json::Value =
+    let mut logs: serde_json::Value =
         ctx.client().get_json(&format!("/executions/{color}/logs{query}")).await?;
     let arr = logs["lines"]
         .as_array()
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/logs returned no lines: {logs}"))?;
     // The limit that cut the tail comes back with it, so the notice
     // below is right whether the reader chose one or the dispatcher's
@@ -58,14 +101,32 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     let limit = logs["limit"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/logs returned no limit: {logs}"))?;
+    // A run that wrote nothing usually did nothing, and the reason is
+    // a skip: a required input closed, a gate said no. The skip is a
+    // lifecycle event, not a log line, so it is fetched here rather
+    // than sending the reader to `weft events --kind skipped` to learn
+    // why nothing happened. Fetched before anything prints, so a
+    // replay that cannot be read fails this command whole instead of
+    // after a line that read as an answer; and `--json` carries the
+    // same list under `skipped`, since an agent reads that shape.
+    let skipped = if arr.is_empty() { skipped_nodes(&ctx, &color).await? } else { Vec::new() };
+    if arr.is_empty() {
+        logs["skipped"] = skipped
+            .iter()
+            .map(|(node, reason)| serde_json::json!({ "node": node, "reason": reason }))
+            .collect();
+    }
     if ctx.json_out(&logs)? {
         return Ok(());
     }
     if arr.is_empty() {
         println!("(no logs: the run wrote no log lines and recorded no failure)");
+        for (node, reason) in &skipped {
+            println!("skipped {node}: {reason}");
+        }
         return Ok(());
     }
-    for entry in arr {
+    for entry in &arr {
         let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
         let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let at = entry.get("at_unix").and_then(|v| v.as_u64()).unwrap_or(0);

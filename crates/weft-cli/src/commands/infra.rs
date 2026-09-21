@@ -137,11 +137,11 @@ async fn run_inner(
         // per-node menu is exactly the caller reading those events.
         InfraAction::NodeStop { node, force } => {
             let place = instance_named(ctx, &node).await?;
-            infra_node_verb(ctx, progress, &place, "stop", force).await?
+            infra_node_verb(ctx, progress, &place, "stop", force, &opts).await?
         }
         InfraAction::NodeTerminate { node } => {
             let place = instance_named(ctx, &node).await?;
-            infra_node_verb(ctx, progress, &place, "terminate", false).await?
+            infra_node_verb(ctx, progress, &place, "terminate", false, &opts).await?
         }
         InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
     }
@@ -203,10 +203,21 @@ async fn infra_node_verb(
     place: &str,
     verb: &str,
     force: bool,
+    opts: &InfraOpts,
 ) -> Result<()> {
     let (client, project_id, name) = super::resolve_project(ctx)?;
     let path = format!("/projects/{project_id}/infra/nodes/{place}/{verb}");
-    let body = serde_json::json!({ "force": force });
+    // The running-work answer, read the one way every verb reads it:
+    // a person who passes nothing gets cancel, and a cap beside cancel
+    // is refused here rather than sent to bound nothing.
+    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
+        opts.running_policy.as_deref(),
+        opts.drain_timeout,
+    )?;
+    let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
+    body.insert("force".into(), serde_json::json!(force));
+    let body = serde_json::Value::Object(body);
+    progress.drain_wait(&body, drain_timeout);
     progress.dispatcher_call_start(&path);
     // 202 Accepted with { command_id }.
     let issued: serde_json::Value = client.post_json(&path, &body).await?;
@@ -247,17 +258,27 @@ async fn infra_sync(
     // live infra down (the server's stop leg), so it collects the
     // user's deactivation choice (same picker as `weft deactivate`)
     // and sends it with `upgrade: true`; the server decomposes.
+    // The running-work pair, read the one way every verb reads it (a
+    // misspelt policy is refused here with the CLI's own words, a cap
+    // beside cancel is refused rather than sent to bound nothing). It
+    // answers the worker replacement inside sync and an upgrade's stop
+    // leg; when the picker is shown its answer outranks these fields,
+    // and it is built from the same pair.
+    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
+        opts.running_policy.as_deref(),
+        opts.drain_timeout,
+    )?;
     let upgrade = matches!(action, InfraAction::Upgrade);
     let trigger_deactivation = if upgrade
         && super::deactivate::project_is_active(&handle.client, &handle.id).await?
     {
-        Some(super::deactivate::prompt_trigger_deactivation(
+        Some(serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
             ctx.json(),
             opts.mode.as_deref(),
             opts.grace,
-            opts.running_policy.as_deref(),
-            opts.drain_timeout,
-        )?)
+            running_policy,
+            drain_timeout,
+        )?)?)
     } else {
         None
     };
@@ -274,17 +295,13 @@ async fn infra_sync(
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
     }
-    // Worker-replacement gating inside sync: the trigger-side
-    // running-policy choice answers the same "what about running
-    // executions" question, so reuse it; the drain cap rides along.
-    if let Some(p) = opts.running_policy.as_deref() {
-        body.insert("runningPolicy".into(), p.into());
-    }
-    if let Some(cap) = opts.drain_timeout {
-        body.insert("drainTimeoutSecs".into(), cap.into());
-    }
+    body.extend(super::ensure::running_choice_fields(running_policy, drain_timeout));
     let path = format!("/projects/{}/infra/sync", handle.id);
     let body = serde_json::Value::Object(body);
+    // The one line that says the call may now sit for a while (an
+    // upgrade's stop leg, or the worker replacement, draining up to the
+    // cap), so a quiet terminal is a wait and not a hang.
+    progress.drain_wait(&body, drain_timeout);
     let node_ids: Vec<String> = image_tags.keys().cloned().collect();
     progress.infra_provision_start(&node_ids);
     progress.dispatcher_call_start(&path);
@@ -312,38 +329,45 @@ async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Res
 }
 
 /// Stop / Terminate share this body. Prompts for trigger
-/// deactivation only when the project is active; sends an empty
-/// body otherwise. Waits on the COMMAND's completion (not the rollup):
-/// a stop where a NoOp unit stays up never drives the rollup to
-/// "stopped", so the command outcome is the only honest done signal.
+/// deactivation only when the project is active; the running-work
+/// choice goes on the body either way, because an inactive project
+/// can still have executions running on this infra and `wait` is how
+/// they get to land first. Waits on the COMMAND's completion (not the
+/// rollup): a stop where a NoOp unit stays up never drives the rollup
+/// to "stopped", so the command outcome is the only honest done
+/// signal.
 async fn infra_destroy(
     ctx: &Ctx,
     progress: &Progress,
     opts: InfraOpts,
     verb: &str,
 ) -> Result<()> {
+    // Read the one way every verb reads it, before anything is asked
+    // or sent: a misspelt policy or a cap beside cancel is refused here.
+    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
+        opts.running_policy.as_deref(),
+        opts.drain_timeout,
+    )?;
     let (client, id, name) = super::resolve_project(ctx)?;
     let active = super::deactivate::project_is_active(&client, &id).await?;
     let trigger_deactivation = if active {
-        Some(super::deactivate::prompt_trigger_deactivation(
+        Some(serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
             ctx.json(),
             opts.mode.as_deref(),
             opts.grace,
-            opts.running_policy.as_deref(),
-            opts.drain_timeout,
-        )?)
+            running_policy,
+            drain_timeout,
+        )?)?)
     } else {
         None
     };
     let path = format!("/projects/{id}/infra/{verb}");
-    let mut body = serde_json::Map::new();
+    let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
     }
-    if let Some(cap) = opts.drain_timeout {
-        body.insert("drainTimeoutSecs".into(), cap.into());
-    }
     let body = serde_json::Value::Object(body);
+    progress.drain_wait(&body, drain_timeout);
     progress.dispatcher_call_start(&path);
     // 202 Accepted with { command_id }.
     let issued: serde_json::Value = client.post_json(&path, &body).await?;

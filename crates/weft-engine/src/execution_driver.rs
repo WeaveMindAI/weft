@@ -2538,9 +2538,11 @@ fn build_unmentioned_closures(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &NodeExecutionTable,
-    // The firing's error on a FAILURE path: rides generator ports'
-    // closures as a failed stream end (the consumer's pull gets the
-    // error). None on every non-failure termination.
+    // Why the firing produced nothing on these ports, when that was a
+    // failure: the node's own error, or the one a skip inherited from
+    // the input that closed on it. Rides every closure (a generator
+    // port's as a failed stream end, so the consumer's pull gets the
+    // error). None when the node completed or declined.
     failure: Option<&str>,
 ) -> Vec<weft_core::exec::PulseEmission> {
     // Loop boundary nodes (LoopIn, LoopOut) fire many times during a
@@ -2641,7 +2643,7 @@ pub(crate) async fn handle_loop_boundary_firing(
     }
 
     if node_def.node_type == "LoopIn" {
-        let firing = instantiate(loop_runtime, node_def, project, &group.received.input, &group.frames, group.color)?;
+        let firing = instantiate(loop_runtime, node_def, project, &group.received, &group.frames, group.color)?;
         if firing.first_instantiation {
             crate::context::record_from_pod(
                 journal,
@@ -2905,7 +2907,7 @@ pub(crate) async fn emit_loop_outward(
             if let Some(inst) = loop_runtime.get_mut(key) {
                 inst.terminated = Some(failed);
             }
-            close_loop_outward(key, project, edge_idx, pulses);
+            close_loop_outward(key, project, edge_idx, pulses, failed);
             journal_loop_terminated(journal, pod_name, key, failed).await;
             Err(e)
         }
@@ -2996,7 +2998,7 @@ async fn handle_loop_boundary_failure(
             loop_runtime
                 .terminate(&key, LoopTerminationReason::Failed)
                 .expect("the instance was found live just above");
-            close_loop_outward(&key, project, edge_idx, pulses);
+            close_loop_outward(&key, project, edge_idx, pulses, LoopTerminationReason::Failed);
             journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Failed).await;
         }
         // ALREADY terminated: the prior LoopTerminated closed the
@@ -3005,7 +3007,7 @@ async fn handle_loop_boundary_failure(
         // NO instance: the outward surface closes now, in RAM; the
         // fold does the same from the NodeFailed row below.
         None => {
-            close_loop_outward(&key, project, edge_idx, pulses);
+            close_loop_outward(&key, project, edge_idx, pulses, LoopTerminationReason::Failed);
         }
     }
 
@@ -3150,16 +3152,20 @@ async fn handle_node_skip(
             terminal_sweep_emission(node_id, frames, ended_firing_ordinal(executions, node_id, color, frames));
         tear_down_scope(
             project, edge_idx, pulses, kicked, emission_id, color, &group_id, frames, Some(reason),
+            reason.inherited_failure(),
         );
         ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
         return;
     }
     // A skipped node's body never runs, so it never emitted on ANY
     // output port: close every port. Same shape as a pre-dispatch
-    // failure: empty mentioned set means "close everything".
+    // failure: empty mentioned set means "close everything". A skip
+    // that was itself the consequence of a failure closes with that
+    // failure, so the next node down still reads a failure.
     let mentioned = std::collections::HashSet::new();
     build_unmentioned_closures(
-        node_id, &mentioned, color, frames, project, edge_idx, pulses, executions, None,
+        node_id, &mentioned, color, frames, project, edge_idx, pulses, executions,
+        reason.inherited_failure(),
     );
     ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
 }
@@ -3354,7 +3360,7 @@ pub(crate) async fn cancel_loop_instances(
         // resume: a refold without it rebuilds the instance as live
         // (terminated=None) and the engine drives it again. The fold
         // closes the outward surface from the row, as this does in RAM.
-        close_loop_outward(&key, project, edge_idx, pulses);
+        close_loop_outward(&key, project, edge_idx, pulses, LoopTerminationReason::Cancelled);
         journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Cancelled).await;
     }
 }

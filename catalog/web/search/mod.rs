@@ -26,6 +26,7 @@ impl Node for WebSearchNode {
         let query: String = ctx.inputs.get("query")?;
         let num_results: f64 = ctx.inputs.get("numResults")?;
         let include_text: bool = ctx.inputs.get("includeText")?;
+        let max_text_chars: f64 = ctx.inputs.get("maxTextChars")?;
         let domains: Vec<String> = ctx.inputs.list("includeDomains")?;
 
         let mut body = json!({
@@ -34,7 +35,12 @@ impl Node for WebSearchNode {
             "numResults": (num_results as u64).clamp(1, 100),
         });
         if include_text {
-            body["contents"] = json!({ "text": true });
+            // Exa cuts each page's text at `maxCharacters`, so the
+            // emitted results carry a bounded amount of text whatever
+            // the pages weigh: a wire carries at most 100 KB, and ten
+            // long articles uncapped would fail the run on a day the
+            // news happened to be long.
+            body["contents"] = json!({ "text": { "maxCharacters": (max_text_chars as u64).max(1) } });
         }
         if !domains.is_empty() {
             body["includeDomains"] = json!(domains);

@@ -27,6 +27,12 @@ Two triggers can share the steps in the middle without their runs becoming one.
 Whatever fed a trigger's ports when you activated is what it uses on every
 firing. The nodes upstream do not run again per event.
 
+Everything upstream of every trigger runs at activation as one program, so two
+steps that do not depend on each other run at the same time. Setup that several
+triggers share, like the schema all their tables live in, is written once and
+wired to each of them; two copies of `create extension if not exists` racing
+each other is how one of them fails on a duplicate key.
+
 So after changing one, `weft resync`. Until then your listener carries on with
 what it registered. weft tells you when a bake is stale:
 

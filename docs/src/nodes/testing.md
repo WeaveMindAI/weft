@@ -1,6 +1,8 @@
 # Testing a node
 
-Tests live beside the node, in a `tests.rs` in its own folder.
+Tests live beside the node, in a `tests.rs` in its own folder. An access node
+has none: the `access_node!` macro is its whole body, so there is nothing of
+yours to test.
 
 `tests.rs`:
 
@@ -75,8 +77,9 @@ attaches, a signal nobody answers.
 |---|---|
 | Run the node | `rig.run(&node, json!({...}))` |
 | Run its trigger setup, or its infra | `rig.run_setup_trigger(...)`, `rig.run_provision_infra(...)` |
-| Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)` |
+| Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)`, `rig.respond_with_headers(...)` for an answer that lives partly in a header (a created id, an ETag) |
 | Check what it sent | `rig.requests()`, `rig.assert_sent(method, path)` |
+| What `ctx.run` recorded | `rig.recorded_steps(&node)`. Run the node twice on one rig and the second run replays the first's steps and the signals it was answered with, like a resumed execution, so a publish that must happen once is something you can prove: two runs, one request. Each node keeps its own, so two nodes on one rig never replay each other's |
 | A connection | `rig.access("slack")`, `rig.connection_value(...)`, `rig.connection_permissions(...)` |
 | A trigger's event | `rig.wake(payload)`, `rig.signal(payload)` |
 | A live caller | `rig.attach_caller(conn)` |

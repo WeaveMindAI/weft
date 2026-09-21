@@ -41,16 +41,25 @@ export function getStatusBadgeColor(status: NodeExecutionStatus): string | undef
 /// An event that carries no reason predates this field: the run is
 /// older than the journal shape, so the honest answer is that we do not
 /// know rather than a guessed one.
+/// The tail a reason's text grows when the closure it names carried a
+/// failure: the same words as the Rust `Display`.
+function afterFailure(failure: string | undefined): string {
+	return failure === undefined ? '' : `: a node before it failed (${failure})`;
+}
+
 export function skipReasonText(reason: SkipReason | undefined): string {
 	if (!reason) return 'reason not recorded';
 	switch (reason.kind) {
 		case 'did_not_flow': return 'its `_should_flow` said no';
-		case 'flow_closed': return 'nothing ever answered its `_should_flow`';
+		case 'flow_closed': return `nothing ever answered its \`_should_flow\`${afterFailure(reason.failure)}`;
 		case 'did_flow': return 'its `_should_not_flow` saw a value';
-		case 'required_input_closed': return `the required input '${reason.port}' closed`;
-		case 'every_input_closed': return 'every input closed';
+		case 'watched_node_failed':
+			return `the node its \`_should_not_flow\` watches did not finish (${reason.error}), which is not the absence this node runs on`;
+		case 'required_input_closed':
+			return `the required input '${reason.port}' closed${afterFailure(reason.failure)}`;
+		case 'every_input_closed': return `every input closed${afterFailure(reason.failure)}`;
 		case 'one_of_group_closed':
-			return `every input of the group (${reason.ports.join(', ')}) closed`;
+			return `every input of the group (${reason.ports.join(', ')}) closed${afterFailure(reason.failure)}`;
 		case 'scope_skipped': return `the scope '${reason.scope}' it lives in did not run`;
 		default: {
 			// Compile-time exhaustiveness; at runtime (a dispatcher newer

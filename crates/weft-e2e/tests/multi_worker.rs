@@ -114,10 +114,10 @@ async fn two_workers_share_the_queue_and_drain_together() -> anyhow::Result<()> 
 
 /// A STALE fleet is replaced as a whole: with TWO workers each holding a
 /// running execution, an infra start on an edited source dooms BOTH
-/// (image + namespace change), drains them through the shared loop
-/// (nothing killed while held), and lands every live worker on the new
-/// image in the project namespace once released. The executions complete
-/// untouched.
+/// (image + namespace change) and, asked to wait, drains them through the
+/// shared loop (nothing killed while held), landing every live worker on
+/// the new image in the project namespace once released. The executions
+/// complete untouched.
 #[tokio::test]
 async fn stale_fleet_is_drained_and_replaced_as_a_whole() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -149,9 +149,18 @@ async fn stale_fleet_is_drained_and_replaced_as_a_whole() -> anyhow::Result<()> 
     // the pre-apply reconcile must doom BOTH old pods, drain them, and
     // only then proceed.
     project.set_main(&graph_trigger_infra_hold(&feed.url(), "go", &gate.url()))?;
+    // `wait` is asked for, never assumed: the shared default is cancel,
+    // and this test is about what the drain does.
     let mut start = spawn_weft(
         project.dir().to_path_buf(),
-        vec!["infra".into(), "start".into(), "--drain-timeout".into(), "300".into()],
+        vec![
+            "infra".into(),
+            "start".into(),
+            "--running-policy".into(),
+            "wait".into(),
+            "--drain-timeout".into(),
+            "300".into(),
+        ],
     );
 
     // Both old pods flip to DRAINING (the multi-pod doomed set) while

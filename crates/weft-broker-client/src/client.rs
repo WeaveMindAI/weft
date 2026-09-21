@@ -18,7 +18,7 @@ use weft_journal::{ExecEvent, JournalClient};
 use weft_task_store::tasks::{
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
 };
-use weft_task_store::{TaskStoreClient, WorkerPodClient};
+use weft_task_store::{TaskStoreClient, WorkerPodClient, WorkerStanding};
 
 use crate::protocol::*;
 use crate::token::TokenSource;
@@ -393,14 +393,14 @@ impl WorkerPodClient for BrokerWorkerPodClient {
         Ok(())
     }
 
-    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool> {
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>> {
         let req = WorkerPodHeartbeatRequest {
             pod_name: pod_name.to_string(),
             mem_pressure,
         };
         let resp: WorkerPodHeartbeatResponse =
             self.http.post("/v1/worker_pod/heartbeat", &req).await?;
-        Ok(resp.renewed)
+        Ok(resp.renewed.then_some(WorkerStanding { draining: resp.draining }))
     }
 
     async fn mark_done(&self, pod_name: &str) -> Result<()> {

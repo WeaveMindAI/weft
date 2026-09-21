@@ -77,8 +77,10 @@ node 'reply' tried to emit on undeclared output port 'txet'. Declare it in
 metadata.json's outputs list, or correct the port name in the node body.
 ```
 
-**A value over 100 KB fails the call**, naming the port. Put bytes in
-[storage](storage.md) and send the marker.
+**A value over 100 KB fails the call**, naming the port. The check is on what
+you emit, so a node one hop later cannot trim it for you: bound it yourself (a
+cap input, a `LIMIT`), or put bytes in [storage](storage.md) and send the
+marker.
 
 ## Waiting for the value to be taken
 

@@ -189,7 +189,10 @@ pub use project::{
     InputDefinition, NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;
-pub use running_policy::RunningPolicy;
+pub use running_policy::{
+    default_drain_timeout_secs, DeactivateSpec, DeactivationMode, RunningChoice, RunningPolicy,
+    DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES,
+};
 pub use exec::CancelCause;
 pub use tag::StopSelf;
 #[cfg(feature = "runtime")]

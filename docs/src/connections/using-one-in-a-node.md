@@ -71,6 +71,11 @@ it. So a node that needs to read history refuses a connection that can only
 write, **before** it makes the call, and the person is told to reconnect rather
 than getting a provider error they have to decode.
 
+The list is all-of, and it is fixed by the node's one job. When the permission
+would depend on which input arrives, like a post that needs one scope for a
+person and another for a company page, that is two nodes, each declaring its
+own. One node with the rule written in prose protects nobody.
+
 A missing stored value always refuses. A missing permission only refuses when
 weft actually knows it is missing: on a service that reports nothing, the call
 goes through and the provider decides.

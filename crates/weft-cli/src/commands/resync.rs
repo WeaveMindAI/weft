@@ -36,18 +36,20 @@ async fn run_inner(
              project; `weft activate` brings it up on the current source"
         );
     }
-    let trigger_deactivation = super::deactivate::prompt_trigger_deactivation(
+    let (running_policy, drain_timeout) =
+        super::ensure::parse_running_choice(opts.running_policy.as_deref(), opts.drain_timeout)?;
+    let trigger_deactivation = serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
         ctx.json(),
         opts.mode.as_deref(),
         opts.grace,
-        opts.running_policy.as_deref(),
-        opts.drain_timeout,
-    )?;
+        running_policy,
+        drain_timeout,
+    )?)?;
     let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
     let path = format!("/projects/{}/resync", handle.id);
     let mut body_map = serde_json::Map::new();
     handle.inject_hash_fields(&mut body_map);
-    progress.drain_wait(&trigger_deactivation, opts.drain_timeout);
+    progress.drain_wait(&trigger_deactivation, drain_timeout);
     body_map.insert("triggerDeactivation".into(), trigger_deactivation);
     let body = serde_json::Value::Object(body_map);
     progress.trigger_register_start();

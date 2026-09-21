@@ -43,8 +43,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::exec::emission::{iteration_launch_emission, loop_termination_emission, PulseEmission};
-use crate::exec::postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};
-use crate::exec::ready::InputBag;
+use crate::exec::postprocess::{postprocess_output, OutputBag};
+use crate::exec::ready::{FiringInput, InputBag};
 use crate::frames::{Frame, LoopFrames};
 use crate::generator::{StreamBuffer, StreamEnd};
 use crate::primitive::{LoopInstanceKey, LoopTerminationReason};
@@ -250,6 +250,12 @@ pub struct LoopInstance {
     /// LoopIn's pulses have already been absorbed by the first dispatch.
     /// Parallel mode reads the same bag once at launch-all time.
     pub outer_input: HashMap<String, Arc<Value>>,
+    /// Outer inputs that arrived as a FAILED closure (the producer
+    /// failed, error text attached), captured with `outer_input`. Each
+    /// iteration closes the same-named inside port WITH the error, so a
+    /// body node watching it with `_should_not_flow` reads a failure as
+    /// a failure, exactly as a node outside any loop would.
+    pub outer_closed_with_error: BTreeMap<String, String>,
     pub terminated: Option<LoopTerminationReason>,
 }
 
@@ -272,6 +278,7 @@ impl LoopInstance {
             gather_lists: HashMap::new(),
             carry_values: HashMap::new(),
             outer_input: HashMap::new(),
+            outer_closed_with_error: BTreeMap::new(),
             terminated: None,
         }
     }
@@ -1057,13 +1064,13 @@ pub fn instantiate(
     loop_runtime: &mut LoopRuntime,
     node_def: &NodeDefinition,
     project: &ProjectDefinition,
-    input: &InputBag,
+    received: &FiringInput,
     frames: &LoopFrames,
     color: Color,
 ) -> Result<LoopInFiring, String> {
     let key = instance_key(node_def, frames, color)?;
     let group_id = key.group_id.clone();
-    let mut input = input.clone();
+    let mut input = received.input.clone();
     // The loop's gate is consumed at the boundary, never broadcast into
     // the body (the LoopIn has no `_should_flow` inside output).
     input.remove(crate::exec::skip::SHOULD_FLOW_PORT);
@@ -1120,6 +1127,11 @@ pub fn instantiate(
     if first_instantiation {
         let inst = loop_runtime.get_mut(&key).expect("just ensured");
         inst.outer_input = input.into_iter().collect();
+        inst.outer_closed_with_error = received
+            .closed_with_error
+            .iter()
+            .map(|(port, error)| (port.clone(), error.clone()))
+            .collect();
         for (port, v) in seed_carry {
             inst.carry_values.insert(port, v);
         }
@@ -1220,10 +1232,12 @@ pub fn launch_iteration(
     // loop boundaries, so the per-iteration analogue lives here, scoped
     // to this iteration's own frame stack so it can't touch the outward
     // ports. A plain Group already gets this via its Passthrough sweep;
-    // loops must not break the skip cascade.
-    close_unmentioned_downstream(
-        &loop_in_id, &mentioned, emission_id, key.color, &body_frames, project, pulses, edge_idx,
-        &mut emissions, None, &std::collections::HashSet::new(),
+    // loops must not break the skip cascade. An outer input that arrived
+    // as a FAILED closure closes inside with its error, first, so the
+    // sweep leaves it alone: a failure reaches the body as a failure.
+    crate::exec::postprocess::close_failed_then_unmentioned_downstream(
+        &loop_in_id, &inst.outer_closed_with_error, &mentioned, emission_id, key.color,
+        &body_frames, project, pulses, edge_idx, &mut emissions,
     )
     .map_err(|e| e.to_string())?;
     // The body's own roots (members no wire feeds) start with the
@@ -1378,6 +1392,7 @@ pub fn close_loop_outward(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
+    reason: LoopTerminationReason,
 ) -> Vec<PulseEmission> {
     crate::exec::boundary::close_scope_outward(
         project,
@@ -1387,8 +1402,25 @@ pub fn close_loop_outward(
         key.color,
         &key.group_id,
         &key.parent_frames,
+        loop_end_failure(reason),
     )
 }
+
+/// What an abnormal loop end says on its outward closures, so a node
+/// outside watching a gathered output with `_should_not_flow` reads a
+/// failed or cancelled loop as one and not as "nothing came". Derived
+/// from the termination REASON, which is what the `LoopTerminated`
+/// row carries, so the live engine and the journal fold close the
+/// surface with the same words; the boundary's own `NodeFailed` row
+/// holds the detailed error.
+fn loop_end_failure(reason: LoopTerminationReason) -> Option<&'static str> {
+    match reason {
+        LoopTerminationReason::Failed => Some("the loop failed"),
+        LoopTerminationReason::Cancelled => Some("the loop was cancelled"),
+        _ => None,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1988,7 +2020,7 @@ mod tests {
         let project = loop_project();
         let mut rt = LoopRuntime::new();
         let input = bag(&[("items", serde_json::json!([10, 20])), ("_should_flow", serde_json::json!(true))]);
-        let first = instantiate(&mut rt, def(&project, "lp__in"), &project, &input, &Vec::new(), Uuid::nil()).unwrap();
+        let first = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
         assert!(first.first_instantiation);
         assert_eq!(first.iter_cap, Some(2));
         assert!(!first.is_stream);
@@ -1996,7 +2028,7 @@ mod tests {
         assert_eq!(*inst.carry_values["acc"], serde_json::json!(0), "an unwired carry seeds from its zero value");
         assert!(!inst.outer_input.contains_key("_should_flow"), "the gate never enters the body");
         assert_eq!(inst.gather_ports, vec!["res".to_string()]);
-        let again = instantiate(&mut rt, def(&project, "lp__in"), &project, &input, &Vec::new(), Uuid::nil()).unwrap();
+        let again = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
         assert!(!again.first_instantiation, "a re-fire finds the instance");
     }
 
@@ -2005,7 +2037,7 @@ mod tests {
         let project = loop_project();
         let mut rt = LoopRuntime::new();
         let input = bag(&[("items", serde_json::json!("not a list"))]);
-        assert!(instantiate(&mut rt, def(&project, "lp__in"), &project, &input, &Vec::new(), Uuid::nil()).is_err());
+        assert!(instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).is_err());
         assert!(rt.iter().next().is_none(), "a refused firing leaves no instance behind");
     }
 
@@ -2016,7 +2048,7 @@ mod tests {
         let mut rt = LoopRuntime::new();
         let mut pulses = PulseTable::default();
         let input = bag(&[("items", serde_json::json!([10, 20])), ("acc", serde_json::json!(5))]);
-        let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &input, &Vec::new(), Uuid::nil()).unwrap();
+        let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
         let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &edge_idx, &mut pulses).unwrap();
         assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
         assert_eq!(launch.roots, vec!["lonely".to_string()]);
@@ -2067,13 +2099,19 @@ mod tests {
         assert_eq!(value("acc"), Some(serde_json::json!(9)));
 
         let mut closed_pulses = PulseTable::default();
-        close_loop_outward(&k, &project, &edge_idx, &mut closed_pulses);
+        close_loop_outward(&k, &project, &edge_idx, &mut closed_pulses, LoopTerminationReason::OverExhausted);
         let sink = pending_at(&closed_pulses, "sink");
         assert_eq!(sink.len(), 2);
-        assert!(sink.iter().all(|p| p.closed));
+        assert!(sink.iter().all(|p| p.closed && p.close_error.is_none()), "a loop that ran out closes plainly");
+        let mut failed_pulses = PulseTable::default();
+        close_loop_outward(&k, &project, &edge_idx, &mut failed_pulses, LoopTerminationReason::Failed);
+        assert!(
+            pending_at(&failed_pulses, "sink").iter().all(|p| p.close_error.is_some()),
+            "a loop that failed says so on every outward closure"
+        );
         let mut twice = PulseTable::default();
-        close_loop_outward(&k, &project, &edge_idx, &mut twice);
-        close_loop_outward(&k, &project, &edge_idx, &mut twice);
+        close_loop_outward(&k, &project, &edge_idx, &mut twice, LoopTerminationReason::OverExhausted);
+        close_loop_outward(&k, &project, &edge_idx, &mut twice, LoopTerminationReason::OverExhausted);
         assert_eq!(pending_at(&twice, "sink").len(), 2, "one instance ends once: the same ids dedup");
     }
 }

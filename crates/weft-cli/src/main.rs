@@ -296,6 +296,8 @@ enum Cmd {
         /// Compile only nodes used by the graph, matching `run --referenced`.
         #[arg(long, conflicts_with = "project")]
         referenced: bool,
+        #[command(flatten)]
+        running: RunningChoiceOpts,
     },
     /// Activate a project. Without a project id, discovers the cwd
     /// project, compiles + registers it first, then activates.
@@ -306,19 +308,26 @@ enum Cmd {
     /// `wipe_all`. Without it the human-terminal prompt fires;
     /// `--json` mode requires it explicitly when there is preserved
     /// state.
+    ///
+    /// A worker built from an older image than the one being
+    /// activated is replaced: `--running-policy cancel` (the default)
+    /// cancels what it runs and replaces it now; `wait` lets its
+    /// in-flight executions land first, up to `--drain-timeout`.
     Activate {
         project: Option<String>,
         #[arg(long = "reactivate-choice", value_name = "choice")]
         reactivate_choice: Option<String>,
+        #[command(flatten)]
+        running: RunningChoiceOpts,
     },
     /// Deactivate a registered project. Choose --mode wipe, hibernate,
     /// or park explicitly in scripts; a terminal prompts when it is omitted.
     /// Wipe cancels suspended work; hibernate and park preserve it.
     ///
     /// `--running-policy` controls how in-flight executions are
-    /// handled: `wait` (default) leaves running executions to
-    /// drain, parking new fires meanwhile; `cancel` kills running
-    /// executions and flips the project straight to inactive.
+    /// handled: `cancel` (the default) kills running executions and
+    /// flips the project straight to inactive; `wait` leaves them to
+    /// drain, parking new fires meanwhile, up to `--drain-timeout`.
     Deactivate {
         project: Option<String>,
         #[command(flatten)]
@@ -709,11 +718,14 @@ impl From<TokenAction> for commands::token::TokenAction {
 }
 
 /// Shared trigger-deactivation flags, used by every verb that takes
-/// triggers down (the standalone `weft deactivate` and every infra
-/// verb that deactivates as a side effect: stop, terminate, upgrade).
+/// triggers down (the standalone `weft deactivate`, `weft resync`, and
+/// every infra verb that deactivates as a side effect: stop, terminate,
+/// upgrade). The running-work pair rides along: the same flags, read
+/// the same way, whether or not the verb ends up showing the picker.
 ///
-/// Missing flags prompt the user on a TTY; in `--json` mode missing
-/// required flags become errors so the extension always passes them.
+/// A missing `--mode` prompts on a TTY; off one (and under `--json`)
+/// it is `wipe`, the standing answer while building. A missing
+/// `--running-policy` is `cancel` everywhere: a wait is asked for.
 #[derive(Debug, clap::Args, Default, Clone)]
 struct TriggerDeactivationOpts {
     /// Preservation mode for active triggers: wipe | hibernate | park.
@@ -723,24 +735,25 @@ struct TriggerDeactivationOpts {
     /// --mode hibernate). Default 15.
     #[arg(long, value_name = "minutes")]
     grace: Option<u32>,
-    /// What to do with in-flight executions: wait | cancel.
-    #[arg(long = "running-policy", value_name = "wait|cancel")]
-    running_policy: Option<String>,
-    /// Cap in seconds on a `--running-policy wait` drain ("wait at
-    /// most N, then proceed anyway": the deactivation cancels the
-    /// stragglers; a worker replacement kills them with the old
-    /// workers). Default: the server's 600s.
-    #[arg(long = "drain-timeout", value_name = "seconds")]
-    drain_timeout: Option<u64>,
+    #[command(flatten)]
+    running: RunningChoiceOpts,
 }
 
-/// The bare drain cap for `weft infra start` (which takes no
-/// trigger-deactivation flags: infra start fires when the project is
-/// inactive, but its worker reconciliation can still drain).
-#[derive(Debug, clap::Args)]
-struct DrainOpts {
-    /// Cap in seconds on a `--running-policy wait` drain before the
-    /// operation proceeds anyway. Default: the server's 600s.
+/// The running-work choice: what happens to the executions running
+/// right now when a verb needs them out of the way (a stale worker
+/// replaced by `weft activate`, `weft bake` or `weft infra start`; the
+/// infra an execution uses taken down by a stop, terminate or per-node
+/// verb; the triggers taken down by a deactivate). The pair travels
+/// together: the cap only ever bounds a wait, and a verb that took one
+/// without the other could only refuse it.
+#[derive(Debug, clap::Args, Default, Clone)]
+struct RunningChoiceOpts {
+    /// What to do with the running executions: cancel (default) | wait.
+    #[arg(long = "running-policy", value_name = "cancel|wait")]
+    running_policy: Option<String>,
+    /// Cap in seconds on a `--running-policy wait` before the operation
+    /// proceeds anyway (what is still running is cancelled). Only
+    /// beside `wait`. Default: the server's 60s.
     #[arg(long = "drain-timeout", value_name = "seconds")]
     drain_timeout: Option<u64>,
 }
@@ -752,7 +765,7 @@ enum InfraAction {
     /// scratch.
     Start {
         #[command(flatten)]
-        drain: DrainOpts,
+        running: RunningChoiceOpts,
     },
     /// Re-apply against current images / sources (stop then start).
     /// When the project is Active, triggers deactivate (same picker as
@@ -810,6 +823,11 @@ enum InfraAction {
     /// the file the site `one` includes), and leaves the rest of the
     /// project's infra untouched. Used from the graph's per-node menu
     /// (the trash icon's siblings).
+    ///
+    /// Nothing records which running executions use this one piece, so
+    /// `--running-policy cancel` (the default) cancels every running
+    /// execution of the project before the piece goes; `wait` lets
+    /// them land first, up to `--drain-timeout`.
     NodeStop {
         #[arg(value_name = "node")]
         node: String,
@@ -819,12 +837,17 @@ enum InfraAction {
         /// the downtime (and any slow re-warmup) by passing this.
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        running: RunningChoiceOpts,
     },
     /// Per-instance terminate. Same scope as `node-stop` but deletes
-    /// resources instead of scaling to 0.
+    /// resources instead of scaling to 0, and the same running-policy
+    /// rule.
     NodeTerminate {
         #[arg(value_name = "node")]
         node: String,
+        #[command(flatten)]
+        running: RunningChoiceOpts,
     },
 }
 
@@ -928,14 +951,15 @@ impl InfraAction {
         let opts_from = |t: TriggerDeactivationOpts| commands::infra::InfraOpts {
             mode: t.mode,
             grace: t.grace,
-            running_policy: t.running_policy,
-            drain_timeout: t.drain_timeout,
+            running_policy: t.running.running_policy,
+            drain_timeout: t.running.drain_timeout,
         };
         match self {
-            InfraAction::Start { drain } => (
+            InfraAction::Start { running } => (
                 commands::infra::InfraAction::Start,
                 commands::infra::InfraOpts {
-                    drain_timeout: drain.drain_timeout,
+                    running_policy: running.running_policy,
+                    drain_timeout: running.drain_timeout,
                     ..Default::default()
                 },
             ),
@@ -953,13 +977,21 @@ impl InfraAction {
                 (commands::infra::InfraAction::ListDoors, Default::default())
             }
             InfraAction::Cancel => (commands::infra::InfraAction::Cancel, Default::default()),
-            InfraAction::NodeStop { node, force } => (
+            InfraAction::NodeStop { node, force, running } => (
                 commands::infra::InfraAction::NodeStop { node, force },
-                Default::default(),
+                commands::infra::InfraOpts {
+                    running_policy: running.running_policy,
+                    drain_timeout: running.drain_timeout,
+                    ..Default::default()
+                },
             ),
-            InfraAction::NodeTerminate { node } => (
+            InfraAction::NodeTerminate { node, running } => (
                 commands::infra::InfraAction::NodeTerminate { node },
-                Default::default(),
+                commands::infra::InfraOpts {
+                    running_policy: running.running_policy,
+                    drain_timeout: running.drain_timeout,
+                    ..Default::default()
+                },
             ),
             InfraAction::Logs { node, tail, follow } => (
                 commands::infra::InfraAction::Logs { node, tail, follow },
@@ -1164,9 +1196,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Wake { color, node } => commands::wake::run(ctx, color, node).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
-        Cmd::Bake { project, referenced } => commands::bake::run(ctx, project, node_set(referenced)).await,
-        Cmd::Activate { project, reactivate_choice } => {
-            commands::activate::run(ctx, project, reactivate_choice).await
+        Cmd::Bake { project, referenced, running } => {
+            commands::bake::run(ctx, project, node_set(referenced), running.running_policy, running.drain_timeout)
+                .await
+        }
+        Cmd::Activate { project, reactivate_choice, running } => {
+            commands::activate::run(
+                ctx,
+                project,
+                reactivate_choice,
+                running.running_policy,
+                running.drain_timeout,
+            )
+            .await
         }
         Cmd::Deactivate { project, opts } => {
             commands::deactivate::run(
@@ -1174,8 +1216,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 project,
                 opts.mode,
                 opts.grace,
-                opts.running_policy,
-                opts.drain_timeout,
+                opts.running.running_policy,
+                opts.running.drain_timeout,
             )
             .await
         }
@@ -1194,8 +1236,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 commands::infra::InfraOpts {
                     mode: opts.mode,
                     grace: opts.grace,
-                    running_policy: opts.running_policy,
-                    drain_timeout: opts.drain_timeout,
+                    running_policy: opts.running.running_policy,
+                    drain_timeout: opts.running.drain_timeout,
                 },
             )
             .await

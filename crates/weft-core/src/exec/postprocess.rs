@@ -369,6 +369,50 @@ pub fn emit_port_closure(
     Ok(())
 }
 
+/// A boundary's closure sweep: first close, WITH its error, every
+/// output whose same-named input arrived as a failed closure
+/// (`closed_with_error`, from the firing input), then close everything
+/// else the firing did not mention plainly. The one place a boundary
+/// forwards a failure as a failure, shared by the group passthrough and
+/// the loop's per-iteration launch so the two cannot drift: a port the
+/// node does not declare as an output, or one the firing mentioned, is
+/// left to the plain sweep's own rules.
+#[allow(clippy::too_many_arguments)]
+pub fn close_failed_then_unmentioned_downstream(
+    node_id: &str,
+    closed_with_error: &std::collections::BTreeMap<String, String>,
+    mentioned: &HashSet<String>,
+    emission_id: Uuid,
+    color: Color,
+    frames: &LoopFrames,
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    edge_idx: &EdgeIndex,
+    emissions: &mut Vec<PulseEmission>,
+) -> WeftResult<()> {
+    let declared: HashSet<&str> = project
+        .nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .map(|n| n.outputs.iter().map(|o| o.name.as_str()).collect())
+        .unwrap_or_default();
+    let mut closed = HashSet::new();
+    for (port, error) in closed_with_error {
+        if mentioned.contains(port) || !declared.contains(port.as_str()) {
+            continue;
+        }
+        emit_port_closure(
+            node_id, port, emission_id, color, frames, project, pulses, edge_idx, emissions,
+            Some(error),
+        )?;
+        closed.insert(port.clone());
+    }
+    close_unmentioned_downstream(
+        node_id, mentioned, emission_id, color, frames, project, pulses, edge_idx, emissions,
+        None, &closed,
+    )
+}
+
 /// Emit a closure on every outgoing edge of `port_name`.
 #[allow(clippy::too_many_arguments)]
 fn emit_closure_on_outgoing(
