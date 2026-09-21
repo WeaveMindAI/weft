@@ -77,9 +77,6 @@ mutable tag is not resolved to a digest**. So `postgres:16` rolling underneath
 you produces no change in the spec and no re-apply. Pin by digest if you want
 an image change to actually land.
 
-(The comment on that type in the source says tags are digest-resolved. They are
-not; the supervisor passes them through.)
-
 ## Reaching it
 
 ```rust

@@ -208,8 +208,11 @@ pub struct NodeMetadata {
     #[serde(default)]
     pub requires_infra: bool,
     /// Local image source directories the CLI must build for this
-    /// node. Each entry is the relative path (from the package root)
-    /// of a directory containing a `Dockerfile`. The directory's
+    /// node. Each entry is a path relative to THE NODE'S OWN
+    /// DIRECTORY, the one holding its `metadata.json`, naming a
+    /// directory that contains a `Dockerfile` (`image_set.rs` joins it
+    /// onto `CatalogEntry::source_dir`; a member of a package does not
+    /// reach up to the package root for these). The directory's
     /// basename becomes the name used in `Image::Local { name }` from
     /// the node's `provision()` body. Example: `["images/bridge"]`
     /// makes `Image::Local { name: "bridge" }` resolvable via the

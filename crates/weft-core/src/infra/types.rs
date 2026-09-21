@@ -368,9 +368,14 @@ impl Container {
 }
 
 /// Image source. Local images are built from a directory in the
-/// node's catalog package and hash-tagged by the CLI. Upstream images
-/// may be digest-pinned or use mutable tags; mutable tags are
-/// resolved to digests at apply time before hashing.
+/// node's catalog package and hash-tagged by the CLI.
+///
+/// An upstream reference passes through to the cluster VERBATIM. A
+/// mutable tag is NOT resolved to a digest, so `postgres:16` rolling
+/// underneath produces no change in the spec and no re-apply: pinning
+/// by digest is the only way to make an image change land. See
+/// `weft-infra-supervisor::lifecycle`, which is the code that applies
+/// it, and the book's infrastructure page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Image {

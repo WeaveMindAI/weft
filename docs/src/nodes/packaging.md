@@ -122,9 +122,5 @@ postgres/database/
     bootstrap.py
 ```
 
-The path is relative to **the node's own directory**, and the last segment
-becomes the name you reference in the spec.
-
-(The doc comment on that field in the source says the package root. The code
-uses the node's directory, which is what the shipped catalog does and what
-works.)
+The path is relative to **the node's own directory**, not the package root, and
+the last segment becomes the name you reference in the spec.
