@@ -80,8 +80,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Cap on the running_policy=wait drain before the op
             -- proceeds anyway (loud warning). Per-command: the user
             -- picks it with the wait choice; the default mirrors
-            -- weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS.
-            drain_timeout_secs BIGINT NOT NULL DEFAULT 600
+            -- weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS
+            -- (SYNC: the two numbers move together, by migration here).
+            drain_timeout_secs BIGINT NOT NULL DEFAULT 60
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
@@ -520,8 +521,11 @@ mod tests {
         }
     }
 
+    /// A request that says nothing about running work does not wait on
+    /// it: waiting is the choice a person makes, never the one they
+    /// get for free.
     #[test]
-    fn running_policy_default_is_wait() {
-        assert_eq!(RunningPolicy::default(), RunningPolicy::Wait);
+    fn running_policy_default_is_cancel() {
+        assert_eq!(RunningPolicy::default(), RunningPolicy::Cancel);
     }
 }

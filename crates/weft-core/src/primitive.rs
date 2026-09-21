@@ -1,4 +1,5 @@
 #[cfg(feature = "runtime")]
+use std::collections::VecDeque;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -380,13 +381,13 @@ pub enum CorruptionSite {
 ///   The closure's output was journaled and replays here without
 ///   re-running the closure (handles non-determinism between
 ///   awaits without forcing replay-from-top to recompute).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AwaitedEntry {
     pub call_index: u32,
     pub kind: AwaitedEntryKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AwaitedEntryKind {
     Await {
@@ -402,6 +403,82 @@ pub enum AwaitedEntryKind {
         name: String,
         value: Value,
     },
+}
+
+/// What a body's `ctx.await_signal` finds in its journal at its call
+/// index: the answer that already arrived, or the token of the wait
+/// it is still parked on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayedAwait {
+    Resolved(Value),
+    Pending { token: String },
+}
+
+/// The replay decision for a `ctx.await_signal` at `call_index`: pops
+/// the next journal entry of the (node, frames) sequence. `None` when
+/// the sequence is exhausted (a fresh await, to be registered). The
+/// ONE reading of the journal for both the execution engine and the
+/// node-test rig, so a body a test replays green replays the same in
+/// production: a mismatched index or a `ctx.run` where an await was
+/// journaled means the body's call order changed, which is refused.
+pub fn replay_await(
+    sequence: &mut VecDeque<AwaitedEntry>,
+    call_index: u32,
+) -> crate::error::WeftResult<Option<ReplayedAwait>> {
+    let Some(entry) = sequence.pop_front() else {
+        return Ok(None);
+    };
+    if entry.call_index != call_index {
+        return Err(crate::error::WeftError::NodeExecution(format!(
+            "await_signal call_index mismatch (counter={call_index}, journal={}). \
+             This means the node body's call order changed between replays. \
+             Wrap any non-deterministic logic between awaits in `ctx.run`.",
+            entry.call_index
+        )));
+    }
+    match entry.kind {
+        AwaitedEntryKind::Await { token, resolved } => Ok(Some(match resolved {
+            Some(value) => ReplayedAwait::Resolved(value),
+            None => ReplayedAwait::Pending { token },
+        })),
+        AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeExecution(format!(
+            "await_signal at call_index={call_index} but journal has Run('{name}'). \
+             This means the node body called `ctx.run` here on a previous run \
+             and `ctx.await_signal` now; non-deterministic bodies are not safe \
+             to replay. Use `ctx.run` to wrap non-deterministic work."
+        ))),
+    }
+}
+
+/// The replay decision for a `ctx.run(name)` at `call_index`: the
+/// journaled value when the step already ran, `None` when the sequence
+/// is exhausted (the fresh path: the closure runs and its value is
+/// recorded). Same rule and same refusals as [`replay_await`].
+pub fn replay_run(
+    sequence: &mut VecDeque<AwaitedEntry>,
+    name: &str,
+    call_index: u32,
+) -> crate::error::WeftResult<Option<Value>> {
+    let Some(entry) = sequence.pop_front() else {
+        return Ok(None);
+    };
+    if entry.call_index != call_index {
+        return Err(crate::error::WeftError::NodeExecution(format!(
+            "ctx.run('{name}') call_index mismatch (counter={call_index}, journal={}). \
+             This means the node body's call order changed between replays. \
+             Wrap any non-deterministic logic in `ctx.run`.",
+            entry.call_index
+        )));
+    }
+    match entry.kind {
+        AwaitedEntryKind::Run { value, .. } => Ok(Some(value)),
+        AwaitedEntryKind::Await { .. } => Err(crate::error::WeftError::NodeExecution(format!(
+            "ctx.run('{name}') at call_index={call_index} but journal has Await. \
+             This means the node body called `ctx.await_signal` here on a previous \
+             run and `ctx.run` now; non-deterministic bodies are not safe to \
+             replay."
+        ))),
+    }
 }
 
 /// Per-paused-(node, frames) info stored in the snapshot. `token` is

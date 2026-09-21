@@ -29,7 +29,7 @@ output, which is how the VS Code extension drives all of this.
 | `weft run` | Compiles, registers, records a version, starts a run, and follows it |
 | `weft run <example>` | The same, with a saved example's starting values |
 | `weft build` | Compiles and registers, starting nothing. Also how you put back code the dispatcher no longer holds |
-| `weft bake` | Prepares every trigger's settings and starts no listeners |
+| `weft bake` | Prepares every trigger's settings and starts no listeners. Takes the same `--running-policy` and `--drain-timeout` as `weft activate`, for the same reason: the setup runs on a worker, and one still up from an older build is replaced first |
 | `weft stop <color>` | Cancels a run |
 | `weft wake <color> <node>` | Resolves a pure time wait now. Refused for a wait that expects a value |
 | `weft follow <project>` | Streams a project's events live |
@@ -58,7 +58,7 @@ Flags on `weft run`:
 |---|---|
 | `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status` |
 | `weft events <color>` | One run's events in order. `--node`, `--kind`, `--full` for whole values |
-| `weft logs [<color>]` | What the nodes wrote, plus every failure. `--limit` |
+| `weft logs [<color>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
 | `weft status` | The cwd project: registration, listener, infra per node, recent runs, what drifted, and what you can do next |
 | `weft ps` | Every project the dispatcher knows |
 | `weft listener inspect` | Every listener pod and the signals on it. An operator's view |
@@ -82,36 +82,37 @@ answers "has my trigger fired since I changed it".
 
 | Command | What it does |
 |---|---|
-| `weft activate` | Sets up every trigger and starts the listeners. Builds and registers first if it has to |
+| `weft activate` | Sets up every trigger and starts the listeners. Builds and registers first if it has to. A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout` |
 | `weft deactivate` | Stops the listening |
-| `weft resync` | Deactivate and re-activate in one shot against your current program. Only on a project that is already active |
+| `weft resync` | Deactivate and re-activate in one shot against your current program. Only on a project that is already active; an inactive one is `weft activate` |
 | `weft cancel-activate` | Cancels an activate in flight |
 | `weft cancel-build` | Cancels a build in flight. Only for a build running in the cluster; Ctrl+C handles a local one |
 | `weft cancel-running` | Ends a drain early while a deactivate is waiting |
 
-`deactivate`, `resync` and the infra verbs share four flags:
+`deactivate`, `resync` and the infra verbs share four flags. `activate` and
+`infra start` take the last two:
 
 | Flag | What it does |
 |---|---|
 | `--mode wipe\|hibernate\|park` | What happens to work in flight. `wipe` drops it all, the other two keep it |
 | `--grace <minutes>` | How long hibernate accepts late answers. 15 by default |
-| `--running-policy wait\|cancel` | Drain the running executions, or cancel them. `wipe` forces `cancel` |
-| `--drain-timeout <seconds>` | Cap on a drain. 600 by default |
+| `--running-policy cancel\|wait` | Cancel the running executions, or wait for them. `cancel` unless you say otherwise; `wipe` refuses `wait`. On `weft infra stop` and `terminate` it works on an inactive project too: no triggers to take down, but a run may still be using the infra |
+| `--drain-timeout <seconds>` | Cap on a wait, so only beside `--running-policy wait`; passed with cancel it is refused. 60 by default. What is still running at the cap is cancelled |
 
 ## Infrastructure
 
 | Command | What it does |
 |---|---|
 | `weft infra start` | Brings up whatever is down |
-| `weft infra stop` | Scales to nothing, keeping the disk |
-| `weft infra terminate` | Deletes it, disk included, unless the node asked for the disk to be kept |
+| `weft infra stop` | Scales to nothing, keeping the disk. The project's running executions are cancelled first unless you pass `--running-policy wait`, because they may be using this infra |
+| `weft infra terminate` | Deletes it, disk included, unless the node asked for the disk to be kept. The same running-policy rule as stop |
 | `weft infra upgrade` | Rebuilds against your current source. Leaves the project deactivated |
 | `weft infra status` | Where each piece stands, with its address |
 | `weft infra list-doors` | Which pieces you can reach from this machine, and at what address |
 | `weft infra logs [<node>]` | What the containers printed. `--tail` (200), `-f` |
 | `weft infra cancel` | Stops waiting on work in flight. Halts between steps rather than undoing |
-| `weft infra node-stop <node> [--force]` | One piece. `--force` takes down units that would normally stay up |
-| `weft infra node-terminate <node>` | One piece, deleted |
+| `weft infra node-stop <node> [--force]` | One piece. `--force` takes down units that would normally stay up. Cancels every running execution of the project unless you pass `--running-policy wait`, since nothing records which of them use this piece |
+| `weft infra node-terminate <node>` | One piece, deleted. The same running-policy rule |
 
 ## Connections and tokens
 
@@ -170,8 +171,8 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 
 | Command | What it does |
 |---|---|
-| `weft describe-nodes --list` | One line per node type: its name, its tags, what it does. The cheap first look |
-| `weft describe-nodes --node <Type> --compact` | One node's wiring view: ports, types and rules, with the presentation stripped out |
+| `weft describe-nodes --list` | One line per node type: its name, its tags, the first sentence of what it does. The cheap first look |
+| `weft describe-nodes --node <Type> --compact` | One node's wiring view: ports, types and rules, with the presentation stripped out. A long pick list shows its first eight entries and how many more there are; the plain `--node <Type>` has them all |
 | `weft parse` | Parses source from stdin and prints the project, the catalog and the diagnostics as JSON. Lenient: unknown types become placeholders |
 | `weft validate` | The same input, strict, including the runtime rules like missing credentials |
 | `weft parse-server` | A long-lived parse server, one JSON request per line, catalog held warm |

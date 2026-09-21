@@ -13,7 +13,27 @@ describe('skipReasonText', () => {
 		[{ kind: 'did_not_flow' }, 'its `_should_flow` said no'],
 		[{ kind: 'flow_closed' }, 'nothing ever answered its `_should_flow`'],
 		[{ kind: 'did_flow' }, 'its `_should_not_flow` saw a value'],
+		[
+			{ kind: 'watched_node_failed', error: 'the database is down' },
+			'the node its `_should_not_flow` watches did not finish (the database is down), which is not the absence this node runs on',
+		],
 		[{ kind: 'required_input_closed', port: 'value' }, "the required input 'value' closed"],
+		[
+			{ kind: 'required_input_closed', port: 'value', failure: 'the database is down' },
+			"the required input 'value' closed: a node before it failed (the database is down)",
+		],
+		[
+			{ kind: 'flow_closed', failure: 'the database is down' },
+			'nothing ever answered its `_should_flow`: a node before it failed (the database is down)',
+		],
+		[
+			{ kind: 'every_input_closed', failure: 'the database is down' },
+			'every input closed: a node before it failed (the database is down)',
+		],
+		[
+			{ kind: 'one_of_group_closed', ports: ['a', 'b'], failure: 'the database is down' },
+			'every input of the group (a, b) closed: a node before it failed (the database is down)',
+		],
 		[{ kind: 'every_input_closed' }, 'every input closed'],
 		[
 			{ kind: 'one_of_group_closed', ports: ['a', 'b'] },

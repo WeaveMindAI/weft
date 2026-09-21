@@ -894,7 +894,7 @@ mod wire_tests {
             ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
             ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: vec![], at_unix: 1 },
             ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
-            ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into() }, at_unix: 1 },
+            ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
             ExecEvent::NodeSuspended { color: color(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
             ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
             ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },

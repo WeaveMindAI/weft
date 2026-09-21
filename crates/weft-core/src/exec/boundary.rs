@@ -25,7 +25,10 @@ use crate::exec::emission::{boundary_emission, PulseEmission};
 use crate::exec::execution::{
     next_firing_ordinal, NodeExecution, NodeExecutionStatus, NodeExecutionTable,
 };
-use crate::exec::postprocess::{close_unmentioned_downstream, emit_port_closure, postprocess_output, OutputBag};
+use crate::exec::postprocess::{
+    close_failed_then_unmentioned_downstream, close_unmentioned_downstream, emit_port_closure,
+    postprocess_output, OutputBag,
+};
 use crate::primitive::Phase;
 use crate::exec::ready::{find_ready_among, kicked_group, settle_out_of_run, InputBag, OutOfRun, ReadyGroup};
 use crate::exec::skip::{SkipReason, SHOULD_FLOW_PORT};
@@ -456,6 +459,7 @@ fn dispatch_passthrough(
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
                 project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, Some(reason),
+                reason.inherited_failure(),
             ));
         }
         NodeExecutionStatus::Skipped
@@ -472,7 +476,7 @@ fn dispatch_passthrough(
         // gated-off path does; only the reason differs.
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, None,
+                project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, None, Some(err),
             ));
         }
         NodeExecutionStatus::Failed
@@ -490,10 +494,14 @@ fn dispatch_passthrough(
             Ok(mentioned) => {
                 // Closed inputs are absent from the bag, so the sweep
                 // closes their same-named outputs and skips cascade
-                // through (and out of) the group.
-                if let Err(e) = close_unmentioned_downstream(
-                    &node_id, &mentioned, emission_id, color, &frames, project, pulses, edge_idx,
-                    &mut emissions, None, &HashSet::new(),
+                // through (and out of) the group. A closure that arrived
+                // WITH an error (the producer failed) goes out with it:
+                // the boundary passes a failure through as a failure,
+                // never laundering it into a plain "nothing came" that a
+                // `_should_not_flow` outside the scope would run on.
+                if let Err(e) = close_failed_then_unmentioned_downstream(
+                    &node_id, &group.received.closed_with_error, &mentioned, emission_id, color,
+                    &frames, project, pulses, edge_idx, &mut emissions,
                 ) {
                     tracing::error!(
                         target: "weft_core::exec::boundary",
@@ -514,8 +522,19 @@ fn dispatch_passthrough(
                 NodeExecutionStatus::Completed
             }
             Err(e) => {
+                // A forward that failed on the way out (a wire's path
+                // cannot read the value, a single-shot port emitted
+                // twice): the same failure as a refused port, so the
+                // same aftermath. The scope never starts and has to be
+                // told, or its roots wait for ever and the run ends
+                // Stuck (the pre-dispatch branch above says why).
                 let err = e.to_string();
                 sweep_all_outputs(&node_id, emission_id, color, &frames, project, edge_idx, pulses, &mut emissions, &err);
+                if let Some(group_id) = &in_scope {
+                    emissions.extend(tear_down_scope(
+                        project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, None, Some(&err),
+                    ));
+                }
                 error = Some(err);
                 NodeExecutionStatus::Failed
             }
@@ -604,42 +623,22 @@ pub fn tear_down_scope(
     group_id: &str,
     frames: &LoopFrames,
     reason: Option<&SkipReason>,
+    failure: Option<&str>,
 ) -> Vec<PulseEmission> {
-    // A call site holds no member of its own: the scope it gates is the
-    // body it calls, one call frame deeper, boundaries included.
-    let body = project.groups.iter().find(|g| g.id == group_id).and_then(|g| match &g.kind {
-        crate::project::GroupKind::Call { body } => Some(body.clone()),
-        _ => None,
-    });
-    // An enclosing scope that was itself skipped has already torn this
-    // one down on its way past: its members are the enclosing scope's
-    // members too, and its Out's outward closures went out with them.
-    // Doing it again would emit a second closure on the same ports. A
-    // FAILED boundary (`reason: None`) has no such enclosing pass, so it
-    // always tears down. A call site is the exception: its body is
-    // compiled at the top level, so no enclosing sweep reaches the
-    // body's nodes, and the site takes them down itself under the call
-    // (its own outward closures are still the enclosing pass's).
-    let taken_down_above = matches!(reason, Some(SkipReason::ScopeSkipped { .. }));
-    if taken_down_above && body.is_none() {
+    let refused = refused_scope(project, edge_idx, group_id, frames);
+    if refused.owed_by_the_enclosing_pass(reason) {
         return Vec::new();
     }
+    // An enclosing scope that was itself skipped took the outward
+    // closures of this one out with it; doing it again would emit a
+    // second closure on the same ports. A call site's body still needs
+    // telling below, its outward closures do not.
+    let taken_down_above = matches!(reason, Some(SkipReason::ScopeSkipped { .. }));
     let mut emissions = if taken_down_above { Vec::new() } else {
-        close_scope_outward(project, edge_idx, pulses, emission_id, color, group_id, frames)
+        close_scope_outward(project, edge_idx, pulses, emission_id, color, group_id, frames, failure)
     };
-    let (scope, frames): (String, LoopFrames) = match body {
-        Some(body) => {
-            let mut inside = frames.clone();
-            inside.push(crate::frames::Frame::Call { site: group_id.to_string() });
-            (body, inside)
-        }
-        None => (group_id.to_string(), frames.clone()),
-    };
+    let RefusedScope { scope, frames, members, .. } = refused;
     let frames = &frames;
-    let mut members: Vec<&NodeDefinition> = scope_members(project, &scope);
-    if scope != group_id {
-        members.extend(project.nodes.iter().filter(|n| n.id == boundary_in_id(&scope) || n.id == boundary_out_id(&scope)));
-    }
     let mut exits = edge_idx.selection().cloned()
         .unwrap_or_else(|| crate::project::selection::RunSelection::whole(project));
     // The exits: wires leaving the scope, minus the ones into its own
@@ -656,13 +655,13 @@ pub fn tear_down_scope(
     exits.edges.retain(|wire| crate::project::selection::wire_ends(project, wire).is_some_and(|(_, target)|
         target.id != boundary_out_id(&scope) && target.id != boundary_out_id(group_id) && !inside.contains(&target)));
     let exit_index = EdgeIndex::selected(project, exits);
-    let members: Vec<&NodeDefinition> = members.into_iter()
-        .filter(|node| edge_idx.admits(&node.id, frames)).collect();
+    // A member's exits close the way the scope ended: with the failure
+    // that took the scope down, or plainly when it was gated off.
     for member in &members {
-        if let Err(error) = close_unmentioned_downstream(&member.id, &HashSet::new(), emission_id,
-            color, frames, project, pulses, &exit_index, &mut emissions, None, &HashSet::new())
+        if let Err(error) = close_unmentioned_downstream(member, &HashSet::new(), emission_id,
+            color, frames, project, pulses, &exit_index, &mut emissions, failure, &HashSet::new())
         {
-            tracing::error!(node = %member.id, %error, "scope member closure failed");
+            tracing::error!(node = %member, %error, "scope member closure failed");
         }
     }
     // EVERY member, for a failure exactly as for a gating, in every
@@ -688,19 +687,76 @@ pub fn tear_down_scope(
     // already there, and a fire that lands later is refused the same
     // way when it dispatches (`scope_permission` reads the gate's
     // record).
-    let members: Vec<String> = members.into_iter().map(|n| n.id.clone()).collect();
     kick_scope(kicked, &members, frames, Some(group_id));
     emissions
+}
+
+/// What a scope that never runs has to tell, and where: its members
+/// (for a call site, the body it calls, one call frame deeper,
+/// boundaries included), those the run admits, at the frames they
+/// live at. Shared by the teardown and by a seeded run reusing a
+/// refused scope's record: the record carries no kick, so the members
+/// this run re-runs are told again the same way.
+pub struct RefusedScope {
+    /// The scope whose members are told: the group itself, or the
+    /// body a call site calls.
+    pub scope: String,
+    pub frames: LoopFrames,
+    pub members: Vec<String>,
+    /// Whether the group is a call site, whose body is compiled at the
+    /// top level, one call frame deeper.
+    pub calls_a_body: bool,
+}
+
+impl RefusedScope {
+    /// Whether the scope owes its members nothing because an enclosing
+    /// scope that was itself skipped already took them down on its way
+    /// past (`reason` is the scope's own skip; `ScopeSkipped` says so).
+    /// Its members are the enclosing scope's members too, and its Out's
+    /// outward closures went out with them. A FAILED boundary (no
+    /// reason) has no such enclosing pass. A call site is the exception:
+    /// no enclosing sweep reaches the body it calls, so the site takes
+    /// that body down itself, under the call.
+    pub fn owed_by_the_enclosing_pass(&self, reason: Option<&SkipReason>) -> bool {
+        matches!(reason, Some(SkipReason::ScopeSkipped { .. })) && !self.calls_a_body
+    }
+}
+
+pub fn refused_scope(project: &ProjectDefinition, edge_idx: &EdgeIndex, group_id: &str, frames: &LoopFrames) -> RefusedScope {
+    // A call site holds no member of its own: the scope it gates is the
+    // body it calls, one call frame deeper, boundaries included.
+    let body = project.groups.iter().find(|g| g.id == group_id).and_then(|g| match &g.kind {
+        crate::project::GroupKind::Call { body } => Some(body.clone()),
+        _ => None,
+    });
+    let calls_a_body = body.is_some();
+    let (scope, frames): (String, LoopFrames) = match body {
+        Some(body) => {
+            let mut inside = frames.clone();
+            inside.push(crate::frames::Frame::Call { site: group_id.to_string() });
+            (body, inside)
+        }
+        None => (group_id.to_string(), frames.clone()),
+    };
+    let mut members: Vec<&NodeDefinition> = scope_members(project, &scope);
+    if scope != group_id {
+        members.extend(project.nodes.iter().filter(|n| n.id == boundary_in_id(&scope) || n.id == boundary_out_id(&scope)));
+    }
+    let members = members.into_iter().filter(|node| edge_idx.admits(&node.id, &frames)).map(|n| n.id.clone()).collect();
+    RefusedScope { scope, frames, members, calls_a_body }
 }
 
 /// The closures a scope that never runs (or a loop that ends
 /// abnormally) owes the outside: one per outward port of its Out
 /// boundary, at the scope's own frames, so downstream skips cascade
 /// instead of deadlocking. A group's and a loop's alike; the outward
-/// surface is the Out node's outputs either way. A missing `__out`
-/// node (impossible unless the compiled project shape is corrupt) is
-/// logged at error level rather than returned, since teardown paths
-/// cannot propagate.
+/// surface is the Out node's outputs either way. `failure` is why the
+/// scope ended when it did not merely decline (a boundary refused a
+/// value, a body failed, the run was cancelled), carried on every
+/// outward closure so what is outside reads a failure as a failure. A
+/// missing `__out` node (impossible unless the compiled project shape
+/// is corrupt) is logged at error level rather than returned, since
+/// teardown paths cannot propagate.
 #[allow(clippy::too_many_arguments)]
 pub fn close_scope_outward(
     project: &ProjectDefinition,
@@ -710,6 +766,7 @@ pub fn close_scope_outward(
     color: Color,
     group_id: &str,
     frames: &LoopFrames,
+    failure: Option<&str>,
 ) -> Vec<PulseEmission> {
     let out_id = boundary_out_id(group_id);
     let Some(out_node) = project.nodes.iter().find(|n| n.id == out_id) else {
@@ -728,7 +785,7 @@ pub fn close_scope_outward(
         // loud rather than unwrap.
         if let Err(e) = emit_port_closure(
             &out_id, &port.name, emission_id, color, frames, project, pulses, edge_idx,
-            &mut emissions, None,
+            &mut emissions, failure,
         ) {
             tracing::error!(
                 target: "weft_core::exec::boundary",
@@ -1096,7 +1153,7 @@ mod tests {
         let edge_idx = EdgeIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut kicked = HashMap::new();
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::DidNotFlow));
+        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::DidNotFlow), None);
         let at = vec![Frame::Call { site: "a".into() }];
         for member in ["B__in", "B.n", "B__out"] {
             let kick = kicked.get(&FiringLocation::new(member, at.clone())).unwrap_or_else(|| panic!("{member} kicked under the call: {kicked:?}"));
@@ -1109,7 +1166,7 @@ mod tests {
         // one call deeper, and closes nothing outward a second time.
         let mut kicked = HashMap::new();
         let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "b",
-            &vec![], Some(&SkipReason::ScopeSkipped { scope: "outer".into() }));
+            &vec![], Some(&SkipReason::ScopeSkipped { scope: "outer".into() }), None);
         let at_b = vec![Frame::Call { site: "b".into() }];
         assert!(kicked.contains_key(&FiringLocation::new("B.n", at_b.clone())), "{kicked:?}");
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "sb" || e.pulse.target_node == "b__out"), "the enclosing pass owns the outward closures: {emissions:?}");
@@ -1142,11 +1199,11 @@ mod tests {
         let edge_idx = EdgeIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut kicked = HashMap::new();
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "g", &vec![], Some(&SkipReason::DidNotFlow));
+        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "g", &vec![], Some(&SkipReason::DidNotFlow), None);
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "the body's In is under the group, not past it: {emissions:?}");
         assert!(kicked.contains_key(&FiringLocation::new("a__in", vec![])), "{kicked:?}");
         // The site's own skip then takes the body down under the call.
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::ScopeSkipped { scope: "g".into() }));
+        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::ScopeSkipped { scope: "g".into() }), None);
         assert!(kicked.contains_key(&FiringLocation::new("B__in", vec![Frame::Call { site: "a".into() }])), "{kicked:?}");
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "{emissions:?}");
     }
@@ -1347,6 +1404,36 @@ mod tests {
             );
         }
         assert_eq!(executions["g__in"][0].error, *error);
+    }
+
+    /// The same aftermath when the boundary fails on the way OUT: a wire
+    /// leaving it reads a key off the value that is not there. Nothing
+    /// was forwarded, every output closes with the error, and the scope
+    /// is told, so its members are never stranded.
+    #[test]
+    fn a_boundary_that_cannot_forward_fails_and_tells_its_scope() {
+        let mut project = grouped_project();
+        project.edges.iter_mut().find(|edge| edge.id == "e2").expect("e2").path = vec!["speed".into()];
+        let edge_idx = EdgeIndex::build(&project);
+        let mut pulses = PulseTable::default();
+        let mut executions = NodeExecutionTable::default();
+        let mut kicked = HashMap::new();
+        let mut bag = OutputBag::new();
+        bag.insert("out".into(), Arc::new(json!(7)));
+        bag.insert("flow".into(), Arc::new(json!(true)));
+        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
+        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        assert_eq!(fired.len(), 1);
+        let BoundaryOutcome::Fired { status, error, output, .. } = &fired[0].outcome else { panic!("in scope") };
+        assert_eq!(*status, NodeExecutionStatus::Failed);
+        assert!(error.as_deref().is_some_and(|e| e.contains("cannot read")), "{error:?}");
+        assert!(output.is_none());
+        let inner = pending(&pulses, "inner");
+        assert_eq!(inner.len(), 1);
+        assert!(inner[0].closed && inner[0].close_error.is_some(), "closed with the failure: {:?}", inner[0]);
+        for member in ["lonely", "inner"] {
+            assert!(kicked.keys().any(|loc| loc.node_id == member), "the failed forward tells {member}: {kicked:?}");
+        }
     }
 
     /// A group with no wire into its In boundary starts from a kick,

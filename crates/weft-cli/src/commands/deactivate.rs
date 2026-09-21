@@ -8,14 +8,9 @@
 //! trigger deactivation means improvements propagate everywhere.
 
 use super::Ctx;
-use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
+use crate::commands::ensure::parse_running_choice;
 use crate::progress::ActionVerb;
-
-/// Default hibernate grace window when the user picks hibernate
-/// but doesn't specify --grace. Mirrors the dispatcher's default;
-/// keeping a single number isolated to one place per side avoids
-/// drift if either side wants to bump it later.
-const DEFAULT_GRACE_MINUTES: u32 = 15;
+use weft_core::{DeactivateSpec, DeactivationMode, RunningPolicy, DEFAULT_GRACE_MINUTES};
 
 /// Resolve the trigger-deactivation choice (mode + grace + running
 /// policy) from explicit flags, falling back to interactive prompts
@@ -33,69 +28,50 @@ const DEFAULT_GRACE_MINUTES: u32 = 15;
 /// with `--mode hibernate` or `--mode park`. This was a refusal until
 /// the agents hit it on every `weft resync`, where a human never did.
 ///
-/// Returns a JSON object matching the wire
-/// `DeactivateSpec` shape (`mode`, `runningPolicy`, optional
-/// `graceMinutes`), ready to embed under `triggerDeactivation`
-/// in the request body or to POST verbatim to `/deactivate`.
+/// Returns the wire `DeactivateSpec` itself, validated, ready to
+/// embed under `triggerDeactivation` in a request body or to POST
+/// verbatim to `/deactivate`: the CLI builds the type the dispatcher
+/// reads, so the two cannot disagree on a mode or a rule.
 pub fn prompt_trigger_deactivation(
     json: bool,
     mode: Option<&str>,
     grace: Option<u32>,
-    running_policy: Option<&str>,
-    drain_timeout: Option<u64>,
-) -> anyhow::Result<serde_json::Value> {
+    running_policy: RunningPolicy,
+    drain_timeout_secs: Option<u64>,
+) -> anyhow::Result<DeactivateSpec> {
     // Mode resolution priority: explicit --mode flag > interactive
     // prompt (human terminal only) > error (a script, or `--json`).
     let scripted = json || !crate::prompt::is_interactive();
     let mode = match mode {
-        Some(m) => m.to_string(),
-        None if scripted => "wipe".to_string(),
+        Some(m) => DeactivationMode::parse(m).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid mode '{m}'; must be one of: {}",
+                DeactivationMode::VARIANTS.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        })?,
+        None if scripted => DeactivationMode::Wipe,
         None => prompt_mode()?,
     };
-    if !["wipe", "hibernate", "park"].contains(&mode.as_str()) {
-        anyhow::bail!("invalid mode '{mode}'; must be one of: wipe, hibernate, park");
-    }
 
     // Grace window: only meaningful for hibernate. `--json` (the editor)
     // takes the documented default; anyone else without --grace is
     // asked, and `prompt_grace` refuses off a terminal naming the flag,
-    // so a shell script never gets a window it did not choose.
-    let grace_minutes = match (mode.as_str(), grace) {
-        ("hibernate", Some(g)) => Some(g),
-        ("hibernate", None) if json => Some(DEFAULT_GRACE_MINUTES),
-        ("hibernate", None) => Some(prompt_grace()?),
-        _ => None,
+    // so a shell script never gets a window it did not choose. The
+    // other modes carry the default the wire would fill in anyway.
+    let grace_minutes = match (mode, grace) {
+        (DeactivationMode::Hibernate, Some(g)) => g,
+        (DeactivationMode::Hibernate, None) if json => DEFAULT_GRACE_MINUTES,
+        (DeactivationMode::Hibernate, None) => prompt_grace()?,
+        _ => DEFAULT_GRACE_MINUTES,
     };
 
-    // Running-policy: wait by default for preservation modes; wipe
-    // forces cancel because waiting before wiping is contradictory.
-    // Parse through the shared `RunningPolicy` so the accepted set
-    // can't drift from the other verbs.
-    let running_policy = match parse_running_policy_flag(running_policy)? {
-        Some(p) => p,
-        None if mode == "wipe" => RunningPolicy::Cancel,
-        None => RunningPolicy::Wait,
-    };
-    if mode == "wipe" && running_policy == RunningPolicy::Wait {
-        anyhow::bail!(
-            "wipe requires running-policy=cancel; waiting before wiping is contradictory"
-        );
-    }
-
-    let mut obj = serde_json::Map::new();
-    obj.insert("mode".into(), serde_json::json!(mode));
-    obj.insert("runningPolicy".into(), serde_json::json!(running_policy));
-    if let Some(g) = grace_minutes {
-        obj.insert("graceMinutes".into(), serde_json::json!(g));
-    }
-    // The drain cap only rides a wait ("wait at most N seconds, then
-    // proceed anyway"); absent = the server default.
-    if running_policy == RunningPolicy::Wait {
-        if let Some(cap) = drain_timeout {
-            obj.insert("drainTimeoutSecs".into(), serde_json::json!(cap));
-        }
-    }
-    Ok(serde_json::Value::Object(obj))
+    // The running-work pair arrives parsed (`parse_running_choice`, the
+    // one reading every verb uses: cancel unless the flag says wait, a
+    // cap only beside a wait). The spec's own validator refuses the one
+    // contradictory pair (wipe + wait) here, before anything is sent.
+    let spec = DeactivateSpec { mode, grace_minutes, running_policy, drain_timeout_secs };
+    spec.validate().map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+    Ok(spec)
 }
 
 /// Read the project's current lifecycle.status from the dispatcher.
@@ -143,16 +119,11 @@ async fn run_inner(
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
-    // No `--mode` in `--json` is refused by `prompt_trigger_deactivation`
-    // (a script never gets a wipe it did not ask for); on a terminal it
-    // prompts.
-    let deactivation = prompt_trigger_deactivation(
-        ctx.json(),
-        mode.as_deref(),
-        grace,
-        running_policy.as_deref(),
-        drain_timeout,
-    )?;
+    // No `--mode` off a terminal (or under `--json`) is `wipe` with the
+    // running executions cancelled, the standing answer while building;
+    // on a terminal `prompt_trigger_deactivation` asks.
+    let (running_policy, drain_timeout) = parse_running_choice(running_policy.as_deref(), drain_timeout)?;
+    let deactivation = prompt_trigger_deactivation(ctx.json(), mode.as_deref(), grace, running_policy, drain_timeout)?;
 
     let (client, id, name) = match project {
         Some(id) => (ctx.client(), id.clone(), id),
@@ -160,27 +131,17 @@ async fn run_inner(
     };
 
     let path = format!("/projects/{id}/deactivate");
-    // The dispatcher's `/deactivate` endpoint takes the canonical
-    // `DeactivateSpec` shape, same field names as the embedded
-    // `triggerDeactivation` body (`mode`, `runningPolicy`,
-    // `graceMinutes`). We send `deactivation` verbatim.
-    let mode_str = deactivation
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("wipe")
-        .to_string();
-    let running_policy_str = deactivation
-        .get("runningPolicy")
-        .and_then(|v| v.as_str())
-        .unwrap_or("cancel")
-        .to_string();
-    let grace_minutes = deactivation
-        .get("graceMinutes")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-    progress.drain_wait(&deactivation, drain_timeout);
+    // The dispatcher's `/deactivate` endpoint takes the `DeactivateSpec`
+    // itself, the same shape the infra verbs embed under
+    // `triggerDeactivation`.
+    let body = serde_json::to_value(&deactivation)?;
+    let mode_str = deactivation.mode.as_str();
+    let running_policy_str = deactivation.running_policy.as_str();
+    let grace_minutes =
+        (deactivation.mode == DeactivationMode::Hibernate).then_some(deactivation.grace_minutes);
+    progress.drain_wait(&body, deactivation.drain_timeout_secs);
     progress.dispatcher_call_start(&path);
-    client.post_with_body(&path, &deactivation).await?;
+    client.post_with_body(&path, &body).await?;
     let mut done = serde_json::Map::new();
     done.insert("mode".into(), serde_json::json!(mode_str));
     done.insert("runningPolicy".into(), serde_json::json!(running_policy_str));
@@ -213,16 +174,16 @@ fn prompt_grace() -> anyhow::Result<u32> {
     })
 }
 
-fn prompt_mode() -> anyhow::Result<String> {
+fn prompt_mode() -> anyhow::Result<DeactivationMode> {
     println!("Choose preservation mode for in-flight signals:");
     println!("  1) wipe       drop all signals, cancel suspended runs (fully fresh on reactivate)");
     println!("  2) hibernate  keep signals; hide pending tasks from extension; park late submissions");
     println!("  3) park       keep signals visible; queue new submissions for reactivate");
     let line = crate::prompt::prompt_line("Enter 1, 2, or 3: ", "--mode wipe | hibernate | park")?;
     Ok(match line.as_str() {
-        "1" | "wipe" => "wipe".into(),
-        "2" | "hibernate" => "hibernate".into(),
-        "3" | "park" => "park".into(),
+        "1" | "wipe" => DeactivationMode::Wipe,
+        "2" | "hibernate" => DeactivationMode::Hibernate,
+        "3" | "park" => DeactivationMode::Park,
         other => anyhow::bail!("aborted: unrecognized choice '{other}'"),
     })
 }
@@ -230,21 +191,50 @@ fn prompt_mode() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::prompt_trigger_deactivation;
+    use crate::commands::ensure::parse_running_choice;
+    use weft_core::{DeactivateSpec, DeactivationMode, RunningPolicy};
+
+    /// The flags as a verb reads them: parsed once, then handed to the
+    /// prompt, exactly the two steps every verb takes.
+    fn prompt(mode: Option<&str>, policy: Option<&str>, cap: Option<u64>) -> anyhow::Result<DeactivateSpec> {
+        let (running_policy, drain_timeout) = parse_running_choice(policy, cap)?;
+        prompt_trigger_deactivation(true, mode, None, running_policy, drain_timeout)
+    }
 
     /// A script (and every agent) gets `wipe` with no flag: the
     /// preserving modes carry signals and suspended runs across a
     /// change to the program, which is how a run ends up waiting on
     /// something nobody will answer. Keeping the in-flight work is the
-    /// thing you ask for.
+    /// thing you ask for, and so is waiting on the running work: with
+    /// no `--running-policy` nothing waits, whatever the mode.
     #[test]
     fn a_script_gets_a_fresh_start_unless_it_asks_to_keep_the_in_flight_work() {
-        let fresh = prompt_trigger_deactivation(true, None, None, None, None).unwrap();
-        assert_eq!(fresh["mode"], "wipe");
-        assert_eq!(fresh["runningPolicy"], "cancel", "waiting before a wipe is contradictory");
+        let fresh = prompt(None, None, None).unwrap();
+        assert_eq!(fresh.mode, DeactivationMode::Wipe);
+        assert_eq!(fresh.running_policy, RunningPolicy::Cancel, "waiting before a wipe is contradictory");
 
-        let park = prompt_trigger_deactivation(true, Some("park"), None, None, None)
-            .unwrap();
-        assert_eq!(park["mode"], "park");
-        assert_eq!(park["runningPolicy"], "wait");
+        let park = prompt(Some("park"), None, None).unwrap();
+        assert_eq!(park.mode, DeactivationMode::Park);
+        assert_eq!(park.running_policy, RunningPolicy::Cancel, "a wait is asked for, never assumed");
+
+        let patient = prompt(Some("hibernate"), Some("wait"), Some(30)).unwrap();
+        assert_eq!(patient.running_policy, RunningPolicy::Wait);
+        assert_eq!(patient.drain_timeout_secs, Some(30), "the cap rides the wait it was asked with");
+        assert_eq!(patient.grace_minutes, 15, "`--json` takes the documented grace");
+
+        let err = prompt(Some("park"), None, Some(30))
+            .expect_err("a cap with nothing to bound is refused, never dropped")
+            .to_string();
+        assert!(err.contains("--drain-timeout") && err.contains("wait"), "{err}");
+
+        let err = prompt(Some("wipe"), Some("wait"), None)
+            .expect_err("wipe + wait is the wire type's own refusal")
+            .to_string();
+        assert!(err.contains("contradictory"), "{err}");
+
+        let err = prompt(Some("nuke"), None, None)
+            .expect_err("an unknown mode is refused, naming the legal ones")
+            .to_string();
+        assert!(err.contains("wipe, hibernate, park"), "{err}");
     }
 }

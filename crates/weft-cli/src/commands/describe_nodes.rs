@@ -27,13 +27,46 @@ struct NodesResponse<T> {
 }
 
 /// One row of `--list`: what a reader scanning for a node needs to
-/// pick one, and nothing else.
+/// pick one, and nothing else. The description is its first sentence:
+/// a hundred nodes at a sentence each is a screen, at a paragraph each
+/// it is a file nobody reads (a whole-catalog listing weighed 52 KB).
 #[derive(Serialize)]
 struct ListRow<'a> {
     #[serde(rename = "type")]
     node_type: &'a str,
     tags: &'a [String],
     description: &'a str,
+}
+
+/// The first sentence of a description: up to and including the first
+/// full stop that ends one. A stop ends a sentence when it is followed
+/// by whitespace or is the last character, sits outside any open
+/// parenthesis (a `(e.g. ...)` aside is inside the sentence), and does
+/// not end an abbreviation (`e.g.`, `i.e.`, `etc.`, `vs.`). A dot inside
+/// `weft.dev` or `ctx.inputs` is followed by a letter, so it never
+/// qualifies. A description with no such stop is one sentence.
+fn first_sentence(description: &str) -> &str {
+    const ABBREVIATIONS: [&str; 4] = ["e.g", "i.e", "etc", "vs"];
+    let bytes = description.as_bytes();
+    let mut depth: usize = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'.' if depth == 0 && bytes.get(i + 1).is_none_or(|next| next.is_ascii_whitespace()) => {
+                let word_start = description[..i]
+                    .rfind(|c: char| c.is_whitespace() || c == '(')
+                    .map_or(0, |at| at + 1);
+                let word = &description[word_start..i];
+                if ABBREVIATIONS.iter().any(|abbr| word.eq_ignore_ascii_case(abbr)) {
+                    continue;
+                }
+                return description[..=i].trim_end();
+            }
+            _ => {}
+        }
+    }
+    description.trim_end()
 }
 
 pub async fn run(
@@ -80,7 +113,7 @@ pub async fn run(
             .map(|(node_type, metadata)| ListRow {
                 node_type,
                 tags: &metadata.tags,
-                description: &metadata.description,
+                description: first_sentence(&metadata.description),
             })
             .collect();
         // The scan warnings go out either way: a node mid-rename that
@@ -141,4 +174,28 @@ pub async fn run(
     };
     println!("{}", printed.context("serialize describe response")?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_sentence;
+
+    /// The listing shows one sentence per node, and a dot inside a
+    /// name (`weft.dev`, `ctx.inputs`) is not the end of one.
+    #[test]
+    fn the_listing_keeps_the_first_sentence_whole() {
+        assert_eq!(first_sentence("Fire on a schedule. The `cron` expression has six fields."), "Fire on a schedule.");
+        assert_eq!(first_sentence("Read ctx.inputs by name. Then emit."), "Read ctx.inputs by name.");
+        assert_eq!(first_sentence("Search weft.dev"), "Search weft.dev");
+        assert_eq!(first_sentence("One sentence.\nA second."), "One sentence.");
+        assert_eq!(first_sentence(""), "");
+        // An aside in parentheses stays inside its sentence, and an
+        // abbreviation's stop is not the sentence's.
+        assert_eq!(
+            first_sentence("Read records (e.g. `{Status} = 'open'`). Fields come back typed."),
+            "Read records (e.g. `{Status} = 'open'`)."
+        );
+        assert_eq!(first_sentence("Pull a file, e.g. a PDF. Then read it."), "Pull a file, e.g. a PDF.");
+        assert_eq!(first_sentence("Fires per message (a search query, i.e. Gmail's own). Twice."), "Fires per message (a search query, i.e. Gmail's own).");
+    }
 }

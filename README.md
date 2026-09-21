@@ -4,9 +4,9 @@
 
 # Weft
 
-**A new programming language and framework for AI orchestration**
+**A programming language and framework for AI orchestration**
 
-[Try it](#try-it) · [The book](https://weavemindai.github.io/weft/) · [Discord](https://discord.com/invite/FGwNu6mDkU) · [Blog](https://weavemind.ai/blog/future-of-programming)
+[Try it](#try-it) · [The book](https://weavemindai.github.io/weft/) · [Discord](https://discord.com/invite/FGwNu6mDkU)
 
 </div>
 

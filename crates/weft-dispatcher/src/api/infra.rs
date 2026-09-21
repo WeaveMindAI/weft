@@ -29,7 +29,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::authenticator::{authorize_project, CallerTenant};
-use crate::infra_lifecycle_command::{self, InfraLifecycleVerb, RunningPolicy};
+use crate::infra_lifecycle_command::{self, InfraLifecycleVerb};
+use weft_core::{DeactivateSpec, RunningChoice, RunningPolicy};
 use crate::infra_node::{self, InfraNodeRow};
 use crate::project_namespace;
 use crate::state::DispatcherState;
@@ -72,21 +73,18 @@ pub struct SyncRequest {
     /// as the standalone `/deactivate` endpoint, so clients reuse
     /// one picker UI.
     #[serde(default, rename = "triggerDeactivation")]
-    pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
-    /// How the worker reconciliation inside sync treats RUNNING
-    /// executions when a worker must be replaced (stale image, or its
-    /// namespace no longer matches placement after infra appeared /
-    /// went away). `wait` (the default) drains the doomed workers (no
-    /// new admissions; in-flight work finishes) up to
-    /// `drainTimeoutSecs`, then replaces; `cancel` cancels the running
-    /// executions first. Never a silent kill.
-    #[serde(default, rename = "runningPolicy")]
-    pub running_policy: Option<RunningPolicy>,
-    /// Cap on the `wait` drain, in seconds; defaults to
-    /// `DEFAULT_DRAIN_TIMEOUT_SECS`. The user's "wait this long as a
-    /// courtesy, then proceed" choice, picked alongside the policy.
-    #[serde(default, rename = "drainTimeoutSecs")]
-    pub drain_timeout_secs: Option<u64>,
+    pub trigger_deactivation: Option<DeactivateSpec>,
+    /// How the worker reconciliation inside sync (and an upgrade's
+    /// stop leg) treats RUNNING executions when a worker must be
+    /// replaced (stale image, or its namespace no longer matches
+    /// placement after infra appeared / went away). `cancel` (the
+    /// default) cancels the running executions first; `wait` drains
+    /// the doomed workers (no new admissions; in-flight work finishes)
+    /// up to `drainTimeoutSecs`, then replaces. Never a silent kill.
+    /// Outranked by `triggerDeactivation`'s answer when that picker
+    /// was shown.
+    #[serde(flatten)]
+    pub running: RunningChoice,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,36 +92,31 @@ pub struct SyncResponse {
     pub nodes: Vec<InfraStatusEntry>,
 }
 
-/// What happens to the executions running right now, and how long we
-/// will wait on them: one answer, wherever in an infra verb the
-/// question comes up.
-///
-/// "What about the running executions" is ONE question a person
-/// answers once, in the picker, and the same answer governs the
-/// trigger side and the infra side. The verb does not get a say:
-/// somebody who asked to wait did not ask to wait for half of it.
-///
-/// `asked` is the picker's answer, present exactly when the picker was
-/// shown, which is when the project is active. When it was not shown
-/// there was nothing to ask about (nothing to park, hibernate or wipe),
-/// so the fallbacks stand in: what the client sent on the body, and
-/// failing that `unasked`, which is what the verb means on its own (a
-/// stop lets in-flight work finish, a terminate ends it).
-fn running_choice(
-    asked: Option<&weft_broker_client::protocol::DeactivateSpec>,
-    body_policy: Option<RunningPolicy>,
-    body_cap: Option<u64>,
-    unasked: RunningPolicy,
-) -> (RunningPolicy, u64) {
-    let policy = asked
-        .map(|spec| spec.running_policy)
-        .or(body_policy)
-        .unwrap_or(unasked);
-    let cap = asked
-        .and_then(|spec| spec.drain_timeout_secs)
-        .or(body_cap)
-        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    (policy, cap)
+/// Make `cancel` mean cancel before an infra command that will take
+/// the containers away. The supervisor treats a `cancel` command as
+/// "the dispatcher already ended the running executions" and tears
+/// down at once, and that is true only when a trigger deactivation
+/// ran (an active project's picker). On an inactive project nothing
+/// ran, so a `weft run` using that infra would have its container
+/// pulled out from under it and fail at the node with no cancel on
+/// record; this is the cancel it gets instead. `wait` needs nothing
+/// here: the supervisor drains before acting.
+async fn settle_running_before_infra_op(
+    state: &DispatcherState,
+    project_id: &str,
+    running_policy: RunningPolicy,
+    trigger_deactivation_ran: bool,
+) -> Result<(), (StatusCode, String)> {
+    if running_policy == RunningPolicy::Cancel && !trigger_deactivation_ran {
+        crate::api::project::cancel_running_non_suspended(
+            state,
+            project_id,
+            None,
+            weft_core::exec::CancelCause::User,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Return shape for verbs that asynchronously enqueue a lifecycle
@@ -149,34 +142,34 @@ pub struct InfraStatusEntry {
 }
 
 /// Body for `/infra/stop` and `/infra/terminate`. Carries the
-/// trigger-deactivation choice when the project is Active. The verb
-/// itself encodes the infra-side intent; the trigger side is the
-/// user's choice (same picker as the standalone Deactivate verb).
+/// trigger-deactivation choice when the project is Active (the same
+/// picker as the standalone Deactivate verb, and its answer governs
+/// the running executions), and the running-work choice on its own
+/// for when it is not: an inactive project can still have executions
+/// running on this infra, and `wait` lets them land before the
+/// supervisor scales it down.
 #[derive(Debug, Default, Deserialize)]
 pub struct StopRequest {
     #[serde(default, rename = "triggerDeactivation")]
-    pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
-    /// Cap on the supervisor's `wait` drain (Stop waits for running
-    /// executions before scaling down), in seconds; defaults to
-    /// `DEFAULT_DRAIN_TIMEOUT_SECS`.
-    #[serde(default, rename = "drainTimeoutSecs")]
-    pub drain_timeout_secs: Option<u64>,
+    pub trigger_deactivation: Option<DeactivateSpec>,
+    #[serde(flatten)]
+    pub running: RunningChoice,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PerNodeRequest {
-    #[serde(default, rename = "runningPolicy")]
-    pub running_policy: Option<RunningPolicy>,
+    /// What happens to the project's running executions, ALL of them:
+    /// which ones use this one instance is not recorded, so `cancel`
+    /// (the default) ends every running execution of the project and
+    /// `wait` lets them all land first.
+    #[serde(flatten)]
+    pub running: RunningChoice,
     /// Stop only: force scale-to-zero every unit, ignoring `on_stop`.
     /// Lets the user take down a unit that would normally stay up
     /// (NoOp) so they can update it on the next start. Ignored by
     /// terminate (terminate already removes everything).
     #[serde(default)]
     pub force: bool,
-    /// Cap on the `wait` drain, in seconds; defaults to
-    /// `DEFAULT_DRAIN_TIMEOUT_SECS`.
-    #[serde(default, rename = "drainTimeoutSecs")]
-    pub drain_timeout_secs: Option<u64>,
 }
 
 // =================================================================
@@ -341,17 +334,13 @@ pub(super) async fn sync_inner(
     // executions running while it does is the person's answer, given in
     // the same picker (an upgrade of an active project always shows it);
     // `wait` lets them finish up to their cap, `cancel` ends them first.
-    // Only an upgrade of an INACTIVE project has no answer, and there a
-    // stop lets in-flight infra work finish, which is what stop means.
-    // The wait below adds a generous margin over the cap so a
+    // Only an upgrade of an INACTIVE project has no answer, and there
+    // nothing waits (the shared default), because a wait is asked for,
+    // never assumed. The wait below adds a generous margin over the cap so a
     // legitimately slow drain is never misread as a wedged supervisor.
     if body.upgrade {
-        let (running_policy, drain_timeout_secs) = running_choice(
-            body.trigger_deactivation.as_ref(),
-            body.running_policy,
-            body.drain_timeout_secs,
-            RunningPolicy::Wait,
-        );
+        let (running_policy, drain_timeout_secs) = body.running.resolve(body.trigger_deactivation.as_ref());
+        settle_running_before_infra_op(&state, &project_id, running_policy, was_active).await?;
         let command_id = issue_lifecycle_ensuring_supervisor(
             &state,
             &project_id,
@@ -435,12 +424,7 @@ pub(super) async fn sync_inner(
     //   6. UNDER the lock: teardown_project_namespace_if_no_infra,
     //      deleting the (now worker-less) namespace + its registry row
     //      when the project no longer has ANY infra state.
-    let (running_policy, drain_timeout_secs) = running_choice(
-        body.trigger_deactivation.as_ref(),
-        body.running_policy,
-        body.drain_timeout_secs,
-        RunningPolicy::Wait,
-    );
+    let (running_policy, drain_timeout_secs) = body.running.resolve(body.trigger_deactivation.as_ref());
 
     // Advance the running-hash trio + infra image-tag map NOW: every reject gate
     // has passed and the upgrade stop leg (if any) succeeded, so from here the sync
@@ -596,8 +580,9 @@ pub async fn cancel(
 }
 
 /// Stop / Terminate share this body. The trigger deactivation choice
-/// (when needed) comes from the client; the infra-side running
-/// policy follows from the verb (Stop = wait; Terminate = cancel).
+/// (when needed) comes from the client, and its running policy is the
+/// one answer for the infra side too; with no picker (an inactive
+/// project) the shared default stands, cancel.
 ///
 /// Returns `202 Accepted` with `{ command_id }`. The supervisor
 /// hasn't run yet at this point; clients poll `/status` or watch
@@ -626,42 +611,27 @@ async fn issue_destroy(
             format!("project is activating; cannot {}", verb.as_str()),
         ));
     }
+    // Apply is never routed through issue_destroy (it is issued as its
+    // own infra lifecycle command). Deactivate / Reactivate are
+    // dispatcher-owned and don't take this path either. If we get here,
+    // a caller wired a new verb without updating this match.
+    if !matches!(verb, InfraLifecycleVerb::Stop | InfraLifecycleVerb::Terminate) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "issue_destroy called with verb '{}'; only Stop/Terminate are valid here",
+                verb.as_str()
+            ),
+        ));
+    }
     // What happens to the executions running right now is the person's
-    // answer, not the verb's. They gave it in the same picker a plain
-    // deactivate uses, and it means the same thing here: `wait` lets
-    // them finish (up to their cap) before the infra goes, `cancel` ends
-    // them first.
-    //
-    // The verb only decides when nobody was asked, which is exactly the
-    // case where the picker is not shown: the project is not active, so
-    // there is no door to open (nothing to park, hibernate or wipe). A
-    // stop then still lets whatever is in flight finish, and a terminate
-    // still ends it, which is what each word means on its own.
-    let unasked = match verb {
-        InfraLifecycleVerb::Stop => RunningPolicy::Wait,
-        InfraLifecycleVerb::Terminate => RunningPolicy::Cancel,
-        // Apply is never routed through issue_destroy (it is issued as its
-        // own infra lifecycle command). Deactivate / Reactivate are
-        // dispatcher-owned and don't take this path either. If we get here,
-        // a caller wired a new verb without updating this match.
-        InfraLifecycleVerb::Apply
-        | InfraLifecycleVerb::Deactivate
-        | InfraLifecycleVerb::Reactivate => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "issue_destroy called with verb '{}'; only Stop/Terminate are valid here",
-                    verb.as_str()
-                ),
-            ));
-        }
-    };
-    let (running_policy, drain_timeout_secs) = running_choice(
-        body.trigger_deactivation.as_ref(),
-        None,
-        body.drain_timeout_secs,
-        unasked,
-    );
+    // answer, not the verb's. On an active project they gave it in the
+    // same picker a plain deactivate uses; on an inactive one (no door
+    // to close, nothing to park, hibernate or wipe, so no picker) the
+    // body's own `runningPolicy` is the same flag. Either way `wait`
+    // lets them finish (up to their cap) before the infra goes and
+    // `cancel` ends them first; with nothing said, nothing waits.
+    let (running_policy, drain_timeout_secs) = body.running.resolve(body.trigger_deactivation.as_ref());
     let was_active = matches!(lifecycle.status, crate::project_store::ProjectStatus::Active);
     if was_active {
         let Some(deactivation) = body.trigger_deactivation.as_ref() else {
@@ -676,6 +646,7 @@ async fn issue_destroy(
         };
         crate::api::project::execute_trigger_deactivation(&state, id, deactivation).await?;
     }
+    settle_running_before_infra_op(&state, &project_id, running_policy, was_active).await?;
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
         &project_id,
@@ -701,15 +672,7 @@ pub async fn stop_node(
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
     authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
-    issue_per_node(
-        state,
-        id_str,
-        node,
-        InfraLifecycleVerb::Stop,
-        body,
-        RunningPolicy::Wait,
-    )
-    .await
+    issue_per_node(state, id_str, node, InfraLifecycleVerb::Stop, body).await
 }
 
 /// `POST /projects/{id}/infra/nodes/{node}/terminate`; see `stop_node`.
@@ -720,15 +683,7 @@ pub async fn terminate_node(
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
     authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
-    issue_per_node(
-        state,
-        id_str,
-        node,
-        InfraLifecycleVerb::Terminate,
-        body,
-        RunningPolicy::Cancel,
-    )
-    .await
+    issue_per_node(state, id_str, node, InfraLifecycleVerb::Terminate, body).await
 }
 
 async fn issue_per_node(
@@ -737,14 +692,15 @@ async fn issue_per_node(
     node: String,
     verb: InfraLifecycleVerb,
     body: Option<Json<PerNodeRequest>>,
-    default_running: RunningPolicy,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
     let id = parse_id(&id_str)?;
     let project_id = id.to_string();
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    // Validation is in the type: serde rejected unknown variants
-    // at deserialize. None falls back to the verb's default.
-    let running_policy = body.running_policy.unwrap_or(default_running);
+    // Validation is in the type: serde rejected unknown variants at
+    // deserialize. No picker on a per-node verb, so the body's answer
+    // or the shared default (cancel): a wait is asked for, never
+    // assumed, for one node exactly as for the project.
+    let (running_policy, drain_timeout_secs) = body.running.resolve(None);
     // The place has to be one the program declares, or one a live row
     // still holds (an orphan the user is taking down by hand): a
     // spelling that is neither would enqueue a command for a row that
@@ -820,6 +776,15 @@ async fn issue_per_node(
 
     // force only applies to Stop (terminate removes everything anyway).
     let force = matches!(verb, InfraLifecycleVerb::Stop) && body.force;
+    // No picker on a per-node verb (an active project's dependent
+    // triggers refused it above; the rest run on), so nothing else
+    // cancelled the running executions. The scope is the WHOLE
+    // project: which executions use this one instance is not
+    // something the journal records, so under cancel every running
+    // execution of the project is cancelled, the ones that never
+    // touched it included. The verb's help says so, and `wait` is the
+    // way to let them land first.
+    settle_running_before_infra_op(&state, &project_id, running_policy, false).await?;
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
         &project_id,
@@ -827,8 +792,7 @@ async fn issue_per_node(
         verb,
         running_policy,
         force,
-        body.drain_timeout_secs
-            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS),
+        drain_timeout_secs,
     )
     .await?;
     Ok((
@@ -1767,55 +1731,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn picked(policy: RunningPolicy, cap: Option<u64>) -> weft_broker_client::protocol::DeactivateSpec {
-        weft_broker_client::protocol::DeactivateSpec {
-            mode: weft_broker_client::protocol::DeactivationMode::Park,
-            grace_minutes: 15,
-            running_policy: policy,
-            drain_timeout_secs: cap,
-        }
-    }
-
-    /// The person's answer governs the infra side too. Terminate used
-    /// to cancel whatever the picker said, so somebody who asked to
-    /// wait watched their executions die anyway.
-    #[test]
-    fn the_picker_beats_the_verb() {
-        let (policy, _) = running_choice(
-            Some(&picked(RunningPolicy::Wait, None)),
-            None,
-            None,
-            RunningPolicy::Cancel,
-        );
-        assert_eq!(policy, RunningPolicy::Wait, "terminate still waits when asked to");
-        let (policy, _) = running_choice(
-            Some(&picked(RunningPolicy::Cancel, None)),
-            None,
-            None,
-            RunningPolicy::Wait,
-        );
-        assert_eq!(policy, RunningPolicy::Cancel, "and stop cancels when asked to");
-    }
-
-    /// The picker is only shown for an ACTIVE project: there is nothing
-    /// to park or wipe otherwise. With no answer the verb's own meaning
-    /// stands.
-    #[test]
-    fn with_no_picker_the_verb_decides() {
-        let (policy, cap) = running_choice(None, None, None, RunningPolicy::Cancel);
-        assert_eq!(policy, RunningPolicy::Cancel);
-        assert_eq!(cap, weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    }
-
-    /// "Wait at most this long" is one answer, not one per tier.
-    #[test]
-    fn the_cap_comes_from_the_same_answer() {
-        let (_, cap) = running_choice(Some(&picked(RunningPolicy::Wait, Some(30))), None, Some(900), RunningPolicy::Wait);
-        assert_eq!(cap, 30, "the picker's cap, not the body's");
-        let (_, cap) = running_choice(None, None, Some(900), RunningPolicy::Wait);
-        assert_eq!(cap, 900, "and the body's when there was no picker");
-    }
-
     #[test]
     fn sync_request_defaults() {
         let r: SyncRequest = serde_json::from_value(json!({})).unwrap();
@@ -1824,18 +1739,19 @@ mod tests {
         assert!(r.infra_hash.is_none());
         assert!(r.image_hashes.is_empty());
         assert!(r.trigger_deactivation.is_none());
-        assert!(r.running_policy.is_none());
+        assert_eq!(r.running, RunningChoice::default());
     }
 
     #[test]
     fn sync_request_running_policy_round_trips() {
         let r: SyncRequest =
-            serde_json::from_value(json!({ "runningPolicy": "cancel" })).unwrap();
-        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+            serde_json::from_value(json!({ "runningPolicy": "cancel", "drainTimeoutSecs": 30 })).unwrap();
+        assert_eq!(r.running.running_policy, Some(RunningPolicy::Cancel));
+        assert_eq!(r.running.drain_timeout_secs, Some(30));
         // ONE wire spelling: snake_case is an unknown field.
         let r: SyncRequest =
             serde_json::from_value(json!({ "running_policy": "cancel" })).unwrap();
-        assert_eq!(r.running_policy, None);
+        assert_eq!(r.running.running_policy, None);
     }
 
     #[test]
@@ -1884,6 +1800,17 @@ mod tests {
     fn stop_request_defaults() {
         let r: StopRequest = serde_json::from_value(json!({})).unwrap();
         assert!(r.trigger_deactivation.is_none());
+        assert_eq!(r.running, RunningChoice::default());
+    }
+
+    /// A stop of an INACTIVE project shows no picker, so the body's own
+    /// answer is the only way to ask it to wait, and it has to reach
+    /// the handler.
+    #[test]
+    fn stop_request_carries_its_own_running_choice() {
+        let r: StopRequest =
+            serde_json::from_value(json!({ "runningPolicy": "wait", "drainTimeoutSecs": 1800 })).unwrap();
+        assert_eq!(r.running.resolve(None), (RunningPolicy::Wait, 1800));
     }
 
     #[test]
@@ -1903,19 +1830,21 @@ mod tests {
     #[test]
     fn per_node_request_defaults() {
         let r: PerNodeRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.running_policy.is_none());
+        assert_eq!(r.running, RunningChoice::default());
+        assert!(!r.force);
     }
 
     #[test]
     fn per_node_request_running_policy_round_trips() {
         let r: PerNodeRequest =
-            serde_json::from_value(json!({"runningPolicy": "cancel"})).unwrap();
-        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+            serde_json::from_value(json!({"runningPolicy": "cancel", "force": true})).unwrap();
+        assert_eq!(r.running.running_policy, Some(RunningPolicy::Cancel));
+        assert!(r.force);
         // ONE wire spelling: a snake_case key is an unknown field and
         // must not populate the (defaulted) field.
         let r: PerNodeRequest =
             serde_json::from_value(json!({"running_policy": "wait"})).unwrap();
-        assert_eq!(r.running_policy, None, "snake_case must not populate the field");
+        assert_eq!(r.running.running_policy, None, "snake_case must not populate the field");
     }
 
     #[test]

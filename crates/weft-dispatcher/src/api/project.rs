@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use weft_core::frames::Located;
 use weft_core::project::{infra_places, trigger_places};
-use weft_core::ProjectDefinition;
+use weft_core::{ProjectDefinition, RunningChoice};
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::events::DispatcherEvent;
@@ -2188,8 +2188,29 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
 /// If the project has no preserved state (status=Registered, or
 /// signals were already wiped), the choice is irrelevant and the
 /// activate is a fresh boot.
+///
+/// `runningPolicy` / `drainTimeoutSecs` (the flattened
+/// [`RunningChoice`]) say what happens to a worker built from an older
+/// image than the one being activated (see `reconcile_worker`):
+/// `cancel` (the default) cancels what it runs and replaces it now;
+/// `wait` lets its in-flight work land first, up to the cap, then
+/// replaces it. The CLI's `--running-policy` and `--drain-timeout` on
+/// `weft activate`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ActivateRequest {
+    #[serde(flatten)]
+    pub target: ActivationTarget,
+    #[serde(flatten)]
+    pub running: RunningChoice,
+}
+
+/// What an activate points the project at: the hashes of the version
+/// that built (absent when activating by id, which keeps the recorded
+/// ones) and the answer to "what about the state a hibernated or
+/// parked project kept". The half of an activate a resync carries
+/// verbatim; the running-work half it takes from its own picker.
+#[derive(Debug, Default, Deserialize)]
+pub struct ActivationTarget {
     #[serde(default, rename = "binaryHash")]
     pub binary_hash: Option<String>,
     #[serde(default, rename = "definitionHash")]
@@ -2200,18 +2221,24 @@ pub struct ActivateRequest {
     pub reactivate_choice: Option<String>,
 }
 
-/// Prepare trigger settings without changing the project's listening state.
+/// Prepare trigger settings without changing the project's listening
+/// state. The body is the [`RunningChoice`] for a worker built from an
+/// older image, the same question an activate answers (the setup runs
+/// on a worker, so a stale one is replaced first).
 pub async fn bake(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id_str): Path<String>,
+    body: Option<Json<RunningChoice>>,
 ) -> Result<Json<crate::journal::TriggerBake>, (StatusCode, String)> {
     let id = id_str.parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     crate::transition::ensure_built_gated(&state, id).await?;
     let (program, project) = coherent_definition(&state, id).await?;
-    prepare_trigger_setup(&state, id, &project).await?;
+    let (running_policy, drain_timeout_secs) =
+        body.map(|Json(choice)| choice).unwrap_or_default().resolve(None);
+    prepare_trigger_setup(&state, id, &project, running_policy, drain_timeout_secs).await?;
     let kicks = compute_trigger_setup_kicks(&project).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if kicks.is_empty() {
         return Err((StatusCode::PRECONDITION_FAILED, "project has no trigger setup to bake".into()));
@@ -2265,16 +2292,21 @@ async fn require_trigger_infra(
 }
 
 /// Make the worker pod match what this project's triggers will need,
-/// and refuse first if their infra is not up.
+/// and refuse first if their infra is not up. A worker built from an
+/// older image is replaced under `running_policy` (see
+/// `reconcile_worker`); the caller's choice, never a fixed one here,
+/// because a `wait` sits inside this request for as long as that
+/// worker's executions run.
 async fn prepare_trigger_setup(
     state: &DispatcherState,
     id: uuid::Uuid,
     project: &ProjectDefinition,
+    running_policy: crate::infra_lifecycle_command::RunningPolicy,
+    drain_timeout_secs: u64,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = id.to_string();
     require_trigger_infra(state, &project_id, project).await?;
-    reconcile_worker(state, &project_id, crate::infra_lifecycle_command::RunningPolicy::Wait,
-        weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS).await
+    reconcile_worker(state, &project_id, running_policy, drain_timeout_secs).await
 }
 
 pub async fn activate(
@@ -2301,24 +2333,7 @@ pub async fn activate(
     // Gated: a real build flips the `building` transition (single-flight,
     // cancellable); a concurrent build rejects with 409.
     crate::transition::ensure_built_gated(&state, id).await?;
-    let (binary_hash, definition_hash, infra_hash, reactivate_choice) = match body {
-        Some(Json(b)) => (
-            b.binary_hash,
-            b.definition_hash,
-            b.infra_hash,
-            b.reactivate_choice,
-        ),
-        None => (None, None, None, None),
-    };
-    activate_inner(
-        &state,
-        id,
-        binary_hash,
-        definition_hash,
-        infra_hash,
-        reactivate_choice,
-    )
-    .await
+    activate_inner(&state, id, body.map(|Json(b)| b).unwrap_or_default()).await
 }
 
 /// How `activate_inner` must roll back a failed Activating-window.
@@ -2480,11 +2495,14 @@ async fn activate_trigger_setup_window(
 pub async fn activate_inner(
     state: &DispatcherState,
     id: uuid::Uuid,
-    binary_hash: Option<String>,
-    definition_hash: Option<String>,
-    infra_hash: Option<String>,
-    reactivate_choice: Option<String>,
+    request: ActivateRequest,
 ) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
+    let ActivateRequest {
+        target: ActivationTarget { binary_hash, definition_hash, infra_hash, reactivate_choice },
+        running,
+    } = request;
+    // No picker on an activate: the body's answer, or the default.
+    let (running_policy, drain_timeout_secs) = running.resolve(None);
     state
         .projects
         .set_running_hashes(
@@ -2530,15 +2548,15 @@ pub async fn activate_inner(
     // activates both calling it is harmless, and keeping it before
     // the CAS means its failure leaves the project in its original
     // status rather than stranded in Activating. MUST propagate.
-    // Wait policy: activate never silently kills running work; stale
-    // workers drain (no new admissions, in-flight finishes) up to the
-    // default cap before being replaced.
+    // The request's running policy says what happens to the stale
+    // worker's executions (cancel unless the caller asked to wait);
+    // either way the replacement is loud, never a silent kill.
     //
     // This also carries the infra precondition, and it runs FIRST: an
     // activation whose triggers need infra that is down is refused here,
     // against the definition this activation just built, before any
     // worker work happens.
-    prepare_trigger_setup(state, id, &project).await?;
+    prepare_trigger_setup(state, id, &project, running_policy, drain_timeout_secs).await?;
 
     // Validate (don't yet apply) the reactivate choice. Validation is
     // a pure rejection and belongs in the read-only pre-flight; the
@@ -3310,15 +3328,18 @@ pub async fn deactivate(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Body for `POST /projects/{id}/resync`: the activate fields plus
-/// the trigger-deactivation choice (mode + runningPolicy + drain cap,
-/// the SAME picker as the standalone Deactivate). Required when the
-/// project is Active (412 otherwise); ignored when it isn't (a resync
-/// of an inactive project is just an activate).
+/// Body for `POST /projects/{id}/resync`: what the activate points at
+/// (hashes, reactivate choice) plus the trigger-deactivation choice
+/// (mode + runningPolicy + drain cap, the SAME picker as the
+/// standalone Deactivate). Required when the project is Active (412
+/// otherwise); ignored when it isn't (a resync of an inactive project
+/// is just an activate). The running-work answer is the picker's, so
+/// the body carries no `runningPolicy` of its own: one answer governs
+/// the trigger drain and the worker replacement alike.
 #[derive(Debug, Default, Deserialize)]
 pub struct ResyncRequest {
     #[serde(flatten)]
-    pub activate: ActivateRequest,
+    pub target: ActivationTarget,
     #[serde(default, rename = "triggerDeactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
 }
@@ -3431,7 +3452,7 @@ pub async fn resync(
                 drain_timeout_secs = cap,
                 "resync drain cap reached; cancelling remaining executions"
             );
-            cancel_running_non_suspended(&state, &project_id, None).await?;
+            cancel_running_non_suspended(&state, &project_id, None, weft_core::exec::CancelCause::User).await?;
         }
         crate::journal_bridge::try_finish_drain(&state, &project_id, None)
             .await
@@ -3444,7 +3465,13 @@ pub async fn resync(
     //    + atomic-cleanup-on-failure semantics are identical. The caller was
     //    already authorized against this project at the top of resync; activate
     //    re-checks the same gate (cheap, and keeps activate self-contained).
-    activate(State(state), caller, Path(id_str), Some(Json(body.activate))).await
+    // The person answered "what about the running executions" ONCE, in
+    // the picker, and the answer governs the reactivate's worker
+    // replacement as much as the trigger-side drain above: a `wait` that
+    // drained the triggers and then cancelled the same executions under
+    // a stale worker would be the verb overriding the person.
+    let reactivate = ActivateRequest { target: body.target, running: spec.running_choice() };
+    activate(State(state), caller, Path(id_str), Some(Json(reactivate))).await
 }
 
 /// Reconcile the project's live worker pod with what current state
@@ -3461,18 +3488,23 @@ pub async fn resync(
 ///     down. There is NO "move": a worker's namespace is fixed at
 ///     spawn, so reconciliation is kill-then-respawn.
 ///
-/// The kill is GATED on the doomed pods' running work.
-/// `RunningPolicy::Wait` marks them DRAINING (the existing worker
-/// mechanism: no NEW executions are admitted to them; anything new
-/// spawns a fresh CORRECT pod via the resolver; in-flight work
-/// finishes and the pod idle-exits) and waits through THE shared
-/// drain loop (`weft_platform_traits::drain_until_zero`, the same
-/// mechanism the supervisor's stop/terminate drain uses) up to the
-/// caller's `drain_timeout_secs` cap, then kills the stragglers with
-/// a loud warning. `RunningPolicy::Cancel` cancels the running
-/// non-suspended executions and kills immediately. Never a silent
-/// kill. Suspended executions survive either way (they hold no
-/// worker; their resume respawns wherever placement then says).
+/// The kill is GATED on the doomed pods' in-flight work, and ONLY on
+/// that. `RunningPolicy::Wait` marks them DRAINING (the existing
+/// worker mechanism: nothing new is admitted to them; anything new
+/// spawns a fresh CORRECT pod via the resolver) and waits through THE
+/// shared drain loop (`weft_platform_traits::drain_until_zero`, the
+/// same mechanism the supervisor's stop/terminate drain uses) for the
+/// work they hold (`count_in_flight_named`: claimed, or pinned to
+/// them) to reach zero, up to the caller's `drain_timeout_secs` cap;
+/// past the cap what is left is cancelled with a loud warning. A
+/// doomed pod that is alive and idle holds nothing, so the wait is
+/// over the moment its last execution lands, never a minute later
+/// when it would have idle-exited on its own (a pod promised to a
+/// caller, or inside its idle grace, used to hold a wait for the
+/// whole cap with nothing running). `RunningPolicy::Cancel` cancels
+/// the running non-suspended executions and kills immediately. Never
+/// a silent kill. Suspended executions survive either way (they hold
+/// no worker; their resume respawns wherever placement then says).
 /// Because Wait can sit for minutes, callers MUST NOT invoke this
 /// while holding the per-project advisory lock.
 ///
@@ -3546,33 +3578,48 @@ pub async fn reconcile_worker(
         "worker reconciliation: pods stale (image and/or namespace)"
     );
 
+    // Nothing new lands on a doomed pod from here on, whatever the
+    // policy: DRAINING is the existing worker mechanism (the one
+    // scale-down uses), and both the pick for a new execution and the
+    // pick that promises a pod to a live caller re-assert "not
+    // draining". Under Cancel this closes the window between
+    // cancelling the pod's executions and killing it, in which a caller
+    // could otherwise be handed a ticket naming a pod about to die.
+    for name in &doomed_names {
+        weft_task_store::worker_pod::set_draining(&state.pg_pool, name)
+            .await
+            .map_err(internal)?;
+    }
+
     // Gate the kill on the doomed pods' running work per the policy.
     use crate::infra_lifecycle_command::RunningPolicy;
     match running_policy {
         RunningPolicy::Wait => {
-            // DRAIN via the existing worker-draining mechanism (the
-            // same one worker scale-down uses): a draining pod stops
-            // being chosen for NEW work (`pick_admittable_for_project`
-            // and cold_start both skip it; anything new spawns a fresh
-            // CORRECT pod via the resolver), finishes its in-flight
-            // executions, and idle-exits. We wait for the doomed pods
-            // to empty out through THE shared drain loop, capped at
-            // the caller's `drain_timeout_secs`; stragglers past the
-            // cap are killed (their executions die with them, loudly).
-            for name in &doomed_names {
-                weft_task_store::worker_pod::set_draining(&state.pg_pool, name)
-                    .await
-                    .map_err(internal)?;
-            }
+            // Two waits under the one cap, through THE shared drain loop.
+            // First for the work the doomed pods hold (claimed or pinned
+            // tasks, and a promise to a caller on the way) to reach
+            // zero. Then for each pod's OWN exit: its heartbeat has told
+            // it it is draining, so it tries the guarded idle exit after
+            // a second of quiet instead of its warm-pod grace, and that
+            // exit is the only one that honours what the dispatcher
+            // cannot see (a metered call's cost still being written down
+            // lives in pod memory and holds the pod's exit gate). Past
+            // the cap what is still running is cancelled, the one way
+            // every drain give-up cancels, and what is still alive is
+            // killed below with the warning; the cap is the person's
+            // "wait this long, then do it".
             let clock = weft_platform_traits::SystemClock;
+            let started = std::time::Instant::now();
+            let cap = std::time::Duration::from_secs(drain_timeout_secs);
             let outcome = weft_platform_traits::drain_until_zero(
                 &clock,
-                std::time::Duration::from_secs(drain_timeout_secs),
-                "worker replacement",
+                cap,
+                "worker replacement: in-flight work",
                 || async {
-                    weft_task_store::worker_pod::count_alive_named(
+                    weft_task_store::worker_pod::count_in_flight_named(
                         &state.pg_pool,
                         &doomed_names,
+                        crate::lease::now_unix(),
                     )
                     .await
                     .map_err(internal)
@@ -3583,27 +3630,73 @@ pub async fn reconcile_worker(
                 tracing::warn!(
                     target: "weft_dispatcher::api::project",
                     project_id,
-                    stragglers = still_running,
+                    still_running,
                     drain_timeout_secs,
-                    "runningPolicy=wait drain cap reached; killing the remaining stale \
-                     workers (their in-flight executions die with them)"
+                    "runningPolicy=wait drain cap reached; cancelling what the stale \
+                     workers still run (and dropping any caller's promise on them) and \
+                     killing them"
                 );
+                cancel_running_non_suspended(
+                    state,
+                    project_id,
+                    Some(&doomed_names),
+                    weft_core::exec::CancelCause::Runtime {
+                        detail: format!(
+                            "the worker running this execution was built from an older image and \
+                             was replaced once the wait for it reached its cap of {drain_timeout_secs}s"
+                        ),
+                    },
+                )
+                .await?;
+            } else {
+                let left = cap.saturating_sub(started.elapsed());
+                let outcome = weft_platform_traits::drain_until_zero(
+                    &clock,
+                    left,
+                    "worker replacement: the pods' own exit",
+                    || async {
+                        weft_task_store::worker_pod::count_alive_named(&state.pg_pool, &doomed_names)
+                            .await
+                            .map_err(internal)
+                    },
+                )
+                .await?;
+                if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
+                    tracing::warn!(
+                        target: "weft_dispatcher::api::project",
+                        project_id,
+                        still_alive = still_running,
+                        drain_timeout_secs,
+                        "runningPolicy=wait drain cap reached with the stale workers' work \
+                         landed but the pods not exited; killing them (a cost record still \
+                         being written down on one of them is lost)"
+                    );
+                }
             }
         }
         RunningPolicy::Cancel => {
             // Scoped to the DOOMED pods' own executions: a mixed fleet
             // (fresh pods next to stale ones) keeps its healthy work.
-            cancel_running_non_suspended(state, project_id, Some(&doomed_names)).await?;
+            // The cause is the person's: cancel is the policy they
+            // chose (or the standing default they left in place).
+            cancel_running_non_suspended(
+                state,
+                project_id,
+                Some(&doomed_names),
+                weft_core::exec::CancelCause::User,
+            )
+            .await?;
         }
     }
 
-    // Kill whatever of the doomed set is still alive (all of it under
-    // Cancel; only the past-cap stragglers under Wait). mark_dead
-    // FIRST so the journal-fencing trigger blocks any late write from
-    // a doomed worker; kubectl delete second. The `spawn_pod` task
-    // executor is intentionally narrow ("spawn a pod when none is
-    // alive") and never kills, so the kill lives here with the
-    // decision.
+    // Kill whatever of the doomed set is still alive: under Wait the
+    // pods normally exited on their own above (this catches the ones
+    // that did not by the cap), under Cancel all of them, their
+    // executions cancelled just now. mark_dead FIRST so the journal-
+    // fencing trigger blocks any late write from a doomed worker;
+    // kubectl delete second. The `spawn_pod` task executor is
+    // intentionally narrow ("spawn a pod when none is alive") and never
+    // kills, so the kill lives here with the decision.
     for (pod_name, namespace, _) in &doomed {
         weft_task_store::worker_pod::mark_dead(&state.pg_pool, pod_name)
             .await
@@ -3865,12 +3958,12 @@ pub async fn deactivate_project_with_mode(
             ..ProjectLifecycle::deactivating_to(target)
         }
     } else if running_policy == RunningPolicy::Cancel && mode != DeactivationMode::Wipe {
-        cancel_running_non_suspended(state, &project_id, None).await?;
+        cancel_running_non_suspended(state, &project_id, None, weft_core::exec::CancelCause::User).await?;
         target
     } else {
-        // Park + wait leaves the running executions exactly as they
-        // are, and wipe + cancel already dropped its rows and
-        // executions above: either way the row lands now.
+        // Wipe + cancel: its rows and executions were dropped above,
+        // so the row lands now. (Park + wait never reaches here: a
+        // wait drains under every mode, first arm.)
         target
     };
 
@@ -3965,7 +4058,7 @@ pub async fn cancel_running(
     // braced and unhyphenated spellings. Keying rows off the raw path
     // would authorize on one id and query on another.
     let project_id = id.to_string();
-    cancel_running_non_suspended(&state, &project_id, None).await?;
+    cancel_running_non_suspended(&state, &project_id, None, weft_core::exec::CancelCause::User).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4075,11 +4168,15 @@ pub async fn cancel_activate(
 /// MIXED (fresh pods next to doomed ones mid-replacement), and a
 /// pod-scoped cancel (reconcile's Cancel policy) must not kill work
 /// running fine on the fresh pods. `None` = the whole project (a
-/// deactivation, a resync, the drain give-up verb).
+/// deactivation, a resync, the drain give-up verb). `cause` is what
+/// the cancelled runs' terminal records say happened: the caller
+/// states it, because only the caller knows whether a person asked
+/// or the runtime decided.
 pub(crate) async fn cancel_running_non_suspended(
     state: &DispatcherState,
     project_id: &str,
     owned_by: Option<&[String]>,
+    cause: weft_core::exec::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
     let suspended_colors = suspended_color_set(state, project_id)
         .await
@@ -4104,21 +4201,18 @@ pub(crate) async fn cancel_running_non_suspended(
         .list_non_terminal_colors_for_project(project_id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?;
-    // A pod-scoped sweep is the runtime replacing a sick pod; a
-    // whole-project sweep is a verb a person invoked.
-    let cause = match owned_by {
-        Some(_) => weft_core::exec::CancelCause::Runtime {
-            detail: "the worker pod hosting this run was replaced by health recovery".into(),
-        },
-        None => weft_core::exec::CancelCause::User,
-    };
     let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> = colors
         .iter()
         .filter(|color| !suspended_colors.contains(color))
         // Un-owned colors (a task not yet claimed) are also skipped on a
-        // pod-scoped sweep: their hash-stamped task can only ever be
-        // claimed by a correct-image pod, so they are not the doomed
-        // pods' work.
+        // pod-scoped sweep. An unpinned one can only ever be claimed by
+        // a correct-image pod, so it is not the doomed pods' work. A
+        // live admission pinned to a doomed pod IS, but its color binds
+        // an owner only on claim, and a draining pod still claims what
+        // is pinned to it; one the pod never gets to (killed first) is
+        // requeued off the dead pod by `reclaim_orphaned_tasks` and
+        // cancelled by the reaper as a live execution whose caller is
+        // gone. So nothing pinned is left behind, only settled later.
         .filter(|color| owned.as_ref().is_none_or(|o| o.contains(color)))
         .map(|c| (*c, &cause))
         .collect();

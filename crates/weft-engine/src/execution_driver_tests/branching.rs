@@ -79,6 +79,16 @@
         }
     }
 
+    /// The same source, broken: it never gets as far as emitting.
+    struct FailingSource;
+    test_manifest!(FailingSource, "Source");
+    #[async_trait]
+    impl Node for FailingSource {
+        async fn run(&self, _ctx: ExecutionContext) -> WeftResult<()> {
+            Err(weft_core::error::node_error("the database is down"))
+        }
+    }
+
     /// Passes its input straight through, and writes down that it ran.
     struct Echo {
         id: &'static str,
@@ -303,6 +313,35 @@
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
     }
 
+    /// The watched node FAILING is not the absence the inverted gate
+    /// waits for. Its ports close either way, but a failure's closure
+    /// carries the error, and the gate reads it: the "nothing there"
+    /// branch stays off (a query that errored must not render as an
+    /// empty result) and the run reports the failure instead.
+    #[tokio::test]
+    async fn a_failed_watched_node_keeps_the_inverted_gate_off() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let nodes = catalog(vec![
+            ("Source", Box::new(FailingSource)),
+            ("Echo", Box::new(Echo { id: "guarded", ran: ran.clone() })),
+            ("Behind", Box::new(Echo { id: "behind", ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(inverted_gate_project(), nodes, &["source"]).await;
+
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "a failure is not an absence, so the branch stays off: {:?}",
+            ran.lock().unwrap()
+        );
+        match skip_reason(&events, "guarded") {
+            Some(SkipReason::WatchedNodeFailed { error }) => {
+                assert!(error.contains("the database is down"), "the reason names the failure: {error}");
+            }
+            other => panic!("expected the watched-node-failed reason, got {other:?}"),
+        }
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+    }
+
     /// And a value arriving is the no, with its own reason so the
     /// inspector can say which of the two gates decided.
     #[tokio::test]
@@ -350,7 +389,7 @@
         assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::DidNotFlow));
         assert_eq!(
             skip_reason(&events, "behind"),
-            Some(SkipReason::RequiredInputClosed { port: "value".into() }),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
             "the node behind is a CONSEQUENCE (its input closed), not a decision"
         );
         assert!(
@@ -387,7 +426,7 @@
             drive(guarded_project(), branch_catalog(None, &ran), &["source"]).await;
 
         assert!(ran.lock().unwrap().is_empty());
-        assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::FlowClosed));
+        assert_eq!(skip_reason(&events, "guarded"), Some(SkipReason::FlowClosed { failure: None }));
     }
 
     /// An ENTRY node (no incoming edges, dispatched through the kick
@@ -861,7 +900,7 @@
         assert_eq!(boundary_skip_reason(&boundaries, "outer.inner__out"), scope_skipped);
         assert_eq!(
             skip_reason(&events, "after"),
-            Some(SkipReason::RequiredInputClosed { port: "value".into() }),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
             "outside the scope, the closure cascade carries on"
         );
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
@@ -1027,6 +1066,233 @@
             "groups": [{ "id": "g", "kind": "group", "parentId": null }]
         }))
         .expect("rooted group project")
+    }
+
+    /// `source -> g__in.a`, and inside `g` a root `boom` that FAILS, feeding
+    /// `g__out.v`; outside, `watcher` runs on `g__out.v` NOT arriving
+    /// (`_should_not_flow`) with its own `value` from `source`.
+    fn failing_group_watched_project() -> ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("source", "Source", json!([]), &[]),
+                {
+                    "id": "g__in", "nodeType": "Passthrough", "label": null,
+                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": "a", "portType": "String", "required": false },
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                    ],
+                    "outputs": [{ "name": "a", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "g", "role": "In" }
+                },
+                plain_node("boom", "Boom", json!(["g"]), &[]),
+                {
+                    "id": "g__out", "nodeType": "Passthrough", "label": null,
+                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "outputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "g", "role": "Out" }
+                },
+                {
+                    "id": "watcher", "nodeType": "Echo", "label": null,
+                    "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": "value", "portType": "String", "required": true },
+                        { "name": SHOULD_NOT_FLOW_PORT, "portType": "T", "required": false }
+                    ],
+                    "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                edge("e1", "source", "value", "g__in", "a"),
+                edge("e2", "boom", "value", "g__out", "v"),
+                edge("e3", "g__out", "v", "watcher", SHOULD_NOT_FLOW_PORT),
+                edge("e4", "source", "value", "watcher", "value")
+            ],
+            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+        }))
+        .expect("failing group watched project")
+    }
+
+    /// A failure INSIDE a group reaches a watcher outside as a failure.
+    /// The group's Out boundary forwards the failed closure with its
+    /// error rather than laundering it into a plain "nothing came", so
+    /// the branch written for the absence stays off one scope up too.
+    #[tokio::test]
+    async fn a_failure_inside_a_group_keeps_an_outside_inverted_gate_off() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Boom", Box::new(FailingSource)),
+            ("Echo", Box::new(Echo { id: "watcher", ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(failing_group_watched_project(), cat, &["source"]).await;
+
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "the failure crossed the boundary as one, so the watcher stayed off: {:?}",
+            ran.lock().unwrap()
+        );
+        match skip_reason(&events, "watcher") {
+            Some(SkipReason::WatchedNodeFailed { error }) => {
+                assert!(error.contains("the database is down"), "the boundary kept the error: {error}");
+            }
+            other => panic!("expected the watched-node-failed reason through the group, got {other:?}"),
+        }
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+    }
+
+    /// `boom -> middle.value` (required) and `middle.value ->
+    /// watcher._should_not_flow`, with `source` feeding the watcher's
+    /// own value. The failure has to cross a SKIPPED node to reach the
+    /// watcher.
+    fn failure_two_hops_project() -> ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("source", "Source", json!([]), &[]),
+                plain_node("boom", "Boom", json!([]), &[]),
+                plain_node("middle", "Middle", json!([]), &[("value", true)]),
+                {
+                    "id": "watcher", "nodeType": "Echo", "label": null,
+                    "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": "value", "portType": "String", "required": true },
+                        { "name": SHOULD_NOT_FLOW_PORT, "portType": "T", "required": false }
+                    ],
+                    "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                edge("e1", "boom", "value", "middle", "value"),
+                edge("e2", "middle", "value", "watcher", SHOULD_NOT_FLOW_PORT),
+                edge("e3", "source", "value", "watcher", "value")
+            ],
+            "groups": []
+        }))
+        .expect("failure two hops project")
+    }
+
+    /// A node that skipped because its input closed on a failure did
+    /// not decline either: its own closures carry the failure on, so a
+    /// watcher two hops from the node that broke still reads a failure.
+    /// Otherwise one skipped node between them would launder the
+    /// failure back into the absence the watcher runs on.
+    #[tokio::test]
+    async fn a_failure_behind_a_skipped_node_keeps_the_inverted_gate_off() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Boom", Box::new(FailingSource)),
+            ("Middle", Box::new(Echo { id: "middle", ran: ran.clone() })),
+            ("Echo", Box::new(Echo { id: "watcher", ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(failure_two_hops_project(), cat, &["source", "boom"]).await;
+
+        assert!(ran.lock().unwrap().is_empty(), "nothing after the failure runs: {:?}", ran.lock().unwrap());
+        match skip_reason(&events, "middle") {
+            Some(SkipReason::RequiredInputClosed { port, failure: Some(failure) }) => {
+                assert_eq!(port, "value");
+                assert!(failure.contains("the database is down"), "the skip names the failure it inherited: {failure}");
+            }
+            other => panic!("expected the required input closed ON A FAILURE, got {other:?}"),
+        }
+        match skip_reason(&events, "watcher") {
+            Some(SkipReason::WatchedNodeFailed { error }) => {
+                assert!(error.contains("the database is down"), "the skipped node passed the error on: {error}");
+            }
+            other => panic!("expected the watched-node-failed reason two hops out, got {other:?}"),
+        }
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+    }
+
+    /// `boom.value -> g__in._should_flow`, a live root `inner` inside `g`
+    /// feeding `g__out.v`, and `g__out.v -> watcher._should_not_flow`.
+    /// The group never starts because its gate closed on a failure.
+    fn failure_gated_group_project() -> ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("source", "Source", json!([]), &[]),
+                plain_node("boom", "Boom", json!([]), &[]),
+                {
+                    "id": "g__in", "nodeType": "Passthrough", "label": null,
+                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                    ],
+                    "outputs": [],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "g", "role": "In" }
+                },
+                plain_node("inner", "Inner", json!(["g"]), &[]),
+                {
+                    "id": "g__out", "nodeType": "Passthrough", "label": null,
+                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "outputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "g", "role": "Out" }
+                },
+                {
+                    "id": "watcher", "nodeType": "Echo", "label": null,
+                    "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": "value", "portType": "String", "required": true },
+                        { "name": SHOULD_NOT_FLOW_PORT, "portType": "T", "required": false }
+                    ],
+                    "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                edge("e1", "boom", "value", "g__in", SHOULD_FLOW_PORT),
+                edge("e2", "inner", "value", "g__out", "v"),
+                edge("e3", "g__out", "v", "watcher", SHOULD_NOT_FLOW_PORT),
+                edge("e4", "source", "value", "watcher", "value")
+            ],
+            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+        }))
+        .expect("failure gated group project")
+    }
+
+    /// A scope whose gate closed on a failure is torn down as a failed
+    /// scope: its outward closures carry the error, and a watcher on the
+    /// group's output stays off. The gate's skip names the failure too.
+    #[tokio::test]
+    async fn a_group_gated_off_by_a_failure_keeps_an_outside_inverted_gate_off() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Boom", Box::new(FailingSource)),
+            ("Inner", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Echo", Box::new(Echo { id: "watcher", ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(failure_gated_group_project(), cat, &["source", "boom"]).await;
+
+        assert!(ran.lock().unwrap().is_empty(), "the watcher stayed off: {:?}", ran.lock().unwrap());
+        let (_, boundaries) = fold_with_boundaries(failure_gated_group_project(), &events);
+        match boundary_skip_reason(&boundaries, "g__in") {
+            Some(SkipReason::FlowClosed { failure: Some(failure) }) => {
+                assert!(failure.contains("the database is down"), "the gate's skip names the failure: {failure}");
+            }
+            other => panic!("expected the gate closed ON A FAILURE, got {other:?}"),
+        }
+        match skip_reason(&events, "watcher") {
+            Some(SkipReason::WatchedNodeFailed { error }) => {
+                assert!(error.contains("the database is down"), "the scope teardown kept the error: {error}");
+            }
+            other => panic!("expected the watched-node-failed reason outside the gated scope, got {other:?}"),
+        }
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
     }
 
     /// A node inside a group that nothing feeds starts when the group
@@ -1215,7 +1481,7 @@
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
         assert_eq!(skip_reason(&events, "gate"), Some(SkipReason::DidNotFlow));
         let (_, boundaries) = fold_with_boundaries(project_again, &events);
-        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), Some(SkipReason::FlowClosed));
+        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), Some(SkipReason::FlowClosed { failure: None }));
         assert_eq!(skip_reason(&events, "deep"), Some(SkipReason::ScopeSkipped { scope: "g".into() }));
     }
 
@@ -1279,7 +1545,7 @@
         assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Completed);
         assert_eq!(
             skip_reason(&events, "reads_b"),
-            Some(SkipReason::RequiredInputClosed { port: "value".into() }),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
             "the closure lands on the member that needs it"
         );
     }
@@ -1341,7 +1607,7 @@
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root ran and fed deep");
         assert_eq!(
             skip_reason(&events, "reads_a"),
-            Some(SkipReason::RequiredInputClosed { port: "value".into() }),
+            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
             "the member on the closed edge skips on its own rule"
         );
         assert_eq!(skip_reason(&events, "seed"), None);

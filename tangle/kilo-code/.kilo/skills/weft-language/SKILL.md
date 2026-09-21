@@ -72,6 +72,13 @@ rows = PostgresExecuteQuery -> (rows: List[Card]) {
 }
 ````
 
+A column that can be NULL is declared so in the shape: `{ title: String,
+extra: JsonDict | Null }`. The declared type judges every row at run time,
+and a `JsonDict` alone refuses a null, so a day when every row has the
+column empty fails the node with `emitted a value on port 'rows' that its
+declared type 'List[Card]' does not accept (got List[Dict[String, String |
+Null]])`; the fix is the `| Null` on that field, never a looser row type.
+
 `Cast` is for a value that has to CHANGE type while it travels. A value that
 already fits needs no node at all, only a port that names the type. If you
 catch yourself adding a `Cast` to put a shape on a value that already has
@@ -257,6 +264,17 @@ yours already made, put that decision on a second output port and gate on it
 with `_should_flow` instead; the wire then reads forwards, cause before
 effect.
 
+A FAILURE is not an absence. When the node it watches fails, its ports close
+too, but that closure carries the error, and the gate reads it: the node
+stays off (skipped with `the node its _should_not_flow watches did not finish
+(...)`, the error in the brackets) and the run reports the failure. So a
+route's "no rows, answer 404" branch never fires over a database that is
+down; the caller gets the failure instead. A group's or a loop's outputs
+close the same way when something inside failed, so the rule holds one scope
+up, and a node that SKIPPED because its input closed on a failure closes its
+own ports with that failure too (its skip reason ends in `: a node before it
+failed (...)`), so the rule holds any number of skips down the line.
+
 A node carries one gate, never both: wiring `_should_flow` and
 `_should_not_flow` on the same node is a compile error, `two-gates`. The
 editor draws both as the same triangle, with a small circle marking
@@ -333,6 +351,15 @@ and the setup node does not, the value has to cross the include's boundary
 like any other, so the file declares a port for it; there is no shortcut, and
 keeping the setup node in the same file as its trigger avoids the crossing
 entirely.
+
+That second one has a limit: setup that several triggers SHARE (the schema
+every included file's tables live in) is written once, in the file that
+includes them, and each included file takes its result as a port. Every
+trigger's setup runs at activation as one program, and two nodes that do not
+depend on each other run at the same time, so two files each carrying their
+own `create extension if not exists pgcrypto` race each other and one of
+them fails on a duplicate key. "Safe to do twice" is not "safe to do twice
+at once".
 
 ## Inline port signatures
 
@@ -545,6 +572,16 @@ compile time: a `JsonDict` port takes any object whatever keys it carries, and
 only a port declared `Image` reads a picture out of one. A value the declared
 type refuses fails the node by name, with whatever it already sent still
 sent.
+
+A value on a wire is at most 100 KB, and the check is on the port that EMITS
+it: `port 'results' of 'search' carries 107 KB; a wire carries at most 100
+KB`. A node one hop later cannot trim what already failed, so the bound is
+set on the emitting node (a `WebSearch` keeps each page under `maxTextChars`
+characters, a query keeps its `LIMIT`), and anything that is bytes rather
+than a value (a file, an audio clip, a long document) travels as a stored
+file: the node puts it in storage and emits the file value, a few hundred
+bytes whatever the file weighs. A program that would carry a big value on a
+good day and fail on a long one is not done until the bound is written.
 
 What runs: a manual run starts ordinary roots within its selection. A trigger
 requires one explicit fire or supplied emitted outputs. `--target <node>` runs

@@ -1190,7 +1190,7 @@ mod tests {
             color: color(),
             node_id: "sink".into(),
             frames: vec![],
-            reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into() },
+            reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None },
             at_unix: 3,
         });
         let events = project_all(&rows);

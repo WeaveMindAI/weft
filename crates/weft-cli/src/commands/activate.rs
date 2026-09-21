@@ -7,8 +7,12 @@
 //! prompted to pick one of three reactivate choices. The choice is
 //! sent in the activate body (`reactivateChoice`); the dispatcher's
 //! activate handler decides whether to drain/wipe/keep based on it.
+//!
+//! A worker built from an older image is replaced on the way:
+//! `--running-policy` says whether its running executions are
+//! cancelled now (the default) or waited for, up to `--drain-timeout`.
 
-
+use super::ensure::{parse_running_choice, running_choice_fields};
 use super::Ctx;
 use crate::progress::ActionVerb;
 
@@ -16,10 +20,20 @@ pub async fn run(
     ctx: Ctx,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
+    running_policy: Option<String>,
+    drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, reactivate_choice_flag).await
+        run_inner(
+            &ctx_inner,
+            &progress,
+            project,
+            reactivate_choice_flag,
+            running_policy,
+            drain_timeout,
+        )
+        .await
     })
     .await
 }
@@ -29,7 +43,14 @@ async fn run_inner(
     progress: &crate::progress::Progress,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
+    running_policy: Option<String>,
+    drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
+    // Parsed before anything is built: a misspelt policy, or a cap with
+    // nothing to bound, is refused here, not after a build that took a
+    // minute.
+    let (running_policy, drain_timeout) =
+        parse_running_choice(running_policy.as_deref(), drain_timeout)?;
     let (client, id, name, binary_hash, definition_hash, infra_hash) = match project {
         // Activate-by-id skips the build/discover step entirely.
         Some(id) => (ctx.client(), id.clone(), id, None, None, None),
@@ -76,6 +97,11 @@ async fn run_inner(
     if let Some(choice) = reactivate_choice {
         body.insert("reactivateChoice".into(), serde_json::Value::String(choice));
     }
+    body.extend(running_choice_fields(running_policy, drain_timeout));
+    // The one line that says the call may now sit for a while (only
+    // under a wait: the progress reads the policy off the body), so a
+    // quiet terminal is a wait and not a hang.
+    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
     let _: serde_json::Value = client.post_json(&path, &serde_json::Value::Object(body)).await?;

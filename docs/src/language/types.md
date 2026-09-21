@@ -57,7 +57,10 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | anything | `Empty` | No |
 
 Records are strict. A field the target does not declare is a mismatch, not
-something quietly carried along.
+something quietly carried along. And a field that can be null says so: `extra:
+JsonDict | Null`. A `JsonDict` alone refuses a null, so a query whose rows all
+have that column empty fails the node with `does not accept (got
+List[Dict[String, String | Null]])`, and the fix is the `| Null` on that field.
 
 `Empty` is the type of a value that cannot exist. An empty list `[]` is
 `List[Empty]`, because there is no item to learn from, and that goes into a

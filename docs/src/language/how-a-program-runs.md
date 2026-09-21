@@ -106,6 +106,18 @@ the absence is **data**, like a key the caller did not send. When the absence
 is a **decision your own step made**, have that step say so on a second output
 and gate on that, because the wire then reads forwards.
 
+A failure is not an absence. When the step it watches fails, its ports close
+too, but that closure carries the error and the gate reads it: the step stays
+off, skipped with the reason `the node its _should_not_flow watches did not
+finish (...)`, the error in the brackets, and the run reports the failure. So a
+"nothing there" branch never runs over a database that is down. The same holds
+through a group or a loop: a failure inside closes the scope's outputs with the
+failure on them, so a watcher outside reads it as one. And it holds through a
+skip: a step that skipped because its input closed on a failure did not decline
+either, so its own ports close with that failure on them (its skip reason ends
+in `: a node before it failed (...)`), and a watcher two steps down still reads
+a failure, not an absence.
+
 A step has one gate. Wiring both spellings is the `two-gates` error.
 
 ## One step, several runs at once

@@ -17,8 +17,8 @@ Three terms hold across the file:
 
 A node is missing only after the catalog says so: `weft describe-nodes --list` for the whole vocabulary, then `weft describe-nodes --node <Type> --compact` on anything close. If the catalog already holds a node that does the job, you go straight to the weft code. Otherwise:
 
-1. **Design [the contract].** The node-smith implements it and never invents it.
-2. **Dispatch one node-smith per node.** [the brief] is [the contract] plus the project context the node-smith cannot see (what [stage] this node feeds, what the upstream types are). Several missing nodes go out in parallel, one node-smith each; nodes that depend on each other's types go out in sequence.
+1. **Design [the contract].** The node-smith implements it and never invents it. One job per node, and the permissions it needs are fixed by that job: when the permission would depend on WHICH input arrives (a post that needs one scope for a person and another for a company page), that is two nodes, each declaring its own `requiresScopes`, never one node with the rule in prose. Every value a node emits on a port is at most 100 KB (the wire limit, see the manual's "The wire limit"); a contract whose output could be bigger (page text, a long listing, a file's bytes) says how the node bounds it, or hands the bytes to storage and emits the file value.
+2. **Dispatch one node-smith per package.** [the brief] is [the contract] plus the project context the node-smith cannot see (what [stage] this node feeds, what the upstream types are). Nodes that share a package (one service's access node and the nodes that use it, `nodes/linkedin/`) go to ONE node-smith with every contract in the brief, because two smiths writing into one package trip over each other's half-written files and one of them ends up creating a `package.toml` over the other's folder. Packages that share nothing go out in parallel, one node-smith each; nodes that depend on each other's types go out in sequence.
 3. **Run [the review]** on [the report] against the checklist below. A report that fails goes back as a redispatch whose brief carries the previous attempt's folder, the specific finding (never "do better"), and what to keep. You never fix the node-smith's node yourself unless the fix is one line and obvious, because the next dispatch needs to know the pattern anyway. If you catch yourself editing the node-smith's `mod.rs` or `tests.rs`, stop and write: "Wait. Redispatch." Then write the finding into the brief.
 4. **Wire it.** With the node green and in the catalog, read its `metadata.json` once more as delivered, and write the weft code.
 
@@ -52,7 +52,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **coverage gap against the contract**: count the tests against the ports: every port in [the contract] needs a test that fails if its behavior breaks, and a port with none is the finding.
 - **live tests missing or hollow**: [the contract] names a service but there is no `NodeTest::live` entry for it, or the entry declares no service and no fixtures.
 - **stale versions**: an API or dependency version taken from memory or an old example instead of the service's current docs, or one the service no longer serves; the rule is under deps.toml.
-- **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so.
+- **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
 - **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
@@ -257,8 +257,10 @@ you assert on those.
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`
 plus a `service` recipe in metadata (acquisition fields with `secret: true`,
 auth steps, a test URL, an identity template). The macro reads the `account`
-input and pulses it on `access`. Credentials live sealed in the runtime's
-access store, never in the project. The compiler synthesizes the runtime
+input and pulses it on `access`. It has no `tests.rs`: the macro is the whole
+body, so there is nothing of yours to test, and the review does not ask for
+one. Credentials live sealed in the runtime's access store, never in the
+project. The compiler synthesizes the runtime
 "no connection picked" rule from the `service` block; a hand-written one is
 a finding. `"connection_optional": true` inside the service block is
 reserved for a node that genuinely runs unconnected. That node is the one
@@ -351,6 +353,18 @@ typed in) and say why in the report.
 
 A trigger's display is NOT yours to write: the signal KIND serves it, inside
 weft. "The display" below says what that means for you.
+
+**The wire limit**: a value emitted on a port is at most 100 KB, checked on
+every emission (and on every yielded item of a stream), and a bigger one
+fails the node right there: `port 'results' of 'search' carries 107 KB; a
+wire carries at most 100 KB`. Nothing downstream can trim it, because the
+check is on what YOU emit, so the node bounds its own output: a cap input
+where the size comes from the outside world (`WebSearch`'s `maxTextChars`
+cuts each page's text at the provider), and storage for anything that is
+bytes rather than a value: `ctx.storage(scope).put(..)` and emit the file
+value, which weighs a few hundred bytes whatever the file does. A node
+whose output CAN exceed the limit on a bad day (a long article, a big
+listing) and does neither is a node that fails on that day.
 
 **A file input**: the value on an `Image` / `Audio` / `Video` / `Blob` port
 is the stored-file marker, and inside the running node it also carries a

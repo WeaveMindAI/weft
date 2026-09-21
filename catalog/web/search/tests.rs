@@ -49,7 +49,8 @@ async fn canned_search(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(
         sent.body.as_ref().expect("json payload"),
         &json!({ "query": "weft workflow language", "type": "auto",
-                 "numResults": 3, "contents": { "text": true } })
+                 "numResults": 3, "contents": { "text": { "maxCharacters": 4000 } } }),
+        "the manifest's text cap rides every text request, so no page can blow the wire"
     );
     Ok(())
 }

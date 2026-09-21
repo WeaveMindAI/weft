@@ -491,12 +491,20 @@ pub async fn run_worker_picker<Ctx>(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     idle_exit: Arc<dyn IdleExit>,
     idle_window: Duration,
+    draining: Arc<std::sync::atomic::AtomicBool>,
     background: Arc<weft_core::in_flight::InFlight>,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
     use std::sync::atomic::Ordering;
     let poll_interval = Duration::from_millis(50);
+    // The idle window is the grace a WARM pod keeps so the next burst
+    // reuses it instead of paying a cold spawn. A draining pod gets no
+    // next burst (nothing new is admitted to it), so once it is idle
+    // the only thing the grace buys is a replacement waiting on it; it
+    // tries the guarded exit after one poll's worth of quiet instead.
+    // `draining` is what the heartbeat learned off the pod's own row.
+    let draining_window = Duration::from_secs(1);
     // When the picker first went idle (no task claimed). Reset to
     // None on every successful claim. When idle longer than
     // `idle_window`, attempt the guarded idle-exit CAS. Uses
@@ -521,7 +529,8 @@ pub async fn run_worker_picker<Ctx>(
                         Duration::ZERO
                     }
                 };
-                if idle_for >= idle_window {
+                let window = if draining.load(Ordering::Relaxed) { draining_window } else { idle_window };
+                if idle_for >= window {
                     // Attempt the guarded exit. The CAS fails if any
                     // pending/claimed work exists (incl. a background
                     // exec holding a claimed task), so this is safe
@@ -793,6 +802,7 @@ mod idle_exit_tests {
             shutdown,
             idle_exit,
             window,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Nothing runs in the background here: this picker claims
             // no work, which is the whole point of an idle-exit test.
             weft_core::in_flight::InFlight::new("worker execution"),

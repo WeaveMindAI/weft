@@ -27,8 +27,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use weft_core::exec::boundary::{
-    is_passthrough, kick_scope, settle_table, tear_down_scope, BoundaryDispatch,
-    BoundaryOutcome,
+    is_passthrough, kick_scope, refused_scope, settle_table, tear_down_scope, BoundaryDispatch,
+    BoundaryOutcome, RefusedScope,
 };
 use weft_core::exec::emission::{boundary_emission, loop_termination_emission, terminal_sweep_emission, PulseEmission};
 use weft_core::exec::loop_runtime::{
@@ -218,6 +218,31 @@ impl Fold {
                 if let Some(output) = source.outputs.get(&record.id) { self.outputs.insert(record.id, output.clone()); }
             }
             self.snap.executions.entry(place.id.clone()).or_default().extend(records);
+        }
+        // A reused In boundary that refused its scope settled the
+        // members by the kick its teardown gave them, never by a pulse
+        // (a gated-off scope emits nothing inward, and the history holds
+        // nothing for it). The record carries no kick, so the members
+        // this run re-runs are told again here; the ones reused with it
+        // keep their own records.
+        for place in places {
+            for record in records_at(&source.snap, place) {
+                if record.status != NodeExecutionStatus::Skipped { continue; }
+                let Some(group_id) = self.project.nodes.iter().find(|node| node.id == place.id)
+                    .and_then(|node| node.group_boundary.as_ref())
+                    .filter(|boundary| boundary.role == GroupBoundaryRole::In)
+                    .map(|boundary| boundary.group_id.clone()) else { continue };
+                // The teardown's own rule: a scope inside a scope that
+                // was taken down owes its members nothing, the enclosing
+                // scope's kick reached them (and reaches them again here
+                // through ITS reused In).
+                let refused = refused_scope(&self.project, &self.edge_idx, &group_id, &record.frames);
+                if refused.owed_by_the_enclosing_pass(record.skip_reason.as_ref()) { continue; }
+                let RefusedScope { frames, members, .. } = refused;
+                let rerun: Vec<String> = members.into_iter()
+                    .filter(|member| !places.contains(&Located::at(member, &frames))).collect();
+                kick_scope(&mut self.snap.kicked, &rerun, &frames, Some(&group_id));
+            }
         }
         for (location, entries) in &source.snap.awaited_sequences {
             if places.contains(&Located::at(&location.node_id, &location.frames)) { self.snap.awaited_sequences.insert(location.clone(), entries.clone()); }
@@ -585,7 +610,7 @@ impl Fold {
                     self.report(CorruptionSite::LoopInstantiated, format!("{}: no LoopIn firing at these frames", describe(ev)));
                     return effects;
                 };
-                if let Err(e) = instantiate(&mut self.snap.loop_runtime, def, &self.project, &view.input, parent_frames, color) {
+                if let Err(e) = instantiate(&mut self.snap.loop_runtime, def, &self.project, &view, parent_frames, color) {
                     self.report(CorruptionSite::LoopInstantiated, format!("{}: {e}", describe(ev)));
                 }
             }
@@ -696,7 +721,7 @@ impl Fold {
                     // nothing to close twice.
                     match self.snap.loop_runtime.terminate(&key, *reason) {
                         Ok(true) => {
-                            effects.emissions.extend(close_loop_outward(&key, &self.project, &self.edge_idx, &mut self.snap.pulses));
+                            effects.emissions.extend(close_loop_outward(&key, &self.project, &self.edge_idx, &mut self.snap.pulses, *reason));
                             self.boundary_pass(*at_unix, &mut effects);
                         }
                         Ok(false) => {}
@@ -889,7 +914,12 @@ impl Fold {
         }
     }
 
-    fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid) {
+    /// The outward closures a torn-down scope owes, remembered the way
+    /// `close_scope_outward` sends them: with the failure that took the
+    /// scope down, or plain when it was gated off. The history is what a
+    /// seeded run replays and what a frozen example expects, so a plain
+    /// record here would launder the failure for both.
+    fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid, failure: Option<&str>) {
         if self.output_history.is_none() { return; }
         let node_id = boundary_out_id(group);
         if !self.edge_idx.admits(&node_id, frames) { return; }
@@ -898,7 +928,7 @@ impl Fold {
             .map(|port| port.name.clone()).collect();
         for port in ports {
             self.remember_output(OutputEmission { id, node: node_id.clone(), frames: frames.clone(), port,
-                value: None, error: None, provided: false });
+                value: None, error: failure.map(str::to_string), provided: false });
         }
     }
 
@@ -947,22 +977,67 @@ impl Fold {
                 {
                     let id = boundary_emission(&dispatch.node_id, &dispatch.frames, record.ordinal);
                     let provided_ports = record.received.provided_ports.clone();
+                    let closed_with_error = record.received.closed_with_error.clone();
                     let skipped = record.status == NodeExecutionStatus::Skipped;
+                    let taken_down_above =
+                        matches!(record.skip_reason, Some(SkipReason::ScopeSkipped { .. }));
+                    // The history says what the wire said, per status
+                    // (`dispatch_passthrough`): a FAILED boundary (a port
+                    // refused its value) swept every output with its own
+                    // error, so that error wins on every port and takes
+                    // the scope down; a SKIPPED one took the scope down
+                    // with the failure its skip inherited (its gate closed
+                    // on one), or plainly; a completed one forwarded each
+                    // closed input with that input's own error. A type
+                    // error recorded beside a skip never reached a wire.
+                    let own_failure: Option<String> =
+                        (record.status == NodeExecutionStatus::Failed).then(|| record.error.clone()).flatten();
+                    let inherited_failure: Option<String> = skipped
+                        .then(|| record.skip_reason.as_ref().and_then(|reason| reason.inherited_failure().map(str::to_string)))
+                        .flatten();
                     let values = output.clone().unwrap_or_default();
-                    let ports: Vec<_> = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
-                        .into_iter().flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &dispatch.frames, &port.name)))
-                        .map(|port| port.name.clone()).collect();
+                    // A boundary inside a scope that was taken down from
+                    // above emitted nothing of its own on the wire (the
+                    // enclosing teardown closed every member's exits), so
+                    // the history holds nothing of its own for it either.
+                    let ports: Vec<_> = if taken_down_above { Vec::new() } else {
+                        self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
+                            .into_iter().flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &dispatch.frames, &port.name)))
+                            .map(|port| port.name.clone()).collect()
+                    };
                     for port in ports {
+                        // A boundary forwards a failed closure WITH its
+                        // error (`dispatch_passthrough`), and the history
+                        // is what a seeded run replays: remembered plain,
+                        // the seed would launder the failure into "nothing
+                        // came" for a watcher outside the scope. A skipped
+                        // In's own ports are remembered closed although
+                        // the wire got no emission (its members were kicked
+                        // into the scope's skip instead): a seed replaying
+                        // the In alone has no kick to give them, so the
+                        // closures are what tell them, with the failure
+                        // the members' own exits carried.
+                        let error = own_failure
+                            .clone()
+                            .or_else(|| closed_with_error.get(&port).cloned())
+                            .or_else(|| inherited_failure.clone());
                         self.remember_output(OutputEmission {
                             id, node: dispatch.node_id.clone(), frames: dispatch.frames.clone(),
-                            value: values.get(&port).cloned(), provided: provided_ports.contains(&port), port, error: None,
+                            value: values.get(&port).cloned(), provided: provided_ports.contains(&port), port, error,
                         });
                     }
-                    if skipped {
+                    // A scope that never started (gated off, or its In
+                    // failed) closed outward: the same closures, with the
+                    // same failure, the wire got from `tear_down_scope`.
+                    // Not for a scope inside a scope that was itself taken
+                    // down: the enclosing pass closed its exits already,
+                    // and the live teardown emits nothing for it.
+                    if (skipped && !taken_down_above) || own_failure.is_some() {
                         let group = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
                             .and_then(|node| node.group_boundary.as_ref()).filter(|boundary| boundary.role == GroupBoundaryRole::In)
                             .map(|boundary| boundary.group_id.clone());
-                        if let Some(group) = group { self.remember_scope_closures(&group, &dispatch.frames, id); }
+                        let failure = own_failure.as_deref().or(inherited_failure.as_deref());
+                        if let Some(group) = group { self.remember_scope_closures(&group, &dispatch.frames, id, failure); }
                     }
                 }
             }
@@ -1111,9 +1186,9 @@ impl Fold {
                 let group_id = in_scope.expect("checked");
                 effects.emissions.extend(tear_down_scope(
                     &self.project, &self.edge_idx, &mut self.snap.pulses, &mut self.snap.kicked,
-                    emission_id, color, &group_id, frames, Some(reason),
+                    emission_id, color, &group_id, frames, Some(reason), reason.inherited_failure(),
                 ));
-                self.remember_scope_closures(&group_id, frames, emission_id);
+                self.remember_scope_closures(&group_id, frames, emission_id, reason.inherited_failure());
             }
             (NodeExecutionStatus::Skipped, Some(SkipReason::ScopeSkipped { .. })) => {}
             _ if is_loop_boundary => {
@@ -1123,7 +1198,7 @@ impl Fold {
                 if status == NodeExecutionStatus::Failed {
                     if let Ok(key) = loop_runtime::instance_key(&def, frames, color) {
                         if self.snap.loop_runtime.get(&key).is_none() {
-                            effects.emissions.extend(close_loop_outward(&key, &self.project, &self.edge_idx, &mut self.snap.pulses));
+                            effects.emissions.extend(close_loop_outward(&key, &self.project, &self.edge_idx, &mut self.snap.pulses, LoopTerminationReason::Failed));
                         }
                     }
                 }
@@ -1131,9 +1206,14 @@ impl Fold {
             _ => {
                 let mentioned = e.mentioned_ports.clone();
                 let closed = e.closed_output_ports.clone();
+                // A skip row carries no error of its own; the failure it
+                // inherited (an input that closed because its producer
+                // broke) rides its closures exactly as the live engine
+                // sends them.
+                let failure = error.or_else(|| skip_reason.and_then(SkipReason::inherited_failure));
                 if let Err(e) = close_unmentioned_downstream(
                     node_id, &mentioned, emission_id, color, frames, &self.project,
-                    &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, error, &closed,
+                    &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, failure, &closed,
                 ) {
                     // A rejected row fires no boundary: the reader that
                     // paints the row paints nothing for it, and boundaries
@@ -1144,7 +1224,7 @@ impl Fold {
                 for port in def.outputs.iter().filter(|port| !closed.contains(&port.name) && (!mentioned.contains(&port.name) || port.is_generator())) {
                     self.remember_output(OutputEmission {
                         id: emission_id, node: node_id.into(), frames: frames.clone(), port: port.name.clone(),
-                        value: None, error: error.map(str::to_string), provided: false,
+                        value: None, error: failure.map(str::to_string), provided: false,
                     });
                 }
             }
@@ -1587,7 +1667,7 @@ mod tests {
                 color: color(),
                 node_id: "b".into(),
                 frames: vec![],
-                reason: SkipReason::RequiredInputClosed { port: "in".into() },
+                reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: None },
                 at_unix: 2,
             },
         ];
@@ -1867,6 +1947,119 @@ mod tests {
         // closes nothing more (its scope's surface is already closed).
         assert_eq!(snap.executions["h__in"][0].status, NodeExecutionStatus::Skipped);
         assert!(pending(&snap, "inner").is_empty());
+    }
+
+    /// The history says what the wire said: a node skipped because its
+    /// input closed on a failure closes its own outputs WITH that
+    /// failure, and the frozen example (`output_wires`) records it so.
+    #[test]
+    fn a_skip_inherited_from_a_failure_is_remembered_with_it() {
+        let mut fold = Fold::new(color(), fan_out_project()).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            ExecEvent::NodeFailed { color: color(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+            started("a", vec![], 2),
+            ExecEvent::NodeSkipped {
+                color: color(), node_id: "a".into(), frames: vec![],
+                reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: Some("the database is down".into()) },
+                at_unix: 2,
+            },
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let wires = fold.output_wires().unwrap();
+        let a_out = wires.iter().find(|wire| wire.node == "a" && wire.port == "out").expect("a.out remembered");
+        assert!(a_out.closed);
+        assert_eq!(a_out.error.as_deref(), Some("the database is down"), "the skip passes the failure on, in the history too");
+    }
+
+    /// A scope gated off by a gate that closed on a failure closes
+    /// outward with it, and the history remembers the Out's ports so.
+    #[test]
+    fn a_scope_gated_off_by_a_failure_is_remembered_with_it() {
+        let mut fold = Fold::new(color(), nested_group_project()).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            ExecEvent::NodeFailed { color: color(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let snap = fold.snapshot();
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Skipped);
+        assert_eq!(pending(snap, "sink")[0].close_error.as_deref(), Some("the database is down"), "the wire carries it");
+        let wires = fold.output_wires().unwrap();
+        let out = wires.iter().find(|wire| wire.node == "g__out" && wire.port == "y").expect("g__out.y remembered");
+        assert!(out.closed);
+        assert_eq!(out.error.as_deref(), Some("the database is down"), "and so does the history");
+    }
+
+    /// An In boundary that refuses a value (a String on a Number port)
+    /// fails before anything is forwarded: every one of its own ports
+    /// and every port of its Out close with that error on the wire, and
+    /// the history remembers them so.
+    #[test]
+    fn a_boundary_that_refused_a_value_is_remembered_failed_throughout() {
+        let mut fold = Fold::new(color(), nested_group_project()).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            emitted(Uuid::new_v4(), "src", vec![], "out", json!("nine")),
+            emitted(Uuid::new_v4(), "src", vec![], "flow", json!(true)),
+            completed("src", vec![], 1),
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let snap = fold.snapshot();
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Failed);
+        let refusal = snap.executions["g__in"][0].error.clone().expect("the refusal is the record's error");
+        assert_eq!(pending(snap, "sink")[0].close_error.as_deref(), Some(refusal.as_str()), "the wire carries it");
+        let wires = fold.output_wires().unwrap();
+        for (node, port) in [("g__in", "x"), ("g__out", "y")] {
+            let wire = wires.iter().find(|wire| wire.node == node && wire.port == port)
+                .unwrap_or_else(|| panic!("{node}.{port} remembered"));
+            assert!(wire.closed);
+            assert_eq!(wire.error.as_deref(), Some(refusal.as_str()), "{node}.{port} remembers the refusal");
+        }
+    }
+
+    /// The nested scope of a gated-off scope was taken down by the
+    /// enclosing pass: its Out's ports get no closure of their own on
+    /// the wire, and none in the history either (a plain one there
+    /// would launder the enclosing failure on replay).
+    #[test]
+    fn a_scope_inside_a_gated_off_scope_remembers_no_closures_of_its_own() {
+        let mut fold = Fold::new(color(), nested_group_project()).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            ExecEvent::NodeFailed { color: color(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let snap = fold.snapshot();
+        assert_eq!(snap.executions["h__in"][0].status, NodeExecutionStatus::Skipped);
+        let wires = fold.output_wires().unwrap();
+        assert!(!wires.iter().any(|wire| wire.node == "h__in" || wire.node == "h__out"), "the nested scope closes from the enclosing pass, not its own: {wires:?}");
+    }
+
+    /// A seeded run that reuses a gated-off scope's In (and the nested
+    /// In under it) but re-runs the members: nothing on the wire ever
+    /// told those members (the scope emits nothing inward), so the
+    /// reuse tells them again with the scope's kick, and they settle as
+    /// scope-skipped exactly as in the run they came from.
+    #[test]
+    fn a_reused_refused_scope_kicks_the_members_it_does_not_reuse() {
+        let project = nested_group_project();
+        let mut source = Fold::new(color(), project.clone()).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            emitted(Uuid::new_v4(), "src", vec![], "out", json!(9)),
+            emitted(Uuid::new_v4(), "src", vec![], "flow", json!(false)),
+            completed("src", vec![], 1),
+        ] { assert!(!source.apply(&event).rejected()); }
+        assert_eq!(source.snapshot().executions["h__in"][0].status, NodeExecutionStatus::Skipped);
+        let reused = BTreeSet::from([Located::top("src"), Located::top("g__in"), Located::top("h__in")]);
+        let eligible = weft_core::seeding::inheritable_nodes(&project, source.snapshot());
+        assert!(reused.iter().all(|node| eligible.contains(node)), "{eligible:?}");
+        let mut child = Fold::new(Uuid::new_v4(), project);
+        child.apply(&started_execution());
+        child.inherit(&source, &reused).unwrap();
+        let snap = child.snapshot();
+        for member in ["inner", "h__out"] {
+            let kick = snap.kicked.get(&FiringLocation::new(member, vec![])).unwrap_or_else(|| panic!("{member} told again: {:?}", snap.kicked.keys().collect::<Vec<_>>()));
+            assert_eq!(kick.scope_skipped.as_deref(), Some("g"), "{member}");
+        }
+        assert!(!snap.kicked.contains_key(&FiringLocation::new("h__in", vec![])), "a reused member keeps its record and gets no second kick");
     }
 
     #[test]
@@ -2501,7 +2694,7 @@ mod tests {
             color: color(),
             node_id: node.into(),
             frames: vec![],
-            reason: SkipReason::RequiredInputClosed { port: "in".into() },
+            reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: None },
             at_unix: at,
         };
         let events = vec![

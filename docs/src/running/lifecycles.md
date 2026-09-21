@@ -103,9 +103,23 @@ Prepare it again: `weft bake` does it without listening, `weft activate` does it
 | `hibernate` | Keeps the signals, hides pending tasks from the browser extension, parks late answers |
 | `park` | Keeps the signals visible and queues new answers until you reactivate |
 
-With no terminal attached, or with `--json`, the default is `wipe` with running
-executions cancelled. `--running-policy wait` drains instead, capped at ten
-minutes, and `weft cancel-running` ends a drain early.
+With no terminal attached, or with `--json`, the default is `wipe`. Running
+executions are cancelled unless you pass `--running-policy wait`, which lets
+them land first, capped at a minute (`--drain-timeout`), and `weft
+cancel-running` ends that wait early.
+
+The infra verbs that take triggers down (`weft infra stop`, `terminate`,
+`upgrade`) ask you the same thing, and their answer means the same. If the
+project is not active there are no triggers to take down, so nothing is asked,
+but a run may still be using that infrastructure: `--running-policy wait` on
+its own lets it land before the containers go.
+
+`weft activate` and `weft bake` make the same choice about a worker still up
+from an older build: by default what it runs is cancelled and it is replaced
+now; with `--running-policy wait` its executions land first. While it waits,
+nothing new is sent to that worker, and once its last execution lands the
+worker finishes writing down what it owes (a metered call's cost) and leaves on
+its own, which takes a second or two; the cap covers both.
 
 Reactivating a project that kept state asks you again: drain the parked work
 and keep the suspensions, keep the suspensions only, or wipe everything.

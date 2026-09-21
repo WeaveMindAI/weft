@@ -38,6 +38,13 @@
       "label": "Include page text"
     },
     {
+      "name": "maxTextChars",
+      "type": "Number",
+      "default": 4000,
+      "label": "Text per result",
+      "description": "The most characters of page text one result carries; Exa cuts each page there. A wire carries at most 100 KB, so `numResults` times this (plus titles and URLs) has to stay under it: the default keeps ten results near 40 KB. Ignored when `includeText` is off."
+    },
+    {
       "name": "includeDomains",
       "type": "List[String]",
       "description": "Only results from these domains. Empty = the whole web."

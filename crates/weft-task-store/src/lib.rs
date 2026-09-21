@@ -46,5 +46,6 @@ pub use worker_pod::{
     delete_row, has_live_for_project,
     insert_spawning, list_orphaned_node_test, list_stale, list_stale_spawning, list_terminal,
     mark_dead, mark_done, mark_done_if_idle, register_alive, AliveTransition, PodStatus,
-    WorkerPodRow, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_STALE_SECS, SPAWN_BOOT_DEADLINE_SECS,
+    WorkerPodRow, WorkerStanding, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_STALE_SECS,
+    SPAWN_BOOT_DEADLINE_SECS,
 };
