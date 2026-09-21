@@ -65,10 +65,6 @@ still.
 
 ![The answer awaiting approval beside the same waiting execution in the graph](../img/extension-task.png)
 
-<!-- IMAGE: extension-task.png. Two panels. Left: the task tab showing
-"Send this answer?" and the draft text with Approve / Reject. Right: the
-same execution in the graph, review waiting in cyan, approved not yet run. -->
-
 Open the extension and **Send this answer?** is waiting in the list. Click it
 and the form opens in its own tab, with the draft text and an Approve and a
 Reject button. Click Approve and `approved` runs. Then run the program a
@@ -82,8 +78,9 @@ You never declared `send_approved`. The form did. A field of kind
 means no value will ever come out of it, and any step waiting on that value is
 skipped.
 
-That is why `approved` has `_should_flow: review.send_approved`. So approving
-switches it on and rejecting switches it off. If you want something to happen
+That is why `approved` has `_should_flow: review.send_approved`: approving runs
+`approved`, and rejecting closes `send_approved`, so it never runs. If you want
+something to happen
 on a rejection instead, wire `send_rejected` into it.
 
 You describe the form once, and that description is what makes the ports.

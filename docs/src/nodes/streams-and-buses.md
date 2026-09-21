@@ -1,8 +1,9 @@
 # Streams and buses in Rust
 
-To send items while your node is still working, emit them on a
-`Generator[T]` output. For choosing between streams and buses when connecting
-nodes, read [Live channels](../language/live-channels.md).
+If you want your node to send items while it is still working, emit them on a
+`Generator[T]` output. If you want it to swap messages with other running
+nodes, open a bus. For choosing between the two when connecting nodes, read
+[Live channels](../language/live-channels.md).
 
 ## Producing a stream
 
@@ -26,6 +27,8 @@ for row in read_rows(&file) {
 
 If your body returns an error instead, the stream closes as **failed**, and
 the consumer's pull gets your error rather than a clean end.
+
+![An LLM answer arriving one chunk at a time](../img/llm-stream.gif)
 
 ### Yield or pulse
 
@@ -57,8 +60,8 @@ must be greater than zero and applies to subsequent emissions.
 Ask what should happen if the consumer stops early.
 
 With `pulse_downstream`, queued items are dropped when the consumer finishes.
-Use it when the consumer may abandon the remaining items; the producer can
-still continue doing work.
+Use it when the consumer may abandon the remaining items; the producer keeps
+going.
 
 A yielded item whose consumer finishes without taking it **fails your body**,
 which is what you want when your producer must know its items landed.
@@ -88,7 +91,7 @@ On the handle:
 |---|---|
 | `next()` | Waits for the next item; returns `Some(item)`, `None` when the stream ends cleanly, or an error if it fails |
 | `try_next()` | Returns `TryNext::Item(item)`, `TryNext::Empty` while open with no buffered item, or `TryNext::Finished`; returns an error if the stream fails |
-| `drain()` | the whole stream as a `Vec`, erroring on a failed end rather than handing back a truncated list |
+| `drain()` | The whole stream as a `Vec`, erroring on a failed end rather than handing back a truncated list |
 | `end()` | `None` while open; otherwise `Finished` or `Failed(error)`, even if buffered items remain to be read |
 
 A pull can also become impossible to satisfy, when every remaining node is
@@ -132,8 +135,8 @@ The host waits for the guest to register before sending the message.
 Without that wait, the message could be sent before the guest is listening.
 
 Both `open_bus` and `join_bus` return a guard that closes the whole bus when
-dropped. Use `bus_from_input` for an observer whose departure should not end
-the conversation.
+dropped, including when the node exits with an error. Use `bus_from_input`
+for an observer whose departure should not end the conversation.
 
 ### Where reading starts
 

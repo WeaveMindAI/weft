@@ -12,8 +12,8 @@ weft run
 assistant how weft works. Once it is in place, you can ask for changes in plain
 English and it will make them. If you use Kilo Code, write `--assistant
 kilo-code` instead. If you use neither, run `weft new hello --assistant none`
-and skip [Ask Tangle](#ask-tangle); this page shows you two other ways to make
-the same change. Repeat the flag to install for several assistants at once.
+and skip [Ask Tangle](#ask-tangle). You can also install both at once:
+`--assistant claude-code --assistant kilo-code`.
 Whichever you pick is remembered, so your next `weft new` installs the same
 one with no flag at all, until you pass `--assistant <name>` to change it or
 `--assistant none` to stop.
@@ -130,11 +130,15 @@ Change `Ada` to another name and run again.
 | `src/main.weft` | The program |
 | `weft.toml` | The project's name and its permanent id |
 | `nodes/` | The code for every kind of step it can use |
-| `CLAUDE.md`, `.claude/` (or `kilo.json`, `.kilo/`) | Tangle's instructions, for whichever assistant you picked. They are copied in, so they get committed with the rest and somebody who clones your project gets Tangle without a weft checkout. After updating weft, `weft tangle update` re-copies them. |
+| `CLAUDE.md`, `.claude/` (or `kilo.json`, `.kilo/`) | Tangle's instructions, for whichever assistant you picked |
 | `layouts/` | Where you dragged the boxes. It turns up the first time you move a box. |
 | `.weft/` | Build files, generated |
 
 `weft new` also starts a git repository and writes a `.gitignore` for you.
+
+The Tangle files are copied in, so they get committed with the rest and
+somebody who clones your project gets Tangle without a weft checkout. After
+updating weft, `weft tangle update` re-copies them.
 
 If you write a step of your own, put it anywhere under `nodes/` except
 `base_catalog/`. That folder holds the standard steps, and `weft catalog update`

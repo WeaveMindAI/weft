@@ -44,7 +44,7 @@ async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
 ```
 
 You can read the complete
-[Cron node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/triggers/cron)
+[Cron node](https://github.com/WeaveMindAI/weft/tree/mvp/catalog/triggers/cron)
 for its imports and metadata.
 
 ## Inputs and event data
@@ -54,6 +54,8 @@ trigger registered. Upstream nodes do not run again for every event.
 If someone changes an input, reactivate the project to register the new
 value. For how that affects a program, read
 [Two phases](../language/triggers.md#two-phases).
+
+![A trigger's saved inputs, with the action to reactivate](../img/trigger-saved-inputs.png)
 
 `ctx.wake` contains this event's fields. Read required fields with
 `get`, as the timer does above. To forward all matching fields to your
@@ -94,7 +96,7 @@ trigger body does not need its own background task.
 dials into. Choose by which side starts the connection.
 
 For the kinds' fields, read their
-[Rust definitions](https://github.com/WeavemindAI/weft/tree/mvp/crates/weft-core/src/signal).
+[Rust definitions](https://github.com/WeaveMindAI/weft/tree/mvp/crates/weft-core/src/signal).
 A form can also be used with `await_signal` to pause an existing execution.
 
 ### Polling and outbound streams
@@ -105,7 +107,7 @@ items. It supports JSON and RSS/Atom feed parsing.
 `StreamListen` describes an opening dialogue and how to split the byte
 stream into messages. Its frames can interpolate connection values, so
 credentials need not be written into the dialogue. The
-[ReceiveEmail node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/email/receive_email)
+[ReceiveEmail node](https://github.com/WeaveMindAI/weft/tree/mvp/catalog/email/receive_email)
 uses it to watch IMAP events; its fired body uses an email library to fetch
 the messages.
 
@@ -127,7 +129,7 @@ ctx.register_signal(Route { common }).await?;
 The caller's opening request arrives as the fire payload, so a trigger of
 this shape reads it off `ctx.wake`; the shipped `Route` and `Socket` fan it
 onto their ports. Use the catalog's
-[route node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/api/route)
+[route node](https://github.com/WeaveMindAI/weft/tree/mvp/catalog/api/route)
 for the accompanying input declarations. For reading the caller's messages
 and sending replies, read [Talking to a live caller](live-callers.md).
 

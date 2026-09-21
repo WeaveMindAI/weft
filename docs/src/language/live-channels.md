@@ -71,6 +71,15 @@ the step author's choice, in
 
 ## Let running steps talk
 
+```mermaid
+flowchart LR
+    producer[Producer] -->|publish| bus((Bus))
+    bus -->|read| consumerA[Consumer A]
+    bus -->|read| consumerB[Consumer B]
+```
+
+![A message on a bus reaching every reader](../img/bus-fanout.png)
+
 A bus lets one step send a message while another is still working, so a
 coordinator can go back and forth with several agents instead of waiting for
 one final answer from each.

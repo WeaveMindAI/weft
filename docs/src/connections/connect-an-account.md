@@ -7,6 +7,8 @@ In the graph, click **Connect** on the access step, or **Change** if it already
 has one. Pick an existing connection, or one of the options under **+ Add a
 connection**.
 
+![The Connect panel with a provider chosen and an account stored](../img/connect-panel.png)
+
 If you would rather work in the terminal, run this from the project folder:
 
 ```bash
@@ -15,6 +17,8 @@ weft connect
 
 Choose the step you want to set up, then follow the prompts to sign in or paste
 whatever the service asks for. Repeat for each service the program needs.
+
+![The provider's consent screen during browser sign-in](../img/connect-oauth.png)
 
 Never paste a key into an ordinary step input, or into a conversation with your
 assistant. Step inputs are written to the journal in the clear and show up in

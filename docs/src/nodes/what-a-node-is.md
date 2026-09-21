@@ -19,8 +19,8 @@ Rust. It belongs in the graph when the person writing the program needs to wire
 it, look at its result, or swap it out.
 
 That is also what makes a node a job you can hand to an assistant: give it the
-inputs, the outputs, and some examples of a good answer, and it can build and
-test that on its own. The port types say how the piece fits back in. Your
+inputs, the outputs, and a test or two, and it can build and check that on its
+own. The port types say how the piece fits back in. Your
 instructions and tests are the only thing saying what good work looks like.
 
 ## The files
@@ -31,9 +31,11 @@ A node lives under your project's `nodes/`:
 nodes/word_count/
   metadata.json       name, inputs, outputs, how it looks in the editor
   mod.rs              the Rust
-  tests.rs            its tests, if it has any
-  deps.toml           extra crates, if it needs any
+   tests.rs            its tests, if it has any
+   deps.toml           extra crates, if it needs any
 ```
+
+![A node folder with metadata.json and mod.rs open in the editor](../img/node-files.png)
 
 The compiler reads `metadata.json` to check the graph without compiling any
 Rust, and pulls in the implementation of whatever you actually used when it
@@ -71,9 +73,8 @@ took it. Opening the account connection and signing the request is not its
 job, so use the ctx's client for that part.
 
 The same ctx gives you storage, durable waits and the rest. Before building one
-of those yourself, check [the ctx](the-ctx.md). If something genuinely is
-missing, propose it or bring it to
-[Discord](https://discord.com/invite/FGwNu6mDkU). For where that line sits,
+of those yourself, check [the ctx](the-ctx.md). If what you need is missing, propose it or bring it
+to [Discord](https://discord.com/invite/FGwNu6mDkU). For where that line sits,
 read [the commandments of plumbing](../thinking/plumbing.md).
 
 The compiler will catch a connection with the wrong type. It has no idea

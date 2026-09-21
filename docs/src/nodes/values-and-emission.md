@@ -135,6 +135,8 @@ To close one early:
 ctx.close_port("text").await?;
 ```
 
+![Journal events showing a port emitted, then closed](../img/emission-events.png)
+
 An ordinary port cannot emit after closure. On a generator, closure ends
 the sequence after the items already emitted.
 

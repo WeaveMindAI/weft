@@ -7,12 +7,13 @@ it meant what you assumed, it is here.
 type for every service. What flows on the wire is a small reference, never a
 credential. See [How connections work](../connections/overview.md).
 
-**Access node.** The node that owns the connect for one service and emits an
+**Access node.** The node that owns the connection for one service and emits an
 `Access` value. Most bodies are one macro; the `connection_optional` ones
 write their own.
 
 **Activation.** Turning a project's triggers on: registers every trigger and
-mints its address. One that cannot be served refuses here, loudly.
+mints its address. A trigger whose address cannot be served fails the
+activation, loudly.
 
 **Broker.** The scoped HTTP front door to the database that every tenant-side
 component uses. The dispatcher bypasses it. See
@@ -84,17 +85,19 @@ from the bytes. A node never states a cost.
 **Pulse.** One emission travelling to one input port, carrying a value, a
 color, and a frame stack. The only thing that moves in a running program.
 
-**Provided.** A backup input supplied at a `--from` or `--group` start,
-or an output supplied through `--emit`. Real execution input takes
-precedence over a backup. Changed supplied values invalidate affected reuse.
+**Supplied input.** A backup input handed to a node at a `--from` or
+`--group` start, or an output supplied through `--emit`. A supplied input is
+a backup at a named start, nothing more: real execution input takes
+precedence over it, and changed supplied values invalidate affected reuse.
 
 **Recipe.** The `service` block in an access node's metadata: how a credential
 is acquired, how a request is signed, what the permissions are, how events
 arrive.
 
 **Registered app.** One OAuth application this weft signs users in with, living
-in the operator's trusted apps file. A recipe may use one and can never extract
-from it.
+in the operator's trusted apps file. Its credential stays in the access store
+and can never be extracted from it: a recipe may use the credential, never read
+it.
 
 **Root.** A node no wire feeds. A manual run kicks ordinary roots in its
 selection. Triggers require an explicit fire or supplied outputs.
@@ -110,23 +113,20 @@ written under. It is a lifetime contract, not a folder name.
 once that run has finished or parked on a signal; if head has no run, it is
 the newest finished or parked run on head's version, or on the nearest
 ancestor version that has one. For which of its nodes are taken and which run
-again, go and read the **Stale** entry below; for how weft picks a seed when
+again, go and read the **Reusable work** entry below; for how weft picks a seed when
 head has no run, go and read
 [Seeding](../running/versions.md#seeding-run-only-what-changed).
 
 **Sequential Diffusion Programming.** Building a program stage by stage against
 a real example, then a second, then a third, until new inputs just work.
-[The chapter](../thinking/sdp.md) is the whole methodology.
+[The chapter](../thinking/sdp.md).
 
 **Signal.** A wake source: a timer, a form, an endpoint, a subscription, a held
 socket. Registered by a trigger, or awaited mid-flow.
 
-**Slice.** A node plus everything upstream of it, hashed together. A seeded
-run compares each node's slice against the seed's and re-runs the ones that
-differ.
-
-<span id="stale"></span>**Stale.** A node a seeded run must run itself
-rather than inherit. A node is stale when:
+**Reusable work.** What a `--seed` run may inherit
+rather than run itself. A seeded run reuses eligible completed work, and work
+is no longer reusable when:
 
 - you edited it, or anything upstream of it;
 - it is new since the seed, or the seed's run never covered it;
@@ -141,8 +141,8 @@ rather than inherit. A node is stale when:
 - it is beyond the permitted `--seed-before` or `--seed-until` boundary;
 - its output contains a live handle tied to the earlier run.
 
-Anything downstream of a stale node is stale, and a loop goes stale whole
-the moment any node inside it does.
+Anything downstream of a reusable node that changed is not reusable either,
+and a loop is reused whole or not at all.
 
 **Supervisor.** The tier that runs kubectl for user infrastructure. One holds a
 lease per project.
@@ -157,13 +157,12 @@ at activation, then a fire per event.
 its own stop behavior, and the infra verbs act on one at a time.
 
 **Version.** The project's program files (`src/`, `weft.toml`, `nodes/`,
-`assets/`, `examples/`, plus the installed
-weft's own version), named by a hash of their contents, so the same code is
-always the same version however many times you run it. Your `layouts/` and
-your notes are not in it. The seeded `nodes/base_catalog/` is not listed file
-by file, but its content hash rides along with the installed weft's version,
-so upgrading the catalog changes the version like any edit. Every run and
-every checkpoint records one.
+`assets/`, `examples/`, plus the installed weft's own version). A version is
+named by a hash of those contents, so the same code is always the same version
+however many times you run it. Your `layouts/` and your notes are not in it.
+The seeded `nodes/base_catalog/` is not listed file by file, but its content
+hash rides along with the installed weft's version, so upgrading the catalog
+changes the version like any edit. Every run and every checkpoint records one.
 
 **Worker.** The compiled project binary, running as a pod, multiplexing
 executions and shutting down when idle.

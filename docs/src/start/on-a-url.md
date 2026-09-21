@@ -18,8 +18,9 @@ response, under a `201`. No Rust, no node folder.
 
 Two things in that program are worth a closer look.
 
-**The body keys are ports you declare.** A route has no `body` port. You say
-which top-level keys you want (`-> (name: String, age: Number)`) and each one
+**The body keys are ports you declare.** A route has no `body` port. On a
+JSON route (the default), you say which top-level keys you want
+(`-> (name: String, age: Number)`) and each one
 arrives typed on its own port, the same way an LLM call with Parse JSON on
 splits its reply. Anything you did not name is dropped, so name every key you
 mean to read. The request itself is always there on the fixed ports: `method`, `path`, `params` (the `{name}` captures of the path),
@@ -32,7 +33,7 @@ takes a picture the body carries as a data URL or base64: the route stores it
 and hands you the stored-file value, never the bytes.
 
 **Reply is one message.** Behind a `Route` it is the response: `status`,
-`headers`, the `body`, and the exchange ends. The body's shape follows the
+`headers`, and the `body`. Sending it ends the exchange. The body's shape follows the
 route's `dataType`: any value on the default `json`, a `String` on `text`, a
 stored file on `bytes`. A stored file inside a `json` body goes out as a link
 the caller can fetch (`{ url, mimeType, filename, sizeBytes }`). Every answer
@@ -45,7 +46,8 @@ between runs is the file itself.
 weft activate
 ```
 
-`activate` compiles the project and registers it, printing `activated <name> (<id>)`.
+`activate` compiles the project and registers it, printing `activated <name>
+(<id>)` (see [Triggers](../language/triggers.md#activation)).
 A project with triggers has to be activated; one without them just runs.
 
 It prints no URL, and it does not need to: the address is fixed by the
@@ -63,22 +65,13 @@ curl -X POST "http://127.0.0.1:9999/connect/local/hello" \
 "ada"
 ```
 
+![A curl request and its response in a terminal](../img/url-curl.png)
+
 Each request is a full execution with its own color and its own row in the
 editor's execution list. `weft follow <project>` streams them
 live as they arrive.
 
 ![The executions list filling up as requests arrive](../img/executions-list.png)
-
-<!-- IMAGE ------------------------------------------------------------------
-file:  docs/src/img/executions-list.png
-kind:  gif (about 8 seconds) or screenshot
-brief: The VS Code sidebar's Weft executions tree, with several executions
-       appearing one after another as curl requests land, each showing its
-       colour id, its status (running then completed), and its timestamp.
-       If a gif: fire four or five requests so rows appear in sequence and the
-       running one flips to completed. Beside it, the graph view showing the
-       most recent execution replayed.
---------------------------------------------------------------------------- -->
 
 ## What just happened underneath
 

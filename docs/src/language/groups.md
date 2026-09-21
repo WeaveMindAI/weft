@@ -124,7 +124,7 @@ several inputs](syntax.md#needing-one-of-several-inputs).
 
 ## A group that hands nothing back
 
-The arrow is optional. A group whose job ENDS inside it, writing the row,
+The arrow is optional. A group whose job ends inside it, writing the row,
 sending the message, uploading the file, has nothing to hand its caller, so
 it takes inputs and stops there:
 

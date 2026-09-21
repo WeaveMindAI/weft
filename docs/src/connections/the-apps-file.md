@@ -30,7 +30,7 @@ The daemon copies it into the cluster, so an edit only takes effect after
 another `weft daemon start`. Nothing reads your local disk at run time.
 
 For more services, start from
-[access-apps.example.json](https://github.com/WeavemindAI/weft/blob/mvp/access-apps.example.json)
+[access-apps.example.json](https://github.com/WeaveMindAI/weft/blob/mvp/access-apps.example.json)
 and keep the entries you want. If there is no file and no
 `WEFT_ACCESS_APPS_FILE`, you simply have no operator-configured apps.
 
@@ -61,6 +61,8 @@ An OAuth app has to declare `covers`, and an empty list means it asks for
 nothing. Those entries are checked against the service's permission catalog.
 An `events` block on a service with no webhook transport is refused. So are
 invalid JSON and a configured file that is not there.
+
+![The apps check command's output](../img/apps-check.png)
 
 ## Apps that ship with a step
 

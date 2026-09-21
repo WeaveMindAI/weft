@@ -18,6 +18,8 @@ The key is the space heading plus the file id underneath it, so
 filename. These work from anywhere, not just inside a project. The editor has a
 browser for the same thing, which can also pick a file for a program input.
 
+![The files list with a stored file and its size](../img/files-panel.png)
+
 `weft files rm <key>` deletes one, after asking. A key ending in `/` means a
 whole space, so read it twice before confirming.
 
@@ -38,7 +40,11 @@ weft or a fresh download link is made. Listing files, looking at their
 metadata, or reusing a link you already have does not reset anything.
 
 To keep an execution file after the fact, put a `KeepFile` step in. Its
-`ttl_days` is 30 by default and zero means forever. It only applies to
+`ttl_days` is 30 by default and zero means forever. Its `scope` input decides
+where the copy lands: the default `execution` keeps the file on this run, and
+`project` copies it out so later runs can use it too. The two inputs do not
+combine: `ttl_days` set together with `scope: project` is refused, because
+project files have their own lifetime. It only applies to
 execution files: project and shared files have their own lifetimes and refuse
 it.
 
@@ -66,8 +72,8 @@ though whether it works from the internet depends on the installation.
 provide it.
 
 Links last 15 minutes by default and seven days at most. A signed bucket URL
-can outlive the file it points at. A public relay link holds off the file's own
-expiry until the link dies, which is not the same as keeping it.
+can outlive the file it points at. A public relay link extends the file's own expiry only while the link is
+alive; it does not keep the file for good.
 
 So keep the file *reference* in your program's outputs and make a link at the
 moment you hand it over. Save the link as the output instead and every old run

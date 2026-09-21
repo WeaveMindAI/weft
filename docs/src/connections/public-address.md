@@ -14,6 +14,8 @@ That starts a Cloudflare quick tunnel and reports a random hostname, which can
 change whenever the tunnel restarts. For a hostname that stays put, keep
 reading.
 
+![The public URL panel with a tunnel running](../img/public-url-panel.png)
+
 The tunnel dials out from the cluster, so you do not need to forward a port on
 your router.
 
@@ -65,10 +67,9 @@ export WEFT_PUBLIC_TUNNEL_HOSTNAME='https://weft.example.com'
 Both have to be there, and the hostname has to be HTTPS with no port, path or
 query. A `.env` file works too, with the same two names and no `export`. If a
 name is in both places, what you exported is what weft uses. weft remembers
-that
-you want a public URL, so later starts keep one, but it does not remember your
-token. Start without those two set and you get a quick tunnel again, on a new
-random hostname, so keep them somewhere you can find them.
+that you want a public URL, so later starts keep one, but it does not
+remember your token. Start without those two set and you get a quick tunnel
+again, on a new random hostname, so keep them somewhere you can find them.
 
 Open the address in a browser afterwards. weft's landing page means requests
 are reaching the proxy. It says nothing about whether a provider's credentials

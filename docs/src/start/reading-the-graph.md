@@ -5,10 +5,6 @@ on the right.
 
 ![The greeting source on the left and its graph on the right](../img/graph-split-view.png)
 
-<!-- IMAGE: graph-split-view.png. The three-node name/message/out example as
-it looks right after opening main.weft. Source left, graph right. No inspector
-open. Do not reverse these panes: the graph opens on the right. -->
-
 You can use the buttons at the top right to open and close the graph or the code view. Type in either pane and the other updates live.
 
 Everything below works with the mouse.
@@ -49,6 +45,8 @@ for done, a filled circle while it is working, a ringed dot while it waits for
 an answer, a cross for failed, a slashed circle for skipped, and a filled
 square for a run you stopped. The whole box glows too: amber while it works,
 cyan while it waits, green when it finished, red when it failed.
+
+![Node status markers: running, waiting, done, failed](../img/graph-status.png)
 
 ## Get around the canvas
 
@@ -124,10 +122,6 @@ cost.
 
 ![The message inspector showing the name that went in and the greeting that came out](../img/graph-inspector.png)
 
-<!-- IMAGE: graph-inspector.png. One node selected, inspector open on that
-firing's inputs and outputs, plus status and timing. Pick a node whose value
-is interesting. -->
-
 If a box failed, the same magnifying glass shows the error, and the bar at the
 bottom keeps the failure on screen until you dismiss it.
 
@@ -171,7 +165,7 @@ brings only the work needed through it; a loop is the exception and comes
 along whole. For the exact rules, read
 [What actually runs](../language/mental-model.md#what-happens-when-you-hit-run).
 
-An aimed run answers only to what it would execute. If the targets' joined
+If the targets' joined
 subgraph reaches no trigger, the Run button shows up even in a project whose
 triggers are the usual way in, which is how a hand-fired maintenance branch
 runs without activating anything. It is also gated by exactly the infra it
@@ -190,10 +184,6 @@ and **Expand group** when it is shut. The wiring outside does not change either
 way.
 
 ![One group collapsed, then expanded with the same outside connections](../img/graph-groups.png)
-
-<!-- IMAGE: graph-groups.png. Left: a group collapsed to one box with its
-name, description line and boundary ports. Right: the same graph expanded,
-children visible. The outside wiring must be identical in both. -->
 
 Once a program gets big, start with the groups shut. If one group's answer is
 wrong, open it up, check the boxes inside, and keep going until you find the one
@@ -214,4 +204,4 @@ Where you drag a box is saved next to the program, in `layouts/`, not in
 Moving one *into* or *out of* a group does change it, because it changes what
 that step can reach.
 
-Next, [put a person in the loop](a-person-in-the-loop.md).
+Next, [put it on a URL](on-a-url.md).

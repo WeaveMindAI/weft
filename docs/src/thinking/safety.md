@@ -42,7 +42,7 @@ weft is powerful enough to build that level of coordination. But:
    decision.
 4. **The more coordination you pull out of the model, the more interpretable the system gets.**
    Everything a run did is in the journal, and you read it
-   against a graph you already have in front of you. One agent node doesn't get more intepretable, but each time you take a
+   against a graph you already have in front of you. One agent node doesn't get more interpretable, but each time you take a
    piece of what the model was deciding and make it explicit in the graph, a
    piece of what used to be an unreadable trajectory becomes something you can
    actually inspect.

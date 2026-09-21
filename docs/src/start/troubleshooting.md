@@ -71,6 +71,8 @@ weft daemon status
 weft daemon logs
 ```
 
+![The doctor command's output](../img/doctor-output.png)
+
 If you stopped it, `weft daemon start` brings it back. If it refuses to start,
 read the error before you start reinstalling things: it usually names a
 missing tool, a port already in use, or a database that needs a migration.

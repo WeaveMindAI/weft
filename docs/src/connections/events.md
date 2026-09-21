@@ -4,10 +4,19 @@ A Slack message or an incoming email can start a program through a trigger.
 How that event reaches weft depends on the service and on the connection you
 picked.
 
+```mermaid
+flowchart TD
+    P["Provider"] -->|"emits an event"| T["Transport: webhook or socket"]
+    T --> L["Listener"]
+    L --> R["Trigger's run"]
+```
+
+![One provider event flowing through the recipe to a trigger's run](../img/events-flow.png)
+
 ## Does it need a public address?
 
-These are the triggers people hit this with. Any other one says which
-transports it can use in its own description in the picker.
+These are the triggers most affected. Any other trigger says which
+transports it can use in its description in the picker.
 
 Some transports dial out from weft and hold the line open. Others need the
 provider to send a request in, which means weft has to be reachable.
@@ -20,6 +29,8 @@ provider to send a request in, which means weft has to be reachable.
 | Email arrivals | An outgoing IMAP connection |
 
 An outgoing connection works from behind a home router. A webhook does not.
+Slack App Messages is the one you want if you are distributing the app and
+want events from every install.
 
 When you activate the project, the trigger picks whichever transport its
 connection can actually support. If none of them can work, activation stops
@@ -51,8 +62,7 @@ connect your own app. Under Event Subscriptions, subscribe the bot to
 `message.channels`, plus `reaction_added`, `reaction_removed` and
 `file_shared` if you are using those triggers. Slack's own [Socket Mode
 setup](https://docs.slack.dev/tools/python-slack-sdk/socket-mode/) covers
-their side. Slack App Messages is the one you want if you are distributing the
-app and want events from every install.
+their side.
 
 **Email.** Supply the mailbox's IMAP settings and credentials, and check the
 provider allows IMAP for that account, since several turn it off by default.

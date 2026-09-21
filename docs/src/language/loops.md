@@ -41,7 +41,7 @@ A branch with no connection to a loop output holds nothing up.
 
 So if you need an action to actually finish first, wire an output that the
 action emits *after* it finishes into a loop output or into `self.done`.
-Sequential on its own does not make disconnected body work wait.
+Sequential on its own does not make work in a disconnected branch wait.
 
 Set `parallel: true` to launch the iterations together. Gathered results still
 come back in input order even when later ones finish first. There is no setting
@@ -62,6 +62,8 @@ What a port does depends on the signature plus the `over` and `carry` lists:
 That last row is a **gather**. Each iteration gets a slot, in index order, and a
 wired output that closes leaves `null` in its slot. So the signature has to
 allow `Null`, or you get `gather-output-must-be-nullable`.
+
+![The loop inspector showing each iteration](../img/loop-iterations.png)
 
 The loop also gives you `self.index`, the iteration number counting from zero,
 and `self.done`, which you write into to stop a sequential loop. Do not declare
@@ -89,8 +91,8 @@ sum.total = 0
 show = Debug { data: sum.total }
 ```
 
-`self.total` starts at `0`, then reads `1`, then `3`, and `6` comes out at the
-end. A carry is a single value, so it does not need the list type a gather
+`self.total` sees `0`, then `1`, then `3` across the three iterations, and
+`sum.total` hands back `6`. A carry is a single value, so it does not need the list type a gather
 does. Carry only works in sequential mode.
 
 If a carry write closes, the previous value stays. The seed input the compiler

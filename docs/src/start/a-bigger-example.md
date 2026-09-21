@@ -2,8 +2,10 @@
 
 The [Telegram image bot](https://github.com/WeaveMindAI/weft/tree/mvp/examples/telegram-image-bot)
 turns a chat message into a picture. Before it calls the model it takes one
-credit off the sender's balance, kept in the program's own database. No
-account or no credits, and they get a polite refusal instead.
+credit off the sender's balance, kept in the program's own database. With no
+account or no credits, they get a polite refusal instead.
+
+![The Telegram support bot's graph](../img/telegram-bot-graph.png)
 
 It is worth opening because it is the first program here with real parts: an
 outside service, a database of its own, a model call, and a form for you to
@@ -31,7 +33,7 @@ Now give yourself an account. Right-click the `enroll` step, choose **Set as
 target**, and run. That runs the enrollment path on its own, which creates the
 table and then waits on the **Add a user** form. Fill it in from the browser
 extension with your numeric Telegram user id and a starting balance, leaving
-the balance empty for five. Wait for that run to finish.
+the balance empty to start with five. Wait for that run to finish.
 
 Turn the bot on with `weft activate`, then send it a picture request in
 Telegram. Open the run in the graph and watch the credit check, the prompt
@@ -72,10 +74,9 @@ return {"paid": True}
 ```
 
 Notice that the success case never mentions `refusal`. That omission is what
-closes the output, and the closed output is what keeps the apology quiet. It
-is worth reading [the closed pulse](../language/mental-model.md#how-a-branch-stops-the-steps-after-it)
-if that feels like sleight of hand, because it is the rule the whole language
-branches on.
+closes the output, and the closed output is what keeps the apology quiet. If that feels like sleight of hand, read [how a branch stops the steps after
+it](../language/mental-model.md#how-a-branch-stops-the-steps-after-it);
+closure-driven skipping is used throughout this book.
 
 ## Two front doors, one program
 

@@ -2,9 +2,8 @@
 
 Every execution writes an append-only record: one row per event, in order.
 
-It is not a log. A log is prose a human reads when something breaks. The
-journal is the **state of the execution**, in a form that can be replayed to
-reconstruct it exactly.
+It is not a log; it is the **state of the execution**, written so it can be
+replayed to reconstruct that state exactly.
 
 That is what lets weft pick a program back up long after the process that
 started it is gone.
@@ -14,39 +13,43 @@ started it is gone.
 | Group | Events |
 |---|---|
 | Lifecycle | execution started, node kicked, node started, completed, failed, skipped, suspended, resumed, cancelled |
-| Data flow | port emitted, port closed, port type mismatch, pulses consumed, run output |
+| Data flow | port emitted, port closed, pulses consumed, run output |
 | Loops | loop instantiated, iteration launched, loop out fired, stream ended, terminated |
 | Suspensions | suspension registered, suspension resolved |
 | Money and logs | cost reported, log line |
 | Terminals | execution completed, failed, cancelled |
 | Buses | joined, left, window, closed |
-| Live callers | connected, inbound, outbound, errored, disconnected |
+| Live callers | connected, window, errored, disconnected |
 
 Each row carries the execution's color, so reading an execution is one indexed
 query ordered by row id.
 
 A value a node emits is written once, on the port emitted row, however many
-wires it fans out on. Which wires carried it, which ports a firing closed,
-what a group boundary forwarded, and what each loop iteration received are
-never written: they are worked out again from the program when the journal
-is read. Group boundaries have no rows at all. So the journal is the list of
-facts the engine learned from outside (a trigger payload, a node's emission,
-a person's answer, a log line, a cost, a stream take, a cancellation), and
-reading it means replaying those facts over the program.
+wires it fans out on. What is never written: which wires carried it, which
+ports a firing closed, what a group boundary forwarded, and what each loop
+iteration received. Those are worked out again from the program when the
+journal is read, and group boundaries have no rows at all. So the journal is
+the list of facts the engine learned from outside (a trigger payload, a node's
+emission, a person's answer, a log line, a cost, a stream take, a
+cancellation), and reading it means replaying those facts over the program.
 
 ## How it is used
 
 **During a normal run, nothing reads it.** The worker holds the whole execution
 in memory and writes rows as it goes. Each write is a checkpoint.
 
-It matters at two moments. When a worker has to rebuild an execution it did
-not run, on a resume or after the previous worker died, it fetches the program
-the execution was started against and **folds** the rows over it in order,
-reconstructing the pulse table, which nodes completed, which are suspended,
-and where each loop got to, and carries on. And whenever something wants to
-show a run (the editor's execution view, `weft events`), the dispatcher folds
-the same way and hands out what the fold derived: the values each firing
-received and emitted, the group boundaries that ran or were skipped.
+It matters at two moments.
+
+The first is a rebuild. When a worker has to pick up an execution it did not
+run, on a resume or after the previous worker died, it fetches the program the
+execution was started against and **folds** the rows over it in order. The
+fold reconstructs the pulse table, which nodes completed, which are suspended,
+and where each loop got to, and the worker carries on.
+
+The second is a view. Whenever something wants to show a run (the editor's
+execution view, `weft events`), the dispatcher folds the same way and hands
+out what the fold derived: the values each firing received and emitted, the
+group boundaries that ran or were skipped.
 
 ## Reading it yourself
 
@@ -70,6 +73,8 @@ and you see the values that firing actually received and emitted.
 A failed run from last Tuesday is still readable node by node, with the real
 values on the real wires, so you rarely have to make a bug happen again to
 study it.
+
+![The execution inspector showing journal events](../img/journal-events.png)
 
 ## Why debugging scales
 
@@ -109,7 +114,7 @@ carries a stream of messages:
   about, and the true size travels beside it. Nothing is refused for being
   big; what a channel carries and what the journal keeps of it are separate
   questions.
-- **Raw bytes are never written down**, whatever the setting says. The size is
+- Raw bytes are **never written down**, whatever the setting says. The size is
   the whole of what is worth keeping: the content would be a third bigger as
   text and unreadable to whoever is looking at it.
 - **Ephemeral means metadata only**, and the content then lives only in that
@@ -243,7 +248,5 @@ journal. A node that had finished but whose completion row was lost gets
 re-run.
 
 For an action that charges money or sends a message, repeating it can matter.
-[`ctx.run`](../nodes/durable-execution.md) reuses a result once it has been
-saved. If the action succeeded but saving its result failed, the action can
-still repeat. Preventing a duplicate requires the receiving service to
-recognize repeated requests, using the same request identifier each time.
+Preventing a duplicate, and the rule about saving the request identifier, is in
+[`ctx.run`: reusing a saved result](../nodes/durable-execution.md#ctx-run-reusing-a-saved-result).

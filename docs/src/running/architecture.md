@@ -106,7 +106,7 @@ gets a hole for exactly that.
 The local management API has no authentication of its own, so whoever can
 reach it can do anything a project owner can. Keep it off any interface you do
 not control. For the rest of the boundaries, read the [security
-policy](https://github.com/WeavemindAI/weft/blob/mvp/SECURITY.md).
+policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
 
 ## Recovery
 

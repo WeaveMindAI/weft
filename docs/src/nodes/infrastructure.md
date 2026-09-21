@@ -1,12 +1,14 @@
 # Infrastructure nodes
 
 If a node needs its own running service, such as a database or a WhatsApp
-bridge, declare that service as infrastructure. weft can start it and
-track its health alongside the program.
+bridge, declare that service as infrastructure. weft starts it and tracks its
+health alongside the program.
 
-The node returns an `InfraSpec` built from Rust types. weft compiles the
-spec into Kubernetes resources, and the supervisor applies them. Your
-node then uses the declared endpoints to talk to the service.
+You describe the service by returning an `InfraSpec` built from Rust types.
+weft compiles the spec into Kubernetes resources and the supervisor applies
+them. Your node then uses the declared endpoints to talk to the service.
+
+![An infrastructure node's panel showing its endpoints](../img/infra-panel.png)
 
 ## Two methods
 
@@ -21,21 +23,20 @@ Provisioning describes what to run. It does not emit values. Its context
 supplies the node and project identity, tenant, and namespace.
 
 For a complete implementation, read the
-[Postgres database node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/postgres/database).
+[Postgres database node](https://github.com/WeaveMindAI/weft/tree/mvp/catalog/postgres/database).
 It provisions a database, obtains its credentials, and publishes a
 connection other nodes can use.
 
 ## Return a stable spec
 
 When you start or upgrade infrastructure, weft compares the spec with the
-applied state. Build it from the declared inputs and node identity so that
-an unchanged configuration produces an unchanged spec.
+applied state. So build the spec from the declared inputs and node identity:
+an unchanged configuration should produce an unchanged spec.
 
-Generating a fresh password inside `provision_infra`, for example,
-changes the desired state on every invocation. If the database keeps the
-original password on its volume, the new value will not match it.
-The Postgres node instead lets the service generate and retain the password,
-then retrieves it in `run`.
+A fresh password generated inside `provision_infra`, for example, changes the
+desired state on every invocation. If the database keeps the original password
+on its volume, the new value will not match it. The Postgres node instead lets
+the service generate and retain the password, then retrieves it in `run`.
 
 This fragment describes a bridge image exposing an HTTP endpoint.
 Place the method in your `impl Node` block and the imports at module scope:
@@ -84,8 +85,10 @@ async fn provision_infra(
 }
 ```
 
-Your image must listen on the supplied port and serve `/health`.
-For how to include that image, see [Packaging](#packaging) below.
+Your image must listen on the supplied port and serve `/health`. The
+readiness probe names a route the service answers with HTTP 200 once it can
+accept work, and that is how weft knows the unit is ready. For how to
+include that image, see [Packaging](#packaging) below.
 
 ## The spec
 
@@ -118,29 +121,27 @@ for a Kubernetes shutdown hook. weft does not call a Rust node method at
 container shutdown.
 
 For all fields and builder methods, read the
-[infrastructure types](https://github.com/WeavemindAI/weft/blob/mvp/crates/weft-core/src/infra/types.rs).
+[infrastructure types](https://github.com/WeaveMindAI/weft/blob/mvp/crates/weft-core/src/infra/types.rs).
 
-### Volumes and network access
-
-A `Volume` has a `name` and a `VolumeKind`. A
-`VolumeKind::Persistent` creates persistent storage; the other kinds are
-`EmptyDir`, `ConfigMap`, and `Secret`.
-Persistent volumes survive ordinary stop and upgrade. Termination removes
-them unless the lifecycle policy names them for preservation.
-
-### The rest
+### Images
 
 **`Image`** is `Image::Local { name }`, built from a directory listed in the
 node's `images` and hash-tagged by the CLI, or `Image::Upstream { reference }`
 such as `"postgres:18"`.
 
+### Endpoints
+
 **`Endpoint`** is `name`, `unit`, `container`, `port` (the named container
-port), and `expose`: `ClusterInternal` (default), `TenantPublic{path}`, or
-`NodePort{port}`. The unit-container-port chain is validated at compile time.
+port), and `expose`: `ClusterInternal` (default), `TenantPublic { path }`, or
+`SameNetwork`. The unit-container-port chain is validated at compile time.
+
+### Volumes
 
 **`Volume`** is `Persistent { size, storage_class?, access_modes }`, preserved
 across stop and upgrade and deleted on terminate unless listed in
 `preserve_pvcs`, or `EmptyDir`, `ConfigMap`, `Secret`.
+
+### Access
 
 **`Access`** is ingress rules (`FromWorkers` default, `FromInternet`,
 `FromCidrs`, `FromLabel`) plus egress (`ToInternet` default, `ToCidrs`),
@@ -217,8 +218,8 @@ Endpoint {
 }
 ```
 
-That is the whole of it. The endpoint says it is reachable and it is, the same
-way a volume you declare is a volume you get. Nothing opens a door after the
+That is the whole of it. The endpoint says it is reachable and it is, the
+same way a volume you declare is a volume you get. Nothing opens a door after the
 fact, and nothing in the project's source can open one your node did not
 declare, so reading the node tells you what is reachable.
 
@@ -241,8 +242,7 @@ expose: if reachable { Expose::SameNetwork } else { Expose::ClusterInternal },
 
 That is how `PostgresDatabase` does it, with a `reachable` input that is off
 by default. The lever is an ordinary port with a label and a description, it
-shows up in the graph next to the disk size, and whether a database is
-reachable reads as part of what the program is.
+shows up in the graph next to the disk size.
 
 ### Finding the address
 
@@ -260,16 +260,13 @@ node already said.
 
 ### The rule: never a credential endpoint
 
-If you write only one thing down from this page, write this one.
-
-**An endpoint that hands out a credential is never `SameNetwork`.** Not when
-it would be convenient, not when it is guarded by a token, not when it only
-answers once.
+**An endpoint that hands out a credential is never `SameNetwork`.**
+Convenience, a guarding token, a one-shot answer: none of them change it.
 
 `PostgresDatabase` is the worked example, because it has one of each. Postgres
 itself listens on `sql`, and reaching it still costs you a password, so that
 endpoint is `SameNetwork`. Beside it runs a small server that mints that
-password, on `credential`, and that one stays `ClusterInternal` for ever. A
+password, on `credential`, and that one stays `ClusterInternal` forever. A
 door onto it would hand the database away to anything that could reach the
 port.
 
@@ -303,7 +300,7 @@ same body, so a program that wants the full connection through the door says
 so and gets it.
 
 The rule that IS absolute is the one above: an endpoint that hands out a
-credential is never `SameNetwork`. That one holds whatever anybody intends.
+credential is never `SameNetwork`.
 
 ## The routes your container serves
 
@@ -335,9 +332,6 @@ Add an `action` object to a live item to give it a button:
 Clicking it sends the action kind and payload to `/action`.
 For item types, read
 [What your node shows in the graph](showing-things-in-the-graph.md#its-display).
-
-For readiness, choose a route such as `/health` and declare it with
-`Probe::http`. Have the service return HTTP 200 when ready to accept work.
 
 ## Lifecycle
 
@@ -412,7 +406,7 @@ container security context or resource limits for you.
 
 These are services you choose to run, including their images and code.
 For the installation's trust boundaries, read the
-[security policy](https://github.com/WeavemindAI/weft/blob/mvp/SECURITY.md).
+[security policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
 
 ## Packaging
 

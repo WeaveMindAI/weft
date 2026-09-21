@@ -11,8 +11,11 @@ let text: String = ctx.inputs.get("text")?;
 ctx.pulse_downstream(NodeOutput::new().set("value", text)).await?;
 ```
 
-`ctx.inputs` contains the firing's wired, literal and defaulted inputs.
+`ctx.inputs` holds the firing's inputs, however each was supplied
+([which values reach it](values-and-emission.md)).
 A firing trigger also reads its event from `ctx.wake`.
+
+![The inspector showing a firing's input values](../img/inspector-inputs.png)
 
 | To… | Use |
 |---|---|
@@ -124,7 +127,8 @@ ctx.tag_execution(["user_7"]).await?;
 ctx.stop_tagged("user_7", StopSelf::Keep).await?;
 ```
 
-`StopSelf::Keep` uses tag-registration order to protect newer runs.
+`StopSelf::Keep` uses tag-registration order: runs that registered the tag
+later than this run are left alone.
 For the ordering and when a queued stop takes effect, read
 [Stopping other runs](steering-executions.md).
 

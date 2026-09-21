@@ -36,6 +36,8 @@ Its ports become `triage`'s ports and you wire it like any node. An include is
 the same boundary as an ordinary [group](groups.md), so the same guarantees
 hold: children reach each other and `self`, and nothing else.
 
+![A file brought in with @include, shown as one group on the canvas](../img/include-group.png)
+
 An included file is compiled once, however many places include it. Each
 `@include` is a call: when a run reaches `triage`, the values on its ports go
 into the file's one body under a frame that names the call site, the body
@@ -160,21 +162,14 @@ Right before every build, weft uploads new or changed files and puts their
 stored references into the compiled workflow. Identical content shares one
 uploaded copy, so an unchanged file is not uploaded again.
 
-Uploaded files stay available while the current workflow uses them. An
-upload starts on a 30-day countdown, and a successful build clears it for
-every file the workflow references; a build that failed after uploading
-leaves its files to expire on their own. Once a successful build or status
-check sees that a file was replaced or removed, its old uploaded copy gets
-the same 30-day countdown. Opening or using that copy
-restarts the countdown; building or checking status again does not. Using
-the file in the current workflow again removes the countdown.
-
-A waiting run keeps the reference to its original file. Waiting alone does
-not extend the file's life: after 30 days without access, the old copy can
-expire. If that run later needs it, the node fails with the file's name,
-an explanation that it may have expired or been deleted, and instructions
-to upload or create the file again and start a new run. It does not silently
-skip the node. Files created by nodes keep their own chosen lifetime rules.
+A file the current workflow uses never expires. Unused uploaded copies expire
+after 30 days of not being touched, and a waiting run can outlive its file: it
+keeps only a reference to the original, so after 30 days without access the
+old copy can expire and the node fails with the file's name, an explanation
+that it may have expired or been deleted, and instructions to upload or create
+the file again and start a new run. Opening or using a copy restarts its
+countdown; building or checking status does not. Files created by nodes keep
+their own chosen lifetime rules.
 
 Your node code never sees any of this. At run time the value on the port is an
 ordinary media value, and inside the running node its marker also carries a

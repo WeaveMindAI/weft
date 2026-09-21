@@ -5,6 +5,8 @@ sit there until tomorrow. weft records the wait. When the answer arrives,
 it runs the body again from the top and supplies the saved answer at the
 same call.
 
+![A suspended execution resuming after an answer arrives](../img/durable-wait.gif)
+
 That changes how you write the work around a wait. A network request on
 line two can run again even though the user is answering the question on
 line ten.
@@ -25,7 +27,7 @@ can continue. When the body runs again, that call returns the recorded
 answer and the code continues below it.
 
 For a complete form-building implementation, read
-[HumanQuery](https://github.com/WeavemindAI/weft/blob/mvp/catalog/human/query/mod.rs).
+[HumanQuery](https://github.com/WeaveMindAI/weft/blob/mvp/catalog/human/query/mod.rs).
 To use a human step in a program, follow
 [A person in the loop](../start/a-person-in-the-loop.md).
 
@@ -42,6 +44,18 @@ When each answer arrives after its wait has been registered, the sequence is:
 
 The code before approval ran three times. The work between the waits ran
 twice. A worker crash can add more attempts.
+
+```mermaid
+sequenceDiagram
+    participant Node
+    Node->>Node: suspend at the first wait
+    Note over Node: answer arrives
+    Node->>Node: body re-runs from the top
+    Node->>Node: return the saved answer
+    Node->>Node: suspend at the second wait
+    Note over Node: answer arrives
+    Node->>Node: body re-runs and finishes
+```
 
 ## `ctx.run`: reusing a saved result
 
@@ -102,8 +116,8 @@ stable.
 ### Emitting before a wait is refused
 
 Finish your durable waits before emitting or closing any output.
-`await_signal` rejects a firing that has already mentioned an output,
-because replaying it would repeat the emission. It also rejects nodes
+`await_signal` rejects a firing that has already emitted on or closed an
+output, because replaying it would repeat the emission. It also rejects nodes
 with generator inputs, whose earlier stream reads cannot be replayed.
 
 If the node needs to exchange messages while it stays alive, use a

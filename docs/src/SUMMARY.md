@@ -27,9 +27,11 @@
 
 # Connecting services
 
+- [How connections work](connections/overview.md)
 - [Connect an account](connections/connect-an-account.md)
 - [Events from a service](connections/events.md)
 - [A public address](connections/public-address.md)
+- [The apps file](connections/the-apps-file.md)
 
 # Running programs
 
@@ -39,7 +41,6 @@
 - [Versions, seeded runs and frozen examples](running/versions.md)
 - [Files at run time](running/files.md)
 - [How the runtime is built](running/architecture.md)
-- [The apps file](connections/the-apps-file.md)
 
 # Writing nodes
 
@@ -60,7 +61,9 @@
 - [Stopping other runs](nodes/steering-executions.md)
 - [Infrastructure nodes](nodes/infrastructure.md)
 - [Packaging](nodes/packaging.md)
-- [How connections work](connections/overview.md)
+
+# Connections in a node
+
 - [Using a connection in a node](connections/using-a-connection.md)
 - [Declaring a service](connections/writing-a-service.md)
 - [Measuring what a call costs](connections/meters.md)

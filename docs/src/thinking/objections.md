@@ -1,8 +1,8 @@
-# Objections we sometimes get and what we think about them
+# Things people say to me
 
 ## "Why a new language? Just make it a library"
 
-For the actual work, weft is a Rust framework. You write a step's logic in Rust with the APIs weft gives you, and I'm not going to invent a new syntax for parsing a response or adding up a number. The language has one job: saying how the pieces fit together. For that job the syntax is the whole point.
+For the actual work, weft is a Rust framework. You write a step's logic in Rust with the APIs weft gives you, and I'm not going to invent a new syntax for parsing a response or adding up a total. The language has one job: saying how the pieces fit together. For that job the syntax is the whole point.
 
 In a normal codebase the architecture isn't written down anywhere. It's something you reconstruct by reading the implementations and working upwards. That's fine while everything fits in context. It stops being fine the moment it doesn't, and that's exactly what happens to a coding assistant: it goes down into one detail, does a good job on the piece in front of it, and doesn't know the shape it was supposed to plug into. So it writes a second version of something that already exists, or a path around the infrastructure it should have used. And by default, if you don't guide it, it writes with no structure at the top at all, because nothing in the language asks for one. It works right up until it doesn't.
 
@@ -18,18 +18,14 @@ And you don't have to hand the project to one assistant at all. Agree the contra
 
 It absolutely can. Two hundred boxes on a canvas don't become understandable because you can zoom out far enough to see them all.
 
-The difference is that the nesting isn't an editor feature, it's in the language. A group is a real boundary with declared inputs and outputs, so folding it away actually removes something from what you have to think about. You still have to pick useful boundaries. No editor rescues a design where everything needs to know about everything else, but the compiler warns you when a level of the graph is getting crowded, and Tangle is told to group things before it gets there. The graph also has a text form: the `.weft` file you review in git *is* the source, and the editor edits that file, not a separate model of it.
+The difference is that the nesting isn't an editor feature, it's in the language. A group is a real boundary with declared inputs and outputs, so folding it away actually removes something from what you have to think about. You still have to pick useful boundaries. No editor rescues a design where everything needs to know about everything else, but the compiler warns you when a level of the graph is getting crowded. The graph also has a text form: the `.weft` file you review in git *is* the source, and the editor edits that file, not a separate model of it.
 
 ## "The compiler checks the wiring, not whether the program is right"
 
 Correct. A perfectly well typed program can send a beautifully formatted wrong answer to the wrong person. What the checks catch today is incompatible port types, missing required inputs and cycles in the wiring. That's feedback about how the pieces got connected, which is exactly the kind of mistake an assistant makes and can fix without you. It says nothing about whether a step does the right work. Your judgement and the step's own tests still have jobs.
 
-Where I want to take it is proving things about how the program behaves, at compilation time. The idea is to let a node carry labels about what it is and what it does: a node that takes an action in the world says so, and how big that action is; a node that's an autonomous agent says so; a node that verifies something says what strength of verification it gives you. Then the compiler checks claims across the whole graph. Every path from an autonomous step to a high-stakes action goes through a verification of at least this strength, or a critical action has three separate human approvals in front of it. If the program doesn't hold up, it doesn't build.
-
-You could even record how often a model hallucinates, and get the chance that a step's output contains one after chaining several AI steps. Add a recovery step, like a second verification with a web search, and that chance drops.
-
-It doesn't exist yet but it's high in the roadmap. For the whole argument about why any of this matters, read [How I think about AI safety](safety.md).
+Where I want to take it is proving things about how the program behaves, at compilation time: letting a node carry labels about what it is and what it does, then having the compiler check claims across the whole graph, so that an autonomous step can't reach a high-stakes action without a strong enough verification in front of it. The full argument, and why I think it matters, is in [How I think about AI safety](safety.md).
 
 ---
 
-If something here looks wrong, or if you have other arguments, come tell me on [Discord](https://discord.com/invite/FGwNu6mDkU). Your argument could help shape weft into something more useful.
+If something here looks wrong, or if you have other arguments, come tell me on [Discord](https://discord.com/invite/FGwNu6mDkU).

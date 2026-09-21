@@ -1,8 +1,9 @@
 # Using a connection in a node
 
-Read an `Access` input, open it, and use the connection's client.
-Authentication is configured for you. Add `use weft::{Access, NodeErrExt};`
-at module scope, then put this fragment in the node's `run` method:
+If your node needs to call a service, take an `Access` input, open it, and use
+the connection's client. Authentication is already set up. Add
+`use weft::{Access, NodeErrExt};` at module scope, then put this fragment in
+the node's `run` method:
 
 ```rust
 let account: Access = ctx.inputs.get("account")?;
@@ -14,44 +15,15 @@ let response = conn.client()
     .node_err("calling the service")?;
 ```
 
-`url` is the service API address your node calls.
-For selecting an account in the editor, follow
-[Connect an account](connect-an-account.md).
-
-## Keep credentials out of the graph
-
-Config and port values are recorded in the journal and shown in the
-inspector. A password placed there becomes part of that record.
-
-Use an access node to collect credentials instead. It stores them in the
-access store and gives the graph a connection reference. For a new service,
-follow [Declaring a service](writing-a-service.md).
-
-The opened connection lets your implementation read values when it needs
-them. Keep secrets out of outputs, logs, and error messages.
-
-| Method | Returns |
-|---|---|
-| `client()` | The authenticated HTTP client |
-| `value("imap_host")?` | A stored value, or an error naming the missing field |
-| `opt_value("alias")` | An optional stored value |
-| `identity()` | The recorded display identity, if present |
-| `credential()?` | A single credential string, when the authentication recipe has one |
-
-`credential()` works when authentication consists of one step using one
-stored value, such as a bearer token. Basic authentication with a username
-and password has no single credential string, so this call fails.
-
-Use the raw credential only when an SDK requires it. If the SDK accepts an
-HTTP client too, give it the connection's client so its calls retain the
-authentication and measurement behavior.
+Here `url` is the service API address your node calls. If you need an account
+to connect in the editor first, follow [Connect an account](connect-an-account.md).
 
 ## Make calls through the connection
 
 The connection's client authenticates requests and applies any registered
-meter that recognizes them. A separately constructed client bypasses that
-work. Call the service's normal API address; the connection handles routing
-for a runtime-supplied credential.
+meter that recognizes them. A client you build yourself bypasses that work.
+Call the service's normal API address; the connection handles routing for a
+runtime-supplied credential.
 
 If you only need the client, use:
 
@@ -59,8 +31,8 @@ If you only need the client, use:
 let client = ctx.client(&account).await?;
 ```
 
-A refusal such as "connect your own" needs to reach the user. Silently
-retrying through another client does not fix the missing connection.
+When a node refuses a runtime credential, that refusal comes back through this
+call so the user sees why they must connect their own.
 
 ### Realtime connections
 
@@ -78,9 +50,13 @@ session.close().await?;
 
 The connection signs the handshake and handles routing. A registered
 session meter can measure the exchange. Your node still implements the
-provider's message protocol. Use a trusted provider URL; direct sockets
-attach authentication even outside the meter's declared API base,
-including when using a runtime-owned credential.
+provider's message protocol.
+
+Use a trusted provider URL. What happens next depends on whose credential
+signs the socket. With the user's own credential, direct sockets attach
+authentication even outside the meter's declared API base. With a
+runtime-owned credential, the same allowlist that guards HTTP calls applies,
+so the route must be classified by the meter or the dial is refused.
 For that distinction, read [Runtime-owned credentials](meters.md#the-runtime-credential-allowlist).
 
 ### Longer calls
@@ -100,10 +76,38 @@ let conn = ctx.open_within(
 
 This window does not change the lifetime of the user's own credentials.
 
+## Read the stored values
+
+The connection also hands you what the user stored when they connected. If
+your node reads mail, it can pick up the incoming server settings from here.
+
+| Method | Returns |
+|---|---|
+| `client()` | The authenticated HTTP client |
+| `value("imap_host")?` | A stored value, or an error naming the missing field |
+| `opt_value("alias")` | An optional stored value |
+| `identity()` | The recorded display identity, if present |
+| `credential()?` | A single credential string, when the authentication recipe has one |
+
+`credential()` works when authentication consists of one step using one
+stored value, such as a bearer token. Basic authentication with a username
+and password has no single credential string, so this call fails.
+
+Reach for the raw credential only when an SDK demands it. If the SDK accepts
+an HTTP client too, give it the connection's client so its calls keep the
+authentication and measurement behavior.
+
+Keep the values out of outputs, logs, and error messages. Whatever lands in
+config or a port value is recorded in the journal and shown in the inspector,
+and a password placed there becomes part of that record. That is also why
+credentials live in an access node's store rather than in your node: the
+store gives the graph a connection reference, not a secret. For a new
+service, follow [Declaring a service](writing-a-service.md).
+
 ## Declare the requirements on the input
 
-For example, a node reading mail might require the connection's incoming
-server settings:
+Say your node reads mail and needs the connection's incoming server settings.
+Declare them on the input:
 
 ```json
 {
@@ -129,7 +133,7 @@ Use `requiresScopes` for permissions needed by the node's own calls:
 ```
 
 A verified permission shortfall refuses the connection. Claimed or unknown
-permissions are allowed through because weft cannot establish that they
+permissions are allowed through, because weft cannot establish that they
 are missing; the provider can still refuse the request.
 
 A permission needed only to browse a resource list belongs on that picker
@@ -140,8 +144,9 @@ A service can declare capabilities that require the user's own account.
 Nodes request those through `requiresScopes` too. For declaring them,
 read [Own-account-only capabilities](writing-a-service.md#own-account-only-capabilities).
 
-These checks happen against the connection record. The compiler has a
-reference to that record, not its current credentials and permissions.
+These checks run against the stored connection record when the connection
+resolves, not against the provider's live state: weft cannot see permissions
+the provider granted after the record was written.
 
 ## Allow an absent connection where the API supports it
 
@@ -154,7 +159,7 @@ let account: Option<Access> = ctx.inputs.opt("account")?;
 let client = ctx.client(account.as_ref()).await?;
 ```
 
-With no account, this returns a plain client. Verify which API address
+With no account, this returns a plain client. Check which API address
 supports anonymous access: a provider may use a different route for public
 resources, or refuse private resources on that route even with credentials.
 
@@ -232,7 +237,7 @@ too. Catch errors inside later provider callbacks and pass them to
 
 Start from the provider's current embed example and connect its callbacks
 to these methods. For a complete metadata example, read
-[Google Sheets Read](https://github.com/WeavemindAI/weft/blob/mvp/catalog/google/sheets_read/metadata.json).
+[Google Sheets Read](https://github.com/WeaveMindAI/weft/blob/mvp/catalog/google/sheets_read/metadata.json).
 
 ## Publish a connection to a service your node runs
 
@@ -267,7 +272,7 @@ node's supplied values; it does not grant access to a runtime credential.
 
 ### Preserve a secret before retiring it
 
-The [Postgres database node](https://github.com/WeavemindAI/weft/blob/mvp/catalog/postgres/database/mod.rs)
+The [Postgres database node](https://github.com/WeaveMindAI/weft/blob/mvp/catalog/postgres/database/mod.rs)
 gets its password from the service on first use, publishes it, then tells
 the service to stop exposing it. Later runs use `ctx.published_access()`
 to retrieve the connection and confirm that its password still matches

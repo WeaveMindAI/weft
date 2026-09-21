@@ -1,6 +1,6 @@
 # What the compiler refuses
 
-Every validation error carries a stable slug, and this page is all of them,
+Every validation error carries a stable slug, and this page lists them,
 grouped by what they protect, with the fix. Parsing errors, and errors from
 the pass that looks up each node's ports, carry no slug: they point at the
 exact spot in your file and say what is wrong there.
@@ -25,6 +25,7 @@ exact spot in your file and say what is wrong there.
 | `duplicate-input-port` | two wires drive the same input. An input has exactly one source. |
 | `duplicate-node-id` | two nodes share an id in one scope. |
 | `gate-not-boolean` | a gate written down (either spelling) that is not `true` or `false`. A wire may carry any value; a constant is a Boolean. |
+| `two-gates` | a node has both `_should_flow` and `_should_not_flow`. A node has one gate; keep the one that says what you mean. |
 | `undeclared-port-no-custom` | a port was referenced that the node neither declares nor allows you to add. |
 | `value-on-output` | a value was written on one of the node's output ports. An output takes no value: a firing emits on it, and you read it as `node.port`. |
 
@@ -57,7 +58,10 @@ exact spot in your file and say what is wrong there.
 | `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
 | `trigger-into-trigger` | a trigger wired into another trigger. No phase delivers that. |
 | `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
-| `route-overlap` | two nodes of this program claim public addresses a single call could reach, so which one answers has no answer (`cards/count` against `cards/{id}`, on a shared method). Change one path, or give them different methods. The same question is asked again at activation, across every project of the account, because only the dispatcher knows what your other programs already serve. |
+| `route-overlap` | two nodes of this program claim public addresses a single call could reach, so it is undecidable which one answers (`cards/count` against `cards/{id}`, on a shared method). Change one path, or give them different methods. The same question is asked again at activation, across every project of the account, because only the dispatcher knows what your other programs already serve. |
+| `route-path-missing` | a node that claims an address has none, or has an empty one, so it would answer at the project's own address and collide with anything else that did. Give it a path. |
+| `route-path-invalid` | the path cannot be served as written, and the message says why. |
+| `route-method-unknown` | the method is not an HTTP verb weft recognises. |
 | `duplicate-port` | two ports on one side of a node share a name, usually two config-derived ports (form fields) given the same key. Give them different names. |
 | `config-ports-not-a-list` | the config key a node derives its ports from does not hold a list. |
 | `config-entry-not-an-object` | an entry of that list is not an object. |
@@ -117,6 +121,7 @@ one producer and one taker.
 | Slug | Meaning |
 |---|---|
 | `require-one-of-unmet` | an `@require_one_of` listing where nothing is satisfied. |
+| `require-one-of-unknown-port` | an `@require_one_of` list names an input the node does not have. Declare it, or drop it from the list. |
 | `unknown-type` | **a warning.** A declared node type is not in the project's catalog: a typo, or the node was never built. The message names the type. |
 | `no-required-skip` | **a warning.** Every input a wire feeds on this node is optional and there is no `@require_one_of`, so the node runs even when its inputs arrive as `null` values (a closed wire would skip it, but `null` is a value). Usually not what you want; add `@require_one_of`. A node built from written constants alone has no upstream and never gets this, and neither does a node with no outputs (a sink), nor a node whose created inputs are optional by nature (`optionalCustomInputs`, like `FirstInOrder`). |
 | `rule-structural` | a node's own declarative validation rule failed at compile time. The message is the node author's. |

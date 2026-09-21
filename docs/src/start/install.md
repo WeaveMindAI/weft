@@ -2,13 +2,13 @@
 
 You need [Docker](https://docs.docker.com/get-docker/),
 [kubectl](https://kubernetes.io/docs/tasks/tools/),
-[kind](https://kind.sigs.k8s.io/) and [Rust](https://rustup.rs/).
-Use VS Code for the graph editor.
+[kind](https://kind.sigs.k8s.io/), [Rust](https://rustup.rs/) and
+[VS Code](https://code.visualstudio.com/) for the graph editor.
 
 From a terminal:
 
 ```bash
-git clone https://github.com/WeaveMindAI/weft.git
+git clone --branch mvp https://github.com/WeaveMindAI/weft.git
 cd weft
 ./setup.sh
 ```
@@ -24,6 +24,8 @@ for installing it manually.
 If your shell cannot find `weft` afterwards, add the PATH line printed by the
 installer to your shell configuration. Then go to
 [Your first program](first-program.md).
+
+![The installer finishing with the CLI, daemon and editor built](../img/install-setup.png)
 
 ## Which build you get
 
@@ -99,5 +101,5 @@ To also discard the local runtime data and cluster:
 A purge deletes the cluster, runtime database, object-store data and weft
 images and caches. Use it only when you intend to lose that local state.
 
-Neither is ever needed to apply an update.
+You never need `--uninstall` or `--purge` to apply an update.
 Your project source files remain in their directories.

@@ -3,10 +3,7 @@
 The docs keep telling you a node does no plumbing, and then never tell you what
 plumbing actually is. So here it is.
 
-This is where the line sits today. If you think it should move, tell us.
-
-They're also aspirational. A commandment can be right, and weft can still not
-cover your case yet, or be missing an option you need. Tell us about that one too.
+This is where the line sits today.
 
 **The test underneath all of them:** if every node that needs a mechanism would
 need the same answer, the mechanism belongs in weft. If two good nodes would do
@@ -81,6 +78,11 @@ Every value on every wire is already in the inspector, live and afterwards. If a
 firing makes something worth looking at, declare a `display` and the editor
 renders it on the node. You never hand-deliver information to whoever is
 watching.
+
+These commandments are also aspirational. A commandment can be right, and weft
+can still not cover your case yet, or be missing an option you need. If you
+think the line should move, tell us about that one on
+[Discord](https://discord.com/invite/FGwNu6mDkU).
 
 ---
 

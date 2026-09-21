@@ -5,198 +5,36 @@ get fixed inline); these are architecture decisions that need design
 before implementation. Each entry carries its own what/why; a written
 plan lives in `docs/` while it is being worked.
 
-## Unify journal holes: a missing/corrupt event is a HOLE, fatal only on the resume frontier
+## Unify journal holes: a missing or unreadable event is a HOLE, fatal only on the resume frontier
 
-### Mental model first (read this, the rest follows from it)
+**Problem.** The journal records what the in-RAM run did; it only drives
+anything on a respawn. Two ways an event can be bad, two unrelated
+sledgehammers. A failed WRITE latches `PoisonOnWriteFailure` and exits
+the worker, even though the live run is fine and the node already fired
+downstream. An unreadable stored ROW makes `fold_journal` refuse the
+whole snapshot and tell the user to `weft clean`, even when the bad row
+sits in dead history nothing will resume over. Meanwhile the
+dispatcher's read path skips the same row and paints a marker.
 
-- A live worker runs the whole execution **in RAM**. Pulses flow out of
-  nodes and trigger downstream nodes; the worker holds all of that
-  state in memory.
-- The **journal is a write-as-you-go RECORD of what the in-RAM run
-  did**, NOT the thing driving each live step. The drive loop folds the
-  journal ONCE at boot, then works off the in-RAM snapshot. It only
-  reads the journal back to DRIVE on a **respawn** (a fresh worker
-  rebuilding state after a crash/eviction, or to resume a suspension).
-- So during a live run, every journal write is just "save a checkpoint
-  so a future respawn can rebuild this." A write failing does NOT break
-  the live run; it only leaves a HOLE that a future respawn would have
-  to deal with.
+**Direction.** One concept: the journal has a hole at some position,
+found either at write time or at fold time. Fatality is decided by
+POSITION, not by which mechanism found it. A hole off the resume path
+is cosmetic (the replay view degrades, the run carries on, and a
+respawn may re-run that node, which is the existing at-least-once
+semantics). A hole touching the resume frontier (the suspended nodes,
+their token resolutions, the pulses their resume consumes) is fatal and
+says so. Drop the worker-bail entirely.
 
-### The problem: two failure paths, both wrong, and they're the same thing
-
-There are two ways a journal event can be bad, handled by two unrelated
-mechanisms today:
-
-1. **Write fails** (saving e.g. `NodeCompleted(B)` is rejected by
-   Postgres / a fencing trigger). The event is now MISSING from disk.
-   Today: `PoisonOnWriteFailure` latches a flag and the drive loop
-   **bails the whole worker** at the next iteration.
-   **Why this is wrong:** in RAM, B finished and already fired
-   downstream; the live run is fine. Killing it because a *save* failed
-   is a sledgehammer. It converts "couldn't save B" into "kill the run,"
-   which forces a respawn that re-folds from the last good prefix and
-   re-runs everything since (including B) anyway.
-
-2. **Read/fold hits a malformed stored row** (the bytes are there but
-   garbage, e.g. a corrupt pulse id). Today: `fold_to_snapshot` SKIPS
-   the row, logs it, adds a `JournalCorruption { site, reason }` to the
-   snapshot (rendered as a corruption marker in the graph), keeps
-   folding. Non-fatal.
-   **Why this is incomplete:** skip-and-continue is correct for DEAD
-   history (a corrupt row in a long-settled branch only degrades the
-   replay view), but the SAME skip runs when the corrupt row is on the
-   RESUME FRONTIER (a `PortEmitted` feeding a suspended node's input,
-   a `NodeResumed` for it); there it would rebuild the suspended
-   node's state wrong. The worker now refuses to resume over ANY
-   corruption (it journals `ExecutionFailed` naming the rows and `weft
-   clean`); the display read still skips and marks.
-
-Both (1) and (2) are the SAME underlying thing: **the journal has a
-HOLE at some position** (a missing event, or an unusable one). The only
-question that matters is WHERE the hole is, not how it got there.
-
-### Direction: one "hole" concept, frontier-aware
-
-- **A failed write becomes a HOLE, not a kill.** When `record_event`
-  fails, record that "an event of kind K for (node, frames) at this
-  point could not be persisted" (a hole marker, the write-time analog
-  of the fold-time corruption marker). Then KEEP RUNNING the live
-  execution on its real in-RAM state. Drop `PoisonOnWriteFailure`'s
-  worker-bail entirely.
-- **A malformed stored row is the same kind of HOLE**, discovered at
-  fold instead of at write. Unify it with the above: one concept ("the
-  journal cannot give a correct event at position P"), two discovery
-  sites (write-time, fold-time).
-- **Fatality is decided by POSITION, not discovery site.** A hole is:
-  - **cosmetic** (current marker behavior) when it's in dead history /
-    off the resume path: replay view degrades, execution/resume
-    unaffected.
-  - **fatal** (fail loud, refuse to resume, surface for inspection)
-    when it intersects the **resume frontier**: the set of
-    {suspended node(s), the resolution of their current token, the
-    pulses their resume will consume}. There, "we lost/corrupted the
-    very thing that drives the resume" → the execution cannot be
-    resumed correctly and must say so loudly, not silently resume on
-    bad state.
-
-### The hard part to design
-
-- **Define the resume frontier precisely at fold time.** Which exact
-  (node, frames) + pulses + token-resolutions does a correct resume
-  depend on? A hole touching that set is fatal; anything else is
-  cosmetic.
-- **The write-time hole marker.** A failed write produces NO row, so
-  there's nothing for the fold to "skip" later. Need a way to PERSIST
-  "there is a hole here" (or reconstruct that a hole exists) so a later
-  respawn's fold knows an event is missing at position P and can decide
-  fatal-vs-cosmetic. Open question: a dedicated hole row, vs detecting
-  the gap structurally (e.g. an in-RAM exec that's Running/Completed
-  with no corresponding journal row), vs something else.
-- **Respawn re-run safety still matters.** Even a cosmetic hole on a
-  completed node B means a respawn re-runs B (double side effect). That
-  at-least-once re-run is the existing crash semantics and is
-  acceptable, but the design should be explicit that "cosmetic hole" =
-  "may re-run on respawn," distinct from "fatal hole" = "cannot resume."
-
-### Why deferred
-
-Real design pass: defining the frontier, the unified hole
-representation, the write-time persistence of a hole, and the
-fatal-vs-cosmetic classifier. Surfaced from the bus+suspension round
-(the resume path made the frontier case concrete). The current
-`PoisonOnWriteFailure` is the placeholder sledgehammer until this
-lands.
+**Why deferred.** Three things need designing: the resume frontier
+defined precisely at fold time, a way to persist "an event is missing
+here" when the failed write left no row to skip, and the
+fatal-versus-cosmetic classifier itself.
 
 [Update Notice Warning] If we touch `PoisonOnWriteFailure`,
-`fold_to_snapshot`'s `report_corruption` path, `CorruptionSite`, or the
-suspension-resume fold (`SuspensionRegistered` / `NodeSuspended` /
-`NodeResumed` / `SuspensionResolved`), revisit this entry.
-
-## Unified error / degraded-state surfacing to the user
-
-**Problem.** When something goes wrong that the runtime can't auto-fix
-(a health-recovery action that keeps failing, an infra node stuck
-Failed, a trigger-setup that errors, a worker that crashloops), the
-user has no consistent, actionable surface. Today it's scattered:
-`InfraEvent::Flaky` / `Recovered` / `ProtocolConfigError` events go to
-the graph view; some failures are bare 500s; some are log-only; the
-new exponential backoff on a failing health action retries silently
-forever with no "this is stuck, do something" signal. The recently
-added action timeout + backoff close the *wedge* (the slot always
-frees, retries are paced) but don't *tell the user* recovery is
-struggling.
-
-**Direction.** One reusable "degraded / needs-attention" surface,
-usable anywhere in the system (health recovery, infra lifecycle,
-trigger setup, worker spawn), not a per-subsystem one-off. Shape to
-design:
-
-- A single structured event/state ("X is degraded: reason, attempt
-  count, next retry, suggested remediation") that rides the existing
-  `InfraEvent` -> `infra_event_bridge` -> SSE -> graph-view rail.
-- Surfaced in the graph view with: what's failing, why (the actual
-  error, not a stack), how many retries / when the next is, and
-  **concrete remediation steps** as helpful as possible.
-- A human off-ramp so the user is never stuck in an infinite
-  auto-retry: bail buttons (Stop / Terminate the infra, Deactivate the
-  project) plus, where possible, a "fix" affordance. These map to verbs
-  that already exist (`infra_stop` / `infra_terminate` / `deactivate`
-  in `compute_available_actions`); the surface just needs to present
-  them in context.
-- A **diagnosis layer** (its own sub-design): inspect *why* an action
-  failed (pod status = ImagePullBackOff -> "bad image, rebuild"; scale
-  rejected -> "RBAC"; readiness timeout -> "node crashing, check
-  logs") and emit a specific remediation per cause, instead of a raw
-  error string. This is the hard, valuable part.
-
-**Requirements.**
-- One representation reused everywhere errors/degradation surface; no
-  per-subsystem error shapes. The goal is "wire a new failing
-  subsystem into the surface in a few lines."
-- Honest: never a silent infinite retry; the user always sees that
-  something needs attention and can always bail.
-- Composes with the existing event rail (don't invent new transport).
-
-**Why deferred.** This is a cross-cutting UX + diagnosis system that
-touches every subsystem that can fail; it deserves a unified design
-pass rather than being bolted onto health-recovery alone. Surfaced
-from the health-action backoff: the backoff paces retries and is
-honest in logs, but the user-facing "recovery is failing, here's what
-to do" surface is the real fix and is general, not health-specific.
-
-## Function callbacks (node-to-node, bottom-to-top)
-
-**Problem.** There's no way to connect nodes "from the bottom back to
-the top": a node can't invoke a subgraph as a function and get a result
-back. This blocks higher-order nodes (`map` / `filter` / "run this
-subgraph per element") and is a core piece of the "Weft as a real
-language" arc (the callback primitive alongside richer types and
-compilation).
-
-**Direction.** A node declares **circuits** (function sockets): named
-entry points it can call as functions, plus the matching **return**
-edge so the side-pass knows where to hand results back. At fire time
-the runtime injects a callable into the node; the node calls it, the
-pulse flows through the connected subgraph (the "side pass"), and when
-that pass completes it calls back into the node with the result. From
-the node's perspective this feels synchronous: invoke, await, get the
-result. Mechanically it resembles a signal suspension (suspend, process
-on the side, resume), but the side-pass is INTERNAL and the node drives
-it, not an external wake event.
-
-**Requirements.**
-- The injected callable crosses the node/language boundary cleanly: the
-  node calls a function, it does NOT reach into the runtime (the "nodes
-  do no plumbing" rule).
-- The circuit's argument + return types are part of the node's declared
-  interface (typed, not untyped-JSON).
-- Preserves the compile-to-standalone-binary path (a callback is an
-  in-process call in the compiled form, not an HTTP round-trip).
-
-**Why deferred.** Design is open. The central architectural call: does
-this SHARE the journal/replay + suspend/resume machinery (a callback is
-a suspension whose resolver is an internal subgraph) or need its own
-path? Likely design this BEFORE loops (loops may fall out of it).
+`fold_journal`'s corruption bail, `fold_to_snapshot`'s
+`report_corruption` path, `CorruptionSite`, or the suspension-resume
+fold (`SuspensionRegistered` / `NodeSuspended` / `NodeResumed` /
+`SuspensionResolved`), revisit this entry.
 
 ## Per-node / per-unit infra drift detection
 
@@ -247,52 +85,6 @@ enforces, not "we assume they can't".
 stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
 supervisor apply path, revisit.
 
-## A closed port carries no reason
-
-**Problem.** A closure says "nothing will arrive here" and nothing
-more: `Pulse::closure` sets `closed: true` with `value: Null` and no
-other field (`crates/weft-core/src/pulse.rs:82-98`). Three unrelated
-situations produce a byte-identical signal at the consumer:
-
-1. the producer FAILED (its body errored, so its ports closed),
-2. the producer deliberately declined to emit (a node whose permission
-   was false, an unselected branch),
-3. the producer was never going to run (a different trigger fired and
-   this branch is dead, so its ports closed at Fire).
-
-Downstream they are the same nothing. A consumer can branch on ABSENCE
-(that's the null-propagation model working as designed) but not on
-CAUSE. So the graph cannot express "retry this when it actually broke,
-but leave it alone when the gate deliberately said no", or "route real
-failures to an alert and ignore deliberate skips": the retry loop
-cannot tell the two apart and retries both.
-
-Second half of the same gap: node code cannot observe a closure at all.
-An optional port that was closed is indistinguishable, from inside the
-body, from an optional port that was never wired. The bag accessors
-answer "do I have a value", never "did something upstream close this".
-
-**Direction.** Deliberately unspecified. Two shapes are visible (a
-closure that carries a reason tag readable by node code; or failure
-propagating as a genuinely distinct signal from deliberate-skip) and
-neither is clearly right, so this entry records the problem and the
-evidence WITHOUT picking a shape. Park it until a real use case bites
-and shows which distinction actually needs to be drawn; designing it
-from the hypothetical would bake in the wrong seam.
-
-**Why deferred.** No design yet, on purpose (see above). Surfaced while
-mapping the node-request corpus (`discord-export/node-requests-ranked.md`)
-against the language: retry-on-real-failure is wanted by essentially
-every flaky-external-API node, and it is the retry/error-handling item
-`ROADMAP.md` names, reached from the other end. Note this is NOT a
-missing retry construct: retry is expressible today as a `Loop` with a
-stop condition, and that stays the explicit way to do it. The gap is
-only that the loop cannot see WHY it got nothing.
-
-[Update Notice Warning] If we touch `Pulse::closure` / the `closed`
-flag, the skip-cascade in `handle_node_skip`, or the `ValueBag`
-accessors, revisit this entry.
-
 ## Held suspensions (warm-worker model)
 
 **Problem.** The durable-replay model dies-and-resumes the worker pod
@@ -332,35 +124,6 @@ that would otherwise have died and refolded) and on the lifecycle/leasing
 implications of a pinned worker. Surfaced from the node-authoring docs,
 which promised this primitive before it existed.
 
-## setup.sh cross-version upgrade path [DORMANT until MVP]
-
-**Status: OFF.** Inactive while pre-users (no install base to protect).
-Turns ON when Quentin says "I am opening the MVP" (or equivalent); at
-that point start enforcing it. Until then a corrupted-state-on-rerun is
-acceptable, the fix is just `setup.sh --uninstall --purge` then
-`setup.sh`.
-
-**The rule (when ON).** `setup.sh` must support a clean upgrade from ANY
-shipped version (every version from the MVP launch onward) to current,
-with NO manual purge and NO corrupted state left behind. When something
-cross-cutting changes (image/tag naming scheme, k8s manifest shape,
-on-disk project layout, DB lifecycle), the upgrade path must detect the
-old shape and migrate or clean it automatically.
-
-**Why.** Once there is an install base, an upgrade that silently breaks
-state is a production incident for every user who reruns setup.
-Pre-users it costs nothing, so the work is deferred, but the obligation
-is recorded so it isn't forgotten at launch. Past incident (pre-MVP,
-harmless then): the image/resource tagging scheme changed between two
-builds; rerunning `setup.sh` left stale state mismatched with the new
-code (`weft run` failed with "project not found" / status-gate errors);
-only `--uninstall --purge` + reinstall fixed it. With users, that same
-situation would corrupt their install on a routine upgrade.
-
-When this flips ON, revisit alongside setup.sh's flag set and the
-image/tag + manifest + project-layout conventions; the migration logic
-lives wherever setup.sh sequences install/upgrade.
-
 ## E2e parallelization: one cluster per e2e, keep failed clusters
 
 **Problem.** The e2e suite runs sequentially against ONE shared kind
@@ -396,33 +159,6 @@ when he calls for it.
 [Update Notice Warning] If we touch `run-e2e.sh`, the e2e harness's
 cluster bootstrap, or the WEFT_CLUSTER_NAME/port env knobs, revisit
 this entry.
-
-## Project-scoped meta log (observability outside the journal)
-
-Design a per-project log surface for everything that is ABOUT a project
-but is not execution data, so debugging held connections stops meaning
-kubectl. What goes there:
-
-- What the listener sees for the project's signals: connect cycles,
-  dialogue progress on a raw pipe (which step, what matched), fires,
-  reconnects, why a fire was filtered out. Today this lands in the
-  pooled listener's pod logs, interleaved across tenants and invisible
-  to the project owner. Debugging "my email trigger never fires" needs
-  this legible per project.
-- A node-facing info log (`ctx.log(...)`-shaped): breadcrumbs a node
-  author wants while developing, deliberately NOT journal events
-  (journaling every log line would bloat the durable record; these are
-  ephemeral, ring-buffered, lossy by design).
-- Later candidates: subscription renewals, access refreshes, tunnel
-  address changes.
-
-Shape to think through: one ring buffer per project (bounded, lossy,
-queryable via dispatcher + shown in the dashboard/extension), what the
-pooled tiers may write to it (tenant isolation: a pooled listener
-writes only to the project the signal belongs to), and rate-limiting
-so a chatty loop cannot flood it. Related: "Note Q" above (ephemeral
-journal buffering) and the unified error-surfacing entry; a design
-should look at all three together before building any one of them.
 
 ## Delegated end-customer connections (embed weft in someone else's product)
 
@@ -478,35 +214,6 @@ as a first-class use case.
 [Update Notice Warning] If we touch the access grant schema, the
 connect/consent flow, or fire-time access resolution, revisit this
 entry.
-
-## Model-list filtering by capability (inference vs embeddings vs rerank)
-
-**Problem.** The provider nodes' `model` input is now a `remote_select`
-fetching the provider's model list (free-typing allowed). The list is
-unfiltered: OpenRouter's `/models` answers every model (chat,
-embedding, rerank alike) with the capability as fields on each item,
-and there is no server-side "only embedding models" parameter. An
-inference provider suggesting embedding models (and the reverse) is
-noise, and today one shared provider node feeds inference, embed,
-rerank, and moderate, so a single model field cannot carry
-per-consumer filters anyway.
-
-**Direction.** Add an optional declarative per-item filter to the
-`remote_select` `list` source (a dotted field path plus an expected or
-contained value, applied store-side while paging, same vocabulary as
-`Lookup`'s label/value paths). Then decide where differently-filtered
-lists live: either the endpoint nodes (LlmEmbed, LlmRerank) get their
-own model input with their own filtered widget, or per-capability
-provider nodes. The filter mechanism is generic (any listing service
-whose items carry a type field); the split question is the real design
-call.
-
-**Why deferred.** The filter needs the split decision to be useful,
-and free-typing already unblocks every model today.
-
-[Update Notice Warning] If we touch the remote_select widget, the
-Lookup shape, or split the LLM provider nodes per capability, revisit
-this entry.
 
 ## Parallel loops: a `max_parallel` concurrency bound
 
@@ -572,7 +279,7 @@ should be a WeftType of its own, or whether three string-ish inputs on
 three nodes is fine.
 
 ## Rename color to exec
-Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name.
+Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name back.
 
 ## Native branching and retries: should `if` / `else` / retry become language constructs?
 
@@ -613,39 +320,6 @@ a race is expressible without a bus.
 
 Decide before the release: a native form added later changes how every
 program is written, so it is cheaper to know now whether it is coming.
-
-## Inverting a decision: SETTLED, `_should_not_flow`
-
-This section used to answer "run this when the other branch did not"
-with: the node that decides emits an optional port that says nothing on
-success, and the other branch hangs off that port. That answer was
-wrong, and it was wrong in a way worth writing down, because it cost a
-whole build session.
-
-It only covers absence that a node you wrote DECIDED on. It does not
-cover absence that is just data: a key missing from a request body, an
-optional input nobody filled. Nothing decided there, so there is no node
-to add a port to. And every other node in the language skips when its
-inputs close, so nothing downstream is left alive to notice. Following
-the old advice meant inventing a node whose whole job was to survive the
-closure and announce it, which is exactly the convoluted shape the
-advice was supposed to avoid.
-
-The language now carries a second spelling of the gate,
-`_should_not_flow`: the same decision read the other way round, where a
-CLOSED input is the yes. It is the one port in the language that fires
-on a closure, which is what makes "act on the thing that did not happen"
-writable at all. A node has one gate; wiring both spellings is a compile
-error (`two-gates`). In the editor it is the same triangle with a small
-circle where it meets the node, the way a negated input is drawn in a
-logic diagram, and right-clicking the gate toggles it.
-
-What is still open is the plain boolean flip: holding a `true` and
-wanting to act on `false` still means writing Python, since nothing in
-the catalog turns a boolean around. A `Not` node (boolean in, boolean
-out) would cover it and compose anywhere a boolean goes. That is a
-smaller question than this section used to be, and it is the only part
-of it left.
 
 ## Killing tagged NODES inside one execution
 
@@ -785,53 +459,6 @@ It pairs with [tags stopping work](#killing-tagged-nodes-inside-one-execution):
 fire-on-arrival is what makes a race expressible, and cancelling the
 losing branch by tag is what stops it costing money.
 
-## A node whose outputs nobody reads
-
-There used to be a warning for it, `orphan-outputs`, and it was removed
-because it fired on the last node of nearly every real program. This
-entry is what would have to be true to bring it back.
-
-**What the warning was for.** A node that computes a value nobody uses
-is usually a mistake: a `Cast` left over from an edit, a `Format` whose
-result was meant to go somewhere. Catching that is worth a line of
-advice in the editor.
-
-**Why it fires on correct programs.** A program ends by DOING
-something: sending the message, writing the row, uploading the file.
-Those nodes have outputs (a message id, a row count) that nobody has to
-read, so every one of them looked like the mistake above. `_is_output:
-true` used to mark them and is gone, because every reached node runs
-now and the marker meant nothing to the runtime. So today the last node
-of a Telegram bot, a Slack bot and a Postgres writer all warn, which
-teaches people to ignore warnings, which costs us the two cases where
-the warning was right.
-
-**Why a metadata flag is not enough.** The obvious fix is a per-node
-flag in the catalog ("this node's effect is the point"), set on send,
-write, upload and react nodes. It works for those, and it breaks on the
-nodes that are both: `ExecPython` is usually a computation whose result
-matters, and sometimes the script itself is the whole point (it calls
-something, it writes a file). Whichever way the flag is set on such a
-node, half its uses are wrong.
-
-**So the shape it needs.** A default in the node's metadata, plus a way
-for a program to override the default on one instance. Which raises the
-questions to answer before writing any of it:
-
-- What is the override's spelling, and is it a config key (the language
-  reading a `_`-reserved key again, which is the thing `_is_output` did
-  and we removed) or something else entirely?
-- Does the override belong on the node at all, or is it really a
-  property of the WIRE that is missing (this output is a receipt) so
-  the check is per-port rather than per-node?
-- Is the editor a better home than the compiler? A node with nothing
-  leaving it is visible at a glance in the graph, and a diagnostic that
-  is only ever advice may not belong in the compile output at all.
-- What does it do inside a group? A member whose outputs feed nothing
-  and no `self.x` is the same mistake one level down.
-
-Until that is answered there is no warning, and a leaf is just a leaf.
-
 ## Show the version tree in the sidebar the way git tools draw history
 
 `weft tree` already knows everything: every version, what changed
@@ -955,33 +582,6 @@ Decided: worth doing, deliberately deferred so it can be one clean pass
 of its own rather than a rename tangled into unrelated work. Until then
 `List[T]` is the spelling.
 
-## Trying a route without a cluster: BUILT
-
-`weft run --fire` on a Route runs the whole program, answer included,
-with no cluster and no activation. The payload is the request to serve:
-the envelope the trigger declares in its `firesWith`, plus a `body`.
-
-```bash
-weft run --fire 'hello={"method":"POST","path":"hello","body":{"name":"ada"}}'
-```
-
-A stand-in caller serves the body and records what the program answered,
-so the status, the headers and the body land in the journal the way a
-real exchange does. It implements the same `CallerConnection` the real
-one does, so the trigger, the Reply, the Stream and the Close all run
-their ordinary code and never learn the difference; a loop that
-exercised a different path from production would teach you about the
-fake instead of the program.
-
-`body` is deliberately outside the `firesWith` contract: a real listener
-never delivers one, because a real caller sends it over the wire, so
-declaring it would make every Route's contract describe something
-production never does. It is split off before the envelope is checked.
-
-A Socket still cannot be fired. Its shape is a conversation over time
-and there is nothing honest to invent for the caller's next message, so
-it says so and points at `weft activate`.
-
 ## A node's display has no limits, and every number in it is hardcoded
 
 Reading what a node is showing works and costs nothing at the size a
@@ -1051,3 +651,4 @@ image among four good items could come back as one unreadable line
 rather than a failed read; and whether a rate limit belongs per token
 or per (token, node), given that one client legitimately watches one
 bridge closely and has no reason to sweep every display it can see.
+

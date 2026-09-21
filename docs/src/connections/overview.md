@@ -11,7 +11,7 @@ account](connect-an-account.md). This page is about what happens behind that.
 
 | Thing | What it is | Where it lives |
 |---|---|---|
-| Service recipe | How to get a credential, sign a request, check permissions and receive events. The glossary calls this the recipe, and so does the rest of the book | The access step's metadata |
+| Service recipe | How to get a credential, sign a request, check permissions and receive events | The access step's metadata |
 | Registered app | An OAuth application the operator configured, with its secret and the redirect URLs it is allowed to use | The runtime's apps file |
 | Connection | One connected account: its values, permissions and identity | The access store |
 | `Access` value | The reference your program passes around | On the wire |
@@ -40,7 +40,7 @@ The two `requires` lists are stamped on per consuming step, from what that
 step said it needed, and a connection that falls short of them is refused when
 it resolves. For where the tenant wall stops and what you still have to keep
 private yourself, go and read the [security
-policy](https://github.com/WeavemindAI/weft/blob/mvp/SECURITY.md).
+policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
 
 ## Shared credentials, or your own
 
@@ -86,7 +86,7 @@ The step opens its `Access` with `ctx.open`. The access store checks what that
 step declared it needs, and refreshes the credential if it has expired. What
 comes back is a client with the authentication already set up.
 
-If a meter recognises the request, weft records what it cost. That is weft's
+If a meter recognizes the request, weft records what it cost. That is weft's
 own record, not the provider's bill. For the rules, read [measuring what a
 call costs](meters.md).
 

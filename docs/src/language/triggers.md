@@ -129,12 +129,15 @@ refuses](diagnostics.md).
 A project with triggers has to be turned on:
 
 ```bash
-weft activate            # register every trigger, mint the URLs
+weft activate            # register every trigger
 weft deactivate          # drop them
 ```
 
-`activate` prints the live addresses it made. Activating again re-registers
-everything and refreshes each trigger's saved inputs.
+`activate` prints `activated <name> (<id>)` and nothing else: the addresses are
+fixed by the install, so there is no new one to print. Activating again
+re-registers everything and refreshes each trigger's saved inputs.
+
+![A trigger activated from the action bar, with its saved inputs](../img/trigger-activation.png)
 
 If you deactivate a project while work is still in flight, you have to say
 what should happen to that work, so `deactivate` takes a mode:
@@ -152,6 +155,4 @@ CLI](../running/cli.md).
 ## If a trigger cannot be served, activation stops there
 
 It refuses and names what is missing, rather than registering something that
-looks active and never fires. That way a misconfigured trigger fails while you
-are still looking at it. See [Design
-principles](../thinking/design-principles.md).
+looks active and never fires.

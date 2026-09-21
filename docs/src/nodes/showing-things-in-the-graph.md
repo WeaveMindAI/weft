@@ -15,7 +15,7 @@ If your node's firing produces or receives a file worth looking at, one line in
 ```
 
 For what `kind` and the port side mean, go and read
-[`display`](metadata.md#display).
+[`display`](metadata.md#showing-a-file-on-the-node-display).
 
 ## Its last value
 
@@ -43,6 +43,8 @@ A **display** is what a node shows about itself while it runs. The WhatsApp
 bridge shows a QR code to scan, and then the phone number that scanned it. The
 Postgres node shows the password it just minted. A webhook trigger shows the
 address it is listening on and how a caller gets past the door.
+
+![A node's display panel showing a QR code and a copyable secret](../img/display-qr.png)
 
 Two kinds of node have one, and both serve it the same way: a `GET /live`
 returning `{ "items": [...] }`. So there is one panel, one set of item types,
@@ -119,29 +121,16 @@ place, so a container that grew a fifth item type still shows its other four.
 
 A display is not only for the editor. If you want a website or an app you built
 on top of the program to show the QR code, rather than sending its user to the
-editor, mint a token that reaches it:
+editor, mint a token that reaches it with `--display`, naming the node and
+scoping the grant as [scoping a token](../running/browser-extension.md#scoping-a-token)
+describes:
 
 ```bash
 weft token mint --name "my site" --display whatsapp
 ```
 
-Name the node the way you write it everywhere else, and run it from the
-project's folder: `whatsapp` for one in this file, `test.whatsapp` for the
-`whatsapp` of the file you brought in as `test`. The tool fills in which
-project you meant, because that is the folder you are standing in, and an
-address is only a name inside one project.
-
-`GET /signal-token/displays` then lists what that token can watch, and
-`GET /signal-token/displays/{project}/{node}` is the same feed the editor
-reads, with `{node}` spelled the same way. Mint refuses a name no display in
-that project answers to, and lists the ones it has.
-
-Saying nothing about displays grants none of them, which is the opposite of how
-`--projects` and `--tags` read: a QR code pairs the account to whoever scans
-it, so it takes an explicit word. `--displays` opens every display of the
-token's projects.
-
-For the doors and their scoping, go and read
+For the display token flags, the refusal when no display answers to the name,
+and the doors a token opens, go and read
 [the doors a token opens](../running/browser-extension.md#the-doors-a-token-opens).
 
 ## When there is no panel

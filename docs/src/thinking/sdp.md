@@ -26,7 +26,7 @@ in there, is it still there? Whatever went wrong, hand that back:
 > This email is asking for a replacement, but the extracted problem says the
 > customer wants a refund. Improve the prompt for this step.
 
-Now you have a real extracted request to test that lookup against, rather than
+Now you have a real extracted request to test the next step against, rather than
 something you made up. Keep going until you can follow that first email all
 the way to the answer you wanted.
 
@@ -64,8 +64,4 @@ change is acceptable. Freezing the new run replaces the accepted example.
 For the commands and their boundaries, read [Versions,
 seeded runs and frozen examples](../running/versions.md).
 
-## What is landing next
-
-- The editor will let you descend into a group, fix one stage there and come
-  back out.
-- Several agents will be able to build branches in parallel under one plan.
+What is landing next is on [the roadmap](../appendix/roadmap.md).

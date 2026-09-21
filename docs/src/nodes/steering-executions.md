@@ -76,6 +76,8 @@ supply valid tags yourself.
 
 Tags appear in the execution inspector and in `weft executions`.
 
+![Execution tags shown in the inspector](../img/tags-inspector.png)
+
 ## `stop_tagged`
 
 ```rust

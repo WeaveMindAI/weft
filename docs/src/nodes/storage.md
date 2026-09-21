@@ -25,6 +25,8 @@ ctx.pulse_downstream(NodeOutput::new().set("file", file)).await?;
 The output contains a stored-file reference. `Some(KeepTtl::Default)` keeps
 its bytes available after the execution so the report can be opened later.
 
+![A stored-file value shown in the inspector](../img/file-reference.png)
+
 ## Choose the scope
 
 | Scope | Storage space | Lifetime |
@@ -96,15 +98,8 @@ Execution writes take `keep: Option<KeepTtl>`:
 | `Some(KeepTtl::Secs { secs })` | The chosen number of seconds, renewed the same way |
 | `Some(KeepTtl::Never)` | Until explicitly deleted |
 
-Listing files, inspecting metadata or reusing an already-issued URL does
-not renew the countdown. You can change an execution file's retention with
-`storage.keep(&handle, ttl).await?` or the catalog's `KeepFile` node.
-Project, Shared and Asset files reject keep settings because their scopes
-have different retention rules.
-
-Kept or not, an execution file stays walled to its run. With `scope: project`
-`KeepFile` copies it into the project scope and emits the copy, which is the
-only form a later run can read.
+For renewal, changing a file's keep setting after the fact, and copying a kept
+file out of its run, read [Files at run time](../running/files.md#how-long-they-last).
 
 ## Files from the graph
 

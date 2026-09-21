@@ -38,7 +38,7 @@ Create `nodes/word_count/metadata.json`:
 `WordCount` is what you will type in the graph, and it has to be unique across
 the whole catalog, standard nodes included.
 
-`"required": true` is there because `Text` cannot run without a string; for
+`"required": true` is there because the node cannot run without a string; for
 every key you can write, and when each one earns its place, go and read
 [metadata.json](metadata.md).
 
@@ -75,10 +75,8 @@ impl Node for WordCountNode {
 from somewhere else, and if it is missing or is not a string you get an error
 naming that input.
 
-The last line is what actually sends the number. Just returning `Ok(())` would
-end the body having emitted nothing. And nothing here checks the counting: a
-node that always emitted `42` would satisfy every declaration on the page,
-which is what tests are for.
+The last line is what actually sends the number, and nothing here checks the
+counting, which is what the test in [Testing a node](testing.md) is for.
 
 ## Put it in a graph
 
@@ -96,8 +94,11 @@ weft validate --file main.weft < main.weft
 weft run
 ```
 
-`validate` checks the wiring without compiling any Rust, and should print
-`{"diagnostics":[]}`. `run` builds the node into the program, so it needs your
+`validate` checks the wiring (the compiler reads the declarations without
+compiling any Rust, as [metadata.json](metadata.md) explains), and should print
+`{"diagnostics":[]}`; it reads the source from stdin, and `--file` only tells
+it where `@file` and `@include` resolve. `run` builds the node into the
+program, so it needs your
 runtime up. In the graph, `count.count` and the Debug result should both be
 `3`.
 
@@ -107,9 +108,9 @@ nothing about whether the Rust compiles.
 
 ## Give it a test
 
-Next, [test it](testing.md), which runs the body against a few inputs on your
-own machine without going near the runtime.
+Next, [test it](testing.md), which runs the tests you just wrote on your own
+machine, without going near the runtime.
 
-For extra crates or shared helper code, read [Packaging](packaging.md). For
-more input controls and declaration options, read
-[metadata.json](metadata.md).
+![The first node's test passing in the terminal](../img/node-first-test.png)
+
+For extra crates or shared helper code, read [Packaging](packaging.md).

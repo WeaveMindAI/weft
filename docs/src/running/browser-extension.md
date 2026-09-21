@@ -9,15 +9,6 @@ where it stopped, whether that was a minute ago or last week.
 
 ![A pending approval task in the extension](../img/extension-popup.png)
 
-<!-- IMAGE ------------------------------------------------------------------
-file:  docs/src/img/extension-popup.png
-kind:  screenshot
-brief: The extension popup open in a browser toolbar, showing one pending task:
-       a title, the context the program sent (a short LLM classification, say),
-       the form fields, and Approve / Reject buttons. Show a second, collapsed
-       task below it so the list nature is visible. Clean, no dev tools open.
---------------------------------------------------------------------------- -->
-
 ## Install it
 
 The extension is in the [Firefox
@@ -70,6 +61,8 @@ nothing about displays reads none of them. A QR code pairs the account to
 whoever scans it, so it takes an explicit word. `--displays` opens every
 display in the token's projects.
 
+![A node's live display panel in the extension, showing a QR code](../img/extension-display.png)
+
 `--display` opens exactly one, and repeats for several. Name the node the way
 you write it everywhere else: `whatsapp` for one in this file, `test.whatsapp`
 for the `whatsapp` of the file you brought in as `test`. Run it from the
@@ -98,7 +91,7 @@ except the answering door:
 | `POST /signal/{signal token}` | you are answering one; the per-task token in the listing is the credential, no bearer |
 | `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that is gone answers 410 saying so; show that in the image's place rather than a broken picture |
 | `GET /signal-token/displays` | you want what this token can watch: one entry per display it reaches, carrying its project, its label, and `node`, the node spelled the way a person writes it, which is what the two doors below take as `{node}` |
-| `GET /signal-token/displays/{project}/{node}` | you are drawing one: `{ "items": [...] }`, the same feed the editor's node panel reads. Read it on every render rather than storing it, because a QR code expires in under a minute |
+| `GET /signal-token/displays/{project}/{node}` | you are drawing one: `{ "items": [...] }`, the same feed the editor's node panel reads. Read it on every render rather than storing it, because a QR code expires quickly |
 | `POST /signal-token/displays/{project}/{node}/action` | the reader pressed a button one of those items carried. Send `{ "kind": "<actionKind>", "payload": ... }`; a refusal the node wrote comes back as a 400 with its text |
 
 The files door is scoped like the listing: a task the token lists, a field the

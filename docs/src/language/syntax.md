@@ -137,6 +137,8 @@ convert = Cast -> (value: Boolean)
 Those are fragments: the steps still need their other required inputs before
 they can run. For what you can write in there, read [types](types.md).
 
+![The port menu adding an input](../img/port-context-menu.png)
+
 ### Extra inputs
 
 Some steps, `ExecPython` and `FirstInOrder` among them, let you invent input
@@ -167,7 +169,7 @@ those lines changes the answer.
 
 | Key | What it does |
 |---|---|
-| `_label: "Review the draft"` | Puts a label on the box. A string, written once. |
+| `_label: "Review the draft"` | Puts a label on the box. A string literal only; it cannot come over a wire. |
 | `_tags: ["support"]` | Tags the step, including for signal scoping. |
 | `_should_flow: decision.approved` | Decides whether the step runs. Takes true, false, or an arrow. |
 | `_should_not_flow: decision.sent` | The same decision the other way round: the step runs when the thing wired here did NOT happen. |
@@ -221,8 +223,7 @@ an optional input nobody filled. When the absence is a DECISION your own node
 made, it is usually clearer to have that node say so on a second output port
 and gate on that, because the wire then reads forwards.
 
-A node has one gate. Wiring both spellings is a compile error (`two-gates`)
-rather than some rule about which wins.
+A node has one gate. Wiring both spellings is a compile error (`two-gates`).
 
 ## Groups and loops
 

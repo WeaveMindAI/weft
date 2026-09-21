@@ -19,6 +19,8 @@ was any good.
 | `Image`, `Video`, `Audio` | A reference to a stored file of that kind |
 | `Blob` | A reference to any other stored file, a PDF or a zip |
 
+![Ports of different types, each with its own colour](../img/port-colors.png)
+
 A file reference travels through the graph while the bytes stay in storage, so
 you can carry an image inside a message record without copying it into every
 journal row. For handling files, read [Files at run

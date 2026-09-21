@@ -46,6 +46,8 @@ flowchart LR
     review -. closed .-> archive[Archive skipped]
 ```
 
+![A branch closing and the steps after it skipping](../img/pulse-skip.gif)
+
 Streams close differently. A closure on a stream is the stream's end rather
 than a skip, so a reader whose stream carried nothing still runs and sees that
 nothing came.
@@ -74,12 +76,10 @@ Say a sensitive question goes to a person for approval and everything else
 goes straight ahead. Only one of those two can supply an approval, and
 `FirstInOrder` takes whichever it was.
 
-`_should_flow` takes one wire, so "delete it only if the model said rude AND
-said sure" has one gate and two answers. `All` is the AND: wire both onto it
-and gate on what it emits. It says yes when every input arrived and none of
-them is `false`, and closes its output otherwise, which a gate reads as a no.
-So it is the AND of the decisions and of the arrivals at once, since a branch
-that closed never arrives at all.
+`_should_flow` takes one wire, so "delete it only if the model said it was rude and said it was sure" is one gate fed by two conditions: `All` is the AND: wire both conditions onto it
+and gate on what it emits. It emits when every input arrived and none of
+them is `false`; a branch that closed never arrives at all, and a closed
+input is not a `false`.
 
 To run a step because something did NOT happen, wire that something into
 `_should_not_flow` instead. It is the one port that starts a step on a

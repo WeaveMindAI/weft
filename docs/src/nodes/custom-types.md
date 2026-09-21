@@ -4,7 +4,10 @@ If several nodes pass the same kind of record around, give it a name.
 A `SupportTicket` input tells you more than `JsonDict`: it says which
 record this node expects, and the declaration says which fields belong in it.
 
-Add a `types` block to a node's metadata or its package's shared metadata:
+## Declare a type and use it on a port
+
+Add a `types` block to a node's metadata or its package's shared metadata,
+at the top level:
 
 ```json
 "types": {
@@ -13,7 +16,7 @@ Add a `types` block to a node's metadata or its package's shared metadata:
 }
 ```
 
-Then use the name on a port:
+Then use the name on a port, as an entry in the `inputs` array:
 
 ```json
 {
@@ -23,27 +26,7 @@ Then use the name on a port:
 }
 ```
 
-Put the `types` block at the top level of the metadata. Add the port object
-to the `inputs` array.
-
-## A name is part of the contract
-
-A `SupportTicket` output can feed a `SupportTicket` input.
-An unnamed object does not become a ticket merely because its fields look
-right. To accept an object from an untyped source, use `Cast` and declare
-the target type. The conversion checks its fields at run time.
-
-A named value can flow out to a compatible structural type.
-`SupportTicket` can feed its record shape or `JsonDict`;
-`TicketBatch` can feed a compatible list. A list is not a `JsonDict`.
-
-The check establishes the declared structure. It does not prove that
-ticket `"T-42"` exists or that its question was answered correctly.
-
-For casts and source-level type declarations, read
-[Types](../language/types.md).
-
-## Where the declaration is visible
+![A record port carrying a typed object](../img/record-port.png)
 
 Metadata types are available throughout the project's catalog and in its
 `.weft` source. Put the declaration beside the node or package that owns
@@ -59,6 +42,23 @@ and include every field you intend to carry. For example, adding an
 
 If you use [package defaults](metadata.md#package-defaults), remember that
 a member's own `types` object replaces the inherited object as a whole.
+
+## What the name checks
+
+A `SupportTicket` output can feed a `SupportTicket` input.
+An unnamed object does not become a ticket merely because its fields look
+right. To accept an object from an untyped source, use `Cast` and declare
+the target type. The conversion checks its fields at run time.
+
+A named value can flow out to a compatible structural type.
+`SupportTicket` can feed its record shape or `JsonDict`;
+`TicketBatch` can feed a compatible list. A list is not a `JsonDict`.
+
+The check establishes the declared structure. It does not prove that
+ticket `"T-42"` exists or that its question was answered correctly.
+
+For casts and source-level type declarations, read
+[Types](../language/types.md).
 
 ## Files inside a record
 
@@ -114,4 +114,4 @@ retention period; import `KeepTtl` from `weft::storage`.
 
 For retention and conversion policies, read [Storage](storage.md).
 For an existing example with nested media, read the
-[chat type declarations](https://github.com/WeavemindAI/weft/blob/mvp/catalog/ai/llm/metadata.json).
+[chat type declarations](https://github.com/WeaveMindAI/weft/blob/mvp/catalog/ai/llm/metadata.json).

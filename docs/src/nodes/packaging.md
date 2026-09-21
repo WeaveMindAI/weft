@@ -1,9 +1,10 @@
 # Packaging
 
-Put nodes in a package when they share code or dependencies. A package
-gives them one home, while each node keeps its own metadata and implementation.
+A node works on its own, so start with a standalone node. Reach for a package
+when several nodes share code or dependencies: the package gives them one home,
+while each node keeps its own metadata and implementation.
 
-## A bare node
+## A standalone node
 
 A standalone node is a directory containing `metadata.json` and `mod.rs`:
 
@@ -20,8 +21,8 @@ follow [Your first node](your-first-node.md).
 
 ## A package
 
-A package has a `package.toml`. Its immediate subdirectories containing
-`metadata.json` become member nodes:
+A package is a directory with a `package.toml`. Its immediate subdirectories
+containing `metadata.json` become member nodes:
 
 ```text
 nodes/my_service/
@@ -36,6 +37,8 @@ nodes/my_service/
     metadata.json
     mod.rs
 ```
+
+![A package folder with its shared files and member nodes](../img/package-layout.png)
 
 For example:
 
@@ -70,8 +73,9 @@ reports a collision.
 
 ## What gets compiled
 
-The compiler reads node metadata without compiling the node implementations.
-That lets it check a graph before building its worker.
+The compiler reads node metadata first, without compiling the node
+implementations ([metadata.json](metadata.md) covers the full statement). That
+lets it check a graph before building its worker.
 
 For the build, it includes the nodes the program references, plus their
 packages' shared Rust files and dependencies. An unused sibling node is
@@ -92,7 +96,9 @@ The generated package already provides `weft`, `weft-providers`,
 `tracing`. Declare other crates your code uses, and comment dependencies
 whose purpose would be unclear to the next reader.
 
-If the code needs native libraries, declare the build and runtime
+### Build scripts and system packages
+
+If your code needs native libraries, declare the build and runtime
 requirements separately. For example, these are dependency-file fragments
 for an image using `apt`:
 
@@ -110,15 +116,6 @@ default = ["ca-certificates"]
 SOME_PATH = "{{catalog_path}}/vendor"
 ```
 
-For a standalone node, place `build.rs` beside `mod.rs` and declare its
-crates under `[build-dependencies]` in `deps.toml`. Its entry point must
-be `pub fn main()`: weft calls it from the generated build script.
-
-Named packages currently also compile their root `build.rs` as a shared
-runtime module, where build-only dependencies are unavailable. A script
-using a crate declared only in `[build-dependencies]` therefore fails in
-that layout.
-
 The `system.build` packages are installed in the builder image;
 `system.runtime` packages go in the worker image.
 
@@ -126,6 +123,14 @@ A system-package table can use a distro key such as `debian_12` in place
 of `default`. weft selects the matching distro entry, then falls back to
 `default` if one exists. In build environment values,
 `{{catalog_path}}` expands to the node's staged directory.
+
+A build script runs at build time, before your node ever executes. For a
+standalone node, place `build.rs` beside `mod.rs` and declare its crates
+under `[build-dependencies]` in `deps.toml`. The same works for a named
+package: put the build script at the package root. In both layouts the
+entry point must be `pub fn main()`: weft copies the script into the
+generated build script of the emitted worker and calls it from there, and
+the `[build-dependencies]` you declared in `deps.toml` are available to it.
 
 ## Sharing a package
 
