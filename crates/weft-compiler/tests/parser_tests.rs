@@ -3522,6 +3522,49 @@ outside = ExecPython(v: Inner) -> (out: String) { code: "return {}" }
     assert_eq!(errors[0].line(), 9, "the squiggle sits on the outside header");
 }
 
+/// A group port typed with a name the CATALOG declares (a node package's
+/// `LlmProvider`) flattens cleanly through `flatten_lenient`: the entry
+/// activates the catalog's registry, so the name resolves the way the
+/// build resolves it. `weft connect` flattens through this entry, and
+/// once parsed without the registry, refusing a file the build accepted.
+#[test]
+fn a_group_port_typed_with_a_catalog_declared_name_flattens() {
+    struct DeclaringCatalog(std::sync::Arc<weft_core::weft_type::TypeRegistry>);
+    impl MetadataCatalog for DeclaringCatalog {
+        fn lookup(&self, _node_type: &str) -> Option<&NodeMetadata> {
+            None
+        }
+        fn all(&self) -> Vec<&NodeMetadata> {
+            vec![]
+        }
+        fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
+            self.0.clone()
+        }
+    }
+    let catalog = DeclaringCatalog(std::sync::Arc::new(
+        weft_core::weft_type::TypeRegistry::build(&[(
+            "LlmProvider".to_string(),
+            "JsonDict".to_string(),
+            "test".to_string(),
+        )])
+        .expect("registry builds"),
+    ));
+    let source = r#"
+chat = Group(brain: LlmProvider) -> () {
+  a = ExecPython(v: LlmProvider) -> (out: String) { code: "return {}" }
+  a.v = self.brain
+}
+"#;
+    let (project, errors) = weft_compiler::flatten_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), &catalog);
+    assert!(errors.is_empty(), "a catalog-declared name is a valid port type: {errors:?}");
+    let a = project.nodes.iter().find(|n| n.id.ends_with(".a")).expect("the group's body node");
+    assert!(
+        matches!(&a.inputs[0].port_type, WeftType::Named { name, .. } if name == "LlmProvider"),
+        "the port keeps the declared name: {:?}",
+        a.inputs[0].port_type
+    );
+}
+
 /// A group's own signature is lowered in the enclosing scope, so a type
 /// declared inside the braces cannot name the group's ports.
 #[test]

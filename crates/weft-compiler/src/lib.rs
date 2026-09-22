@@ -86,6 +86,26 @@ pub fn parse_only(
     catalog.type_registry().scoped(|| parse_only_inner(source, project_id, fs, catalog, source_name))
 }
 
+/// Lex + parse + flatten with every `@include` inlined, LENIENT, and
+/// nothing after it: no enrich, no validation. The whole program's
+/// node list, for a caller that reads it before the program is wired
+/// up (a missing input or a mis-typed literal leaves the list whole).
+/// A declared type name in source (a group port typed `LlmProvider`)
+/// resolves against the catalog's registry, the table every other
+/// entry here parses under.
+pub fn flatten_lenient(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+) -> (ProjectDefinition, Vec<weft_compiler::CompileError>) {
+    // The build compiles the entry file with no source id, so this does
+    // too: the ids it hands out are the ones the build keys nodes by.
+    catalog.type_registry().scoped(|| {
+        weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, None)
+    })
+}
+
 fn parse_only_inner(
     source: &str,
     project_id: Uuid,

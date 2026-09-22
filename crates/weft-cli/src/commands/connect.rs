@@ -602,12 +602,11 @@ fn access_targets(
         .root
         .canonicalize()
         .with_context(|| format!("resolve {}", project.root.display()))?;
-    let (program, parse_errors) = weft_compiler::weft_compiler::compile_lenient(
+    let (program, parse_errors) = weft_compiler::flatten_lenient(
         &main,
         project.id(),
         weft_compiler::CompileFs::disk(&root).anchored_at(Some(&root.join(weft_compiler::project::SRC_DIR))),
-        weft_compiler::weft_compiler::IncludeMode::Full,
-        None,
+        catalog,
     );
     if let Some(first) = parse_errors.first() {
         bail!(
