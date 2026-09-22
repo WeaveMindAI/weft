@@ -21,6 +21,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only token for every job: nothing here writes to the repo.
+permissions:
+  contents: read
+
 # The workflow name is in the group: a called run (release.yml's gate)
 # reports the CALLER's workflow, so a manual `ci` dispatch on the same
 # ref lands in a different group instead of cancelling a release's
