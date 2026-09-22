@@ -1,6 +1,6 @@
 {
   "name": "@weft/graph",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared weft graph renderer + editor. Extracted from the VS Code extension so multiple hosts render the graph from one source. Each consumer provides its own host bridge (VS Code messaging, or the dispatcher HTTP API).",
   "type": "module",
   "private": true,
@@ -21,20 +21,20 @@
     "svelte": "^5.0.0"
   },
   "dependencies": {
-    "@codemirror/commands": "^6.10.3",
+    "@codemirror/commands": "^6.11.1",
     "@codemirror/lang-javascript": "^6.2.5",
     "@codemirror/lang-python": "^6.2.1",
-    "@codemirror/language": "^6.12.3",
-    "@codemirror/state": "^6.6.0",
-    "@codemirror/view": "^6.41.1",
-    "@lucide/svelte": "^1.8.0",
-    "@uiw/codemirror-theme-github": "^4.25.9",
-    "bits-ui": "^2.18.0",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.13",
+    "@lucide/svelte": "^1.47.0",
+    "@uiw/codemirror-theme-github": "^4.25.11",
+    "bits-ui": "^2.19.2",
     "clsx": "^2.1.1",
-    "plyr": "^3.8.4",
     "codemirror": "^6.0.2",
-    "marked": "^18.0.2",
-    "svelte-sonner": "^1.1.0",
-    "tailwind-merge": "^3.5.0"
+    "marked": "^18.0.14",
+    "plyr": "^3.8.4",
+    "svelte-sonner": "^1.2.1",
+    "tailwind-merge": "^3.7.0"
   }
 }

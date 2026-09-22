@@ -152,7 +152,9 @@ app.get('/media/:messageId', async (req, res) => {
     res.set('X-Filename', filename);
     res.send(buffer);
   } catch (err) {
-    console.error(`[media] Failed to download media for ${messageId}:`, err.message);
+    // The id comes from the URL, so it goes in as an argument, never
+    // inside the format string.
+    console.error('[media] Failed to download media for %s:', messageId, err.message);
     res.status(500).json({ error: `Failed to download media: ${err.message}` });
   }
 });

@@ -386,7 +386,9 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
       // SYNC: the /action envelope <-> crates/weft-dispatcher/src/api/infra.rs (infra_action_result), catalog/postgres/database/images/credential/bootstrap.py
       res.json({ result });
     } catch (err) {
-      console.error(`[action] ${action} failed:`, err);
+      // The action name is caller-supplied, so it goes in as an argument,
+      // never inside the format string.
+      console.error('[action] %s failed:', action, err);
       res.status(500).json({ error: err.message || 'Action failed' });
     }
   };

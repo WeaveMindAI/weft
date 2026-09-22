@@ -33,7 +33,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
-lru = "0.12"
+lru = "0.16"
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
@@ -41,7 +41,7 @@ hmac = { workspace = true }
 # dispatcher's forward, and Google-issued identity tokens are verified
 # against the published key set.
 base64 = { workspace = true }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 url = { workspace = true }
 getrandom = "0.2"
 parking_lot = { workspace = true }
