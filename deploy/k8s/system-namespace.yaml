@@ -151,14 +151,17 @@ spec:
       ports:
         - protocol: TCP
           port: 9999
-    # kube-apiserver (kubectl apply/scale/delete). Scoped to the
-    # apiserver's single ClusterIP, same reasoning as the broker's rule.
+    # kube-apiserver (kubectl apply/scale/delete). Named by where the
+    # apiserver actually answers, not by the `kubernetes` Service's
+    # ClusterIP: the policy engine sees a packet after kube-proxy has
+    # rewritten that ClusterIP to the endpoint behind it, so a rule
+    # naming the ClusterIP matches nothing. Same rule and reasoning as
+    # the broker's. The daemon substitutes both from the cluster's own
+    # `kubernetes` endpoint slice at apply time.
     - to:
-        - ipBlock:
-            cidr: ${WEFT_APISERVER_CLUSTERIP}/32
-      ports:
+${WEFT_APISERVER_PEERS}      ports:
         - protocol: TCP
-          port: 443
+          port: ${WEFT_APISERVER_PORT}
     # DNS.
     - to:
         - namespaceSelector:

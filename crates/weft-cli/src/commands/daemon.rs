@@ -235,8 +235,12 @@ async fn manifest_template_vars(
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
     check_cidr(&cfg.pod_cidr, false)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_POD_CIDR='{}': {e}", cfg.pod_cidr))?;
-    let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
-        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
+
+    // The docker network the cluster sits on; a real cluster has none.
+    let kind_network = match cfg.backend {
+        ClusterBackend::Kind => Some(kind_network_ipv4().await?),
+        ClusterBackend::K8s => None,
+    };
 
     // The operator's machine, as the cluster sees it, in both
     // directions. OUT: the address a pod dials to reach a port
@@ -246,14 +250,26 @@ async fn manifest_template_vars(
     // reaching the dispatcher). On docker for Linux both are the kind
     // network's gateway; on Docker Desktop the way out of its virtual
     // machine is a different address from the one its port proxy
-    // connects from, so the two are read separately. A real cluster
-    // has neither.
-    let (host_gateway, node_port_source) = match cfg.backend {
-        ClusterBackend::Kind => (
-            Some(machine_address_for_pods(cfg).await?),
-            Some(kind_network_gateway_ipv4().await?),
+    // connects from, so the two are read separately.
+    let host_gateway = match &kind_network {
+        Some(net) => Some(machine_address_for_pods(cfg, &net.gateway).await?),
+        None => None,
+    };
+    let node_port_source = kind_network.as_ref().map(|net| net.gateway.clone());
+
+    // Where the apiserver answers, for the two egress rules that admit
+    // it (the dispatcher's and the broker's).
+    let apiserver = apiserver_endpoint().await?;
+    let apiserver_peers = match &kind_network {
+        // The apiserver is a process inside the node, and the node is a
+        // container on this network at an address docker may hand out
+        // differently after a restart. The network's range on the
+        // apiserver's port is stable, and nothing else on that network
+        // answers on it.
+        Some(net) => apiserver_peers_yaml(&[net.subnet.to_string()]),
+        None => apiserver_peers_yaml(
+            &apiserver.addresses.iter().map(|ip| format!("{ip}/32")).collect::<Vec<_>>(),
         ),
-        ClusterBackend::K8s => (None, None),
     };
 
     // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
@@ -480,7 +496,8 @@ async fn manifest_template_vars(
         ("WEFT_STORE_ALLOW_CIDR", store_allow_cidr),
         ("WEFT_LISTENER_ALLOW_CIDR", listener_allow_cidr),
         ("WEFT_NODE_PORT_SOURCE_CIDR", node_port_source_cidr),
-        ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
+        ("WEFT_APISERVER_PEERS", apiserver_peers),
+        ("WEFT_APISERVER_PORT", apiserver.port.to_string()),
         ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
         // The ADDITIONAL internet-reachable address, empty when none:
         // the base URL above stays the stable local address either
@@ -573,23 +590,82 @@ impl MappedPort {
     }
 }
 
-/// The Kubernetes apiserver's ClusterIP: by convention the FIRST
-/// usable address of the Service CIDR (kind: 10.96.0.1 for
-/// 10.96.0.0/12). The broker's egress NetworkPolicy is scoped to this
-/// single /32 so a compromised broker can reach only the apiserver
-/// (TokenReview), not every ClusterIP Service in the cluster.
-fn apiserver_clusterip(service_cidr: &str) -> std::result::Result<String, String> {
-    let net: ipnet::IpNet = service_cidr.parse().map_err(|e| format!("not a valid CIDR: {e}"))?;
-    match net {
-        ipnet::IpNet::V4(n) => {
-            let base = u32::from(n.network());
-            Ok(std::net::Ipv4Addr::from(base + 1).to_string())
-        }
-        ipnet::IpNet::V6(n) => {
-            let base = u128::from(n.network());
-            Ok(std::net::Ipv6Addr::from(base + 1).to_string())
-        }
+/// Where the Kubernetes apiserver actually answers: the addresses and
+/// port behind the `kubernetes` Service, read from its endpoint slice.
+struct ApiserverEndpoint {
+    addresses: Vec<String>,
+    port: u16,
+}
+
+/// The apiserver's endpoint, for the egress rules that admit it.
+///
+/// The `kubernetes` Service's ClusterIP is NOT usable there: a
+/// NetworkPolicy engine sees a packet after kube-proxy has rewritten
+/// the ClusterIP to the endpoint behind it, so a rule naming the
+/// ClusterIP matches nothing and the default deny drops every
+/// apiserver call (on kind: no worker is ever created, `weft run`
+/// hangs after "started"). The endpoint slice is what the packet
+/// carries when the engine looks.
+async fn apiserver_endpoint() -> Result<ApiserverEndpoint> {
+    let out = kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "endpointslices",
+        "-l",
+        "kubernetes.io/service-name=kubernetes",
+        "-o",
+        "json",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "reading the apiserver's endpoint slice failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
+    let listing: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .context("the apiserver's endpoint slice listing is not JSON")?;
+    apiserver_endpoint_from_slices(&listing)
+}
+
+/// The addresses and the port out of an EndpointSlice listing. Pure,
+/// so the parse is testable against a captured listing.
+fn apiserver_endpoint_from_slices(listing: &serde_json::Value) -> Result<ApiserverEndpoint> {
+    let items = listing["items"].as_array().cloned().unwrap_or_default();
+    let addresses: Vec<String> = items
+        .iter()
+        .flat_map(|slice| slice["endpoints"].as_array().cloned().unwrap_or_default())
+        .flat_map(|endpoint| endpoint["addresses"].as_array().cloned().unwrap_or_default())
+        .filter_map(|address| address.as_str().map(str::to_string))
+        .collect();
+    let port = items
+        .iter()
+        .flat_map(|slice| slice["ports"].as_array().cloned().unwrap_or_default())
+        .find_map(|port| port["port"].as_u64())
+        .and_then(|port| u16::try_from(port).ok());
+    match (addresses.is_empty(), port) {
+        (false, Some(port)) => Ok(ApiserverEndpoint { addresses, port }),
+        _ => anyhow::bail!(
+            "the `kubernetes` endpoint slice names no apiserver address and port; the \
+             cluster's control plane is not reachable through it"
+        ),
+    }
+}
+
+/// The `- ipBlock:` entries a NetworkPolicy `to:` list gets for the
+/// apiserver, one per range, at the indentation the shipped manifests
+/// place the placeholder at (column 0, immediately after the `- to:`
+/// line). Ends with a newline so the manifest's next line stays its
+/// own.
+// SYNC: indentation <-> deploy/k8s/system-namespace.yaml and
+//       deploy/k8s/broker.yaml (the ${WEFT_APISERVER_PEERS} lines)
+fn apiserver_peers_yaml(cidrs: &[String]) -> String {
+    cidrs
+        .iter()
+        .map(|cidr| format!("        - ipBlock:\n            cidr: {cidr}\n"))
+        .collect()
 }
 
 pub enum DaemonAction {
@@ -2029,9 +2105,8 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
 
 /// This machine's address as the cluster's containers see it: what a
 /// pod dials to reach a port published on this machine (the object
-/// store, a service a trigger watches), and what a packet from this
-/// machine carries when it enters the node. Stable for the life of
-/// the docker install, so it can sit in a pod's environment.
+/// store, a service a trigger watches). Stable for the life of the
+/// docker install, so it can sit in a pod's environment.
 ///
 /// Two docker flavours, two answers. Docker Desktop (macOS, Windows)
 /// runs docker inside a virtual machine and publishes ports on the
@@ -2039,11 +2114,11 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
 /// nothing; the one address that leads back out is the name
 /// `host.docker.internal`, which every container there can resolve,
 /// so the node is asked to. Docker on Linux defines no such name: the
-/// machine IS the docker host, and the kind network's gateway is its
-/// address on that network.
+/// machine IS the docker host, and `gateway`, the kind network's
+/// gateway, is its address on that network.
 // SYNC: the machine address pods dial <-> scripts/run-e2e.sh
 //       (the WEFT_E2E_S3_ENDPOINT block)
-async fn machine_address_for_pods(cfg: &ClusterConfig) -> Result<String> {
+async fn machine_address_for_pods(cfg: &ClusterConfig, gateway: &str) -> Result<String> {
     let node = format!("{}-control-plane", cfg.cluster_name);
     let out = images::docker()
         .args(["exec", &node, "getent", "hosts", "host.docker.internal"])
@@ -2058,36 +2133,52 @@ async fn machine_address_for_pods(cfg: &ClusterConfig) -> Result<String> {
             return Ok(ip.to_string());
         }
     }
-    kind_network_gateway_ipv4().await
+    Ok(gateway.to_string())
 }
 
-/// The IPv4 gateway of the `kind` docker network. Discovered at
-/// runtime (docker picks the range per machine).
-async fn kind_network_gateway_ipv4() -> Result<String> {
+/// The IPv4 side of the `kind` docker network, as docker reports it.
+/// Read at runtime: docker picks the range per machine.
+struct KindNetworkIpv4 {
+    /// The network's gateway: this machine's address on it (docker
+    /// for Linux), and the source every packet from this machine
+    /// carries into the node through a published port (both flavours).
+    gateway: String,
+    /// The whole range, which the node's own address is somewhere in.
+    subnet: ipnet::Ipv4Net,
+}
+
+async fn kind_network_ipv4() -> Result<KindNetworkIpv4> {
     let out = images::docker()
-        .args(["network", "inspect", "kind", "-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"])
+        .args([
+            "network",
+            "inspect",
+            "kind",
+            "-f",
+            "{{range .IPAM.Config}}{{.Subnet}}={{.Gateway}} {{end}}",
+        ])
         .output()
         .await?;
     if !out.status.success() {
         anyhow::bail!("docker network inspect kind failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    // The network has both an IPv6 and an IPv4 gateway; pick the IPv4 one (the one
-    // with dots and no colons).
-    String::from_utf8_lossy(&out.stdout)
+    // The network has an IPv6 range beside the IPv4 one; the IPv4
+    // range is the one that parses as such.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
         .split_whitespace()
-        .find(|g| g.contains('.') && !g.contains(':'))
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 gateway on the kind docker network"))
+        .find_map(|pair| {
+            let (subnet, gateway) = pair.split_once('=')?;
+            let subnet: ipnet::Ipv4Net = subnet.parse().ok()?;
+            Some(KindNetworkIpv4 { gateway: gateway.to_string(), subnet })
+        })
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 range on the kind docker network: {stdout}"))
 }
 
 /// The cluster DNS Service's address, for nginx's `resolver`.
 ///
-/// READ from the cluster, where its sibling `apiserver_clusterip`
-/// DERIVES from the configured service CIDR. The difference is what
-/// each is for: that one renders a NetworkPolicy, which must be
-/// buildable with nothing but configuration, while a resolver pointing
-/// at the wrong address turns every proxied request into a lookup
-/// failure, so this one asks.
+/// READ from the cluster, like its sibling `apiserver_endpoint`: a
+/// resolver pointing at the wrong address turns every proxied request
+/// into a lookup failure, so this asks rather than assumes.
 ///
 /// `kube-dns` is the Service name every Kubernetes distribution uses;
 /// `WEFT_CLUSTER_DNS_IP` names the address directly for one that does
@@ -3696,9 +3787,9 @@ mod tests {
         assert!(!super::dispatcher_needs_replacement(&sidecar, "owner", "new"));
     }
     use super::{
-        apiserver_clusterip, canonical_tunnel_hostname, check_cidr, configured_dns_ip,
-        endpoint_host, parse_pooled_listing, rolls_for, split_yaml_documents,
-        yaml_document_kind, DetectedChanges, EndpointHost,
+        apiserver_endpoint_from_slices, apiserver_peers_yaml, canonical_tunnel_hostname,
+        check_cidr, configured_dns_ip, endpoint_host, parse_pooled_listing, rolls_for,
+        split_yaml_documents, yaml_document_kind, DetectedChanges, EndpointHost,
     };
 
     /// The roll decision, pinned as an explicit table (never a
@@ -3901,14 +3992,39 @@ mod tests {
     }
 
     #[test]
-    fn apiserver_clusterip_is_first_address_of_service_cidr() {
-        // The broker egress NetworkPolicy is scoped to this /32, so it
-        // must be the apiserver's real ClusterIP (network + 1).
-        assert_eq!(apiserver_clusterip("10.96.0.0/12").unwrap(), "10.96.0.1");
-        assert_eq!(apiserver_clusterip("172.20.0.0/16").unwrap(), "172.20.0.1");
-        // IPv6: same network+1 derivation (the egress /32 is security-critical).
-        assert_eq!(apiserver_clusterip("fd00::/108").unwrap(), "fd00::1");
-        assert!(apiserver_clusterip("garbage").is_err());
+    fn apiserver_endpoint_is_read_from_the_kubernetes_endpoint_slice() {
+        // The shape `kubectl get endpointslices -o json` returns for
+        // the `kubernetes` Service on kind: the node's address and the
+        // apiserver's real port, which is what a packet carries once
+        // kube-proxy has rewritten the ClusterIP.
+        let listing = serde_json::json!({"items": [{
+            "endpoints": [{"addresses": ["172.19.0.2"], "conditions": {"ready": true}}],
+            "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}]
+        }]});
+        let endpoint = apiserver_endpoint_from_slices(&listing).unwrap();
+        assert_eq!(endpoint.addresses, vec!["172.19.0.2".to_string()]);
+        assert_eq!(endpoint.port, 6443);
+        // A control plane with several apiservers lists every one.
+        let listing = serde_json::json!({"items": [{
+            "endpoints": [{"addresses": ["10.0.0.1"]}, {"addresses": ["10.0.0.2"]}],
+            "ports": [{"port": 443}]
+        }]});
+        assert_eq!(apiserver_endpoint_from_slices(&listing).unwrap().addresses.len(), 2);
+        // No address or no port is a refusal, never a rule that admits nothing.
+        assert!(apiserver_endpoint_from_slices(&serde_json::json!({"items": []})).is_err());
+    }
+
+    /// The rendered `to:` entries sit at the manifests' indentation
+    /// and end on a newline, so the `ports:` line that follows the
+    /// placeholder stays a line of its own.
+    #[test]
+    fn apiserver_peers_render_one_ip_block_per_range() {
+        let yaml = apiserver_peers_yaml(&["172.19.0.0/16".to_string(), "10.0.0.2/32".to_string()]);
+        assert_eq!(
+            yaml,
+            "        - ipBlock:\n            cidr: 172.19.0.0/16\n\
+             \x20       - ipBlock:\n            cidr: 10.0.0.2/32\n"
+        );
     }
 
     /// A resolver address nginx would accept as a token but never

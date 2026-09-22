@@ -271,22 +271,20 @@ spec:
           port: 53
     # kube-apiserver (TokenReview).
     #
-    # The apiserver doesn't live in a Pod we can pod-select; the only
-    # reliable selector is its ClusterIP via ipBlock. We scope to the
-    # apiserver's SINGLE ClusterIP /32 (the first address in the
-    # Service CIDR; kind: 10.96.0.1), NOT the whole Service CIDR.
-    # Scoping to the CIDR would let a compromised broker reach every
-    # other ClusterIP Service in the cluster on 443; this rule's whole
-    # purpose is that only TokenReview (the apiserver) is reachable.
-    # The `weft daemon` apply path substitutes ${WEFT_APISERVER_CLUSTERIP}
-    # (derived from the validated Service CIDR's .1) so a non-kind
-    # operator with a different CIDR gets the right address.
+    # The apiserver doesn't live in a Pod we can pod-select, so it is
+    # named by address: where it actually answers, on its own port,
+    # never the `kubernetes` Service's ClusterIP. The policy engine
+    # sees a packet after kube-proxy has rewritten that ClusterIP to
+    # the endpoint behind it, so a rule naming the ClusterIP matches
+    # nothing and the default deny drops every TokenReview. Scoped to
+    # the apiserver alone, never the whole Service range: this rule's
+    # whole purpose is that only the apiserver is reachable. The
+    # `weft daemon` apply path substitutes both placeholders from the
+    # cluster's own `kubernetes` endpoint slice.
     - to:
-        - ipBlock:
-            cidr: ${WEFT_APISERVER_CLUSTERIP}/32
-      ports:
+${WEFT_APISERVER_PEERS}      ports:
         - protocol: TCP
-          port: 443
+          port: ${WEFT_APISERVER_PORT}
     # Object store (the runtime-file bucket) + the access system's
     # outbound calls (connect-time test calls, OAuth token exchanges,
     # remote_select lookups), which address external services. This
