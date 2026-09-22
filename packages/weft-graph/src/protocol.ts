@@ -2059,9 +2059,16 @@ export type HostMessage =
       error?: string;
     };
 
+/// Which run the graph shows, and whether a run that starts takes over:
+///   - following: every run that starts takes the canvas.
+///   - locked: the canvas stays on one run; runs that start are counted.
+///   - off: no run on the canvas; runs that start are counted.
+export type FollowMode = 'following' | 'locked' | 'off';
+
 export interface FollowStatus {
-  mode: 'latest' | 'pinned';
+  mode: FollowMode;
   color: string | undefined;
+  /// Runs that started while not following, so not shown.
   pendingCount: number;
 }
 
@@ -2199,11 +2206,9 @@ export type WebviewMessage =
   /// the file-change debounce. Useful after editing source
   /// outside the IDE or when the user wants to confirm state.
   | { kind: 'refreshStatus' }
-  | { kind: 'followTogglePin' }
-  | { kind: 'followCatchUp' }
-  /// Stop showing the followed run and go back to an empty, live
-  /// canvas: the next run to start is followed as usual.
-  | { kind: 'followClear' }
+  /// The person picked a follow mode on the toolbar toggle (or the
+  /// "new runs" chip, which picks `following`).
+  | { kind: 'followSetMode'; mode: FollowMode }
   /// Replay a PAST execution onto the canvas: the host loads that execution's
   /// recorded events and feeds them as the editor's execution state (so the
   /// graph shows that run's final node statuses + outputs). `color` is the

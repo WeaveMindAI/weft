@@ -41,6 +41,7 @@ import type {
   BarPhase,
   CliEvent,
   ErrorVerb,
+  FollowMode,
 } from '../../packages/weft-graph/src/protocol';
 import {
   ACTIVITY_LINE_CAP,
@@ -49,7 +50,7 @@ import {
 import { backendFromSnapshot, parseTransition } from '../../packages/weft-graph/src/status';
 
 interface FollowState {
-  mode: 'latest' | 'pinned';
+  mode: FollowMode;
   color: string | undefined;
 }
 
@@ -86,7 +87,7 @@ function emptySlot(): Slot {
   return {
     backend: undefined,
     runningColors: new Set(),
-    follow: { mode: 'latest', color: undefined },
+    follow: { mode: 'following', color: undefined },
     cli: undefined,
     pendingAction: undefined,
     error: undefined,
@@ -241,7 +242,7 @@ export class ActionBarStore {
   /// AutoFollow emitted a follow-state change for projectId.
   /// Mirrors mode + color into the slot so the reducer can compute
   /// the watched-live color.
-  setFollow(projectId: string, mode: 'latest' | 'pinned', color: string | undefined): void {
+  setFollow(projectId: string, mode: FollowMode, color: string | undefined): void {
     const slot = this.ensureSlot(projectId);
     slot.follow = { mode, color };
     this.notifyIfPinned(projectId);
@@ -464,11 +465,12 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 
 /// Pure function: which running color does the bar act on for this slot?
 ///
-///   pinned mode: the user's pinned color, only if it's currently running.
-///   latest mode: the most recently started of the running colors.
-///                Returns undefined when nothing runs.
+///   locked: the locked color, only if it's currently running.
+///   off:    undefined; no run is on screen to stop.
+///   following: the most recently started of the running colors.
+///              Returns undefined when nothing runs.
 ///
-/// "Latest" is the last element of an insertion-ordered set, and that
+/// "Most recently started" is the last element of an insertion-ordered set, and that
 /// really is the newest from both directions: a run arriving on the
 /// live stream is appended as it starts, and a status fetch replaces
 /// the whole set with the dispatcher's own oldest-first list.
@@ -478,12 +480,13 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 /// execution is running on the same project.
 function computeWatchedRunningColor(slot: Slot): string | undefined {
   if (slot.runningColors.size === 0) return undefined;
-  if (slot.follow.mode === 'pinned') {
+  if (slot.follow.mode === 'off') return undefined;
+  if (slot.follow.mode === 'locked') {
     return slot.follow.color && slot.runningColors.has(slot.follow.color)
       ? slot.follow.color
       : undefined;
   }
-  // Latest mode: the newest running color. Set iteration is
+  // Following: the newest running color. Set iteration is
   // insertion-order, and both things that fill this set put the newest
   // last (see the note above), so the last element is the answer.
   let last: string | undefined;

@@ -1,15 +1,14 @@
 <script lang="ts">
-  import { ArrowLeft, EyeOff, Info, Pin, PinOff } from '@lucide/svelte';
+  import { ArrowLeft, Eye, EyeOff, Info, Lock } from '@lucide/svelte';
   import type { Snippet } from 'svelte';
+  import type { FollowMode } from '../../../../protocol';
 
   let {
     mode,
     color,
     pendingCount,
     notPainted = undefined,
-    onTogglePin,
-    onCatchUp,
-    onClearFollow,
+    onSetMode,
     navDepth = 0,
     navFileName = '',
     interactive = true,
@@ -18,7 +17,7 @@
     trailing,
     below,
   }: {
-    mode: 'latest' | 'pinned';
+    mode: FollowMode;
     color: string | undefined;
     pendingCount: number;
     /// Set when the run on screen cannot be painted from its journal,
@@ -26,12 +25,9 @@
     /// half-empty and the person deserves to be told why rather than
     /// left to guess at the viewer.
     notPainted?: string;
-    onTogglePin: () => void;
-    onCatchUp: () => void;
-    /// Take the run off the canvas without leaving live mode: the eye
-    /// button. Before it, the only way out of a replayed run's
-    /// highlight was closing the graph.
-    onClearFollow: () => void;
+    /// The person picked a mode on the toggle, or clicked the "new
+    /// runs" chip (which picks following).
+    onSetMode: (mode: FollowMode) => void;
     /// Include-navigation depth: > 0 means viewing an @include'd file, so a
     /// Return button shows. navFileName labels the current file.
     navDepth?: number;
@@ -63,6 +59,35 @@
   } = $props();
 
   const shortColor = $derived(color ? color.slice(0, 8) : '');
+
+  /// The three choices of the follow toggle, in the order drawn. Only
+  /// the active one shows its word; the others show their icon, and
+  /// every one says on hover what picking it does.
+  const choices = $derived([
+    {
+      mode: 'following' as const,
+      icon: Eye,
+      label: 'Following',
+      hint: 'Following: every run that starts takes over the graph.',
+      disabled: false,
+    },
+    {
+      mode: 'locked' as const,
+      icon: Lock,
+      label: 'Locked',
+      hint: color || mode === 'locked'
+        ? 'Locked: the graph stays on this run. Runs that start are counted, not shown.'
+        : 'Locked: keeps the graph on one run. There is no run on the graph to lock onto yet.',
+      disabled: !color && mode !== 'locked',
+    },
+    {
+      mode: 'off' as const,
+      icon: EyeOff,
+      label: 'Off',
+      hint: 'Off: no run on the graph, just the program. Runs that start are counted, not shown.',
+      disabled: false,
+    },
+  ]);
 </script>
 
 <div class="absolute top-3 left-3 z-30 flex flex-col items-start gap-2 pointer-events-auto">
@@ -81,7 +106,7 @@
   {/if}
 
   <!-- A view that is no place in the program shows no run, so none of
-       the run controls below (catch up, pin, stop showing) mean anything
+       the run controls below (the follow toggle, the new-runs chip) mean anything
        here: the pill takes their spot and says where a run is seen. -->
   {#if !interactive}
     <div
@@ -103,48 +128,52 @@
     </div>
   {/if}
 
-  {#if mode === 'pinned' && pendingCount > 0}
-    <button
-      type="button"
-      onclick={onCatchUp}
-      class="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-100 text-amber-800 border border-amber-300 shadow-sm text-xs font-medium hover:bg-amber-200 transition"
-      title="Jump to the newest execution"
-    >
-      <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
-      {pendingCount} new {pendingCount === 1 ? 'execution' : 'executions'} &middot; Catch up
-    </button>
-  {/if}
-
-  <button
-    type="button"
-    onclick={onTogglePin}
-    class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border shadow-sm text-xs font-medium transition
-      {mode === 'pinned'
-        ? 'bg-zinc-900 text-white border-zinc-900 hover:bg-zinc-800'
-        : 'bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50'}"
-    title={mode === 'pinned'
-      ? 'Pinned to this execution. Click to unpin and jump to the latest.'
-      : 'Live: following the latest execution. Click to pin to this one.'}
-    disabled={!color}
+  <div
+    role="radiogroup"
+    aria-label="Which run the graph shows"
+    class="flex items-center gap-0.5 p-0.5 rounded-md border border-zinc-200 bg-white shadow-sm text-xs font-medium"
   >
-    {#if mode === 'pinned'}
-      <Pin class="w-3 h-3" />
-      Pinned{shortColor ? ` · ${shortColor}` : ''}
-    {:else}
-      <PinOff class="w-3 h-3" />
-      Live{shortColor ? ` · ${shortColor}` : ''}
-    {/if}
-  </button>
+    {#each choices as choice (choice.mode)}
+      {@const active = mode === choice.mode}
+      <button
+        type="button"
+        role="radio"
+        aria-checked={active}
+        aria-label={choice.label}
+        title={choice.hint}
+        aria-disabled={choice.disabled}
+        onclick={() => { if (!choice.disabled) onSetMode(choice.mode); }}
+        class="flex items-center gap-1.5 h-6 rounded transition
+          {active ? 'px-2 bg-zinc-900 text-white' : 'w-6 justify-center text-zinc-500'}
+          {choice.disabled ? 'opacity-40 cursor-default' : active ? '' : 'hover:bg-zinc-100 hover:text-zinc-900'}"
+      >
+        <!-- aria-disabled rather than disabled: a disabled button shows no
+             tooltip, and the hover text is what says why Locked is greyed. -->
+        <choice.icon class="w-3 h-3" />
+        {#if active}
+          {choice.label}{choice.mode !== 'off' && shortColor ? ` · ${shortColor}` : ''}
+        {/if}
+      </button>
+    {/each}
+  </div>
 
-  {#if color}
+  <!-- Runs that started while not following. Clicking follows again,
+       starting from the newest of them. Louder while locked (the person
+       is looking at a run and newer ones exist) than while off. -->
+  {#if mode !== 'following' && pendingCount > 0}
     <button
       type="button"
-      onclick={onClearFollow}
-      class="flex items-center justify-center w-7 h-7 rounded-md border border-zinc-200 bg-white text-zinc-600 shadow-sm hover:bg-zinc-50 hover:text-zinc-900 transition"
-      title="Stop showing this run. The graph goes blank and follows the next run that starts."
-      aria-label="Stop showing this run"
+      onclick={() => onSetMode('following')}
+      class="flex items-center gap-1.5 px-3 py-1.5 rounded-md border shadow-sm text-xs font-medium transition
+        {mode === 'locked'
+          ? 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
+          : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50'}"
+      title="Show the newest of them and follow runs again"
     >
-      <EyeOff class="w-3.5 h-3.5" />
+      {#if mode === 'locked'}
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+      {/if}
+      {pendingCount} new {pendingCount === 1 ? 'run' : 'runs'} &middot; Follow
     </button>
   {/if}
   {/if}

@@ -16,7 +16,7 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -108,9 +108,7 @@ export class GraphViewController {
   /// null at the top level) on every navigation, so the Executions view
   /// marks the runs scoped to it.
   private navHandler: ((focusedGroup: string | null) => void) | undefined;
-  private followTogglePinHandler: (() => void) | undefined;
-  private followCatchUpHandler: (() => void) | undefined;
-  private followClearHandler: (() => void) | undefined;
+  private followModeHandler: ((mode: FollowMode) => void) | undefined;
   private openSourceHandler: ((location: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
@@ -232,9 +230,7 @@ export class GraphViewController {
   private lastExecVersion: { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null } | undefined;
   /// Which project `lastExecVersion` describes a run of.
   private execVersionFor: string | undefined;
-  setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
-  setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
-  setFollowClearHandler(fn: () => void): void { this.followClearHandler = fn; }
+  setFollowModeHandler(fn: (mode: FollowMode) => void): void { this.followModeHandler = fn; }
   setOpenSourceHandler(fn: (location: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
@@ -1348,14 +1344,8 @@ export class GraphViewController {
       case 'refreshStatus':
         void this.refreshActionAvailability();
         break;
-      case 'followTogglePin':
-        this.followTogglePinHandler?.();
-        break;
-      case 'followCatchUp':
-        this.followCatchUpHandler?.();
-        break;
-      case 'followClear':
-        this.followClearHandler?.();
+      case 'followSetMode':
+        this.followModeHandler?.(msg.mode);
         break;
       case 'openSource':
         this.openSourceHandler?.(msg.location);

@@ -69,11 +69,25 @@ to the dispatcher at `http://localhost:9999` (setting `weft.dispatcherUrl`).
 
 ## Toolbar and action bar
 
-Top-left floating toolbar: "Return · <file>" (inside an @include), "N new
-execution(s) · Catch up" (runs started while pinned), the [pin pill]
-("Live · <color>" following the newest run, "Pinned · <color>" locked to
-one; click to switch), and **"Source"** (opens the text beside the graph;
-click again to focus it).
+Top-left floating toolbar: "Return · <file>" (inside an @include), the
+[follow toggle], "N new run(s) · Follow" (runs that started while locked
+or off; click to show the newest and follow again), and **"Source"**
+(opens the text beside the graph; click again to focus it).
+
+The [follow toggle] has three parts, each explained on hover; only the
+active one shows its word:
+- **"Following · <color>"** (eye icon): every run that starts takes over
+  the graph. The default.
+- **"Locked · <color>"** (lock icon): the graph stays on this run; runs
+  that start are counted, not shown. Greyed while no run is on screen.
+- **"Off"** (crossed eye): no run on the graph, just the program.
+
+Clicking Run, Activate, or Infra Start in the editor switches to
+Following. A run started from the terminal (including every `weft run`
+you issue) never changes the mode: if the user left the graph Locked or
+Off, your run lands in the "N new run(s)" count, not on their screen, so
+tell them to click it (or switch to "Following") to watch it. Each project
+remembers whether it was left Following.
 
 Top-right: **"Simplified view"** toggle. On: square, read-only nodes (toast
 "Switch to the builder view to edit the graph"), one dot per side, for
@@ -176,8 +190,8 @@ panels, and a firing navigator ("‹ 2/5 iter 5/2 ›") for nodes that fired
 several times. The Copy button exports the whole inspection.
 
 Past runs: in the Executions view, "View in Graph" replays the run in the
-graph with every value in place; the [pin pill] says which run is on
-screen, and "Catch up" jumps to the newest. From the terminal the same
+graph with every value in place and locks the [follow toggle] onto it;
+"N new run(s) · Follow" jumps to the newest. From the terminal the same
 facts are `weft executions`, `weft events <color>`, `weft logs` (the
 `weft-running` skill).
 

@@ -129,15 +129,25 @@ its header to step through the firings.
 
 ## Look at an older run
 
-The button at the top left says which run is on screen: **Live** while it
-follows the newest, **Pinned** while it stays on one you chose. Click it to
-switch. If runs happen while you are pinned, an amber button appears counting
-them with **Catch up** on the end.
+The toggle at the top left decides which run the graph shows. Hover any of
+its three parts to see what it does:
+
+- **Following** puts every run that starts on the graph. It is the default,
+  and clicking **Run** in the editor always comes back to it.
+- **Locked** keeps the graph on the run it shows, so you can read it while
+  others start.
+- **Off** takes the run away and leaves just the program.
+
+While locked or off, runs that start are counted in a button beside the
+toggle, like **2 new runs · Follow**, and clicking it shows the newest and
+follows again. A run started from a terminal, yours or an assistant's, never
+changes the mode. Each project remembers whether you left it following.
 
 For a run from yesterday, click the **Weft** icon in the side strip.
 **Executions** lists every run of the project you last opened, newest first,
 and each row has **View in Graph**, which puts that run back on the canvas with
-its values in place. A replayed run looks exactly like a live one.
+its values in place and locks the toggle onto it. A replayed run looks exactly
+like a live one.
 
 ## Fold a big program down
 

@@ -92,7 +92,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
     // The follow itself lives extension-side and survives the
     // remount; the webview's copy of its status does not. Re-seed it
-    // so the pin pill / catch-up banner render the real state.
+    // so the follow toggle and the new-runs chip render the real state.
     autoFollow.emitStatus();
     // And which version the followed run ran, for the same reason. A
     // click on "view in graph" for a project that was not open creates
@@ -118,6 +118,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
       graphView.post(msg);
     },
+    context.workspaceState,
     (ev) => {
       if (ev.kind === 'execution_started') {
         actionBar.markExecutionStarted(ev.project_id, ev.color);
@@ -235,17 +236,18 @@ export function activate(context: vscode.ExtensionContext) {
 
   graphView.setRunHandler((targets) => runPinned(targets));
   graphView.setNavHandler((group) => executionsProvider.setFocusedGroup(group));
-  graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
-  graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
-  graphView.setFollowClearHandler(() => stopShowingRun());
+  graphView.setFollowModeHandler((mode) => {
+    autoFollow.setMode(mode);
+    // Off takes the run off the canvas, and its version banner with it.
+    if (mode === 'off') graphView.forgetExecVersion();
+  });
 
-  /// Take the followed run off the canvas: the eye button on the graph,
-  /// and deleting the run that is on screen, both end here. The
-  /// controller clears its follow and the webview's paint; the version
-  /// banner is remembered by the view itself, so it is forgotten here
-  /// too, or a remount would bring it back over an empty canvas.
+  /// The run on screen was deleted (here or in another window): take
+  /// it off the canvas. The version banner is remembered by the view
+  /// itself, so it is forgotten here too, or a remount would bring it
+  /// back over an empty canvas.
   function stopShowingRun(): void {
-    autoFollow.clearFollow();
+    autoFollow.stopShowing();
     graphView.forgetExecVersion();
   }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
@@ -272,7 +274,7 @@ export function activate(context: vscode.ExtensionContext) {
     watchPinnedProjectForDrift();
     executionsProvider.setPinnedProject(project);
     projectStream.setProject(project.id);
-    autoFollow.setProject();
+    autoFollow.setProject(project.id);
     // Tell the action-bar store which slot drives webview
     // emissions now. The store keeps every project's slot alive
     // (so an in-flight verb's events keep accumulating in the
@@ -453,7 +455,7 @@ export function activate(context: vscode.ExtensionContext) {
       || verb === 'resync'
       || (verb === 'infra' && (args[0] === 'start' || args[0] === 'upgrade'))
     ) {
-      autoFollow.pinAndFollow(undefined);
+      autoFollow.followStartedByUser(undefined);
     }
     actionBar.cliStart(projectId, verbTag);
     try {
@@ -478,7 +480,7 @@ export function activate(context: vscode.ExtensionContext) {
           ev.detail?.project_id === projectId &&
           pinnedProject?.id === projectId
         ) {
-          autoFollow.pinAndFollow(ev.detail.color);
+          autoFollow.followStartedByUser(ev.detail.color);
         }
       }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
@@ -1097,7 +1099,7 @@ export function activate(context: vscode.ExtensionContext) {
     // the pin changes, and puts the entry file and its graph in front
     // either way, so a closed or buried panel comes back.
     await showProject(match);
-    autoFollow.pinToExecution(summary.color);
+    autoFollow.lockTo(summary.color);
     // A run opened from the version tree tells the graph which version
     // it ran and which one the disk is, so it can say when they differ.
     if (version !== undefined) {

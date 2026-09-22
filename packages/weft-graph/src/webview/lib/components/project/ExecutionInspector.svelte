@@ -206,8 +206,7 @@
 	// which yanked the user back to the newest mid-read whenever a run streamed in.
 	// `pinnedToLatest` stays true while they're viewing the last item (so a new one
 	// follows) and flips false the moment they navigate to an older one (so their
-	// place is held); navigating back to the last re-pins. Same pinned/latest model
-	// the GraphToolbar follow control uses.
+	// place is held); navigating back to the last re-pins.
 	let pinnedToLatest = $state(true);
 	const count = $derived(executions.length);
 	$effect(() => {

@@ -77,6 +77,22 @@ describe('the running set follows the status fetch', () => {
   });
 });
 
+describe('which running run the bar acts on follows the follow mode', () => {
+  it('following acts on the newest, locked on its own run, off on none', () => {
+    const store = new ActionBarStore();
+    store.setPinnedProject('p');
+    store.markExecutionStarted('p', 'old');
+    store.markExecutionStarted('p', 'new');
+    store.setFollow('p', 'following', 'new');
+    expect(store.watchedRunningColor('p')).toBe('new');
+    store.setFollow('p', 'locked', 'old');
+    expect(store.watchedRunningColor('p')).toBe('old');
+    // Off shows no run, so there is no run on screen for Stop to stop.
+    store.setFollow('p', 'off', undefined);
+    expect(store.watchedRunningColor('p')).toBeUndefined();
+  });
+});
+
 const PROJECT = 'p1';
 
 function pinnedStore(): ActionBarStore {

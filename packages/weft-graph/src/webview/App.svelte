@@ -13,7 +13,7 @@
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
+  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import type { Snippet } from 'svelte';
   import type { EditorContext } from './editor-context';
@@ -301,7 +301,7 @@
 
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
-  let followMode = $state<'latest' | 'pinned'>('latest');
+  let followMode = $state<FollowMode>('following');
   let followColor = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
   /// Why the followed run cannot be painted whole, when it cannot: the
@@ -1086,7 +1086,7 @@
         {#if leftPanel}{@render leftPanel(editorContext)}{/if}
         <!-- The canvas. `relative` so ProjectEditor's `absolute inset-0` fills
              this cell; `min-w-0` so a wide panel can't shove it off-screen. The
-             editor's own floating toolbar (Live / pin / Source / nav) lives
+             editor's own floating toolbar (follow toggle / Source / nav) lives
              INSIDE this cell so it floats over the CANVAS only: when the left
              panel opens it pushes the canvas right, and the toolbar travels with
              it instead of overlapping the panel. -->
@@ -1096,9 +1096,7 @@
             color={followColor}
             pendingCount={followPendingCount}
             notPainted={runNotPainted}
-            onTogglePin={() => send({ kind: 'followTogglePin' })}
-            onCatchUp={() => send({ kind: 'followCatchUp' })}
-            onClearFollow={() => send({ kind: 'followClear' })}
+            onSetMode={(mode) => send({ kind: 'followSetMode', mode })}
             {navDepth}
             {navFileName}
             {interactive}
