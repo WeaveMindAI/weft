@@ -26,6 +26,9 @@ weft new hello --assistant claude-code
 That puts Tangle in the project. Tangle is our weft specialist: it knows the
 language, reads the catalog on your disk before it wires anything, writes any
 step you are missing, and will build you a web frontend if you ask for one.
+It also tests what it builds. It runs one piece at a time on a real input, looks
+at what came out, and goes back to fix the step that got it wrong. You can hand
+it a job and find the program working when you come back.
 
 Open the project in your assistant and ask it to show you around, or just say
 what you want built. It walks you through everything below, pointing at your

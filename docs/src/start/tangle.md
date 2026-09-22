@@ -37,6 +37,12 @@ one in `front/`, talking to your program through the program's own HTTP routes.
 The default stack is SvelteKit, PostgreSQL, BetterAuth and shadcn-svelte, and
 if you name a different one, yours wins.
 
+**It tests as it goes.** Tangle runs one piece of the program on its own, with
+values it makes up or a real input you gave it. It reads what came out, fixes
+the step, then runs only what changed. When a case comes out right, Tangle
+freezes it, and after a later change it runs that case again and reads what
+moved. You do not have to be there for any of that.
+
 **It offers guard rails on risky programs.** If strangers can post into your
 program, or it sends, deletes or spends money on its own, Tangle names the
 protections that slow things down (a check, a gate, a person who has to
