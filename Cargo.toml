@@ -87,6 +87,8 @@ rowan = "0.16"
 
 # cli
 clap = { version = "4", features = ["derive", "env"] }
+# Tab completion: the shell asks the `weft` binary itself for candidates.
+clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 
 # errors
 thiserror = "2"

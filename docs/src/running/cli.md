@@ -14,6 +14,13 @@ output, which is how the VS Code extension drives all of this.
 - `weft connect --json` only works with `--list`, `--grant`, `--disconnect` and
   `--forget`. The walkthrough prints for a person.
 
+Tab completes commands and flags in a new terminal after `./setup.sh`. For
+zsh and bash, setup adds a short block to `~/.zshrc` or `~/.bashrc`, between
+two `# weft tab completion` marker lines, and `./setup.sh --uninstall` takes it
+out again. For fish it writes `~/.config/fish/completions/weft.fish`. Every Tab
+asks the installed `weft` for the candidates, so new commands and flags show
+up as soon as you update it.
+
 ## Start a project
 
 | Command | What it does |

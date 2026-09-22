@@ -1097,6 +1097,12 @@ fn parse_phase(text: &str) -> Result<weft_core::context::Phase, String> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Tab completion. The shell's completion script runs `weft` again
+    // with `COMPLETE=<shell>` set and the words typed so far; this
+    // answers with the candidates and exits, before anything else
+    // runs. Without the variable it returns and `weft` runs normally.
+    // `COMPLETE=bash weft` (or zsh, fish, ...) prints that script.
+    clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command).complete();
     // The flags are parsed out here so a failure anywhere below can be
     // reported the way the caller asked for it: `--json` gets one
     // error event on stdout, a terminal gets one `error:` line.

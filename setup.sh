@@ -1080,6 +1080,23 @@ fi
 
 bin_dir="${prefix}/bin"
 weft_bin="${bin_dir}/weft"
+# Tab completion. fish loads a script from its completions folder by
+# itself; bash and zsh are told in their startup file, inside a block
+# between these two marker lines, which setup rewrites on every install
+# and removes on uninstall. Everything between the markers is setup's.
+fish_completion_file="${XDG_CONFIG_HOME:-${HOME}/.config}/fish/completions/weft.fish"
+completion_rc_files=("${ZDOTDIR:-${HOME}}/.zshrc" "${HOME}/.bashrc")
+completion_block_begin='# >>> weft tab completion (written by weft setup.sh) >>>'
+completion_block_end='# <<< weft tab completion <<<'
+# Take the block out of one startup file. Rewritten through `cat >` so
+# a startup file that is a link (a dotfiles repo) stays a link.
+remove_completion_block() { # <rc file>
+  [[ -f "$1" ]] && grep -qF "${completion_block_begin}" "$1" || return 0
+  local kept
+  kept="$(awk -v b="${completion_block_begin}" -v e="${completion_block_end}" \
+    '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$1")" || return 1
+  printf '%s\n' "${kept}" > "$1"
+}
 
 # ---- pre-flight: required binaries ----------------------------------
 #
@@ -1246,6 +1263,19 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       rm -f "${installed_bin}"
       ok "removed ${C_DIM}${installed_bin}${C_RESET}"
     fi
+    if [[ -f "${fish_completion_file}" ]]; then
+      rm -f "${fish_completion_file}"
+      ok "removed ${C_DIM}${fish_completion_file}${C_RESET}"
+    fi
+    for rc_file in "${completion_rc_files[@]}"; do
+      if [[ -f "${rc_file}" ]] && grep -qF "${completion_block_begin}" "${rc_file}"; then
+        if remove_completion_block "${rc_file}"; then
+          ok "removed weft tab completion from ${C_DIM}${rc_file}${C_RESET}"
+        else
+          warn "could not edit ${rc_file}; delete the lines between the two '# weft tab completion' markers by hand"
+        fi
+      fi
+    done
 
     # 4. Hints for the manual cleanup we deliberately don't do.
     #    Only relevant when uninstall runs without --purge; if the
@@ -1727,6 +1757,55 @@ if [[ $build_cli -eq 1 ]]; then
     }
     ln -sfn "${installed_bin}" "${weft_bin}"
     ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
+  fi
+
+  # Tab completion. The shell's side only knows how to ask `weft` for
+  # the candidates (`COMPLETE=<shell> weft` prints it), so the commands
+  # and flags always come from the installed binary. The startup-file
+  # block regenerates that script in every new shell, so it always
+  # matches the binary; the fish file is rewritten on every install for
+  # the same reason. A shell that cannot be set up only loses tab
+  # completion, so a failure warns and the install carries on.
+  #
+  # Every zsh and bash startup file that exists gets its block, plus the
+  # login shell's even when it does not exist yet (a fresh Mac has no
+  # ~/.zshrc). `$SHELL` alone is not enough: it names the LOGIN shell,
+  # and a bashrc that ends in `exec zsh` makes every terminal a zsh. A
+  # block only ever runs in its own shell, so an extra one costs nothing.
+  for completion_shell in zsh bash; do
+    if [[ "${completion_shell}" == zsh ]]; then
+      completion_rc="${completion_rc_files[0]}"
+    else
+      completion_rc="${completion_rc_files[1]}"
+    fi
+    [[ -f "${completion_rc}" || "$(basename "${SHELL:-}")" == "${completion_shell}" ]] || continue
+    if err="$( {
+        remove_completion_block "${completion_rc}" \
+        && { [[ ! -s "${completion_rc}" || -z "$(tail -c 1 "${completion_rc}")" ]] || printf '\n' >> "${completion_rc}"; } \
+        && {
+          printf '%s\n' "${completion_block_begin}"
+          # zsh registers completions through `compdef`, which only
+          # exists once the completion system is loaded; a bare zshrc
+          # (the macOS default) never loads it.
+          if [[ "${completion_shell}" == zsh ]]; then
+            printf '%s\n' '(( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }'
+          fi
+          printf 'if [ -x "%s" ]; then eval "$(COMPLETE=%s "%s")"; fi\n' "${weft_bin}" "${completion_shell}" "${weft_bin}"
+          printf '%s\n' "${completion_block_end}"
+        } >> "${completion_rc}"
+      } 2>&1 )"; then
+      ok "${completion_shell} tab completion ${SYM_ARROW} ${C_DIM}${completion_rc}${C_RESET} (new terminals)"
+    else
+      warn "${completion_shell} tab completion not set up in ${completion_rc}: ${err}"
+    fi
+  done
+  if command -v fish >/dev/null 2>&1; then
+    if err="$( { mkdir -p "$(dirname "${fish_completion_file}")" && COMPLETE=fish "${weft_bin}" >"${fish_completion_file}"; } 2>&1 )"; then
+      ok "fish tab completion ${SYM_ARROW} ${C_DIM}${fish_completion_file}${C_RESET}"
+    else
+      rm -f "${fish_completion_file}"
+      warn "fish tab completion not installed: ${err}"
+    fi
   fi
 
   # Engine-change sweep, on either path: the builder base and the
