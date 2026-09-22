@@ -71,18 +71,21 @@ if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
   echo "provisioned: WEFT_E2E_DATABASE_URL via port-forward (pid $PF_PID)"
 fi
 
-# An S3 store: the daemon ALREADY runs SeaweedFS as a host docker
-# container ('weft-object-store', S3 gateway on WEFT_SEAWEED_PORT,
-# local-dev identities); reuse it with a dedicated e2e bucket rather
-# than spawning a second store. Pods reach it at the kind docker
-# network's gateway address; the broker's egress denies private
+# An S3 store: the daemon ALREADY runs SeaweedFS as a docker container
+# beside the cluster ('weft-object-store', local-dev identities); reuse
+# it with a dedicated e2e bucket rather than spawning a second store.
+# The endpoint below is dialled by the WORKER POD running the node
+# under test, so it is the store's address on the cluster's own docker
+# network, never the port published on this machine (which a pod
+# cannot reach on Docker Desktop). The broker's egress denies private
 # ranges, and the daemon derives that address's /32 opening from its
 # own object-store endpoint, so nothing is exported here for it.
+# SYNC: the pod-reachable store endpoint <->
+#       crates/weft-cli/src/commands/daemon.rs (object_store_endpoint_for_pods)
 if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
-  KIND_GATEWAY="$(docker network inspect kind \
-    --format '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
-  if [ -n "$KIND_GATEWAY" ] && [ -n "$(docker ps -q -f name='^weft-object-store$')" ]; then
+  STORE_IP="$(docker inspect weft-object-store \
+    -f '{{ (index .NetworkSettings.Networks "kind").IPAddress }}' 2>/dev/null)"
+  if [ -n "$STORE_IP" ] && [ -n "$(docker ps -q -f name='^weft-object-store$')" ]; then
     # The bucket stays across runs (it is the store the daemon owns,
     # not ours to tear down), so "already exists" is as good as
     # created. Any OTHER failure must not export the S3 vars: the test
@@ -97,7 +100,7 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
       'echo "s3.bucket.list" | weed shell' 2>&1)"
     BUCKET_STATUS=$?
     if [ "$BUCKET_STATUS" -eq 0 ] && printf '%s\n' "$BUCKET_OUT" | grep -q 'weft-e2e'; then
-      export WEFT_E2E_S3_ENDPOINT="http://$KIND_GATEWAY:${WEFT_SEAWEED_PORT:-9096}"
+      export WEFT_E2E_S3_ENDPOINT="http://$STORE_IP:8333"
       export WEFT_E2E_S3_REGION="us-east-1"
       export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
       export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
@@ -109,7 +112,7 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
       printf '%s\n' "$BUCKET_OUT" >&2
     fi
   else
-    echo "warning: no running weft-object-store container (or no kind network); the S3 e2e will skip" >&2
+    echo "warning: no running weft-object-store container (or it is not on the kind network); the S3 e2e will skip" >&2
   fi
 fi
 
