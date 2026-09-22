@@ -49,10 +49,10 @@ pub struct ClusterConfig {
     /// downloads); the live gateway is a separate front door.
     pub gateway_port: u16,
     /// Loopback port the bundled SeaweedFS object store's docker
-    /// container (a container beside the cluster, not a pod; see
-    /// `ensure_object_store`) is published on. Runtime-file downloads are
-    /// presigned BUCKET urls signed for this host-reachable address (the
-    /// address the pods dial is on a docker network no browser can see).
+    /// container (a host container, not a pod; see `ensure_object_store`)
+    /// is published on. Runtime-file downloads are presigned BUCKET urls
+    /// signed for this host-reachable address (the broker's in-cluster
+    /// I/O endpoint is unreachable from the host / a browser).
     pub seaweed_port: u16,
     /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
     /// range; the broker NetworkPolicy allows TokenReview egress to
@@ -238,18 +238,16 @@ async fn manifest_template_vars(
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
 
-    // The docker network the cluster sits on. Its gateway is the
-    // operator's machine as the cluster sees it (what every packet from
-    // this machine carries when it enters the node: a listener's watch
-    // on a local service, the CLI arriving through a mapped node port),
-    // and the object store's address is carved out of its range. Read
-    // once; three defaults below derive from it. A real cluster has no
-    // such network.
-    let kind_network = match cfg.backend {
-        ClusterBackend::Kind => Some(kind_network_ipv4().await?),
+    // The operator's machine, as the cluster sees it: on kind, the
+    // address a pod dials to reach a port published on this machine
+    // (the object store, a service a trigger watches) and the address
+    // a packet from this machine carries when it enters the node (the
+    // CLI arriving through a mapped node port). Read once; three
+    // defaults below derive from it. A real cluster has no such address.
+    let host_gateway = match cfg.backend {
+        ClusterBackend::Kind => Some(machine_address_for_pods(cfg).await?),
         ClusterBackend::K8s => None,
     };
-    let host_gateway = kind_network.as_ref().map(|n| n.gateway.clone());
 
     // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
     // bytes to this bucket, and workers read/write it DIRECTLY via presigned URLs.
@@ -258,18 +256,18 @@ async fn manifest_template_vars(
     // override any of these via env for their own S3.
     //
     // INTERNAL endpoint (what the broker and the worker pods dial): the object
-    // store is a docker container sitting on the same docker network as the
-    // cluster's nodes, so pods reach it at its address on that network. This is
-    // the host string presigned internal URLs are signed for, and the pods then
-    // connect to (the two must match for SigV4).
+    // store is a docker container on this machine with its S3 port published
+    // here, and pods reach this machine at the address above. This is the host
+    // string presigned internal URLs are signed for, and the pods then connect
+    // to (the two must match for SigV4).
     let object_store_endpoint = match std::env::var("WEFT_OBJECT_STORE_ENDPOINT") {
         Ok(v) => v,
         // The derived default only exists on kind (where weft runs the
         // store itself); a real cluster has no address to derive, so
         // absence there is a configuration error, named rather than
         // surfacing as a failed docker inspect.
-        Err(_) => match &kind_network {
-            Some(net) => object_store_endpoint_for_pods(net.subnet),
+        Err(_) => match &host_gateway {
+            Some(host) => format!("http://{host}:{}", cfg.seaweed_port),
             None => anyhow::bail!(
                 "WEFT_OBJECT_STORE_ENDPOINT is required for the k8s backend; set it to \
                  the S3 endpoint the cluster reaches"
@@ -704,10 +702,9 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
         ensure_cluster(cfg, rebuild_cluster).await?;
-        // The object store is a docker container beside the cluster
-        // that the cluster reaches OUT to (the local stand-in for a
-        // real S3 provider). After the cluster, because it joins the
-        // network kind creates; before anything that needs a bucket.
+        // The object store is a HOST docker container the cluster
+        // reaches OUT to (the local stand-in for a real S3 provider);
+        // up before anything that needs a bucket.
         ensure_object_store(cfg).await?;
         ensure_ingress_controller().await?;
         ensure_envoy_gateway().await?;
@@ -2006,17 +2003,6 @@ async fn create_cluster(cfg: &ClusterConfig, config: &str, fingerprint: &str) ->
 //       container, its "<container>-data" volume, and the seaweedfs image)
 const OBJECT_STORE_CONTAINER: &str = "weft-object-store";
 
-/// The docker network `kind` puts its nodes on, and the network the
-/// object store joins so pods and nodes reach it container to
-/// container. `kind` names it after itself and offers no way to rename
-/// it.
-const KIND_NETWORK: &str = "kind";
-
-/// The port SeaweedFS's S3 gateway listens on INSIDE its container.
-/// `cfg.seaweed_port` is the separate host port the same gateway is
-/// published on for the browser; pods use this one.
-const OBJECT_STORE_S3_PORT: u16 = 8333;
-
 /// The S3 identities config the object store validates signatures against: one
 /// admin identity holding the local-dev key/secret.
 fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
@@ -2034,71 +2020,57 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
     )
 }
 
-/// The IPv4 side of the `kind` docker network, as docker reports it.
-/// Read at runtime: docker picks the range per machine.
-struct KindNetworkIpv4 {
-    /// The address a packet from THIS MACHINE carries when it enters
-    /// the cluster, and the address a pod dialling back out to this
-    /// machine's own services uses.
-    gateway: String,
-    /// The whole range; the object store's fixed address is carved
-    /// out of it.
-    subnet: ipnet::Ipv4Net,
+/// This machine's address as the cluster's containers see it: what a
+/// pod dials to reach a port published on this machine (the object
+/// store, a service a trigger watches), and what a packet from this
+/// machine carries when it enters the node. Stable for the life of
+/// the docker install, so it can sit in a pod's environment.
+///
+/// Two docker flavours, two answers. Docker Desktop (macOS, Windows)
+/// runs docker inside a virtual machine and publishes ports on the
+/// machine OUTSIDE it, so the docker network's gateway reaches
+/// nothing; the one address that leads back out is the name
+/// `host.docker.internal`, which every container there can resolve,
+/// so the node is asked to. Docker on Linux defines no such name: the
+/// machine IS the docker host, and the kind network's gateway is its
+/// address on that network.
+// SYNC: the machine address pods dial <-> scripts/run-e2e.sh
+//       (the WEFT_E2E_S3_ENDPOINT block)
+async fn machine_address_for_pods(cfg: &ClusterConfig) -> Result<String> {
+    let node = format!("{}-control-plane", cfg.cluster_name);
+    let out = images::docker()
+        .args(["exec", &node, "getent", "hosts", "host.docker.internal"])
+        .output()
+        .await?;
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(ip) = stdout
+            .split_whitespace()
+            .find(|word| word.parse::<std::net::Ipv4Addr>().is_ok())
+        {
+            return Ok(ip.to_string());
+        }
+    }
+    kind_network_gateway_ipv4().await
 }
 
-async fn kind_network_ipv4() -> Result<KindNetworkIpv4> {
+/// The IPv4 gateway of the `kind` docker network. Discovered at
+/// runtime (docker picks the range per machine).
+async fn kind_network_gateway_ipv4() -> Result<String> {
     let out = images::docker()
-        .args([
-            "network",
-            "inspect",
-            KIND_NETWORK,
-            "-f",
-            "{{range .IPAM.Config}}{{.Subnet}}={{.Gateway}} {{end}}",
-        ])
+        .args(["network", "inspect", "kind", "-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"])
         .output()
         .await?;
     if !out.status.success() {
         anyhow::bail!("docker network inspect kind failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    // The network has an IPv6 range beside the IPv4 one; the IPv4
-    // subnet is the one that parses as such.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
+    // The network has both an IPv6 and an IPv4 gateway; pick the IPv4 one (the one
+    // with dots and no colons).
+    String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
-        .find_map(|pair| {
-            let (subnet, gateway) = pair.split_once('=')?;
-            let subnet: ipnet::Ipv4Net = subnet.parse().ok()?;
-            Some(KindNetworkIpv4 { gateway: gateway.to_string(), subnet })
-        })
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 range on the kind docker network: {stdout}"))
-}
-
-/// The object store's address on the `kind` docker network: the last
-/// usable address of the range.
-///
-/// Fixed rather than left to docker, because the broker and every
-/// worker carry this address in their environment and in the URLs they
-/// sign. Docker hands addresses out from the bottom of the range in
-/// the order containers come up, so after a reboot the store and the
-/// node can trade places, and nothing in the cluster would know. The
-/// top of the range is where that allocation never reaches.
-fn object_store_ipv4(net: ipnet::Ipv4Net) -> std::net::Ipv4Addr {
-    std::net::Ipv4Addr::from(u32::from(net.broadcast()) - 1)
-}
-
-/// The S3 endpoint in-cluster pods reach the bundled object store at.
-///
-/// The store and the cluster's nodes are both containers on the `kind`
-/// docker network, so a pod dials the store's own address on that
-/// network and the packet never leaves docker. The port published on
-/// this machine is NOT an answer here: on Docker Desktop (macOS and
-/// Windows) docker runs in a virtual machine and publishes ports on the
-/// machine OUTSIDE it, so a pod dialling the network's gateway address
-/// reaches nothing and times out.
-// SYNC: the pod-reachable store endpoint <-> scripts/run-e2e.sh
-//       (the WEFT_E2E_S3_ENDPOINT block)
-fn object_store_endpoint_for_pods(net: ipnet::Ipv4Net) -> String {
-    format!("http://{}:{OBJECT_STORE_S3_PORT}", object_store_ipv4(net))
+        .find(|g| g.contains('.') && !g.contains(':'))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 gateway on the kind docker network"))
 }
 
 /// The cluster DNS Service's address, for nginx's `resolver`.
@@ -2267,20 +2239,20 @@ async fn heal_root_owned_config_dir(cfg_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Bring up the object store as a docker container (SeaweedFS's S3 gateway),
-/// beside the cluster's nodes on the same docker network rather than inside the
-/// cluster: the cluster reaches OUT to it over S3, exactly as it would to a real
-/// provider. Idempotent: a running container is left alone, a stopped one is
-/// started, else it is created. `-s3.externalUrl` is deliberately UNSET so the
-/// gateway validates each presigned request against its own incoming Host header
-/// (v3.80 behavior), letting the SAME instance accept URLs signed for its
-/// docker-network address (pods) AND for 127.0.0.1 (the browser).
+/// Bring up the object store as a HOST docker container (SeaweedFS's S3 gateway).
+/// The cluster reaches OUT to it over S3, exactly as it would to a real
+/// provider: the store is never inside the cluster. Idempotent: a running
+/// container is left alone, a stopped one is started, else it is created.
+/// `-s3.externalUrl` is deliberately UNSET so the gateway validates each
+/// presigned request against its own incoming Host header (v3.80 behavior),
+/// letting the SAME instance accept URLs signed for this machine's address as
+/// pods see it AND for 127.0.0.1 (the browser).
 async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
-    let run_args = object_store_run_args(cfg, object_store_ipv4(kind_network_ipv4().await?.subnet));
+    let run_args = object_store_run_args(cfg);
     // What the container would be run with today. A container cannot change
-    // its ports, mounts, network or image in place, so when this text moves
-    // the container is rebuilt. Its data volume is named and is not touched,
-    // so rebuilding costs nothing but the restart.
+    // its ports, mounts or image in place, so when this text moves the
+    // container is rebuilt. Its data volume is named and is not touched, so
+    // rebuilding costs nothing but the restart.
     let want = run_args.join(" ");
     let stamp = data_dir().join("object-store-run.sha256");
     let want_hash = {
@@ -2369,7 +2341,7 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
 
 /// Everything `docker run` is given for the object store. One place, so the
 /// fingerprint that decides whether to rebuild covers exactly what was run.
-fn object_store_run_args(cfg: &ClusterConfig, ip: std::net::Ipv4Addr) -> Vec<String> {
+fn object_store_run_args(cfg: &ClusterConfig) -> Vec<String> {
     let cfg_path = data_dir().join("object-store").join("s3.config.json");
     [
         "run",
@@ -2378,19 +2350,8 @@ fn object_store_run_args(cfg: &ClusterConfig, ip: std::net::Ipv4Addr) -> Vec<Str
         OBJECT_STORE_CONTAINER,
         "--restart",
         "unless-stopped",
-        // On the cluster's own docker network, at a fixed address, so
-        // a pod reaches the store container to container instead of
-        // back out through this machine (which Docker Desktop's
-        // virtual machine makes impossible), and finds it at the same
-        // address after a reboot.
-        "--network",
-        KIND_NETWORK,
-        "--ip",
-        &ip.to_string(),
-        // Published for the BROWSER and the CLI, which are on this
-        // machine and cannot see the docker network.
         "-p",
-        &format!("{}:{OBJECT_STORE_S3_PORT}", cfg.seaweed_port),
+        &format!("{}:8333", cfg.seaweed_port),
         "-v",
         &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
         "-v",
@@ -2398,13 +2359,8 @@ fn object_store_run_args(cfg: &ClusterConfig, ip: std::net::Ipv4Addr) -> Vec<Str
         "chrislusf/seaweedfs:3.80",
         "server",
         "-dir=/data",
-        // Listen on every interface. Left alone, weed binds each
-        // server to the ONE address the container had when it came
-        // up, so a network attached later (or attached in the other
-        // order) gets a refusal on the same port.
-        "-ip.bind=0.0.0.0",
         "-s3",
-        &format!("-s3.port={OBJECT_STORE_S3_PORT}"),
+        "-s3.port=8333",
         "-s3.config=/etc/seaweedfs/s3.config.json",
         "-master.volumeSizeLimitMB=1024",
     ]
@@ -3540,9 +3496,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        access_apps_file, access_apps_plan, kind_cluster_config, object_store_endpoint_for_pods,
-        object_store_ipv4, object_store_run_args, substitute_placeholders, AccessAppsPlan,
-        ClusterBackend, ClusterConfig, MappedPort, KIND_NETWORK, OBJECT_STORE_S3_PORT,
+        access_apps_file, access_apps_plan, kind_cluster_config, substitute_placeholders,
+        AccessAppsPlan, ClusterBackend, ClusterConfig, MappedPort,
     };
 
     fn kind_config_with_ports(dispatcher: u16, ingress: u16, gateway: u16) -> ClusterConfig {
@@ -3560,45 +3515,6 @@ mod tests {
             cluster_dns_ip: String::new(),
             backend: ClusterBackend::Kind,
         }
-    }
-
-    /// The store's address is the top of the docker network's range,
-    /// where docker's bottom-up allocation never reaches, and the
-    /// endpoint the pods are given is that address on the container's
-    /// own S3 port (never the port published on this machine).
-    #[test]
-    fn the_object_store_takes_the_last_address_of_the_kind_network() {
-        let net: ipnet::Ipv4Net = "172.25.0.0/16".parse().unwrap();
-        assert_eq!(object_store_ipv4(net).to_string(), "172.25.255.254");
-        assert_eq!(
-            object_store_endpoint_for_pods(net),
-            format!("http://172.25.255.254:{OBJECT_STORE_S3_PORT}")
-        );
-        let small: ipnet::Ipv4Net = "10.9.8.0/24".parse().unwrap();
-        assert_eq!(object_store_ipv4(small).to_string(), "10.9.8.254");
-    }
-
-    /// The object store joins the cluster's own docker network at its
-    /// fixed address, and it publishes its S3 port on this machine as
-    /// well. Both halves matter: pods dial the store across the docker
-    /// network, and a browser follows a presigned download link to the
-    /// published port. Dropping the network puts the store back where
-    /// only this machine can reach it, which on Docker Desktop leaves
-    /// every pod timing out.
-    #[test]
-    fn the_object_store_sits_on_the_cluster_network_and_on_this_machine() {
-        let ip = "172.25.255.254".parse().unwrap();
-        let args = object_store_run_args(&kind_config_with_ports(19999, 19998, 19097), ip);
-        let pair = |flag: &str| {
-            args.iter().position(|a| a == flag).map(|i| args[i + 1].clone()).unwrap_or_default()
-        };
-        assert_eq!(pair("--network"), KIND_NETWORK);
-        assert_eq!(pair("--ip"), "172.25.255.254");
-        assert_eq!(pair("-p"), format!("9096:{OBJECT_STORE_S3_PORT}"));
-        assert!(
-            args.iter().any(|a| a == &format!("-s3.port={OBJECT_STORE_S3_PORT}")),
-            "the gateway must listen on the port both addresses lead to: {args:?}"
-        );
     }
 
     /// The kind config maps each front door's node port to the
