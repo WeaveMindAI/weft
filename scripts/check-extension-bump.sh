@@ -34,11 +34,14 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # One line per extension: the package directory, then every path its
-# build reads. Both editors bundle the shared graph package, so an edit
-# there ships in both.
+# build reads. The VS Code extension bundles the shared graph package
+# (the graph webview) and ships files from the syntax package through
+# symlinks (the grammar and the markdown highlighter), so an edit in
+# either ships in it. The browser extension reads neither: it is the
+# task popup and never draws a graph.
 packages=(
-  "extension-vscode extension-vscode packages/weft-graph"
-  "extension-browser extension-browser packages/weft-graph"
+  "extension-vscode extension-vscode packages/weft-graph packages/weft-syntax"
+  "extension-browser extension-browser"
 )
 
 version_at() {

@@ -13,9 +13,11 @@ concept and nothing merges there. Work lands on a feature branch, goes
 into `main` through a PR, and the merge is what publishes.
 
 1. Commit on the feature branch (only when the [user] says so).
-   If the change touches `extension-vscode/`, `extension-browser/` or
-   `packages/weft-graph/` (both editors bundle it), bump that package's
-   version IN THE SAME PR (`pnpm version patch --no-git-tag-version`
+   If the change touches `extension-vscode/`, `packages/weft-graph/` or
+   `packages/weft-syntax/` (the VS Code extension ships all three), bump
+   `extension-vscode`; if it touches `extension-browser/`, bump that one.
+   The browser extension is the task popup and uses neither shared
+   package. Bump IN THE SAME PR (`pnpm version patch --no-git-tag-version`
    in the package directory): a merge without a bump publishes nothing
    to the stores. The `extension versions bumped` CI check refuses a
    PR that forgot; `scripts/check-extension-bump.sh origin/main` is the
