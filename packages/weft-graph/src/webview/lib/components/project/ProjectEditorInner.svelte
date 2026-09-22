@@ -2153,52 +2153,91 @@
 		});
 	});
 
-	// Simplified view sizes every node to its measured content (see simplifiedSizing),
-	// so when a node gains a live display (an image loads, a feed grows) it RESIZES.
-	// A resize can make it overlap a neighbour, so we re-run auto-organize to re-flow
-	// around the new measured size (a full re-layout: in simplified view that is
-	// accepted over preserving manual positions). Keyed off the REAL measured sizes
-	// of leaf (non-container) nodes, so it fires on any actual resize (image, feed,
-	// label) without duplicating the "has live display" predicate, and never loops:
-	// auto-organize changes positions, not a leaf's content-driven measured size.
-	// Debounced so a burst of streaming updates triggers one re-flow, not dozens.
-	let leafSizeSig = '';
-	let resizeReflowTimer: ReturnType<typeof setTimeout> | null = null;
+	// A node whose content grows on its own (a QR code or an image arrives, a feed
+	// fills, a debug value gets longer) takes more room than the layout gave it, and
+	// would overlap its neighbours. So in both views, when a leaf's measured size
+	// differs from the size the layout on screen was computed for, the whole view is
+	// laid out again. That overrides hand-placed positions, accepted in exchange for
+	// never showing overlaps. Keyed off the REAL measured sizes of leaf
+	// (non-container) nodes, so it catches any resize without a "has live display"
+	// predicate, and never loops: auto-organize moves nodes and sizes containers, it
+	// never changes a leaf's content-driven size.
+	//
+	// `laidOutFor` is what each view's layout was computed for: runAutoOrganize
+	// records the leaf sizes it laid out with, and a view whose layout came from the
+	// saved file takes the first settled sizes it is seen at. Comparing against it,
+	// rather than against the previous reading, is what keeps a view toggle quiet:
+	// the sizes swing from one view's boxes to the other's and back, and a toggle
+	// that ends at the sizes the layout was made for changes nothing.
+	const laidOutFor = new Map<LayoutVerb, Map<string, string>>();
+	function leafSizes(): Map<string, string> {
+		return new Map(
+			nodes
+				.filter(n => !n.hidden && (n.type === 'project' || n.type === 'groupCollapsed'))
+				.map(n => [n.id, `${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`]),
+		);
+	}
+	let resizeCheckTimer: ReturnType<typeof setTimeout> | null = null;
 	// True once the component is torn down, so an in-flight async organize that
 	// resolves after teardown does not write `nodes` / persist on dead state.
 	let destroyed = false;
-	// Cancel a pending reflow: on teardown (the timer must not fire on dead state)
-	// and when leaving simplified view (a stale reflow would run in builder view and
-	// silently rewrite builder positions with no undo entry). This clears the
-	// debounce timer; an organize ALREADY in flight (mid measure-wait) is caught
-	// separately by runAutoOrganize re-checking the active view + `destroyed` before
-	// it writes (see runAutoOrganize's apply guard), so neither window can persist
-	// the wrong view's positions or touch a destroyed component.
-	function cancelResizeReflow(): void {
-		if (resizeReflowTimer) { clearTimeout(resizeReflowTimer); resizeReflowTimer = null; }
-	}
-	onDestroy(() => { destroyed = true; cancelResizeReflow(); });
+	// Nothing is moved under the person's hand: while a pointer is held (dragging
+	// a node, pulling a resize handle, stretching a text box, drawing a selection)
+	// a check that lands waits for the release.
+	let pointerHeld = false;
+	let resizeCheckAfterRelease = false;
+	const holdPointer = () => { pointerHeld = true; };
+	const releasePointer = () => {
+		pointerHeld = false;
+		if (resizeCheckAfterRelease) { resizeCheckAfterRelease = false; scheduleResizeCheck(); }
+	};
+	// Capture phase, so a node that stops the event from bubbling still counts.
 	$effect(() => {
-		if (!simplified) { leafSizeSig = ''; cancelResizeReflow(); return; }
-		// Read measured sizes reactively so this re-runs when xyflow re-measures.
-		const sig = nodes
-			.filter(n => n.type === 'project' || n.type === 'groupCollapsed')
-			.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`)
-			.join('|');
-		untrack(() => {
-			// Skip until the active view is laid out (every visible node placed,
-			// no organize in flight; `organizeUnplaced` owns that); only react
-			// to LATER resizes.
-			const entries = parseLayoutCode(layoutCode, layoutVerb);
-			const laidOut = !organizeInFlight && nodes.every(n => n.hidden || entries[n.id]);
-			if (!laidOut) { leafSizeSig = sig; return; }
-			if (sig === leafSizeSig) return;
-			leafSizeSig = sig;
-			if (resizeReflowTimer) clearTimeout(resizeReflowTimer);
-			// No fitView (don't yank the camera mid-execution); non-undoable (an
-			// automatic re-flow is not a user action, must not pollute the undo stack).
-			resizeReflowTimer = setTimeout(() => { resizeReflowTimer = null; void runAutoOrganize(false, false); }, 250);
-		});
+		window.addEventListener('pointerdown', holdPointer, true);
+		window.addEventListener('pointerup', releasePointer, true);
+		window.addEventListener('pointercancel', releasePointer, true);
+		return () => {
+			window.removeEventListener('pointerdown', holdPointer, true);
+			window.removeEventListener('pointerup', releasePointer, true);
+			window.removeEventListener('pointercancel', releasePointer, true);
+		};
+	});
+	onDestroy(() => {
+		destroyed = true;
+		if (resizeCheckTimer) { clearTimeout(resizeCheckTimer); resizeCheckTimer = null; }
+	});
+	/// Debounced so a burst of streaming updates (and the frames a resize takes to
+	/// settle) triggers one check, not dozens.
+	function scheduleResizeCheck(): void {
+		if (resizeCheckTimer) clearTimeout(resizeCheckTimer);
+		resizeCheckTimer = setTimeout(checkResize, 250);
+	}
+	function checkResize(): void {
+		resizeCheckTimer = null;
+		if (destroyed) return;
+		if (pointerHeld) { resizeCheckAfterRelease = true; return; }
+		// An organize running now records its own sizes when it lands, and its
+		// end schedules another check. A view with unplaced nodes is
+		// `organizeUnplaced`'s job.
+		if (organizesRunning > 0) return;
+		const entries = parseLayoutCode(layoutCode, layoutVerb);
+		if (!nodes.every(n => n.hidden || entries[n.id])) return;
+		const now = leafSizes();
+		const base = laidOutFor.get(layoutVerb);
+		// Only a node the layout already placed counts: a new one has no size to
+		// differ from, and a removed one leaves nothing to overlap.
+		const resized = base !== undefined && [...now].some(([id, size]) => base.has(id) && base.get(id) !== size);
+		if (!resized) { laidOutFor.set(layoutVerb, now); return; }
+		// No fitView (don't yank the camera mid-execution); non-undoable (an
+		// automatic re-flow is not a user action, must not pollute the undo stack).
+		void runAutoOrganize(false, false);
+	}
+	$effect(() => {
+		// Read measured sizes reactively so this re-runs when xyflow re-measures,
+		// and the view so a toggle re-checks against the new view's layout.
+		void layoutVerb;
+		leafSizes();
+		untrack(scheduleResizeCheck);
 	});
 
 	let selectedNodeId = $state<string | null>(null);
@@ -2380,8 +2419,7 @@
 	// height prop so xyflow reads the real DOM size into `n.measured`, which is what
 	// the layout engine consumes. `min-width`/`min-height` floor the empty square;
 	// `max-width` caps a runaway card. When a live display appears and the node
-	// resizes, the overlay effect re-runs auto-organize so the layout re-reads the
-	// new measured size (a full re-flow, accepted over preserving manual positions).
+	// resizes, the resize check (`checkResize`) lays the view out again around it.
 	// A `function` (hoisted), not a const arrow: computeSizing runs during the
 	// `$state.raw(buildNodes(...))` initializer above, so a const declared here
 	// would be in its temporal dead zone (the "Loading graph..." crash).
@@ -2591,7 +2629,20 @@
 	// fallback placements only on 'failed', and re-inferring the reason at the
 	// call site is fragile, so it's returned explicitly.
 	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed' | 'failed';
+	/// Organizes in progress, whoever started them: the resize check stands back
+	/// while one runs, and each one's end re-checks, so a node that grew while ELK
+	/// was busy still gets its layout.
+	let organizesRunning = 0;
 	async function runAutoOrganize(andFitView = false, undoable = true): Promise<OrganizeOutcome> {
+		organizesRunning++;
+		try {
+			return await organizeOnce(andFitView, undoable);
+		} finally {
+			organizesRunning--;
+			scheduleResizeCheck();
+		}
+	}
+	async function organizeOnce(andFitView: boolean, undoable: boolean): Promise<OrganizeOutcome> {
 		// The view this organize is FOR. ELK runs across an up-to-2s measure-wait,
 		// during which the user can toggle views or close the editor. The result is
 		// only valid for the view that was active at entry, so the apply step below
@@ -2726,6 +2777,8 @@
 			// @slayout in simplified, @layout in builder.)
 			if (destroyed) return 'destroyed';
 			if (layoutVerb !== startVerb) return 'view-changed';
+			// The sizes this layout is for: the resize check compares against them.
+			laidOutFor.set(startVerb, leafSizes());
 			nodes = nodes.map((n) => {
 				const pos = positions.get(n.id);
 				const groupSize = groupSizes.get(n.id);
