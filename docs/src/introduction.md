@@ -57,7 +57,7 @@ belongs in the language.
 
 These docs are AI-written and the code moves fast, so mistakes get through. If
 you find one, or an explanation you cannot follow,
-[tell us](https://github.com/WeaveMindAI/weft/blob/mvp/CONTRIBUTING.md#found-something-wrong-in-the-docs)
+[tell us](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#found-something-wrong-in-the-docs)
 or come and say so on
 [Discord](https://discord.com/invite/FGwNu6mDkU). You do not need the
 correction worked out before you raise it.

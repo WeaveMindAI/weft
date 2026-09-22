@@ -1,6 +1,6 @@
 ---
 name: releasing
-description: "Shipping weft: merging into mvp through a PR, what the release workflow publishes, the record tags that decide which stores publish, and the store rules that have actually bitten us. Load before merging to mvp, bumping an extension version, or debugging a red publish job."
+description: "Shipping weft: merging into main through a PR, what the release workflow publishes, the record tags that decide which stores publish, and the store rules that have actually bitten us. Load before merging to main, bumping an extension version, or debugging a red publish job."
 ---
 
 How a change gets from the working tree to the stores, and the traps
@@ -8,9 +8,9 @@ that cost a round trip the last time each one was hit.
 
 ## The path
 
-`mvp` is the branch that ships. `main` carries the old proof of
+`main` is the branch that ships. `poc` carries the retired proof of
 concept and nothing merges there. Work lands on a feature branch, goes
-into `mvp` through a PR, and the merge is what publishes.
+into `main` through a PR, and the merge is what publishes.
 
 1. Commit on the feature branch (only when the [user] says so).
    If the change touches `extension-vscode/`, `extension-browser/` or
@@ -18,16 +18,16 @@ into `mvp` through a PR, and the merge is what publishes.
    version IN THE SAME PR (`pnpm version patch --no-git-tag-version`
    in the package directory): a merge without a bump publishes nothing
    to the stores. The `extension versions bumped` CI check refuses a
-   PR that forgot; `scripts/check-extension-bump.sh origin/mvp` is the
+   PR that forgot; `scripts/check-extension-bump.sh origin/main` is the
    same check locally.
-2. `gh pr create --base mvp --head <branch>`.
+2. `gh pr create --base main --head <branch>`.
 3. `gh pr merge <n> --auto --merge`, which lands it the moment CI
-   passes. Earlier PRs into `mvp` are merge commits, so match that.
-4. The push to `mvp` runs `release.yml`, which builds the images, the
+   passes. Earlier PRs into `main` are merge commits, so match that.
+4. The push to `main` runs `release.yml`, which builds the images, the
    CLI binaries, the `.vsix` and the browser zips, updates the rolling
-   `mvp-latest` release, and then publishes to each store.
+   `latest` release, and then publishes to each store.
 
-CI runs on `pull_request` into `mvp` only. Six checks: `extension
+CI runs on `pull_request` into `main` only. Six checks: `extension
 versions bumped` (PRs only), `build`, `public proxy routes`,
 `cargo test + clippy`, `cargo test --features db-tests`, and
 `graph + editor`.
@@ -123,8 +123,8 @@ Checked against the published rules, and all of these are enforced:
 - The icon may not be an SVG and must be at least 128x128.
 - Images in the README must resolve to `https` URLs and may not be
   SVGs. Relative links are rewritten by `vsce` using the repository
-  field, and it defaults to the `main` branch, which on this repo is
-  the old POC. Prefer absolute links to the docs site.
+  field against the `main` branch. Prefer absolute links to the docs
+  site.
 - Badges are only allowed from approved providers.
 - `categories` must come from the fixed list; `keywords` caps at 30.
 - `displayName` must be unique Marketplace-wide.
@@ -164,7 +164,7 @@ script died before printing it, not because the store said nothing.
 ## What ships even when a store fails
 
 Each store publish is its own job, so one refusal never blocks another,
-and the rolling `mvp-latest` release goes out as long as the `.vsix`
+and the rolling `latest` release goes out as long as the `.vsix`
 packaged and the images stitched. That release is what a fresh
 `./setup.sh` pulls prebuilts from, so a failed store publish costs the
 listing on that store and nothing else. Say so plainly rather than

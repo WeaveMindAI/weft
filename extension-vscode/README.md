@@ -49,4 +49,4 @@ questions and bug reports are welcome
 
 ## License
 
-See [LICENSE](https://github.com/WeaveMindAI/weft/blob/mvp/LICENSE).
+See [LICENSE](https://github.com/WeaveMindAI/weft/blob/main/LICENSE).

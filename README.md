@@ -149,7 +149,7 @@ forks such as Devin Desktop. We are working on a CLI-only version, support for o
 automatically, follow the manual instructions the installer prints.
 
 ```bash
-git clone --branch mvp https://github.com/WeaveMindAI/weft.git
+git clone https://github.com/WeaveMindAI/weft.git
 cd weft
 ./setup.sh
 weft new hello --assistant claude-code

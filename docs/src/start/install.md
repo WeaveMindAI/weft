@@ -13,7 +13,7 @@ one is missing.
 The installer is a bash script, so on Windows run it inside WSL.
 
 ```bash
-git clone --branch mvp https://github.com/WeaveMindAI/weft.git
+git clone https://github.com/WeaveMindAI/weft.git
 cd weft
 ```
 

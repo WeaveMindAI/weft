@@ -123,7 +123,7 @@ work out, set `WEFT_STORE_ALLOW_CIDR` to it.
 The local management API has no authentication of its own, so whoever can reach
 it can do anything a project owner can. Keep it on an interface you control.
 For the rest of the boundaries, go and read the
-[security policy](https://github.com/WeaveMindAI/weft/blob/mvp/SECURITY.md).
+[security policy](https://github.com/WeaveMindAI/weft/blob/main/SECURITY.md).
 
 ## What happens when something dies
 

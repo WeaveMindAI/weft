@@ -14,7 +14,7 @@
 # most rebuild loops need.
 #
 # Prebuilt artifacts: on a CLEAN checkout of a commit CI has already
-# built (the rolling `mvp-latest` release), the CLI binary and the
+# built (the rolling `latest` release), the CLI binary and the
 # .vsix are downloaded instead of compiled and the daemon images are
 # pulled from the registry, so a fresh install needs no Rust or Node
 # toolchain and takes minutes, not tens of minutes. Any local change
@@ -804,7 +804,7 @@ hint "installing from ${C_BOLD}${here}${C_RESET}"
 #       vscode_version, sha256_<asset>) <->
 #       .github/workflows/release.yml (cli matrix `asset` values, the
 #       vsix `mv` target, the release job's manifest generation)
-release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/mvp-latest"
+release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/latest"
 prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
 # THE home of the `weft` binary on PATH, whichever path produced it:
 # downloaded prebuilt, or copied here out of target/ after a local

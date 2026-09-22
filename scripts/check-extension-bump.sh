@@ -11,7 +11,7 @@
 #
 # Usage: scripts/check-extension-bump.sh <base-ref>
 #   base-ref is the commit the branch merges into (CI passes the PR's
-#   base; locally, `origin/mvp`).
+#   base; locally, `origin/main`).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

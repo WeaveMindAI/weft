@@ -7,16 +7,15 @@ name: ci
 
 on:
   pull_request:
-    # Into mvp only: main carries the old POC this suite was never
-    # written for.
-    branches: [mvp]
+    # Into main only: `poc` (the retired proof of concept) carries
+    # code this suite was never written for.
+    branches: [main]
   workflow_dispatch:
-  # release.yml runs this as its gate on every mvp push, so nothing
+  # release.yml runs this as its gate on every main push, so nothing
   # (images, binaries, store uploads) publishes from a commit that
-  # fails the checks. There is deliberately no `push` trigger: mvp
+  # fails the checks. There is deliberately no `push` trigger: main
   # pushes get their run through the call (a second trigger would
-  # double it), PRs into mvp get theirs through `pull_request`, and
-  # main carries the old POC this suite was never written for.
+  # double it), and PRs into main get theirs through `pull_request`.
   workflow_call:
 
 env:
@@ -33,7 +32,7 @@ concurrency:
 jobs:
   # The stores publish a version once (the record tags in release.yml),
   # so an extension change merged under a version the stores already
-  # carry never reaches them. PRs only: a called run on an mvp push has
+  # carry never reaches them. PRs only: a called run on a main push has
   # no base to compare against, and by then the merge has happened.
   bump:
     name: extension versions bumped

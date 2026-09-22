@@ -8,16 +8,14 @@ name: docs
 
 on:
   push:
-    # mvp is the release branch for now (main still carries the old
-    # POC the current prod system runs).
-    branches: [mvp]
+    branches: [main]
     paths:
       - "docs/**"
       - ".github/workflows/docs.yml"
   pull_request:
-    # Into mvp only: PRs into main (the old POC) carry a different
-    # docs tree this build was never written for.
-    branches: [mvp]
+    # Into main only: `poc` (the retired proof of concept) carries a
+    # different docs tree this build was never written for.
+    branches: [main]
     paths:
       - "docs/**"
       - ".github/workflows/docs.yml"
@@ -64,7 +62,7 @@ jobs:
 
   deploy:
     # Pull requests build the book to catch dead links, and stop there.
-    if: github.ref == 'refs/heads/mvp' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
