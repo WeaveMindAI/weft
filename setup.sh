@@ -499,7 +499,32 @@ sweep_stale_build_plane() {
 code_ipc() {
   local sock="$1" deadline="$2"
   shift 2
-  VSCODE_IPC_HOOK_CLI="${sock}" timeout "${deadline}" code "$@"
+  VSCODE_IPC_HOOK_CLI="${sock}" with_deadline "${deadline}" code "$@"
+}
+
+# Run a command with a deadline in seconds (fractions allowed), in
+# plain bash: macOS ships no `timeout`, and asking every Mac to install
+# coreutils for four call sites is the wrong trade. Exit status is the
+# command's own, or 124 when the deadline passed, the same contract as
+# `timeout`, so the callers read it the same way.
+with_deadline() {
+  local secs="$1"
+  shift
+  "$@" &
+  local pid=$!
+  ( sleep "${secs}"; kill "${pid}" 2>/dev/null ) &
+  local killer=$!
+  local rc=0
+  wait "${pid}" || rc=$?
+  # The killer is still sleeping when the command finished on its own;
+  # a killer that already fired is gone and the kill is a harmless miss.
+  kill "${killer}" 2>/dev/null
+  wait "${killer}" 2>/dev/null || true
+  # 143 is "killed by SIGTERM", which is what the killer sends.
+  if [[ $rc -eq 143 ]]; then
+    return 124
+  fi
+  return "${rc}"
 }
 
 # Nothing asks the window what it has installed any more: the answer
@@ -509,21 +534,21 @@ code_ipc() {
 # just tries the uninstall, which answers the same question by working
 # or not.
 
-# Print the path of a LIVE VS Code IPC socket under /run/user/$UID (closed
-# terminals leave dead sockets behind, so probe for one that answers). Used by
-# both the install side and the uninstall/reinstall side; defined once here so
-# the two can't drift. Returns non-zero if no live socket is found.
+# Print the path of a LIVE VS Code IPC socket (closed terminals leave dead
+# sockets behind, so probe for one that answers). VS Code writes them
+# under /run/user/$UID on Linux and under $TMPDIR on macOS, so both are
+# searched, newest first. Used by both the install side and the
+# uninstall/reinstall side; defined once here so the two can't drift.
+# Returns non-zero if no live socket is found.
 pick_live_vscode_socket() {
-  local run_dir="/run/user/${UID}"
-  [[ -d "${run_dir}" ]] || return 1
   local sock
-  for sock in $(ls -1t "${run_dir}"/vscode-ipc-*.sock 2>/dev/null); do
+  for sock in $(ls -1t "/run/user/${UID}"/vscode-ipc-*.sock "${TMPDIR:-/tmp}"/vscode-ipc-*.sock 2>/dev/null); do
     if command -v socat >/dev/null 2>&1; then
-      if timeout 0.3 socat -u /dev/null UNIX-CONNECT:"${sock}" >/dev/null 2>&1; then
+      if with_deadline 0.3 socat -u /dev/null UNIX-CONNECT:"${sock}" >/dev/null 2>&1; then
         printf '%s' "${sock}"; return 0
       fi
     elif command -v nc >/dev/null 2>&1; then
-      if timeout 0.3 nc -U -z "${sock}" >/dev/null 2>&1; then
+      if with_deadline 0.3 nc -U -z "${sock}" >/dev/null 2>&1; then
         printf '%s' "${sock}"; return 0
       fi
     else
@@ -1196,7 +1221,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         else
           hint "VS Code extension: not installed, or the window was busy; if it is still there: code --uninstall-extension ${ext_id}"
         fi
-      elif timeout 180 code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
+      elif with_deadline 180 code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
         ok "VS Code extension uninstalled"
         rm -f "${HOME}/.local/share/weft/vscode-hashes/installed.sha"
       else

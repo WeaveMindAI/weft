@@ -238,15 +238,22 @@ async fn manifest_template_vars(
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
 
-    // The operator's machine, as the cluster sees it: on kind, the
-    // address a pod dials to reach a port published on this machine
-    // (the object store, a service a trigger watches) and the address
-    // a packet from this machine carries when it enters the node (the
-    // CLI arriving through a mapped node port). Read once; three
-    // defaults below derive from it. A real cluster has no such address.
-    let host_gateway = match cfg.backend {
-        ClusterBackend::Kind => Some(machine_address_for_pods(cfg).await?),
-        ClusterBackend::K8s => None,
+    // The operator's machine, as the cluster sees it, in both
+    // directions. OUT: the address a pod dials to reach a port
+    // published on this machine (the object store, a service a
+    // trigger watches). IN: the address a packet from this machine
+    // carries when it enters the node through a mapped port (the CLI
+    // reaching the dispatcher). On docker for Linux both are the kind
+    // network's gateway; on Docker Desktop the way out of its virtual
+    // machine is a different address from the one its port proxy
+    // connects from, so the two are read separately. A real cluster
+    // has neither.
+    let (host_gateway, node_port_source) = match cfg.backend {
+        ClusterBackend::Kind => (
+            Some(machine_address_for_pods(cfg).await?),
+            Some(kind_network_gateway_ipv4().await?),
+        ),
+        ClusterBackend::K8s => (None, None),
     };
 
     // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
@@ -331,9 +338,9 @@ async fn manifest_template_vars(
         .map_err(|e| anyhow::anyhow!("WEFT_STORE_ALLOW_CIDR='{store_allow_cidr}': {e}"))?;
 
     // The one extra private CIDR a listener's watch URLs may dial. On
-    // kind it defaults to the operator's own machine (the docker
-    // network gateway), so a trigger can watch a service running right
-    // there; on a real cluster it defaults to a benign unused /32.
+    // kind it defaults to the operator's own machine as pods reach it,
+    // so a trigger can watch a service running right there; on a real
+    // cluster it defaults to a benign unused /32.
     let listener_allow_cidr = match std::env::var("WEFT_LISTENER_ALLOW_CIDR") {
         Ok(v) => v,
         Err(_) => match &host_gateway {
@@ -348,13 +355,13 @@ async fn manifest_template_vars(
     // from, for the dispatcher's ingress NetworkPolicy. The kind node
     // maps the operator's loopback ports to NodePort Services
     // (deploy/k8s/kind-node-ports.yaml), and a connection arriving that
-    // way carries the operator's machine's address on the cluster
-    // network: kube-proxy rewrites the destination before the policy
-    // engine sees the packet and the source only after, so the /32 of
-    // the docker gateway is exactly what the policy compares against.
-    // A real cluster maps no node port, so it opens a benign unused
-    // address instead.
-    let node_port_source_cidr = match &host_gateway {
+    // way carries the docker network's gateway as its source, on Linux
+    // and on Docker Desktop alike (docker's port proxy connects from
+    // the bridge): kube-proxy rewrites the destination before the
+    // policy engine sees the packet and the source only after, so that
+    // /32 is exactly what the policy compares against. A real cluster
+    // maps no node port, so it opens a benign unused address instead.
+    let node_port_source_cidr = match &node_port_source {
         Some(gateway) => format!("{gateway}/32"),
         None => "192.0.2.0/32".into(),
     };
