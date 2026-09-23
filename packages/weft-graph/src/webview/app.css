@@ -1,4 +1,7 @@
-@import "tailwindcss";
+/* Scan the renderer's own sources for class names. Without a source,
+ * Tailwind scans from the build's working directory, which for the
+ * editor is extension-vscode, a folder that holds none of them. */
+@import "tailwindcss" source("..");
 
 /* v1 uses a fixed light palette (white canvas, zinc/slate text,
  * colored accents per node type). The VS Code theme would override
