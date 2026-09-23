@@ -912,7 +912,7 @@ impl Journal for PostgresJournal {
         .bind(&tok.allowed_displays)
         .bind(tok.all_displays)
         // Store the caller-stamped mint time verbatim (the handler set it from
-        // the canonical clock), so postgres and the mock agree.
+        // the canonical clock), so postgres and the fake agree.
         .bind(tok.created_at as i64)
         .execute(&self.pool)
         .await?;
@@ -1017,7 +1017,7 @@ impl Journal for PostgresJournal {
         // Only the log-worthy kinds leave the database (`LogEntry::KINDS`
         // is the projection's own list): every one of the color's, in
         // journal order, and the tail is cut by `LogEntry::tail` in
-        // WRITTEN order, the same code the mock runs. The cut cannot be
+        // WRITTEN order, the same code the fake runs. The cut cannot be
         // the SQL's: a node's line lands in the journal whenever a pod
         // drains its task, so the row order is not the run's, and the
         // written time lives inside the payload, which only a decode

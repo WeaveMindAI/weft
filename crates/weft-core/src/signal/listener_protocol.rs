@@ -10,14 +10,14 @@
 //!   to compute the consumer-facing payload for a token; the result
 //!   is cached on the signal row.
 //! - listener owns kind-specific state (timer schedules, SSE
-//!   connections, future browser sessions). When a held event fires,
+//!   connections, held sockets). When a held event fires,
 //!   the listener enqueues a `FireSignal` task via the broker; the
 //!   dispatcher's task picker drives it through the same routing as
 //!   a stateless fire.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use weft_core::primitive::{SignalRouting, SignalSpec};
+use crate::primitive::{SignalRouting, SignalSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -183,7 +183,7 @@ pub struct LiveRequest {
 /// panel and an infra container's panel with one renderer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveResponse {
-    pub live: weft_core::live::LiveFeed,
+    pub live: crate::live::LiveFeed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,8 +380,8 @@ mod tests {
 
         let restore = RegisterSource::Restore {
             routing: SignalRouting {
-                surface: weft_core::primitive::SignalSurface::Internal,
-                auth: weft_core::primitive::SignalAuth::None,
+                surface: crate::primitive::SignalSurface::Internal,
+                auth: crate::primitive::SignalAuth::None,
                 auth_config: serde_json::Value::Null,
             },
             kind_state: serde_json::json!({"cursor": 7}),

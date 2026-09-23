@@ -61,6 +61,9 @@ docs/book/
 # Bundled highlight.js for the markdown preview (built by
 # `pnpm run bundle:markdown-preview`).
 extension-vscode/markdown-preview/hljs.js
+# The graph webview bundle, built from packages/weft-graph by
+# `pnpm run bundle:webview` (setup.sh and the release job both run it).
+extension-vscode/media/webview/
 packages/weft-syntax/node_modules
 
 # Example projects generate build state when opened; never commit it.

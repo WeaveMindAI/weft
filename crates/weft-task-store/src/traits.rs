@@ -1,18 +1,15 @@
-//! Worker-facing task and worker-pod surfaces.
+//! Worker-facing task, worker-pod and infra surfaces.
 //!
-//! The shapes mirror the existing free functions in `tasks` and
-//! `worker_pod`. Two implementations per trait:
-//!   - `Postgres*Client` (this crate): direct DB. Used by the
-//!     dispatcher and by the broker (after its scope check).
-//!   - `Broker*Client` (in `weft-broker-client`): HTTP through the
-//!     broker. Used by workers and listeners.
+//! The task and worker-pod shapes mirror the free functions in `tasks`
+//! and `worker_pod`; `InfraReader` reads the dispatcher-written
+//! `infra_node` table. Two implementations per trait:
+//!   - `Postgres*` (this crate): direct DB. Used by the dispatcher and
+//!     by the broker (after its scope check).
+//!   - `Broker*` (in `weft-broker-client`): HTTP through the broker.
+//!     Used by workers and listeners.
 //!
-//! `InfraReader` lives in the dedicated `weft-infra` crate (its
-//! table is dispatcher-owned, not part of the task / worker_pod
-//! surface).
-//!
-//! The engine takes both `TaskStoreClient` and `WorkerPodClient`;
-//! the listener takes only `TaskStoreClient`.
+//! The engine takes `TaskStoreClient`, `WorkerPodClient` and
+//! `InfraReader`; the listener takes only `TaskStoreClient`.
 
 use std::time::Duration;
 
@@ -20,6 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::worker_pod::WorkerStanding;
@@ -163,5 +161,98 @@ impl WorkerPodClient for PostgresWorkerPodClient {
 
     async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool> {
         crate::worker_pod::mark_done_if_idle(&self.pool, pod_name).await
+    }
+}
+
+/// Read surface for `infra_node`, the table the dispatcher writes as it
+/// provisions infrastructure.
+#[async_trait]
+pub trait InfraReader: Send + Sync {
+    /// The cluster-internal URL of one declared endpoint of an infra
+    /// node. `None` when the node is not Running or declares no endpoint
+    /// by that name. Backs `ctx.endpoint(name)` in node code.
+    async fn endpoint_url(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        endpoint_name: &str,
+    ) -> Result<Option<String>>;
+}
+
+pub struct PostgresInfraReader {
+    pool: PgPool,
+}
+
+impl PostgresInfraReader {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl InfraReader for PostgresInfraReader {
+    async fn endpoint_url(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        endpoint_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT endpoints_json FROM infra_node \
+             WHERE project_id = $1 AND node_id = $2 AND status = 'running'",
+        )
+        .bind(project_id)
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // A corrupt `endpoints_json` fails loud rather than reading as
+        // "endpoint not available", which would send the node chasing an
+        // endpoint that is really there. Only a name the object does not
+        // hold is the legitimate `None`.
+        let endpoints: Value = row.try_get("endpoints_json")?;
+        endpoint_in(&endpoints, endpoint_name)
+    }
+}
+
+/// One endpoint's URL out of an `endpoints_json` object.
+fn endpoint_in(endpoints: &Value, endpoint_name: &str) -> Result<Option<String>> {
+    let Some(map) = endpoints.as_object() else {
+        anyhow::bail!("infra_node.endpoints_json is not an object: {endpoints}");
+    };
+    match map.get(endpoint_name) {
+        None => Ok(None),
+        Some(Value::String(url)) => Ok(Some(url.clone())),
+        Some(other) => {
+            anyhow::bail!("infra_node endpoint '{endpoint_name}' is not a URL string: {other}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_in;
+    use serde_json::json;
+
+    #[test]
+    fn a_declared_endpoint_gives_its_url() {
+        let endpoints = json!({ "http": "http://pg.ns.svc:5432" });
+        assert_eq!(
+            endpoint_in(&endpoints, "http").unwrap().as_deref(),
+            Some("http://pg.ns.svc:5432"),
+        );
+    }
+
+    #[test]
+    fn an_undeclared_endpoint_is_none() {
+        assert_eq!(endpoint_in(&json!({}), "http").unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_endpoints_value_is_an_error() {
+        assert!(endpoint_in(&json!(["http"]), "http").is_err());
+        assert!(endpoint_in(&json!({ "http": 5432 }), "http").is_err());
     }
 }

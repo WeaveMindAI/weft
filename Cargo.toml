@@ -14,7 +14,6 @@ members = [
     "crates/weft-access-store",
     "crates/weft-broker",
     "crates/weft-broker-client",
-    "crates/weft-infra",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
     "crates/weft-assets",

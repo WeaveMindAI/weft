@@ -3,7 +3,7 @@
 //!
 //! Default impl is Postgres-backed (`PostgresProjectStore`), so
 //! every dispatcher Pod reads/writes the same `project` table.
-//! Tests use `MockProjectStore` (in-memory HashMap).
+//! Tests use `FakeProjectStore` (in-memory HashMap).
 
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub type InfraImageTags =
 
 /// Backing store for project metadata. Implementations:
 /// - `PostgresProjectStore` (production)
-/// - `MockProjectStore` (tests, behind `test-helpers`).
+/// - `FakeProjectStore` (tests, behind `test-helpers`).
 #[async_trait]
 pub trait ProjectStoreOps: Send + Sync {
     /// Atomic register-and-hash-advance. Wraps every write of the
@@ -1593,7 +1593,7 @@ impl ProjectStoreOps for PostgresProjectStore {
 // that one function.
 
 #[cfg(any(test, feature = "test-helpers"))]
-pub struct MockProjectStore {
+pub struct FakeProjectStore {
     sources: RwLock<HashMap<uuid::Uuid, weft_core::project::hash::Manifest>>,
     inner: RwLock<HashMap<uuid::Uuid, (String, ProjectStatus, ProjectDefinition)>>,
     binary_hashes: RwLock<HashMap<uuid::Uuid, String>>,
@@ -1621,7 +1621,7 @@ pub struct MockProjectStore {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl MockProjectStore {
+impl FakeProjectStore {
     pub fn new() -> Self {
         Self {
             sources: RwLock::new(HashMap::new()),
@@ -1642,7 +1642,7 @@ impl MockProjectStore {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl Default for MockProjectStore {
+impl Default for FakeProjectStore {
     fn default() -> Self {
         Self::new()
     }
@@ -1650,7 +1650,7 @@ impl Default for MockProjectStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
-impl ProjectStoreOps for MockProjectStore {
+impl ProjectStoreOps for FakeProjectStore {
     async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
@@ -1660,7 +1660,7 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model the infra image-tag column (the real
+        // The fake does not model the infra image-tag column (the real
         // readers are SQL-direct: the broker handler and the
         // referenced-images keep-set); accepted to satisfy the trait,
         // ignored.
@@ -1700,9 +1700,9 @@ impl ProjectStoreOps for MockProjectStore {
         // touch `status` (an Active project stays active through a
         // re-register), and a FRESH row gets the column defaults the
         // lifecycle CAS methods read (status='registered',
-        // accepting/visible true). Without the seeding, mock-backed
+        // accepting/visible true). Without the seeding, fake-backed
         // register -> activate tests would 409 where production
-        // activates; without the preservation, the mock's status
+        // activates; without the preservation, the fake's status
         // mirror and `lifecycles` would disagree after a re-register.
         let status = {
             let mut inner = self.inner.write().await;
@@ -1731,7 +1731,7 @@ impl ProjectStoreOps for MockProjectStore {
         }
         if let Some(h) = definition_hash {
             // Record history row first, then advance the pointer.
-            // The mock cannot truly atomicize the five `RwLock` writes
+            // The fake cannot truly atomicize the five `RwLock` writes
             // (they're independent locks taken in sequence); the
             // ordering invariant is preserved so a fold in any test
             // sees the history row before the pointer, matching the
@@ -1816,7 +1816,7 @@ impl ProjectStoreOps for MockProjectStore {
         // Mirror Postgres FK CASCADE: removing a project clears every
         // per-id side-map (binary/definition/infra hashes, lifecycles,
         // tenants, has_infra, namespaces, transitions). Without this the
-        // mock diverges from production: a test that re-registers under
+        // fake diverges from production: a test that re-registers under
         // the same id, or asserts cleanup, would see ghost state
         // Postgres does not have.
         //
@@ -1853,7 +1853,7 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model the infra image-tag column (the real
+        // The fake does not model the infra image-tag column (the real
         // readers are SQL-direct: the broker handler and the
         // referenced-images keep-set); accepted to satisfy the trait,
         // ignored.
@@ -1951,26 +1951,8 @@ impl ProjectStoreOps for MockProjectStore {
     }
 
     async fn lifecycle(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifecycle>> {
-        // The mock seeds a default for unregistered ids; in
-        // production the PG impl returns Ok(None). Tests that rely
-        // on the seeded default should expect Some(default) here.
-        // (Behaviour preserved from the pre-Result mock.)
-        Ok(Some(
-            self.lifecycles
-                .read()
-                .await
-                .get(&id)
-                .cloned()
-                .unwrap_or(ProjectLifecycle {
-                    status: ProjectStatus::Registered,
-                    accepting_fires: true,
-                    fires_visible_to_consumers: true,
-                    fires_deadline_unix: None,
-                    deactivated_by_health: false,
-                    drain_deadline_unix: None,
-                    activating_ts_color: None,
-                }),
-        ))
+        // Like the PG impl: an unregistered id has no lifecycle.
+        Ok(self.lifecycles.read().await.get(&id).cloned())
     }
 
     async fn set_lifecycle_guarded(

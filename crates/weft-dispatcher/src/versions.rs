@@ -18,7 +18,7 @@
 //! by `checkpoint`, `run`, `branch`, and `activate`. No state on disk.
 //!
 //! Every write goes through [`VersionStoreOps`]; the Postgres store
-//! runs SQL, the mock keeps maps, and the decisions (which run seeds
+//! runs SQL, the fake keeps maps, and the decisions (which run seeds
 //! the next one, what a prune removes, what changed between two
 //! versions) are pure functions over the rows so they are tested at
 //! layer 1 and the handlers only gather and dispatch.
@@ -601,7 +601,7 @@ impl VersionStoreOps for PostgresVersionStore {
 /// reaches production with the tests green.
 #[cfg(any(test, feature = "test-helpers"))]
 #[derive(Default)]
-pub struct MockVersionStore {
+pub struct FakeVersionStore {
     versions: std::sync::Mutex<Vec<VersionRow>>,
     runs: std::sync::Mutex<Vec<RunRow>>,
     heads: std::sync::Mutex<BTreeMap<uuid::Uuid, Head>>,
@@ -622,7 +622,7 @@ pub struct MockVersionStore {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl MockVersionStore {
+impl FakeVersionStore {
     pub fn new() -> Self {
         Self::default()
     }
@@ -673,7 +673,7 @@ impl MockVersionStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
-impl VersionStoreOps for MockVersionStore {
+impl VersionStoreOps for FakeVersionStore {
     async fn upsert_version(&self, version: &VersionRow) -> anyhow::Result<bool> {
         let mut versions = self.versions.lock().unwrap();
         if versions.iter().any(|v| v.project_id == version.project_id && v.id == version.id) {
@@ -1176,7 +1176,7 @@ mod tests {
     /// reader can act on, the same way Postgres's foreign key does.
     #[tokio::test]
     async fn a_run_on_an_unknown_version_names_the_missing_version() {
-        let store = MockVersionStore::new();
+        let store = FakeVersionStore::new();
         let project = uuid::Uuid::nil();
         store.add_project(project);
         let err = store.insert_run(&run(1, "never-committed", 3)).await.expect_err("no such version");
@@ -1193,7 +1193,7 @@ mod tests {
     /// kept could not be reached or freed by anything afterwards.
     #[tokio::test]
     async fn removing_a_project_takes_its_whole_tree() {
-        let store = MockVersionStore::new();
+        let store = FakeVersionStore::new();
         let project = uuid::Uuid::nil();
         store.add_project(project);
         store.upsert_version(&version("ran", None, &[("main.weft", "1")], 1)).await.unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
     /// which is the case this sweep exists for.
     #[tokio::test]
     async fn retirement_drops_what_no_journal_knows_and_keeps_the_lineage() {
-        let store = MockVersionStore::new();
+        let store = FakeVersionStore::new();
         let project = uuid::Uuid::nil();
         store.add_project(project);
         // root (no runs) -> middle (no runs) -> leaf (one real run)

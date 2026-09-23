@@ -67,7 +67,7 @@ fn invalid_port_type_keeps_the_port_as_must_override_with_a_diagnostic() {
 }
 
 #[test]
-fn test_basic_project() {
+fn a_small_project_compiles_its_nodes_and_wire() {
     let source = r#"
 # A test project
 
@@ -96,7 +96,7 @@ llm.config = config.value
 }
 
 #[test]
-fn test_bare_node() {
+fn a_bare_type_with_no_braces_is_a_node() {
     let source = r#"
 node = Debug
 "#;
@@ -107,7 +107,7 @@ node = Debug
 }
 
 #[test]
-fn test_node_with_ports() {
+fn a_signature_declares_inputs_and_outputs_with_optionality() {
     let source = r#"
 worker = ExecPython(
     data: String,
@@ -181,7 +181,7 @@ p = ExecPython(
 }
 
 #[test]
-fn test_node_with_ports_no_config() {
+fn a_signature_without_a_body_has_empty_config() {
     let source = r#"
 pass = ExecPython(data: String) -> (result: String)
 "#;
@@ -193,7 +193,7 @@ pass = ExecPython(data: String) -> (result: String)
 }
 
 #[test]
-fn test_node_empty_inputs() {
+fn empty_input_parens_declare_no_inputs() {
     let source = r#"
 gen = ExecPython() -> (result: String) {
     code: "return {}"
@@ -206,7 +206,7 @@ gen = ExecPython() -> (result: String) {
 }
 
 #[test]
-fn test_group_basic() {
+fn a_group_compiles_to_two_passthrough_boundaries() {
     let source = r#"
 
 input = Text { value: "hello" }
@@ -258,7 +258,7 @@ output.data = preprocessor.result
 }
 
 #[test]
-fn test_nested_groups() {
+fn nested_groups_each_get_their_own_boundaries() {
     let source = r#"
 
 outer = Group(data: String) -> (result: String) {
@@ -289,7 +289,7 @@ outer = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_self_reserved() {
+fn self_is_refused_as_a_node_name() {
     let source = r#"
 self = Debug {}
 "#;
@@ -298,7 +298,7 @@ self = Debug {}
 }
 
 #[test]
-fn test_reserved_type_keyword_as_name() {
+fn a_reserved_type_keyword_as_a_name_errors_on_its_declaration_line() {
     // Naming a group with the reserved `Group` keyword must fail loudly ON the
     // declaration line (line 1 here), not only cryptically where it's later
     // referenced.
@@ -310,7 +310,7 @@ fn test_reserved_type_keyword_as_name() {
 }
 
 #[test]
-fn test_connection_direction() {
+fn a_connection_line_wires_the_right_side_into_the_left() {
     // target.input = source.output
     let source = r#"
 a = Text { value: "hi" }
@@ -326,7 +326,7 @@ b.data = a.value
 }
 
 #[test]
-fn test_group_self_connections() {
+fn self_ports_wire_through_the_group_boundaries() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
@@ -349,7 +349,7 @@ grp = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_triple_backtick_multiline() {
+fn a_multiline_heredoc_keeps_every_line() {
     let source = "
 
 node = ExecPython {
@@ -367,7 +367,7 @@ print(\"line2\")
 }
 
 #[test]
-fn test_triple_backtick_inline() {
+fn an_inline_heredoc_is_its_content() {
     let source = "
 node = ExecPython {
     code: ```print(\"hello\")```
@@ -379,7 +379,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_triple_backtick_inline_with_braces() {
+fn an_inline_heredoc_may_contain_braces() {
     let source = "
 node = ExecPython {
     code: ```return {\"result\": f\"{name} ({email})\"}```
@@ -393,7 +393,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_port_types() {
+fn port_types_parse_primitives_lists_dicts_and_unions() {
     let source = r#"
 node = ExecPython(
     img: Image,
@@ -418,7 +418,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_group_ports_types() {
+fn group_boundaries_carry_the_declared_port_types() {
     // Types are declared as-is in the signature.
     let source = r#"
 batch = Group(items: List[String]) -> (results: List[String]) {
@@ -437,7 +437,7 @@ batch = Group(items: List[String]) -> (results: List[String]) {
 }
 
 #[test]
-fn test_require_one_of() {
+fn require_one_of_in_a_signature_records_the_set() {
     let source = r#"
 resolver = ExecPython(
     text?: String,
@@ -456,23 +456,7 @@ resolver = ExecPython(
 }
 
 #[test]
-fn test_mock_rejected() {
-    let source = r#"
-node = HttpRequest {
-    url: "https://api.test.com"
-    mock: {"body": "hello", "status": 200}
-    mocked: true
-}
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    assert!(result.is_err(), "mock/mocked should be rejected as compile errors");
-    let errors = result.unwrap_err();
-    assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
-    assert!(errors.iter().any(|e| e.message.contains("'mocked' is not a valid config key")));
-}
-
-#[test]
-fn test_tags_non_string_element_rejected() {
+fn a_non_string_tag_is_refused() {
     // A non-string element in `_tags` was SILENTLY DROPPED (filter_map on as_str),
     // so `_tags: ["ok", 5]` compiled as `["ok"]`, discarding user data with no
     // error. It must now fail loudly.
@@ -491,7 +475,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_tags_all_strings_compiles() {
+fn string_tags_are_kept_in_order() {
     // The valid case still compiles and keeps every tag.
     let source = r#"
 node = ExecPython {
@@ -504,7 +488,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_group_description_from_comments() {
+fn a_groups_leading_comment_is_not_a_node() {
     // First comment block inside group body is the description (like a docstring)
     // The compiler skips it like any other comment
     let source = r#"
@@ -522,7 +506,7 @@ grp = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_typevar_ports() {
+fn a_type_variable_port_stays_a_type_variable() {
     let source = r#"
 node = ExecPython(
     data: T
@@ -537,7 +521,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_must_override_port() {
+fn an_untyped_port_must_be_overridden() {
     let source = r#"
 node = ExecPython(data) -> (result) {}
 "#;
@@ -548,7 +532,7 @@ node = ExecPython(data) -> (result) {}
 }
 
 #[test]
-fn test_triple_nested_groups() {
+fn wires_cross_three_levels_of_group_boundaries() {
     let source = r#"
 
 input_text = Text { value: "hello" }
@@ -614,7 +598,7 @@ output.data = level1.result
 }
 
 #[test]
-fn test_duplicate_inner_node_names_scoped() {
+fn same_named_children_of_sibling_groups_stay_distinct() {
     let source = r#"
 group_a = Group(data: String) -> (result: String) {
     worker = Template { template: "A" }
@@ -635,7 +619,7 @@ group_b = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_nested_node_with_multiline_signature_in_group() {
+fn a_multiline_signature_inside_a_group_compiles() {
     let source = "
 # Test
 
@@ -660,26 +644,19 @@ return {\"output\": \"hello\"}
   self.result = inner_node.output
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    if let Err(ref errors) = result {
-        for e in errors { eprintln!("COMPILE ERROR: {}", e); }
-    }
-    let result = result.expect("should compile nested node with multi-line signature");
-    for n in &result.nodes { eprintln!("NODE: {} ({})", n.id, n.node_type); }
-    for e in &result.edges { eprintln!("EDGE: {}.{} -> {}.{}", e.source, e.source_handle.as_deref().unwrap_or("?"), e.target, e.target_handle.as_deref().unwrap_or("?")); }
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
+        .expect("should compile nested node with multi-line signature");
     // outer__in, outer__out, outer.inner_node = 3 nodes
     assert_eq!(result.nodes.len(), 3);
     let inner = result.nodes.iter().find(|n| n.id == "outer.inner_node").unwrap();
     assert_eq!(inner.node_type, "ExecPython");
-    eprintln!("CONFIG: {:?}", inner.config);
     assert_eq!(inner.label.as_deref(), Some("Inner"));
     let code = inner.config.get("code").and_then(|v| v.as_str());
-    eprintln!("CODE: {:?}", code);
     assert!(code.is_some() && code.unwrap().contains("hello"));
 }
 
 #[test]
-fn test_complex_types_in_ports() {
+fn nested_dict_list_and_union_port_types_parse() {
     let source = r#"
 node = ExecPython(
     a: Dict[String, Number],
@@ -701,7 +678,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_media_type_alias() {
+fn media_is_an_alias_for_the_media_union() {
     let source = r#"
 node = ExecPython(input: Media) -> (result: String) {}
 "#;
@@ -711,31 +688,19 @@ node = ExecPython(input: Media) -> (result: String) {}
 }
 
 #[test]
-fn test_mock_always_rejected() {
-    // Even with invalid JSON, mock key itself is rejected before JSON parsing
-    let source = r#"
-node = HttpRequest {
-    url: "https://api.test.com"
-    mock: {broken json
-}
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    assert!(result.is_err(), "mock should be rejected as compile error");
-    let errors = result.unwrap_err();
-    assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
-}
-
-#[test]
-fn test_reject_invalid_type() {
+fn an_unknown_port_type_is_refused() {
     let source = r#"
 node = ExecPython(data: Foo) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    assert!(result.is_err(), "Unknown type 'Foo' should produce an error");
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.message.contains("Invalid port type") && e.message.contains("Foo")),
+        "expected an 'Invalid port type Foo' error, got {errors:?}"
+    );
 }
 
 #[test]
-fn test_reject_any_type() {
+fn any_is_not_a_type() {
     let source = r#"
 node = ExecPython(data: Any) -> (result: String) {}
 "#;
@@ -744,7 +709,7 @@ node = ExecPython(data: Any) -> (result: String) {}
 }
 
 #[test]
-fn test_group_with_no_body() {
+fn a_group_without_braces_still_gets_boundaries() {
     let source = r#"
 grp = Group(data: String) -> (result: String)
 "#;
@@ -755,7 +720,7 @@ grp = Group(data: String) -> (result: String)
 }
 
 #[test]
-fn test_multiple_connections() {
+fn each_connection_line_is_one_edge() {
     let source = r#"
 a = Text { value: "hi" }
 b = Llm {}
@@ -768,7 +733,7 @@ c.data = b.response
 }
 
 #[test]
-fn test_pack_with_require_one_of_in_group() {
+fn require_one_of_inside_a_group_child_compiles() {
     let source = "
 # Test
 
@@ -794,17 +759,13 @@ grp = Group(
   self.metadata = pack_node.out
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    if let Err(ref errors) = result {
-        for e in errors { eprintln!("ERR: {}", e); }
-    }
-    let result = result.expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let pack = result.nodes.iter().find(|n| n.id == "grp.pack_node").unwrap();
     assert_eq!(pack.label.as_deref(), Some("Metadata"));
 }
 
 #[test]
-fn test_multiline_json_array_in_config() {
+fn a_json_array_may_span_several_lines() {
     let source = r#"
 # Test
 
@@ -819,20 +780,15 @@ review = HumanQuery {
   }]
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    if let Err(ref errors) = result {
-        for e in errors { eprintln!("ERR: {}", e); }
-    }
-    let result = result.expect("should compile multiline JSON array");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile multiline JSON array");
     let node = result.nodes.iter().find(|n| n.id == "review").unwrap();
-    for (k, v) in node.config.as_object().unwrap() { eprintln!("  {}: {}", k, v); }
     let fields = node.config.get("fields").expect("fields should exist");
     assert!(fields.is_array(), "fields should be a JSON array");
 }
 
 
 #[test]
-fn test_post_config_duplicate_output_port_error() {
+fn redeclaring_an_output_after_the_body_is_refused() {
     let source = r#"
 node = ExecPython() -> (result: String) {
     code: "return {}"
@@ -846,7 +802,7 @@ node = ExecPython() -> (result: String) {
 
 
 #[test]
-fn test_output_only_no_inputs_no_config() {
+fn an_output_only_signature_declares_no_inputs() {
     // Pattern: id = Type -> (output: String)
     let source = r#"
 node = ExecPython -> (result: String)
@@ -861,7 +817,7 @@ node = ExecPython -> (result: String)
 // ─── Config Value Parsing ──────────────────────────────────────────────────
 
 #[test]
-fn test_config_boolean_values() {
+fn boolean_values_parse() {
     let source = r#"
 node = ExecPython {
     enabled: true
@@ -875,7 +831,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_config_numeric_values() {
+fn integer_float_and_negative_values_parse() {
     let source = r#"
 node = ExecPython {
     count: 42
@@ -891,7 +847,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_config_escaped_string() {
+fn string_escapes_are_decoded() {
     let source = r#"
 node = ExecPython {
     prompt: "line1\nline2\ttab"
@@ -905,7 +861,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_config_json_array_inline() {
+fn an_inline_json_array_parses() {
     let source = r#"
 node = ExecPython {
     items: ["a", "b", "c"]
@@ -919,7 +875,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_config_json_object_inline() {
+fn an_inline_json_object_parses() {
     let source = r#"
 node = ExecPython {
     headers: {"Authorization": "Bearer token", "Content-Type": "application/json"}
@@ -1138,7 +1094,7 @@ g = Group(items: List[String]) -> (out: String) {
 }
 
 #[test]
-fn test_config_empty_quoted_string() {
+fn an_empty_quoted_string_is_kept() {
     let source = r#"
 node = ExecPython {
     prefix: ""
@@ -1152,7 +1108,7 @@ node = ExecPython {
 // ─── Label Parsing ─────────────────────────────────────────────────────────
 
 #[test]
-fn test_label_quoted() {
+fn a_quoted_label_becomes_the_node_label() {
     let source = r#"
 node = ExecPython {
     _label: "My Worker Node"
@@ -1219,7 +1175,7 @@ fn flatten_never_ships_duplicate_node_ids() {
 }
 
 #[test]
-fn test_label_with_escapes() {
+fn a_label_decodes_escaped_quotes() {
     let source = r#"
 node = ExecPython {
     _label: "Has \"quotes\" inside"
@@ -1232,7 +1188,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_label_in_oneliner() {
+fn a_label_works_in_a_one_line_body() {
     let source = r#"
 node = ExecPython { _label: "Quick", code: "return {}" }
 "#;
@@ -1245,7 +1201,7 @@ node = ExecPython { _label: "Quick", code: "return {}" }
 // ─── Error Cases ───────────────────────────────────────────────────────────
 
 #[test]
-fn test_error_unclosed_config_block() {
+fn an_unclosed_body_is_refused() {
     let source = r#"
 node = ExecPython {
     code: "return {}"
@@ -1257,7 +1213,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_error_unclosed_group() {
+fn an_unclosed_group_is_refused() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "hi" }
@@ -1269,7 +1225,7 @@ grp = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_error_duplicate_root_node_id() {
+fn a_duplicate_top_level_name_is_refused() {
     let source = r#"
 node = Text { value: "a" }
 node = Text { value: "b" }
@@ -1281,7 +1237,7 @@ node = Text { value: "b" }
 }
 
 #[test]
-fn test_error_duplicate_group_name() {
+fn a_duplicate_group_name_is_refused() {
     let source = r#"
 grp = Group() -> ()
 grp = Group() -> ()
@@ -1293,7 +1249,7 @@ grp = Group() -> ()
 }
 
 #[test]
-fn test_error_duplicate_node_in_group() {
+fn a_duplicate_name_inside_a_group_is_refused() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "a" }
@@ -1309,11 +1265,11 @@ grp = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_error_require_one_of_in_outputs() {
+fn require_one_of_among_outputs_is_refused() {
     let source = r#"
 node = ExecPython() -> (
-    a: String?,
-    b: String?,
+    a: String,
+    b: String,
     @require_one_of(a, b)
 ) {}
 "#;
@@ -1324,11 +1280,11 @@ node = ExecPython() -> (
 }
 
 #[test]
-fn test_error_require_one_of_missing_paren() {
+fn require_one_of_without_its_closing_paren_is_refused() {
     let source = r#"
 node = ExecPython(
-    a: String?,
-    b: String?,
+    a?: String,
+    b?: String,
     @require_one_of(a, b
 ) -> (result: String) {}
 "#;
@@ -1339,16 +1295,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_error_invalid_port_type() {
-    let source = r#"
-node = ExecPython(data: Foo) -> (result: String) {}
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
-    assert!(result.is_err(), "Invalid type 'Foo' should error");
-}
-
-#[test]
-fn test_error_duplicate_port_name() {
+fn a_duplicate_port_name_is_refused() {
     let source = r#"
 node = ExecPython(data: String, data: Number) -> (result: String) {}
 "#;
@@ -1359,7 +1306,7 @@ node = ExecPython(data: String, data: Number) -> (result: String) {}
 }
 
 #[test]
-fn test_error_port_name_starts_with_number() {
+fn a_port_name_starting_with_a_digit_is_refused() {
     let source = r#"
 node = ExecPython(1data: String) -> (result: String) {}
 "#;
@@ -1368,7 +1315,7 @@ node = ExecPython(1data: String) -> (result: String) {}
 }
 
 #[test]
-fn test_error_unexpected_root_content() {
+fn stray_text_at_the_top_level_is_refused() {
     let source = r#"
 node = Text { value: "hi" }
 this is not valid syntax
@@ -1380,7 +1327,7 @@ this is not valid syntax
 }
 
 #[test]
-fn test_error_broken_multiline_json() {
+fn an_unterminated_multiline_json_value_is_refused() {
     let source = r#"
 node = ExecPython {
     data: [{
@@ -1397,14 +1344,14 @@ node2 = Text { value: "hi" }
 // ─── Empty and Minimal Projects ────────────────────────────────────────────
 
 #[test]
-fn test_empty_source() {
+fn an_empty_file_is_an_empty_project() {
     let source = "";
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("empty project should compile");
     assert_eq!(result.nodes.len(), 0);
 }
 
 #[test]
-fn test_comments_only() {
+fn a_file_of_only_comments_is_an_empty_project() {
     let source = r#"
 # Nothing here
 
@@ -1420,7 +1367,7 @@ fn test_comments_only() {
 // ─── Multiline Port Signatures ─────────────────────────────────────────────
 
 #[test]
-fn test_multiline_inputs_and_outputs_on_separate_lines() {
+fn inputs_and_outputs_may_sit_on_separate_lines() {
     let source = r#"
 node = ExecPython(
     input1: String,
@@ -1438,7 +1385,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_arrow_on_next_line() {
+fn the_output_arrow_may_start_the_next_line() {
     let source = "
 node = ExecPython(data: String)
 -> (result: String) {
@@ -1452,7 +1399,7 @@ node = ExecPython(data: String)
 }
 
 #[test]
-fn test_deeply_split_signature() {
+fn a_signature_split_one_port_per_line_parses() {
     let source = r#"
 node = ExecPython(
     a: String,
@@ -1475,7 +1422,7 @@ node = ExecPython(
 // ─── Triple Backtick Edge Cases ────────────────────────────────────────────
 
 #[test]
-fn test_triple_backtick_verbatim() {
+fn heredoc_content_is_verbatim_between_the_fences() {
     // Heredoc content is VERBATIM between the fences: only the one
     // newline after the open fence and the one before the close fence
     // are syntax. Indentation and trailing spaces are the value (no
@@ -1496,7 +1443,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_triple_backtick_empty_value() {
+fn an_empty_heredoc_is_an_empty_string() {
     let source = "
 node = ExecPython {
     code: ```
@@ -1510,7 +1457,7 @@ node = ExecPython {
 }
 
 #[test]
-fn test_triple_backtick_with_escaped_inner_fence() {
+fn an_escaped_fence_inside_a_heredoc_is_literal() {
     // The ONE heredoc escape: `\```` ``` `` is a literal inner fence.
     // The lexer skips it (the heredoc does not end there) and the
     // decoder unescapes it. Lone backticks are verbatim, no escape.
@@ -1531,7 +1478,7 @@ tick `
 // ─── One-liner Config ──────────────────────────────────────────────────────
 
 #[test]
-fn test_oneliner_config() {
+fn a_one_line_body_takes_comma_separated_fields() {
     let source = r#"
 node = ExecPython { code: "return {}", mode: "fast" }
 "#;
@@ -1542,7 +1489,7 @@ node = ExecPython { code: "return {}", mode: "fast" }
 }
 
 #[test]
-fn test_empty_config_block() {
+fn empty_braces_are_an_empty_config() {
     let source = r#"
 node = ExecPython(data: String) -> (result: String) {}
 "#;
@@ -1554,7 +1501,7 @@ node = ExecPython(data: String) -> (result: String) {}
 // ─── Comments ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_comments_between_declarations() {
+fn comments_between_declarations_are_ignored() {
     let source = r#"
 a = Text { value: "one" }
 
@@ -1568,7 +1515,7 @@ b = Text { value: "two" }
 }
 
 #[test]
-fn test_comment_after_opening_brace() {
+fn a_comment_after_an_opening_brace_is_ignored() {
     let source = "
 node = ExecPython(data: String) -> (result: String) { # This is a config block
     code: \"return {}\"
@@ -1582,7 +1529,7 @@ node = ExecPython(data: String) -> (result: String) { # This is a config block
 // ─── Port Features ─────────────────────────────────────────────────────────
 
 #[test]
-fn test_multiple_require_one_of_groups() {
+fn several_require_one_of_sets_are_kept_separately() {
     let source = r#"
 node = ExecPython(
     text?: String,
@@ -1601,7 +1548,7 @@ node = ExecPython(
 }
 
 #[test]
-fn test_port_underscore_name() {
+fn port_names_may_start_with_an_underscore() {
     let source = r#"
 node = ExecPython(_internal: String) -> (_result: String) {}
 "#;
@@ -1612,7 +1559,7 @@ node = ExecPython(_internal: String) -> (_result: String) {}
 }
 
 #[test]
-fn test_port_must_override_optional() {
+fn an_untyped_port_may_be_optional() {
     let source = r#"
 node = ExecPython(data?, required_data) -> (result) {}
 "#;
@@ -1626,7 +1573,7 @@ node = ExecPython(data?, required_data) -> (result) {}
 // ─── Null in Types ─────────────────────────────────────────────────────────
 
 #[test]
-fn test_null_in_union_type() {
+fn null_may_be_part_of_a_union() {
     let source = r#"
 node = ExecPython(data: String | Null) -> (result: String | Null) {}
 "#;
@@ -1644,7 +1591,7 @@ node = ExecPython(data: String | Null) -> (result: String | Null) {}
 // ─── Connection Edge Cases ─────────────────────────────────────────────────
 
 #[test]
-fn test_connections_with_whitespace() {
+fn spaces_around_a_connections_equals_sign_are_ignored() {
     let source = r#"
 a = Text { value: "hi" }
 b = Debug {}
@@ -1657,7 +1604,7 @@ b.data   =   a.value
 }
 
 #[test]
-fn test_multiple_connections_to_same_node() {
+fn one_node_may_take_wires_from_several_sources() {
     let source = r#"
 src1 = Text { value: "a" }
 src2 = Text { value: "b" }
@@ -1674,7 +1621,7 @@ target.y = src2.value
 // ─── Group Edge Cases ──────────────────────────────────────────────────────
 
 #[test]
-fn test_group_empty_body() {
+fn an_empty_group_body_still_gets_boundaries() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {}
 "#;
@@ -1686,7 +1633,7 @@ grp = Group(data: String) -> (result: String) {}
 }
 
 #[test]
-fn test_group_with_only_connections() {
+fn a_group_may_wire_its_input_straight_to_its_output() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     self.result = self.data
@@ -1700,7 +1647,7 @@ grp = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_same_node_id_in_different_groups_allowed() {
+fn the_same_child_name_is_allowed_in_different_groups() {
     let source = r#"
 a = Group(data: String) -> (result: String) {
     proc = Template { template: "A" }
@@ -1721,7 +1668,7 @@ b = Group(data: String) -> (result: String) {
 // ─── Config in Group ───────────────────────────────────────────────────────
 
 #[test]
-fn test_require_one_of_in_config_block() {
+fn require_one_of_in_a_body_records_the_set() {
     let source = r#"
 node = ExecPython(
     a?: String,
@@ -1740,7 +1687,7 @@ node = ExecPython(
 // ─── Mixed Complex Scenarios ───────────────────────────────────────────────
 
 #[test]
-fn test_full_workflow_small() {
+fn a_small_workflow_with_a_group_compiles_end_to_end() {
     let source = r#"
 # Small end-to-end test
 
@@ -1784,7 +1731,7 @@ output.data = llm.response
 // ─── Scope & GroupBoundary ─────────────────────────────────────────────
 
 #[test]
-fn test_scope_top_level_nodes() {
+fn top_level_nodes_have_no_scope_and_no_boundary() {
     let source = r#"
 a = Text { value: "hello" }
 b = Template { template: "{{data}}" }
@@ -1797,7 +1744,7 @@ b = Template { template: "{{data}}" }
 }
 
 #[test]
-fn test_scope_simple_group() {
+fn a_groups_boundaries_sit_in_its_parent_scope_and_children_in_its_own() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
@@ -1857,7 +1804,7 @@ g = Group(data: String, extra?: String) -> (text: String, body: String) {
 }
 
 #[test]
-fn test_scope_nested_groups() {
+fn nested_scopes_list_every_enclosing_group_outermost_first() {
     let source = r#"
 outer = Group(data: String) -> (result: String) {
     inner = Group(data: String) -> (result: String) {
@@ -1899,7 +1846,7 @@ outer = Group(data: String) -> (result: String) {
 }
 
 #[test]
-fn test_scope_triple_nested() {
+fn scopes_stack_through_three_levels() {
     let source = r#"
 a = Group(x: String) -> (y: String) {
     b = Group(x: String) -> (y: String) {
@@ -1935,10 +1882,9 @@ a = Group(x: String) -> (y: String) {
 }
 
 #[test]
-fn test_scope_mocking_inner_group_skips_only_inner() {
-    // Verify that scope allows distinguishing which nodes belong to which group.
-    // If "outer.inner" is mocked, only nodes with "outer.inner" in their scope should be skipped.
-    // Nodes with just "outer" in scope (but not "outer.inner") should NOT be skipped.
+fn a_parents_own_children_are_outside_a_nested_groups_scope() {
+    // Scope tells apart a group's own children from a nested group's: a
+    // node directly in "outer" is not in "outer.inner", one inside it is in both.
     let source = r#"
 outer = Group(data: String) -> (result: String) {
     pre = Template { template: "pre" }
@@ -1963,11 +1909,6 @@ outer = Group(data: String) -> (result: String) {
     // "deep" is inside both
     assert!(deep.scope.contains(&"outer".to_string()));
     assert!(deep.scope.contains(&"outer.inner".to_string()));
-
-    // If we mock "outer.inner", pre should NOT be skipped, deep SHOULD be skipped
-    let mocked_group = "outer.inner";
-    assert!(!pre.scope.iter().any(|s| s == mocked_group), "pre should not be inside mocked group");
-    assert!(deep.scope.iter().any(|s| s == mocked_group), "deep should be inside mocked group");
 }
 
 
@@ -3004,21 +2945,6 @@ fn require_one_of_with_space_before_paren_fails_loud() {
     );
 }
 
-/// A group or loop takes no `@require_one_of`: its inputs are optional at
-/// its boundary, and the node inside that needs one of them carries the
-/// `_is_output` marked the nodes a run existed to feed. Every reached
-/// node runs now, so the key is refused naming `--target`, under both
-/// spellings it ever had.
-#[test]
-fn is_output_is_refused_naming_target() {
-    for key in ["_is_output", "is_output"] {
-        let src = format!("t = Text {{ value: \"x\", {key}: true }}\n");
-        let err = compile(&src, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("refused");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("`_is_output` no longer exists") && msg.contains("--target"), "{key}: {msg}");
-    }
-}
-
 /// A value lands on an INPUT port, in one of two families (a quoted
 /// constant, a dotted wire), and nowhere else. The rows the language
 /// refuses, each with the fix in its message: a bare word (neither
@@ -3368,13 +3294,12 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
     assert_eq!(node.config.get("raw"), Some(&serde_json::json!("hi")));
 }
 
-/// A container names its ports in its signature, so a port called
-/// `label` (or `mock`) is just a port there: the reserved vocabulary is a
-/// node's. A value written for it lands on the boundary, on a group, on a
-/// loop and on an include alias in both modes, while the same key on a
-/// node is still the renamed-key refusal.
+/// `label` and `mock` are ordinary names, only `_label` is reserved. A
+/// value written for a container port of that name lands on the boundary,
+/// on a group and on an include alias in both modes, and on a node it is
+/// plain config, on a connection line as in the braces.
 #[test]
-fn a_container_port_may_be_called_label() {
+fn label_and_mock_are_ordinary_port_names() {
     let group = "g = Group(label: String, mock: String) -> (y: String) {\n  self.y = self.label\n}\ng.label = \"hi\"\ng.mock = \"m\"\nout = Debug {}\nout.data = g.y\n";
     let p = compile(group, uuid::Uuid::new_v4(), CompileFs::none()).expect("a group port called label");
     let pt_in = p.nodes.iter().find(|n| n.id == "g__in").expect("in boundary");
@@ -3393,14 +3318,18 @@ fn a_container_port_may_be_called_label() {
     let node = p2.nodes.iter().find(|n| n.id == "m").expect("opaque include node");
     assert_eq!(node.config.get("label"), Some(&serde_json::json!("hi")));
 
-    // On a node the key is still the node's reserved vocabulary, on a
-    // connection line as in the braces.
-    let node = "n = Debug {}\nn.label = \"hi\"\n";
-    let err = compile(node, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("a node's label key");
-    assert!(format!("{err:?}").contains("'label' was renamed to '_label'"), "got {err:?}");
-    let node = "n = Debug { label: \"hi\" }\n";
-    let err = compile(node, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("a node's label key");
-    assert!(format!("{err:?}").contains("'label' was renamed to '_label'"), "got {err:?}");
+    for node in [
+        "n = ExecPython { label: \"hi\", mock: \"m\", mocked: true, is_output: true }\n",
+        "n = ExecPython {}\nn.label = \"hi\"\nn.mock = \"m\"\nn.mocked = true\nn.is_output = true\n",
+    ] {
+        let p = compile(node, uuid::Uuid::new_v4(), CompileFs::none()).expect("ordinary config keys");
+        let n = p.nodes.iter().find(|n| n.id == "n").expect("node n");
+        assert_eq!(n.label, None, "`label` is not the node's label: {node}");
+        assert_eq!(n.config.get("label"), Some(&serde_json::json!("hi")), "{node}");
+        assert_eq!(n.config.get("mock"), Some(&serde_json::json!("m")), "{node}");
+        assert_eq!(n.config.get("mocked"), Some(&serde_json::json!(true)), "{node}");
+        assert_eq!(n.config.get("is_output"), Some(&serde_json::json!(true)), "{node}");
+    }
 }
 
 /// `name?: Type` is the one optional spelling: the `?` on the name once

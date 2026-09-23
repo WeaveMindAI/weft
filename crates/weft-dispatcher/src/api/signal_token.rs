@@ -142,7 +142,7 @@ pub async fn mint_token(
         allowed_displays,
         all_displays: body.all_displays,
         // Stamp the mint time here (the canonical wall clock) and store it
-        // verbatim, so both the postgres and mock journals agree instead of one
+        // verbatim, so both the postgres and fake journals agree instead of one
         // stamping now() and the other keeping a placeholder.
         created_at: crate::lease::now_unix() as u64,
     };

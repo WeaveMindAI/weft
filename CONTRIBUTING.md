@@ -30,18 +30,44 @@ the two builds shouldn't fight. Your `.env`, `.env.extension` and
 ## Tests
 
 ```bash
-cargo test                        # the workspace
+cargo test                                          # the workspace
 cargo clippy --workspace --all-targets --locked -- -D warnings
-pnpm -C packages/weft-graph test  # the graph renderer
-pnpm -C extension-vscode test     # the VS Code extension
+cargo check -p weft-compiler --no-default-features  # the parse-only build
+scripts/validate-examples.sh                        # every project in examples/ still compiles
+pnpm -C packages/weft-graph test                    # the graph renderer
+pnpm -C packages/weft-syntax test                   # the .weft grammar and highlighter
+pnpm -C extension-vscode test                       # the VS Code extension
+pnpm -C extension-vscode run compile                # its type check, webview included
+pnpm -C extension-browser exec tsc --noEmit         # the browser extension's type check
+pnpm -C extension-browser check                     # and its Svelte check
 ```
 
-CI runs all four of those, plus the Postgres ones further down. The two pnpm
-suites share the VS Code extension's install, so `./setup.sh` (or at least `./setup.sh --vscode`) has to
-have run at least once before they work.
+CI runs all of those, plus the Postgres ones further down. The graph, syntax
+and VS Code suites share the VS Code extension's install, so `./setup.sh` (or
+at least `./setup.sh --vscode`) has to have run at least once before they
+work. The browser extension has its own install: `pnpm -C extension-browser
+install`.
 
-If you are not sure which layer your test belongs at, go check
-[the testing pyramid](https://weavemindai.github.io/weft/running/architecture.html#testing-in-four-layers).
+### Which layer a test belongs at
+
+We sort tests into four layers, and a test's place tells you which one it is.
+
+1. **Pure functions.** Values in, values out, no I/O, in a `#[cfg(test)]`
+   block next to the function. Most tests live here.
+2. **Wire shapes.** Round-trip a type that crosses a process boundary through
+   its serialization, next to the type. This catches a renamed field breaking
+   the other side.
+3. **Contracts with fakes.** One subsystem's real code against in-memory fakes
+   of its I/O. The fakes are hand-rolled, named `Fake*`, and sit behind the
+   crate's `test-helpers` feature. We do not use mock libraries, because a
+   generated mock hides what the test actually checks.
+4. **End to end.** Real binaries on a real cluster with a real Postgres,
+   through `scripts/run-e2e.sh` below.
+
+If you are not sure, the lowest layer that can see the bug is the right one.
+Orchestration bugs are the ones only layer 3 catches. A node's own tests span
+layers: its `basic` tier is layer 1, `fake` is layer 3, and `live` is layer 4
+pointed at a real account.
 
 Three more suites have their own runners:
 
@@ -73,9 +99,9 @@ the cache in `.live-pass-cache` in `target/node-tests`).
 
 The live tier needs a real connection per service. If you signed into one in any editor,
 it is picked up automatically; otherwise, for pasted keys, the runner reads
-`WEFT_NODE_TEST_*` from this repo's root `.env`. The full list of
-variables, and the three ways to hand a test an account, is in
-[Giving the live tier what it needs](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
+`WEFT_NODE_TEST_*` from this repo's root `.env`. For how those variables are
+named, and the other ways to hand a test an account, go and read
+[Live tests](https://weavemindai.github.io/weft/nodes/testing.html#live-tests).
 
 When an end-to-end test fails, its project and any pods it made are left in
 the cluster on purpose so you can debug what happened.
@@ -95,7 +121,7 @@ If you want a first contribution, this is a good one. A node is a folder with
 two files in it. [The guide](https://weavemindai.github.io/weft/nodes/what-a-node-is.html)
 covers how to write one. If it talks to a service weft has never logged into before,
 it needs an access node beside it holding the login, which is
-[Declaring a service](https://weavemindai.github.io/weft/connections/writing-a-service.html). You can ask tangle to build one for you, tangle has all the knowledge to build one properly.
+[Declaring a service](https://weavemindai.github.io/weft/connections/declaring-a-service.html). You can ask tangle to build one for you, tangle has all the knowledge to build one properly.
 
 A few things we look for in review:
 
@@ -114,10 +140,10 @@ A few things we look for in review:
   [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
 - **Never ask for a secret in config**: anything in config is stored in
   the clear and shows up in the inspector. Secrets come from
-  [a connection](https://weavemindai.github.io/weft/connections/using-a-connection.html).
+  [a connection](https://weavemindai.github.io/weft/connections/using-one-in-a-node.html).
 - **Make it easy to use.** You can go read
   [which widget when](https://weavemindai.github.io/weft/nodes/metadata.html#widget).
-- **Say what it shows.** [What your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
+- **Say what it shows.** [What your node shows in the graph](https://weavemindai.github.io/weft/nodes/display.html)
   says what it can put on its own body.
 - **Ship a `fake` test**, in a `tests.rs` beside your `mod.rs`. And if it talks
   to a provider, a `live` one on the cheapest path that still exercises the real

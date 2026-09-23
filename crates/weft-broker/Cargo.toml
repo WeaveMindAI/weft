@@ -15,7 +15,6 @@ weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-access-store = { workspace = true }
 weft-providers = { workspace = true }
-weft-infra = { path = "../weft-infra" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
 

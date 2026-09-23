@@ -41,7 +41,7 @@ use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, Sig
 use weft_core::signal::{EventScope, ProviderEvents, Signal};
 
 use crate::event_context::FireContext;
-use crate::protocol::{ProcessOutcome, ProcessTarget, PushEvent};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget, PushEvent};
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 

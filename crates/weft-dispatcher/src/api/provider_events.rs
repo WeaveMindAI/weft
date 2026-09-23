@@ -236,7 +236,7 @@ async fn match_signals(
             .push(token);
     }
 
-    let push = weft_listener::protocol::PushEvent {
+    let push = weft_core::signal::listener_protocol::PushEvent {
         service: service.to_string(),
         topic: topic.to_string(),
         event: named_event.clone(),

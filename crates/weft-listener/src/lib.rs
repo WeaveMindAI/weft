@@ -1,5 +1,6 @@
-//! Per-tenant listener service. Kind-aware processor for signals,
-//! running in the tenant's k8s namespace.
+//! Pooled listener service. Kind-aware processor for signals, running
+//! in the control-plane namespace; each pod holds signals from many
+//! tenants, placed per signal by the dispatcher.
 //!
 //! Endpoints (network-trusted; only reachable from `weft-system`):
 //!   POST /register, /unregister, /process, /render, /live,
@@ -14,7 +15,6 @@ pub mod event_context;
 pub mod fire_sink;
 pub mod kinds;
 pub mod listener_access;
-pub mod protocol;
 pub mod registry;
 pub mod router;
 pub mod socket_engine;
@@ -65,9 +65,9 @@ impl ListenerState {
     /// once it is true; `mem_pressure` rides along for the scale-down
     /// planner's headroom math + observability. `signals` /
     /// `held_connections` remain for observability only.
-    pub fn load_report(&self) -> crate::protocol::LoadReport {
+    pub fn load_report(&self) -> weft_core::signal::listener_protocol::LoadReport {
         let fraction = self.mem_pressure.fraction();
-        crate::protocol::LoadReport {
+        weft_core::signal::listener_protocol::LoadReport {
             saturated: is_saturated(fraction, SATURATION_MEM_FRACTION),
             mem_pressure: fraction,
             signals: self.registry.len() as u32,

@@ -45,7 +45,7 @@ pub fn worker_headless_service_name() -> &'static str {
 
 pub struct K8sWorkerBackend {
     /// Broker URL injected into worker Pods. Workers never speak
-    /// directly to Postgres in arch-5; everything goes through the
+    /// directly to Postgres; everything goes through the
     /// broker, which validates the worker's projected SA token and
     /// scopes every operation per-tenant.
     broker_url: String,

@@ -72,6 +72,10 @@ jobs:
       # database. The tests that do want one are behind the `db-tests` feature.
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The parse-only build (weft-core without its `runtime` layer, what a
+      # WASM parser links). A workspace build always turns `runtime` on, so
+      # nothing else compiles this shape.
+      - run: cargo check -p weft-compiler --no-default-features --locked
       # The examples are the first thing a new user copies, and nothing
       # else compiles them. The script tolerates only the
       # connect-a-credential diagnostics a fresh checkout produces.

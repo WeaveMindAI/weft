@@ -52,7 +52,8 @@ pub mod signed_token;
 pub mod storage;
 // What every channel's messages look like once written down: the one
 // trim rule and the one meaning of "ephemeral" a bus and a live caller
-// conversation both answer to.
+// conversation both answer to. Runtime-only: it records bus payloads.
+#[cfg(feature = "runtime")]
 pub mod stream_journal;
 pub mod tag;
 pub mod wait;

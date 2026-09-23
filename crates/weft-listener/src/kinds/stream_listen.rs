@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, SocketFrame, StreamListen};
 
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 use crate::socket_engine::PrepareError;
 use crate::stream_engine::{self, PlanReply, PlanStep, StreamPlan};

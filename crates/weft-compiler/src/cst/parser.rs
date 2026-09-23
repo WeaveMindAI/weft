@@ -623,7 +623,7 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// A config field `key: value`. `_label`/`label` keys become LABEL_FIELD;
+    /// A config field `key: value`. The `_label` key becomes LABEL_FIELD;
     /// everything else CONFIG_FIELD. The value may be a STRING, NUMBER, HEREDOC,
     /// JSON_VALUE, MARKER, a `{...}` JSON object (wrapped JSON_VALUE), an inline
     /// expression (`Type {...}.port`), or a dotted ref (port wiring).
@@ -632,7 +632,7 @@ impl<'a> Parser<'a> {
         let key_is_label = self
             .tokens
             .get(self.pos + sig[0].0)
-            .map(|t| t.text == "label" || t.text == "_label")
+            .map(|t| t.text == "_label")
             .unwrap_or(false);
         let wrapper = if key_is_label { SyntaxKind::LABEL_FIELD } else { SyntaxKind::CONFIG_FIELD };
         self.builder.start_node(wrapper.into());

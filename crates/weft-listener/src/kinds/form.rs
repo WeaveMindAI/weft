@@ -12,7 +12,7 @@ use anyhow::Result;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Form, Signal};
 
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;

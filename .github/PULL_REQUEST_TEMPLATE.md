@@ -36,7 +36,7 @@ change something underneath you. CONTRIBUTING.md has the rest.
 - [ ] If you touched the graph renderer, `pnpm -C packages/weft-graph test` passes.
 - [ ] If you touched the VS Code extension, `pnpm -C extension-vscode test` passes.
 - [ ] New code has tests, at [the right
-      layer](https://weavemindai.github.io/weft/running/architecture.html#testing-in-four-layers).
+      layer](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#which-layer-a-test-belongs-at).
 - [ ] A bug fix has a regression test that fails before the fix.
 - [ ] Docs updated, if this changes behavior the docs describe.
 - [ ] If you changed SQL, the `db-tests` suites pass against a real Postgres.

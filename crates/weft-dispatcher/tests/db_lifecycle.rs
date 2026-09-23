@@ -1,7 +1,7 @@
 //! Layer-3 tests for the dispatcher's OWN SQL, against a REAL Postgres.
 //! The dispatcher's correctness-critical decisions (task stamping, the
 //! listener reap-vs-placement lock discipline) live in SQL statements the
-//! mock stores never execute, so a faked layer cannot catch their bugs;
+//! fake stores never execute, so a faked layer cannot catch their bugs;
 //! two escaped to the live cluster before this rig existed (a `uuid =
 //! text` bind error in the enqueue stamp, and the reap/placement
 //! write-skew). These tests exercise the actual statements.

@@ -13,12 +13,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use weft_core::Color;
-use weft_infra::InfraReader;
 use weft_journal::{ExecEvent, JournalClient};
 use weft_task_store::tasks::{
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
 };
-use weft_task_store::{TaskStoreClient, WorkerPodClient, WorkerStanding};
+use weft_task_store::{InfraReader, TaskStoreClient, WorkerPodClient, WorkerStanding};
 
 use crate::protocol::*;
 use crate::token::TokenSource;

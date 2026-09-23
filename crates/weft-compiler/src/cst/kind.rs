@@ -69,7 +69,7 @@ pub enum SyntaxKind {
     ENDPOINT,     // ident.port, or bare `self` (one side of a connection)
     INLINE_EXPR,  // key: Type { ... }.port (a node literal used as a value)
     DIRECTIVE,    // standalone @require_one_of(...) line inside a body
-    LABEL_FIELD,  // _label: "..." / label: "..." (promoted to node.label)
+    LABEL_FIELD,  // _label: "..." (promoted to node.label)
     GROUP_DESC,   // plain `# ...` comment as the FIRST body line of a group
     TYPE_DECL,    // `type Name = <type>` at the top of a scope
 

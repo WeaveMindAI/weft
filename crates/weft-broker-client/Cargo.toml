@@ -9,7 +9,6 @@ repository.workspace = true
 weft-core = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
-weft-infra = { path = "../weft-infra" }
 
 reqwest = { workspace = true }
 serde = { workspace = true }

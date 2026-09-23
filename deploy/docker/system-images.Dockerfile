@@ -100,9 +100,9 @@ EXPOSE 9999
 CMD ["weft-dispatcher"]
 
 # ---
-# weft-listener: per-tenant event-source daemon. One image serves every
-# tenant; the dispatcher spawns a Deployment per tenant and feeds
-# config (tenant id, dispatcher URL, tokens) via env vars.
+# weft-listener: pooled event-source daemon. One image serves every
+# tenant; the dispatcher spawns listener Deployments as load needs and
+# feeds config (pod name, broker URL, token path) via env vars.
 
 FROM runtime-plain AS listener
 COPY --from=builder /usr/local/bin/weft-listener /usr/local/bin/weft-listener
@@ -121,7 +121,7 @@ EXPOSE 9090
 CMD ["weft-broker"]
 
 # ---
-# weft-infra-supervisor: per-tenant pod that owns runtime infra
+# weft-infra-supervisor: pooled pod that owns runtime infra
 # lifecycle: claims infra_lifecycle_command rows from the broker,
 # executes them via kubectl, polls k8s for replica state, evaluates
 # HealthProtocols, emits infra_event rows.

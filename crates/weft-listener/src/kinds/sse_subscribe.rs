@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, SseSubscribe};
 
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
 use super::event_source::Backoff;

@@ -64,5 +64,5 @@ pub use project_store::{
     PostgresProjectStore, ProjectStatus as StoreStatus, ProjectStore, ProjectStoreOps,
 };
 #[cfg(any(test, feature = "test-helpers"))]
-pub use project_store::MockProjectStore;
+pub use project_store::FakeProjectStore;
 pub use state::DispatcherState;

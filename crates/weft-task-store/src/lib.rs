@@ -40,7 +40,8 @@ pub use tasks::{
     TaskTarget, CLAIM_DURATION_SECS, CLAIM_HEARTBEAT_INTERVAL_SECS, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{
-    PostgresTaskStoreClient, PostgresWorkerPodClient, TaskStoreClient, WorkerPodClient,
+    InfraReader, PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
+    TaskStoreClient, WorkerPodClient,
 };
 pub use worker_pod::{
     delete_row, has_live_for_project,

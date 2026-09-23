@@ -5,7 +5,7 @@
     use weft_core::node::NodeMetadata;
     use weft_core::ProjectDefinition;
     use weft_journal::{ExecEvent, JournalClient};
-    use weft_infra::InfraReader;
+    use weft_task_store::InfraReader;
     use crate::context::InfraStateClient;
 
     pub(super) fn trivial_metadata(node_type: &str) -> NodeMetadata {

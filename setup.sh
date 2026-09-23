@@ -2077,20 +2077,17 @@ if [[ $build_vscode -eq 1 ]]; then
   # to the stamp), hashed by content. A hand-kept file list here
   # repeatedly went stale (.vscodeignore, media/, the README all ship
   # and were once missing); enumerating from git closes the class.
-  # Ignored files (out/, node_modules/) stay out, and so does
-  # media/webview (tracked but DERIVED from weft-graph's sources,
-  # which are hashed; hashing the output too would make every build
-  # dirty its own stamp). A deleted-but-still-tracked file hashes as
+  # Ignored files (out/, node_modules/, the media/webview bundle built
+  # from weft-graph's sources) stay out, which also keeps a build from
+  # dirtying its own stamp. A deleted-but-still-tracked file hashes as
   # its absence, so a mid-refactor worktree changes the fingerprint
   # instead of killing the run.
   if git -C "${here}" rev-parse HEAD >/dev/null 2>&1; then
     current_hash="$(
       {
-        git -C "${here}" ls-files -z extension-vscode packages/weft-graph packages/weft-syntax \
-          ':(exclude)extension-vscode/media/webview'
+        git -C "${here}" ls-files -z extension-vscode packages/weft-graph packages/weft-syntax
         git -C "${here}" ls-files -z --others --exclude-standard \
-          extension-vscode packages/weft-graph packages/weft-syntax \
-          ':(exclude)extension-vscode/media/webview'
+          extension-vscode packages/weft-graph packages/weft-syntax
       } | {
         cd "${here}" && sort -z | while IFS= read -r -d '' f; do
           if [[ -e "$f" ]]; then ${sha256_bin} "$f"; else printf 'absent  %s\n' "$f"; fi

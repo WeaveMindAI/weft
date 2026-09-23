@@ -56,7 +56,7 @@ use parking_lot::Mutex;
 use crate::config::ListenerConfig;
 use crate::event_context::FireContext;
 use crate::fire_sink::FireSignalSink;
-use crate::protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent};
+use weft_core::signal::listener_protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent};
 use crate::registry::{RegisteredSignal, Registry, ServingState, TaskGuard, Transport};
 
 /// Everything a kind's background task is spawned with, bundled: the

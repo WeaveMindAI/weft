@@ -2874,9 +2874,9 @@ fn is_list_of_nullable(ty: &weft_core::weft_type::WeftType) -> bool {
 /// There is deliberately no "this node's outputs go nowhere" warning.
 /// A leaf is how a program ends: the last node sends the message,
 /// writes the row, uploads the file, and its outputs are receipts
-/// nobody has to read. `_is_output` used to mark those and is gone
-/// (every reached node runs), so the warning fired on the last node of
-/// nearly every real program, which teaches people to ignore warnings.
+/// nobody has to read. Every reached node runs, so the warning would
+/// fire on the last node of nearly every real program, which teaches
+/// people to ignore warnings.
 /// Telling a leaf that acts from a leaf that only computes needs
 /// something the language does not have yet; see TODO.md, "A node
 /// whose outputs nobody reads".

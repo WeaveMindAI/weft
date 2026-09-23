@@ -1,7 +1,7 @@
 //! Sink that lets stateful kinds (Timer, SSE) report a held event
-//! firing. In arch-5 we don't push HTTP to the dispatcher; we
-//! enqueue a `FireSignal` task through the broker, and the
-//! dispatcher's task picker runs `dispatch_listener_outcome`.
+//! firing. The listener never calls the dispatcher: it enqueues a
+//! `FireSignal` task through the broker, and the dispatcher's task
+//! picker runs `dispatch_listener_outcome`.
 
 use std::sync::Arc;
 

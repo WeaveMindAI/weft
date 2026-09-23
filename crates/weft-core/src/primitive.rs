@@ -1,6 +1,6 @@
 #[cfg(feature = "runtime")]
-use std::collections::VecDeque;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

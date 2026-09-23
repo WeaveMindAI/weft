@@ -1914,13 +1914,6 @@ fn lower_config_field(
     // Otherwise a literal value: reconstruct the value text after the colon.
     let value_text = field_value_text(field);
     if field.kind() == K::LABEL_FIELD {
-        // The parser wraps both spellings so neither falls into config, and
-        // the old one is refused here the way it is on a connection line
-        // (`node_config_key_ok`): a hard break, never a silent alias.
-        if key == "label" {
-            errors.push(CompileError::at(span, "'label' was renamed to '_label' (reserved internal key)"));
-            return;
-        }
         // The label has ONE home (`node.label`); set twice is a loud error, the
         // same rule `store_value_text` enforces for config keys.
         if out.label.is_some() {
@@ -2628,7 +2621,7 @@ fn lower_grouplike_body_in_scope(
                 let noun = group.kind.noun();
                 errors.push(CompileError::at(
                     li.span_of(&child),
-                    format!("{noun} '{id}': {noun}s do not take a 'label' field"),
+                    format!("{noun} '{id}': {noun}s do not take a '_label' field"),
                 ));
             }
             K::CONNECTION => conn_nodes.push(child.clone()),
@@ -3126,36 +3119,11 @@ fn quote_markers(raw: &str) -> String {
 
 
 /// Whether `key` may be a NODE's config key. The reserved vocabulary
-/// (`_label`, `_tags`, the gates) and the removed keys are a node's
-/// concern only: a group, a loop or an included file names its ports in
-/// its signature, so a port there called `label` is just a port, and a
-/// value written for it never comes through here (the container fill
+/// (`_label`, `_tags`, the gates) is a node's concern only: a group, a
+/// loop or an included file names its ports in its signature, and a
+/// value written for one never comes through here (the container fill
 /// checks the signature instead). Pushes its own error.
 fn node_config_key_ok(key: &str, span: Span, errors: &mut Vec<CompileError>) -> bool {
-    // Reject removed config keys
-    if key == "mock" || key == "mocked" {
-        errors.push(CompileError::at(span, format!("'{}' is not a valid config key. Use test configs for mocking.", key)));
-        return false;
-    }
-
-    // Hard break: pre-arch4 keys were renamed to leading-underscore
-    // form. Surface a clear migration error so projects don't pick
-    // up the old behavior silently.
-    if key == "label" {
-        errors.push(CompileError::at(span, "'label' was renamed to '_label' (reserved internal key)"));
-        return false;
-    }
-    // `_is_output` used to mark the nodes a run existed to feed. There
-    // is no such set any more: every node the run reaches runs, and a
-    // narrower run is asked for at the command (`--target`).
-    if key == "_is_output" || key == "is_output" {
-        errors.push(CompileError::at(
-            span,
-            "`_is_output` no longer exists: every reached node runs; use `--target` to narrow a run",
-        ));
-        return false;
-    }
-
     // `_label` is NOT a config value: it is the node's LABEL, set ONLY via the
     // body `_label: "..."` field (which routes through `parse_label_value` into
     // `node.label`, never here). Reaching this check with `_label` means a

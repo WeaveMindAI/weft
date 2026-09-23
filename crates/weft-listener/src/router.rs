@@ -1,6 +1,6 @@
 //! HTTP router for the listener. Every endpoint is network-trusted:
 //! only Pods in the dispatcher's namespace can reach the listener
-//! port (NetworkPolicy enforces this). No bearer auth in arch-5.
+//! port (NetworkPolicy enforces this), so there is no bearer auth.
 //!
 //!   POST /register     add a signal to the registry
 //!   POST /unregister   remove a signal
@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::kinds;
-use crate::protocol::{
+use weft_core::signal::listener_protocol::{
     LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome,
     ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest, WakeByHandRequest,
     WakeByHandResponse,
@@ -84,7 +84,7 @@ async fn health() -> StatusCode {
 
 /// Load surface for the dispatcher's placement. Returns the pod's
 /// current load + its own saturation call.
-async fn load(State(state): State<ListenerState>) -> Json<crate::protocol::LoadReport> {
+async fn load(State(state): State<ListenerState>) -> Json<weft_core::signal::listener_protocol::LoadReport> {
     Json(state.load_report())
 }
 
@@ -113,10 +113,10 @@ async fn register(
             spec: req.spec,
         },
         match req.source {
-            crate::protocol::RegisterSource::Fresh { prior_kind_state, prior_seq } => {
+            weft_core::signal::listener_protocol::RegisterSource::Fresh { prior_kind_state, prior_seq } => {
                 kinds::RoutingSource::Fresh { prior_kind_state, prior_seq }
             }
-            crate::protocol::RegisterSource::Restore { routing, kind_state, seq } => {
+            weft_core::signal::listener_protocol::RegisterSource::Restore { routing, kind_state, seq } => {
                 kinds::RoutingSource::Restore { routing, kind_state, seq }
             }
         },

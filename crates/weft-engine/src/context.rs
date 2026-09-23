@@ -39,11 +39,10 @@ use weft_core::Color;
 
 use crate::now_unix;
 use crate::wait_tracker::{DeliveryGate, WaitTracker};
-use weft_infra::InfraReader;
 use weft_journal::{ExecEvent, JournalClient};
 
 use weft_task_store::tasks as task_store;
-use weft_task_store::{TaskKind, TaskStoreClient};
+use weft_task_store::{InfraReader, TaskKind, TaskStoreClient};
 
 /// Serialize a frame stack into the canonical string used in task dedup keys.
 /// One definition so the side-effect-task and register-signal-task

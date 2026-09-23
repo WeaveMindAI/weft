@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
-use weft_listener::protocol::ProcessTarget;
+use weft_core::signal::listener_protocol::ProcessTarget;
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;

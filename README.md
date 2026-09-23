@@ -173,7 +173,7 @@ For human questions and approvals, install **Weft tasks** from
 [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/) or the
 [Chrome Web Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm).
 
-To connect Weft tasks to weft, read the [human-step walkthrough](https://weavemindai.github.io/weft/start/a-person-in-the-loop.html).
+To connect Weft tasks to weft, read the [human-step walkthrough](https://weavemindai.github.io/weft/build/a-person-in-the-loop.html).
 
 ## Where to go from here
 

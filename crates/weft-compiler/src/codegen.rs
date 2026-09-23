@@ -892,7 +892,7 @@ pub fn workspace_crate_closure(
 /// Last path component of a dependency `path = "..."` value: every worker-linked
 /// local crate lives directly under `crates/`, so the final component IS the
 /// crate's directory name whether the path is root-relative (`crates/weft-core`),
-/// sibling-relative (`../weft-infra`), or container-absolute
+/// sibling-relative (`../weft-journal`), or container-absolute
 /// (`../weft/crates/weft-engine`).
 fn crate_dir_name(path: &str) -> Option<String> {
     Path::new(path)
@@ -1570,7 +1570,6 @@ mod tests {
                 "weft-broker-client".to_string(),
                 "weft-core".to_string(),
                 "weft-engine".to_string(),
-                "weft-infra".to_string(),
                 "weft-journal".to_string(),
                 "weft-node-derive".to_string(),
                 "weft-platform-traits".to_string(),

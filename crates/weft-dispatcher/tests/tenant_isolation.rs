@@ -1,5 +1,5 @@
 //! Layer-3 contract test: multi-tenant isolation, proven against the in-memory
-//! fakes (`MockProjectStore`, `MockJournal`) that are the real isolation
+//! fakes (`FakeProjectStore`, `FakeJournal`) that are the real isolation
 //! enforcers. Two tenants register projects, run executions, and mint tokens;
 //! the test asserts neither can see, reach, or seize the other's resources.
 //!
@@ -12,8 +12,8 @@ use chrono::Utc;
 use uuid::Uuid;
 use weft_core::ProjectDefinition;
 use weft_dispatcher::authenticator::authorize_execution;
-use weft_dispatcher::journal::{ExecutionQuery, SignalToken, Journal, MockJournal};
-use weft_dispatcher::project_store::{MockProjectStore, ProjectStoreOps};
+use weft_dispatcher::journal::{ExecutionQuery, SignalToken, Journal, FakeJournal};
+use weft_dispatcher::project_store::{FakeProjectStore, ProjectStoreOps};
 use weft_dispatcher::tenant::TenantId;
 
 const TENANT_A: &str = "tenant-a";
@@ -30,7 +30,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
     }
 }
 
-async fn register(store: &MockProjectStore, id: Uuid, name: &str, tenant: &str) {
+async fn register(store: &FakeProjectStore, id: Uuid, name: &str, tenant: &str) {
     store
         .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None)
         .await
@@ -39,7 +39,7 @@ async fn register(store: &MockProjectStore, id: Uuid, name: &str, tenant: &str) 
 
 #[tokio::test]
 async fn list_projects_is_scoped_to_the_caller_tenant() {
-    let store = MockProjectStore::new();
+    let store = FakeProjectStore::new();
     let a1 = Uuid::new_v4();
     let a2 = Uuid::new_v4();
     let b1 = Uuid::new_v4();
@@ -62,7 +62,7 @@ async fn tenant_for_drives_the_per_resource_gate() {
     // `authorize_project` authorizes iff `tenant_for(id) == caller`. Prove the
     // primitive it relies on returns the true owner, so a cross-tenant caller is
     // rejected and a missing project is indistinguishable from a foreign one.
-    let store = MockProjectStore::new();
+    let store = FakeProjectStore::new();
     let a1 = Uuid::new_v4();
     register(&store, a1, "a-one", TENANT_A).await;
 
@@ -76,7 +76,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
     // Tenant B may not re-register tenant A's project id to seize it. The
     // register guard (mirroring the Postgres `WHERE project.tenant_id =
     // EXCLUDED.tenant_id`) rejects the collision, and A's ownership stands.
-    let store = MockProjectStore::new();
+    let store = FakeProjectStore::new();
     let shared_id = Uuid::new_v4();
     register(&store, shared_id, "a-owned", TENANT_A).await;
 
@@ -99,7 +99,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
 
 #[tokio::test]
 async fn list_executions_is_scoped_to_the_caller_tenant() {
-    let journal = MockJournal::new();
+    let journal = FakeJournal::new();
     let proj_a = Uuid::new_v4().to_string();
     let proj_b = Uuid::new_v4().to_string();
     // Mirror the project->tenant mapping the Postgres execution_color seed reads.
@@ -143,8 +143,8 @@ async fn an_executions_owner_outlives_its_project() {
     // forever with `weft clean` refusing them 404. Both fields now
     // come off the stamped row, which nothing can delete out from
     // under it.
-    let store = MockProjectStore::new();
-    let journal = MockJournal::new();
+    let store = FakeProjectStore::new();
+    let journal = FakeJournal::new();
     let project = Uuid::new_v4();
     let project_id = project.to_string();
     register(&store, project, "doomed", TENANT_A).await;
@@ -188,7 +188,7 @@ async fn an_executions_owner_outlives_its_project() {
 
 #[tokio::test]
 async fn signal_tokens_are_scoped_to_the_caller_tenant() {
-    let journal = MockJournal::new();
+    let journal = FakeJournal::new();
     let tok_a = token("hash-a", TENANT_A);
     let tok_b = token("hash-b", TENANT_B);
     journal.mint_signal_token(&tok_a).await.unwrap();
@@ -238,8 +238,8 @@ async fn signal_tokens_are_scoped_to_the_caller_tenant() {
 /// run nobody can make sense of.
 #[tokio::test]
 async fn a_program_is_retired_only_when_no_run_still_names_it() {
-    let store = MockProjectStore::new();
-    let journal = MockJournal::new();
+    let store = FakeProjectStore::new();
+    let journal = FakeJournal::new();
     let project = Uuid::new_v4();
     let project_id = project.to_string();
     register(&store, project, "doomed", TENANT_A).await;

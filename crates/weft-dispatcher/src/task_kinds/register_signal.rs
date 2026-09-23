@@ -369,7 +369,7 @@ impl RegisterSignalExecutor {
                             payload.is_resume,
                             resume_color_owned.as_deref(),
                             placement_generation,
-                            weft_listener::protocol::RegisterSource::Fresh {
+                            weft_core::signal::listener_protocol::RegisterSource::Fresh {
                                 prior_kind_state: prior_state_call,
                                 prior_seq,
                             },

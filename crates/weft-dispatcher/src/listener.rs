@@ -8,8 +8,7 @@
 //! ## State (all in Postgres; pod-local RAM is only optimization)
 //!
 //! - `listener_pod(pod_name PK, admin_url, namespace, owner_pod_id,
-//!   leased_until_unix)`: the registry of live listener pods. The
-//!   pooled analog of the old per-tenant `tenant_listener` row, keyed
+//!   leased_until_unix)`: the registry of live listener pods, keyed
 //!   by POD. `owner_pod_id` + `leased_until_unix` say which dispatcher
 //!   pod is authoritative for this listener's lifecycle; a sibling
 //!   dispatcher adopts an expired lease.
@@ -30,10 +29,10 @@
 //! ## Resolution + reap
 //!
 //! Fire / display / action resolve `token -> signal.listener_pod ->
-//! admin_url`. The reaper reaps a listener pod that holds ZERO signals
-//! (per-pod idle, replacing the old per-tenant idle check). A pod
-//! holding live held-connection loops is never reaped under load; its
-//! signals are re-placed elsewhere first on an intentional scale-down.
+//! admin_url`. The reaper reaps a listener pod that holds ZERO signals.
+//! A pod holding live held-connection loops is never reaped under load;
+//! its signals are re-placed elsewhere first on an intentional
+//! scale-down.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -393,14 +392,14 @@ pub async fn register_signal(
     is_resume: bool,
     color: Option<&str>,
     placement_generation: i64,
-    source: weft_listener::protocol::RegisterSource,
+    source: weft_core::signal::listener_protocol::RegisterSource,
 ) -> Result<(weft_core::primitive::SignalRouting, Value)> {
     let client = admin_http();
     let url = format!("{}/register", handle.admin_url.trim_end_matches('/'));
     // Use the typed wire struct so a new required field (e.g. tenant_id)
     // is a compile error here, not a runtime deserialize failure on the
     // listener.
-    let req = weft_listener::protocol::RegisterRequest {
+    let req = weft_core::signal::listener_protocol::RegisterRequest {
         token: token.to_string(),
         tenant_id: tenant_id.to_string(),
         spec: spec.clone(),
@@ -412,7 +411,7 @@ pub async fn register_signal(
     };
     let resp = client.post(&url).json(&req).send().await?;
     let resp = bail_unless_ok(resp, "/register").await?;
-    let body: weft_listener::protocol::RegisterResponse = resp.json().await?;
+    let body: weft_core::signal::listener_protocol::RegisterResponse = resp.json().await?;
     Ok((body.routing, body.kind_state))
 }
 
@@ -434,7 +433,7 @@ pub async fn live_signal(
     // compile here rather than arriving as a silently absent address.
     let resp = admin_http()
         .post(&url)
-        .json(&weft_listener::protocol::LiveRequest {
+        .json(&weft_core::signal::listener_protocol::LiveRequest {
             token: token.to_string(),
             address: address.map(str::to_string),
         })
@@ -444,7 +443,7 @@ pub async fn live_signal(
         return Ok(None);
     }
     let resp = bail_unless_ok(resp, "/live").await?;
-    let body: weft_listener::protocol::LiveResponse = resp.json().await?;
+    let body: weft_core::signal::listener_protocol::LiveResponse = resp.json().await?;
     Ok(Some(body.live))
 }
 
@@ -453,7 +452,7 @@ pub async fn process_signal(
     handle: &ListenerHandle,
     token: &str,
     payload: &Value,
-) -> Result<weft_listener::protocol::ProcessOutcome> {
+) -> Result<weft_core::signal::listener_protocol::ProcessOutcome> {
     let client = admin_http();
     let url = format!("{}/process", handle.admin_url.trim_end_matches('/'));
     let resp = client
@@ -462,7 +461,7 @@ pub async fn process_signal(
         .send()
         .await?;
     let resp = bail_unless_ok(resp, "/process").await?;
-    Ok(resp.json::<weft_listener::protocol::ProcessOutcome>().await?)
+    Ok(resp.json::<weft_core::signal::listener_protocol::ProcessOutcome>().await?)
 }
 
 /// Ask one listener pod which of `tokens` a verified provider push
@@ -476,14 +475,14 @@ pub async fn process_signal(
 /// provider wait on a round trip each.
 pub async fn match_push(
     handle: &ListenerHandle,
-    push: &weft_listener::protocol::PushEvent,
+    push: &weft_core::signal::listener_protocol::PushEvent,
     tokens: &[String],
-) -> Result<Vec<weft_listener::protocol::MatchedPush>> {
+) -> Result<Vec<weft_core::signal::listener_protocol::MatchedPush>> {
     let client = admin_http();
     let url = format!("{}/match_push", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
-        .json(&weft_listener::protocol::MatchPushRequest {
+        .json(&weft_core::signal::listener_protocol::MatchPushRequest {
             push: push.clone(),
             tokens: tokens.to_vec(),
         })
@@ -491,7 +490,7 @@ pub async fn match_push(
         .await?;
     let resp = bail_unless_ok(resp, "/match_push").await?;
     Ok(resp
-        .json::<weft_listener::protocol::MatchPushResponse>()
+        .json::<weft_core::signal::listener_protocol::MatchPushResponse>()
         .await?
         .matched)
 }
@@ -509,12 +508,12 @@ pub async fn wake_by_hand(handle: &ListenerHandle, token: &str) -> Result<Option
     let url = format!("{}/wake_by_hand", handle.admin_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
-        .json(&weft_listener::protocol::WakeByHandRequest { token: token.to_string() })
+        .json(&weft_core::signal::listener_protocol::WakeByHandRequest { token: token.to_string() })
         .send()
         .await?;
     let resp = bail_unless_ok(resp, "/wake_by_hand").await?;
     Ok(resp
-        .json::<weft_listener::protocol::WakeByHandResponse>()
+        .json::<weft_core::signal::listener_protocol::WakeByHandResponse>()
         .await?
         .payload)
 }
@@ -551,11 +550,11 @@ pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<(
     Ok(())
 }
 
-async fn load_report(handle: &ListenerHandle) -> Result<weft_listener::protocol::LoadReport> {
+async fn load_report(handle: &ListenerHandle) -> Result<weft_core::signal::listener_protocol::LoadReport> {
     let url = format!("{}/load", handle.admin_url.trim_end_matches('/'));
     let resp = admin_http().get(&url).send().await?;
     let resp = bail_unless_ok(resp, "/load").await?;
-    Ok(resp.json::<weft_listener::protocol::LoadReport>().await?)
+    Ok(resp.json::<weft_core::signal::listener_protocol::LoadReport>().await?)
 }
 
 // =============================================================
@@ -804,7 +803,7 @@ impl ListenerPool {
                         is_resume,
                         color.as_deref(),
                         generation,
-                        weft_listener::protocol::RegisterSource::Restore {
+                        weft_core::signal::listener_protocol::RegisterSource::Restore {
                             routing,
                             kind_state,
                             seq: kind_state_seq,
@@ -1145,8 +1144,8 @@ impl ListenerPool {
     }
 
     /// True iff `project_id` has at least one signal with a live holder.
-    /// Replaces the old per-tenant `is_alive`; used by status endpoints
-    /// to render "listener: running" for a project.
+    /// Status endpoints use it to render "listener: running" for a
+    /// project.
     pub async fn project_has_live_listener(
         &self,
         project_id: &str,
@@ -1177,9 +1176,8 @@ impl ListenerPool {
         Ok(())
     }
 
-    /// Reaper hook: reap every listener pod that holds ZERO signals.
-    /// Per-pod idle reap (replaces the old per-tenant idle check). A pod
-    /// holding even one signal is kept (something still needs it).
+    /// Reaper hook: reap every listener pod that holds ZERO signals. A
+    /// pod holding even one signal is kept (something still needs it).
     /// Adopt-on-expiry: a pod whose owning dispatcher died (lease
     /// lapsed) is adopted before being reaped, so a sibling cleans it.
     pub async fn reap_idle(

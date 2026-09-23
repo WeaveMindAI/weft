@@ -7,10 +7,10 @@ use std::time::Duration;
 use anyhow::Context;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-use weft_infra::{InfraReader, PostgresInfraReader};
 use weft_journal::{JournalClient, PostgresJournalClient};
 use weft_task_store::{
-    PostgresTaskStoreClient, PostgresWorkerPodClient, TaskStoreClient, WorkerPodClient,
+    InfraReader, PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
+    TaskStoreClient, WorkerPodClient,
 };
 
 use weft_platform_traits::ObjectStore;
@@ -291,11 +291,10 @@ pub mod kube_client {
             // (and `pod-uid`) to a projected SA token's `user.extra`
             // map when the token is bound to a pod (i.e. minted via
             // serviceAccountToken volume projection, which is how every
-            // weft tenant pod gets its token). Absence here means the
-            // caller is using a raw legacy SA token (not bound to a
-            // specific pod), which under this runtime model should
-            // not exist; treat as None and let downstream handlers
-            // refuse pod-bound operations.
+            // weft tenant pod gets its token). A token minted without a
+            // pod binding carries no pod name: it still identifies its
+            // service account, and every pod-bound operation refuses it
+            // (`require_pod_name_matches`, the color-owner gates).
             let pod_name = user
                 .extra
                 .as_ref()

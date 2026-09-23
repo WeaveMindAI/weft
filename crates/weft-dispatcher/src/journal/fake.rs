@@ -17,7 +17,7 @@ use crate::journal::{
 };
 
 #[derive(Default)]
-struct MockState {
+struct FakeState {
     trigger_setups: HashMap<String, Color>,
     trigger_bakes: HashMap<(String, String), super::TriggerBake>,
     events: Vec<ExecEvent>,
@@ -54,7 +54,7 @@ struct MockState {
     next_tag_seq: i64,
 }
 
-/// A mock `signal` row: the registration as a read hands it back, and
+/// A fake `signal` row: the registration as a read hands it back, and
 /// the `placement_generation` column beside it.
 struct StoredSignal {
     row: SignalRegistration,
@@ -62,17 +62,17 @@ struct StoredSignal {
 }
 
 #[derive(Default)]
-pub struct MockJournal {
-    inner: Mutex<MockState>,
+pub struct FakeJournal {
+    inner: Mutex<FakeState>,
 }
 
-impl MockJournal {
+impl FakeJournal {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The work items the atomic-birth writers committed (see
-    /// `MockState::tasks`), for test assertions.
+    /// `FakeState::tasks`), for test assertions.
     pub fn enqueued_tasks(&self) -> Vec<weft_task_store::tasks::NewTask> {
         self.inner.lock().unwrap().tasks.clone()
     }
@@ -189,7 +189,7 @@ impl MockJournal {
                 .row
                 .listener_pod
                 .clone()
-                .expect("the mock stamps every stored row with its holder"),
+                .expect("the fake stamps every stored row with its holder"),
             generation: stored.placement_generation,
         })
     }
@@ -216,7 +216,7 @@ impl MockJournal {
 /// project has no `project` row (the JOIN finds no tenant). So an unregistered
 /// project is an error here too, NOT a silent `local` default, otherwise a test
 /// that starts an execution for a project it never registered would pass on the
-/// mock while the identical sequence 500s in production. Register the project's
+/// fake while the identical sequence 500s in production. Register the project's
 /// tenant first via `set_project_tenant`.
 /// One `execution_color` row's mirror. A named struct (not a tuple)
 /// so adding a column is a compile error at every read site instead
@@ -235,7 +235,7 @@ struct ExecutionColorRow {
 }
 
 fn seed_execution_color(
-    state: &mut MockState,
+    state: &mut FakeState,
     color: Color,
     project_id: &str,
     node_test: bool,
@@ -268,7 +268,7 @@ fn seed_execution_color(
 }
 
 #[async_trait]
-impl Journal for MockJournal {
+impl Journal for FakeJournal {
     async fn is_trigger_setup_pending(&self, color: Color) -> anyhow::Result<bool> {
         Ok(self.inner.lock().unwrap().trigger_setups.values().any(|setup| *setup == color))
     }
@@ -347,8 +347,8 @@ impl Journal for MockJournal {
         // Dumb: one always-admittable pod. Pins the task exactly like the real
         // insert does, so assertions see the pin.
         let pod = weft_task_store::tasks::AdmittedPod {
-            pod_name: "mock-worker-0".into(),
-            namespace: "mock-ns".into(),
+            pod_name: "fake-worker-0".into(),
+            namespace: "fake-ns".into(),
         };
         let mut g = self.inner.lock().unwrap();
         let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = start else {
@@ -391,7 +391,7 @@ impl Journal for MockJournal {
             });
             if !has_terminal {
                 // Same fidelity as the real cancel: the
-                // terminal row, no per-node rows (the mock folds no nodes).
+                // terminal row, no per-node rows (the fake folds no nodes).
                 g.events.push(ExecEvent::ExecutionCancelled {
                     color,
                     reason: cause.to_string(),
@@ -400,7 +400,7 @@ impl Journal for MockJournal {
                 });
                 write.node_cancellations = Some(0);
             }
-            // The mock has no worker pods, so no color has an alive
+            // The fake has no worker pods, so no color has an alive
             // owner and no cancel task is ever queued.
         }
         Ok(write)
@@ -420,7 +420,7 @@ impl Journal for MockJournal {
             .filter(|e| e.color() == color)
             .enumerate()
             .map(|(index, event)| crate::events::IdentifiedEvent {
-                event_id: format!("mock:{color}:{index}"), event: event.clone(),
+                event_id: format!("fake:{color}:{index}"), event: event.clone(),
             })
             .collect();
         Ok((events, Vec::new()))
@@ -625,7 +625,7 @@ impl Journal for MockJournal {
     ) -> anyhow::Result<Vec<Color>> {
         // Read from `execution_colors` (mirror of Postgres
         // `execution_color`) instead of scanning `events`. Keeps
-        // mock semantics aligned with the real DB: `delete_execution`
+        // fake semantics aligned with the real DB: `delete_execution`
         // clears the row so cleaned colors don't keep appearing as
         // non-terminal.
         let g = self.inner.lock().unwrap();
@@ -648,7 +648,7 @@ impl Journal for MockJournal {
             }
         }
         // Oldest first, like Postgres orders on `started_at_unix`: the
-        // editor reads the last one as "the latest run", so a mock that
+        // editor reads the last one as "the latest run", so a fake that
         // answered in map order would let a test pass against an order
         // production never gives.
         out.sort_by_key(|color| {
@@ -709,7 +709,7 @@ impl Journal for MockJournal {
 
     async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64> {
         // Mirrors Postgres: the project's colors come from the index,
-        // then each one's whole footprint goes. A mock that erased less
+        // then each one's whole footprint goes. A fake that erased less
         // than the real store would let a leak of whatever it skipped
         // pass every test here.
         let colors: Vec<Color> = {
@@ -727,7 +727,7 @@ impl Journal for MockJournal {
     }
 
     async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<String>> {
-        // The mock has no project table, so it cannot know which
+        // The fake has no project table, so it cannot know which
         // project rows are gone. Answering "none" is honest here and
         // safe: it under-reports, so a test can never see a sweep the
         // real one would not do. Anything that turns on this predicate
@@ -770,7 +770,7 @@ impl Journal for MockJournal {
         // node. Postgres reuses the SAME token across reactivates (ON CONFLICT
         // (token) refresh), so a second entry row for the same node under a
         // DIFFERENT token is a unique violation there. Reject it here too, else a
-        // mock test could believe a double-registration is fine when production
+        // fake test could believe a double-registration is fine when production
         // rejects it. Resume rows (per-suspension tokens) are exempt, matching the
         // index's `WHERE is_resume = FALSE`.
         if !sig.is_resume {
@@ -897,7 +897,7 @@ impl Journal for MockJournal {
         let mut g = self.inner.lock().unwrap();
         // Mirror the postgres predicate EXACTLY (`DELETE ... WHERE color =
         // $1`, `SIGNAL_DELETE_BY_COLOR_RETURNING`): every signal tied to
-        // the color goes, whatever its kind, so the mock and the real
+        // the color goes, whatever its kind, so the fake and the real
         // store cannot diverge the day an entry signal carries a color.
         let keys: Vec<String> = g
             .signals
@@ -969,7 +969,7 @@ mod tests {
     /// stamped.
     #[tokio::test]
     async fn signal_insert_records_placement_with_the_row() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         assert!(j.signal_placement("tok-1").is_none(), "no signal yet");
         j.signal_insert(
             &registration("tok-1"),
@@ -991,7 +991,7 @@ mod tests {
     /// has nothing else to learn the pod from.
     #[tokio::test]
     async fn consume_suspension_hands_back_the_row_and_its_holder() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         let mut resume = registration("tok-r");
         resume.is_resume = true;
         j.signal_insert(
@@ -1024,7 +1024,7 @@ mod tests {
     /// entry signal is not the run's and stays.
     #[tokio::test]
     async fn delete_execution_hands_back_the_resume_signals_it_removed() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         let placement =
             SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 };
         let run = weft_core::Color::new_v4();
@@ -1049,7 +1049,7 @@ mod tests {
     /// the row keeps the higher seq.
     #[tokio::test]
     async fn signal_insert_never_rewinds_a_newer_kind_state() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         let placement =
             SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 };
         let mut fresh = registration("tok-1");
@@ -1081,7 +1081,7 @@ mod tests {
     /// skip it, exactly like the Postgres `kind = 'execution'` filter.
     #[tokio::test]
     async fn node_test_colors_stay_out_of_lifecycle_reads() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("p", "t");
         let run = weft_core::Color::new_v4();
         let test = weft_core::Color::new_v4();
@@ -1124,7 +1124,7 @@ mod tests {
     /// execution in `running_count`.
     #[tokio::test]
     async fn terminal_and_non_terminal_color_sets_partition_the_project() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("p", "t");
         let done = uuid::Uuid::new_v4();
         let live = uuid::Uuid::new_v4();
@@ -1151,7 +1151,7 @@ mod tests {
     /// project store, so a since-deleted project's terminal event still resolves.
     #[tokio::test]
     async fn execution_owner_reads_the_seeded_row() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         let color = weft_core::Color::new_v4();
         j.set_project_tenant("p", "tenant-x");
         j.record_event(&started(color, "p")).await.unwrap();
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_bake_publication_is_owned_atomic_and_retained_after_clean() {
-        let journal = MockJournal::new();
+        let journal = FakeJournal::new();
         let first = Color::new_v4();
         let bake = super::super::TriggerBake::from_events(&setup_events(first, serde_json::json!({"x":1}))).unwrap().unwrap();
         journal.inner.lock().unwrap().trigger_setups.insert("p".into(), first);
@@ -1244,7 +1244,7 @@ mod tests {
     /// terminal status. This is what replaced the "fetch a page, scan it" get.
     #[tokio::test]
     async fn execution_summary_is_a_direct_point_lookup() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         let c = weft_core::Color::new_v4();
         j.set_project_tenant("p", "t");
         j.record_event(&started_at(c, "p", 100)).await.unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
     /// wall.
     #[tokio::test]
     async fn list_executions_pages_and_filters() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("pa", "t");
         j.set_project_tenant("pb", "t");
         j.set_project_tenant("other", "t2");
@@ -1323,7 +1323,7 @@ mod tests {
     /// thing that tells one run from the thousands beside it.
     #[tokio::test]
     async fn list_executions_filters_by_entry_node() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("p", "t");
         let mine = weft_core::Color::new_v4();
         let noise = weft_core::Color::new_v4();
@@ -1357,7 +1357,7 @@ mod tests {
     /// to answer both shapes.
     #[tokio::test]
     async fn list_executions_filters_by_status() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("p", "t");
         let broke = weft_core::Color::new_v4();
         let fine = weft_core::Color::new_v4();
@@ -1396,7 +1396,7 @@ mod tests {
     /// so a listing can say which is which.
     #[tokio::test]
     async fn list_executions_filters_by_phase() {
-        let j = MockJournal::new();
+        let j = FakeJournal::new();
         j.set_project_tenant("p", "t");
         let fire = weft_core::Color::new_v4();
         let setup = weft_core::Color::new_v4();

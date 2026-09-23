@@ -13,9 +13,9 @@
 pub mod postgres;
 
 #[cfg(any(test, feature = "test-helpers"))]
-pub mod mock;
+pub mod fake;
 #[cfg(any(test, feature = "test-helpers"))]
-pub use mock::MockJournal;
+pub use fake::FakeJournal;
 
 use weft_journal::ExecEvent;
 
@@ -872,7 +872,7 @@ impl LogEntry {
     }
 
     /// The last `limit` lines in written order: THE `logs_for` answer,
-    /// the same code for both journals, so what a mock-backed test
+    /// the same code for both journals, so what a fake-backed test
     /// pins is what the real read does. The cut is made after the
     /// sort, so it is the last lines the run wrote and never the last
     /// rows a pod happened to drain.
@@ -910,14 +910,14 @@ impl LogEntry {
     /// The log line a journal event projects to, or `None` for an
     /// event that is not log-worthy (a pulse, a completion). The ONE
     /// place the journal-to-log projection lives, shared by the
-    /// Postgres and mock journals so `weft logs` reads the same thing
+    /// Postgres and fake journals so `weft logs` reads the same thing
     /// against both.
     pub fn from_event(event: &ExecEvent) -> Option<LogEntry> {
         // `KINDS` is the one gate, for both journals: the SQL read
         // fetches those rows and nothing else, and this projection
         // answers for those kinds and nothing else, so a kind the
         // match knows and the list omits is unprojected everywhere
-        // rather than reaching the log from the mock alone. A kind
+        // rather than reaching the log from the fake alone. A kind
         // the list carries and the match does not is a bug the tests
         // pin (`every_listed_kind_projects`), never a quiet `None`.
         if !Self::KINDS.contains(&event.kind_str()) {

@@ -27,6 +27,10 @@
 pub mod predicate;
 pub use predicate::{Predicate, PredicateOp};
 
+// The dispatcher <-> listener wire, also wire-pure, so the dispatcher
+// speaks it without linking the listener.
+pub mod listener_protocol;
+
 #[cfg(feature = "runtime")]
 pub mod auth;
 #[cfg(feature = "runtime")]

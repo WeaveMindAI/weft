@@ -12,8 +12,9 @@
 //! `infra_lifecycle_command`, and writes runtime events (Flaky /
 //! Recovered) and may flip status as part of that execution.
 //!
-//! Workers / listeners read `endpoints_json` via the broker's
-//! `/v1/infra/endpoint_url` endpoint (NOT via this module).
+//! Workers read `endpoints_json` through the broker's
+//! `/v1/infra/endpoint_url` endpoint, which answers from
+//! `weft_task_store::PostgresInfraReader` (NOT from this module).
 
 use anyhow::Result;
 use serde_json::Value;
@@ -182,37 +183,6 @@ pub async fn remove_project(pool: &PgPool, project_id: &str) -> Result<u64> {
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
-}
-
-/// Look up the cluster-internal URL for an endpoint of a Running
-/// infra node. None if not running or endpoint name not declared.
-/// Used by the broker's `infra/endpoint_url` handler.
-pub async fn endpoint_url(
-    pool: &PgPool,
-    project_id: &str,
-    node_id: &str,
-    endpoint_name: &str,
-) -> Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT endpoints_json FROM infra_node \
-         WHERE project_id = $1 AND node_id = $2 AND status = 'running'",
-    )
-    .bind(project_id)
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(r) = row else {
-        return Ok(None);
-    };
-    // Decode fails loud: a corrupt / schema-drifted `endpoints_json`
-    // must surface as an error, not masquerade as "endpoint not
-    // available" (which would send the worker chasing a phantom
-    // missing-endpoint). A missing endpoint NAME inside a valid
-    // object is the legitimate `None` (not declared).
-    let v: Value = r.try_get("endpoints_json")?;
-    Ok(v.as_object()
-        .and_then(|m| m.get(endpoint_name))
-        .and_then(|val| val.as_str().map(|s| s.to_string())))
 }
 
 /// Decode one `infra_node` row. Every NOT-NULL column is required;

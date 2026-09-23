@@ -23,7 +23,6 @@ weft-compiler = { path = "../weft-compiler", features = ["build"] }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-access-store = { workspace = true }
-weft-listener = { path = "../weft-listener" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
 tokio = { workspace = true }
@@ -67,7 +66,6 @@ test-helpers = []
 db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
-weft-listener = { path = "../weft-listener" }
 weft-dispatcher = { path = ".", features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.

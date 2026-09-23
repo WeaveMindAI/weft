@@ -4643,7 +4643,6 @@ dependencies = [
  "weft-broker-client",
  "weft-core",
  "weft-dispatcher",
- "weft-infra",
  "weft-journal",
  "weft-platform-traits",
  "weft-providers",
@@ -4664,7 +4663,6 @@ dependencies = [
  "tracing",
  "uuid",
  "weft-core",
- "weft-infra",
  "weft-journal",
  "weft-task-store",
 ]
@@ -4812,7 +4810,6 @@ dependencies = [
  "weft-core",
  "weft-dispatcher",
  "weft-journal",
- "weft-listener",
  "weft-platform-traits",
  "weft-task-store",
 ]
@@ -4873,21 +4870,10 @@ dependencies = [
  "uuid",
  "weft-broker-client",
  "weft-core",
- "weft-infra",
  "weft-journal",
  "weft-platform-traits",
  "weft-providers",
  "weft-task-store",
-]
-
-[[package]]
-name = "weft-infra"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde_json",
- "sqlx",
 ]
 
 [[package]]

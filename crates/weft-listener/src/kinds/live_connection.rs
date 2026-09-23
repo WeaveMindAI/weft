@@ -20,7 +20,7 @@ use weft_core::signal::{LiveConnectionConfig, Route, Signal, Socket};
 
 use async_trait::async_trait;
 
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
 use super::{KindHandler, SpawnCtx};

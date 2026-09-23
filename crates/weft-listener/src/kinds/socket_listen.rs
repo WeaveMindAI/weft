@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, SocketFrame, SocketListen};
 
-use crate::protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
