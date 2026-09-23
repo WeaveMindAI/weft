@@ -57,6 +57,36 @@ weft run --from triage='{"text":"the invoice is wrong"}' --before publish --deta
   which is also how `weft events` prints it. A group's entry and exit rows
   print under the group's own name (`triage`, with `boundary=in|out`), and
   `--node triage` shows them; there is no `triage__in` to name.
+- Whatever cut you choose, an input left with nothing is checked before the
+  run starts: its wire's source is outside the run and you handed no value.
+  If a step would skip without it (a required input, or the last member of
+  a `@require_one_of` set that could get a value; the node's own, or one
+  inside the group it enters, followed through every group, loop and
+  included file), the run is refused, naming the input, its source, and
+  what it feeds. Hand it a value
+  at your start, or start further up so the source runs. A start is where
+  the walk upstream stops, so neither `--group` nor `--from` runs what feeds
+  the start's own ports: only what feeds the nodes AFTER it. On a `--seed`
+  run a saved result can feed it instead.
+- `--feed start` runs what feeds a start: for each of its inputs you did
+  not hand, the node that feeds it (through every group or include door on
+  the way, however deep), and nothing above that node. A loop feeding it
+  runs whole. The way to run one group whose
+  connections come from outside: `--from 'hear.note={}' --feed hear.note
+  --target hear.note`. Naming the feeders as starts yourself works too:
+  when one start lies upstream of another, the run keeps both.
+- A start whose gate (`_should_flow`, its own or a surrounding group's)
+  only comes from triggers the run does not fire, or from outside the run,
+  is refused: it would skip and still report completed. `--feed` never
+  opens a gate: it runs what feeds a start's inputs, and the gate is not
+  one of them. Hand the gate a value at its own door, the start for its
+  own gate (`--from 'start={"_should_flow": true}'`) and the group for a
+  surrounding group's (`--from 'group={"_should_flow": true}'`, or
+  `--group` if the run was a `--group` run), or `--fire` the trigger.
+- Without `--target` a run reaches everything downstream of its starts, so
+  `--from db` runs every branch `db` feeds. `--target` keeps only what the
+  target needs, from the starts down: it is a shape, not "run until you
+  reach the target".
 - `--emit node='{"port":value}'` supplies that node's outputs without
   running its body. Repeat for several supplied nodes. An output with no
   consumer remains valid output evidence.

@@ -1340,7 +1340,18 @@ pub struct ProjectExecutionsSummary {
     /// action bar follows "the latest run" and nothing else here says
     /// which that is. A queued run with no journal row yet sorts last,
     /// which is right, it is the newest thing in the list.
-    pub running_colors: Vec<String>,
+    ///
+    /// Each carries its phase: the setup an `infra start` or an
+    /// activation runs is running too, and the editor shows it as that
+    /// verb working instead of as a run with a Stop button.
+    pub running: Vec<RunningExecution>,
+}
+
+// SYNC: RunningExecution <-> packages/weft-graph/src/status.ts RunningExecution
+#[derive(Debug, Serialize)]
+pub struct RunningExecution {
+    pub color: String,
+    pub phase: weft_core::context::Phase,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1539,13 +1550,16 @@ pub async fn status(
     // editor's action bar follows "the latest run" and nothing else on
     // the wire says which that is; sorting these by id, as this used
     // to, made "latest" mean whichever uuid happened to sort highest.
-    let running_colors: Vec<String> = running.iter().map(|c| c.to_string()).collect();
+    let running: Vec<RunningExecution> = running
+        .into_iter()
+        .map(|(color, phase)| RunningExecution { color: color.to_string(), phase })
+        .collect();
     let executions = ProjectExecutionsSummary {
         total: execs.total as usize,
         last_completed_at: last.and_then(|l| l.completed_at),
         last_color: last.map(|l| l.color.to_string()),
         last_status: last.map(|l| l.status.clone()),
-        running_colors,
+        running,
     };
 
     let binary_hash = state
@@ -2427,6 +2441,7 @@ async fn activate_trigger_setup_window(
                     color: bake.color.to_string(), node_id: node_id.clone(), frames: Vec::new(),
                     spec: capture.spec.clone(), is_resume: false, call_index: 0,
                     port_snapshot: Some(capture.ports.clone()),
+                    asked_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                 }).await.map_err(|error| ActivateWindowError {
                     status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{node_id}': {error:#}"),
                     rollback: ActivateRollback::WipeSignals,
@@ -3141,8 +3156,9 @@ async fn apply_reactivate_choice(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear parked: {e}")))?;
         }
         "wipe_all" => {
-            cancelled = state.journal.list_non_terminal_colors_for_project(project_id, None).await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list activation cleanup: {e}")))?;
+            cancelled = state.journal.list_non_terminal_colors_for_project(project_id).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list activation cleanup: {e}")))?
+                .into_iter().map(|(color, _)| color).collect();
             removed = crate::journal::postgres::remove_project_signals(&mut *tx, project_id).await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear activation signals: {e}")))?;
         }
@@ -3213,11 +3229,14 @@ async fn wipe_project_signals(
     state: &DispatcherState,
     project_id: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let colors = state
+    let colors: Vec<weft_core::Color> = state
         .journal
-        .list_non_terminal_colors_for_project(project_id, None)
+        .list_non_terminal_colors_for_project(project_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?
+        .into_iter()
+        .map(|(color, _)| color)
+        .collect();
     // Every run is attempted before any error is reported: one failing
     // cancel must not leave the runs after it live with their wakes
     // registered on a project being wiped.
@@ -4196,11 +4215,14 @@ pub(crate) async fn cancel_running_non_suspended(
             Some(rows.into_iter().filter_map(|(c,)| c.parse().ok()).collect())
         }
     };
-    let colors = state
+    let colors: Vec<weft_core::Color> = state
         .journal
-        .list_non_terminal_colors_for_project(project_id, None)
+        .list_non_terminal_colors_for_project(project_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?
+        .into_iter()
+        .map(|(color, _)| color)
+        .collect();
     let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> = colors
         .iter()
         .filter(|color| !suspended_colors.contains(color))
@@ -4273,11 +4295,11 @@ pub(crate) async fn running_colors(
     state: &DispatcherState,
     project_id: &str,
     exclude_task: Option<uuid::Uuid>,
-) -> anyhow::Result<(Vec<weft_core::Color>, usize)> {
+) -> anyhow::Result<(Vec<(weft_core::Color, weft_core::context::Phase)>, usize)> {
     let suspended_colors = suspended_color_set(state, project_id).await?;
     let colors = state
         .journal
-        .list_non_terminal_colors_for_project(project_id, None)
+        .list_non_terminal_colors_for_project(project_id)
         .await?;
     // Colors the journal already records as finished. A task row must
     // NEVER resurrect one of these: a completed/failed/cancelled
@@ -4291,9 +4313,9 @@ pub(crate) async fn running_colors(
     // A Vec, not a set, and the journal's own order is kept: oldest
     // first, so the last is the most recently started. The editor reads
     // it that way and a set would throw that away.
-    let mut running: Vec<weft_core::Color> = colors
+    let mut running: Vec<(weft_core::Color, weft_core::context::Phase)> = colors
         .into_iter()
-        .filter(|c| !suspended_colors.contains(c))
+        .filter(|(c, _)| !suspended_colors.contains(c))
         .collect();
     let task_rows: Vec<(uuid::Uuid, Option<String>)> = sqlx::query_as(
         "SELECT id, color FROM task \
@@ -4321,9 +4343,11 @@ pub(crate) async fn running_colors(
                 }
                 // A queued run has no journal row yet, so it has no
                 // start time to sort by and belongs after everything
-                // that has one: it is the newest thing here.
-                if !running.contains(&parsed) {
-                    running.push(parsed);
+                // that has one: it is the newest thing here. It is a
+                // run of the graph: a setup journals its start before
+                // it queues anything.
+                if !running.iter().any(|(c, _)| *c == parsed) {
+                    running.push((parsed, weft_core::context::Phase::Fire));
                 }
             }
             None => colorless += 1,

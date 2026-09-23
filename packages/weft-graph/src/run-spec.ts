@@ -38,6 +38,8 @@ export interface RunSpec {
   from?: PortValues;
   target?: string[];
   before?: string[];
+  /// Starts whose feeders run too (`--feed`).
+  feed?: string[];
   group?: [string, Record<string, JsonValue>];
   emit?: PortValues;
   fire?: [string, JsonValue];
@@ -77,9 +79,9 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected'], 'spec');
   string(spec.name, 'name');
-  for (const key of ['target', 'before']) if (spec[key] !== undefined) {
+  for (const key of ['target', 'before', 'feed']) if (spec[key] !== undefined) {
     for (const id of array(spec[key], key)) string(id, key);
   }
   if (spec.group != null) {
@@ -209,8 +211,20 @@ export interface CrossingPort {
   port: string;
   source_node: string;
   source_port: string;
+  /// Whether something in the run needs this input (`needed_by` is set).
   required: boolean;
+  /// The required input it ends up feeding: its own, or one inside the
+  /// group, loop or included file it enters.
+  needed_by?: string;
+  /// Where to hand the missing value: the first start the value would pass.
+  hand_at?: StartPort;
   supplied: boolean;
+}
+
+// SYNC: StartPort <-> crates/weft-core/src/run_spec.rs StartPort
+export interface StartPort {
+  node: string;
+  port: string;
 }
 
 export interface Refusal {
@@ -239,6 +253,7 @@ export function specToRunArgs(spec: RunSpec, seeded = false): string[] {
   }
   for (const id of spec.target ?? []) args.push('--target', id);
   for (const id of spec.before ?? []) args.push('--before', id);
+  for (const id of spec.feed ?? []) args.push('--feed', id);
   if (spec.group) args.push('--group', Object.keys(spec.group[1]).length ? `${spec.group[0]}=${JSON.stringify(spec.group[1])}` : spec.group[0]);
   if (spec.fire) args.push('--fire', `${spec.fire[0]}=${JSON.stringify(spec.fire[1])}`);
   for (const [node, ports] of Object.entries(spec.emit ?? {})) args.push('--emit', `${node}=${JSON.stringify(ports)}`);
@@ -251,6 +266,7 @@ export function specSummary(spec: RunSpec): string {
   if (Object.keys(spec.from ?? {}).length) parts.push(`from ${Object.keys(spec.from!).join(', ')}`);
   if (spec.target?.length) parts.push(`until ${spec.target.join(', ')}`);
   if (spec.before?.length) parts.push(`before ${spec.before.join(', ')}`);
+  if (spec.feed?.length) parts.push(`feeding ${spec.feed.join(', ')}`);
   if (spec.fire) parts.push(`fires ${spec.fire[0]}`);
   const count = Object.values(spec.from ?? {}).reduce((n, ports) => n + Object.keys(ports).length, 0) + Object.keys(spec.group?.[1] ?? {}).length;
   if (count) parts.push(`${count} input backups`);

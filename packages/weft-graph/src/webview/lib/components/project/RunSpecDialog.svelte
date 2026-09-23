@@ -30,6 +30,7 @@
 	let from = $state('');
 	let target = $state('');
 	let before = $state('');
+	let feed = $state('');
 	let emit = $state('{}');
 	let group = $state('');
 	let groupPayload = $state('{}');
@@ -40,6 +41,16 @@
 	/// interior node unless the person also chooses it as a start.
 	let provided = $state<Record<string, string>>({});
 	let missing = $state<CrossingPort[]>([]);
+	/// Each input crossing into the run, under the start it is handed at:
+	/// the first start its value would pass (`hand_at`), which for a
+	/// group inside another is that group, not the outer door the wire
+	/// lands on. One with no start on its way is listed on its own.
+	const handedAt = (port: CrossingPort) => port.hand_at ?? { node: port.node, port: port.port };
+	const missingAt = (start: string) => missing.filter(port => handedAt(port).node === start);
+	const missingElsewhere = $derived(missing.filter(port => {
+		const at = handedAt(port).node;
+		return !port.supplied && at !== group.trim() && !list(from).includes(at);
+	}));
 	let errors = $state<string[]>([]);
 	let warnings = $state<string[]>([]);
 	let runnable = $state(false);
@@ -66,6 +77,7 @@
 		from = Object.keys(initial.from ?? {}).join(', ');
 		target = (initial.target ?? []).join(', ');
 		before = (initial.before ?? []).join(', ');
+		feed = (initial.feed ?? []).join(', ');
 		emit = JSON.stringify(initial.emit ?? {});
 		group = initial.group?.[0] ?? '';
 		groupPayload = JSON.stringify(initial.group?.[1] ?? {});
@@ -97,7 +109,7 @@
 		const spec: RunSpec = {
 			...initial,
 			name: name.trim() || 'one-off',
-			from: starts, target: list(target), before: list(before),
+			from: starts, target: list(target), before: list(before), feed: list(feed),
 			group: group.trim() ? [group.trim(), parse(groupPayload, 'group inputs') as Record<string, unknown>] : undefined,
 			fire: fireNode.trim() ? [fireNode.trim(), parse(firePayload, `fire ${fireNode}`)] : undefined,
 			emit: parse(emit, 'simulated outputs') as PortValues,
@@ -206,11 +218,16 @@
 				{#if group.trim()}
 					<span class="text-zinc-500">Group input backups (port values as JSON)</span>
 					<textarea class="border rounded px-2 py-1 font-mono h-16" bind:value={groupPayload} oninput={changed}></textarea>
+					{@render crossings(missingAt(group.trim()))}
 				{/if}
 			</label>
 			<label class="flex flex-col gap-1">
 				<span class="text-zinc-500">Before (exclude these endpoints)</span>
 				<input class="border rounded px-2 py-1 font-mono" bind:value={before} oninput={changed} />
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-zinc-500">Also run what feeds these starts (from or group ids)</span>
+				<input class="border rounded px-2 py-1 font-mono" bind:value={feed} oninput={changed} />
 			</label>
 			<label class="flex flex-col gap-1 col-span-2">
 				<span class="text-zinc-500">Simulated outputs: node to port values (JSON)</span>
@@ -234,11 +251,15 @@
 					<label class="flex flex-col gap-1 mb-2">
 						<span class="font-mono">{node}</span>
 						<textarea class="border rounded px-2 py-1 font-mono h-16" placeholder={'{"port": "value"}'} bind:value={provided[node]} oninput={changed}></textarea>
-						{#each missing.filter(port => port.node === node) as port}
-							<span class="text-amber-700">{port.port}: {port.required ? 'required' : 'optional'}, supplied upstream by {port.source_node}.{port.source_port}</span>
-						{/each}
+						{@render crossings(missingAt(node))}
 					</label>
 				{/each}
+			</div>
+		{/if}
+		{#if missingElsewhere.length > 0}
+			<div class="mt-3 text-xs flex flex-col gap-1">
+				<div class="text-zinc-500">Inputs no start passes: start at them to hand a value</div>
+				{@render crossings(missingElsewhere, true)}
 			</div>
 		{/if}
 		{#if errors.length > 0}
@@ -268,3 +289,9 @@
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>
+
+{#snippet crossings(ports: CrossingPort[], named = false)}
+	{#each ports as port}
+		<span class="text-amber-700">{named ? `${port.node}.${port.port}` : handedAt(port).port}: {port.needed_by ? `needed by ${port.needed_by}` : 'nothing in this run needs it'}{port.supplied ? ', supplied here' : ''}, fed upstream by {port.source_node}.{port.source_port}</span>
+	{/each}
+{/snippet}

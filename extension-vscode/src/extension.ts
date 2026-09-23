@@ -35,7 +35,8 @@ import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
 import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation } from '../../packages/weft-graph/src/protocol';
-import { emptyActionAvailability, parseStatusPayload } from '../../packages/weft-graph/src/status';
+import { emptyActionAvailability, parseRunning, parseStatusPayload } from '../../packages/weft-graph/src/status';
+import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
@@ -111,7 +112,7 @@ export function activate(context: vscode.ExtensionContext) {
       // Mirror autoFollow's followStatus into the action-bar
       // store so the reducer can compute the watched-live color.
       // Stop button shows iff the user is actually watching a
-      // running execution (pinned color in runningColors, or
+      // running execution (pinned color among the running runs, or
       // latest mode + something running).
       if (msg.kind === 'followStatus' && pinnedProject) {
         actionBar.setFollow(pinnedProject.id, msg.status.mode, msg.status.color);
@@ -121,7 +122,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.workspaceState,
     (ev) => {
       if (ev.kind === 'execution_started') {
-        actionBar.markExecutionStarted(ev.project_id, ev.color);
+        actionBar.markExecutionStarted(ev.project_id, ev.color, ev.phase);
       } else if (
         ev.kind === 'execution_completed' ||
         ev.kind === 'execution_failed' ||
@@ -549,7 +550,7 @@ export function activate(context: vscode.ExtensionContext) {
   ): Promise<string | null | undefined> {
     let status: StatusResult | undefined;
     try {
-      status = await fetchActionAvailability(project.rootPath);
+      status = await fetchActionAvailability(project.id, project.rootPath);
     } catch {
       return null;
     }
@@ -710,7 +711,7 @@ export function activate(context: vscode.ExtensionContext) {
     /// bar's running set is REPLACED with this: SSE drives the same
     /// transitions during a live session, the fetch is the truth
     /// that catches whatever the stream lost.
-    runningColors: string[];
+    running: RunningExecution[];
   }
 
   /// Run `weft status --json` for a specific project root and
@@ -718,6 +719,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// failure so the bar keeps its last-known state instead of
   /// flickering.
   async function fetchActionAvailability(
+    projectId: string,
     projectRoot: string,
   ): Promise<StatusResult | undefined> {
     let out: string;
@@ -744,10 +746,10 @@ export function activate(context: vscode.ExtensionContext) {
       // will fail the same way, so the bar keeps its buttons and says
       // what is wrong above them instead of quietly looking like a
       // project nobody has registered.
-      if (pinnedProject && isDaemonUnreachable(err)) {
+      if (isDaemonUnreachable(err)) {
         actionBar.setError(
-          pinnedProject.id,
-          'run',
+          projectId,
+          'status',
           'The weft daemon is not answering, so nothing here can run.',
           {
             what: 'Reading the project status',
@@ -766,23 +768,46 @@ export function activate(context: vscode.ExtensionContext) {
         );
       } else {
         console.warn('[weft] status fetch failed; project not registered yet', err);
+        actionBar.clearErrorIfVerb(projectId, 'status');
       }
       return {
         snapshot: emptyActionAvailability(),
-        runningColors: [],
+        running: [],
       };
     }
     try {
       // The remap lives in the shared package (`parseStatusPayload`)
       // so every host builds the exact same snapshot.
       const json = JSON.parse(out) as import('../../packages/weft-graph/src/status').RawStatusPayload;
-      const running = json?.executions?.running_colors;
-      return {
+      const result = {
         snapshot: parseStatusPayload(json),
-        runningColors: Array.isArray(running) ? running.filter((c): c is string => typeof c === 'string') : [],
+        running: parseRunning(json),
       };
+      // A status banner lasts exactly as long as the status cannot be
+      // read: the next good read takes it down, and only its own.
+      actionBar.clearErrorIfVerb(projectId, 'status');
+      return result;
     } catch (err) {
+      // The daemon answered with something this editor cannot read: a
+      // version apart, most likely. Said above the bar, never quietly
+      // kept as a stale state.
       console.warn('[weft] fetchActionAvailability failed', err);
+      actionBar.setError(
+        projectId,
+        'status',
+        'The weft daemon answered with a status this editor cannot read.',
+        {
+          what: 'Reading the project status',
+          stage: 'dispatch',
+          diagnostics: [
+            {
+              severity: 'error',
+              message: err instanceof Error ? err.message : String(err),
+              hint: 'The editor and the daemon are probably different versions. Update both to the same release.',
+            },
+          ],
+        },
+      );
       return undefined;
     }
   }
@@ -805,11 +830,11 @@ export function activate(context: vscode.ExtensionContext) {
     const id = projectId ?? pinnedProject?.id;
     const root = projectRoot ?? pinnedProject?.rootPath;
     if (!id || !root) return;
-    const result = await fetchActionAvailability(root);
+    const result = await fetchActionAvailability(id, root);
     if (!result) return;
     // The snapshot and the running set land together; the set is the
     // reconciliation for any SSE event a dropped stream lost.
-    actionBar.pushStatus(id, result.snapshot, result.runningColors);
+    actionBar.pushStatus(id, result.snapshot, result.running);
     // Webview only renders the pinned project's snapshot. Older
     // slots get refreshed silently for when the user pins back.
     if (pinnedProject?.id === id) {

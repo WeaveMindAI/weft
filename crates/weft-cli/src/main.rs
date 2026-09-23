@@ -213,6 +213,12 @@ enum Cmd {
         /// its boundary inputs provided.
         #[arg(long, value_name = "group[=json]")]
         group: Option<String>,
+        /// Also run what feeds this start (a --from node or the --group):
+        /// for each of its inputs you did not hand a value, the node that
+        /// feeds it, through any group or include doors on the way, and
+        /// nothing above that node. Repeatable.
+        #[arg(long, value_name = "start")]
+        feed: Vec<String>,
         /// Fire exactly one trigger with this wake payload, using a matching
         /// bake without activating listeners: `trigger=<json>`.
         #[arg(long, value_name = "trigger=json")]
@@ -228,7 +234,7 @@ enum Cmd {
         #[arg(long, value_name = "name")]
         save: Option<String>,
         /// Clear a saved setting before applying explicit flags: from,
-        /// emit, target, before, group, or fire. Repeatable.
+        /// emit, target, before, group, feed, or fire. Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
     },
@@ -1175,7 +1181,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, fire, emit, save, clear } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, save, clear } => {
             commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -1186,7 +1192,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     seed_until,
                     seed_before,
                     root,
-                    flags: commands::versions::RunFlags { from, target, before, group, fire, emit, clear },
+                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, clear },
                     save,
                 },
             )

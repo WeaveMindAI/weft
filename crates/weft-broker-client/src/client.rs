@@ -295,13 +295,8 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         })
     }
 
-    async fn wait_for_terminal(
-        &self,
-        task_id: Uuid,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<TaskOutcome> {
-        let req = TaskWaitTerminalRequest::new(task_id, timeout, poll_interval);
+    async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
+        let req = TaskWaitTerminalRequest::new(task_id, timeout);
         // The broker-side wait can run for the full `timeout` budget,
         // so the HTTP layer must not abort sooner. Per-call client
         // gets `timeout + 5s` of grace.

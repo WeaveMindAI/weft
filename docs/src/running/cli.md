@@ -51,13 +51,14 @@ Flags on `weft run`:
 | `--before <node>` | Run what it needs, and not it. Repeatable |
 | `--from <node>=<json>` | Start here, with these values as backups. A real producer still wins |
 | `--emit <node>=<json>` | Stand in for a node: say what it would have emitted, and do not run it |
-| `--group <group>=<json>` | Run one group, or one included file, on its own |
+| `--group <group>=<json>` | Run one group, or one included file, on its own, with the values you hand it. A port a step inside needs that you do not hand is refused before the run starts |
+| `--feed <start>` | Also run what feeds this start: for each input you did not hand a value, the node that feeds it (through any group or include doors on the way) and nothing above it. Names a `--from` or `--group` start. Repeatable |
 | `--fire <trigger>=<json>` | Fire exactly one trigger with this event, using its bake. One per run |
 | `--seed` | Reuse everything from head's run whose slice of the program did not change |
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
-| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `fire` |
+| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire` |
 
 ## Look at a run
 

@@ -43,7 +43,7 @@ impl KindHandler for PollEndpointHandler {
     /// queued while the project was inactive (and on an
     /// acknowledged-cursor feed like Telegram, actively tell the
     /// provider to drop it).
-    fn compute_initial_state(&self, _spec: &SignalSpec, prior: Option<&Value>) -> Result<Value> {
+    fn compute_initial_state(&self, _spec: &SignalSpec, prior: Option<&Value>, _asked_at_unix_ms: i64) -> Result<Value> {
         Ok(prior.cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new())))
     }
 

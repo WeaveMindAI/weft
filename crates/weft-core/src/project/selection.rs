@@ -49,6 +49,11 @@ pub struct SelectionBounds {
     pub before: Vec<String>,
     pub group: Option<String>,
     pub fire: Option<String>,
+    /// Starts (a `from` entry or the `group`) whose feeders run too: for
+    /// each start port not handed a value (the set beside it), the node
+    /// that feeds it, found through any doors on the way, and nothing
+    /// above that node.
+    pub feed: Vec<(String, BTreeSet<String>)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,6 +176,137 @@ fn upstream_of(project: &ProjectDefinition, place: &Located, port: Option<&str>)
         .collect()
 }
 
+/// The nodes `feed` asks to run: for each fed start, the node feeding
+/// each of its input ports that was not handed a value, found by
+/// following the wire outward through any doors on the way, and those
+/// doors (a feeder inside a group hands its value out through the
+/// group's output door). Only that node; what feeds IT stays outside
+/// unless the cut already reaches it.
+fn feeders_of(
+    project: &ProjectDefinition,
+    feed: &[(String, BTreeSet<String>)],
+    entries: &BTreeSet<Located>,
+    group: Option<&str>,
+) -> Result<BTreeSet<Located>, String> {
+    let mut feeders = BTreeSet::new();
+    for (spelled, handed) in feed {
+        let start = start_node_at(project, spelled)?;
+        let group_start = group.is_some_and(|g| start_node_at(project, g).is_ok_and(|place| place == start));
+        if !entries.contains(&start) && !group_start {
+            return Err(format!("--feed {spelled}: only a start can be fed; name it with --from or --group too"));
+        }
+        let node = project.nodes.iter().find(|n| n.id == start.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
+        let mut pending: Vec<(Located, String)> = node.inputs.iter()
+            .filter(|input| !crate::exec::skip::is_gate_port(&input.name) && !handed.contains(&input.name))
+            .map(|input| (start.clone(), input.name.clone())).collect();
+        let mut visited = BTreeSet::new();
+        while let Some((place, port)) = pending.pop() {
+            if !visited.insert((place.clone(), port.clone())) { continue; }
+            for (edge, source, _) in incoming(project, &place) {
+                if edge.target_handle.as_deref().unwrap_or("default") != port { continue; }
+                if is_ordinary_boundary(project, &source.id) {
+                    // A door on the way runs too: the value crosses it. A
+                    // group's output door is how a feeder inside that group
+                    // hands its value out, and nothing else would bring it.
+                    feeders.insert(source.clone());
+                    pending.push((source, edge.source_handle.as_deref().unwrap_or("default").to_string()));
+                } else if let Some(each) = loop_of(project, &source) {
+                    // A loop's result comes out of the loop as a whole: it
+                    // runs whole, and never cut inside.
+                    feeders.extend(members_with_paths(project, &each, &source.path));
+                } else {
+                    feeders.insert(source);
+                }
+            }
+        }
+    }
+    Ok(feeders)
+}
+
+/// The loop whose boundary `place` is, if it is one.
+fn loop_of(project: &ProjectDefinition, place: &Located) -> Option<String> {
+    let boundary = project.nodes.iter().find(|n| n.id == place.id)?.group_boundary.as_ref()?;
+    project.groups.iter()
+        .any(|g| g.id == boundary.group_id && matches!(g.kind, GroupKind::Loop { .. }))
+        .then(|| boundary.group_id.clone())
+}
+
+/// Where a value that arrives at a port ends up needed: the input that
+/// would leave its node skipped without it, and the first start of the
+/// run the value passes on the way (the door a person hands it at).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Need {
+    pub needer: (Located, String),
+    pub start: Option<(Located, String)>,
+    /// The `@require_one_of` set the needer belongs to, when that set is
+    /// why it is needed (every other member gets nothing); `None` when
+    /// the input is required on its own.
+    pub one_of: Option<Vec<String>>,
+}
+
+/// A gate a run's start sits behind that cannot open in the run
+/// ([`RunSelection::shut_gates`]): the door whose `_should_flow` it is,
+/// and the unfired triggers every source of its value ends at (none
+/// when the value comes from outside the run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutGate {
+    pub door: Located,
+    pub triggers: Vec<Located>,
+}
+
+/// The input a value arriving at `port` of the node at `at` ends up
+/// needed by, or `None` when nothing that needs it lies on its path.
+///
+/// A node answers for itself: its input is needed when it is required
+/// with no default, or when it belongs to a `@require_one_of` set whose
+/// every other member gets nothing (`fed(place, port)` says whether an
+/// input of the node at `place` gets a value some other way). A group, a
+/// call site or a body boundary requires nothing of its own (its only
+/// say over whether it runs is its gate), so the walk follows the port
+/// through it, and through every boundary nested behind it, until it
+/// reaches nodes. A loop's In requires the ports it iterates or carries
+/// (with no list there is no iteration), which the compiler records as
+/// that port's `required`, so a loop answers like a node for those and
+/// is walked through for the rest.
+///
+/// `counts(place, port)` says where a value arriving there still matters:
+/// everywhere for the compiler; for a run, only places the run executes,
+/// never a trigger (a fired one reads its bake, the others close), and not
+/// past a start that was handed a value for that port. `is_start` marks
+/// the run's starts, so the answer can name the door to hand a value at.
+pub fn required_consumer(
+    project: &ProjectDefinition,
+    at: &Located,
+    port: &str,
+    counts: &dyn Fn(&Located, &str) -> bool,
+    is_start: &dyn Fn(&Located) -> bool,
+    fed: &dyn Fn(&Located, &str) -> bool,
+) -> Option<Need> {
+    let mut pending = vec![(at.clone(), port.to_string(), None::<(Located, String)>)];
+    let mut visited = BTreeSet::new();
+    while let Some((place, port, start)) = pending.pop() {
+        if !visited.insert((place.clone(), port.clone())) { continue; }
+        if crate::exec::skip::is_gate_port(&port) || !counts(&place, &port) { continue; }
+        let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else { continue };
+        let start = start.or_else(|| is_start(&place).then(|| (place.clone(), port.clone())));
+        let input = node.inputs.iter().find(|p| p.name == port);
+        if input.is_some_and(|input| input.required && input.default.is_none()) {
+            return Some(Need { needer: (place, port), start, one_of: None });
+        }
+        let last_of = node.features.one_of_required.iter()
+            .find(|set| set.contains(&port) && set.iter().all(|other| *other == port || !fed(&place, other)));
+        if let Some(set) = last_of {
+            return Some(Need { needer: (place, port), start, one_of: Some(set.clone()) });
+        }
+        if !super::boundary_types::is_boundary(&node.node_type) { continue; }
+        for (edge, target, _) in outgoing(project, &place) {
+            if edge.source_handle.as_deref().unwrap_or("default") != port { continue; }
+            pending.push((target, edge.target_handle.as_deref().unwrap_or("default").to_string(), start.clone()));
+        }
+    }
+    None
+}
+
 /// The wires out of `at` that are on its path, each with the place of
 /// its target and the wire's own place.
 fn outgoing<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
@@ -282,6 +418,7 @@ impl RunSelection {
         let emits: Vec<Located> = bounds.emit.iter().map(|id| locate(project, id)).collect::<Result<_, _>>()?;
         let fire: Option<Located> = bounds.fire.as_ref().map(|id| locate(project, id)).transpose()?;
         let mut excluded: BTreeSet<Located> = emits.iter().cloned().collect();
+        let feeders = feeders_of(project, &bounds.feed, &entries, bounds.group.as_deref())?;
         for (inclusive, ends) in [(true, &bounds.target), (false, &bounds.before)] {
             for spelled in ends {
                 let place = locate(project, spelled)?;
@@ -325,10 +462,11 @@ impl RunSelection {
                 return Err(format!("unknown group '{}'", place.id));
             }
             validate_group_place(project, &place, group)?;
-            let nodes: BTreeSet<Located> = members_with_paths(project, &place.id, &place.path).into_iter().collect();
+            let mut nodes: BTreeSet<Located> = members_with_paths(project, &place.id, &place.path).into_iter().collect();
             if fire.as_ref().is_some_and(|fire| !nodes.contains(fire)) {
                 return Err("the fired trigger is outside the selected group".into());
             }
+            nodes.extend(feeders);
             Self::from_nodes(project, nodes, BTreeSet::new())
         } else {
             let is_trigger = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.features.is_trigger);
@@ -343,10 +481,24 @@ impl RunSelection {
                 nodes.extend(downstream);
                 nodes
             };
+            nodes.extend(feeders.iter().cloned());
             let mut suppliers: BTreeSet<Located> = emits.iter().cloned().collect();
+            // An endpoint's walk stops at the starts, so nothing above them
+            // runs. A start that lies downstream of another start is no
+            // boundary though: the cut runs from the one furthest up, so
+            // the walk passes it and every start upstream stays. A fed
+            // start's feeders are kept as well, one level and no further.
+            let others_reach = |start: &Located| entries.iter().chain(&emits)
+                .filter(|other| *other != start)
+                .any(|other| Self::downstream(project, std::slice::from_ref(other)).contains(start));
+            let inner: BTreeSet<Located> = entries.iter().filter(|start| others_reach(start)).cloned().collect();
+            let bounded = |place: &Located| is_trigger(place)
+                || emits.contains(place)
+                || (entries.contains(place) && !inner.contains(place));
             for ends in [&target, &before] {
                 if !ends.is_empty() {
-                    let allowed = walk(project, ends, Direction::Upstream, &stops);
+                    let mut allowed = walk(project, ends, Direction::Upstream, &bounded);
+                    allowed.extend(feeders.iter().cloned());
                     nodes.retain(|place| allowed.contains(place));
                     suppliers.retain(|place| allowed.contains(place));
                 }
@@ -386,6 +538,75 @@ impl RunSelection {
         let selection = Self::dependencies(project, targets);
         selection.validate_loops(project)?;
         Ok(selection)
+    }
+
+    /// The gates that leave `start` shut: its own `_should_flow`, and
+    /// that of every group it runs inside, when the gate is wired, handed
+    /// no value, and every branch its value could come from in this run
+    /// ends at a trigger that does not fire (`fired` is the one that
+    /// does), or outside the run. Such a gate closes, so the start skips
+    /// whatever it is fed. Empty when every gate could open: a branch
+    /// counts as open when a node on it has nothing to wait on, a
+    /// supplied or reused source feeds it, or a value is handed on the
+    /// way. Deciding that from the graph alone, a branch counts as open
+    /// whenever any of its inputs might be, so a refusal built on this is
+    /// never wrong.
+    ///
+    /// Each gate is named by its door, because that is where a value
+    /// opens it: the start's own, or the enclosing group's In, which only
+    /// a start AT that group can be handed.
+    pub fn shut_gates(&self, project: &ProjectDefinition, start: &Located, fired: Option<&Located>) -> Vec<ShutGate> {
+        let mut doors: BTreeSet<Located> = gates_of(project, start).into_iter()
+            .map(|gate| Located::new(boundary_in_id(&gate.id), gate.path)).collect();
+        doors.insert(start.clone());
+        let gate = crate::exec::skip::SHOULD_FLOW_PORT;
+        doors.into_iter().filter_map(|door| {
+            if self.input.get(&door).is_some_and(|ports| ports.contains_key(gate)) { return None; }
+            if !project.edges.iter().any(|edge| edge.target == door.id && edge.target_handle.as_deref() == Some(gate)) { return None; }
+            let mut triggers = BTreeSet::new();
+            (!self.could_carry(project, &door, gate, fired, &mut BTreeSet::new(), &mut triggers))
+                .then(|| ShutGate { door, triggers: triggers.into_iter().collect() })
+        }).collect()
+    }
+
+    /// Whether a value could reach `port` of `at` in this run (see
+    /// [`Self::shut_gates`]), collecting the unfired triggers that every
+    /// dead branch ends at. A wire counts only when the runtime would
+    /// read it ([`Self::fed_by`]): the run's wire set also holds wires
+    /// into a selected node whose source does not run, and a node whose
+    /// every wire is like that is a root that fires on its own.
+    fn could_carry(
+        &self,
+        project: &ProjectDefinition,
+        at: &Located,
+        port: &str,
+        fired: Option<&Located>,
+        seen: &mut BTreeSet<(Located, String)>,
+        triggers: &mut BTreeSet<Located>,
+    ) -> bool {
+        if !seen.insert((at.clone(), port.to_string())) { return false; }
+        if self.input.get(at).is_some_and(|ports| ports.contains_key(port)) { return true; }
+        let wires: Vec<(Edge, Located)> = incoming(project, at)
+            .filter(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default") == port && self.fed_by(project, at, edge))
+            .map(|(edge, source, _)| (edge.clone(), source)).collect();
+        wires.into_iter().any(|(edge, source)| {
+            if self.suppliers.contains(&source) { return true; }
+            let Some(node) = project.nodes.iter().find(|n| n.id == source.id) else { return false };
+            if node.features.is_trigger && fired != Some(&source) {
+                triggers.insert(source);
+                return false;
+            }
+            if is_ordinary_boundary(project, &source.id) {
+                let through = edge.source_handle.as_deref().unwrap_or("default");
+                return self.could_carry(project, &source, through, fired, seen, triggers);
+            }
+            // A node: open when nothing it reads comes over a wire of the
+            // run, or when any wired input could carry.
+            let ports: BTreeSet<String> = incoming(project, &source)
+                .filter(|(edge, _, _)| self.fed_by(project, &source, edge))
+                .map(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default").to_string()).collect();
+            ports.is_empty() || ports.iter().any(|port| self.could_carry(project, &source, port, fired, seen, triggers))
+        })
     }
 
     /// Whether something in the run feeds `port` of the node at `at`.

@@ -1,8 +1,9 @@
+import { pipeline } from 'node:stream';
 import express from 'express';
 import { createBridge } from './bridge.js';
 import { createActionRouter } from './actions.js';
 import { WebhookManager } from './webhooks.js';
-import { MessageStore } from './message-store.js';
+import { MessageStore, contentDisposition } from './message-store.js';
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const AUTH_DIR = process.env.AUTH_DIR || '/data/auth';
@@ -137,26 +138,39 @@ app.get('/media/:messageId', async (req, res) => {
     return res.status(404).json({ error: 'Message does not contain downloadable media' });
   }
 
+  // Streamed through, never held whole: the bytes go from WhatsApp to
+  // the caller (the receive node, which streams them into storage) as
+  // they decrypt, so a long video costs this pod a buffer, not its size.
+  let stream;
   try {
     const { downloadMediaMessage } = await import('baileys');
-    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+    stream = await downloadMediaMessage(msg, 'stream', {}, {
       reuploadRequest: sock.updateMediaMessage,
     });
-
-    const mimetype = mediaMessage.mimetype || 'application/octet-stream';
-    const filename = mediaMessage.fileName || `media_${messageId}`;
-
-    res.set('Content-Type', mimetype);
-    res.set('Content-Disposition', `inline; filename="${filename}"`);
-    res.set('X-Mime-Type', mimetype);
-    res.set('X-Filename', filename);
-    res.send(buffer);
   } catch (err) {
     // The id comes from the URL, so it goes in as an argument, never
     // inside the format string.
     console.error('[media] Failed to download media for %s:', messageId, err.message);
-    res.status(500).json({ error: `Failed to download media: ${err.message}` });
+    return res.status(500).json({ error: `Failed to download media: ${err.message}` });
   }
+  // The filename and the type are the sender's: a header that cannot be
+  // set closes the download it would have described.
+  try {
+    res.set('Content-Type', mediaMessage.mimetype || 'application/octet-stream');
+    res.set('Content-Disposition', contentDisposition(mediaMessage.fileName || `media_${messageId}`));
+  } catch (err) {
+    stream.destroy();
+    console.error('[media] Cannot describe media %s in a header:', messageId, err.message);
+    return res.status(500).json({ error: `Cannot serve this media: ${err.message}` });
+  }
+
+  // Past this point the status is sent, so a failure mid-file can only
+  // cut the response short: the caller sees a truncated body and fails,
+  // rather than storing half a file as if it were whole. A caller that
+  // hangs up closes the download from WhatsApp with it.
+  pipeline(stream, res, (err) => {
+    if (err) console.error('[media] Download of %s ended early:', messageId, err.message);
+  });
 });
 
 // Action dispatch (standard endpoint contract)

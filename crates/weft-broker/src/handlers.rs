@@ -511,11 +511,7 @@ pub async fn task_wait_terminal(
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let outcome = state
         .tasks
-        .wait_for_terminal(
-            req.task_id,
-            Duration::from_millis(req.timeout_ms),
-            Duration::from_millis(req.poll_interval_ms),
-        )
+        .wait_for_terminal(req.task_id, Duration::from_millis(req.timeout_ms))
         .await
         .map_err(internal)?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))

@@ -8,8 +8,9 @@
 //     the project's at-rest facts. Available verbs, drift bits,
 //     trigger/infra rollups, per-node infra status.
 //
-//   - Live executions: a Set of currently-running colors on the
-//     project. REPLACED by every status fetch's `running_colors` (the
+//   - Live executions: the currently-running colors on the project,
+//     each with its phase (a run, or an infra / trigger setup).
+//     REPLACED by every status fetch's `running` (the
 //     reconciliation), mutated between fetches by SSE
 //     `execution_started/completed/failed/cancelled` (the fast path).
 //     A terminal event lost to a dropped stream is caught by the next
@@ -24,9 +25,11 @@
 // The reducer computes "watched-live color" by intersecting follow
 // state with running colors. When that intersection is non-empty,
 // the bar shows Stop and cancels that color; otherwise the bar
-// shows Run/Activate. The infra and trigger sections are
-// independent: they read the backend status directly and never
-// look at follow or running.
+// shows Run/Activate. Only runs of the graph count there: a setup is
+// never a run to stop. The trigger section reads the backend status
+// alone; the infra section also reads whether an infra setup is
+// running (`infraSetup`), so an `infra start` typed in a terminal shows
+// as that verb working.
 
 import type {
   ActionBarState,
@@ -41,13 +44,15 @@ import type {
   BarPhase,
   CliEvent,
   ErrorVerb,
+  ExecutionPhase,
   FollowMode,
 } from '../../packages/weft-graph/src/protocol';
 import {
   ACTIVITY_LINE_CAP,
   ACTIVITY_LINE_CHAR_CAP,
 } from '../../packages/weft-graph/src/protocol';
-import { backendFromSnapshot, parseTransition } from '../../packages/weft-graph/src/status';
+import { backendFromSnapshot, emptyActionAvailability, parseTransition } from '../../packages/weft-graph/src/status';
+import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 interface FollowState {
   mode: FollowMode;
@@ -56,7 +61,10 @@ interface FollowState {
 
 interface Slot {
   backend: ActionAvailability | undefined;
-  runningColors: Set<string>;
+  /// Running colors in start order (a Map iterates in insertion
+  /// order), each with what it is for. Only `fire` ones are runs the
+  /// bar can stop; the setups drive the infra and trigger slots.
+  running: Map<string, ExecutionPhase>;
   follow: FollowState;
   cli: {
     verb: ActionVerb;
@@ -86,7 +94,7 @@ interface Slot {
 function emptySlot(): Slot {
   return {
     backend: undefined,
-    runningColors: new Set(),
+    running: new Map(),
     follow: { mode: 'following', color: undefined },
     cli: undefined,
     pendingAction: undefined,
@@ -133,7 +141,7 @@ export class ActionBarStore {
   pushStatus(
     projectId: string,
     snapshot: ActionAvailability,
-    runningColors: readonly string[],
+    running: readonly RunningExecution[],
   ): void {
     const slot = this.ensureSlot(projectId);
     slot.backend = snapshot;
@@ -143,12 +151,12 @@ export class ActionBarStore {
     //
     // The fetch's ORDER is the truth too, and it replaces what was
     // here rather than being merged into it. The dispatcher sends them
-    // oldest first (see `ProjectExecutionsSummary::running_colors`), so
+    // oldest first (see `ProjectExecutionsSummary::running`), so
     // taking the last is taking the newest. Keeping the old positions
     // and appending, which is what this used to do, mixed one ordering
     // into another and left "latest" following an arbitrary run.
-    slot.runningColors = new Set(runningColors);
-    const next = slot.runningColors;
+    slot.running = new Map(running.map((r) => [r.color, r.phase]));
+    const next = slot.running;
     // A Stop waiting on a run the fetch no longer lists is over: the
     // run ended, whether or not its terminal event ever arrived.
     if (slot.pendingAction && !next.has(slot.pendingAction.color)) {
@@ -171,9 +179,9 @@ export class ActionBarStore {
   }
 
   /// SSE `execution_started` arrived: that color is now live.
-  markExecutionStarted(projectId: string, color: string): void {
+  markExecutionStarted(projectId: string, color: string, phase: ExecutionPhase): void {
     const slot = this.ensureSlot(projectId);
-    slot.runningColors.add(color);
+    slot.running.set(color, phase);
     this.notifyIfPinned(projectId);
   }
 
@@ -182,7 +190,7 @@ export class ActionBarStore {
   markExecutionFinished(projectId: string, color: string): void {
     const slot = this.slots.get(projectId);
     if (!slot) return;
-    slot.runningColors.delete(color);
+    slot.running.delete(color);
     // If a pending action was targeting this color, the backend
     // has confirmed it: clear the pending state. The bar exits
     // "Cancelling..." into whatever the next derived state is.
@@ -413,6 +421,7 @@ export class ActionBarStore {
     return {
       backend: snapshotFromSlot(slot),
       overlay: overlayFromSlot(slot),
+      infraSetup: [...(slot?.running.values() ?? [])].includes('infra_setup'),
       ...(slot?.error ? { error: slot.error } : {}),
       ...(slot?.activity && slot.activity.lines.length > 0
         ? { activity: slot.activity }
@@ -421,22 +430,10 @@ export class ActionBarStore {
   }
 }
 
-const DEFAULT_BACKEND: BackendSnapshot = {
-  available: [],
-  status: 'unknown',
-  transition: 'none',
-  orphanedInfra: false,
-  mode: 'unknown',
-  infraRollup: 'none',
-  infraBusy: false,
-  runningCount: 0,
-};
-
 function snapshotFromSlot(slot: Slot | undefined): BackendSnapshot {
-  const b = slot?.backend;
-  if (!b) return DEFAULT_BACKEND;
-  // The shared projection: one derivation for both hosts.
-  return backendFromSnapshot(b);
+  // The shared projection: one derivation for both hosts, and the
+  // same empty snapshot before any status has arrived.
+  return backendFromSnapshot(slot?.backend ?? emptyActionAvailability());
 }
 
 function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
@@ -479,20 +476,21 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 /// execution (so the bar shows Run, not Stop), even if a different
 /// execution is running on the same project.
 function computeWatchedRunningColor(slot: Slot): string | undefined {
-  if (slot.runningColors.size === 0) return undefined;
+  // Only runs: a setup is its verb working, shown in its own slot.
+  const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([color]) => color);
+  if (runs.length === 0) return undefined;
   if (slot.follow.mode === 'off') return undefined;
   if (slot.follow.mode === 'locked') {
-    return slot.follow.color && slot.runningColors.has(slot.follow.color)
+    return slot.follow.color && runs.includes(slot.follow.color)
       ? slot.follow.color
       : undefined;
   }
-  // Following: the newest running color. Set iteration is
-  // insertion-order, and both things that fill this set put the newest
-  // last (see the note above), so the last element is the answer.
-  let last: string | undefined;
-  for (const c of slot.runningColors) last = c;
-  return last;
+  // Following: the newest running run. Map iteration is
+  // insertion-order, and both things that fill it put the newest
+  // last (see the note above), so the last one is the answer.
+  return runs[runs.length - 1];
 }
+
 
 /// Split a raw output chunk into the lines the bar keeps.
 ///

@@ -1710,9 +1710,16 @@ export interface CliEvent {
 ///   - CLI complete             -> overlay = idle
 ///   - CLI error                -> overlay = idle, error set
 ///   - user clicks Stop         -> overlay = pending, until SSE confirms
+///
+///   4. `infraSetup`: an infra setup is running, whoever started it
+///      (this bar, a terminal, an assistant). The infra slot shows
+///      "Starting infra..." for it, and it is never a run the middle
+///      slot offers to stop. An activation needs no such flag: the
+///      project's own `activating` status already says it.
 export type ActionBarState = {
   backend: BackendSnapshot;
   overlay: ActionBarOverlay;
+  infraSetup: boolean;
   error?: ActionBarError;
   activity?: ActionBarActivity;
 };
@@ -1751,7 +1758,7 @@ export const ACTIVITY_LINE_CHAR_CAP = 2000;
 /// click. Surfaced as a wider union than `ActionVerb` so the modal
 /// renders an honest headline ("Parse failed", "Catalog failed")
 /// instead of pretending a CLI verb crashed when none did.
-export type ErrorVerb = ActionVerb | 'parse' | 'catalog';
+export type ErrorVerb = ActionVerb | 'parse' | 'catalog' | 'status';
 
 /// User-visible failure for the action bar. The banner shows `message`
 /// (one-line); clicking the banner opens a modal that renders `details`
@@ -2064,6 +2071,14 @@ export type HostMessage =
 ///   - locked: the canvas stays on one run; runs that start are counted.
 ///   - off: no run on the canvas; runs that start are counted.
 export type FollowMode = 'following' | 'locked' | 'off';
+
+/// What an execution is for: a run of the graph (`fire`), or the setup
+/// an `infra start` (`infra_setup`) or an activation (`trigger_setup`)
+/// runs. The action bar shows a setup as its verb working, never as a
+/// run to stop.
+// SYNC: EXECUTION_PHASES <-> crates/weft-core/src/primitive.rs Phase
+export const EXECUTION_PHASES = ['fire', 'trigger_setup', 'infra_setup'] as const;
+export type ExecutionPhase = (typeof EXECUTION_PHASES)[number];
 
 export interface FollowStatus {
   mode: FollowMode;

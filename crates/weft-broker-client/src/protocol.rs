@@ -396,7 +396,6 @@ pub struct TaskEnqueueDedupResponse {
 pub struct TaskWaitTerminalRequest {
     pub task_id: Uuid,
     pub timeout_ms: u64,
-    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,12 +423,8 @@ impl TaskWaitTerminalResponse {
 }
 
 impl TaskWaitTerminalRequest {
-    pub fn new(task_id: Uuid, timeout: Duration, poll_interval: Duration) -> Self {
-        Self {
-            task_id,
-            timeout_ms: timeout.as_millis() as u64,
-            poll_interval_ms: poll_interval.as_millis() as u64,
-        }
+    pub fn new(task_id: Uuid, timeout: Duration) -> Self {
+        Self { task_id, timeout_ms: timeout.as_millis() as u64 }
     }
 }
 

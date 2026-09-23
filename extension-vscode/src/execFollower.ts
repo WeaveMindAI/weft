@@ -22,6 +22,7 @@ import type {
   WirePayload,
   CancelCause,
   CorruptionSite,
+  ExecutionPhase,
   HostMessage,
   Frame,
   LoopTerminationReason,
@@ -37,7 +38,9 @@ export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 // SYNC: event_id <-> crates/weft-dispatcher/src/events.rs IdentifiedEvent
 export type DispatcherEvent = { event_id: string } & (
-  | { kind: 'execution_started'; color: string; entry_node: string; subgraph?: string[]; seed?: Seed; project_id: string; at_unix: number }
+  // `phase`: a run of the graph (`fire`) or the setup an `infra start`
+  // (`infra_setup`) or an activation (`trigger_setup`) runs.
+  | { kind: 'execution_started'; color: string; entry_node: string; phase: ExecutionPhase; subgraph?: string[]; seed?: Seed; project_id: string; at_unix: number }
   // `inherited_from` is set when the firing was taken from the run this
   // one was seeded from (`weft run --seed`); `provided_ports` names the
   // input ports supplied at a run's `--from` or `--group` start.

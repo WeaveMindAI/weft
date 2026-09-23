@@ -7,10 +7,13 @@
 
 import type {
   ActionAvailability,
+  ActionBarState,
   ActionVerb,
   BackendSnapshot,
+  ExecutionPhase,
   ProjectTransition,
 } from './protocol';
+import { EXECUTION_PHASES } from './protocol';
 
 /// The raw dispatcher status payload (snake_case wire shape). Only the
 /// fields the frontends consume; extra fields are ignored.
@@ -42,9 +45,10 @@ export interface RawStatusPayload {
   executions?: {
     last_status?: string;
     last_color?: string;
-    /** Every execution running right now; the editor replaces its
-     *  running set with this on each refresh. */
-    running_colors?: string[];
+    /** Every execution running right now, oldest first, with what it
+     *  is for; the editor replaces its running set with this on each
+     *  refresh. */
+    running?: RunningExecution[];
   };
 }
 
@@ -147,6 +151,36 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
       parked: Number(raw.preservation?.parked ?? 0),
       suspended: Number(raw.preservation?.suspended ?? 0),
     },
+  };
+}
+
+/// One execution running right now, and what it is for.
+// SYNC: RunningExecution <-> crates/weft-dispatcher/src/api/project.rs RunningExecution
+export interface RunningExecution {
+  color: string;
+  phase: ExecutionPhase;
+}
+
+/// The running executions a status payload names, oldest first. An
+/// entry whose phase is not one the editor knows is a wire drift and
+/// throws, rather than being shown as a run it may not be.
+export function parseRunning(raw: RawStatusPayload): RunningExecution[] {
+  const running = raw.executions?.running ?? [];
+  return running.map((entry) => {
+    if (typeof entry?.color !== 'string' || !EXECUTION_PHASES.includes(entry.phase)) {
+      throw new Error(`status names a running execution the editor cannot read: ${JSON.stringify(entry)}`);
+    }
+    return { color: entry.color, phase: entry.phase };
+  });
+}
+
+/// The bar before any status has arrived: nothing offered, nothing
+/// running. Every host starts from this one value.
+export function idleActionBarState(): ActionBarState {
+  return {
+    backend: backendFromSnapshot(emptyActionAvailability()),
+    overlay: { kind: 'idle' },
+    infraSetup: false,
   };
 }
 

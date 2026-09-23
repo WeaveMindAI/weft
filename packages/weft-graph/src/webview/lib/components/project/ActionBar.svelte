@@ -309,6 +309,8 @@
 		| { kind: 'cli_working'; phase: BarPhase }
 		// An HTTP infra verb POST in flight, before /status catches up.
 		| { kind: 'pending'; message: string }
+		// An infra setup running that this bar did not start.
+		| { kind: 'setup' }
 		| {
 			kind: 'rollup';
 			rollup: BackendSnapshot['infraRollup'];
@@ -362,6 +364,12 @@
 		// A pending HTTP infra verb owns this slot: show its spinner in place.
 		if (pendingVerb !== undefined && isInfraVerb(pendingVerb) && pendingMessage !== undefined) {
 			return { kind: 'pending', message: pendingMessage };
+		}
+		// An infra setup started anywhere else (a terminal, an assistant):
+		// the same verb working, with the cancel the dispatcher offers
+		// for it.
+		if (barState.infraSetup) {
+			return { kind: 'setup' };
 		}
 		return {
 			kind: 'rollup',
@@ -741,6 +749,8 @@
 		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message)}
+	{:else if slot.kind === 'setup'}
+		{@render workingButton('Starting infra...', isVerbAvailable('infra_cancel') ? onCancelInfra : undefined)}
 	{:else}
 		{#if slot.rollup === 'stopping' || slot.rollup === 'terminating' || slot.rollup === 'provisioning'}
 			<!-- Supervisor-driven transients. The dispatcher offers

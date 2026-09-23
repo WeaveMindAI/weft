@@ -29,12 +29,10 @@ use crate::tasks::{
 pub trait TaskStoreClient: Send + Sync {
     async fn enqueue_dedup(&self, spec: NewTask) -> Result<DedupOutcome>;
 
-    async fn wait_for_terminal(
-        &self,
-        task_id: Uuid,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<TaskOutcome>;
+    /// Wait for the task to finish, or for `timeout` to pass, and hand
+    /// back its outcome either way. Ends the moment the task does (see
+    /// [`crate::terminal`]), never on a polling tick.
+    async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome>;
 
     /// Picker primitive: claim one pending or stale-claimed row that
     /// matches the filter. Used by both pickers.
@@ -81,11 +79,15 @@ pub trait WorkerPodClient: Send + Sync {
 
 pub struct PostgresTaskStoreClient {
     pool: PgPool,
+    /// The one `LISTEN` connection this client's waits share, opened by
+    /// the first wait: a client that never waits (the dispatcher's
+    /// picker) never holds one.
+    terminal: tokio::sync::OnceCell<std::sync::Arc<crate::terminal::TerminalWatch>>,
 }
 
 impl PostgresTaskStoreClient {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, terminal: tokio::sync::OnceCell::new() }
     }
 }
 
@@ -95,13 +97,12 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::tasks::enqueue_dedup(&self.pool, spec).await
     }
 
-    async fn wait_for_terminal(
-        &self,
-        task_id: Uuid,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<TaskOutcome> {
-        crate::tasks::wait_for_terminal(&self.pool, task_id, timeout, poll_interval).await
+    async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
+        let watch = self
+            .terminal
+            .get_or_try_init(|| crate::terminal::TerminalWatch::start(&self.pool))
+            .await?;
+        crate::terminal::wait_for_terminal(&self.pool, watch, task_id, timeout).await
     }
 
     async fn claim_one(&self, pod_id: &str, filter: ClaimFilter) -> Result<Option<Task>> {

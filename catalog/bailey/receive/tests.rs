@@ -12,6 +12,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("setup_subscribes_to_the_bridge_events", setup_registers),
         NodeTest::fake("a_text_fire_fans_the_declared_fields", text_fire),
         NodeTest::fake("a_media_fire_pulls_the_bytes_into_storage", media_fire),
+        NodeTest::fake("a_voice_note_says_its_size_and_length", voice_note_facts),
         NodeTest::fake("a_smuggled_file_key_never_starts_a_run", a_smuggled_file_key_never_starts_a_run),
     ]
 }
@@ -118,5 +119,29 @@ async fn a_smuggled_file_key_never_starts_a_run(rig: FakeRig) -> WeftResult<()> 
             "the refusal names the smuggled key ({message_type}): {err}"
         );
     }
+    Ok(())
+}
+
+/// The size and length ride the event, so a graph can gate on them
+/// before any byte is fetched.
+async fn voice_note_facts(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    rig.respond_raw("GET", "/media/wa-7", 200, "audio/ogg", b"OGG".to_vec());
+    rig.wake(json!({
+        "messageType": "audio",
+        "from": "4915112345678",
+        "messageId": "wa-7",
+        "fileSize": 48213,
+        "seconds": 12,
+    }));
+    let outcome = rig
+        .run(
+            &BaileyReceiveNode,
+            json!({ "endpointUrl": "http://bridge.example:8090" }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["fileSize"], json!(48213));
+    assert_eq!(outcome.outputs["seconds"], json!(12));
     Ok(())
 }

@@ -101,7 +101,10 @@ are in [versions, seeds and frozen examples](../running/versions.md).
 
 **Run Project** is at the bottom of the canvas, or press **Ctrl+Enter** with
 the graph focused. While a run is going, that button becomes **Stop
-Execution**.
+Execution**. The bar follows what happens whoever started it: an `infra start`
+typed in a terminal, or asked for by Tangle, shows as **Starting infra...** on
+the infrastructure buttons, and an activation as **Activating...**, each with
+its Cancel, the same as clicking them.
 
 Each box gets a glow and a small mark:
 

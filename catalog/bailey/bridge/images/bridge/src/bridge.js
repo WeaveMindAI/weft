@@ -11,7 +11,7 @@ import {
   DisconnectReason,
   proto,
 } from 'baileys';
-import { toNumber } from './message-store.js';
+import { extractTextContent, mediaFacts, toNumber } from './message-store.js';
 
 // Resolve enum values once at module load. If Baileys ever
 // renames or moves these (it has done so between major versions),
@@ -307,11 +307,15 @@ export async function createBridge(authDir, webhookManager, messageStore) {
 
     for (const msg of messages) {
       // Persist every message (including our own) for /media + history.
-      messageStore.add(msg);
+      // It fires once, when its content is first known: a placeholder
+      // for a message Baileys could not decrypt yet waits for the real
+      // copy, and a message delivered twice, or already stored before a
+      // restart, does not fire again.
+      const firstContent = messageStore.add(msg);
 
-      if (msg.key.fromMe) continue;
+      if (msg.key.fromMe || !firstContent) continue;
 
-      const { content, messageType } = extractMessageContent(msg);
+      const { content, messageType } = extractTextContent(msg);
 
       // Skip non-actionable noise (reactions, receipts, protocol msgs).
       // Media without caption still goes through; the receive node
@@ -338,6 +342,9 @@ export async function createBridge(authDir, webhookManager, messageStore) {
         timestamp: toNumber(msg.messageTimestamp),
         isGroup,
         chatId: from,
+        // `fileSize` and `seconds` of a media message, so a graph can
+        // refuse an hour-long voice note before paying to transcribe it.
+        ...mediaFacts(msg),
       });
     }
   }
@@ -468,34 +475,4 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       });
     },
   };
-}
-
-/**
- * Extract text content + message type from a WhatsApp message.
- *
- * Returns { content, messageType }. Text messages carry their text in
- * `content`; media messages report their `messageType` and a caption
- * (if any) as `content`, so an audio message has `content: null`. The
- * bytes are never downloaded here: the message is kept in the store
- * and served on demand by `/media/:messageId`, which is where the
- * receive node (live) and the fetch-media node (history) get them.
- */
-function extractMessageContent(msg) {
-  const m = msg.message;
-  if (!m) return { content: '', messageType: 'text' };
-
-  if (m.conversation) return { content: m.conversation, messageType: 'text' };
-  if (m.extendedTextMessage?.text) {
-    return { content: m.extendedTextMessage.text, messageType: 'text' };
-  }
-
-  if (m.imageMessage) return { content: m.imageMessage.caption ?? null, messageType: 'image' };
-  if (m.videoMessage) return { content: m.videoMessage.caption ?? null, messageType: 'video' };
-  if (m.documentMessage) return { content: m.documentMessage.caption ?? null, messageType: 'document' };
-  if (m.audioMessage) return { content: null, messageType: 'audio' };
-  if (m.stickerMessage) return { content: null, messageType: 'sticker' };
-  if (m.contactMessage) return { content: null, messageType: 'contact' };
-  if (m.locationMessage) return { content: null, messageType: 'location' };
-
-  return { content: '', messageType: 'text' };
 }

@@ -331,8 +331,9 @@ pub trait Journal: Send + Sync {
     async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>>;
 
     /// Every color belonging to `project_id` whose journal has no
-    /// terminal event yet, narrowed to one `phase` when given (the
-    /// activation sweep wants only the trigger-setup runs). Used by
+    /// terminal event yet, each with its phase (a run, or the setup an
+    /// `infra start` or an activation runs, which the editor shows as
+    /// that verb working rather than as a run to stop). Used by
     /// wipe / cancel_running / the activation sweep to enumerate what
     /// needs cancelling without the limit-truncation problem of
     /// `list_executions`. Single SQL roundtrip, no per-color fold.
@@ -345,8 +346,7 @@ pub trait Journal: Send + Sync {
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
-        phase: Option<weft_core::context::Phase>,
-    ) -> anyhow::Result<Vec<Color>>;
+    ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>>;
 
     /// Every color belonging to `project_id` whose journal HAS a
     /// terminal event (completed / failed / cancelled). The exact

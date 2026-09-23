@@ -149,7 +149,11 @@ pub trait KindHandler: Send + Sync {
     /// is a feed cursor (poll_endpoint) returns it forward so a
     /// deactivate/activate cycle never re-primes and silently
     /// discards what arrived in between.
-    fn compute_initial_state(&self, _spec: &SignalSpec, _prior: Option<&Value>) -> Result<Value> {
+    ///
+    /// `asked_at_unix_ms` is when the registration was asked for (the
+    /// node's `await_signal`, or the activation), for a kind whose state
+    /// counts from that moment.
+    fn compute_initial_state(&self, _spec: &SignalSpec, _prior: Option<&Value>, _asked_at_unix_ms: i64) -> Result<Value> {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
@@ -293,6 +297,8 @@ pub enum RoutingSource {
         prior_kind_state: Option<Value>,
         /// The write-fence version the prior state was read at.
         prior_seq: i64,
+        /// When the registration was asked for (ms since the epoch).
+        asked_at_unix_ms: i64,
     },
     Restore {
         routing: SignalRouting,
@@ -356,9 +362,9 @@ pub async fn register_in_registry(
     }
     let fresh = matches!(source, RoutingSource::Fresh { .. });
     let (routing, kind_state_owned, state_seq) = match source {
-        RoutingSource::Fresh { prior_kind_state, prior_seq } => {
+        RoutingSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
             let r = handler.compute_routing(&spec)?;
-            let s = handler.compute_initial_state(&spec, prior_kind_state.as_ref())?;
+            let s = handler.compute_initial_state(&spec, prior_kind_state.as_ref(), asked_at_unix_ms)?;
             (r, s, prior_seq)
         }
         RoutingSource::Restore { routing, kind_state, seq } => (routing, kind_state, seq),

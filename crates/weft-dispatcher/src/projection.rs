@@ -220,10 +220,11 @@ impl ExecutionProjector {
                 })
                 .collect()
         } else { match ev {
-            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, .. } => {
+            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, .. } => {
                 vec![DispatcherEvent::ExecutionStarted {
                     color, at_unix,
                     entry_node: entry_node.clone(),
+                    phase: *phase,
                     subgraph: subgraph.as_ref().map(|s| s.nodes.iter().cloned().collect()),
                     seed: seed.clone(),
                     project_id,

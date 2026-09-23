@@ -21,6 +21,8 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
  */
 export class MessageStore {
   constructor(maxPerChat = 500, persistPath = null) {
+    // Eviction keeps the message just added, so a chat holds at least one.
+    if (!(maxPerChat >= 1)) throw new RangeError(`maxPerChat must be at least 1, got ${maxPerChat}`);
     this.maxPerChat = maxPerChat;
     this.persistPath = persistPath;
     /** @type {Map<string, Array<Object>>} chatId -> sorted array of raw WAMessages */
@@ -40,14 +42,34 @@ export class MessageStore {
   }
 
   /**
-   * Ingest one raw Baileys WAMessage.
-   * Safe to call multiple times with the same message (deduped by messageId).
+   * Ingest one raw Baileys WAMessage. Safe to call with the same message
+   * more than once (deduped by messageId).
+   *
+   * Returns whether this call is the first time the store knows the
+   * message's content: true for a new message that has content, or for
+   * the real copy of a placeholder; false for a repeat, a placeholder,
+   * or a message the store already held with its content (including one
+   * loaded from disk or from history sync). The trigger fires on true,
+   * so it fires once per message and never for what arrived before.
+   *
+   * A copy with no content never hides the real one. Baileys announces a
+   * message it could not decrypt yet as a placeholder with `message`
+   * null, asks the sender's phone to resend, and delivers the real copy
+   * later under the SAME id. That copy replaces the placeholder, or the
+   * store would serve `/media` an empty message for a message it had.
    */
   add(msg) {
     const chatId = msg.key?.remoteJid;
     const msgId = msg.key?.id;
-    if (!chatId || !msgId) return;
-    if (this.seen.has(msgId)) return;
+    if (!chatId || !msgId) return false;
+    if (this.seen.has(msgId)) {
+      const list = this.chats.get(chatId) ?? [];
+      const at = list.findIndex((m) => m.key?.id === msgId);
+      if (at < 0 || list[at].message || !msg.message) return false;
+      list[at] = msg;
+      this._markDirty();
+      return true;
+    }
     this.seen.add(msgId);
 
     if (!this.chats.has(chatId)) {
@@ -60,15 +82,16 @@ export class MessageStore {
     // Keep sorted by timestamp ascending
     list.sort((a, b) => toNumber(a.messageTimestamp) - toNumber(b.messageTimestamp));
 
-    // Evict oldest if over capacity
-    if (list.length > this.maxPerChat) {
-      const removed = list.splice(0, list.length - this.maxPerChat);
-      for (const r of removed) {
-        this.seen.delete(r.key?.id);
-      }
+    // Evict the oldest past capacity, never the message just added: a
+    // late delivery older than everything stored is still the message
+    // the trigger fires for, and `/media` has to find it.
+    while (list.length > this.maxPerChat) {
+      const [removed] = list.splice(list[0] === msg ? 1 : 0, 1);
+      this.seen.delete(removed.key?.id);
     }
 
     this._markDirty();
+    return !!msg.message;
   }
 
   /**
@@ -166,6 +189,8 @@ export class MessageStore {
 
   /** Flush immediately (e.g. on shutdown). */
   flushSync() {
+    clearTimeout(this._flushTimer);
+    this._flushTimer = null;
     if (!this.persistPath || !this._dirty) return;
     this._flushToDisk();
   }
@@ -245,9 +270,10 @@ export function toNumber(ts) {
 }
 
 /**
- * Extract text content and message type from a raw Baileys WAMessage.
- * Used when serializing messages for the action response.
- * Does NOT download audio, that's handled separately at query time.
+ * Extract text content and message type from a raw Baileys WAMessage:
+ * the text of a text message, the caption (or null) of a media one. The
+ * bytes are never downloaded here; `/media/:messageId` serves them on
+ * demand.
  */
 export function extractTextContent(msg) {
   const m = msg.message;
@@ -267,4 +293,33 @@ export function extractTextContent(msg) {
   if (m.locationMessage) return { content: null, messageType: 'location' };
 
   return { content: '', messageType: 'text' };
+}
+
+/**
+ * What a media message says about its file before anyone downloads it:
+ * `fileSize` in bytes and, for a voice note or a video, its length in
+ * `seconds`. A field WhatsApp did not send is left out, never guessed.
+ */
+export function mediaFacts(msg) {
+  const m = msg.message;
+  const media = m?.imageMessage || m?.videoMessage || m?.audioMessage || m?.documentMessage || m?.stickerMessage;
+  if (!media) return {};
+  const facts = {};
+  if (media.fileLength != null) facts.fileSize = toNumber(media.fileLength);
+  if (media.seconds != null) facts.seconds = toNumber(media.seconds);
+  return facts;
+}
+
+/**
+ * The `Content-Disposition` for a file the sender named: the name as
+ * written, in the RFC 5987 `filename*` form a header can carry whatever
+ * its characters, plus a plain `filename` for a reader that only knows
+ * that form. A name is the sender's choice, so nothing in it may reach
+ * the header raw: a quote, a line break or an emoji would break it or
+ * make setting it throw.
+ */
+export function contentDisposition(name) {
+  const plain = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
+  const encoded = encodeURIComponent(name).replace(/['()*!]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `inline; filename="${plain}"; filename*=UTF-8''${encoded}`;
 }

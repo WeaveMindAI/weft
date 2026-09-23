@@ -62,8 +62,9 @@ reqwest = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 # Byte-exact percent decoding for the node-test rig's canonical query
 # keys (the URL stack's pair parser decodes lossily to UTF-8, which
-# would merge distinct binary tokens).
-percent-encoding = { version = "2", optional = true }
+# would merge distinct binary tokens), and for the RFC 5987 filename a
+# `Content-Disposition` carries (`storage`, in the pure layer too).
+percent-encoding = "2"
 http = { version = "1", optional = true }
 # Raw outbound pipes (`net`): TLS over TCP with the system's trust roots,
 # for everything that holds a non-HTTP connection (the listener's raw-pipe
@@ -91,7 +92,6 @@ runtime = [
     "dep:reqwest-middleware",
     "dep:reqwest",
     "dep:url",
-    "dep:percent-encoding",
     "dep:http",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",

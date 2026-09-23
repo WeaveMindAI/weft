@@ -536,10 +536,9 @@ pub async fn ensure_all_shared_images(
         "shared image build failed:\n  {}",
         failures.join("\n  ")
     );
-    let worker = if base.is_some() {
-        Some(ensure_standard_worker(rebuild, ref_suffix).await?)
-    } else {
-        None
+    let worker = match &base {
+        Some(bare) => Some(ensure_standard_worker(bare, rebuild, ref_suffix).await?),
+        None => None,
     };
     Ok(SharedImages { system: imgs, builder_base: base, worker })
 }
@@ -597,12 +596,17 @@ pub fn standard_worker_ref() -> Result<String> {
 
 /// Materialize the full-library worker under its content-addressed ref
 /// (present -> pull -> build FROM the already-ensured builder base).
-async fn ensure_standard_worker(rebuild: bool, suffix: Option<&str>) -> Result<String> {
+///
+/// `base` is the builder base this process just ensured, never recomputed
+/// here: its ref hashes the checkout, and a file edited while the base was
+/// building would name a base nobody built, failing the FROM with "not
+/// found".
+async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>) -> Result<String> {
     let stock = StandardWorkerProject::new()?;
     let image = stock.image_ref()?;
     let target = suffixed_ref(&image, suffix);
     if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
-        let build = stock.stage(&suffixed_ref(&builder_base_ref()?, suffix))?;
+        let build = stock.stage(&suffixed_ref(base, suffix))?;
         let dockerfile = build.build_context.join("Dockerfile");
         docker_build(&target, &dockerfile, &build.build_context, &[], None).await?;
     }

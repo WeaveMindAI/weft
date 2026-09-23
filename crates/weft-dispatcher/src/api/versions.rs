@@ -449,10 +449,11 @@ async fn in_flight_colors(
 ) -> Result<std::collections::HashSet<Color>, ApiError> {
     let mut live: std::collections::HashSet<Color> = state
         .journal
-        .list_non_terminal_colors_for_project(project, None)
+        .list_non_terminal_colors_for_project(project)
         .await
         .map_err(|e| internal("non-terminal colors", e))?
         .into_iter()
+        .map(|(color, _)| color)
         .collect();
     // Parked on a person is not "still going": it is waiting, and
     // prune's refusal is about work that could still write rows.
@@ -698,6 +699,21 @@ pub async fn run(
         }
         None => (None, resolved.selection.nodes.clone(), resolved.kicks.clone()),
     };
+    // Against the selection as it will run: a seed's history may have
+    // fed a crossing the authored cut left open. When it did not, say
+    // which run was read and why its results could not stand in, or
+    // `--seed` reads as ignored.
+    weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).map_err(|mut refusal| {
+        if let Some(seed) = &seed {
+            refusal.errors.push(format!(
+                "--seed read run {}: a saved result stands in only for a node that run completed and whose \
+                 code has not changed since.",
+                seed.parent
+            ));
+            refusal.errors.extend(resolved.warnings.iter().filter(|w| w.starts_with("cannot seed")).cloned());
+        }
+        refused(&refusal)
+    })?;
     // A stale node with no kick still runs: its inputs are inherited
     // pulses the worker folds in, and it fires the moment they settle
     // after the selected reuse boundary. Only a run with

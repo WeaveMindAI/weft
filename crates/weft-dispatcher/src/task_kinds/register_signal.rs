@@ -42,6 +42,11 @@ pub struct RegisterSignalPayload {
     /// signal row and replayed onto the trigger's ports at every fire.
     #[serde(default)]
     pub port_snapshot: Option<serde_json::Value>,
+    /// When the registration was asked for (ms since the epoch): the
+    /// worker stamps the moment the node called in, activation stamps
+    /// its own start. Handed to the listener so a relative wait counts
+    /// from here, whatever the trip to the listener cost.
+    pub asked_at_unix_ms: i64,
 }
 
 pub struct RegisterSignalExecutor;
@@ -372,6 +377,7 @@ impl RegisterSignalExecutor {
                             weft_core::signal::listener_protocol::RegisterSource::Fresh {
                                 prior_kind_state: prior_state_call,
                                 prior_seq,
+                                asked_at_unix_ms: payload.asked_at_unix_ms,
                             },
                         )
                         .await?;

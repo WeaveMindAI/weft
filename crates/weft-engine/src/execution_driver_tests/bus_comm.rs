@@ -1230,7 +1230,6 @@
             &self,
             t: uuid::Uuid,
             _to: std::time::Duration,
-            _pi: std::time::Duration,
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             let token = self
                 .tokens

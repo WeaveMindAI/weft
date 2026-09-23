@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseStatusPayload, emptyActionAvailability } from './status';
+import { parseRunning, parseStatusPayload, emptyActionAvailability } from './status';
 
 describe('parseStatusPayload', () => {
   it('remaps snake_case wire fields to the camelCase snapshot', () => {
@@ -49,5 +49,21 @@ describe('parseStatusPayload', () => {
     expect(snap.runningCount).toBe(0);
     expect(snap.infraNodes).toEqual([]);
     expect(snap.firesDeadlineUnix).toBeUndefined();
+  });
+});
+
+describe('parseRunning', () => {
+  it('keeps the dispatcher order and each phase', () => {
+    const running = parseRunning({
+      executions: { running: [{ color: 'a', phase: 'infra_setup' }, { color: 'b', phase: 'fire' }] },
+    });
+    expect(running).toEqual([{ color: 'a', phase: 'infra_setup' }, { color: 'b', phase: 'fire' }]);
+    expect(parseRunning({})).toEqual([]);
+  });
+
+  it('refuses a phase it does not know rather than showing it as a run', () => {
+    expect(() => parseRunning({
+      executions: { running: [{ color: 'a', phase: 'mystery' as never }] },
+    })).toThrow(/cannot read/);
   });
 });

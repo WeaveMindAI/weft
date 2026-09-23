@@ -76,10 +76,14 @@ pub enum DispatcherEvent {
     /// `subgraph` is the node set the run is held to (`None` for the
     /// whole graph): the graph paints every other node as not in this
     /// run. `seed` names the run this one inherits from and what it
-    /// re-ran, for the run's banner.
+    /// re-ran, for the run's banner. `phase` says what the execution
+    /// is for: a run of the graph (`fire`), or the setup an `infra
+    /// start` or an activation runs, which the editor shows as that verb
+    /// working rather than as a run to stop.
     ExecutionStarted {
         color: Color,
         entry_node: String,
+        phase: weft_core::context::Phase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subgraph: Option<Vec<weft_core::frames::Located>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

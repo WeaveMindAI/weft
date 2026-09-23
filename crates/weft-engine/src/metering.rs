@@ -975,7 +975,6 @@ mod tests {
             &self,
             _task_id: uuid::Uuid,
             _timeout: std::time::Duration,
-            _poll_interval: std::time::Duration,
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!("metering tests only enqueue")
         }

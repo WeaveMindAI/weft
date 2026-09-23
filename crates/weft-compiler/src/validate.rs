@@ -1818,6 +1818,90 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
 // ─── group 4: port coverage ─────────────────────────────────────────────────
 
+/// required-port-unmet, for a group, a loop or an include site: an input
+/// the outside neither wires nor writes, which inside ends at a required
+/// input of a node. A container port is never required for its own sake
+/// (whether a group runs is its gate's call alone, and a closed port
+/// flows inside like any closure), so a port nothing inside needs may
+/// stay unconnected. A loop's iterated and carried ports are required on
+/// the loop itself and fall under the node rule instead.
+fn check_container_inputs(
+    project: &ProjectDefinition,
+    node: &NodeDefinition,
+    driven: &std::collections::HashSet<(String, String)>,
+    d: &mut Vec<Diagnostic>,
+) {
+    use weft_core::project::boundary_types::{CALL_IN, LOOP_IN, PASSTHROUGH};
+    let is_door = node.group_boundary.as_ref().is_some_and(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+        && matches!(node.node_type.as_str(), PASSTHROUGH | CALL_IN | LOOP_IN);
+    if !is_door {
+        return;
+    }
+    for input in &node.inputs {
+        if input.required
+            || weft_core::exec::skip::is_gate_port(&input.name)
+            || driven.contains(&(node.id.clone(), input.name.clone()))
+            || literal_fills(node, &input.name)
+        {
+            continue;
+        }
+        let at = weft_core::frames::Located::top(&node.id);
+        let fed = |at: &weft_core::frames::Located, port: &str| gets_value(project, &at.id, port);
+        let Some(need) =
+            weft_core::project::selection::required_consumer(project, &at, &input.name, &|_, _| true, &|_| false, &fed)
+        else {
+            continue;
+        };
+        let (needer, port) = need.needer;
+        let why = match &need.one_of {
+            None => "a required input".to_string(),
+            Some(set) => format!("the only one of @require_one_of({}) that could get a value", set.join(", ")),
+        };
+        push(
+            d,
+            node.source_file.as_deref(),
+            node.header_span_or_default(),
+            Severity::Error,
+            "required-port-unmet",
+            format!(
+                "input '{group}.{name}' has nothing connected, and inside it feeds \
+                 '{needer}.{port}', {why}, so '{group}.{name}' is required too: \
+                 wire or write it",
+                group = author_name(node),
+                name = input.name,
+                needer = weft_core::project::address_of(project, &needer.id, &needer.path),
+            ),
+        );
+    }
+}
+
+/// Whether input `port` of node `id` gets a value: written in the
+/// source, a default, or a wire from anything but a container's input
+/// door left unconnected itself. Read so it is never wrong in the
+/// direction that refuses a program: a door is followed only where its
+/// answer is one answer, a group's, a loop's or a call site's own In
+/// with an input of that name. An output a door makes on its own (a
+/// loop's `index`), or an included body's In, which every site feeds
+/// differently, counts as a value (the run check judges each site).
+fn gets_value(project: &ProjectDefinition, id: &str, port: &str) -> bool {
+    use weft_core::project::boundary_types::{CALL_IN, LOOP_IN, PASSTHROUGH};
+    let Some(node) = project.nodes.iter().find(|n| n.id == id) else { return false };
+    if literal_fills(node, port) || node.inputs.iter().any(|input| input.name == port && input.default.is_some()) {
+        return true;
+    }
+    project.edges.iter()
+        .filter(|e| e.target == id && e.target_handle.as_deref().unwrap_or("default") == port)
+        .any(|e| {
+            let from = e.source_handle.as_deref().unwrap_or("default");
+            let followed = project.nodes.iter().find(|n| n.id == e.source).filter(|door| {
+                door.group_boundary.as_ref().is_some_and(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+                    && matches!(door.node_type.as_str(), PASSTHROUGH | LOOP_IN | CALL_IN)
+                    && door.inputs.iter().any(|input| input.name == from)
+            });
+            followed.is_none() || gets_value(project, &e.source, from)
+        })
+}
+
 /// required-port-unmet: required input with no driver (no edge + no
 ///   body value).
 /// require-one-of-unmet: each @require_one_of group must have at
@@ -1845,6 +1929,7 @@ fn check_port_coverage(
         .collect();
 
     for node in &project.nodes {
+        check_container_inputs(project, node, &driven, d);
         if weft_core::project::boundary_types::is_forwarding(&node.node_type) {
             continue;
         }

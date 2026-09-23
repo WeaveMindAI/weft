@@ -38,7 +38,6 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
         &self,
         _: uuid::Uuid,
         _: std::time::Duration,
-        _: std::time::Duration,
     ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
         unreachable!("not used by the serving side")
     }

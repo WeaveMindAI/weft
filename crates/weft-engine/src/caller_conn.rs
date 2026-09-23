@@ -921,7 +921,6 @@ pub struct ConnServerState {
 /// right: past it the caller hears that the run did not start, instead
 /// of a hang.
 const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const ARRIVAL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The request as the birth reads it: the method, the query without the
 /// gateway hop's own routing token, and the headers. What the handshake
@@ -991,7 +990,7 @@ async fn ask_for_birth(
             return Err((StatusCode::BAD_GATEWAY, format!("the run could not be asked for: {e}")).into_response());
         }
     };
-    let outcome = match state.tasks.wait_for_terminal(task_id, ARRIVAL_WAIT, ARRIVAL_POLL).await {
+    let outcome = match state.tasks.wait_for_terminal(task_id, ARRIVAL_WAIT).await {
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::error!(target: "weft_engine::caller_conn", color = %claims.color, error = %e, "arrival wait failed");
@@ -2405,7 +2404,6 @@ mod tests {
             &self,
             _task_id: uuid::Uuid,
             _timeout: std::time::Duration,
-            _poll_interval: std::time::Duration,
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             let (status, error) = self.answer.lock().unwrap().clone().expect("the test set an answer");
             Ok(weft_task_store::tasks::TaskOutcome { status, result: None, error })

@@ -48,10 +48,25 @@ async fn each_call_holds_its_own_wait_and_is_woken_on_its_own() -> anyhow::Resul
     let stdout = project.weft(&["run", "--json", "--target", "first", "--target", "second"]).await?;
     project.mark_registered();
     let held = color_of(&stdout)?;
+    // `waiting_for_input` means ONE wait is registered, not both: each
+    // call registers its own, and the second can land a moment after the
+    // first. So the run is watched until both are in.
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
-    let mut waits = waiting_on(&disp, held).await?;
-    waits.sort();
-    anyhow::ensure!(waits == vec!["one.hold", "two.hold"], "two waits, one per call: {waits:?}");
+    let disp_for_poll = disp.clone();
+    poll_until(
+        "two waits, one per call",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || {
+            let disp = disp_for_poll.clone();
+            async move {
+                let mut waits = waiting_on(&disp, held).await?;
+                waits.sort();
+                Ok((waits == vec!["one.hold", "two.hold"]).then_some(()))
+            }
+        },
+    )
+    .await?;
 
     // The compiler's key resolves (it IS the node's id) and is refused
     // with the spelling that works.

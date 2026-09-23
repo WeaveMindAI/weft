@@ -128,8 +128,14 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
 
 fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {
     if let Some(spec) = spec {
-        weft_core::run_spec::resolve_spec(spec, definition)
+        let resolved = weft_core::run_spec::resolve_spec(spec, definition)
             .map_err(|error| anyhow::anyhow!("the run cannot start:\n{error}"))?;
+        // A seeded run can feed a crossing from history, which only the
+        // dispatcher reads; it refuses an unfed input after that.
+        if !args.seed {
+            weft_core::run_spec::refuse_unrunnable(definition, &resolved.selection, spec)
+                .map_err(|error| anyhow::anyhow!("the run cannot start:\n{error}"))?;
+        }
     }
     weft_core::project::selection::RunSelection::carve(definition, &weft_core::project::selection::SelectionBounds {
         target: args.seed_until.clone(), before: args.seed_before.clone(), ..Default::default()

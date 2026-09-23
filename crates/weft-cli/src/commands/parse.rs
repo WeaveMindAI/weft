@@ -293,8 +293,12 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                                     .map_err(weft_core::run_spec::Refusal::error)?;
                                 weft_core::run_spec::validate_fire_bake(node, &program, &req.bakes)?;
                             }
+                            // A seeded start can feed a crossing from history, which
+                            // only the dispatcher reads, so the refusal waits for it.
                             if req.seeded {
-                                resolved.warnings.push("This preview has not checked the saved run. When starting, compatible saved results may supply inputs at the cut; the input warnings describe what happens without those results.".into());
+                                resolved.warnings.push("This preview has not checked the saved run. When starting, compatible saved results may supply inputs at the cut; an input something needs that no saved result supplies refuses the run then.".into());
+                            } else {
+                                weft_core::run_spec::refuse_unrunnable(&definition, &resolved.selection, &spec)?;
                             }
                             Ok(resolved)
                         });

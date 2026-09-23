@@ -15,6 +15,7 @@
   import { bareRecord } from './lib/types';
   import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
+  import { idleActionBarState } from '../status';
   import type { Snippet } from 'svelte';
   import type { EditorContext } from './editor-context';
 
@@ -322,19 +323,7 @@
   // the webview is a pure renderer that reads from this store.
   // `backend` always present, `overlay` carries the user-action
   // layer, `error` sticky banner.
-  let actionBarState = $state<ActionBarState>({
-    backend: {
-      available: [],
-      status: 'unknown',
-      transition: 'none',
-      orphanedInfra: false,
-      mode: 'unknown',
-      infraRollup: 'none',
-      infraBusy: false,
-      runningCount: 0,
-    },
-    overlay: { kind: 'idle' },
-  });
+  let actionBarState = $state<ActionBarState>(idleActionBarState());
 
   // Latest /status snapshot. Drives the action bar's drift
   // indicators (Resync/Upgrade lights) AND the graph's per-node

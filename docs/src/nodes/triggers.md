@@ -85,7 +85,7 @@ before it fails.
 
 | Kind | What it is |
 |---|---|
-| `Timer` | A delay, a date, or a cron schedule |
+| `Timer` | A delay, a date, or a cron schedule. A delay counts from when it was asked for: the activation for a trigger, the `await_signal` call for a node that waits |
 | `Form` | A person filling something in |
 | `Route` | An inbound HTTP request |
 | `Socket` | An inbound WebSocket |

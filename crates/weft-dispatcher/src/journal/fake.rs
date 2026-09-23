@@ -621,8 +621,7 @@ impl Journal for FakeJournal {
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
-        phase: Option<weft_core::context::Phase>,
-    ) -> anyhow::Result<Vec<Color>> {
+    ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>> {
         // Read from `execution_colors` (mirror of Postgres
         // `execution_color`) instead of scanning `events`. Keeps
         // fake semantics aligned with the real DB: `delete_execution`
@@ -637,21 +636,18 @@ impl Journal for FakeJournal {
             if row.project_id != project_id || row.kind != "execution" {
                 continue;
             }
-            if phase.is_some_and(|p| row.phase != p.as_str()) {
-                continue;
-            }
             let terminal = g.events.iter().any(|e2| {
                 e2.color() == *color && e2.is_execution_terminal()
             });
             if !terminal {
-                out.push(*color);
+                out.push((*color, super::postgres::phase_from_column(row.phase)));
             }
         }
         // Oldest first, like Postgres orders on `started_at_unix`: the
         // editor reads the last one as "the latest run", so a fake that
         // answered in map order would let a test pass against an order
         // production never gives.
-        out.sort_by_key(|color| {
+        out.sort_by_key(|(color, _)| {
             let started = g
                 .events
                 .iter()
@@ -1099,7 +1095,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let live = j.list_non_terminal_colors_for_project("p", None).await.unwrap();
+        let live = j.list_non_terminal_colors_for_project("p").await.unwrap().into_iter().map(|(color, _)| color).collect::<Vec<_>>();
         assert_eq!(live, vec![run], "the node-test color never counts as a project run");
     }
 
@@ -1137,7 +1133,7 @@ mod tests {
             .unwrap();
 
         let terminal = j.list_terminal_colors_for_project("p").await.unwrap();
-        let non_terminal = j.list_non_terminal_colors_for_project("p", None).await.unwrap();
+        let non_terminal = j.list_non_terminal_colors_for_project("p").await.unwrap().into_iter().map(|(color, _)| color).collect::<Vec<_>>();
 
         assert!(terminal.contains(&done), "completed color is terminal");
         assert!(!terminal.contains(&live), "still-running color is not terminal");

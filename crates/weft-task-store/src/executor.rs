@@ -753,7 +753,6 @@ mod idle_exit_tests {
             &self,
             _id: Uuid,
             _timeout: Duration,
-            _poll: Duration,
         ) -> Result<crate::tasks::TaskOutcome> {
             unreachable!("picker never waits for terminal")
         }

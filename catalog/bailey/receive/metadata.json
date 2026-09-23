@@ -55,6 +55,16 @@
       "name": "file",
       "type": "File",
       "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text."
+    },
+    {
+      "name": "fileSize",
+      "type": "Number",
+      "description": "The media's size in bytes, as WhatsApp reports it before anything is downloaded; absent for text. Gate on it to refuse a file too large to process."
+    },
+    {
+      "name": "seconds",
+      "type": "Number",
+      "description": "The length of a voice note or a video, in seconds; absent for anything else. Gate on it to refuse an hour-long voice note before paying to transcribe it."
     }
   ],
   "requires_infra": false,
@@ -66,7 +76,9 @@
     "timestamp?": "Number",
     "isGroup?": "Boolean",
     "chatId?": "String",
-    "messageType?": "String"
+    "messageType?": "String",
+    "fileSize?": "Number",
+    "seconds?": "Number"
   },
   "features": {
     "isTrigger": true

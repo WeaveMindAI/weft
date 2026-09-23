@@ -30,16 +30,17 @@ the two builds shouldn't fight. Your `.env`, `.env.extension` and
 ## Tests
 
 ```bash
-cargo test                                          # the workspace
+cargo test                                                     # the workspace
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo check -p weft-compiler --no-default-features  # the parse-only build
-scripts/validate-examples.sh                        # every project in examples/ still compiles
-pnpm -C packages/weft-graph test                    # the graph renderer
-pnpm -C packages/weft-syntax test                   # the .weft grammar and highlighter
-pnpm -C extension-vscode test                       # the VS Code extension
-pnpm -C extension-vscode run compile                # its type check, webview included
-pnpm -C extension-browser exec tsc --noEmit         # the browser extension's type check
-pnpm -C extension-browser check                     # and its Svelte check
+cargo check -p weft-compiler --no-default-features             # the parse-only build
+scripts/validate-examples.sh                                   # every project in examples/ still compiles
+pnpm -C packages/weft-graph test                               # the graph renderer
+pnpm -C packages/weft-syntax test                              # the .weft grammar and highlighter
+pnpm -C extension-vscode test                                  # the VS Code extension
+pnpm -C extension-vscode run compile                           # its type check, webview included
+node --test catalog/bailey/bridge/images/bridge/src/*.test.js  # the WhatsApp bridge
+pnpm -C extension-browser exec tsc --noEmit                    # the browser extension's type check
+pnpm -C extension-browser check                                # and its Svelte check
 ```
 
 CI runs all of those, plus the Postgres ones further down. The graph, syntax

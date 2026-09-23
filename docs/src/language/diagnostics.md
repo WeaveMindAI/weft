@@ -38,7 +38,7 @@ a slug per cause.
 | `unresolved-typevar` | A connected port still has a type variable nothing pinned down | Connect it to something concrete, or declare the type |
 | `cast-not-allowed` | A cast node's two ports are a pair the conversion table does not allow | Pick types the table allows |
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus |
-| `required-port-unmet` | A required input has no wire, no written value and no default | Give it one of the three |
+| `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a step inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
 
 ## Values you wrote
 

@@ -4239,3 +4239,153 @@ seen.data = mark.count
     );
     assert!(errors(&validate(&returning, &catalog())).is_empty());
 }
+
+// ── container inputs that a node inside needs ────────────────────────────────
+
+fn entry_program(src: &str, dir: &std::path::Path) -> Vec<Diagnostic> {
+    let mut p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir)).expect("compile");
+    enrich(&mut p, &catalog()).expect("enrich");
+    validate(&p, &catalog())
+}
+
+fn unmet(d: &[Diagnostic]) -> Vec<&str> {
+    d.iter().filter(|d| d.code.as_deref() == Some("required-port-unmet")).map(|d| d.message.as_str()).collect()
+}
+
+/// The report's repro: `g.b` is wired from nowhere, and inside it is
+/// `f.y`, which `Format` needs. The group requires nothing of its own,
+/// so the port inherits the requirement from the node it ends at.
+#[test]
+fn a_group_input_a_required_node_needs_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "src = Text { value: \"hi\" }\n\
+        g = Group(a: String, b: String) -> (out: String) {\n\
+          f = Format(x: String, y: String) { template: \"{{x}} {{y}}\", x: self.a, y: self.b }\n\
+          self.out = f.text\n\
+        }\n\
+        g.a = src.value\n\
+        d = Debug { data: g.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'g.b'") && unmet[0].contains("'g.f.y'"), "{}", unmet[0]);
+
+    let wired = src.replace("g.a = src.value\n", "g.a = src.value\ng.b = src.value\n");
+    assert!(unmet_is_empty(&entry_program(&wired, dir.path())));
+}
+
+fn unmet_is_empty(d: &[Diagnostic]) -> bool {
+    unmet(d).is_empty()
+}
+
+/// A port nothing inside needs may stay unconnected: the closure flows
+/// in and the optional input it reaches takes it like any closure.
+#[test]
+fn a_group_input_only_optional_inputs_read_may_stay_unconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "g = Group(a: String) -> (out: String) {\n\
+          f = Format(x?: String) { template: \"{{x}}\", x: self.a }\n\
+          self.out = f.text\n\
+        }\n\
+        d = Debug { data: g.out }\n";
+    assert!(unmet_is_empty(&entry_program(src, dir.path())));
+}
+
+/// The requirement is found through every boundary on the way: a group
+/// inside a group, then the node.
+#[test]
+fn a_requirement_is_found_through_nested_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "outer = Group(a: String) -> (out: String) {\n\
+          inner = Group(b: String) -> (out: String) {\n\
+            f = Format(y: String) { template: \"{{y}}\", y: self.b }\n\
+            self.out = f.text\n\
+          }\n\
+          inner.b = self.a\n\
+          self.out = inner.out\n\
+        }\n\
+        d = Debug { data: outer.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'outer.a'") && unmet[0].contains("'outer.inner.f.y'"), "{}", unmet[0]);
+}
+
+/// An include site is a container too: its port ends in the included
+/// file, at whatever node there needs it.
+#[test]
+fn an_include_input_a_required_node_needs_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("busy.weft"),
+        "Group(chat: String) -> (out: String) {\n  f = Format(y: String) { template: \"{{y}}\", y: self.chat }\n  self.out = f.text\n}\n",
+    ).unwrap();
+    let src = "one = @include(\"busy.weft\")\nd = Debug { data: one.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'one.chat'"), "{}", unmet[0]);
+
+    let wired = "one = @include(\"busy.weft\")\none.chat = Text { value: \"x\" }.value\nd = Debug { data: one.out }\n";
+    assert!(unmet_is_empty(&entry_program(wired, dir.path())));
+}
+
+/// A loop's port it neither iterates nor carries is walked through like
+/// a group's.
+#[test]
+fn a_loop_input_a_required_node_needs_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "items = Text { value: \"x\" }\n\
+        l = Loop(items: List[String], prefix: String) -> (out: List[String | Null]) {\n\
+          over: [\"items\"]\n\
+          f = Format(p: String, i: String) { template: \"{{p}}{{i}}\", p: self.prefix, i: self.items }\n\
+          self.out = f.text\n\
+        }\n\
+        l.items = [\"a\"]\n\
+        d = Debug { data: l.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'l.prefix'"), "{}", unmet[0]);
+}
+
+/// A group port that is the only way a `@require_one_of` set inside can
+/// be met is required too; wiring the other member lets it stay open.
+#[test]
+fn a_group_input_the_last_of_a_one_of_set_needs_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "g = Group(a: String) -> (out: String) {\n\
+          act = ExecPython(p?: String, q?: String, @require_one_of(p, q)) -> (out: String) {\n\
+            code: \"return {'out': p or q}\"\n\
+            p: self.a\n\
+          }\n\
+          self.out = act.out\n\
+        }\n\
+        d = Debug { data: g.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'g.a'") && unmet[0].contains("@require_one_of(p, q)"), "{}", unmet[0]);
+
+    let other = src.replace("p: self.a\n", "p: self.a\n            q: \"x\"\n");
+    assert!(unmet_is_empty(&entry_program(&other, dir.path())));
+}
+
+/// A value a loop makes on its own (`index`) is a value: the other
+/// member of the set gets it, so the loop's port may stay unconnected.
+#[test]
+fn a_one_of_member_fed_by_the_loop_index_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "l = Loop(items: List[String], k: String) -> (out: List[String | Null]) {\n\
+          over: [\"items\"]\n\
+          act = ExecPython(p?: String, q?: Number, @require_one_of(p, q)) -> (out: String) {\n\
+            code: \"return {'out': 'x'}\"\n\
+            p: self.k\n\
+            q: self.index\n\
+          }\n\
+          self.out = act.out\n\
+        }\n\
+        l.items = [\"a\"]\n\
+        d = Debug { data: l.out }\n";
+    assert!(unmet_is_empty(&entry_program(src, dir.path())));
+}

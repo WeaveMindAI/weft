@@ -23,7 +23,7 @@ import {
   type VersionTreeNode,
 } from './version-tree';
 import { describeOutcome, statusThemeIcon } from './outcome';
-import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
+import type { CancelCause, ExecutionPhase } from '../../../packages/weft-graph/src/protocol';
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
@@ -35,8 +35,7 @@ export interface ExecutionSummary {
   status: string;
   /** A trigger fire or manual run (`fire`), or one of the two setup
    *  runs an activate / resync / infra start makes. */
-  // SYNC: ExecutionSummary.phase <-> crates/weft-core/src/primitive.rs Phase
-  phase: 'fire' | 'trigger_setup' | 'infra_setup';
+  phase: ExecutionPhase;
   started_at: number;
   completed_at?: number | null;
   /** The tags the run put on itself (`ctx.tag_execution`), in claim

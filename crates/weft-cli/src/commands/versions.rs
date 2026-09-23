@@ -598,6 +598,7 @@ pub struct RunFlags {
     pub target: Vec<String>,
     pub before: Vec<String>,
     pub group: Option<String>,
+    pub feed: Vec<String>,
     pub fire: Vec<String>,
     pub emit: Vec<String>,
     pub clear: Vec<String>,
@@ -609,6 +610,7 @@ impl RunFlags {
             && self.target.is_empty()
             && self.before.is_empty()
             && self.group.is_none()
+            && self.feed.is_empty()
             && self.fire.is_empty()
             && self.emit.is_empty()
             && self.clear.is_empty()
@@ -663,13 +665,15 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
             "target" => spec.target.clear(),
             "before" => spec.before.clear(),
             "group" => spec.group = None,
+            "feed" => spec.feed.clear(),
             "fire" => spec.fire = None,
-            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, or fire"),
+            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, or fire"),
         }
     }
     if !flags.from.is_empty() { spec.from = parse_port_flags(&flags.from, "--from", true)?; }
     if !flags.target.is_empty() { spec.target = flags.target.clone(); }
     if !flags.before.is_empty() { spec.before = flags.before.clone(); }
+    if !flags.feed.is_empty() { spec.feed = flags.feed.clone(); }
     if let Some(group) = &flags.group {
         spec.group = parse_port_flags(std::slice::from_ref(group), "group", true)?.into_iter().next();
     }
@@ -1159,6 +1163,18 @@ mod tests {
         for field in ["input", "scope", "expected", "misspelled"] {
             assert!(apply_run_flags(&saved, &RunFlags { clear:vec![field.into()], ..Default::default() }).is_err());
         }
+    }
+
+    #[test]
+    fn feed_is_saved_with_the_spec_and_cleared_on_request() {
+        let spec = spec_from_flags("case", &RunFlags {
+            from: vec!["hear.note".into()], feed: vec!["hear.note".into()], ..Default::default()
+        }).unwrap();
+        assert_eq!(spec.feed, vec!["hear.note".to_string()]);
+        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(saved.feed, spec.feed, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["feed".into()], ..Default::default() }).unwrap();
+        assert!(cleared.feed.is_empty());
     }
 
     #[test]

@@ -119,6 +119,8 @@ jobs:
       - run: pnpm -C packages/weft-syntax test
       - run: pnpm -C extension-vscode test
       - run: pnpm -C extension-vscode run compile
+      # The WhatsApp bridge's pure parts; `node --test` needs no install.
+      - run: node --test catalog/bailey/bridge/images/bridge/src/*.test.js
       # The browser extension ships to three stores gated only on a
       # version bump, so its checks belong in the same gate as
       # everything else JS.

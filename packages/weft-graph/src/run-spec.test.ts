@@ -52,6 +52,8 @@ describe('run spec', () => {
     expect(specToRunArgs({ name: 'plain' })).toEqual([]);
     expect(specToRunArgs({ name: 'batch', group: ['batch', { items: [1, 2] }] })).toEqual(['--group', 'batch={"items":[1,2]}']);
     expect(specToRunArgs({ name: 'batch', group: ['batch', {}] })).toEqual(['--group', 'batch']);
+    expect(specToRunArgs({ name: 'fed', from: { 'hear.note': {} }, feed: ['hear.note'] }))
+      .toEqual(['--from', 'hear.note', '--feed', 'hear.note']);
     // The seed checkbox has to travel: the dialog resolves the spec WITH
     // seeding to decide it is runnable, so a run without `--seed` is
     // refused for an input the preview said was covered.

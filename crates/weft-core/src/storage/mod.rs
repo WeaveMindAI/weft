@@ -180,11 +180,18 @@ pub fn filename_from_disposition(header: &str) -> Option<String> {
         // `inline` / `attachment` carry no `=`; they are not the name.
         let Some((key, value)) = part.split_once('=') else { continue };
         let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
-        let value = match key.as_str() {
-            // The extended form carries a charset and a language
-            // before the name; only the name is wanted.
-            "filename*" => value.rsplit('\'').next().unwrap_or(value),
-            "filename" if best.is_none() => value,
+        let value: std::borrow::Cow<str> = match key.as_str() {
+            // The extended form carries a charset and a language before
+            // the name, and the name percent-encoded; only the name is
+            // wanted, as it was written.
+            "filename*" => {
+                let encoded = value.rsplit('\'').next().unwrap_or(value);
+                match percent_encoding::percent_decode_str(encoded).decode_utf8() {
+                    Ok(name) => name,
+                    Err(_) => continue,
+                }
+            }
+            "filename" if best.is_none() => value.into(),
             _ => continue,
         };
         let value = value.trim().trim_matches('"');
@@ -1127,6 +1134,11 @@ mod disposition_tests {
             filename_from_disposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8\'\'real.txt"),
             Some("real.txt".to_string()),
             "the extended form wins"
+        );
+        assert_eq!(
+            filename_from_disposition("inline; filename=\"_t_ _.pdf\"; filename*=UTF-8''%C3%A9t%C3%A9%20%F0%9F%8E%89.pdf"),
+            Some("été 🎉.pdf".to_string()),
+            "the extended form is percent-decoded"
         );
         assert_eq!(
             filename_from_disposition("attachment; filename=\"../../etc/passwd\""),

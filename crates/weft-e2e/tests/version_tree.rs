@@ -262,19 +262,20 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
         anyhow::ensure!(!refused.contains(phase), "a refused cut must not build or register: {refused}");
     }
 
-    let stdout = project.weft(&["run", "--json", "--from", "mid"]).await?;
-    project.mark_registered();
+    // `mid` needs its `value` and nothing hands it one: refused before
+    // anything is built, naming the input and where it would come from.
+    let refused = project.weft_refused(&["run", "--json", "--from", "mid"]).await?;
     anyhow::ensure!(
-        warnings_of(&stdout).iter().any(|warning| warning.contains("mid") && warning.contains("value")),
-        "missing crossing input should be explained: {stdout}"
+        refused.contains("mid.value gets nothing in this run: src.value is outside it"),
+        "a required crossing with no value is refused: {refused}"
     );
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?.assert_untouched("src")?;
     let refused = project.weft_refused(&["run", "--json", "--from", "out", "--target", "src"]).await?;
     anyhow::ensure!(refused.contains("selection is empty"), "{refused}");
     let refused = project.weft_refused(&["run", "--json", "--fire", "src={}"]).await?;
     anyhow::ensure!(refused.contains("is not a trigger"), "{refused}");
     // Saved, then run by name: the value by hand reaches `mid`, `src` never runs.
     let stdout = project.weft(&["run", "--json", "--from", "mid={\"value\":\"by hand\"}", "--save", "mid-only"]).await?;
+    project.mark_registered();
     let saved_run = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), saved_run).await?.completed()?;
     let tree = tree_of(&project).await?;

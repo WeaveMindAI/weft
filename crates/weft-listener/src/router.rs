@@ -113,8 +113,8 @@ async fn register(
             spec: req.spec,
         },
         match req.source {
-            weft_core::signal::listener_protocol::RegisterSource::Fresh { prior_kind_state, prior_seq } => {
-                kinds::RoutingSource::Fresh { prior_kind_state, prior_seq }
+            weft_core::signal::listener_protocol::RegisterSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
+                kinds::RoutingSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms }
             }
             weft_core::signal::listener_protocol::RegisterSource::Restore { routing, kind_state, seq } => {
                 kinds::RoutingSource::Restore { routing, kind_state, seq }

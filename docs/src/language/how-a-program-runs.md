@@ -177,6 +177,70 @@ A value a real execution produced beats one you handed in, and a producer that
 is still running is waited for. For which flag picks which part of the graph,
 go and read [versions, seeds and frozen examples](../running/versions.md).
 
+`--group` runs the group's own steps and nothing that feeds it, so a group
+port wired from outside gets only what you hand it. If a cut leaves an input
+with nothing, weft looks at who needs it. When a step would skip without it
+(it is a required input, or the only member of a `@require_one_of` set that
+could get a value; the step's own, or one inside the group it enters, followed
+through every group, loop and included file on the way), the run is refused
+before it starts, naming the input and what it feeds:
+
+```text
+triage.text gets nothing in this run: ask.text is outside it, and
+triage.classify.text cannot run without it. Hand it a value at this start
+(--from triage='{"text": ...}'), run what feeds it with --feed triage, or
+start further up so ask runs too.
+```
+
+The flag in the message is the one the start was named with: `--group` for a
+`--group` start. An input no start lies in front of is named where the wire
+lands, and the way to hand it a value is to start there.
+
+The input is named at the start you gave, even when the missing value would
+cross more doors on the way (a group inside an included file), and a value you
+hand there feeds everything behind it. A trigger's own inputs never count: a
+run that does not fire it never reads them. An input only optional steps read
+just closes, with a warning.
+
+A start is where the walk upstream stops, for `--from` and `--group` alike, so
+a start's own ports get only what you hand them. To have weft run what feeds
+them instead, add `--feed`:
+
+```bash
+weft run --from 'hear.note={}' --feed hear.note --target hear.note
+```
+
+For each input of `hear.note` you did not hand a value, that runs the node
+feeding it and nothing above that node. The value is followed through every
+door it crosses, however deeply the groups nest, and a feeder shared by several
+inputs runs once. A loop's result comes from the whole loop, so a loop feeding
+the start runs whole. You can also
+name the feeders as starts yourself (`--from db --from accounts --from
+hear.note`): when one start lies upstream of another, the run keeps both, and
+`--target` still leaves out every branch that target does not need.
+
+A start that could only ever skip is refused too. When the start's
+`_should_flow`, or that of a group it sits inside, only comes from triggers the
+run does not fire, or from outside the run altogether, the gate closes and
+nothing you started would run, even with every input fed. The refusal names
+the gate and the trigger, if there is one. Hand the gate a value to run as if
+the condition held, or `--fire` the trigger with an event. A value reaches a
+gate only at its own door: for the start's own gate that is the start
+(`--from 'triage={"_should_flow": true}'`), and for a surrounding group's it
+is that group, so the refusal asks you to start there instead, with the flag
+you used (`--from 'outer={"_should_flow": true}'`, or `--group` if you ran a
+group).
+
+Without `--target`, a run goes everywhere downstream of its starts, so
+`--from db` alone runs every branch `db` feeds. `--target` narrows that to
+what the target needs, starting no further up than the starts. It is one
+shape, not a run that goes until it reaches the target.
+
+On a `--seed` run the check waits for the seed, since a saved result can
+supply the input. It only can when the run it reads completed that node and
+the node's code has not changed since; a refused seeded run names the run it
+read.
+
 A **trigger firing** picks the work downstream of that trigger, plus whatever
 that work needs upstream, again stopping at other triggers. Only the trigger
 that fired gets the event; any others close. Two triggers can share the steps

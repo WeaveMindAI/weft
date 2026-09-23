@@ -16,7 +16,6 @@
 //! for live rows lets producers attach to in-flight work via
 //! `enqueue_dedup`. Tenant-scoped so dedup never crosses tenants.
 
-use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -55,6 +54,11 @@ impl TaskStatus {
             "failed" => Some(Self::Failed),
             _ => None,
         }
+    }
+
+    /// Whether the task is done, one way or the other.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed)
     }
 }
 
@@ -686,6 +690,18 @@ pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>
     Ok(row.and_then(|(r,)| r))
 }
 
+/// `update` (an `UPDATE task ... ` that makes rows terminal) wrapped so
+/// each row it changes notifies [`crate::terminal::TERMINAL_CHANNEL`]
+/// with its id, in the same statement: the notification goes out when
+/// the write commits. Returns one row per task it changed.
+fn notify_terminal(update: &str) -> String {
+    format!(
+        "WITH done AS ({update} RETURNING id) \
+         SELECT pg_notify('{}', id::text) FROM done",
+        crate::terminal::TERMINAL_CHANNEL
+    )
+}
+
 /// Mark a claim complete with a result payload. Bails if the row
 /// no longer belongs to us so callers can react to lost claims.
 pub async fn complete(
@@ -695,21 +711,21 @@ pub async fn complete(
     result: Value,
 ) -> Result<()> {
     let now = unix_now();
-    let updated = sqlx::query(
+    let updated = sqlx::query(&notify_terminal(
         r#"UPDATE task
            SET status = 'complete',
                result = $1,
                completed_at_unix = $2,
                claimed_until_unix = NULL
            WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'"#,
-    )
+    ))
     .bind(&result)
     .bind(now)
     .bind(task_id)
     .bind(pod_id)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    if updated.rows_affected() == 0 {
+    if updated.is_empty() {
         anyhow::bail!("complete: task {task_id} no longer claimed by {pod_id}");
     }
     Ok(())
@@ -723,17 +739,17 @@ pub async fn complete(
 /// meantime: someone IS handling it, so the caller backs off.
 pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<bool> {
     let now = unix_now();
-    let updated = sqlx::query(
+    let updated = sqlx::query(&notify_terminal(
         r#"UPDATE task
            SET status = 'failed', error = $1, completed_at_unix = $2
            WHERE id = $3 AND status = 'pending'"#,
-    )
+    ))
     .bind(error)
     .bind(now)
     .bind(task_id)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(updated.rows_affected() > 0)
+    Ok(!updated.is_empty())
 }
 
 /// Mark a claim failed with an error. Bails on lost claim like
@@ -746,21 +762,21 @@ pub async fn fail(
     error: String,
 ) -> Result<()> {
     let now = unix_now();
-    let updated = sqlx::query(
+    let updated = sqlx::query(&notify_terminal(
         r#"UPDATE task
            SET status = 'failed',
                error = $1,
                completed_at_unix = $2,
                claimed_until_unix = NULL
            WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'"#,
-    )
+    ))
     .bind(&error)
     .bind(now)
     .bind(task_id)
     .bind(pod_id)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    if updated.rows_affected() == 0 {
+    if updated.is_empty() {
         anyhow::bail!("fail: task {task_id} no longer claimed by {pod_id}");
     }
     Ok(())
@@ -772,28 +788,6 @@ pub struct TaskOutcome {
     pub status: TaskStatus,
     pub result: Option<Value>,
     pub error: Option<String>,
-}
-
-/// Poll a task row until it reaches terminal state, or timeout.
-pub async fn wait_for_terminal(
-    pool: &PgPool,
-    task_id: Uuid,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<TaskOutcome> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let outcome = peek(pool, task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("task {task_id} disappeared"))?;
-        if matches!(outcome.status, TaskStatus::Complete | TaskStatus::Failed) {
-            return Ok(outcome);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(outcome);
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
 }
 
 /// [`peek`] scoped to a project: answers only when the task row
@@ -830,7 +824,7 @@ pub async fn peek_for_project(
     }))
 }
 
-async fn peek(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskOutcome>> {
+pub(crate) async fn peek(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskOutcome>> {
     // Same terminal-only `result` rule as `peek_for_project`: a
     // mid-claim partial result never leaves the store as an outcome.
     let row = sqlx::query(

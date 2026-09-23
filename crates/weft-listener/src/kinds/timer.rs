@@ -76,14 +76,16 @@ impl KindHandler for TimerHandler {
         Some(serde_json::json!({ "scheduledTime": now, "actualTime": now }))
     }
 
-    /// Pin the fire time at register time for `After` schedules so a
-    /// listener restart doesn't reset the clock. `At` is already
+    /// Pin the fire time for `After` schedules so a listener restart
+    /// doesn't reset the clock. It counts from when the wait was ASKED
+    /// for, not from when this pod heard of it: the trip from the node
+    /// through the dispatcher to here is not part of the wait. `At` is already
     /// wall-clock-absolute in the spec, and `Cron` recomputes the
     /// next tick from "now" on every iteration (each fire is its
     /// own deadline), so neither needs persisted state.
     // `_prior` is deliberately ignored: reactivate IS a fresh schedule
     // (an After-timer restarts its countdown from the activation).
-    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>) -> Result<Value> {
+    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>, asked_at_unix_ms: i64) -> Result<Value> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         if let TimerSpec::After { duration_ms } = timer.spec {
@@ -91,8 +93,7 @@ impl KindHandler for TimerHandler {
             // `After` (duration_ms < 1000, which validation allows)
             // must not floor to 0 and fire immediately. At/Cron are
             // already ms-precise; After matches.
-            let fire_at_ms = unix_now_ms() + duration_ms;
-            return Ok(serde_json::json!({ "next_fire_at_unix_ms": fire_at_ms as i64 }));
+            return Ok(serde_json::json!({ "next_fire_at_unix_ms": after_deadline_ms(asked_at_unix_ms, duration_ms) }));
         }
         Ok(Value::Object(serde_json::Map::new()))
     }
@@ -272,6 +273,12 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Ins
     }
 }
 
+/// The moment an `After` timer fires: `duration_ms` after it was asked
+/// for. Validation already refused a duration the epoch cannot hold.
+fn after_deadline_ms(asked_at_unix_ms: i64, duration_ms: u64) -> i64 {
+    asked_at_unix_ms.saturating_add(i64::try_from(duration_ms).unwrap_or(i64::MAX))
+}
+
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -284,6 +291,16 @@ inventory::submit!(&TimerHandler as &dyn KindHandler);
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
+
+    /// A wait counts from when it was asked for: the time the
+    /// registration spent reaching this pod is already spent.
+    #[test]
+    fn an_after_timer_counts_from_when_it_was_asked_for() {
+        let spec = weft_core::signal::to_spec(Timer { spec: TimerSpec::After { duration_ms: 3_000 } });
+        let asked = 1_700_000_000_000;
+        let state = TimerHandler.compute_initial_state(&spec, None, asked).unwrap();
+        assert_eq!(state["next_fire_at_unix_ms"], asked + 3_000);
+    }
 
     #[test]
     fn a_duration_reads_back_in_the_unit_it_was_written_in() {

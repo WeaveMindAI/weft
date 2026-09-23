@@ -748,6 +748,14 @@ and "there is no card without a picture". Note where it sits: on the port of
 the node that reads the value, never on `look`'s output (an output carries no
 `?`; emitting nothing IS how it says "absent").
 
+The build holds a group's ports to that same rule. A port nothing outside
+connects is fine while only optional inputs inside read it. Once it reaches a
+required input, or the last member of a `@require_one_of` set that could get a
+value (through any group, loop or included file in between), `weft validate`
+fails with `required-port-unmet`, naming the group's port and the
+input inside that needs it. A `?` on the group's own port changes nothing: the
+node that reads the value is what decides.
+
 Worked, for the per-branch count: a file holding `db = PostgresDatabase`, a
 `cards` group (four nodes inside), a `gallery` group (three nodes inside) and
 a `stats` group (two nodes inside), each of the three wired to `db`, is three

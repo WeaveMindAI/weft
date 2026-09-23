@@ -54,10 +54,14 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
             .assert_completed(source)?.assert_untouched(member)?.assert_untouched(after)?;
     }
 
-    // A missing backup is a closed input, not a request to widen the group.
-    let stdout = project.weft(&["run", "--json", "--group", "triage"]).await?;
-    anyhow::ensure!(!warnings_of(&stdout).is_empty(), "the crossing is explained");
-    project.settled(color_of(&stdout)?).await?.completed()?.assert_untouched("src")?.assert_untouched("shout")?;
+    // A port a step inside needs, handed nothing, is refused before the
+    // run starts (running it would only skip everything behind it), and
+    // the refusal names the port and the step. It never widens the group.
+    let refused = project.weft_refused(&["run", "--group", "triage"]).await?;
+    anyhow::ensure!(
+        refused.contains("triage.text gets nothing in this run") && refused.contains("triage.first.text"),
+        "{refused}"
+    );
 
     // A `--from` inside the include takes values at that node.
     let stdout = project

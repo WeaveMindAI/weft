@@ -69,8 +69,10 @@ mod retention_tests {
 /// NULL and only ever written from `Phase::as_str`, so an unreadable
 /// value is corruption of the same row whose payload already failed to
 /// decode; it is logged and answered as a fire so the row still
-/// appears (in the listing and on the point-get alike).
-fn phase_from_column(text: &str) -> weft_core::context::Phase {
+/// appears (in the listing, on the point-get, and to the running set
+/// the cancel and wipe sweeps read, which must never be the thing a
+/// bad row breaks).
+pub(crate) fn phase_from_column(text: &str) -> weft_core::context::Phase {
     weft_core::context::Phase::from_tag(text).unwrap_or_else(|| {
         tracing::warn!(
             target: "weft_dispatcher::journal",
@@ -1315,8 +1317,7 @@ impl Journal for PostgresJournal {
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
-        phase: Option<weft_core::context::Phase>,
-    ) -> anyhow::Result<Vec<Color>> {
+    ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>> {
         // A color is "non-terminal" iff it belongs to this project
         // AND has no terminal event in the journal. `execution_color`
         // is the denormalized (color, project_id) index seeded at
@@ -1327,13 +1328,10 @@ impl Journal for PostgresJournal {
         // read behind the cancel/wipe sweeps and the drain count, and
         // a node-test color's lifecycle is owned by its task, never by
         // the project's.
-        // `$2 IS NULL OR ec.phase = $2`: one query for both the
-        // whole-project read and the per-phase one.
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT ec.color FROM execution_color ec \
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT ec.color, ec.phase FROM execution_color ec \
              WHERE ec.project_id = $1 \
                AND ec.kind = 'execution' \
-               AND ($2::text IS NULL OR ec.phase = $2) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM exec_event t \
                    WHERE t.color = ec.color \
@@ -1344,15 +1342,14 @@ impl Journal for PostgresJournal {
              ORDER BY ec.started_at_unix ASC, ec.color ASC",
         )
         .bind(project_id)
-        .bind(phase.map(|p| p.as_str()))
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
-        for (c,) in rows {
+        for (c, phase) in rows {
             let color: Color = c
                 .parse()
                 .map_err(|e| anyhow::anyhow!("bad color in execution_color: {e}"))?;
-            out.push(color);
+            out.push((color, phase_from_column(&phase)));
         }
         Ok(out)
     }

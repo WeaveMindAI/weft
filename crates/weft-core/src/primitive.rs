@@ -590,7 +590,7 @@ pub enum LoopTerminationReason {
 ///   receives the wake payload, its outputs flow downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-// SYNC: Phase <-> extension-vscode/src/sidebar/executions.ts ExecutionSummary.phase
+// SYNC: Phase <-> packages/weft-graph/src/protocol.ts EXECUTION_PHASES
 pub enum Phase {
     InfraSetup,
     TriggerSetup,

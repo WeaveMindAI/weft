@@ -68,6 +68,26 @@ inside that needs one of those values.
 A loop is the exception, for the ports it iterates or threads: with no list to
 walk, there is no iteration to launch.
 
+## When a group input has to be connected
+
+A group port is never required for its own sake, and the `?` on it changes
+nothing. What the compiler checks is whether a step inside needs it.
+
+It follows the port inward, through any group, loop or included file nested
+behind it, until it reaches the steps that read it. If one of them takes it
+into a required input, or into the only member of a `@require_one_of` set that
+could get a value, and nothing outside connects or writes the group's port, the
+build fails with `required-port-unmet`, naming both ends:
+
+```text
+input 'g.b' has nothing connected, and inside it feeds 'g.f.y', a required
+input, so 'g.b' is required too: wire or write it
+```
+
+A port that only optional inputs read may stay unconnected: the closure goes
+inside and each of them handles it the way it handles any closure. An included
+file's ports and a loop's other ports follow the same rule.
+
 ## Skipping the whole thing
 
 `_should_flow` goes inside the braces, and when it skips a group it skips

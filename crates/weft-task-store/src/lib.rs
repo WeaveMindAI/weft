@@ -21,6 +21,7 @@ pub mod executor;
 pub mod kinds;
 pub mod schema_guard;
 pub mod tasks;
+pub mod terminal;
 pub mod traits;
 pub mod worker_pod;
 
@@ -36,7 +37,7 @@ pub use kinds::{
 };
 pub use tasks::{
     claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
-    wait_for_terminal, ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus,
+    ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus,
     TaskTarget, CLAIM_DURATION_SECS, CLAIM_HEARTBEAT_INTERVAL_SECS, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{

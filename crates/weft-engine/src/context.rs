@@ -1164,7 +1164,10 @@ pub enum EmitKind {
 /// Round-trip timeout for control-plane tasks. Generous because
 /// some involve listener spawn + Pod readiness wait.
 pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
-pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often an infrastructure apply's command row is read while the
+/// supervisor works on it. The apply itself takes seconds to minutes,
+/// so the reading cadence adds nothing a person notices.
+const INFRA_APPLY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The runtime output-type gate: a node may only emit on a port a value
 /// its declared type accepts (`WeftType::accepts_runtime_value`: a
@@ -2826,6 +2829,9 @@ async fn enqueue_register_signal_task(
         "is_resume": is_resume,
         "call_index": call_index,
         "port_snapshot": port_snapshot,
+        // Stamped here, where the node asked: a relative wait counts
+        // from this moment, not from whenever the listener hears of it.
+        "asked_at_unix_ms": crate::now_unix_ms(),
     });
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
@@ -2846,7 +2852,7 @@ async fn enqueue_register_signal_task(
         // always yields a task id.
         .expect("register-signal enqueue is never fenced");
     let outcome = tasks
-        .wait_for_terminal(id, TASK_WAIT_TIMEOUT, TASK_POLL_INTERVAL)
+        .wait_for_terminal(id, TASK_WAIT_TIMEOUT)
         .await?;
     match outcome.status {
         task_store::TaskStatus::Complete => {
@@ -3661,7 +3667,6 @@ mod replay_tests {
             &self,
             _task_id: uuid::Uuid,
             _timeout: std::time::Duration,
-            _poll_interval: std::time::Duration,
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!("replay tests do not wait")
         }
@@ -4056,7 +4061,7 @@ pub async fn apply_via_supervisor(
             );
             next_report = clock.now() + Duration::from_secs(30);
         }
-        clock.sleep(TASK_POLL_INTERVAL).await;
+        clock.sleep(INFRA_APPLY_POLL_INTERVAL).await;
     }
 }
 

@@ -60,9 +60,6 @@ pub struct RegisterRequest {
     /// during a scale-down move overlap is fenced out (no double-fire).
     pub placement_generation: i64,
     /// Where routing and kind_state come from (see [`RegisterSource`]).
-    /// Defaults to a fresh registration with no prior state, so an
-    /// older dispatcher's request still deserializes.
-    #[serde(default)]
     pub source: RegisterSource,
 }
 
@@ -94,6 +91,11 @@ pub enum RegisterSource {
         /// reactivate can never regress the fence.
         #[serde(default)]
         prior_seq: i64,
+        /// When the registration was asked for, in ms since the epoch:
+        /// the moment a node called `await_signal`, or the activation.
+        /// A relative wait counts from here, so the trip through the
+        /// dispatcher to this pod is not added to it.
+        asked_at_unix_ms: i64,
     },
     Restore {
         routing: SignalRouting,
@@ -102,12 +104,6 @@ pub enum RegisterSource {
         #[serde(default)]
         seq: i64,
     },
-}
-
-impl Default for RegisterSource {
-    fn default() -> Self {
-        Self::Fresh { prior_kind_state: None, prior_seq: 0 }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +337,7 @@ mod tests {
             source: RegisterSource::Fresh {
                 prior_kind_state: Some(serde_json::json!({"cursor": 42})),
                 prior_seq: 9,
+                asked_at_unix_ms: 1_700_000_000_123,
             },
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -352,31 +349,31 @@ mod tests {
         assert_eq!(back.placement_generation, 7);
         assert_eq!(back.token, "tok-1");
         match back.source {
-            RegisterSource::Fresh { prior_kind_state, prior_seq } => {
+            RegisterSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
                 assert_eq!(prior_kind_state.unwrap()["cursor"], 42);
                 assert_eq!(prior_seq, 9);
+                assert_eq!(asked_at_unix_ms, 1_700_000_000_123);
             }
             RegisterSource::Restore { .. } => panic!("round trip flipped the source"),
         }
     }
 
-    /// A request without a `source` (an older writer) deserializes as a
-    /// fresh registration with no prior state; a Restore round-trips
-    /// its routing and state verbatim.
+    /// A request must say where its state comes from, and a fresh one
+    /// when it was asked for: without it a relative timer would count
+    /// from a guess. A Restore round-trips its routing and state
+    /// verbatim.
     #[test]
-    fn register_source_defaults_fresh_and_restore_round_trips() {
-        let json = serde_json::json!({
+    fn register_source_is_required_and_restore_round_trips() {
+        let mut json = serde_json::json!({
             "token": "tok-1",
             "tenant_id": "acme",
             "spec": { "kind": "timer", "config": {} },
             "node_id": "node-1",
             "placement_generation": 7
         });
-        let back: RegisterRequest = serde_json::from_value(json).unwrap();
-        assert!(matches!(
-            back.source,
-            RegisterSource::Fresh { prior_kind_state: None, prior_seq: 0 }
-        ));
+        assert!(serde_json::from_value::<RegisterRequest>(json.clone()).is_err(), "no source");
+        json["source"] = serde_json::json!({ "kind": "fresh" });
+        assert!(serde_json::from_value::<RegisterRequest>(json).is_err(), "a fresh source with no asked_at");
 
         let restore = RegisterSource::Restore {
             routing: SignalRouting {
