@@ -13,14 +13,32 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sqlx::PgPool;
 
-use weft_task_store::tasks::{self, claim_one, ClaimFilter};
+use weft_task_store::pg_signal::{Heard, Subscription};
+use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm, ClaimFilter};
+use weft_task_store::terminal::TERMINAL_CHANNEL;
 use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient, TaskTarget};
 
-use support::setup;
+use support::{setup, signals};
 
 /// Far below the 30s the waits are given, far above any wake-up: a wait
 /// that ends before this was woken, not timed out.
 const WOKEN: Duration = Duration::from_secs(10);
+
+/// How long the line has to stay quiet before nothing more is coming.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// The ids announced as terminal until the line goes quiet.
+async fn terminal_ids(subscription: &mut Subscription) -> Vec<String> {
+    let mut ids = Vec::new();
+    while let Ok(next) = tokio::time::timeout(QUIET, subscription.next()).await {
+        match next.expect("the watch is running") {
+            Heard::Signal { channel, payload } if channel == TERMINAL_CHANNEL => ids.push(payload.to_string()),
+            Heard::Signal { .. } => {}
+            Heard::Recheck => panic!("a recheck would hide which notifications were sent"),
+        }
+    }
+    ids
+}
 
 fn task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
@@ -43,14 +61,14 @@ fn task(dedup: &str) -> tasks::NewTask {
 #[sqlx::test]
 async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
     setup(&pool).await;
-    let client = PostgresTaskStoreClient::new(pool.clone());
+    let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let id = tasks::enqueue(&pool, task("complete")).await.expect("enqueue");
 
     let finisher = {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            claim_one(&pool, "disp-1", ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+            claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
             tasks::complete(&pool, id, "disp-1", json!({"token": "t"})).await.expect("complete");
         })
     };
@@ -69,7 +87,7 @@ async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
 #[sqlx::test]
 async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
     setup(&pool).await;
-    let client = PostgresTaskStoreClient::new(pool.clone());
+    let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let claimed = tasks::enqueue(&pool, task("fail")).await.expect("enqueue");
     let pending = tasks::enqueue(&pool, task("fail-pending")).await.expect("enqueue");
 
@@ -77,7 +95,7 @@ async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let first = claim_one(&pool, "disp-1", ClaimFilter::Dispatcher).await.expect("claim").expect("a task");
+            let first = claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("a task");
             tasks::fail(&pool, first.id, "disp-1", "boom".into()).await.expect("fail");
             let other = if first.id == claimed { pending } else { claimed };
             // Whichever is left: failed where it stands if pending, or
@@ -103,9 +121,9 @@ async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
 #[sqlx::test]
 async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: PgPool) {
     setup(&pool).await;
-    let client = PostgresTaskStoreClient::new(pool.clone());
+    let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let done = tasks::enqueue(&pool, task("done")).await.expect("enqueue");
-    claim_one(&pool, "disp-1", ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
     tasks::complete(&pool, done, "disp-1", json!(1)).await.expect("complete");
     assert_eq!(client.wait_for_terminal(done, Duration::from_secs(30)).await.unwrap().status, TaskStatus::Complete);
 
@@ -114,4 +132,62 @@ async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: 
     let outcome = client.wait_for_terminal(open, Duration::from_millis(500)).await.expect("wait");
     assert_eq!(outcome.status, TaskStatus::Pending);
     assert!(started.elapsed() >= Duration::from_millis(500));
+}
+
+/// A finish that puts the task back to pending (it was asked to run
+/// again while claimed) is not an end, so it wakes nobody; the finish of
+/// the run it asked for wakes waiters exactly once.
+#[sqlx::test]
+async fn a_finish_that_runs_the_task_again_wakes_nobody(pool: PgPool) {
+    setup(&pool).await;
+    let watch = signals(&pool).await;
+    let mut heard = watch.subscribe();
+    let tasks::DedupOutcome::Inserted(id) = enqueue_or_rearm(&pool, task("rerun")).await.expect("enqueue") else {
+        panic!("the first ask inserts");
+    };
+
+    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    enqueue_or_rearm(&pool, task("rerun")).await.expect("ask again");
+    tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
+    assert_eq!(terminal_ids(&mut heard).await, Vec::<String>::new(), "back to pending is not an end");
+
+    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task again");
+    tasks::complete(&pool, id, "disp-1", json!(2)).await.expect("complete");
+    assert_eq!(terminal_ids(&mut heard).await, vec![id.to_string()]);
+}
+
+/// The project-scoped wait reads only its own project's task: another
+/// project's asking finds nothing at once, and the owner's wait ends when
+/// the task does.
+#[sqlx::test]
+async fn a_project_scoped_wait_sees_only_its_own_projects_task(pool: PgPool) {
+    use weft_task_store::terminal::wait_for_terminal_in_project;
+    setup(&pool).await;
+    let watch = signals(&pool).await;
+    let owner = uuid::Uuid::from_u128(1);
+    let id = tasks::enqueue(&pool, tasks::NewTask { project_id: Some(owner), ..task("scoped") })
+        .await
+        .expect("enqueue");
+
+    let stranger = wait_for_terminal_in_project(&pool, &watch, id, uuid::Uuid::from_u128(2), Duration::from_secs(30));
+    let started = Instant::now();
+    assert!(stranger.await.expect("wait").is_none(), "another project's task is not found");
+    assert!(started.elapsed() < WOKEN, "not found at once, not at the timeout");
+
+    let finisher = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+            tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
+        })
+    };
+    let started = Instant::now();
+    let outcome = wait_for_terminal_in_project(&pool, &watch, id, owner, Duration::from_secs(30))
+        .await
+        .expect("wait")
+        .expect("the owner finds its task");
+    finisher.await.unwrap();
+    assert_eq!(outcome.status, TaskStatus::Complete);
+    assert!(started.elapsed() < WOKEN, "{:?}", started.elapsed());
 }

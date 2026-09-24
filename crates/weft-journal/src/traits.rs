@@ -1,6 +1,6 @@
 //! Worker-facing journal surface. Two implementations:
 //!   - `PostgresJournalClient` (in this crate): direct DB. Used by
-//!     the dispatcher.
+//!     the broker, after its scope check.
 //!   - `BrokerJournalClient` (in `weft-broker-client`): HTTP through
 //!     the broker. Used by workers and listeners.
 //!
@@ -9,9 +9,29 @@
 //! `Journal` trait in `weft-dispatcher/src/journal/mod.rs` is a
 //! superset for dispatcher-internal use).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use weft_task_store::pg_signal::PgSignalWatch;
 
 use crate::events::ExecEvent;
+
+/// One journal row as stored: its place in the table and its payload,
+/// undecoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawJournalRow {
+    pub id: i64,
+    pub payload: String,
+}
+
+/// One journal row, decoded.
+#[derive(Debug, Clone)]
+pub struct JournalRow {
+    pub id: i64,
+    pub event: ExecEvent,
+}
 
 /// Read + write surface used by the worker (engine) and the listener
 /// for journal operations. `pod_name` is the worker's k8s Pod name,
@@ -28,20 +48,49 @@ pub trait JournalClient: Send + Sync {
         pod_name: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// All events for a single execution, ordered. Used for the
-    /// boot fold and re-fold-after-stall.
-    async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>>;
-
-    /// The same rows as RAW payload strings, undecoded. For a FERRY (the
-    /// broker's journal-fetch handler): a hop that decoded into its own
-    /// `ExecEvent` and re-encoded would silently strip any field its
-    /// build predates, so a row that only passes through must pass
-    /// through byte-faithful. Consumers of the rows decode them
-    /// themselves, loudly.
-    async fn raw_events_for_color(
+    /// The rows of `color` after `after_id`, in order, as RAW payload
+    /// strings, holding up to `wait` for at least one to exist (a zero
+    /// `wait` answers at once; empty when none came). A color's rows
+    /// are numbered and committed in one order (see `write`), so a
+    /// reader that resumes from the last id it applied never passes a
+    /// row. Raw for a FERRY (the broker's handler): a hop that decoded
+    /// into its own `ExecEvent` and re-encoded would silently strip any
+    /// field its build predates, so a row that only passes through must
+    /// pass through byte-faithful.
+    async fn raw_rows_after(
         &self,
         color: weft_core::Color,
-    ) -> anyhow::Result<Vec<String>>;
+        after_id: i64,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<RawJournalRow>>;
+
+    /// [`Self::raw_rows_after`], decoded. A row that no longer decodes
+    /// fails the read outright: this read feeds the engine's fold, and a
+    /// fold over a partial event list rebuilds a state that never
+    /// existed (skips un-happen, closures never cascade), so the
+    /// execution fails loudly and `weft clean` removes it, instead of
+    /// resuming wrong.
+    async fn rows_after(
+        &self,
+        color: weft_core::Color,
+        after_id: i64,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<JournalRow>> {
+        self.raw_rows_after(color, after_id, wait)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let event = crate::decode_event(color, &row.payload).map_err(anyhow::Error::msg)?;
+                Ok(JournalRow { id: row.id, event })
+            })
+            .collect()
+    }
+
+    /// Every event of one execution, in order, as it stands now. For a
+    /// log that no longer changes (a seed ancestor, which is terminal).
+    async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
+        Ok(self.rows_after(color, 0, Duration::ZERO).await?.into_iter().map(|row| row.event).collect())
+    }
 
     /// True iff a terminal event already exists for `color`. Used
     /// by the worker before writing its own terminal so the
@@ -66,14 +115,14 @@ impl JournalClient for NoopJournal {
         Ok(())
     }
 
-    async fn events_for_color(&self, _color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn raw_events_for_color(
+    /// Nothing is ever written, so nothing ever comes: the hold runs out.
+    async fn raw_rows_after(
         &self,
         _color: weft_core::Color,
-    ) -> anyhow::Result<Vec<String>> {
+        _after_id: i64,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<RawJournalRow>> {
+        tokio::time::sleep(wait).await;
         Ok(Vec::new())
     }
 
@@ -82,15 +131,18 @@ impl JournalClient for NoopJournal {
     }
 }
 
-/// Direct-DB implementation. Used by the dispatcher and by the
-/// broker (the broker calls into this after its scope check).
+/// Direct-DB implementation, used by the broker (after its scope check).
+/// Holds on the process's signal watch, which must listen on
+/// [`crate::EXEC_EVENT_CHANNEL`].
 pub struct PostgresJournalClient {
     pool: sqlx::postgres::PgPool,
+    signals: Arc<PgSignalWatch>,
 }
 
 impl PostgresJournalClient {
-    pub fn new(pool: sqlx::postgres::PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: sqlx::postgres::PgPool, signals: Arc<PgSignalWatch>) -> anyhow::Result<Self> {
+        signals.require(crate::EXEC_EVENT_CHANNEL)?;
+        Ok(Self { pool, signals })
     }
 }
 
@@ -106,32 +158,31 @@ impl JournalClient for PostgresJournalClient {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
-        let payloads = self.raw_events_for_color(color).await?;
-        let mut out = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            // This read feeds the engine's resume fold, which rebuilds
-            // the execution's state. A fold over a partial event list
-            // rebuilds a state that never existed (skips un-happen,
-            // closures never cascade), so a row that no longer decodes
-            // fails the read outright: the execution fails loudly and
-            // `weft clean` removes it, instead of resuming wrong.
-            out.push(crate::decode_event(color, &payload).map_err(anyhow::Error::msg)?);
-        }
-        Ok(out)
-    }
-
-    async fn raw_events_for_color(
+    async fn raw_rows_after(
         &self,
         color: weft_core::Color,
-    ) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
-        )
-        .bind(color.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(p,)| p).collect())
+        after_id: i64,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<RawJournalRow>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let color = color.to_string();
+        // Subscribed before the first read, so a row committed between
+        // an empty read and the wait still ends the wait.
+        let mut heard = self.signals.subscribe();
+        loop {
+            let rows: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT id, payload_json FROM exec_event WHERE color = $1 AND id > $2 ORDER BY id ASC",
+            )
+            .bind(&color)
+            .bind(after_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if !rows.is_empty()
+                || !heard.woken_before(deadline, |c, p| c == crate::EXEC_EVENT_CHANNEL && p == color).await?
+            {
+                return Ok(rows.into_iter().map(|(id, payload)| RawJournalRow { id, payload }).collect());
+            }
+        }
     }
 
     async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool> {

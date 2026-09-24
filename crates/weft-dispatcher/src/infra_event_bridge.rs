@@ -9,14 +9,17 @@
 //! publish is cosmetic (clients reconnect and re-poll), losing a
 //! control-plane action is not, and that path has its own queue.
 //!
-//! Multi-pod concurrency: the cursor read AND advance happen in one
-//! transaction that takes `FOR UPDATE` on the `dispatcher_cursor`
-//! row, so only one dispatcher Pod drains a given batch. Other
-//! Pods' polls wait on the row lock and then see an advanced cursor.
+//! Multi-pod concurrency: a drain holds a session advisory lock on its
+//! own connection, taken with `pg_try_advisory_lock`, so only one
+//! dispatcher Pod drains at a time and the others skip rather than wait
+//! (the holder's own wake covers whatever they heard). No transaction
+//! stays open across the publishes: an open one would hold back the
+//! settled horizon every cursor reads against (`crate::settled`).
 
 use crate::events::DispatcherEvent;
 use crate::infra_event::{self, InfraEvent};
-use crate::pg_wake::{self, DrainStep};
+use crate::pg_wake::{self, DrainStep, WakeOn};
+use crate::settled::{Position, SettledReader};
 use crate::state::DispatcherState;
 
 const CURSOR_KEY: &str = "infra_event_bridge";
@@ -27,9 +30,9 @@ const CURSOR_KEY: &str = "infra_event_bridge";
 /// runner re-invokes immediately.
 const FETCH_LIMIT: i64 = 500;
 
-/// Postgres NOTIFY channel writers (broker's `supervisor_event_record`)
-/// kick on every infra_event insert. The bridge listens; the
-/// safety poll catches missed wakes.
+/// The channel every `infra_event` row notifies on when it commits, from
+/// the `infra_event_notify_on_insert` trigger in `infra_event::GROUP`.
+/// The bridge listens; the safety tick catches a lost notification.
 pub const INFRA_EVENT_CHANNEL: &str = "weft_infra_event";
 
 /// Seed this bridge's cursor row in `dispatcher_cursor` (the table is
@@ -47,69 +50,83 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     ],
 };
 
+const ON_INFRA_EVENT: &[WakeOn] = &[WakeOn::any(INFRA_EVENT_CHANNEL)];
+
+/// The advisory lock key only one Pod's drain holds at a time.
+// SYNC: 'infra_event_bridge' <-> CURSOR_KEY (the lock is keyed like the cursor row)
+const DRAIN_LOCK_SQL: &str = "hashtextextended('infra_event_bridge', 0)";
+
 pub async fn run(state: DispatcherState) {
+    let reader = tokio::sync::Mutex::new(SettledReader::new("infra_event_bridge"));
     pg_wake::run(
-        state.pg_pool.clone(),
-        INFRA_EVENT_CHANNEL,
+        state.signals.subscribe(),
+        ON_INFRA_EVENT,
+        pg_wake::SAFETY_POLL_INTERVAL,
         "weft_dispatcher::infra_event_bridge",
-        || async { drain(&state).await },
+        || async { drain(&state, &mut *reader.lock().await).await },
     )
     .await;
 }
 
-async fn drain(state: &DispatcherState) -> anyhow::Result<DrainStep> {
-    use sqlx::Row;
-    let mut tx = state.pg_pool.begin().await?;
-    // Lock the cursor row so only one Pod processes a given batch.
-    // Other Pods' SELECTs block here until we commit; they then see
-    // the advanced cursor and find no new rows.
-    let row = sqlx::query(
-        "SELECT last_id FROM dispatcher_cursor WHERE key = $1 FOR UPDATE",
-    )
-    .bind(CURSOR_KEY)
-    .fetch_one(&mut *tx)
-    .await?;
-    let cursor: i64 = row.try_get("last_id")?;
-
-    let rows = infra_event::fetch_since_tx(&mut tx, cursor, FETCH_LIMIT).await?;
-    if rows.is_empty() {
-        // No work; commit to release the lock and park.
-        tx.commit().await?;
+async fn drain(state: &DispatcherState, reader: &mut SettledReader) -> anyhow::Result<DrainStep> {
+    let mut conn = state.pg_pool.acquire().await?;
+    let locked: bool = sqlx::query_scalar(&format!("SELECT pg_try_advisory_lock({DRAIN_LOCK_SQL})"))
+        .fetch_one(&mut *conn)
+        .await?;
+    if !locked {
+        // A sibling is draining; its own wake covers what this one heard.
         return Ok(DrainStep::Done);
     }
-    let saturated = (rows.len() as i64) >= FETCH_LIMIT;
-    let mut max_id = cursor;
-    let events: Vec<_> = rows
-        .into_iter()
-        .filter_map(|ev| {
-            max_id = max_id.max(ev.id);
-            to_dispatcher_event(&ev)
-        })
-        .collect();
+    let step = drain_locked(state, reader, &mut conn).await;
+    let unlocked = sqlx::query(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_SQL})"))
+        .execute(&mut *conn)
+        .await;
+    if step.is_err() || unlocked.is_err() {
+        // Never hand a connection that may still hold the lock back to
+        // the pool: closing it is what releases the lock for certain.
+        conn.close_on_drop();
+    }
+    let step = step?;
+    unlocked?;
+    Ok(step)
+}
 
-    // Publish BEFORE the cursor advances. SSE consumers are
-    // idempotent (they de-dupe by (project_id, color, step) on the
-    // client), so a crash AFTER publish + BEFORE commit just
-    // re-publishes the same events on the next pod's drain. A crash
-    // AFTER commit + BEFORE publish would silently drop the events:
-    // the cursor moved past them, no replay ever happens, the SSE
-    // client never sees them. Publish-before-commit makes the
-    // failure mode "duplicate" (recoverable, idempotent) instead of
-    // "lost" (unrecoverable).
-    for de in events {
+async fn drain_locked(
+    state: &DispatcherState,
+    reader: &mut SettledReader,
+    conn: &mut sqlx::PgConnection,
+) -> anyhow::Result<DrainStep> {
+    let (xid, id): (i64, i64) = sqlx::query_as(
+        "SELECT last_xid::text::bigint, last_id FROM dispatcher_cursor WHERE key = $1",
+    )
+    .bind(CURSOR_KEY)
+    .fetch_one(&mut *conn)
+    .await?;
+    let batch = reader
+        .read(&mut *conn, "infra_event", infra_event::READ_COLUMNS, Position { xid, id }, FETCH_LIMIT)
+        .await?;
+    let Some(last) = batch.rows.last().map(Position::of).transpose()? else {
+        return Ok(batch.next);
+    };
+    let rows = infra_event::parse_rows(batch.rows)?;
+
+    // Publish BEFORE the cursor advances. SSE consumers are idempotent
+    // (they de-dupe by (project_id, color, step) on the client), so a
+    // crash after publish and before the advance just re-publishes the
+    // same events on the next drain, while a crash after an advance and
+    // before publish would drop them for good. The lock is a session
+    // lock, so a crash anywhere releases it with the connection.
+    for de in rows.iter().filter_map(to_dispatcher_event) {
         state.events.publish(de).await;
     }
 
-    sqlx::query("UPDATE dispatcher_cursor SET last_id = $1 WHERE key = $2")
-        .bind(max_id)
+    sqlx::query("UPDATE dispatcher_cursor SET last_xid = $1::text::xid8, last_id = $2 WHERE key = $3")
+        .bind(last.xid.to_string())
+        .bind(last.id)
         .bind(CURSOR_KEY)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
-    // If we filled the batch, more rows likely remain, so tell the
-    // runner to invoke us again without waiting for the next NOTIFY.
-    // Otherwise park on the next wake.
-    Ok(if saturated { DrainStep::More } else { DrainStep::Done })
+    Ok(batch.next)
 }
 
 /// Pure mapping from a fetched `infra_event` row to the
@@ -119,7 +136,7 @@ async fn drain(state: &DispatcherState) -> anyhow::Result<DrainStep> {
 pub(crate) fn to_dispatcher_event(
     ev: &crate::infra_event::InfraEventRow,
 ) -> Option<DispatcherEvent> {
-    let pid = ev.project_id.clone();
+    let pid = ev.project_id;
     // Status-change kinds all need a node_id. Project-wide kinds
     // (ProtocolConfigError) don't. The pattern-match drives both.
     match &ev.event {
@@ -204,7 +221,7 @@ mod tests {
         InfraEventRow {
             id: 1,
             tenant_id: "t".into(),
-            project_id: "p".into(),
+            project_id: uuid::Uuid::nil(),
             node_id: node_id.map(|s| s.to_string()),
             event,
             at_unix: 0,
@@ -224,7 +241,7 @@ mod tests {
         let de = to_dispatcher_event(&r).expect("event");
         match de {
             DispatcherEvent::InfraFlaky { project_id, node_id, reason } => {
-                assert_eq!(project_id, "p");
+                assert_eq!(project_id, uuid::Uuid::nil());
                 assert_eq!(node_id, "n1");
                 assert_eq!(reason, "crashloop");
             }

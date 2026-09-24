@@ -44,7 +44,7 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// per-entry expiry.
 #[derive(Clone)]
 pub struct ScopeCache {
-    project_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
+    project_to_tenant: Arc<Mutex<LruCache<uuid::Uuid, (String, Instant)>>>,
     color_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
     signal_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
     /// A worker's own (tenant, project), keyed by the pod it is.
@@ -69,9 +69,9 @@ impl Default for ScopeCache {
     }
 }
 
-async fn cache_get<V: Clone>(
-    map: &Mutex<LruCache<String, (V, Instant)>>,
-    key: &str,
+async fn cache_get<K: std::hash::Hash + Eq + std::borrow::Borrow<Q>, Q: std::hash::Hash + Eq + ?Sized, V: Clone>(
+    map: &Mutex<LruCache<K, (V, Instant)>>,
+    key: &Q,
 ) -> Option<V> {
     let mut g = map.lock().await;
     let entry = g.get(key)?;
@@ -84,7 +84,7 @@ async fn cache_get<V: Clone>(
     }
 }
 
-async fn cache_put<V>(map: &Mutex<LruCache<String, (V, Instant)>>, key: String, value: V) {
+async fn cache_put<K: std::hash::Hash + Eq, V>(map: &Mutex<LruCache<K, (V, Instant)>>, key: K, value: V) {
     let mut g = map.lock().await;
     g.put(key, (value, Instant::now()));
 }
@@ -99,11 +99,11 @@ pub async fn require_project_owned_by(
     cache: &ScopeCache,
     pool: &PgPool,
     caller: &CallerIdentity,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<String, (StatusCode, String)> {
     let tenant = lookup_project_tenant(cache, pool, project_id).await?;
-    let owner = ProjectScope { tenant, project: project_id.to_string() };
-    enforce_scope(caller, "project", project_id, &owner)?;
+    let owner = ProjectScope { tenant, project: project_id };
+    enforce_scope(caller, "project", &project_id.to_string(), &owner)?;
     Ok(owner.tenant)
 }
 
@@ -113,7 +113,7 @@ pub async fn require_project_owned_by(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectScope {
     pub tenant: String,
-    pub project: String,
+    pub project: uuid::Uuid,
 }
 
 /// Resolve who `color` belongs to, enforcing ownership. See
@@ -191,7 +191,7 @@ fn enforce_scope(
     // name one in a request body. Checked HERE so no verb can be the
     // one that forgot to ask.
     if caller.scope.pinned_project().is_some_and(|p| p != owner.project) {
-        log_denied(caller, &format!("{kind} (project)"), resource, &owner.project);
+        log_denied(caller, &format!("{kind} (project)"), resource, &owner.project.to_string());
         return Err((StatusCode::FORBIDDEN, format!("{kind} belongs to a different project")));
     }
     Ok(())
@@ -200,12 +200,12 @@ fn enforce_scope(
 async fn lookup_project_tenant(
     cache: &ScopeCache,
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<String, (StatusCode, String)> {
-    if let Some(t) = cache_get(&cache.project_to_tenant, project_id).await {
+    if let Some(t) = cache_get(&cache.project_to_tenant, &project_id).await {
         return Ok(t);
     }
-    let row: Option<(String,)> = sqlx::query_as("SELECT tenant_id FROM project WHERE id = $1::uuid")
+    let row: Option<(String,)> = sqlx::query_as("SELECT tenant_id FROM project WHERE id = $1")
         .bind(project_id)
         .fetch_optional(pool)
         .await
@@ -215,7 +215,7 @@ async fn lookup_project_tenant(
         .0;
     cache_put(
         &cache.project_to_tenant,
-        project_id.to_string(),
+        project_id,
         tenant.clone(),
     )
     .await;
@@ -230,12 +230,12 @@ async fn lookup_color_scope(
     if let Some(scope) = cache_get(&cache.color_to_scope, color).await {
         return Ok(scope);
     }
-    let row: Option<(String, String)> =
+    let row: Option<(String, uuid::Uuid)> =
         sqlx::query_as("SELECT tenant_id, project_id FROM execution_color WHERE color = $1")
             .bind(color)
             .fetch_optional(pool)
             .await
-            .map_err(|e| internal(anyhow::anyhow!("color lookup: {e}")))?;
+            .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("color lookup")))?;
     let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?;
     let scope = ProjectScope { tenant, project };
     cache_put(&cache.color_to_scope, color.to_string(), scope.clone()).await;
@@ -250,13 +250,13 @@ async fn lookup_signal_scope(
     if let Some(scope) = cache_get(&cache.signal_to_scope, token).await {
         return Ok(scope);
     }
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<(String, uuid::Uuid)> = sqlx::query_as(
         "SELECT tenant_id, project_id FROM signal WHERE token = $1",
     )
     .bind(token)
     .fetch_optional(pool)
     .await
-    .map_err(|e| internal(anyhow::anyhow!("signal lookup: {e}")))?;
+    .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("signal lookup")))?;
     let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
     let scope = ProjectScope { tenant, project };
     cache_put(&cache.signal_to_scope, token.to_string(), scope.clone()).await;
@@ -280,9 +280,9 @@ async fn lookup_pod_scope(
     // pod called the same thing. Both halves come from the verified
     // token, and the row records both, so there is no reason to ask
     // with only one of them.
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT p.id::text, p.tenant_id \
-         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
+    let row: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT p.id, p.tenant_id \
+         FROM worker_pod wp JOIN project p ON p.id = wp.project_id \
          WHERE wp.pod_name = $1 AND wp.namespace = $2",
     )
     .bind(pod_name)
@@ -376,7 +376,7 @@ mod tests {
         CallerIdentity {
             scope: CallerScope::Tenant {
                 tenant: tenant.to_string(),
-                project: format!("{tenant}-project"),
+                project: project(&format!("{tenant}-project")),
             },
             role: Role::Worker,
             namespace: format!("wft-{tenant}"),
@@ -393,8 +393,12 @@ mod tests {
         }
     }
 
-    fn owned_by(tenant: &str, project: &str) -> ProjectScope {
-        ProjectScope { tenant: tenant.into(), project: project.into() }
+    fn project(name: &str) -> uuid::Uuid {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+    }
+
+    fn owned_by(tenant: &str, name: &str) -> ProjectScope {
+        ProjectScope { tenant: tenant.into(), project: project(name) }
     }
 
     #[test]

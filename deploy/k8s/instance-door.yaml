@@ -1,0 +1,25 @@
+# A NAMED install's only door: its dispatcher's API, at a node port the
+# apiserver picks from the cluster's node-port range. The kind node
+# publishes that whole range on this machine's loopback at the same
+# numbers (weft_core::infra::NODE_PORTS), so whatever port lands here is
+# reachable at http://127.0.0.1:<port>, and it is both where the CLI
+# talks to this install and where the links it mints point.
+#
+# The default install is reached through its fixed doors instead
+# (deploy/k8s/kind-node-ports.yaml); the front door's gateway routes to
+# the default install only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-dispatcher-node-port
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
+  labels:
+    app: weft-dispatcher
+spec:
+  type: NodePort
+  selector:
+    app: weft-dispatcher
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999

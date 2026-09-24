@@ -14,8 +14,13 @@ pub mod traits;
 pub mod write;
 
 pub use events::{ExecEvent, Seed};
+
+/// The channel every journal row notifies on when it commits, with its
+/// color as the payload, from the `exec_event_notify_on_insert` trigger
+/// in the dispatcher's journal schema group.
+pub const EXEC_EVENT_CHANNEL: &str = "weft_exec_event";
 pub use fold::{fold_to_snapshot, FiringView, Fold, FoldEffects};
-pub use seed::{fold_seeded, seed_chain, SeedChain};
+pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
 
 /// Decode one journal row, or the loud message every reader shares:
 /// the color, the reason, and the recovery (`weft clean`). THE single
@@ -29,7 +34,7 @@ pub fn decode_event(color: weft_core::Color, payload: &str) -> Result<ExecEvent,
         )
     })
 }
-pub use traits::{JournalClient, NoopJournal, PostgresJournalClient};
+pub use traits::{JournalClient, JournalRow, NoopJournal, PostgresJournalClient, RawJournalRow};
 pub use write::{
-    record_event, record_event_dedup, record_event_from_pod, record_event_in, RecordError,
+    lock_colors, record_event, record_event_dedup, record_event_from_pod, record_event_in, RecordError,
 };

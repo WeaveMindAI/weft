@@ -45,6 +45,7 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
         &self,
         _: &str,
         _: weft_task_store::tasks::ClaimFilter,
+        _: std::time::Duration,
     ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
         unreachable!()
     }

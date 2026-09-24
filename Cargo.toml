@@ -45,6 +45,18 @@ too_many_arguments = "allow"
 [profile.dev]
 debug = "line-tables-only"
 
+# The system images (`deploy/docker/system-images.Dockerfile`) and the
+# CLI build `--release`, locally after every runtime edit. By default a
+# release build recompiles each edited crate, and everything depending on
+# it, whole: a one-line change to weft-core took about 80 seconds.
+# Incremental builds with many codegen units recompile only what the edit
+# touched, and the image's cache mount keeps that state between builds.
+# The cost is a slightly slower binary than 16 units would give, which
+# none of these services notice.
+[profile.release]
+incremental = true
+codegen-units = 256
+
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
@@ -52,6 +64,11 @@ license = "LicenseRef-OSAASy"
 repository = "https://github.com/WeaveMindAI/weft"
 
 [workspace.dependencies]
+# JWT signing (access-store's MintJwt) and verification (the broker's
+# caller auth). Version 10 carries no crypto of its own: without a backend
+# feature its first sign or verify panics at run time, so the backend is
+# chosen once, here, for every crate.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # async + runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -76,10 +93,20 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "r
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-types = "1"
 
+# Kubernetes API, in process: one client per process, and watches
+# rather than repeated lists. `runtime` for the watcher (a dropped watch
+# is relisted and resumed); rustls with ring, like every other TLS
+# client here.
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "runtime"] }
+# SYNC: the `v1_35` feature <-> the Kubernetes version kind builds (the
+#       node image of the `kind` the CLI finds; `kubectl version`)
+k8s-openapi = { version = "0.28", features = ["v1_35"] }
+
 # serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.8"
+serde_yaml = "0.9"
 
 # lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip)
 rowan = "0.16"

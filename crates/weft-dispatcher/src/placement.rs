@@ -51,7 +51,13 @@ pub trait PlacementPolicy: Send + Sync {
     /// The single source of truth for worker placement: every spawn, DNS
     /// computation, and teardown routes through this so there is no second answer
     /// to "where does this worker live."
-    fn worker_namespace(&self, attached_to_infra: bool, tenant: &str, project_id: &str) -> String;
+    fn worker_namespace(
+        &self,
+        instance: &weft_core::infra::Instance,
+        attached_to_infra: bool,
+        tenant: &str,
+        project_id: uuid::Uuid,
+    ) -> String;
 }
 
 /// The resolved answer to "where does this project's worker live RIGHT NOW".
@@ -89,7 +95,7 @@ pub struct ResolvedPlacement {
 /// `Ok(None)` = project unregistered (caller decides skip vs error).
 pub async fn resolve_worker_placement(
     state: &crate::state::DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<Option<ResolvedPlacement>> {
     let Some(declares_infra) = state.projects.project_has_infra(project_id).await? else {
         return Ok(None);
@@ -104,7 +110,7 @@ pub async fn resolve_worker_placement(
     let namespace =
         state
             .placement
-            .worker_namespace(attached_to_infra, tenant.as_str(), project_id);
+            .worker_namespace(&state.instance, attached_to_infra, tenant.as_str(), project_id);
     Ok(Some(ResolvedPlacement { tenant, namespace }))
 }
 
@@ -125,10 +131,16 @@ pub trait SandboxPolicy: Send + Sync {
 pub struct LocalPlacementPolicy;
 
 impl PlacementPolicy for LocalPlacementPolicy {
-    fn worker_namespace(&self, attached_to_infra: bool, tenant: &str, project_id: &str) -> String {
+    fn worker_namespace(
+        &self,
+        instance: &weft_core::infra::Instance,
+        attached_to_infra: bool,
+        tenant: &str,
+        project_id: uuid::Uuid,
+    ) -> String {
         // Delegate to the canonical structural rule (one body, with its own
         // tests in `project_namespace`).
-        crate::project_namespace::worker_namespace(attached_to_infra, tenant, project_id)
+        crate::project_namespace::worker_namespace(instance, attached_to_infra, tenant, project_id)
     }
 }
 
@@ -191,27 +203,33 @@ pub fn default_reclaimer() -> Arc<dyn ProjectReclaimer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_namespace::{name_for, SHARED_WORKER_NAMESPACE};
+    use crate::project_namespace::name_for;
+    use weft_core::infra::Instance;
+
+    const PROJECT_1: uuid::Uuid = uuid::Uuid::from_u128(0x101);
+    const PROJECT_2: uuid::Uuid = uuid::Uuid::from_u128(0x106);
 
     #[test]
     fn local_placement_matches_the_structural_rule() {
         let p = LocalPlacementPolicy;
+        let i = Instance::default_install();
+        let shared = i.shared_worker_namespace();
         // No infra: the shared namespace, regardless of tenant/project.
-        assert_eq!(p.worker_namespace(false, "local", "p1"), SHARED_WORKER_NAMESPACE);
-        assert_eq!(p.worker_namespace(false, "tenant-xyz", "p2"), SHARED_WORKER_NAMESPACE);
+        assert_eq!(p.worker_namespace(&i, false, "local", PROJECT_1), shared);
+        assert_eq!(p.worker_namespace(&i, false, "tenant-xyz", PROJECT_2), shared);
         // Infra: the project's own namespace.
-        assert_eq!(p.worker_namespace(true, "local", "p1"), name_for("local", "p1"));
+        assert_eq!(p.worker_namespace(&i, true, "local", PROJECT_1), name_for(&i, "local", PROJECT_1));
         // A no-infra and an infra project never share a namespace.
         assert_ne!(
-            p.worker_namespace(false, "local", "p1"),
-            p.worker_namespace(true, "local", "p1")
+            p.worker_namespace(&i, false, "local", PROJECT_1),
+            p.worker_namespace(&i, true, "local", PROJECT_1)
         );
     }
 
     #[test]
     fn no_sandbox_never_sets_a_runtime_class() {
         let s = NoSandbox;
-        assert_eq!(s.runtime_class(SHARED_WORKER_NAMESPACE), None);
+        assert_eq!(s.runtime_class("wft-shared-workers"), None);
         assert_eq!(s.runtime_class("wft-project-x--y"), None);
     }
 }

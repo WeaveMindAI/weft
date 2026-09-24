@@ -1,7 +1,21 @@
 ---
-# Live caller connection gateway (Envoy Gateway).
+# The one front door (Envoy Gateway). Three listeners on one Gateway,
+# each on its own port, so what one of them lets through can never be
+# reached from another:
 #
-# Routes an outside caller all the way to ONE specific worker pod, by
+#   - `http` (80): live caller connections, routed all the way to ONE
+#     worker pod (below).
+#   - `local` (81): the dispatcher, every path. What the operator's
+#     machine reaches at the loopback port the kind node maps
+#     (`MappedPort::Local`), and where every link the dispatcher mints
+#     for this machine points (storage downloads, signal URLs).
+#   - `public` (8080): the public trigger surface. Only the allowlisted
+#     routes below attach to it, and only the public tunnel reaches it
+#     (through the `weft-public-door` Service in public-tunnel.yaml), so
+#     "only the allowlist is public" is a fact of the wiring, not of a
+#     rule someone could forget.
+#
+# The live listener routes an outside caller all the way to ONE specific worker pod, by
 # encoding the pod + its namespace in the request's leftmost two DNS
 # labels: `<pod>.<namespace>.<gateway-host>`. A single GatewayClass +
 # Gateway + HTTPRoute + DynamicResolver Backend handle EVERY project and
@@ -26,6 +40,30 @@ metadata:
   name: weft-live
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: weft-live-proxy
+    namespace: envoy-gateway-system
+---
+# The proxy's own Service is a ClusterIP. Envoy Gateway's default is a
+# LoadBalancer, which nothing here provisions: it would stay pending
+# (the Gateway never reports Programmed) and allocate one node port per
+# listener out of the small band project doors are published on
+# (`NODE_PORTS`). The operator's machine and the tunnel reach the
+# listeners through the pinned NodePort Services in kind-node-ports.yaml
+# and public-tunnel.yaml instead.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: weft-live-proxy
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: ClusterIP
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -45,6 +83,32 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
+    # The dispatcher door. No hostname: a link the dispatcher mints
+    # carries whatever Host the caller used to reach it. Routes from
+    # every namespace attach here, since a project's `TenantPublic`
+    # endpoint (weft-core `infra::compile`) is an HTTPRoute in the
+    # project's own namespace. Envoy Gateway runs its proxy unprivileged
+    # and moves a listener below 1024 up by 10000, so the container
+    # listens on 10081.
+    # SYNC: listener `local` + container port 10081 <-> deploy/k8s/kind-node-ports.yaml
+    #       (weft-local-door-node-port), crates/weft-core/src/infra/compile.rs
+    #       (compile_http_route's parentRef)
+    - name: local
+      protocol: HTTP
+      port: 81
+      allowedRoutes:
+        namespaces:
+          from: All
+    # The public trigger surface. Only routes in this namespace may
+    # attach, and only the allowlist below does.
+    # SYNC: listener `public` + port 8080 <-> deploy/k8s/public-tunnel.yaml
+    #       (weft-public-door, tunnel-egress)
+    - name: public
+      protocol: HTTP
+      port: 8080
+      allowedRoutes:
+        namespaces:
+          from: Same
 ---
 # The dynamic-forward-proxy backend: Envoy resolves the upstream from the
 # (rewritten) Host header at request time, so no per-pod Service or route
@@ -65,6 +129,7 @@ metadata:
 spec:
   parentRefs:
     - name: weft-live-gateway
+      sectionName: http
   hostnames:
     - "*.${GATEWAY_HOST}"
   rules:
@@ -213,8 +278,9 @@ spec:
 #   - `streamIdleTimeout`: the PER-STREAM idle (default 5 MINUTES). This is
 #     the one that actually cuts a quiet WebSocket or held HTTP stream: it
 #     fires when a single stream sees no bytes either way. Disabling it is
-#     the whole point of this policy. (It is listener-scoped here, which is
-#     fine: this Gateway exists solely for live caller traffic.)
+#     the whole point of this policy. (It targets the `http` listener only,
+#     the one live callers arrive on; `local` and `public` keep their own
+#     policies below.)
 #   - `idleTimeout`: the CONNECTION-level idle (default ~1h), independent of
 #     the per-stream one; disabled too so a kept-alive connection between
 #     streams is never reaped.
@@ -231,6 +297,7 @@ spec:
     - group: gateway.networking.k8s.io
       kind: Gateway
       name: weft-live-gateway
+      sectionName: http
   timeout:
     http:
       # 0s disables each: a quiet live stream/connection stays open.
@@ -330,7 +397,10 @@ spec:
     name: weft-live-gateway
   jsonPatches:
     - type: "type.googleapis.com/envoy.config.listener.v3.Listener"
-      # The xDS listener this Gateway's HTTP port serves on.
+      # The xDS listener the Gateway's `http` listener serves on. Each
+      # Gateway listener here has a port of its own, so each is its own
+      # xDS listener, named after it, and this reaches the live callers
+      # only.
       name: envoy-gateway-system/weft-live-gateway/http
       operation:
         op: add
@@ -340,3 +410,225 @@ spec:
             name: 18
             int_value: 30000
             state: STATE_PREBIND
+---
+# The dispatcher door: every path to the dispatcher Service. Lives in the
+# dispatcher's namespace, next to the Service it forwards to, so no
+# cross-namespace grant is needed; the `local` listener admits routes
+# from every namespace.
+# SYNC: weft-dispatcher:9999 <-> deploy/k8s/dispatcher.yaml (Service)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: weft-dispatcher-local
+  namespace: weft-system
+spec:
+  parentRefs:
+    - name: weft-live-gateway
+      namespace: envoy-gateway-system
+      sectionName: local
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: weft-dispatcher
+          port: 9999
+---
+# The dispatcher door holds what the dispatcher holds: an event stream a
+# person follows for as long as a run lasts (the dispatcher keeps it
+# alive with a comment every 15s), and requests that wait on the cluster
+# for minutes (an infra start). Envoy's defaults would cut both: a route
+# timeout of 15s on every request, and a stream that sends nothing for
+# five minutes. No request timeout here; an hour of silence on one
+# stream, the bound the ingress controller this replaced carried.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: weft-dispatcher-local-no-request-timeout
+  namespace: weft-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: weft-dispatcher-local
+  timeout:
+    http:
+      requestTimeout: 0s
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: weft-local-stream-idle
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: weft-live-gateway
+      sectionName: local
+  timeout:
+    http:
+      streamIdleTimeout: 3600s
+---
+# The public trigger surface: an ALLOWLIST. Only what these rules match
+# passes through to the dispatcher: the provider-events receiver
+# (`/events/...`, POST only: a GET there is a private project or
+# execution event stream), the token-authenticated per-signal fire door
+# (`/signal/...`), the signal-token enumeration surface
+# (`/signal-token/...`, the token rides the Authorization header), the
+# token-credentialed file relay (`/public/files/...`, minted expiring
+# media links), the OAuth callback (exact path, so nothing else under
+# `/access` is reachable), and the small static page at the bare root
+# (`/`, `/index.html`, `/logo.png`). How a path is normalized before it
+# is matched is pinned by `weft-public-path-handling` below.
+# Every other path matches no rule, and Envoy answers 404 without the
+# dispatcher ever seeing it: the tunnel never exposes the project/admin
+# API, the dashboard, or the storage plane itself.
+#
+# The tunnel terminates TLS, so every rule tells the dispatcher the
+# caller came in over https (it builds the links it hands back from the
+# request's own Host and X-Forwarded-Proto).
+#
+# SYNC: the allowlist <-> crates/weft-cli/src/commands/daemon.rs
+#       (the public door test), crates/weft-dispatcher/src/api/mod.rs
+#       (the routes these paths reach), crates/weft-dispatcher/src/api/public_page.rs
+#       (PUBLIC_PAGE_PREFIX)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: weft-public-door
+  namespace: envoy-gateway-system
+spec:
+  parentRefs:
+    - name: weft-live-gateway
+      sectionName: public
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /events/
+          method: POST
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Forwarded-Proto
+                value: https
+      backendRefs:
+        - name: weft-dispatcher
+          namespace: weft-system
+          port: 9999
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /signal/
+        - path:
+            type: PathPrefix
+            value: /signal-token/
+        - path:
+            type: PathPrefix
+            value: /public/files/
+        - path:
+            type: Exact
+            value: /access/oauth/callback
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Forwarded-Proto
+                value: https
+      backendRefs:
+        - name: weft-dispatcher
+          namespace: weft-system
+          port: 9999
+    # The bare root's page, served by the dispatcher under a prefix of
+    # its own (which is not itself on this listener).
+    - matches:
+        - path:
+            type: Exact
+            value: /
+        - path:
+            type: Exact
+            value: /index.html
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /public-page/index.html
+      backendRefs:
+        - name: weft-dispatcher
+          namespace: weft-system
+          port: 9999
+    - matches:
+        - path:
+            type: Exact
+            value: /logo.png
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /public-page/logo.png
+      backendRefs:
+        - name: weft-dispatcher
+          namespace: weft-system
+          port: 9999
+---
+# How the public listener reads a path before it matches the allowlist
+# above. The allowlist is a list of prefixes, so a path that reaches the
+# dispatcher must be the path Envoy matched: `/signal/../projects`,
+# `//projects` or `/signal%2F..%2Fprojects` must never slip past a
+# `/signal/` rule and land on `/projects`. Pinned here rather than left to
+# Envoy Gateway's defaults: dot segments are resolved and repeated slashes
+# merged BEFORE the match (so those land on `/projects`, which no rule
+# lets through), and an encoded slash or backslash is refused outright.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: weft-public-path-handling
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: weft-live-gateway
+      sectionName: public
+  path:
+    escapedSlashesAction: RejectRequest
+    disableMergeSlashes: false
+---
+# The public door forwards across namespaces, to the dispatcher Service
+# in weft-system: that namespace has to say it allows it.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: weft-public-door-to-dispatcher
+  namespace: weft-system
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: envoy-gateway-system
+  to:
+    - group: ""
+      kind: Service
+      name: weft-dispatcher
+---
+# A public fire can wait on the run it starts, so Envoy's 15s route
+# timeout would cut an answer the dispatcher is still writing. No request
+# timeout; a stream silent for Envoy's default five minutes still ends.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: weft-public-door-no-request-timeout
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: weft-public-door
+  timeout:
+    http:
+      requestTimeout: 0s

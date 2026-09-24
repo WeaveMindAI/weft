@@ -24,18 +24,24 @@
 //! fire, so exactly one execution results. `wait_for_triggered_execution`
 //! BAILS on more than one new execution, so a double-fire fails loudly and
 //! a dropped fire times out; exactly-one is the pass.
+//!
+//! It runs in a cell of its own, at real time: the overlap is two pods of
+//! one pool, and a shared pool's scale-down would fold them together as
+//! soon as other tests' triggers leave it idle enough. Real time keeps the
+//! scale-down from ending the overlap before the push lands.
 
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
 use serde_json::json;
-use weft_e2e::{ensure, fakes::SseFake, platform::Platform, project::Project, run, SettledRun};
+use weft_e2e::{fakes::SseFake, platform::Platform, project::Project, run, Cell, SettledRun};
 
 #[tokio::test]
 async fn sse_signal_in_a_two_pod_overlap_fires_exactly_once() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let cell = Cell::start(1.0).await?;
+    let disp = cell.dispatcher();
+    let platform = Platform::connect(&disp).await?;
     let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
     let pid = project.id();
 
@@ -151,10 +157,9 @@ async fn sse_signal_in_a_two_pod_overlap_fires_exactly_once() -> anyhow::Result<
          (a stale old-pod fire was not fenced)"
     );
 
-    // Success cleanup: remove the listener clone THIS test created (by
-    // exact name, so it never touches another test's clone). Only reached
-    // on the success path (a failing test returns earlier and KEEPS the
-    // clone for inspection, like `Project`'s Drop keeps the project).
-    platform.sweep_clone(&pod_b).await?;
-    project.finish().await
+    // Removing the cell takes the listener clone with it. Only reached on
+    // the success path (a failing test returns earlier and KEEPS the cell
+    // for inspection, like `Project`'s Drop keeps the project).
+    project.finish().await?;
+    cell.finish().await
 }

@@ -7,13 +7,19 @@
 //! that nothing else in the system knows the caller is expected, which
 //! is what the worker's promise (`held_until_unix`) exists to fix.
 //!
-//! This file waits real minutes, because elapsed time against a live
-//! cluster is the thing under test. It runs last in the suite.
+//! Elapsed time against a live cluster is the thing under test, so it runs
+//! in a cell whose clock runs four times faster: the ticket, the worker's
+//! idle exit and the waits below are all the real-time figures, compressed
+//! together, so the story is the same three minutes told in 45 seconds.
+//! Not [`Cell::FAST`]: the ticket's life starts before the worker it names
+//! is ready, and that part is real work that no clock compresses. A tenth
+//! of two minutes left too little of the ticket once a busy cluster had
+//! spent a few seconds starting the worker.
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
 use serde_json::{json, Value};
-use weft_e2e::{ensure, live, project::Project};
+use weft_e2e::{live, project::Project, Cell};
 
 /// A ticket is a promise, and the worker keeps it.
 ///
@@ -36,13 +42,13 @@ use weft_e2e::{ensure, live, project::Project};
 ///     longer than the ticket so it is there to say this, instead of
 ///     the caller meeting a socket that does not answer.
 ///
-/// Slow by construction (it waits three real minutes) because the thing
-/// under test is elapsed time against a live cluster. The rule it rests
-/// on is pinned fast in the dispatcher's database tests; this proves the
-/// whole path.
+/// The minutes below are the cell's: three of them pass in 45 real
+/// seconds. The rule it rests on is pinned fast in the dispatcher's
+/// database tests; this proves the whole path.
 #[tokio::test]
 async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
+    let cell = Cell::start(0.25).await?;
+    let disp = cell.dispatcher();
     let mut project = Project::prepare("api_reply", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
@@ -56,7 +62,7 @@ async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> 
 
     // A minute of nothing at all: no calls, no runs, nobody touching
     // the project. The worker's own idle timer is half that.
-    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    tokio::time::sleep(cell.scaled(std::time::Duration::from_secs(60))).await;
 
     let (status, body) = live::follow(&soon, Method::GET, &[], None).await?;
     anyhow::ensure!(
@@ -69,7 +75,7 @@ async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> 
 
     // Two more minutes. The first caller's run finished long ago, so
     // the worker is idle again and only the promise is holding it up.
-    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    tokio::time::sleep(cell.scaled(std::time::Duration::from_secs(120))).await;
 
     let (status, body) = live::follow(&late, Method::GET, &[], None).await?;
     let said = String::from_utf8_lossy(&body).into_owned();
@@ -85,5 +91,6 @@ async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> 
     let (status, body) = live::follow(&fresh, Method::GET, &[], None).await?;
     anyhow::ensure!(status == 200, "{}", String::from_utf8_lossy(&body));
 
-    project.finish().await
+    project.finish().await?;
+    cell.finish().await
 }

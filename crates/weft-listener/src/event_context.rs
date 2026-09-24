@@ -34,6 +34,12 @@ pub enum FireOutcome {
     /// fire was deliberately dropped (the replacement pod will offer
     /// it). NOT delivered; a cursor must not advance past it.
     Fenced,
+    /// The broker does not know this signal's token (HTTP 404). NOT
+    /// delivered. It means either the row is not committed yet (a fire
+    /// racing its own registration) or the signal is gone; the broker
+    /// cannot tell which, so the kind decides from how long ago it
+    /// armed.
+    UnknownSignal,
 }
 
 /// Cheap to clone (Arc inside the sink; the rest is small).
@@ -104,6 +110,17 @@ impl FireContext {
                      will offer the event"
                 );
                 FireOutcome::Fenced
+            }
+            Err(e) if e
+                .downcast_ref::<weft_broker_client::BrokerRefused>()
+                .is_some_and(|r| r.status == reqwest::StatusCode::NOT_FOUND) =>
+            {
+                debug!(
+                    target: "weft_listener::event_context",
+                    kind = target, token = %self.token, error = %e,
+                    "the broker does not know this signal token"
+                );
+                FireOutcome::UnknownSignal
             }
             Err(e) => {
                 warn!(

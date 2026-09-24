@@ -2,8 +2,6 @@
 //! and the client side import from here, so a typo can't drift the
 //! two ends apart.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -14,6 +12,11 @@ use uuid::Uuid;
 use weft_core::access::wire::PublishedConnection;
 use weft_journal::ExecEvent;
 use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus};
+
+/// The longest the broker holds any request open (every `wait_ms`
+/// field is capped at it). A client that wants to wait longer asks
+/// again.
+pub use weft_task_store::pg_signal::MAX_HOLD;
 
 // =================================================================
 // Wire-enum helper
@@ -343,21 +346,34 @@ pub struct ExecutionStopTaggedRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStopTaggedResponse {}
+pub struct ExecutionStopTaggedResponse {
+    /// The stop reaches the asking run itself (`StopSelf::Include` and
+    /// the run carries the tag). The asker then waits for its own
+    /// cancel instead of going on: the dispatcher carries the stop out
+    /// a moment later, and a node that returned first would let the run
+    /// go past its own stop.
+    pub stops_asker: bool,
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalFetchRequest {
+/// The rows of one execution after `after_id`, held open up to
+/// `wait_ms` (the broker caps it at `pg_signal::MAX_HOLD`) until at
+/// least one exists. `after_id: 0` reads the whole log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalWaitRequest {
     pub color: String,
+    pub after_id: i64,
+    pub wait_ms: u64,
 }
 
 /// RAW payload strings, exactly as journaled, never re-encoded typed
 /// events: the broker only ferries these rows, and a typed hop would
 /// silently STRIP any field its own build predates (a stale broker
 /// once erased `ExecutionStarted.subgraph` this way, and the worker
-/// ran an aimed run unbounded). The consumer decodes, loudly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalFetchResponse {
-    pub payloads: Vec<String>,
+/// ran an aimed run unbounded). The consumer decodes, loudly. Empty
+/// when the hold ended with nothing new.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalWaitResponse {
+    pub rows: Vec<weft_journal::RawJournalRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,10 +408,13 @@ pub struct TaskEnqueueDedupResponse {
     pub fenced: bool,
 }
 
+/// A task's outcome, held open up to `wait_ms` (the broker caps it at
+/// `pg_signal::MAX_HOLD`) until it is terminal; the answer is its state
+/// either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskWaitTerminalRequest {
     pub task_id: Uuid,
-    pub timeout_ms: u64,
+    pub wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,16 +441,14 @@ impl TaskWaitTerminalResponse {
     }
 }
 
-impl TaskWaitTerminalRequest {
-    pub fn new(task_id: Uuid, timeout: Duration) -> Self {
-        Self { task_id, timeout_ms: timeout.as_millis() as u64 }
-    }
-}
-
+/// Claim one task, holding up to `wait_ms` (the broker caps it at
+/// `pg_signal::MAX_HOLD`) for one to be announced when none is
+/// claimable yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClaimOneRequest {
     pub pod_id: String,
     pub filter: ClaimFilter,
+    pub wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,7 +511,7 @@ pub struct TaskFailResponse {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPodRegisterAliveRequest {
     pub pod_name: String,
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,7 +562,7 @@ pub struct WorkerPodMarkDoneIfIdleResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     /// The instance's place spelling (see `InfraEnqueueApplyRequest`):
     /// the asking node's own place, so a node inside a file included
     /// twice reaches the instance of its own call.
@@ -555,7 +572,9 @@ pub struct InfraEndpointUrlRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlResponse {
-    pub endpoint_url: Option<String>,
+    /// `None` when the node is not running or declares no endpoint by
+    /// that name.
+    pub address: Option<weft_core::infra::EndpointAddress>,
 }
 
 // ---------- Connections + cost recording ----------
@@ -723,7 +742,7 @@ pub struct ReleaseConnectionResponse {}
 /// row or it doesn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFetchDefinitionRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     /// The definition hash the caller expects the project to have.
     /// Workers learn it from the `Execute` / `Resume` task payload;
     /// the dispatcher (which controls task enqueue) stamps it from
@@ -780,7 +799,7 @@ pub struct SupervisorSyncOwnershipRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorProject {
-    pub project_id: String,
+    pub project_id: Uuid,
     /// The project's tenant. A pooled supervisor serves many tenants,
     /// so the compile context's tenant comes from the project, not from
     /// a per-supervisor identity (it has none).
@@ -805,6 +824,11 @@ pub struct SupervisorSyncOwnershipResponse {
     /// Every project this pod now owns (after renew + claim). The work
     /// loops act only on these.
     pub owned: Vec<SupervisorProject>,
+    /// The projects among `owned` this tick took on: freshly claimed, or
+    /// this pod's own lease revived after it lapsed. A command issued on
+    /// one of them while nobody held it woke none of this pod's claims,
+    /// so the pod asks again at once when this is not empty.
+    pub claimed: Vec<Uuid>,
 }
 
 /// Pure read of the projects a supervisor pod currently owns (no claim,
@@ -824,7 +848,7 @@ pub struct SupervisorOwnedProjectsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraNodesRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,7 +858,12 @@ pub struct SupervisorInfraNode {
     pub instance_id: String,
     pub status: InfraNodeStatus,
     pub applied_spec_hash: Option<String>,
-    pub endpoints: std::collections::BTreeMap<String, String>,
+    /// Where the last apply stamped the endpoints. The apply's full
+    /// skip compares it with what the spec gives now, so a row stamped
+    /// before a field existed (or by an older rule) is applied again
+    /// rather than skipped with stale addresses.
+    #[serde(flatten)]
+    pub addresses: AppliedEndpoints,
     /// PVC names to preserve on terminate (see
     /// `SupervisorSetAppliedRequest::preserve_pvcs`). No
     /// `serde(default)`: pre-prod, supervisor + broker deploy
@@ -854,7 +883,7 @@ pub struct SupervisorInfraNodesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorHealthProtocolsRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -867,21 +896,35 @@ pub struct SupervisorClaimCommandRequest {
     /// The pooled supervisor pod claiming work. It claims a lifecycle
     /// command ONLY for a project whose infra it currently owns (the
     /// `infra_owner` exclusive lease), so two supervisors never run
-    /// kubectl for the same project; among its owned projects, the
-    /// per-command claim lease keyed on this pod serializes individual
-    /// commands.
+    /// kubectl for the same project.
     pub claimer_pod: String,
+    /// The projects this pod is running a command for right now. Their
+    /// next command waits until that one completes, so one project's
+    /// commands run in order while different projects' run side by side.
+    pub busy_projects: Vec<uuid::Uuid>,
+    /// How long to hold for a command to be issued when none is
+    /// waiting (the broker caps it at `pg_signal::MAX_HOLD`).
+    pub wait_ms: u64,
 }
 
+/// What a supervisor's claim comes back with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorClaimCommandResponse {
-    pub command: Option<SupervisorCommandRow>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SupervisorClaim {
+    /// The command this pod runs next.
+    Command(SupervisorCommandRow),
+    /// A command was issued for a project no supervisor owns yet. The
+    /// pod takes ownership now rather than at its next ownership tick,
+    /// and claims again.
+    UnownedWork,
+    /// Nothing was issued for this pod for the whole hold.
+    Nothing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandRow {
     pub id: i64,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: Option<String>,
     pub verb: InfraLifecycleVerb,
     /// Whether the supervisor should wait for the project's
@@ -911,7 +954,7 @@ pub struct SupervisorCommandRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorEventRecordRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: Option<String>,
     pub kind: InfraEventKind,
     pub payload: serde_json::Value,
@@ -1105,9 +1148,10 @@ pub struct SupervisorSetStatusRequest {
     ///
     /// `None` for autonomous writes from the health loop
     /// (`Flaky` / `Running` reconciliation) where there is no
-    /// command in flight. Tenant scope still applies.
+    /// command in flight. The ownership check applies all the same, so
+    /// a pod that lost the project cannot stamp it either.
     pub command_id: Option<i64>,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: String,
     /// The unit whose status this write sets. `Some(unit)` updates that
     /// unit's entry in `units_json` and recomputes the node-level
@@ -1140,11 +1184,12 @@ pub struct SupervisorSetAppliedRequest {
     /// that `remove_node` deleted, or stamping over the new owner's
     /// still-running apply.
     pub command_id: i64,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: String,
     pub instance_id: String,
     pub applied_spec_hash: String,
-    pub endpoints: std::collections::BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub addresses: AppliedEndpoints,
     pub namespace: String,
     /// PVC names to preserve on a future terminate. From
     /// `InfraSpec.lifecycle.on_terminate.preserve_pvcs`. Persisted
@@ -1163,6 +1208,18 @@ pub struct SupervisorSetAppliedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetAppliedResponse {}
 
+/// Where an applied node's endpoints answer, as the apply stamps them
+/// on its `infra_node` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedEndpoints {
+    /// Endpoint name to its cluster-internal URL.
+    #[serde(rename = "endpoints")]
+    pub urls: std::collections::BTreeMap<String, String>,
+    /// Endpoint name to the path it answers at on the front door, for
+    /// `TenantPublic` endpoints only (`weft_core::infra::tenant_public_path`).
+    pub public_paths: std::collections::BTreeMap<String, String>,
+}
+
 /// Supervisor-callable: write or update the `infra_node` row at
 /// `Provisioning` status BEFORE the kubectl apply begins. Locks
 /// in the (instance_id, namespace, preserve_pvcs) tuple so that a
@@ -1178,7 +1235,7 @@ pub struct SupervisorSetProvisioningRequest {
     /// lease. See [`SupervisorSetStatusRequest::pod_name`].
     pub pod_name: String,
     pub command_id: i64,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: String,
     pub instance_id: String,
     pub namespace: String,
@@ -1206,7 +1263,7 @@ pub struct SupervisorSetProvisioningResponse {}
 /// `Apply` / `Stop` / `Terminate` through this endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorEnqueueLifecycleRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     pub spec: LifecycleSpec,
 }
 
@@ -1299,7 +1356,7 @@ pub struct SupervisorEnqueueLifecycleResponse {
 /// skip / fresh / replace internally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEnqueueApplyRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     /// The instance's PLACE, spelled the way a person writes the node
     /// (`db`, or `one.db` inside the file the site `one` includes): the
     /// key its `infra_node` row and every resource are made under. A
@@ -1314,11 +1371,16 @@ pub struct InfraEnqueueApplyResponse {
 }
 
 /// Worker-callable: wait for a previously-issued apply command to
-/// reach terminal state. Worker polls this until completion.
+/// reach terminal state. The broker holds the request until the
+/// command completes or the hold ends; the worker asks again until it
+/// completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraWaitApplyRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     pub command_id: i64,
+    /// How long to hold for the command to complete (the broker caps it
+    /// at `pg_signal::MAX_HOLD`); the answer is its state either way.
+    pub wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1355,7 +1417,7 @@ wire_enum! {
 /// so it can resolve `Image::Local` references at apply time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorProjectImageTagsRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: String,
 }
 
@@ -1412,7 +1474,7 @@ pub fn decode_infra_image_tags(
 //       the per-unit status patch)
 pub fn decode_units_json(
     value: serde_json::Value,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, UnitRuntime>> {
     serde_json::from_value(value).map_err(|e| {
@@ -1430,7 +1492,7 @@ pub fn decode_units_json(
 /// entries carrying `stop_behavior`, which every real `UnitRuntime`
 /// has. Printed in the decode error for the operator to run by hand,
 /// and executed by the broker's db suite to prove it heals a row.
-pub fn units_json_repair_sql(project_id: &str, node_id: &str) -> String {
+pub fn units_json_repair_sql(project_id: uuid::Uuid, node_id: &str) -> String {
     format!(
         "UPDATE infra_node SET units_json = (SELECT COALESCE(jsonb_object_agg(k, v), \
          '{{}}'::jsonb) FROM jsonb_each(units_json) AS e(k, v) WHERE v ? 'stop_behavior') \
@@ -1444,7 +1506,7 @@ pub struct SupervisorRemoveNodeRequest {
     /// gates the cascade-delete on it holding the project's live
     /// `infra_owner` lease. See [`SupervisorSetStatusRequest::pod_name`].
     pub pod_name: String,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub node_id: String,
 }
 
@@ -1488,7 +1550,7 @@ pub struct SupervisorCommandCancelRequestedResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorTriggerDepsRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1504,7 +1566,7 @@ pub struct SupervisorTriggerDepsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRunningCountRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1517,7 +1579,7 @@ pub struct SupervisorRunningCountResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraCommandInFlightRequest {
-    pub project_id: String,
+    pub project_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1897,11 +1959,11 @@ mod supervisor_protocol_tests {
     #[test]
     fn project_fetch_definition_round_trip() {
         let req = ProjectFetchDefinitionRequest {
-            project_id: "p1".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             expected_hash: "abc123".into(),
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["project_id"], "p1");
+        assert_eq!(v["project_id"], "00000000-0000-0000-0000-0000000000a1");
         assert_eq!(v["expected_hash"], "abc123");
         let resp: ProjectFetchDefinitionResponse = serde_json::from_value(json!({
             "project_json": "{\"nodes\":[]}",
@@ -1923,18 +1985,53 @@ mod supervisor_protocol_tests {
         let resp: SupervisorSyncOwnershipResponse = serde_json::from_value(json!({
             "owned": [
                 {
-                    "project_id": "p1",
+                    "project_id": "00000000-0000-0000-0000-0000000000a1",
                     "tenant_id": "alice",
                     "project_namespace": "wft-project-alice-p1",
                     "status": "active",
                     "deactivated_by_health": false,
                 }
-            ]
+            ],
+            "claimed": ["00000000-0000-0000-0000-0000000000a1"],
         }))
         .unwrap();
         assert_eq!(resp.owned.len(), 1);
-        assert_eq!(resp.owned[0].project_id, "p1");
+        assert_eq!(resp.owned[0].project_id.to_string(), "00000000-0000-0000-0000-0000000000a1");
         assert_eq!(resp.owned[0].status, ProjectStatus::Active);
+        assert_eq!(resp.claimed, vec![resp.owned[0].project_id]);
+    }
+
+    #[test]
+    fn claim_round_trip() {
+        let req = SupervisorClaimCommandRequest {
+            claimer_pod: "sup-1".into(),
+            busy_projects: vec![uuid::Uuid::from_u128(0xa1)],
+            wait_ms: 25_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "claimer_pod": "sup-1",
+                "busy_projects": ["00000000-0000-0000-0000-0000000000a1"],
+                "wait_ms": 25_000,
+            })
+        );
+        let command = SupervisorCommandRow {
+            id: 7,
+            project_id: uuid::Uuid::from_u128(0xa1),
+            node_id: Some("db".into()),
+            verb: InfraLifecycleVerb::Apply,
+            running_policy: None,
+            spec_json: None,
+            force: false,
+            drain_timeout_secs: 300,
+        };
+        for claim in [SupervisorClaim::Command(command), SupervisorClaim::UnownedWork, SupervisorClaim::Nothing] {
+            let back: SupervisorClaim =
+                serde_json::from_value(serde_json::to_value(&claim).unwrap()).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{claim:?}"));
+        }
+        assert_eq!(serde_json::to_value(SupervisorClaim::UnownedWork).unwrap(), json!({ "kind": "unowned_work" }));
     }
 
     #[test]
@@ -1947,7 +2044,7 @@ mod supervisor_protocol_tests {
         let resp: SupervisorOwnedProjectsResponse = serde_json::from_value(json!({
             "owned": [
                 {
-                    "project_id": "p1",
+                    "project_id": "00000000-0000-0000-0000-0000000000a1",
                     "tenant_id": "alice",
                     "project_namespace": "wft-project-alice-p1",
                     "status": "active",
@@ -1967,7 +2064,7 @@ mod supervisor_protocol_tests {
     fn owned_project_missing_status_fails() {
         let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
             "owned": [
-                { "project_id": "p1", "project_namespace": "wft-project-alice-p1" }
+                { "project_id": "00000000-0000-0000-0000-0000000000a1", "project_namespace": "wft-project-alice-p1" }
             ]
         }));
         assert!(
@@ -1986,7 +2083,7 @@ mod supervisor_protocol_tests {
     fn owned_project_missing_deactivated_by_health_fails() {
         let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
             "owned": [
-                { "project_id": "p1", "project_namespace": "wft-project-alice-p1", "status": "active" }
+                { "project_id": "00000000-0000-0000-0000-0000000000a1", "project_namespace": "wft-project-alice-p1", "status": "active" }
             ]
         }));
         assert!(
@@ -2006,6 +2103,7 @@ mod supervisor_protocol_tests {
                     "status": "running",
                     "applied_spec_hash": "deadbeef",
                     "endpoints": { "api": "http://x.svc:8080" },
+                    "public_paths": { "api": "/infra/ns/wn-abc-tgi-12/hooks" },
                     "preserve_pvcs": ["model-cache"],
                     "units": { "main": {
                         "status": "running",
@@ -2017,7 +2115,8 @@ mod supervisor_protocol_tests {
             ]
         });
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.nodes[0].endpoints.get("api").unwrap(), "http://x.svc:8080");
+        assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
+        assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/ns/wn-abc-tgi-12/hooks");
         assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
         assert_eq!(resp.nodes[0].applied_spec_hash.as_deref(), Some("deadbeef"));
         assert_eq!(resp.nodes[0].preserve_pvcs, vec!["model-cache".to_string()]);
@@ -2049,17 +2148,25 @@ mod supervisor_protocol_tests {
         let req = SupervisorSetAppliedRequest {
             pod_name: "weft-infra-supervisor-abc".into(),
             command_id: 7,
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
             instance_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
-            endpoints: [("api".to_string(), "http://x".to_string())].into(),
+            addresses: AppliedEndpoints {
+                urls: [("api".to_string(), "http://x".to_string())].into(),
+                public_paths: [("api".to_string(), "/infra/wft-x/wn-abc-tgi-12/hooks".to_string())].into(),
+            },
             namespace: "wft-x".into(),
             preserve_pvcs: vec!["data".into()],
             units: std::collections::BTreeMap::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
+        // Flattened: the two maps sit on the request itself, and the
+        // URLs keep the `endpoints` name the broker writes to its column.
+        assert_eq!(v["endpoints"]["api"], "http://x");
+        assert_eq!(v["public_paths"]["api"], "/infra/wft-x/wn-abc-tgi-12/hooks");
         let back: SupervisorSetAppliedRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.addresses, req.addresses);
         assert_eq!(back.command_id, 7);
         assert_eq!(back.preserve_pvcs, vec!["data".to_string()]);
         assert_eq!(back.instance_id, "wn-abc-tgi-12");
@@ -2154,7 +2261,7 @@ mod supervisor_protocol_tests {
         // Write path mirrors the read path: no serde(default) on
         // preserve_pvcs, so a missing field is loud schema drift.
         let v = json!({
-            "command_id": 7, "project_id": "p", "node_id": "tgi",
+            "command_id": 7, "project_id": "00000000-0000-0000-0000-0000000000a1", "node_id": "tgi",
             "instance_id": "i", "applied_spec_hash": "h",
             "endpoints": {}, "namespace": "ns", "units": {}
         });
@@ -2167,7 +2274,7 @@ mod supervisor_protocol_tests {
         let req = SupervisorSetProvisioningRequest {
             pod_name: "weft-infra-supervisor-abc".into(),
             command_id: 9,
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
             instance_id: "wn-abc-tgi-12".into(),
             namespace: "wft-x".into(),
@@ -2183,7 +2290,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_provisioning_missing_preserve_pvcs_fails() {
         let v = json!({
-            "command_id": 9, "project_id": "p", "node_id": "tgi",
+            "command_id": 9, "project_id": "00000000-0000-0000-0000-0000000000a1", "node_id": "tgi",
             "instance_id": "i", "namespace": "ns"
         });
         let res: Result<SupervisorSetProvisioningRequest, _> = serde_json::from_value(v);
@@ -2196,7 +2303,7 @@ mod supervisor_protocol_tests {
         // (dispatcher verbs + Apply leave the column NULL).
         let v = json!({
             "id": 1,
-            "project_id": "p",
+            "project_id": "00000000-0000-0000-0000-0000000000a1",
             "verb": "stop"
         });
         let row: SupervisorCommandRow = serde_json::from_value(v).unwrap();
@@ -2282,7 +2389,7 @@ mod supervisor_protocol_tests {
     fn command_row_per_node_serializes() {
         let row = SupervisorCommandRow {
             id: 42,
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
             verb: InfraLifecycleVerb::Terminate,
             running_policy: Some(RunningPolicy::Cancel),
@@ -2332,7 +2439,7 @@ mod supervisor_protocol_tests {
         let r = SupervisorSetStatusRequest {
             pod_name: "weft-infra-supervisor-abc".into(),
             command_id: None,
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
             unit: None,
             status: InfraNodeStatus::Running,
@@ -2350,7 +2457,7 @@ mod supervisor_protocol_tests {
         let r = SupervisorSetStatusRequest {
             pod_name: "weft-infra-supervisor-abc".into(),
             command_id: Some(42),
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
             unit: None,
             status: InfraNodeStatus::Stopping,
@@ -2366,7 +2473,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn event_record_request_round_trip() {
         let r = SupervisorEventRecordRequest {
-            project_id: "p".into(),
+            project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
             kind: InfraEventKind::Flaky,
             payload: json!({ "desired": 3, "ready": 1 }),
@@ -2386,15 +2493,24 @@ mod supervisor_protocol_tests {
 
     #[test]
     fn endpoint_url_response_handles_null() {
-        let v = json!({ "endpoint_url": null });
+        let v = json!({ "address": null });
         let r: InfraEndpointUrlResponse = serde_json::from_value(v).unwrap();
-        assert!(r.endpoint_url.is_none());
+        assert!(r.address.is_none());
+    }
+
+    #[test]
+    fn endpoint_url_response_carries_the_public_url() {
+        let v = json!({ "address": { "url": "http://a.ns.svc:80", "public_url": "http://door/infra/ns/a/hooks" } });
+        let r: InfraEndpointUrlResponse = serde_json::from_value(v).unwrap();
+        let address = r.address.unwrap();
+        assert_eq!(address.url, "http://a.ns.svc:80");
+        assert_eq!(address.public_url.as_deref(), Some("http://door/infra/ns/a/hooks"));
     }
 
     #[test]
     fn endpoint_url_request_carries_endpoint_name() {
         let v = json!({
-            "project_id": "p",
+            "project_id": "00000000-0000-0000-0000-0000000000a1",
             "node_id": "n",
             "endpoint_name": "api"
         });

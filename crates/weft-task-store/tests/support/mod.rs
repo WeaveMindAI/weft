@@ -2,9 +2,27 @@
 //! task and worker-pod groups, plus stand-ins for the two journal tables
 //! the worker-pod triggers attach to.
 
+use std::sync::Arc;
+
 use sqlx::PgPool;
+use weft_task_store::pg_signal::PgSignalWatch;
 use weft_task_store::tasks;
 use weft_task_store::worker_pod;
+
+/// Every channel this crate's writes notify on. (Each test file
+/// compiles this module; the ones that never wait leave these unused.)
+#[allow(dead_code)]
+pub const CHANNELS: &[&str] = &[
+    tasks::TASK_READY_CHANNEL,
+    weft_task_store::terminal::TERMINAL_CHANNEL,
+    worker_pod::WORKER_POD_CHANNEL,
+];
+
+/// A signal watch on the test database, listening on [`CHANNELS`].
+#[allow(dead_code)]
+pub async fn signals(pool: &PgPool) -> Arc<PgSignalWatch> {
+    PgSignalWatch::start(pool, CHANNELS).await.expect("start the signal watch")
+}
 
 /// Apply the task and worker-pod schema to a fresh test database.
 pub async fn setup(pool: &PgPool) {
@@ -26,7 +44,8 @@ pub async fn setup(pool: &PgPool) {
             payload_json TEXT NOT NULL,
             created_at BIGINT NOT NULL,
             pod_name TEXT,
-            dedup_key TEXT
+            dedup_key TEXT,
+            writer_xid XID8 NOT NULL DEFAULT pg_current_xact_id()
         )"#,
     )
     .execute(pool)
@@ -43,7 +62,7 @@ pub async fn setup(pool: &PgPool) {
     sqlx::query(
         r#"CREATE TABLE IF NOT EXISTS execution_color (
             color TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
             tenant_id TEXT NOT NULL,
             started_at_unix BIGINT NOT NULL,
             phase TEXT NOT NULL,

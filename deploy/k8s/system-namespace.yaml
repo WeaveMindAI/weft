@@ -1,18 +1,20 @@
-# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
-#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+# Namespaces are rendered per install by the daemon
+# (crates/weft-cli/src/commands/daemon.rs, manifest_template_vars) from
+# weft_core::infra::Instance, so a named install beside the default one
+# applies this same file into namespaces of its own.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: weft-system
+  name: ${WEFT_SYSTEM_NAMESPACE}
   labels:
     weft.dev/role: system
-    kubernetes.io/metadata.name: weft-system
+    kubernetes.io/metadata.name: ${WEFT_SYSTEM_NAMESPACE}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-system-default-deny
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 spec:
   podSelector: {}
   policyTypes:
@@ -20,7 +22,8 @@ spec:
     - Egress
 ---
 # Dispatcher ingress. Allowed sources:
-#   - public ingress controller (external webhooks, storage links)
+#   - the front door's proxy pods (minted links, and the public trigger
+#     surface when a tunnel is open)
 #   - the operator's machine through the mapped node port (CLI / editor)
 #   - intra-namespace (other dispatcher Pods, headless Service)
 # Tenant pods CANNOT reach the dispatcher: their NetworkPolicy denies
@@ -29,7 +32,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: dispatcher-ingress
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
@@ -37,10 +40,20 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # The front door (deploy/k8s/gateway.yaml): the `local` listener
+    # (every path, from this machine) and the `public` listener (the
+    # allowlisted trigger surface, from the public tunnel) both forward
+    # here. What each lets through is decided by its routes; this
+    # decides that nothing else in the gateway's namespace talks to the
+    # dispatcher.
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: weft-live-gateway
       ports:
         - protocol: TCP
           port: 9999
@@ -64,16 +77,6 @@ spec:
       ports:
         - protocol: TCP
           port: 9999
-    # The public trigger surface: the allowlisting proxy forwards
-    # /events/... and /signal/... here (deploy/k8s/public-tunnel.yaml);
-    # nothing else passes it.
-    - from:
-        - podSelector:
-            matchLabels:
-              app: weft-public-proxy
-      ports:
-        - protocol: TCP
-          port: 9999
 ---
 # Dispatcher egress: a closed, enumerated set. Everything the
 # dispatcher actually dials is a rule below: Postgres and the broker
@@ -93,7 +96,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: dispatcher-egress
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
@@ -105,7 +108,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-db
+              kubernetes.io/metadata.name: ${WEFT_DB_NAMESPACE}
           podSelector:
             matchLabels:
               app: weft-postgres
@@ -115,7 +118,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-db
+              kubernetes.io/metadata.name: ${WEFT_DB_NAMESPACE}
           podSelector:
             matchLabels:
               app: weft-broker
@@ -185,13 +188,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weft-listener-sa
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weft-infra-supervisor-sa
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 ---
 # Pooled listener egress. The listener holds outbound event sources
 # (SSE / poll / socket) whose URLs a workflow supplies. Its egress is a
@@ -207,7 +210,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: pooled-listener
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
@@ -232,7 +235,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-db
+              kubernetes.io/metadata.name: ${WEFT_DB_NAMESPACE}
           podSelector:
             matchLabels:
               app: weft-broker
@@ -285,7 +288,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: pooled-supervisor
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 spec:
   podSelector:
     matchLabels:

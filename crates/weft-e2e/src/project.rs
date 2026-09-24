@@ -46,7 +46,7 @@ pub struct Project {
     /// Dispatcher client, shared from the suite's ensured-up system.
     disp: Dispatcher,
     /// The shared clean-on-pass / keep-and-warn-on-fail guard. Owns the id's
-    /// registered/finished bookkeeping + the Drop warning, so this CLI fixture
+    /// finished bookkeeping + the Drop warning, so this CLI fixture
     /// and an API-driven HTTP fixture share ONE teardown policy.
     teardown: Teardown,
     /// Extra working directories this project handed out
@@ -84,7 +84,7 @@ impl Project {
         // built CLI's stdlib_root points here), preserving any custom nodes the
         // fixture committed under nodes/. This is what makes the rig test
         // current node code rather than a stale mirror.
-        cli_ok(&dir, &["catalog", "update"])
+        cli_ok(&disp, &dir, &["catalog", "update"])
             .await
             .with_context(|| format!("catalog update for {fixture}"))?;
 
@@ -136,7 +136,7 @@ impl Project {
 
     /// Run `weft <args>` in this project, requiring success, returning stdout.
     pub async fn weft(&self, args: &[&str]) -> Result<String> {
-        cli_ok(&self.dir, args).await
+        cli_ok(&self.disp, &self.dir, args).await
     }
 
     /// A SECOND checkout of this same project: a copy of the working
@@ -181,7 +181,7 @@ impl Project {
     /// manifest difference no edit of the test's caused.
     pub async fn second_checkout_with_catalog(&self) -> Result<PathBuf> {
         let other = self.second_checkout()?;
-        cli_ok(&other, &["catalog", "update"])
+        cli_ok(&self.disp, &other, &["catalog", "update"])
             .await
             .with_context(|| format!("catalog update for the second checkout at {}", other.display()))?;
         Ok(other)
@@ -191,7 +191,7 @@ impl Project {
     /// otherwise returns stdout and stderr together so the test asserts
     /// on the refusal's message.
     pub async fn weft_refused(&self, args: &[&str]) -> Result<String> {
-        let out = crate::client::cli(&self.dir, args).await?;
+        let out = crate::client::cli(&self.disp, &self.dir, args).await?;
         anyhow::ensure!(!out.success, "`{}` unexpectedly succeeded:\n{}", out.invocation, out.stdout);
         Ok(format!("{}\n{}", out.stdout, out.stderr))
     }
@@ -370,27 +370,21 @@ impl Project {
     /// a plain run builds on its own.
     pub async fn build(&mut self) -> Result<()> {
         self.weft(&["build"]).await?;
-        self.teardown.mark_registered();
         Ok(())
     }
 
     /// Activate the project (build + register + enable triggers). Required for
-    /// fixtures whose entry is a trigger (web, live, form, timer, feed). Marks
-    /// the project registered so [`Project::finish`] removes it.
+    /// fixtures whose entry is a trigger (web, live, form, timer, feed).
     pub async fn activate(&mut self) -> Result<()> {
         self.weft(&["activate"]).await?;
-        self.teardown.mark_registered();
         Ok(())
     }
 
     /// Run `weft activate` EXPECTING a refusal: errors if activation
     /// succeeds, otherwise returns the CLI's combined output so the
-    /// test asserts on the refusal's message. The project is still
-    /// marked for teardown (a refused activation may have registered
-    /// state before the failing trigger; `weft rm` cleans either way).
+    /// test asserts on the refusal's message.
     pub async fn activate_refused(&mut self) -> Result<String> {
-        let out = crate::client::cli(&self.dir, &["activate"]).await?;
-        self.teardown.mark_registered();
+        let out = crate::client::cli(&self.disp, &self.dir, &["activate"]).await?;
         anyhow::ensure!(
             !out.success,
             "`weft activate` unexpectedly succeeded; this scenario expects a refusal"
@@ -398,22 +392,14 @@ impl Project {
         Ok(format!("{}\n{}", out.stdout, out.stderr))
     }
 
-    /// Mark the project registered without going through activate. Used by the
-    /// run path, where the first `weft run` builds + registers the project as a
-    /// side effect, so teardown must still remove it.
-    pub fn mark_registered(&mut self) {
-        self.teardown.mark_registered();
-    }
-
     /// Remove the project the way a user does, as the thing under
     /// test rather than as teardown: `weft rm <id> --yes`. Teardown
-    /// then only has the temp directory left to clear.
+    /// then finds it gone and only has the temp directory left to clear.
     pub async fn remove(&mut self) -> Result<String> {
         let id = self.id.to_string();
-        let out = cli_ok(&self.dir, &["rm", &id, "--yes"])
+        let out = cli_ok(&self.disp, &self.dir, &["rm", &id, "--yes"])
             .await
             .with_context(|| format!("weft rm {id}"))?;
-        self.teardown.mark_removed();
         Ok(out)
     }
 
@@ -425,12 +411,16 @@ impl Project {
     /// returns early WITHOUT marking the guard done, so the guard keeps + warns,
     /// exactly as an early-exiting test does.)
     pub async fn finish(mut self) -> Result<()> {
-        if self.teardown.registered() {
+        // The dispatcher is asked, never a flag kept on the side: a
+        // project gets registered by more verbs than any flag would
+        // follow (run, build, bake, checkpoint, infra), and one it
+        // missed would stay on the install after a passing test.
+        if self.registered_on_dispatcher().await? {
             // `weft rm <id>` deactivates then unregisters, exactly as a user
             // would clean up. Run by id so it is unambiguous; `--yes`
             // answers the confirmation a script cannot type.
             let id = self.id.to_string();
-            cli_ok(&self.dir, &["rm", &id, "--yes"])
+            cli_ok(&self.disp, &self.dir, &["rm", &id, "--yes"])
                 .await
                 .with_context(|| format!("teardown: weft rm {id}"))?;
         }
@@ -443,6 +433,13 @@ impl Project {
             .with_context(|| format!("teardown: remove temp dir {}", self.dir.display()))?;
         self.teardown.complete();
         Ok(())
+    }
+
+    /// Whether the dispatcher holds this project.
+    async fn registered_on_dispatcher(&self) -> Result<bool> {
+        let projects: Vec<serde_json::Value> = self.disp.get_json("/projects").await?;
+        let id = self.id.to_string();
+        Ok(projects.iter().any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str())))
     }
 }
 
@@ -505,9 +502,13 @@ fn weft_sources(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// What every test project's name starts with (see [`rewrite_project_id`]).
+pub const E2E_PROJECT_PREFIX: &str = "e2e_";
+
 /// Rewrite the `package.id` in the copy's `weft.toml` to `new_id`, preserving
-/// every other field. Parses + re-serializes via toml so we never string-munge
-/// the manifest (which would be the kind of fragile patch the rules forbid).
+/// every other field, refusing a fixture whose name lacks the test-project
+/// mark. Parses + re-serializes via toml so we never string-munge the
+/// manifest (which would be the kind of fragile patch the rules forbid).
 fn rewrite_project_id(dir: &Path, new_id: Uuid) -> Result<()> {
     let path = dir.join("weft.toml");
     let raw = std::fs::read_to_string(&path)
@@ -518,6 +519,17 @@ fn rewrite_project_id(dir: &Path, new_id: Uuid) -> Result<()> {
         .get_mut("package")
         .and_then(|p| p.as_table_mut())
         .context("weft.toml missing [package] table")?;
+    // Every project a test registers is named `e2e_...`: it is how
+    // `scripts/run-e2e.sh --clean` tells what a failed run kept from the
+    // projects a person has on the same install, so a fixture without the
+    // mark is refused before it registers anything.
+    let name = pkg.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+    anyhow::ensure!(
+        name.starts_with(E2E_PROJECT_PREFIX),
+        "fixture {} is named '{name}'; every fixture's [package] name starts with \
+         '{E2E_PROJECT_PREFIX}' so the cleanup can tell test projects from yours",
+        dir.display()
+    );
     pkg.insert("id".to_string(), toml::Value::String(new_id.to_string()));
     let out = toml::to_string_pretty(&doc).context("re-serialize weft.toml")?;
     std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;

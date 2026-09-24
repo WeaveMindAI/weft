@@ -48,13 +48,6 @@ jobs:
           fetch-depth: 0
       - run: scripts/check-extension-bump.sh "origin/${{ github.base_ref }}"
 
-  public-proxy:
-    name: public proxy routes
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: python3 deploy/tests/test_public_proxy.py
-
   rust:
     name: cargo test + clippy
     runs-on: ubuntu-latest
@@ -102,6 +95,9 @@ jobs:
       # rustup reads rust-toolchain.toml (see the rust job's comment).
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The script runs the suites under cargo-nextest (every test side by
+      # side); its prebuilt binary, from the project's own install script.
+      - run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       # The same script developers run locally, pointed at the service
       # container, so the crate list lives in exactly one place.
       - run: scripts/run-db-tests.sh

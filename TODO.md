@@ -124,42 +124,6 @@ that would otherwise have died and refolded) and on the lifecycle/leasing
 implications of a pinned worker. Surfaced from the node-authoring docs,
 which promised this primitive before it existed.
 
-## E2e parallelization: one cluster per e2e, keep failed clusters
-
-**Problem.** The e2e suite runs sequentially against ONE shared kind
-cluster, so tests cannot overlap (they share the dispatcher, the
-project namespace pool, the ingress/seaweed ports) and a failing test's
-cluster state is torn down or reused before it can be inspected.
-
-**Direction (agreed shape, not yet designed in detail).**
-- Each e2e gets its OWN kind cluster. The knobs already exist as env
-  vars (`WEFT_CLUSTER_NAME`, `WEFT_INGRESS_PORT`, `WEFT_SEAWEED_PORT`,
-  `WEFT_DISPATCHER_URL`), so a per-test cluster is "pick a unique name
-  + unique ports, export, run"; no code seam needed, the work is in the
-  runner.
-- `run-e2e.sh` grows the same `--parallel [N]` contract as
-  `run-node-tests.sh`: bare = all at once, N = batches of N, outputs
-  buffered per test and printed in suite order, a failure stops after
-  its whole batch (every failure in that batch visible). Realistic
-  batch size is 3-5 (each cluster is a full control plane; RAM/CPU
-  bound).
-- **A failed test's cluster is KEPT for inspection** (named after the
-  test, printed in the failure banner with the kubectl context to poke
-  it and the delete command); passing tests' clusters are deleted as
-  soon as they pass. A sweep must never leave passing clusters behind.
-- Node-test and e2e suites already share nothing (own scratch projects,
-  own build dirs, own cluster projects), so they stay runnable
-  simultaneously; per-e2e clusters only strengthen that.
-
-**Why deferred.** Quentin parked it explicitly ("let's wait for the e2e
-parallelization and having their own cluster after we are done with the
-other stuff") after the node-test `--parallel` work landed. Pick it up
-when he calls for it.
-
-[Update Notice Warning] If we touch `run-e2e.sh`, the e2e harness's
-cluster bootstrap, or the WEFT_CLUSTER_NAME/port env knobs, revisit
-this entry.
-
 ## Delegated end-customer connections (embed weft in someone else's product)
 
 **Problem.** An operator builds a product on top of weft (say a
@@ -485,7 +449,7 @@ diff should open the file diff in the editor rather than a tooltip.
 
 Deployment beyond one machine is undesigned. What exists: a kind
 cluster per machine, set up by `./setup.sh`, and an opt-in Cloudflare
-quick tunnel (`--public-url`) whose nginx proxy allowlists exactly the
+quick tunnel (`--public-url`) whose door allowlists exactly the
 provider-events receiver, the per-signal fire door, the file relay and
 the OAuth callback. A `k8s` backend exists in `weft daemon start` and
 demands `WEFT_GATEWAY_HOST`, `WEFT_GATEWAY_BASE_URL` and
@@ -585,11 +549,15 @@ of its own rather than a rename tangled into unrelated work. Until then
 ## A node's display has no limits, and every number in it is hardcoded
 
 Reading what a node is showing works and costs nothing at the size a
-local install runs at. Every bound it will need on a real deployment is
-either missing or a literal in the middle of a function, and the doors
-are on the internet-facing surface (the public proxy's allowlist passes
-the whole `/signal-token/` prefix, so a client holding a `--display`
-token reads from anywhere).
+local install runs at. The editor no longer polls: it opens one stream
+per graph (`/events/project/{id}/displays`), the dispatcher looks at
+each watched node once per 3 seconds however many editors watch it,
+sends only what changed, and stops looking the moment the stream closes
+(a hidden graph tab closes it). What is left is every bound a real
+deployment needs, most of them missing or a literal in the middle of a
+function, and the token doors are on the internet-facing surface (the
+public door lets the whole `/signal-token/` prefix through, so a client
+holding a `--display` token reads from anywhere).
 
 **The one that is not about scale.** The dispatcher reads a container's
 `/live` answer with `resp.json::<Value>()` and no byte cap
@@ -605,10 +573,9 @@ user, not at a thousand.
 | Knob | Today | Wants |
 |---|---|---|
 | Bytes the dispatcher will read from a `/live` answer | unbounded | a cap, with a 502 naming the cap and the node; a `Content-Length` refusal before reading a byte |
-| Deadline on that read | `Duration::from_secs(3)`, a literal in `read_live` | configurable, and probably shorter than the poll interval by construction |
+| Deadline on that read | `Duration::from_secs(3)`, a literal in `read_live` | configurable, and probably shorter than the look interval by construction |
+| How often a watched display is looked at | `LOOK_EVERY`, 3s, in `display_feeds.rs` | configurable |
 | Deadline on a display's `/action` press | none at all, on purpose (the work is the container's and the wait the user's) | a cap anyway on the token-facing door, where nobody is watching a spinner and a held connection is just a held connection |
-| Editor poll interval | `liveIntervalMs = 3000`, a literal in `graphView.ts` | configurable, and ideally not a fixed timer at all (see below) |
-| Polling while the graph tab is in the background | keeps running; only a disposed panel stops it | stop, or slow down, when nobody is looking |
 | Rate limit on `/signal-token/displays*` | none, and the dispatcher has no rate limiting anywhere | a limit per token, which is the first such limit the dispatcher would have, so it is a decision about the whole outside surface rather than about displays |
 
 **What it should look like.** Every row above is an option with a
@@ -617,23 +584,12 @@ dispatcher's deployment knobs are set, not a literal in a handler. The
 defaults are what a person running `./setup.sh` gets and never thinks
 about; a cluster operator moves them.
 
-Two changes would also cut most of the traffic without touching the
-freshness guarantee, which is that a display is read on every render
-and never stored (a QR code expires in under a minute):
-
-- **Conditional reads.** Hash the feed, answer 304 on `If-None-Match`.
-  The common case is a display that has not changed, and it becomes a
-  few bytes instead of the whole payload.
-- **Coalescing.** A shared entry per project and node with a TTL around
-  a second, so a hundred readers of one bridge cost one container hit
-  rather than a hundred.
-
-For the shape of the load: a display is polled every 3 seconds per open
-graph, whole payload every time. The WhatsApp example has two displays,
-so about 5 MB an hour per open graph to show a picture that changes
-twice. Ten thousand concurrent viewers with five displays each is
-roughly 16,000 requests a second, every one of them a dispatcher to
-container round trip and load on the tenant's own container.
+**The token door still reads on demand.** A client on
+`/signal-token/displays/...` gets the whole payload on every request and
+is its own poller. Serving it from the same feeds (a stream, or a
+conditional read answering 304 on `If-None-Match`) would make a hundred
+outside readers of one bridge cost one container hit, as the editor's
+readers already do.
 
 **One documentation gap that comes with the cap.** A `data:` URI in an
 `image` item is fine for something a container generates in memory (a
@@ -644,11 +600,9 @@ stored-file path with its expiring links is the right answer for
 anything big. Once there is a cap to name, say all of that in the
 node-authoring skill with the number in it.
 
-**Open questions.** Whether the poll becomes a push (the dispatcher
-already has an SSE surface) or stays a poll with the two optimizations
-above; whether the cap is per answer or per item, since one oversized
-image among four good items could come back as one unreadable line
-rather than a failed read; and whether a rate limit belongs per token
-or per (token, node), given that one client legitimately watches one
-bridge closely and has no reason to sweep every display it can see.
+**Open questions.** Whether the cap is per answer or per item, since one
+oversized image among four good items could come back as one unreadable
+line rather than a failed read; and whether a rate limit belongs per
+token or per (token, node), given that one client legitimately watches
+one bridge closely and has no reason to sweep every display it can see.
 

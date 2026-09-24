@@ -22,31 +22,40 @@ use super::Ctx;
 use crate::images;
 
 /// Cluster / namespace / port config the CLI talks to.
-/// `system_namespace` holds the dispatcher Pod, its Service, PVC and
-/// Ingress; `db_namespace` holds postgres + broker. Per-project
+/// `system_namespace` holds the dispatcher Pod, its Service and PVC;
+/// `db_namespace` holds postgres + broker. Per-project
 /// namespaces are created by the dispatcher at first infra apply.
 pub struct ClusterConfig {
     pub cluster_name: String,
     pub kube_context: String,
+    /// Which install on the cluster this CLI drives (`WEFT_INSTANCE`,
+    /// unset for the default one). A named install lives beside the
+    /// default one with namespaces of its own; see
+    /// `weft_core::infra::Instance`.
+    pub instance: weft_core::infra::Instance,
+    /// How fast the install's own timers run (`WEFT_TIME_SCALE`, `1`
+    /// when unset), written into the dispatcher and broker manifests;
+    /// see `weft_core::time_scale`.
+    pub time_scale: f64,
+    /// `instance.system_namespace()`, kept as a field so call sites read
+    /// one authority.
     pub system_namespace: String,
+    /// `instance.db_namespace()`, likewise.
     pub db_namespace: String,
     /// Loopback port the dispatcher's API answers at on kind: the kind
     /// node maps it to the dispatcher's node port (see [`MappedPort`]).
     /// Baked into the node's shape, so changing it rebuilds the node.
     pub dispatcher_port: u16,
-    /// Loopback port the cluster ingress controller answers at on kind,
-    /// mapped the same way. Storage file downloads (and any
-    /// ingress-served URL) are minted as
-    /// `http://127.0.0.1:<ingress_port>/...` in local dev. Distinct
-    /// from `dispatcher_port` (the dispatcher's own API): downloads
-    /// stream straight from the storage box through the ingress, never
-    /// through the dispatcher.
-    pub ingress_port: u16,
-    /// Loopback port the live-connection gateway (Envoy Gateway)
-    /// answers at on kind, mapped the same way. A caller's URL is
-    /// minted as `http://<pod>.<ns>.<host>:<gateway_port>/...` in local
-    /// dev. Distinct from `ingress_port` (the nginx ingress for storage
-    /// downloads); the live gateway is a separate front door.
+    /// Loopback port the front door's `local` listener answers at on
+    /// kind, mapped the same way: every path to the dispatcher. Every
+    /// link the dispatcher mints for this machine (a storage download, a
+    /// signal URL) is `http://127.0.0.1:<local_port>/...` in local dev,
+    /// the dispatcher's public base URL.
+    pub local_port: u16,
+    /// Loopback port the front door's `http` listener (live caller
+    /// connections) answers at on kind, mapped the same way. A caller's
+    /// URL is minted as `http://<pod>.<ns>.<host>:<gateway_port>/...` in
+    /// local dev.
     pub gateway_port: u16,
     /// Loopback port the bundled SeaweedFS object store's docker
     /// container (a host container, not a pod; see `ensure_object_store`)
@@ -62,13 +71,6 @@ pub struct ClusterConfig {
     /// Cluster Pod CIDR. Passed to the dispatcher for NetworkPolicy
     /// rendering. kind's default is `10.244.0.0/16`.
     pub pod_cidr: String,
-    /// The cluster DNS Service's address, for the public proxy's
-    /// nginx `resolver`. Empty means "ask the cluster", which is the
-    /// normal path; every Kubernetes distribution names that Service
-    /// `kube-system/kube-dns`, and WEFT_CLUSTER_DNS_IP is for one that
-    /// does not. Validated as an IP address where the manifests are
-    /// rendered, like the CIDRs.
-    pub cluster_dns_ip: String,
     /// `kind` for local dev (uses `kind create` + `kind load`);
     /// `k8s` for targeting an external cluster (skips kind
     /// bootstrap, images come from whatever registry the
@@ -95,16 +97,27 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "weft-local".into());
         let kube_context = std::env::var("WEFT_KUBE_CONTEXT")
             .unwrap_or_else(|_| format!("kind-{cluster_name}"));
-        // Constants, not env knobs (see weft_core::infra's namespace
-        // constants for why). The fields stay so call sites read one
-        // authority.
-        let system_namespace = weft_core::infra::SYSTEM_NAMESPACE.to_string();
-        let db_namespace = weft_core::infra::DB_NAMESPACE.to_string();
+        // Like the backend below, a malformed install name or pace is
+        // not something a later consumer can catch (every namespace and
+        // every timer follows from them), so it stops the process here.
+        let instance = weft_core::infra::Instance::from_env().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let time_scale = weft_core::time_scale::parse(
+            std::env::var(weft_core::time_scale::TIME_SCALE_ENV).ok().as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let system_namespace = instance.system_namespace();
+        let db_namespace = instance.db_namespace();
         let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9999);
-        let ingress_port = std::env::var("WEFT_INGRESS_PORT")
+        let local_port = std::env::var("WEFT_LOCAL_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9998);
@@ -125,8 +138,6 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "10.96.0.0/12".into());
         let pod_cidr = std::env::var("WEFT_CLUSTER_POD_CIDR")
             .unwrap_or_else(|_| "10.244.0.0/16".into());
-        let cluster_dns_ip =
-            std::env::var("WEFT_CLUSTER_DNS_IP").unwrap_or_default().trim().to_string();
         // Unlike the CIDRs above, a misread backend is not something a
         // later consumer can catch: every command branches on it, and
         // the default branch is the one that runs `kind create cluster`
@@ -153,15 +164,16 @@ impl ClusterConfig {
         Self {
             cluster_name,
             kube_context,
+            instance,
+            time_scale,
             system_namespace,
             db_namespace,
             dispatcher_port,
-            ingress_port,
+            local_port,
             gateway_port,
             seaweed_port,
             service_cidr,
             pod_cidr,
-            cluster_dns_ip,
             backend,
         }
     }
@@ -215,8 +227,8 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 /// well-formed.
 ///
 /// Public base URL policy:
-/// - Kind (local dev): default to `http://127.0.0.1:<ingress_port>`
-///   (the kind node maps the cluster ingress there) and set
+/// - Kind (local dev): default to `http://127.0.0.1:<local_port>`
+///   (the kind node maps the front door's `local` listener there) and set
 ///   WEFT_LOCAL_DEV=1 so the dispatcher accepts the loopback host.
 ///   An operator may still override WEFT_DISPATCHER_PUBLIC_BASE_URL.
 /// - K8s (real cluster): the operator MUST set
@@ -384,8 +396,10 @@ async fn manifest_template_vars(
 
     let (public_base_url, local_dev) = match cfg.backend {
         ClusterBackend::Kind => {
+            // A named install's links are pointed at its own door once
+            // that door has a port (`apply_platform_state`).
             let url = std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL")
-                .unwrap_or_else(|_| format!("http://127.0.0.1:{}", cfg.ingress_port));
+                .unwrap_or_else(|_| format!("http://127.0.0.1:{}", cfg.local_port));
             (url, "1".to_string())
         }
         ClusterBackend::K8s => {
@@ -440,8 +454,12 @@ async fn manifest_template_vars(
         }
     };
 
-    let object_store_bucket =
-        std::env::var("WEFT_OBJECT_STORE_BUCKET").unwrap_or_else(|_| "weft".to_string());
+    // One bucket per install on the store: a named install's files never
+    // sit beside the default install's (the tenant-wide `shared/` scope
+    // would otherwise be one scope for both), and removing it drops its
+    // bucket whole. The broker creates it at boot.
+    let object_store_bucket = std::env::var("WEFT_OBJECT_STORE_BUCKET")
+        .unwrap_or_else(|_| object_store_bucket(&cfg.instance));
     let object_store_region =
         std::env::var("WEFT_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     // The credentials and the browser-facing address. Their defaults
@@ -523,6 +541,7 @@ async fn manifest_template_vars(
         ("WEFT_OBJECT_STORE_SECRET_KEY", object_store_secret_key),
         ("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT", object_store_public_endpoint),
     ]);
+    vars.extend(install_template_vars(&cfg.instance, cfg.time_scale));
     // The node ports the kind node's port mappings land on, so the
     // NodePort Services and the kind config are rendered from ONE set
     // of numbers (see `MappedPort`).
@@ -530,10 +549,68 @@ async fn manifest_template_vars(
     Ok(vars)
 }
 
-/// The three services the operator's machine reaches inside the kind
+/// The template vars that tell one install on the cluster from another:
+/// its namespaces, the names of its cluster-wide objects, where its
+/// Postgres keeps its files, the database URL that follows from its db
+/// namespace, and how fast its timers run. For the default install they
+/// render exactly the names every existing cluster already has, so a
+/// default install's manifests hash the same as before this existed.
+fn install_template_vars(
+    instance: &weft_core::infra::Instance,
+    time_scale: f64,
+) -> Vec<(&'static str, String)> {
+    let database_url_base64 =
+        base64::engine::general_purpose::STANDARD.encode(install_database_url(instance));
+    vec![
+        ("WEFT_SYSTEM_NAMESPACE", instance.system_namespace()),
+        ("WEFT_DB_NAMESPACE", instance.db_namespace()),
+        ("WEFT_INSTANCE", instance.name().unwrap_or_default().to_string()),
+        ("WEFT_INSTANCE_SUFFIX", instance.name().map(|n| format!("-{n}")).unwrap_or_default()),
+        ("WEFT_TIME_SCALE", time_scale.to_string()),
+        ("WEFT_POSTGRES_VOLUME", postgres_volume(instance)),
+        ("WEFT_POSTGRES_NODE_PATH", postgres_node_path(instance)),
+        ("WEFT_DATABASE_URL_BASE64", database_url_base64),
+    ]
+}
+
+/// The bucket an install keeps its runtime files in, on the object store
+/// every install on the machine shares.
+fn object_store_bucket(instance: &weft_core::infra::Instance) -> String {
+    instance.cluster_object("weft")
+}
+
+/// The URL the install's dispatcher and broker reach its Postgres at.
+// SYNC: local-dev PG credentials <-> deploy/k8s/postgres.yaml (the
+//       credentials Secret), crates/weft-e2e/src/platform.rs
+//       (PG_USER/PG_PASSWORD/PG_DBNAME)
+fn install_database_url(instance: &weft_core::infra::Instance) -> String {
+    format!(
+        "postgres://weft:weft-local-dev@weft-postgres.{}.svc.cluster.local:5432/weft",
+        instance.db_namespace()
+    )
+}
+
+/// Where inside the kind node an install's Postgres keeps its files.
+/// The default install's path is the one the node mounts from this
+/// machine ([`postgres_data_dir`]), so its database outlives the node. A
+/// named install's is a plain directory inside the node: it is a
+/// throwaway install, and `weft daemon remove` deletes it with the rest.
+fn postgres_node_path(instance: &weft_core::infra::Instance) -> String {
+    match instance.name() {
+        None => NODE_POSTGRES_PATH.to_string(),
+        Some(name) => format!("{NAMED_INSTALLS_NODE_PATH}/{name}/postgres"),
+    }
+}
+
+/// The directory inside the kind node that holds every named install's
+/// files, one subdirectory each.
+const NAMED_INSTALLS_NODE_PATH: &str = "/var/weft-installs";
+
+/// The three doors the operator's machine reaches inside the kind
 /// cluster, each at a loopback port of its own: the dispatcher's API
-/// (the CLI and the editor), the ingress controller (storage
-/// downloads) and the live-connection gateway (route callers).
+/// (the CLI and the editor), and two of the front door's listeners
+/// (deploy/k8s/gateway.yaml): `local`, where every link the dispatcher
+/// mints for this machine lands, and `http`, the live callers.
 ///
 /// Each is exposed by a NodePort Service pinned to a fixed node port
 /// (`deploy/k8s/kind-node-ports.yaml`), and the kind config maps that
@@ -547,26 +624,26 @@ async fn manifest_template_vars(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MappedPort {
     Dispatcher,
-    Ingress,
+    Local,
     Gateway,
 }
 
 impl MappedPort {
-    const ALL: [MappedPort; 3] = [MappedPort::Dispatcher, MappedPort::Ingress, MappedPort::Gateway];
+    const ALL: [MappedPort; 3] = [MappedPort::Dispatcher, MappedPort::Local, MappedPort::Gateway];
 
     /// The fixed node port. All three sit in the lower band of the
     /// default node-port range (30000-32767): the apiserver reserves
     /// the first min(max(16, range/16), 128) = 128 ports of the range
     /// for explicitly requested node ports and hands dynamic
-    /// allocations (ingress-nginx's own Service, the Service Envoy
-    /// Gateway generates) ports from the rest first, so a Service that
+    /// allocations (the Service Envoy Gateway generates) ports from the
+    /// rest first, so a Service that
     /// is created before ours never takes one of these.
     /// SYNC: node ports <-> deploy/k8s/kind-node-ports.yaml (rendered
     ///       from these through the template vars, never typed there)
     fn node_port(self) -> u16 {
         match self {
             MappedPort::Dispatcher => 30099,
-            MappedPort::Ingress => 30098,
+            MappedPort::Local => 30098,
             MappedPort::Gateway => 30097,
         }
     }
@@ -575,7 +652,7 @@ impl MappedPort {
     fn host_port(self, cfg: &ClusterConfig) -> u16 {
         match self {
             MappedPort::Dispatcher => cfg.dispatcher_port,
-            MappedPort::Ingress => cfg.ingress_port,
+            MappedPort::Local => cfg.local_port,
             MappedPort::Gateway => cfg.gateway_port,
         }
     }
@@ -584,7 +661,7 @@ impl MappedPort {
     fn template_var(self) -> &'static str {
         match self {
             MappedPort::Dispatcher => "WEFT_DISPATCHER_NODE_PORT",
-            MappedPort::Ingress => "WEFT_INGRESS_NODE_PORT",
+            MappedPort::Local => "WEFT_LOCAL_NODE_PORT",
             MappedPort::Gateway => "WEFT_GATEWAY_NODE_PORT",
         }
     }
@@ -674,6 +751,8 @@ pub enum DaemonAction {
     /// "nothing exists yet" are just states it converges from.
     Start { rebuild: bool, rebuild_cluster: bool, public_url: Option<bool>, clear_access_apps: bool },
     Stop,
+    /// Take a named install off the cluster (`remove_named_install`).
+    Remove,
     Status,
     Logs { tail: usize, follow: bool },
 }
@@ -681,9 +760,20 @@ pub enum DaemonAction {
 pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Start { rebuild, rebuild_cluster, public_url, clear_access_apps } => {
-            set_public_url_choice(public_url)?;
+            // The public surface is the front door's, which routes to the
+            // default install only.
+            if let Some(name) = cluster_config().instance.name() {
+                anyhow::ensure!(
+                    public_url.is_none(),
+                    "--public-url / --no-public-url open or close the default install's \
+                     public surface; the install '{name}' has none"
+                );
+            } else {
+                set_public_url_choice(public_url)?;
+            }
             reconcile(&ctx, rebuild, rebuild_cluster, clear_access_apps).await
         }
+        DaemonAction::Remove => remove_named_install().await,
         DaemonAction::Stop => stop().await,
         DaemonAction::Status => status(&ctx).await,
         DaemonAction::Logs { tail, follow } => logs(tail, follow).await,
@@ -695,11 +785,33 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
 /// dispatcher's node port; on a real cluster, the address the CLI is
 /// configured to talk to (`--dispatcher` / WEFT_DISPATCHER_URL), which
 /// is the operator's external ingress host.
-fn dispatcher_reach_url(cfg: &ClusterConfig, ctx: &Ctx) -> String {
-    match cfg.backend {
-        ClusterBackend::Kind => format!("http://127.0.0.1:{}", cfg.dispatcher_port),
-        ClusterBackend::K8s => ctx.dispatcher_url().trim_end_matches('/').to_string(),
-    }
+async fn dispatcher_reach_url(cfg: &ClusterConfig, ctx: &Ctx) -> Result<String> {
+    Ok(match (cfg.backend, cfg.instance.name()) {
+        (ClusterBackend::Kind, None) => format!("http://127.0.0.1:{}", cfg.dispatcher_port),
+        // A named install answers at its own door (instance-door.yaml).
+        (ClusterBackend::Kind, Some(_)) => {
+            format!("http://127.0.0.1:{}", instance_door_port(cfg).await?)
+        }
+        (ClusterBackend::K8s, _) => ctx.dispatcher_url().trim_end_matches('/').to_string(),
+    })
+}
+
+/// A named install moves into the cluster the default install built,
+/// and relies on what that install set up for everyone: the node, the
+/// front door's gateway, the object store. Refuse, saying so, when it
+/// is not there, rather than failing half way through an apply.
+async fn require_default_install_up(cfg: &ClusterConfig, name: &str) -> Result<()> {
+    let default_ns = weft_core::infra::Instance::default_install().system_namespace();
+    let out = kubectl(&["get", "namespace", &default_ns, "-o", "name"]).output().await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "the install '{name}' lives beside the default install in cluster '{}', and that \
+         one is not up (no namespace {default_ns}). Bring it up first with `./setup.sh` \
+         or `weft daemon start` without {}.",
+        cfg.cluster_name,
+        weft_core::infra::INSTANCE_ENV
+    );
+    Ok(())
 }
 
 /// Why `weft daemon start` stops on the k8s backend, and what the
@@ -708,9 +820,9 @@ fn dispatcher_reach_url(cfg: &ClusterConfig, ctx: &Ctx) -> String {
 /// The backend exists because parts of weft are cluster-shaped already
 /// (images pull from a registry, the manifests template every address).
 /// What it does not have is anybody who installs the pieces `reconcile`
-/// assumes: on kind weft installs the ingress controller and the Envoy
-/// Gateway controller itself, and then patches that controller's config
-/// to turn on the two extension APIs `gateway.yaml` is written against.
+/// assumes: on kind weft installs the Envoy Gateway controller itself,
+/// and then patches that controller's config to turn on the two
+/// extension APIs `gateway.yaml` is written against.
 /// None of that runs there, yet `gateway.yaml` is applied on both
 /// backends. The kinder of the two outcomes is a raw apiserver error
 /// about a CRD nobody registered; the other one is a clean apply onto a
@@ -730,7 +842,6 @@ fn refuse_k8s_backend() -> anyhow::Error {
          ConfigMap and the controller restarted onto them. `deploy/k8s/gateway.yaml` is \
          written against both, and applies without complaint onto a controller that has \
          neither.\n\
-         \x20 - an ingress controller answering the `nginx` class (`deploy/k8s/ingress.yaml`).\n\
          \x20 - the gateway variables: WEFT_GATEWAY_HOST (a wildcard host with DNS and a \
          certificate pointed at the gateway), WEFT_GATEWAY_BASE_URL, WEFT_CALLER_TOKEN_SECRET.\n\
          \x20 - the object store: WEFT_OBJECT_STORE_ENDPOINT, WEFT_OBJECT_STORE_PUBLIC_ENDPOINT, \
@@ -773,8 +884,7 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
         return Err(refuse_k8s_backend());
     }
 
-    // The cluster + its ingress controller + the Envoy Gateway
-    // controller before anything else (gateway.yaml's CRs need Envoy's
+    // The cluster + the Envoy Gateway controller before anything else (gateway.yaml's CRs need Envoy's
     // CRDs and its two extension APIs; everything needs a cluster to
     // apply into). All idempotent: a no-op once present, which is what
     // makes this self-healing over a missing/partial cluster (a fresh
@@ -782,15 +892,34 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     // cluster is gone). Everything past the refusal above is on kind,
     // so this is not a branch so much as the shape of the one backend
     // that gets here.
+    //
+    // All of that is the cluster's, and the default install owns it. A
+    // named install moves into a cluster the default install already
+    // built, and never touches the node: rebuilding it would take the
+    // default install's projects with it.
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
-        ensure_cluster(cfg, rebuild_cluster).await?;
-        // The object store is a HOST docker container the cluster
-        // reaches OUT to (the local stand-in for a real S3 provider);
-        // up before anything that needs a bucket.
-        ensure_object_store(cfg).await?;
-        ensure_ingress_controller().await?;
-        ensure_envoy_gateway().await?;
+        match cfg.instance.name() {
+            None => {
+                ensure_cluster(cfg, rebuild_cluster).await?;
+                // The object store is a HOST docker container the
+                // cluster reaches OUT to (the local stand-in for a real
+                // S3 provider); up before anything that needs a bucket.
+                ensure_object_store(cfg).await?;
+                ensure_envoy_gateway().await?;
+                retire_replaced_front_doors(cfg).await?;
+                trim_single_node_control_plane(cfg).await?;
+            }
+            Some(name) => {
+                anyhow::ensure!(
+                    !rebuild_cluster,
+                    "--rebuild-cluster rebuilds the node every install on it lives in; \
+                     run it without {} (the default install owns the cluster), not for '{name}'",
+                    weft_core::infra::INSTANCE_ENV
+                );
+                require_default_install_up(cfg, name).await?;
+            }
+        }
     }
 
     let imgs = provision_images(rebuild).await?;
@@ -816,7 +945,12 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     // under-rolling once left a stale broker silently stripping
     // journal fields for a day).
     let mut pending = PendingStamps::default();
-    let changes = apply_platform_state(cfg, &imgs, &repo_root, clear_access_apps, &mut pending).await?;
+    let created = CreatedThisBoot {
+        dispatcher: !workload_exists("statefulset", "weft-dispatcher", &cfg.system_namespace).await?,
+        broker: !workload_exists("deployment", "weft-broker", &cfg.db_namespace).await?,
+    };
+    let (changes, tunnel) =
+        apply_platform_state(cfg, &imgs, &repo_root, clear_access_apps, &mut pending).await?;
 
     recover_failed_dispatcher_update(&cfg.system_namespace, &imgs.dispatcher).await?;
 
@@ -830,7 +964,7 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     // step it needed: the dispatcher roll and the broker roll each fire
     // on their own condition (see `rolls_for` for what triggers each),
     // never on a branch agreeing with the other.
-    let rolls = rolls_for(&changes, rebuild);
+    let rolls = rolls_for(&changes, rebuild, &created);
     if rolls.dispatcher {
         roll_workload("statefulset", "weft-dispatcher", &cfg.system_namespace).await?;
     }
@@ -840,8 +974,11 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     // Reachability from THIS machine is the gate: the rollout above
     // proved the pod Ready inside the cluster, and this proves the path
     // in (the node's port mapping and the NodePort Service on kind).
-    let reach = dispatcher_reach_url(cfg, ctx);
+    let reach = dispatcher_reach_url(cfg, ctx).await?;
     wait_for_dispatcher_health(&reach).await?;
+    if let Some(tunnel) = tunnel {
+        announce_public_tunnel(tunnel).await?;
+    }
     // The summary says what actually happened: applies and rolls are
     // different facts (a manifest change is applied but may roll
     // nothing here; a --rebuild rolls everything with no stamp moving),
@@ -888,7 +1025,9 @@ async fn reconcile(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool, clear_access
     // Every roll the detected changes demanded has completed: persist
     // the change stamps, and the checkout this boot installed from.
     pending.flush();
-    record_repo_root(&repo_root)?;
+    if cfg.instance.name().is_none() {
+        record_repo_root(&repo_root)?;
+    }
 
     // The pooled listener / supervisor Deployments were rendered by the
     // dispatcher with the image IT knew at spawn time, so an image
@@ -1005,11 +1144,33 @@ struct Rolls {
     broker: bool,
 }
 
-fn rolls_for(c: &DetectedChanges, rebuilt: bool) -> Rolls {
+/// Which workloads this boot's apply created. A pod that first started
+/// after every secret, manifest and image of this boot was in place
+/// already runs all of it, so it owes no restart (a fresh install's
+/// restarts once doubled its start time).
+struct CreatedThisBoot {
+    dispatcher: bool,
+    broker: bool,
+}
+
+fn rolls_for(c: &DetectedChanges, rebuilt: bool, created: &CreatedThisBoot) -> Rolls {
     Rolls {
-        dispatcher: c.sealing_key || c.postgres_manifest || rebuilt,
-        broker: c.sealing_key || c.apps || c.postgres_manifest || rebuilt,
+        dispatcher: !created.dispatcher && (c.sealing_key || c.postgres_manifest || rebuilt),
+        broker: !created.broker && (c.sealing_key || c.apps || c.postgres_manifest || rebuilt),
     }
+}
+
+/// Whether `kind/name` exists in `namespace`.
+async fn workload_exists(kind: &str, name: &str, namespace: &str) -> Result<bool> {
+    let out = kubectl(&["-n", namespace, "get", &format!("{kind}/{name}"), "--ignore-not-found", "-o", "name"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "kubectl get {kind}/{name} -n {namespace} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(!out.stdout.is_empty())
 }
 
 /// Restart `kind/name` in `namespace` and hold until Ready: callers
@@ -1184,7 +1345,7 @@ async fn apply_platform_state(
     repo_root: &Path,
     clear_access_apps: bool,
     pending: &mut PendingStamps,
-) -> Result<DetectedChanges> {
+) -> Result<(DetectedChanges, Option<OpenedTunnel>)> {
     let manifests = repo_root.join("deploy/k8s");
     let mut other_manifests = false;
     // The var set is computed ONCE (it is not free: a docker network
@@ -1200,17 +1361,36 @@ async fn apply_platform_state(
             kubectl_apply_changed(&manifests.join(name), &template_vars, pending).await?;
     }
     // The node ports the kind node maps to this machine's loopback
-    // (see `MappedPort`): one NodePort Service per front door, in the
-    // namespaces the cluster, ingress and gateway installs above
-    // created. Kind only; a real cluster is reached at the operator's
-    // external addresses.
+    // (see `MappedPort`): one NodePort Service per door, in the
+    // namespaces the cluster and gateway installs above created. Kind only; a real cluster is reached at the operator's
+    // external addresses. A named install has one door of its own
+    // instead, at whatever node port the apiserver gives it, and every
+    // link it mints points there.
     if cfg.backend == ClusterBackend::Kind {
-        other_manifests |= kubectl_apply_changed(
-            &manifests.join("kind-node-ports.yaml"),
-            &template_vars,
-            pending,
-        )
-        .await?;
+        match cfg.instance.name() {
+            None => {
+                other_manifests |= kubectl_apply_changed(
+                    &manifests.join("kind-node-ports.yaml"),
+                    &template_vars,
+                    pending,
+                )
+                .await?;
+            }
+            Some(_) => {
+                other_manifests |= kubectl_apply_changed(
+                    &manifests.join("instance-door.yaml"),
+                    &template_vars,
+                    pending,
+                )
+                .await?;
+                let door = instance_door_port(cfg).await?;
+                set_template_var(
+                    &mut template_vars,
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL",
+                    format!("http://127.0.0.1:{door}"),
+                );
+            }
+        }
     }
     // The public tunnel next, when opted in: its minted address is an
     // ADDITIONAL internet-reachable door, substituted into the
@@ -1222,11 +1402,15 @@ async fn apply_platform_state(
     // or the dispatcher gets applied with an empty internet address,
     // silently un-wiring a tunnel that is still running (https
     // consents block, event pushes point at nothing).
-    if let Some(url) = reconcile_public_tunnel(&manifests).await? {
-        for (key, value) in template_vars.iter_mut() {
-            if *key == "WEFT_DISPATCHER_INTERNET_URL" {
-                *value = url.clone();
-            }
+    // The tunnel belongs to the default install: it opens the front
+    // door's public listener, which routes to that install only.
+    // Its reachability is proven later (`announce_public_tunnel`), once
+    // the gateway and dispatcher it leads to are up.
+    let mut tunnel = None;
+    if cfg.instance.name().is_none() {
+        tunnel = reconcile_public_tunnel(&manifests).await?;
+        if let Some(t) = &tunnel {
+            set_template_var(&mut template_vars, "WEFT_DISPATCHER_INTERNET_URL", t.url.clone());
         }
     }
     // Postgres before everything that needs a database, gated to Ready
@@ -1234,7 +1418,7 @@ async fn apply_platform_state(
     // Its change flag is its OWN: postgres.yaml carries the database
     // credentials both the dispatcher and the broker read as env at
     // pod start (see `DetectedChanges::postgres_manifest`).
-    prepare_postgres_apply(&manifests.join("postgres.yaml")).await?;
+    prepare_postgres_apply(cfg, &manifests.join("postgres.yaml")).await?;
     let postgres_manifest =
         kubectl_apply_changed(&manifests.join("postgres.yaml"), &template_vars, pending).await?;
     wait_workload_ready("deployment", "weft-postgres", &cfg.db_namespace).await?;
@@ -1255,27 +1439,70 @@ async fn apply_platform_state(
     // supervisor + listener pods (tenant-agnostic, in the
     // control-plane namespace), bound into project namespaces by
     // RoleBindings the dispatcher creates at first infra apply.
-    for name in [
-        "dispatcher.yaml",
-        "ingress.yaml",
-        "cluster-rbac.yaml",
-        // Live caller connection gateway (Envoy Gateway CRs). These
-        // need the controller's CRDs registered and its two extension
-        // APIs turned on, which `ensure_envoy_gateway` did above. It
-        // only ran because we are on kind: the k8s backend is refused
-        // at the top of `reconcile` precisely so this never applies
-        // onto a controller nobody set up. `${GATEWAY_HOST}` is
-        // substituted from template vars.
-        "gateway.yaml",
-    ] {
+    for name in ["dispatcher.yaml", "cluster-rbac.yaml"] {
         other_manifests |=
             kubectl_apply_changed(&manifests.join(name), &template_vars, pending).await?;
     }
-    Ok(DetectedChanges {
-        postgres_manifest,
-        other_manifests,
-        sealing_key,
-        apps,
+    // The front door (Envoy Gateway CRs): live callers, the local door
+    // to the dispatcher, the public allowlist. These need the
+    // controller's CRDs registered and its two extension APIs turned
+    // on, which `ensure_envoy_gateway` did above. It only ran because
+    // we are on kind: the k8s backend is refused at the top of
+    // `reconcile` precisely so this never applies onto a controller
+    // nobody set up. `${GATEWAY_HOST}` is substituted from template
+    // vars. The default install owns it: a named install's live
+    // callers ride the same gateway (its routes attach to it by
+    // namespace), and it has no local door there.
+    if cfg.instance.name().is_none() {
+        other_manifests |=
+            kubectl_apply_changed(&manifests.join("gateway.yaml"), &template_vars, pending)
+                .await?;
+    }
+    Ok((
+        DetectedChanges {
+            postgres_manifest,
+            other_manifests,
+            sealing_key,
+            apps,
+        },
+        tunnel,
+    ))
+}
+
+/// Replace one template var already in the set: for the values only
+/// known once part of the install is applied (the tunnel's address, a
+/// named install's door).
+fn set_template_var(vars: &mut [(&'static str, String)], key: &str, value: String) {
+    let slot = vars
+        .iter_mut()
+        .find(|(k, _)| *k == key)
+        .unwrap_or_else(|| panic!("template var {key} is always in the set"));
+    slot.1 = value;
+}
+
+/// The node port the apiserver gave a named install's door
+/// (deploy/k8s/instance-door.yaml).
+async fn instance_door_port(cfg: &ClusterConfig) -> Result<u16> {
+    let out = kubectl(&[
+        "-n",
+        &cfg.system_namespace,
+        "get",
+        "service",
+        "weft-dispatcher-node-port",
+        "-o",
+        "jsonpath={.spec.ports[0].nodePort}",
+    ])
+    .output()
+    .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "reading the node port of {}'s door failed: {}",
+        cfg.system_namespace,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    raw.parse().map_err(|_| {
+        anyhow::anyhow!("{}'s door has no node port yet (read '{raw}')", cfg.system_namespace)
     })
 }
 
@@ -1286,10 +1513,11 @@ pub fn data_dir() -> PathBuf {
 
 // ----- The opt-in public trigger surface ------------------------------
 //
-// `--public-url` runs a filtering proxy + an outbound tunnel inside
-// the cluster (deploy/k8s/public-tunnel.yaml) so a local install gets
-// a public https address for exactly its public trigger surface
-// (`/events/...`, `/signal/...`) and nothing else. The choice is
+// `--public-url` runs an outbound tunnel inside the cluster
+// (deploy/k8s/public-tunnel.yaml) onto the front door's `public`
+// listener, so a local install gets a public https address for exactly
+// its public trigger surface (the allowlist in deploy/k8s/gateway.yaml)
+// and nothing else. The choice is
 // PERSISTED (a marker file) so every later daemon start keeps it
 // until `--no-public-url`.
 
@@ -1397,20 +1625,17 @@ fn canonical_tunnel_hostname(raw: &str) -> Result<String> {
     Ok(format!("https://{host}"))
 }
 
-/// Bring the tunnel + filtering proxy up (or tear them down) to match
+/// Bring the tunnel and its door up (or tear them down) to match
 /// the persisted choice, and answer the public https address when one
 /// is up. Quick mode reads the minted random address from the tunnel's
 /// own logs (the only authority for a per-connection address); named
 /// mode's address is the configured hostname.
-async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<String>> {
+async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<OpenedTunnel>> {
     let cfg = cluster_config();
     let manifest = manifests.join("public-tunnel.yaml");
     // The manifest carries `${TUNNEL_ARGS}` (the mode's argv); any
     // kubectl that PARSES it needs the substitution, deletes included.
-    let quick_args = format!(
-        r#"["tunnel", "--no-autoupdate", "--url", "http://weft-public-proxy.{}.svc.cluster.local:8080"]"#,
-        cfg.system_namespace
-    );
+    let quick_args = format!(r#"["tunnel", "--no-autoupdate", "--url", "{PUBLIC_DOOR_URL}"]"#);
     if !public_url_enabled() {
         // Local state first, cluster second: a transient apiserver
         // failure below must never leave the stamps or the recorded
@@ -1421,38 +1646,15 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         let _ = std::fs::remove_file(public_url_file());
         let _ = std::fs::remove_file(manifest_stamp_file(&manifest));
         let _ = std::fs::remove_file(manifest_stamp_file(Path::new("weft-tunnel-token")));
-        let _ = std::fs::remove_file(manifest_stamp_file(Path::new("weft-public-page")));
         // Teardown closes a PUBLIC surface, so every kubectl step is
         // checked: reporting success while the tunnel still serves
         // would leave the operator believing a door is shut that is
-        // not. Neither substituted value reaches the cluster on this
+        // not. The substituted value never reaches the cluster on this
         // path (kubectl deletes by kind/name and never reads the
-        // bodies); they only have to render the manifest parseable, so
-        // a delete never depends on the cluster still answering.
-        kubectl_delete_rendered(
-            &manifest,
-            &[
-                ("TUNNEL_ARGS", quick_args.to_string()),
-                ("CLUSTER_DNS", "127.0.0.1".to_string()),
-            ],
-        )
-        .await?;
+        // bodies); it only has to render the manifest parseable, so a
+        // delete never depends on the cluster still answering.
+        kubectl_delete_rendered(&manifest, &[("TUNNEL_ARGS", quick_args)]).await?;
         delete_tunnel_token_secret().await?;
-        let out = kubectl(&[
-            "-n",
-            &cfg.system_namespace,
-            "delete",
-            "configmap",
-            "weft-public-page",
-            "--ignore-not-found",
-        ])
-        .output()
-        .await?;
-        anyhow::ensure!(
-            out.status.success(),
-            "deleting the weft-public-page configmap failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
         return Ok(None);
     }
     // Named mode (a stable operator-owned hostname) or the free quick
@@ -1487,36 +1689,14 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         secret_changed =
             manifest_apply_changed_by_stamp(Path::new("weft-tunnel-token"), &secret, &mut pending);
     }
-    // Content-hash apply: when the manifest actually changed (e.g. the
-    // proxy's nginx allowlist gained a location, or the mode's argv
-    // switched), the running proxy must be ROLLED, because nginx never
-    // re-reads a mounted ConfigMap on its own. A tunnel-Deployment
-    // spec change rolls the tunnel pod by itself; a proxy-only change
-    // leaves it alone (a quick tunnel's minted address survives a
-    // proxy roll). A secret-only change rolls the tunnel explicitly,
-    // since nothing else would re-inject the new token; a page-only
-    // change rolls the proxy the same way (its files mount at start).
-    // The root page's files before the manifest, so the proxy pod the
-    // manifest (or a roll below) creates always finds its mount.
-    let page_dir = manifests
-        .parent()
-        .expect("deploy/k8s has a parent")
-        .join("public-page");
-    let page_changed = apply_public_page_configmap(&page_dir, &mut pending).await?;
-    let manifest_changed = kubectl_apply_changed(
-        &manifest,
-        &[
-            ("TUNNEL_ARGS", tunnel_args.to_string()),
-            ("CLUSTER_DNS", cluster_dns_ip().await?),
-        ],
-        &mut pending,
-    )
-    .await?;
+    // Content-hash apply. A tunnel-Deployment spec change (the mode's
+    // argv switched) rolls the tunnel pod by itself; a secret-only
+    // change rolls it explicitly, since nothing else would re-inject the
+    // new token. The door the tunnel forwards to is the gateway's
+    // `public` listener, applied with the rest of the front door.
+    kubectl_apply_changed(&manifest, &[("TUNNEL_ARGS", tunnel_args)], &mut pending).await?;
     if secret_changed {
         roll_workload("deployment", "weft-tunnel", &cfg.system_namespace).await?;
-    }
-    if manifest_changed || page_changed {
-        roll_workload("deployment", "weft-public-proxy", &cfg.system_namespace).await?;
     }
     // Unconditional readiness gate, changed or not: the address
     // answered below is only meaningful while exactly one tunnel pod
@@ -1543,21 +1723,88 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         Some((_, hostname)) => hostname.clone(),
         None => wait_for_quick_tunnel_url().await?,
     };
+    Ok(Some(OpenedTunnel { url, named: named.is_some() }))
+}
+
+/// A public tunnel that is up, not yet proven to reach the door.
+struct OpenedTunnel {
+    url: String,
+    named: bool,
+}
+
+/// Prove the tunnel reaches the door, then record and announce its
+/// address. Runs only once the gateway (whose `public` listener the
+/// tunnel forwards to) is applied and the dispatcher behind it answers
+/// health: before that, a fresh install's check could never pass.
+async fn announce_public_tunnel(tunnel: OpenedTunnel) -> Result<()> {
+    let OpenedTunnel { url, named } = tunnel;
+    // The pod being ready says the tunnel reached Cloudflare, nothing
+    // about the hop after it: a named tunnel's destination is set in the
+    // Cloudflare dashboard, where nothing here can see it. So the address
+    // is recorded only once a request through it reached the door.
+    verify_public_url(&url, named).await?;
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(public_url_file(), &url)?;
     println!("public trigger surface reachable at {url}");
-    println!("  exposed through the filtering proxy: /events/... (provider event pushes), /signal/... (per-signal fire tokens), and /public/files/... (minted expiring media links); everything else answers 404.");
+    println!("  exposed through the public door: /events/... (provider event pushes), /signal/... (per-signal fire tokens), /signal-token/... (token listing), /public/files/... (minted expiring media links), and the OAuth callback; everything else answers 404.");
     println!("  Rerun with --no-public-url to close it.");
-    if named.is_none() {
+    if !named {
         println!(
             "  NOTE: this free-tunnel address changes whenever the tunnel reconnects, \
              and everything registered against it (a provider's event push URL, an \
              OAuth redirect) rots until re-registered. For a stable address, set \
              WEFT_PUBLIC_TUNNEL_TOKEN + WEFT_PUBLIC_TUNNEL_HOSTNAME \
-             (https://weavemindai.github.io/weft/connections/public-address.html)."
+             (https://weavemindai.github.io/weft/build/public-address.html)."
         );
     }
-    Ok(Some(url))
+    Ok(())
+}
+
+/// Where the tunnel sends what arrives: the Service in front of the
+/// gateway's `public` listener. A named tunnel's Cloudflare dashboard
+/// must name exactly this.
+// SYNC: weft-public-door:8080 <-> deploy/k8s/public-tunnel.yaml, deploy/k8s/gateway.yaml (listener `public`)
+const PUBLIC_DOOR_URL: &str = "http://weft-public-door.envoy-gateway-system.svc.cluster.local:8080";
+
+/// Fetch the public page at the bare root of `url`, through the tunnel,
+/// until it answers or the tunnel had long enough to settle (a quick
+/// tunnel's fresh hostname takes a while to resolve). An internal wait:
+/// nothing a person controls is on the other end.
+async fn verify_public_url(url: &str, named: bool) -> Result<()> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let seen = match client.get(format!("{url}/")).send().await {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) => format!("it answered {}", r.status()),
+            Err(e) => format!("the request failed: {e}"),
+        };
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("{}", public_url_unreachable(url, named, &seen));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// What to say when the public address does not reach the door.
+fn public_url_unreachable(url: &str, named: bool, seen: &str) -> String {
+    let cfg = cluster_config();
+    let logs = format!(
+        "kubectl --context {} -n {} logs deployment/weft-tunnel",
+        cfg.kube_context, cfg.system_namespace
+    );
+    if named {
+        format!(
+            "{url} does not reach weft's public door ({seen}). The tunnel is connected, so \
+             the likely cause is where Cloudflare sends the traffic: in the Cloudflare \
+             dashboard, the tunnel's public hostname for {url} must have the service \
+             {PUBLIC_DOOR_URL}. The tunnel's log names the destination it tried: {logs}"
+        )
+    } else {
+        format!(
+            "{url} does not reach weft's public door ({seen}). The tunnel's log says why: {logs}"
+        )
+    }
 }
 
 /// The QUICK tunnel's minted address, scraped from its own pod's log
@@ -1637,6 +1884,140 @@ async fn wait_for_quick_tunnel_url() -> Result<String> {
     }
 }
 
+/// `weft daemon remove`: take a NAMED install off the cluster, leaving
+/// nothing of it behind: its namespaces (every project's with them),
+/// its cluster-wide objects, its database files inside the node, its
+/// bucket, and its change stamps. The default install is refused: it
+/// holds everyone's projects, and `./setup.sh --uninstall` is its way
+/// out, with the choices that deserves.
+async fn remove_named_install() -> Result<()> {
+    let cfg = cluster_config();
+    let Some(name) = cfg.instance.name() else {
+        anyhow::bail!(
+            "`weft daemon remove` takes a named install off the cluster, and {} is not \
+             set, which means the default install. That one holds every project on this \
+             machine; `./setup.sh --uninstall` is how it goes.",
+            weft_core::infra::INSTANCE_ENV
+        );
+    };
+    let instance = &cfg.instance;
+    // Postgres first, and waited for: its files are removed from the
+    // node next, and a server still running would write into a
+    // directory being deleted under it.
+    let postgres = kubectl(&[
+        "-n", &cfg.db_namespace, "delete", "deployment", "weft-postgres",
+        "--ignore-not-found", "--wait=true",
+    ])
+    .output()
+    .await?;
+    anyhow::ensure!(
+        postgres.status.success(),
+        "stopping {name}'s Postgres failed: {}",
+        String::from_utf8_lossy(&postgres.stderr)
+    );
+    if cfg.backend == ClusterBackend::Kind {
+        let node = format!("{}-control-plane", cfg.cluster_name);
+        let dir = format!("{NAMED_INSTALLS_NODE_PATH}/{name}");
+        let out = images::docker().args(["exec", &node, "rm", "-rf", &dir]).output().await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "removing {dir} inside the node {node} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Every namespace the install created: its two own, and every one
+    // its dispatcher made for tenants (they all start with the
+    // install's prefix, the shared worker namespace included). Not
+    // waited for: a namespace finishes terminating on its own, and
+    // nothing of another install can be in it.
+    let listing = kubectl(&["get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "listing namespaces failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let namespaces = install_namespaces(instance, &String::from_utf8_lossy(&listing.stdout));
+    if !namespaces.is_empty() {
+        let mut args = vec!["delete", "namespace", "--ignore-not-found", "--wait=false"];
+        args.extend(namespaces.iter().map(String::as_str));
+        let out = kubectl(&args).output().await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "deleting {name}'s namespaces failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Its cluster-wide objects, by the names `install_template_vars`
+    // gave them.
+    for (kind, object) in [
+        ("clusterrolebinding", instance.cluster_object("weft-dispatcher")),
+        ("clusterrolebinding", instance.cluster_object("weft-broker-tokenreview")),
+        ("persistentvolume", postgres_volume(instance)),
+    ] {
+        let out = kubectl(&["delete", kind, &object, "--ignore-not-found", "--wait=false"])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "deleting {kind} {object} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    if cfg.backend == ClusterBackend::Kind {
+        delete_install_bucket(&object_store_bucket(instance)).await?;
+    }
+    let stamps = install_stamp_dir();
+    match std::fs::remove_dir_all(&stamps) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("removing {}: {e}", stamps.display()),
+    }
+    println!("install '{name}' removed");
+    Ok(())
+}
+
+/// Which of the cluster's namespaces (a space-separated listing) belong
+/// to a named install: its system and db namespaces, and every tenant
+/// namespace its dispatcher created.
+fn install_namespaces(instance: &weft_core::infra::Instance, listing: &str) -> Vec<String> {
+    let own = [instance.system_namespace(), instance.db_namespace()];
+    let tenant_prefix = instance.tenant_prefix();
+    listing
+        .split_whitespace()
+        .filter(|ns| own.iter().any(|o| o == ns) || ns.starts_with(tenant_prefix.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Drop a named install's bucket from the object store. The store's
+/// shell exits 0 on errors, so the bucket listing afterwards is what
+/// says whether it is gone.
+async fn delete_install_bucket(bucket: &str) -> Result<()> {
+    let weed = |command: String| {
+        images::docker()
+            .args(["exec", OBJECT_STORE_CONTAINER, "sh", "-c", &format!("echo '{command}' | weed shell")])
+            .output()
+    };
+    weed(format!("s3.bucket.delete -name {bucket}")).await?;
+    let listing = weed("s3.bucket.list".to_string()).await?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "listing the object store's buckets failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let still_there = String::from_utf8_lossy(&listing.stdout)
+        .split_whitespace()
+        .any(|word| word == bucket);
+    anyhow::ensure!(
+        !still_there,
+        "the bucket {bucket} is still on the object store after deleting it; remove it with \
+         `docker exec {OBJECT_STORE_CONTAINER} sh -c 'echo \"s3.bucket.delete -name {bucket}\" | weed shell'`"
+    );
+    Ok(())
+}
+
 async fn stop() -> Result<()> {
     let cfg = cluster_config();
     let _ = kubectl(&[
@@ -1665,9 +2046,18 @@ async fn status(ctx: &Ctx) -> Result<()> {
     // The public trigger surface, when it is open: what providers
     // deliver events to, and what a trigger's setup instructions ask
     // the operator to paste at the provider.
+    // The surface belongs to the default install (the tunnel opens the
+    // front door's public listener, which routes to it alone), so the
+    // machine-wide address says nothing about a named one.
+    if let Some(name) = cfg.instance.name() {
+        println!(
+            "public trigger surface: none for install '{name}' (the default install owns it)"
+        );
+        return Ok(());
+    }
     match current_public_url() {
         Some(url) => println!(
-            "public trigger surface: {url} (events + signal fire routes only; \
+            "public trigger surface: {url} (the public trigger routes only; \
              ./setup.sh --no-public-url closes it)"
         ),
         None => println!("public trigger surface: closed"),
@@ -1693,7 +2083,7 @@ async fn logs(tail: usize, follow: bool) -> Result<()> {
     Ok(())
 }
 
-// ----- Cluster + ingress bootstrap ----------------------------------
+// ----- Cluster bootstrap ------------------------------------------------
 
 /// Where the database's files live: a directory on this machine, mounted into
 /// the cluster's node.
@@ -1716,6 +2106,11 @@ const NODE_POSTGRES_PATH: &str = "/var/weft-postgres";
 
 /// The cluster's shape. Fingerprinted, so a change here rebuilds the node
 /// rather than being silently ignored on every machine that already has one.
+///
+/// Only what a running node cannot change belongs here: a rebuild
+/// destroys every project's own database, so a setting that can be
+/// applied to the live node (a label, a component flag) is applied there
+/// instead (see `trim_single_node_control_plane`).
 ///
 /// The port mappings are the whole path from this machine into the
 /// cluster: docker publishes each configured loopback port straight to
@@ -1765,11 +2160,6 @@ nodes:
   - role: control-plane
     kubeadmConfigPatches:
       - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
-      - |
         kind: ClusterConfiguration
         apiServer:
           extraArgs:
@@ -1788,94 +2178,18 @@ nodes:
 /// built. Docker binds each one when the node container starts, and a
 /// port something else holds fails `kind create cluster` with a docker
 /// error that names neither the port's purpose nor the holder.
-///
-/// The one holder this code knows is its own past: a weft older than
-/// this one kept `kubectl port-forward` tunnels alive on these ports
-/// through `weft daemon supervise-forward` keepers, and those outlive
-/// an install (they hold the old binary's inode). An upgrade has to
-/// come up by itself, so they are stopped here, with their pid and log
-/// files, and only a port held by something unknown is refused.
 async fn free_mapped_ports(cfg: &ClusterConfig) -> Result<()> {
-    let stale = stale_forward_processes();
-    if !stale.is_empty() {
-        println!(
-            "stopping {} port-forward keeper process(es) left by an older weft (pid {})",
-            stale.len(),
-            stale.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-        );
-        for pid in &stale {
-            let _ = tokio::process::Command::new("kill").arg(pid.to_string()).status().await;
-        }
-        remove_forward_litter();
-    }
     for m in MappedPort::ALL {
         let port = m.host_port(cfg);
-        // A killed keeper's socket closes shortly after the signal; give
-        // it a moment before deciding the port is somebody else's.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match std::net::TcpListener::bind(("127.0.0.1", port)) {
-                Ok(_) => break,
-                Err(_) if !stale.is_empty() && std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-                Err(e) => anyhow::bail!(
-                    "127.0.0.1:{port} is not free ({e}), and the kind node needs it for the \
-                     {m:?} port mapping. Find what holds it (`ss -ltnp | grep :{port}`), stop \
-                     it, and re-run `weft daemon start`."
-                ),
-            }
+        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            anyhow::bail!(
+                "127.0.0.1:{port} is not free ({e}), and the kind node needs it for the \
+                 {m:?} port mapping. Find what holds it (`ss -ltnp | grep :{port}`), stop \
+                 it, and re-run `weft daemon start`."
+            );
         }
     }
     Ok(())
-}
-
-/// The pids of every `weft daemon supervise-forward` keeper and every
-/// `kubectl port-forward` it spawned, read off `/proc`: processes an
-/// older weft left running, which nothing else stops.
-fn stale_forward_processes() -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-    let mut pids = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
-        if pid == std::process::id() {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else { continue };
-        let args: Vec<&str> = raw.split(|b| *b == 0).filter_map(|a| std::str::from_utf8(a).ok()).collect();
-        if is_stale_forward_cmdline(&args) {
-            pids.push(pid);
-        }
-    }
-    pids
-}
-
-/// Whether a process command line is an old weft's keeper or the
-/// tunnel it kept: `weft daemon supervise-forward ...`, or `kubectl
-/// port-forward` aimed at one of the daemon's services.
-fn is_stale_forward_cmdline(args: &[&str]) -> bool {
-    let program = args.first().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or("");
-    match program {
-        "weft" => args.get(1) == Some(&"daemon") && args.get(2) == Some(&"supervise-forward"),
-        "kubectl" => {
-            args.contains(&"port-forward")
-                && args.iter().any(|a| *a == "svc/weft-dispatcher" || a.starts_with("svc/ingress-nginx") || a.starts_with("svc/envoy-"))
-        }
-        _ => false,
-    }
-}
-
-/// Remove the pid and log files the old keepers wrote under the data
-/// dir; nothing reads them any more.
-fn remove_forward_litter() {
-    let Ok(entries) = std::fs::read_dir(data_dir()) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("port-forward-") && (name.ends_with(".pid") || name.ends_with(".log")) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }
 
 /// Whether the running kind node carries the postgres host mount. The
@@ -1947,6 +2261,14 @@ fn record_install(name: &str, want: &str) -> Result<()> {
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(data_dir().join(format!("installed-{name}.txt")), want)?;
     Ok(())
+}
+
+/// Drop the record of an install the cluster no longer carries.
+fn forget_install(name: &str) -> Result<()> {
+    match std::fs::remove_file(data_dir().join(format!("installed-{name}.txt"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Where the fingerprint of the config the current node was built from is
@@ -2172,67 +2494,6 @@ async fn kind_network_ipv4() -> Result<KindNetworkIpv4> {
             Some(KindNetworkIpv4 { gateway: gateway.to_string(), subnet })
         })
         .ok_or_else(|| anyhow::anyhow!("no IPv4 range on the kind docker network: {stdout}"))
-}
-
-/// The cluster DNS Service's address, for nginx's `resolver`.
-///
-/// READ from the cluster, like its sibling `apiserver_endpoint`: a
-/// resolver pointing at the wrong address turns every proxied request
-/// into a lookup failure, so this asks rather than assumes.
-///
-/// `kube-dns` is the Service name every Kubernetes distribution uses;
-/// `WEFT_CLUSTER_DNS_IP` names the address directly for one that does
-/// not.
-///
-/// A configured address is PARSED, like the CIDRs beside it, and a
-/// value that is not an IP address fails here naming the variable.
-/// The alternative is the failure this whole directive exists to
-/// prevent, arriving silently: nginx accepts almost any token as a
-/// resolver, starts happily, passes the rollout gate, and then fails
-/// every proxied request with nothing anywhere naming the cause.
-async fn cluster_dns_ip() -> Result<String> {
-    if let Some(configured) = configured_dns_ip(&cluster_config().cluster_dns_ip)? {
-        return Ok(configured);
-    }
-    let out = kubectl(&[
-        "-n",
-        "kube-system",
-        "get",
-        "service",
-        "kube-dns",
-        "-o",
-        "jsonpath={.spec.clusterIP}",
-    ])
-    .output()
-    .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "reading the cluster DNS service address failed: {}. Set WEFT_CLUSTER_DNS_IP if \
-             this cluster's DNS Service is not kube-system/kube-dns.",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if ip.is_empty() {
-        anyhow::bail!(
-            "the cluster DNS service (kube-system/kube-dns) has no address; set \
-             WEFT_CLUSTER_DNS_IP to this cluster's DNS Service address"
-        );
-    }
-    Ok(ip)
-}
-
-/// The DNS address an operator configured, or `None` when they
-/// configured none. Anything that is not an IP address is refused
-/// here, naming the variable, rather than reaching nginx.
-fn configured_dns_ip(raw: &str) -> Result<Option<String>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    raw.parse::<std::net::IpAddr>()
-        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_DNS_IP='{raw}': {e}"))?;
-    Ok(Some(raw.to_string()))
 }
 
 /// An endpoint URL's host, classified for the store egress opening.
@@ -2467,46 +2728,118 @@ fn object_store_run_args(cfg: &ClusterConfig) -> Vec<String> {
     .collect()
 }
 
-/// The ingress controller's bundle. Changing this re-applies it on every
-/// machine, which is why it is a constant rather than a literal at the call
-/// site.
-const INGRESS_MANIFEST: &str = "https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml";
+/// The kind node's control-plane components that elect a leader among
+/// copies of themselves. On one node there is only ever one copy, so the
+/// election is a lease written to the apiserver every couple of seconds
+/// for nothing: most of an idle cluster's writes.
+const LEADER_ELECTED_MANIFESTS: [&str; 2] = [
+    "/etc/kubernetes/manifests/kube-scheduler.yaml",
+    "/etc/kubernetes/manifests/kube-controller-manager.yaml",
+];
 
-async fn ensure_ingress_controller() -> Result<()> {
-    let installed = kubectl(&["get", "namespace", "ingress-nginx", "-o", "name"])
+/// Take out what a one-node cluster pays for copies it cannot have:
+/// leader election in the scheduler and the controller manager (their
+/// static pod manifests, which the kubelet restarts them from when the
+/// file changes), and the second CoreDNS replica. Only ever run on the
+/// kind node weft builds, which is one node by construction; none of it
+/// limits how much that node can run. Done here rather than in the kind
+/// config so a node that already exists gets it without being rebuilt.
+async fn trim_single_node_control_plane(cfg: &ClusterConfig) -> Result<()> {
+    let node = format!("{}-control-plane", cfg.cluster_name);
+    for manifest in LEADER_ELECTED_MANIFESTS {
+        let out = images::docker().args(["exec", &node, "cat", manifest]).output().await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "reading {manifest} on the kind node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let Some(trimmed) = without_leader_election(&String::from_utf8_lossy(&out.stdout))? else {
+            continue;
+        };
+        println!("turning off leader election in {manifest} (one node, one copy)");
+        // Written in place (the same file, truncated), never beside it:
+        // the kubelet runs every manifest in that directory, so a
+        // temporary file there would start a second copy.
+        let mut child = images::docker()
+            .args(["exec", "-i", &node, "sh", "-c", &format!("cat > {manifest}")])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            stdin.write_all(trimmed.as_bytes()).await?;
+        }
+        let status = child.wait().await?;
+        anyhow::ensure!(status.success(), "writing {manifest} on the kind node failed with {status}");
+    }
+    let out = kubectl(&["-n", "kube-system", "scale", "deployment", "coredns", "--replicas=1"])
         .output()
         .await?;
-    let present = installed.status.success() && !installed.stdout.is_empty();
-    // Present is not the same as current. The stamp says WHICH bundle this
-    // cluster was given, so changing the bundle re-applies it here instead of
-    // only reaching machines that have never installed one.
-    if present && !install_is_stale("ingress", INGRESS_MANIFEST) {
-        return Ok(());
+    anyhow::ensure!(
+        out.status.success(),
+        "scaling CoreDNS to one replica failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// A control-plane static pod manifest with leader election turned off,
+/// or `None` when it already is. The manifest has to carry the flag the
+/// way kubeadm writes it: anything else is a manifest this does not
+/// understand, refused rather than edited blind.
+fn without_leader_election(manifest: &str) -> Result<Option<String>> {
+    const ON: &str = "- --leader-elect=true\n";
+    const OFF: &str = "- --leader-elect=false\n";
+    if manifest.contains(OFF) {
+        return Ok(None);
     }
-    println!("installing nginx-ingress controller");
-    let status = kubectl(&["apply", "-f", INGRESS_MANIFEST]).status().await?;
-    if !status.success() {
-        anyhow::bail!("ingress install failed with {status}");
+    anyhow::ensure!(
+        manifest.matches(ON).count() == 1,
+        "the manifest does not carry `--leader-elect=true` once, as kubeadm writes it"
+    );
+    Ok(Some(manifest.replacen(ON, OFF, 1)))
+}
+
+/// Remove the front doors the Envoy Gateway replaced, from a cluster an
+/// earlier weft installed them on: the ingress-nginx controller (its
+/// whole namespace, and its node port, which the gateway's `local`
+/// listener now takes), the dispatcher's Ingress object, and the public
+/// trigger surface's nginx proxy. Left running, the old controller would
+/// hold the node port the new door needs and keep its own leader-election
+/// lease renewing for nothing. Idempotent: each delete ignores what is
+/// already gone, so a cluster that never had them passes through.
+async fn retire_replaced_front_doors(cfg: &ClusterConfig) -> Result<()> {
+    // The old controller's NodePort Service goes first, and is waited
+    // out: it holds the node port `kind-node-ports.yaml` gives the local
+    // door, and the namespace delete below returns before its Services
+    // are gone, so the door's apply would meet "port already allocated".
+    let deletes: [&[&str]; 4] = [
+        &[
+            "-n", "ingress-nginx", "delete", "service", "ingress-nginx-node-port",
+            "--ignore-not-found", "--wait=true",
+        ],
+        &["delete", "namespace", "ingress-nginx", "--ignore-not-found", "--wait=false"],
+        &[
+            "-n", &cfg.system_namespace, "delete", "ingress", "weft-dispatcher", "--ignore-not-found",
+        ],
+        &[
+            "-n", &cfg.system_namespace, "delete",
+            "deployment/weft-public-proxy", "service/weft-public-proxy",
+            "configmap/weft-public-proxy-config", "networkpolicy/public-proxy",
+            "configmap/weft-public-page",
+            "--ignore-not-found",
+        ],
+    ];
+    for args in deletes {
+        let out = kubectl(args).output().await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "removing a front door the Envoy Gateway replaced failed (`kubectl {}`): {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    record_install("ingress", INGRESS_MANIFEST)?;
-    // `kubectl wait --for=condition=ready pod --selector=...` errors
-    // immediately if zero pods exist at the moment of the call.
-    // Right after `kubectl apply`, the Deployment is created but the
-    // ReplicaSet hasn't materialized any pods yet. `rollout status`
-    // handles that case (polls until at least one replica is ready).
-    let wait = kubectl(&[
-        "-n",
-        "ingress-nginx",
-        "rollout",
-        "status",
-        "deployment/ingress-nginx-controller",
-        "--timeout=180s",
-    ])
-    .status()
-    .await?;
-    if !wait.success() {
-        anyhow::bail!("ingress controller failed to become ready");
-    }
+    forget_install("ingress")?;
     Ok(())
 }
 
@@ -2553,25 +2886,29 @@ async fn ensure_envoy_gateway() -> Result<()> {
     if !wait.success() {
         anyhow::bail!("Envoy Gateway controller failed to become ready");
     }
-    enable_envoy_backend_api().await?;
+    configure_envoy_gateway().await?;
     Ok(())
 }
 
-/// Enable the extension APIs the live-caller gateway needs, in the
-/// controller's config. `EnvoyGateway` is the config FILE's kind, living
-/// in the `envoy-gateway-config` ConfigMap, not a cluster CR, so we patch
-/// the ConfigMap's `extensionApis` and restart the controller to pick it
-/// up. Idempotent: a no-op once both are already present.
+/// What weft needs from the Envoy Gateway controller's own config, set
+/// in place. `EnvoyGateway` is the config FILE's kind, living in the
+/// `envoy-gateway-config` ConfigMap, not a cluster CR, so the ConfigMap
+/// is patched and the controller restarted onto it. A no-op once all of
+/// it is there.
 ///
-/// Two of them, for two things the gateway cannot do without:
-///   - `enableBackend`: the DynamicResolver the route resolves each
-///     worker pod through, so one route serves every pod.
-///   - `enableEnvoyPatchPolicy`: lets `gateway.yaml` put a socket option
-///     on the listener, which is how a caller who VANISHES (no close, no
-///     goodbye: a closed lid, a dropped network) is ever noticed. Without
-///     it the gateway holds that connection, and the worker's run behind
-///     it, until the kernel gives up a quarter of an hour later.
-async fn enable_envoy_backend_api() -> Result<()> {
+///   - `extensionApis.enableBackend`: the DynamicResolver the live route
+///     resolves each worker pod through, so one route serves every pod.
+///   - `extensionApis.enableEnvoyPatchPolicy`: lets `gateway.yaml` put a
+///     socket option on the listener, which is how a caller who VANISHES
+///     (no close, no goodbye: a closed lid, a dropped network) is ever
+///     noticed. Without it the gateway holds that connection, and the
+///     worker's run behind it, until the kernel gives up a quarter of an
+///     hour later.
+///   - `provider.kubernetes.leaderElection.disable`: the controller runs
+///     one copy on a one-node cluster, so there is never another to hand
+///     over to, and electing a leader is a lease written to the apiserver
+///     every few seconds for nothing.
+async fn configure_envoy_gateway() -> Result<()> {
     let out = kubectl(&[
         "-n",
         "envoy-gateway-system",
@@ -2586,37 +2923,12 @@ async fn enable_envoy_backend_api() -> Result<()> {
     if !out.status.success() {
         anyhow::bail!("could not read envoy-gateway-config ConfigMap");
     }
-    let current = String::from_utf8_lossy(&out.stdout).to_string();
-    const ENABLED: &str =
-        "extensionApis:\n  enableBackend: true\n  enableEnvoyPatchPolicy: true";
-    if current.contains("enableBackend: true")
-        && current.contains("enableEnvoyPatchPolicy: true")
-    {
-        return Ok(()); // already enabled
-    }
-    // Replace the empty `extensionApis: {}` with the enabled block. The
-    // controller writes `extensionApis: {}` by default; if a future
-    // version changes that spelling this match misses and we bail loud
-    // rather than silently leaving the extension APIs off.
-    //
-    // An install from before the patch policy was needed carries the
-    // older one-line block, so that spelling is upgraded in place rather
-    // than left half-enabled.
-    let patched = if current.contains("extensionApis: {}") {
-        current.replace("extensionApis: {}", ENABLED)
-    } else if current.contains("extensionApis:\n  enableBackend: true") {
-        current.replace("extensionApis:\n  enableBackend: true", ENABLED)
-    } else {
-        anyhow::bail!(
-            "envoy-gateway-config has an unexpected extensionApis shape; \
-             cannot enable the Backend API and the patch policy automatically. \
-             Set `extensionApis.enableBackend: true` and \
-             `extensionApis.enableEnvoyPatchPolicy: true` in the ConfigMap manually."
-        )
+    let Some(configured) = envoy_gateway_config(&String::from_utf8_lossy(&out.stdout))? else {
+        return Ok(());
     };
-    // Apply the new ConfigMap data. `kubectl patch --type merge` with the
-    // full data key replaces just that field.
-    let patch = serde_json::json!({ "data": { "envoy-gateway.yaml": patched } }).to_string();
+    // `kubectl patch --type merge` with the full data key replaces just
+    // that field.
+    let patch = serde_json::json!({ "data": { "envoy-gateway.yaml": configured } }).to_string();
     let status = kubectl(&[
         "-n",
         "envoy-gateway-system",
@@ -2631,7 +2943,7 @@ async fn enable_envoy_backend_api() -> Result<()> {
     .status()
     .await?;
     if !status.success() {
-        anyhow::bail!("failed to patch envoy-gateway-config for the Backend API");
+        anyhow::bail!("failed to patch envoy-gateway-config");
     }
     // Restart the controller to reload the config, and WAIT for it to come
     // back ready. Both must succeed: if the reload fails or never becomes
@@ -2650,8 +2962,8 @@ async fn enable_envoy_backend_api() -> Result<()> {
     .await?;
     if !restart.success() {
         anyhow::bail!(
-            "envoy-gateway controller restart failed; the Backend API config was patched \
-             but not reloaded, so live caller connections would not route"
+            "envoy-gateway controller restart failed; its config was patched but not \
+             reloaded, so live caller connections would not route"
         );
     }
     let ready = kubectl(&[
@@ -2666,11 +2978,42 @@ async fn enable_envoy_backend_api() -> Result<()> {
     .await?;
     if !ready.success() {
         anyhow::bail!(
-            "envoy-gateway controller did not become ready after the Backend API reload; \
+            "envoy-gateway controller did not become ready after its config reload; \
              live caller connections would not route"
         );
     }
     Ok(())
+}
+
+/// The controller config `current` with what weft needs set (see
+/// [`configure_envoy_gateway`]), or `None` when it already has all of
+/// it. Everything else in the document is kept as the controller wrote
+/// it. A document of the wrong shape is refused rather than rewritten.
+fn envoy_gateway_config(current: &str) -> Result<Option<String>> {
+    use serde_yaml::{Mapping, Value};
+    let mut doc: Value = serde_yaml::from_str(current)
+        .map_err(|e| anyhow::anyhow!("envoy-gateway-config does not hold a YAML document: {e}"))?;
+    fn section<'a>(parent: &'a mut Value, key: &str) -> Result<&'a mut Value> {
+        let map = parent
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("envoy-gateway-config: expected a map above `{key}`"))?;
+        let entry = map.entry(Value::from(key)).or_insert_with(|| Value::Mapping(Mapping::new()));
+        anyhow::ensure!(entry.is_mapping(), "envoy-gateway-config: `{key}` is not a map");
+        Ok(entry)
+    }
+    let before = doc.clone();
+    let apis = section(&mut doc, "extensionApis")?;
+    for flag in ["enableBackend", "enableEnvoyPatchPolicy"] {
+        apis.as_mapping_mut().expect("checked above").insert(Value::from(flag), Value::from(true));
+    }
+    let provider = section(&mut doc, "provider")?;
+    let kubernetes = section(provider, "kubernetes")?;
+    let election = section(kubernetes, "leaderElection")?;
+    election.as_mapping_mut().expect("checked above").insert(Value::from("disable"), Value::from(true));
+    if doc == before {
+        return Ok(None);
+    }
+    Ok(Some(serde_yaml::to_string(&doc)?))
 }
 
 /// The pooled tiers the dispatcher spawns dynamically, addressed by
@@ -2958,57 +3301,6 @@ async fn kubectl_delete_rendered(path: &Path, vars: &[(&str, String)]) -> Result
     Ok(())
 }
 
-/// Ship `deploy/public-page/` (the static page the proxy serves on
-/// the tunnel's bare root) into the cluster as the `weft-public-page`
-/// ConfigMap: text files as plain data, everything else as binary.
-/// Returns whether the content changed since the last apply (the
-/// proxy pod mounts the files at start, so a change needs its roll).
-async fn apply_public_page_configmap(
-    page_dir: &Path,
-    pending: &mut PendingStamps,
-) -> Result<bool> {
-    let mut data = serde_json::Map::new();
-    let mut binary = serde_json::Map::new();
-    let entries = std::fs::read_dir(page_dir)
-        .map_err(|e| anyhow::anyhow!("read the public page dir {}: {e}", page_dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let bytes = std::fs::read(entry.path())?;
-        match String::from_utf8(bytes) {
-            Ok(text) => {
-                data.insert(name, serde_json::Value::String(text));
-            }
-            Err(raw) => {
-                binary.insert(
-                    name,
-                    serde_json::Value::String(
-                        base64::engine::general_purpose::STANDARD.encode(raw.into_bytes()),
-                    ),
-                );
-            }
-        }
-    }
-    anyhow::ensure!(
-        data.contains_key("index.html"),
-        "{} has no index.html; the proxy's root page needs one",
-        page_dir.display()
-    );
-    let configmap = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": { "name": "weft-public-page", "namespace": cluster_config().system_namespace },
-        "data": data,
-        "binaryData": binary,
-    })
-    .to_string();
-    kubectl_apply_stdin(&configmap, "weft-public-page configmap").await?;
-    Ok(manifest_apply_changed_by_stamp(Path::new("weft-public-page"), &configmap, pending))
-}
-
 /// Delete the named tunnel's token Secret, checked (missing is fine;
 /// a failed delete of a credential is not).
 async fn delete_tunnel_token_secret() -> Result<()> {
@@ -3061,9 +3353,20 @@ async fn kubectl_apply_changed(
 /// Lives next to nothing but the apply itself so no apply path can
 /// forget it: both the fresh-start path and the rolling-restart path
 /// call this immediately before applying the manifest.
-async fn prepare_postgres_apply(manifest: &Path) -> Result<()> {
-    guard_postgres_data_major(manifest).await?;
-    rebind_released_postgres_volume().await
+async fn prepare_postgres_apply(cfg: &ClusterConfig, manifest: &Path) -> Result<()> {
+    // Only the default install keeps its database on this machine; a
+    // named install's starts empty inside the node every time.
+    if cfg.instance.name().is_none() {
+        guard_postgres_data_major(manifest).await?;
+    }
+    rebind_released_postgres_volume(&postgres_volume(&cfg.instance)).await
+}
+
+/// The name of an install's Postgres PersistentVolume (cluster-wide,
+/// so one per install).
+// SYNC: the volume name <-> deploy/k8s/postgres.yaml (WEFT_POSTGRES_VOLUME)
+fn postgres_volume(instance: &weft_core::infra::Instance) -> String {
+    instance.cluster_object("weft-postgres-data")
 }
 
 /// The data directory now outlives the node, which makes the Postgres
@@ -3173,13 +3476,13 @@ fn postgres_major_in_manifest(text: &str) -> Option<String> {
 /// deleted; the data survived under reclaim policy Retain), clear the
 /// stale claimRef uid so the recreated claim can rebind. A missing
 /// volume (first run) is a no-op.
-async fn rebind_released_postgres_volume() -> Result<()> {
+async fn rebind_released_postgres_volume(volume: &str) -> Result<()> {
     // `--ignore-not-found` exits 0 with EMPTY output for a missing
     // volume (the apply below creates it), so absence never has to be
     // told apart from a real failure (API server down, a wrong kube
     // context) by string-matching stderr; every real failure bails.
     let out = kubectl(&[
-        "get", "pv", "weft-postgres-data", "--ignore-not-found", "-o",
+        "get", "pv", volume, "--ignore-not-found", "-o",
         "jsonpath={.status.phase}",
     ])
     .output()
@@ -3199,7 +3502,7 @@ async fn rebind_released_postgres_volume() -> Result<()> {
         // always carry both fields. Nulling them is a no-op for a
         // missing one.
         let status = kubectl(&[
-            "patch", "pv", "weft-postgres-data", "--type=merge", "-p",
+            "patch", "pv", volume, "--type=merge", "-p",
             r#"{"spec":{"claimRef":{"uid":null,"resourceVersion":null}}}"#,
         ])
         .status()
@@ -3500,6 +3803,20 @@ const ACCESS_APPS_SECRET_KEY: &str = "access-apps.json";
 /// B's roll as done (the exact silent-stale-broker gap the stamps
 /// exist to close, arriving through the key instead of the timing).
 fn manifest_stamp_file(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy().replace(['/', ':'], "_"))
+        .unwrap_or_else(|| "manifest".into());
+    install_stamp_dir().join(format!("{stem}.hash"))
+}
+
+/// The directory every stamp of THIS install on THIS cluster lives in:
+/// the cluster's own for the default install (where every existing
+/// stamp already is), a subdirectory per named install, since two
+/// installs render the same file differently and each must answer "did
+/// this change since MY last apply". `weft daemon remove` deletes a
+/// named install's whole.
+fn install_stamp_dir() -> PathBuf {
     // Whitelist sanitizing: anything but [A-Za-z0-9._-] becomes `_`,
     // so no context string (however hostile: `..`, a backslash) can
     // name a directory outside the stamp root. A digest of the RAW
@@ -3517,12 +3834,13 @@ fn manifest_stamp_file(path: &Path) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    let cluster = format!("{sanitized}-{}", &digest[..8]);
-    let stem = path
-        .file_name()
-        .map(|s| s.to_string_lossy().replace(['/', ':'], "_"))
-        .unwrap_or_else(|| "manifest".into());
-    data_dir().join("manifest-stamps").join(cluster).join(format!("{stem}.hash"))
+    let cluster = data_dir()
+        .join("manifest-stamps")
+        .join(format!("{sanitized}-{}", &digest[..8]));
+    match cluster_config().instance.name() {
+        None => cluster,
+        Some(name) => cluster.join("installs").join(name),
+    }
 }
 
 /// Stamp writes held back until the change they record has been fully
@@ -3593,24 +3911,25 @@ async fn require_binary(name: &str) -> Result<()> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{
+    use super::{public_url_unreachable, PUBLIC_DOOR_URL, 
         access_apps_file, access_apps_plan, kind_cluster_config, substitute_placeholders,
         AccessAppsPlan, ClusterBackend, ClusterConfig, MappedPort,
     };
 
-    fn kind_config_with_ports(dispatcher: u16, ingress: u16, gateway: u16) -> ClusterConfig {
+    fn kind_config_with_ports(dispatcher: u16, local: u16, gateway: u16) -> ClusterConfig {
         ClusterConfig {
             cluster_name: "weft-test".into(),
             kube_context: "kind-weft-test".into(),
+            instance: weft_core::infra::Instance::default_install(),
+            time_scale: 1.0,
             system_namespace: "weft-system".into(),
             db_namespace: "weft-db".into(),
             dispatcher_port: dispatcher,
-            ingress_port: ingress,
+            local_port: local,
             gateway_port: gateway,
             seaweed_port: 9096,
             service_cidr: "10.96.0.0/12".into(),
             pod_cidr: "10.244.0.0/16".into(),
-            cluster_dns_ip: String::new(),
             backend: ClusterBackend::Kind,
         }
     }
@@ -3625,7 +3944,7 @@ mod tests {
         let config = kind_cluster_config(&cfg);
         for (m, host_port) in [
             (MappedPort::Dispatcher, 19999),
-            (MappedPort::Ingress, 19998),
+            (MappedPort::Local, 19998),
             (MappedPort::Gateway, 19097),
         ] {
             let mapping = format!(
@@ -3699,7 +4018,7 @@ mod tests {
     /// Every pinned node port sits in the lower band of the default
     /// node-port range that the apiserver reserves for explicit
     /// requests (the first 128 of 30000-32767), so a Service created
-    /// before ours (ingress-nginx's, Envoy Gateway's) never gets one
+    /// before ours (the one Envoy Gateway generates) never gets one
     /// of them from a dynamic allocation.
     #[test]
     fn node_ports_sit_in_the_static_band_and_are_distinct() {
@@ -3731,9 +4050,293 @@ mod tests {
             assert_eq!(rendered.matches(&line).count(), 1, "{m:?} pinned once:\n{rendered}");
         }
         assert_eq!(rendered.matches("type: NodePort").count(), 3);
-        for ns in ["namespace: weft-system", "namespace: ingress-nginx", "namespace: envoy-gateway-system"] {
+        for ns in ["namespace: weft-system", "namespace: envoy-gateway-system"] {
             assert!(rendered.contains(ns), "missing {ns}");
         }
+    }
+
+    /// Render a shipped manifest with an install's own vars, every other
+    /// placeholder filled with a stand-in: what tells installs apart is
+    /// all this looks at.
+    fn render_for_install(file: &str, instance: &weft_core::infra::Instance) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s").join(file);
+        let mut text = std::fs::read_to_string(&path).expect("manifest readable");
+        for (key, value) in super::install_template_vars(instance, 0.05) {
+            text = text.replace(&format!("${{{key}}}"), &value);
+        }
+        while let Some(start) = text.find("${") {
+            let end = start + text[start..].find('}').expect("closed placeholder");
+            text.replace_range(start..=end, "stand-in");
+        }
+        text
+    }
+
+    const INSTALL_MANIFESTS: [&str; 6] = [
+        "system-namespace.yaml",
+        "db-namespace.yaml",
+        "postgres.yaml",
+        "broker.yaml",
+        "dispatcher.yaml",
+        "instance-door.yaml",
+    ];
+
+    #[test]
+    fn a_named_install_renders_every_manifest_into_names_of_its_own() {
+        let cell = weft_core::infra::Instance::named("cell3").unwrap();
+        for file in INSTALL_MANIFESTS {
+            let yaml = render_for_install(file, &cell);
+            for line in yaml.lines().filter(|l| !l.trim_start().starts_with('#')) {
+                for default in ["weft-system", "weft-db"] {
+                    assert!(
+                        !line.trim_end().ends_with(&format!(": {default}")) && !line.contains(&format!(".{default}.")),
+                        "{file} still names the default install's {default}: {line}"
+                    );
+                }
+            }
+        }
+        let postgres = render_for_install("postgres.yaml", &cell);
+        assert!(postgres.contains("name: weft-postgres-data-cell3"));
+        assert!(postgres.contains("path: /var/weft-installs/cell3/postgres"));
+        let dispatcher = render_for_install("dispatcher.yaml", &cell);
+        assert!(dispatcher.contains("name: weft-dispatcher-cell3"), "its own ClusterRoleBinding");
+        assert!(dispatcher.contains("weft-broker.weft-cell3-db.svc"));
+        assert!(dispatcher.contains("value: \"cell3\""), "WEFT_INSTANCE rides the pod");
+        assert!(dispatcher.contains("value: \"0.05\""), "WEFT_TIME_SCALE rides the pod");
+    }
+
+    #[test]
+    fn the_default_install_renders_the_names_every_cluster_already_has() {
+        let default = weft_core::infra::Instance::default_install();
+        let vars: std::collections::BTreeMap<_, _> =
+            super::install_template_vars(&default, 1.0).into_iter().collect();
+        assert_eq!(vars["WEFT_SYSTEM_NAMESPACE"], "weft-system");
+        assert_eq!(vars["WEFT_DB_NAMESPACE"], "weft-db");
+        assert_eq!(vars["WEFT_INSTANCE"], "");
+        assert_eq!(vars["WEFT_INSTANCE_SUFFIX"], "");
+        assert_eq!(vars["WEFT_TIME_SCALE"], "1");
+        assert_eq!(vars["WEFT_POSTGRES_VOLUME"], "weft-postgres-data");
+        assert_eq!(vars["WEFT_POSTGRES_NODE_PATH"], "/var/weft-postgres");
+        // The exact bytes the credentials Secret carried before installs
+        // were named, so an existing cluster sees no change.
+        assert_eq!(
+            vars["WEFT_DATABASE_URL_BASE64"],
+            "cG9zdGdyZXM6Ly93ZWZ0OndlZnQtbG9jYWwtZGV2QHdlZnQtcG9zdGdyZXMud2VmdC1kYi5zdmMuY2x1c3Rlci5sb2NhbDo1NDMyL3dlZnQ="
+        );
+        assert_eq!(super::object_store_bucket(&default), "weft");
+    }
+
+    #[test]
+    fn removing_a_named_install_takes_its_namespaces_and_nobody_elses() {
+        let cell = weft_core::infra::Instance::named("cell3").unwrap();
+        let listing = "default weft-system weft-db wft-shared-workers wft-project-local--abc \
+                       weft-cell3-system weft-cell3-db wft-cell3-shared-workers \
+                       wft-cell3-project-local--abc weft-cell30-system wft-cell30-shared-workers";
+        assert_eq!(
+            super::install_namespaces(&cell, listing),
+            vec![
+                "weft-cell3-system",
+                "weft-cell3-db",
+                "wft-cell3-shared-workers",
+                "wft-cell3-project-local--abc",
+            ]
+        );
+    }
+
+    /// The controller config as a fresh v1.8 install writes it: the
+    /// extension APIs off, a leader elected.
+    const FRESH_ENVOY_GATEWAY_CONFIG: &str = "apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyGateway
+extensionApis: {}
+gateway:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+provider:
+  kubernetes:
+    shutdownManager:
+      image: envoyproxy/gateway:v1.8.1
+  type: Kubernetes
+";
+
+    #[test]
+    fn the_gateway_controller_gets_its_extension_apis_and_no_leader_election() {
+        let configured = super::envoy_gateway_config(FRESH_ENVOY_GATEWAY_CONFIG).unwrap().expect("changed");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&configured).unwrap();
+        assert_eq!(doc["extensionApis"]["enableBackend"], serde_yaml::Value::from(true));
+        assert_eq!(doc["extensionApis"]["enableEnvoyPatchPolicy"], serde_yaml::Value::from(true));
+        assert_eq!(doc["provider"]["kubernetes"]["leaderElection"]["disable"], serde_yaml::Value::from(true));
+        // What the controller wrote is kept.
+        assert_eq!(doc["provider"]["type"], serde_yaml::Value::from("Kubernetes"));
+        assert_eq!(
+            doc["provider"]["kubernetes"]["shutdownManager"]["image"],
+            serde_yaml::Value::from("envoyproxy/gateway:v1.8.1")
+        );
+        // Once configured, nothing to do: no patch, no controller restart.
+        assert_eq!(super::envoy_gateway_config(&configured).unwrap(), None);
+    }
+
+    #[test]
+    fn leader_election_is_turned_off_once_and_only_where_kubeadm_put_it() {
+        let manifest = "spec:\n  containers:\n  - command:\n    - kube-scheduler\n    - --leader-elect=true\n    image: x\n";
+        let off = super::without_leader_election(manifest).unwrap().expect("changed");
+        assert!(off.contains("    - --leader-elect=false\n"));
+        assert!(!off.contains("--leader-elect=true"));
+        assert_eq!(off.replace("false", "true"), manifest, "nothing else moved");
+        assert_eq!(super::without_leader_election(&off).unwrap(), None, "already off: left alone");
+        assert!(super::without_leader_election("spec: {}\n").is_err(), "no flag: not edited blind");
+    }
+
+    #[test]
+    fn a_gateway_controller_config_of_the_wrong_shape_is_refused() {
+        assert!(super::envoy_gateway_config("extensionApis: [1]\n").is_err());
+        assert!(super::envoy_gateway_config("provider: plain\n").is_err());
+    }
+
+    /// Every document of a shipped manifest, parsed.
+    fn manifest_documents(name: &str) -> Vec<serde_yaml::Value> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s").join(name);
+        let text = std::fs::read_to_string(&path).expect("manifest readable");
+        text.split("\n---")
+            .map(|doc| serde_yaml::from_str::<serde_yaml::Value>(doc).expect("each document parses"))
+            .filter(|doc| !doc.is_null())
+            .collect()
+    }
+
+    /// The public trigger surface is an allowlist, and this is its
+    /// contract: the `public` listener carries exactly these routes and
+    /// nothing else attaches to it, so any other path is Envoy's 404
+    /// without the dispatcher ever seeing it.
+    #[test]
+    fn the_public_door_lets_through_exactly_the_allowlist() {
+        let docs = manifest_documents("gateway.yaml");
+        let gateway = docs.iter().find(|d| d["kind"] == "Gateway").expect("the Gateway");
+        let public = gateway["spec"]["listeners"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == "public")
+            .expect("a public listener");
+        assert_eq!(public["port"], serde_yaml::Value::from(8080));
+        assert!(public["hostname"].is_null());
+        assert_eq!(public["allowedRoutes"]["namespaces"]["from"], serde_yaml::Value::from("Same"));
+
+        // Every route that could land on the public listener: one naming
+        // it, or one naming the Gateway without a listener (which would
+        // attach to all of them).
+        let routes: Vec<&serde_yaml::Value> = docs
+            .iter()
+            .filter(|d| d["kind"] == "HTTPRoute")
+            .filter(|d| {
+                d["spec"]["parentRefs"].as_sequence().unwrap().iter().any(|p| {
+                    p["name"] == "weft-live-gateway"
+                        && (p["sectionName"] == "public" || p["sectionName"].is_null())
+                })
+            })
+            .collect();
+        assert_eq!(routes.len(), 1, "only the public door attaches to the public listener");
+        let door = routes[0];
+        assert_eq!(door["metadata"]["name"], serde_yaml::Value::from("weft-public-door"));
+
+        let mut allowed: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+        for rule in door["spec"]["rules"].as_sequence().unwrap() {
+            let forwards_https = rule["filters"].as_sequence().unwrap().iter().any(|f| {
+                f["type"] == "RequestHeaderModifier"
+                    && f["requestHeaderModifier"]["set"].as_sequence().unwrap().iter().any(|h| {
+                        h["name"] == "X-Forwarded-Proto" && h["value"] == "https"
+                    })
+            });
+            let rewrite = rule["filters"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .find(|f| f["type"] == "URLRewrite")
+                .map(|f| f["urlRewrite"]["path"]["replaceFullPath"].as_str().unwrap().to_string());
+            assert!(forwards_https || rewrite.is_some(), "a forwarded rule says https: {rule:?}");
+            for backend in rule["backendRefs"].as_sequence().unwrap() {
+                assert_eq!(backend["name"], serde_yaml::Value::from("weft-dispatcher"));
+            }
+            for m in rule["matches"].as_sequence().unwrap() {
+                allowed.push((
+                    m["path"]["type"].as_str().unwrap().to_string(),
+                    m["path"]["value"].as_str().unwrap().to_string(),
+                    m["method"].as_str().map(str::to_string),
+                    rewrite.clone(),
+                ));
+            }
+        }
+        let expected = |kind: &str, path: &str, method: Option<&str>, rewrite: Option<&str>| {
+            (kind.to_string(), path.to_string(), method.map(str::to_string), rewrite.map(str::to_string))
+        };
+        allowed.sort();
+        let mut want = vec![
+            expected("PathPrefix", "/events/", Some("POST"), None),
+            expected("PathPrefix", "/signal/", None, None),
+            expected("PathPrefix", "/signal-token/", None, None),
+            expected("PathPrefix", "/public/files/", None, None),
+            expected("Exact", "/access/oauth/callback", None, None),
+            expected("Exact", "/", None, Some("/public-page/index.html")),
+            expected("Exact", "/index.html", None, Some("/public-page/index.html")),
+            expected("Exact", "/logo.png", None, Some("/public-page/logo.png")),
+        ];
+        want.sort();
+        assert_eq!(allowed, want);
+
+        // The allowlist is prefixes, so the path it matches must be the
+        // path the dispatcher gets: an encoded slash is refused, and
+        // repeated slashes are merged before the match.
+        let path_policy = docs
+            .iter()
+            .find(|d| {
+                d["kind"] == "ClientTrafficPolicy"
+                    && d["spec"]["targetRefs"].as_sequence().is_some_and(|refs| {
+                        refs.iter().any(|r| {
+                            r["name"] == "weft-live-gateway" && r["sectionName"] == "public"
+                        })
+                    })
+                    && !d["spec"]["path"].is_null()
+            })
+            .expect("a ClientTrafficPolicy on the public listener pinning path handling");
+        assert_eq!(
+            path_policy["spec"]["path"]["escapedSlashesAction"],
+            serde_yaml::Value::from("RejectRequest")
+        );
+        let merge = &path_policy["spec"]["path"]["disableMergeSlashes"];
+        assert!(
+            merge.is_null() || merge.as_bool() == Some(false),
+            "repeated slashes must be merged before the match: {merge:?}"
+        );
+    }
+
+    /// Only the tunnel reaches the public listener: the door's Service is
+    /// shipped with the tunnel, and no node port maps it to the machine.
+    #[test]
+    fn a_named_tunnel_that_misses_the_door_names_the_dashboard_setting() {
+        let named = public_url_unreachable("https://w.example", true, "it answered 502 Bad Gateway");
+        assert!(named.contains(PUBLIC_DOOR_URL), "{named}");
+        assert!(named.contains("502"), "{named}");
+        let quick = public_url_unreachable("https://x.trycloudflare.com", false, "it answered 502");
+        assert!(!quick.contains("dashboard"), "{quick}");
+        let tunnel = manifest_documents("public-tunnel.yaml");
+        let door = tunnel.iter().find(|d| d["metadata"]["name"] == "weft-public-door").unwrap();
+        assert_eq!(
+            PUBLIC_DOOR_URL,
+            format!(
+                "http://{}.{}.svc.cluster.local:{}",
+                door["metadata"]["name"].as_str().unwrap(),
+                door["metadata"]["namespace"].as_str().unwrap(),
+                door["spec"]["ports"][0]["port"].as_u64().unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn nothing_but_the_tunnel_reaches_the_public_door() {
+        let ports = manifest_documents("kind-node-ports.yaml");
+        for service in &ports {
+            for port in service["spec"]["ports"].as_sequence().unwrap() {
+                assert_ne!(port["targetPort"], serde_yaml::Value::from(8080), "{service:?}");
+            }
+        }
+        let tunnel = manifest_documents("public-tunnel.yaml");
+        assert!(tunnel.iter().any(|d| d["kind"] == "Service" && d["metadata"]["name"] == "weft-public-door"));
     }
 
     #[test]
@@ -3788,8 +4391,8 @@ mod tests {
     }
     use super::{
         apiserver_endpoint_from_slices, apiserver_peers_yaml, canonical_tunnel_hostname,
-        check_cidr, configured_dns_ip, endpoint_host, parse_pooled_listing, rolls_for,
-        split_yaml_documents, yaml_document_kind, DetectedChanges, EndpointHost,
+        check_cidr, endpoint_host, parse_pooled_listing, rolls_for,
+        split_yaml_documents, yaml_document_kind, CreatedThisBoot, DetectedChanges, EndpointHost,
     };
 
     /// The roll decision, pinned as an explicit table (never a
@@ -3832,9 +4435,22 @@ mod tests {
             let rolls = rolls_for(
                 &DetectedChanges { postgres_manifest, other_manifests, sealing_key, apps },
                 rebuilt,
+                &CreatedThisBoot { dispatcher: false, broker: false },
             );
             assert_eq!((rolls.dispatcher, rolls.broker), want, "inputs: {inputs:?}");
         }
+    }
+
+    /// A workload this boot created started on everything the boot put
+    /// in place, so even with every trigger up it is not restarted; the
+    /// one that already existed still is.
+    #[test]
+    fn a_workload_created_this_boot_is_never_rolled() {
+        let everything = DetectedChanges { postgres_manifest: true, other_manifests: true, sealing_key: true, apps: true };
+        let rolls = rolls_for(&everything, true, &CreatedThisBoot { dispatcher: true, broker: true });
+        assert_eq!((rolls.dispatcher, rolls.broker), (false, false));
+        let rolls = rolls_for(&everything, true, &CreatedThisBoot { dispatcher: true, broker: false });
+        assert_eq!((rolls.dispatcher, rolls.broker), (false, true));
     }
 
     /// A line the pooled-listing parser cannot read must come back as
@@ -4027,25 +4643,6 @@ mod tests {
         );
     }
 
-    /// A resolver address nginx would accept as a token but never
-    /// resolve with is the exact failure the directive exists to
-    /// prevent, so a configured one is parsed rather than trusted.
-    #[test]
-    fn a_configured_dns_address_must_be_an_ip() {
-        assert_eq!(configured_dns_ip("10.96.0.10").unwrap().as_deref(), Some("10.96.0.10"));
-        assert_eq!(configured_dns_ip("  10.96.0.10  ").unwrap().as_deref(), Some("10.96.0.10"));
-        assert_eq!(configured_dns_ip("fd00::a").unwrap().as_deref(), Some("fd00::a"));
-        // Unset means "ask the cluster", which is the normal path.
-        assert!(configured_dns_ip("").unwrap().is_none());
-        assert!(configured_dns_ip("   ").unwrap().is_none());
-        // A hostname, an address with a port, and a typo all read as
-        // valid nginx tokens and none of them resolve.
-        for bad in ["kube-dns.kube-system.svc", "10.96.0.10:53", "10.96.0", "hello"] {
-            let e = configured_dns_ip(bad).expect_err("{bad} must be refused");
-            assert!(e.to_string().contains("WEFT_CLUSTER_DNS_IP"), "{e}");
-        }
-    }
-
     #[test]
     fn endpoint_host_classifies_every_shape() {
         let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
@@ -4095,20 +4692,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod stale_forward_tests {
-    use super::is_stale_forward_cmdline;
-
-    /// The two shapes an older weft left behind are recognized by their
-    /// command line, and nothing else that mentions a port is.
-    #[test]
-    fn only_an_old_keeper_or_its_tunnel_counts_as_stale() {
-        assert!(is_stale_forward_cmdline(&["/home/u/.local/share/weft/bin/weft", "daemon", "supervise-forward", "dispatcher"]));
-        assert!(is_stale_forward_cmdline(&["kubectl", "-n", "weft-system", "port-forward", "svc/weft-dispatcher", "9999:9999"]));
-        assert!(is_stale_forward_cmdline(&["kubectl", "-n", "ingress-nginx", "port-forward", "svc/ingress-nginx-controller", "9998:80"]));
-        assert!(!is_stale_forward_cmdline(&["weft", "daemon", "start"]));
-        assert!(!is_stale_forward_cmdline(&["kubectl", "-n", "weft-db", "port-forward", "svc/weft-postgres", "15433:5432"]));
-        assert!(!is_stale_forward_cmdline(&["ssh", "-L", "9999:localhost:9999", "host"]));
-        assert!(!is_stale_forward_cmdline(&[]));
-    }
-}

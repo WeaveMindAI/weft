@@ -200,7 +200,7 @@ impl ListenerBackend for K8sListenerBackend {
         self.kube
             .delete_named(
                 namespace,
-                "service",
+                weft_platform_traits::kube::NamedKind::Service,
                 pod_name,
                 weft_platform_traits::DeleteOpts::wait(),
             )
@@ -208,7 +208,7 @@ impl ListenerBackend for K8sListenerBackend {
         self.kube
             .delete_named(
                 namespace,
-                "deployment",
+                weft_platform_traits::kube::NamedKind::Deployment,
                 pod_name,
                 weft_platform_traits::DeleteOpts::wait_cascade(),
             )
@@ -293,6 +293,9 @@ spec:
               value: "{broker_url}"
             - name: WEFT_BROKER_TOKEN_PATH
               value: "/var/run/weft/sa/token"
+            # This install's pace, shared by every process in it.
+            - name: {time_scale_env}
+              value: "{time_scale}"
           volumeMounts:
             - name: weft-sa-token
               mountPath: /var/run/weft/sa
@@ -324,6 +327,8 @@ spec:
     - port: 8080
       targetPort: 8080
 "#,
+        time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        time_scale = weft_core::time_scale::factor(),
     )
 }
 
@@ -1010,7 +1015,7 @@ impl ListenerPool {
         .bind(&handle.admin_url)
         .bind(&self.namespace)
         .bind(pod_id)
-        .bind(now + crate::lease::LEASE_DURATION_SECS)
+        .bind(now + crate::lease::lease_duration_secs())
         .bind(now + crate::lease::SPAWN_GRACE_SECS)
         .execute(pg_pool)
         .await
@@ -1061,7 +1066,7 @@ impl ListenerPool {
     /// the next register/fire; here we only nudge live holders.
     pub async fn rehydrate_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         pg_pool: &PgPool,
     ) -> Result<()> {
         let pods: Vec<(String,)> = sqlx::query_as(
@@ -1148,7 +1153,7 @@ impl ListenerPool {
     /// project.
     pub async fn project_has_live_listener(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         pg_pool: &PgPool,
     ) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
@@ -1169,7 +1174,7 @@ impl ListenerPool {
         sqlx::query(
             "UPDATE listener_pod SET leased_until_unix = $1 WHERE owner_pod_id = $2",
         )
-        .bind(crate::lease::now_unix() + crate::lease::LEASE_DURATION_SECS)
+        .bind(crate::lease::now_unix() + crate::lease::lease_duration_secs())
         .bind(pod_id)
         .execute(pg_pool)
         .await?;

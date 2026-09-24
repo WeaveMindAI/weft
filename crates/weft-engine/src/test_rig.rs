@@ -32,7 +32,7 @@ pub struct LiveTestRunner {
     clients: EngineClients,
     pod_name: String,
     tenant_id: String,
-    project_id: String,
+    project_id: uuid::Uuid,
     /// THE run's execution identity: the pre-registered color the
     /// spawning runtime supplied (it registered the color so the
     /// broker can scope the run), or a fresh mint. One runner serves
@@ -93,7 +93,7 @@ impl LiveTestRunner {
         catalog: &'static dyn weft_core::NodeCatalog,
         pod_name: String,
         tenant_id: String,
-        project_id: String,
+        project_id: uuid::Uuid,
         fixed_color: Option<Color>,
     ) -> Self {
         clients.journal = Arc::new(weft_journal::NoopJournal);
@@ -121,7 +121,7 @@ impl LiveTestRunner {
         let clients = self.clients.clone();
         let pod_name = self.pod_name.clone();
         let tenant_id = self.tenant_id.clone();
-        let project_id = self.project_id.clone();
+        let project_id = self.project_id;
         let handles = self.handles.clone();
         let color = self.color;
         let catalog = self.catalog;
@@ -201,7 +201,7 @@ impl LiveTestRunner {
                 .map_err(weft_core::WeftError::Config)?;
             let handle = Arc::new(RunnerHandle::new(
                 format!("node-test-{}", color.simple()),
-                project_id.clone(),
+                project_id,
                 color,
                 node_id.to_string(),
                 node_id.to_string(),

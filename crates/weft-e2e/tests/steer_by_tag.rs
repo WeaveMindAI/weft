@@ -47,9 +47,8 @@ struct Rig {
 }
 
 impl Rig {
-    /// One rig on a freshly swept cluster. A test that needs two rigs
-    /// calls [`Self::up_on`] with one `ensure::up` dispatcher: the sweep
-    /// in `ensure::up` deletes every project, the first rig's included.
+    /// One rig on the default install. A test that needs two rigs on one
+    /// dispatcher calls [`Self::up_on`] for each.
     async fn up() -> anyhow::Result<Self> {
         Self::up_on(ensure::up().await?).await
     }
@@ -123,6 +122,26 @@ impl Rig {
 
     async fn parked(&self, color: Uuid) -> anyhow::Result<()> {
         run::wait_for_status(&self.disp, color, "waiting_for_input").await
+    }
+
+    /// Wait until `color` carries `tag`. A run reads as running before
+    /// its tag node has run, and the stop order is the order runs TAGGED
+    /// themselves, so a test that means "a later run stops this one"
+    /// waits for the tag, not for the status.
+    async fn tagged(&self, color: Uuid, tag: &str) -> anyhow::Result<()> {
+        weft_e2e::client::poll_until(
+            &format!("execution {color} to carry the tag '{tag}'"),
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async move {
+                let summary = self.summary(color).await?;
+                let carries = summary["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|t| t == tag));
+                Ok(carries.then_some(()))
+            },
+        )
+        .await
     }
 
     async fn finish(self) -> anyhow::Result<()> {
@@ -305,6 +324,7 @@ async fn a_stop_reaches_a_run_in_flight() -> anyhow::Result<()> {
 
     let first = rig.fire("go", "user_7").await?;
     run::wait_for_status(&rig.disp, first, "running").await?;
+    rig.tagged(first, "user_7").await?;
 
     let second = rig.fire("go", "user_7").await?;
     let first_settled = SettledRun::observe(&rig.disp, first).await?;
@@ -502,16 +522,41 @@ fn assert_stopped_by(settled: &SettledRun, by: Uuid, tag: &str) -> anyhow::Resul
         "reason on {}: {reason}",
         settled.color
     );
-    let node_cancel = settled
-        .replay()
-        .first_kind("node_cancelled")
-        .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.color))?;
-    anyhow::ensure!(
-        node_cancel.str_field("reason").unwrap_or_default() == reason,
-        "the live node's cancel row names the same cause: {:?}",
-        node_cancel.0
-    );
+    // A node is cancelled only if one was live when the stop landed: a
+    // run stopped between two nodes (one finished, the next not yet
+    // started) has nothing to cancel, and that is the stop working.
+    if !live_before_cancel(settled).is_empty() {
+        let node_cancel = settled
+            .replay()
+            .first_kind("node_cancelled")
+            .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.color))?;
+        anyhow::ensure!(
+            node_cancel.str_field("reason").unwrap_or_default() == reason,
+            "the live node's cancel row names the same cause: {:?}",
+            node_cancel.0
+        );
+    }
     Ok(())
+}
+
+/// The nodes that had started (or resumed, or parked) and not ended
+/// when the run's cancel was written: the ones the stop must cancel.
+fn live_before_cancel(settled: &SettledRun) -> Vec<String> {
+    let mut live: Vec<String> = Vec::new();
+    for event in &settled.replay().events {
+        let Some(node) = event.node() else { continue };
+        match event.kind() {
+            "node_started" | "node_resumed" | "node_suspended" => {
+                if !live.iter().any(|n| n == node) {
+                    live.push(node.to_string());
+                }
+            }
+            "node_completed" | "node_failed" | "node_skipped" => live.retain(|n| n != node),
+            "node_cancelled" => return live,
+            _ => {}
+        }
+    }
+    live
 }
 
 /// The tagging is on the record as one `execution_tagged` carrying the

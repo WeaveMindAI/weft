@@ -1,13 +1,15 @@
-# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
-#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+# Namespaces are rendered per install by the daemon
+# (crates/weft-cli/src/commands/daemon.rs, manifest_template_vars) from
+# weft_core::infra::Instance, so a named install beside the default one
+# applies this same file into namespaces of its own.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: weft-db
+  name: ${WEFT_DB_NAMESPACE}
   labels:
     weft.dev/role: db
     # Explicit metadata.name label is what other namespaces match on
     # in NetworkPolicy `namespaceSelector` rules. kube-apiserver auto-
     # applies this on every namespace, but we set it here to make
     # the intent explicit.
-    kubernetes.io/metadata.name: weft-db
+    kubernetes.io/metadata.name: ${WEFT_DB_NAMESPACE}

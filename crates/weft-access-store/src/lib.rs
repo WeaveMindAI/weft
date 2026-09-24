@@ -119,7 +119,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- OAuth's design, and event routing filters on it in SQL.
             client_id TEXT,
             -- NULL for an exclusive-class shared grant.
-            project_id TEXT,
+            project_id UUID,
             -- The AccessSpec snapshot: refresh/auth need no catalog.
             spec_json JSONB NOT NULL,
             -- The stored values (token, refresh_token, captures, pasted
@@ -200,7 +200,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- from begin to callback (any dispatcher pod completes it).
             -- SEALED (crypt.rs).
             registration_sealed TEXT NOT NULL,
-            project_id TEXT,
+            project_id UUID,
             spec_json JSONB NOT NULL,
             scopes JSONB NOT NULL DEFAULT '[]',
             -- SEALED (crypt.rs): with the consent code intercepted, the

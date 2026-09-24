@@ -30,7 +30,7 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
         serde_json::json!({}),
     )
     .await?;
-    let mut project = Project::prepare("openrouter_chat", disp).await?;
+    let mut project = Project::prepare("openrouter_chat", disp.clone()).await?;
     set_account(&project, "prov", "connection", conn.handle())?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
@@ -41,7 +41,10 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
     // until it expires; none means the bytes went inline (no tunnel /
     // public base on this install). Printed so a `--public-url` run
     // shows the link path actually engaged.
-    let links = weft_e2e::platform::Platform::connect().await?.public_file_link_count().await?;
+    let links = weft_e2e::platform::Platform::connect(&disp)
+        .await?
+        .public_file_link_count_for(&settled.color, &project.id())
+        .await?;
     if links > 0 {
         eprintln!("media path: PUBLIC RELAY LINK ({links} live link(s) minted)");
     } else {

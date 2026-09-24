@@ -309,10 +309,10 @@ pub async fn listener_inspect(
         // PRESERVED, absent from the registry by design. Every row is
         // named, never just counted, so the drift below can say WHICH
         // signal is the odd one out.
-        let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+        let rows: Vec<(String, String, uuid::Uuid, bool)> = sqlx::query_as(
             "SELECT s.token, s.node_id, s.project_id, \
                     COALESCE(p.status = ANY($2), FALSE) \
-             FROM signal s LEFT JOIN project p ON p.id::text = s.project_id \
+             FROM signal s LEFT JOIN project p ON p.id = s.project_id \
              WHERE s.listener_pod = $1 \
              ORDER BY s.project_id, s.node_id, s.token",
         )
@@ -367,7 +367,7 @@ pub async fn listener_inspect(
 pub struct PlacedSignal {
     pub token: String,
     pub node_id: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
 }
 
 /// One entry of a pod's in-RAM registry, as its `/signals` lists it.
@@ -428,7 +428,7 @@ mod listener_drift_tests {
     use super::*;
 
     fn placed(token: &str) -> PlacedSignal {
-        PlacedSignal { token: token.into(), node_id: format!("node_{token}"), project_id: "p".into() }
+        PlacedSignal { token: token.into(), node_id: format!("node_{token}"), project_id: uuid::Uuid::from_u128(0x100) }
     }
     fn held(token: &str) -> RegistryEntry {
         RegistryEntry { token: token.into(), node_id: format!("node_{token}"), kind: Value::from("timer") }
@@ -560,7 +560,7 @@ async fn apply_lifecycle_gate(
         return dispatch_listener_outcome(
             state,
             token,
-            &routing.project_id,
+            routing.project_id,
             &routing.tenant_id,
             payload,
             None,
@@ -658,7 +658,7 @@ async fn apply_lifecycle_gate(
 /// not on the fire path: it gates consumer enumeration in
 /// `visible_signals`, never decides whether to park / refuse / pass.
 pub(crate) struct FireGateInfo {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// The signal's own owning tenant, frozen on the row at register time. The
     /// fire path stamps tasks/spawns with THIS, not a re-derivation through the
     /// tenant router, so the answer comes from the same source that authorized
@@ -680,7 +680,7 @@ pub(crate) async fn lookup_signal_routing(
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
          FROM signal s \
-         LEFT JOIN project p ON p.id::text = s.project_id \
+         LEFT JOIN project p ON p.id = s.project_id \
          WHERE s.token = $1",
     )
     .bind(token)
@@ -688,7 +688,7 @@ pub(crate) async fn lookup_signal_routing(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal lookup: {e}")))?
     .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
-    let project_id: String = row
+    let project_id: uuid::Uuid = row
         .try_get("project_id")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let tenant_id: String = row
@@ -811,7 +811,7 @@ mod retry_tests {
 pub(crate) async fn dispatch_listener_outcome(
     state: &DispatcherState,
     token: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tenant: &str,
     payload: Value,
     // `Some` when a drain pops a parked element: its id is the fire's
@@ -820,7 +820,6 @@ pub(crate) async fn dispatch_listener_outcome(
     parked: Option<ParkedRef<'_>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token_owned = token.to_string();
-    let project_owned = project_id.to_string();
     let tenant_str = tenant.to_string();
     let parked_id = parked.map(|p| p.id.to_string());
     let attempts = parked.map(|p| p.attempts).unwrap_or(0);
@@ -933,7 +932,7 @@ pub(crate) async fn dispatch_listener_outcome(
                         };
                         crate::task_kinds::execute::enqueue_resume(
                             &state.pg_pool,
-                            &project_owned,
+                            project_id,
                             color,
                             &definition_hash,
                             Some(&tenant_str),
@@ -983,7 +982,7 @@ pub(crate) async fn dispatch_listener_outcome(
                                 // deactivate fast-path CAS and the
                                 // drain-watcher must not flip a project
                                 // Inactive while one of these is in flight.
-                                project_id: Some(project_owned.clone()),
+                                project_id: Some(project_id),
                                 dedup_key: Some(key),
                                 color: None,
                                 tenant_id: Some(tenant_str.clone()),
@@ -1074,7 +1073,7 @@ pub(crate) async fn delete_signals(
 /// (the journal returns the deleted rows for the unregister step).
 pub(crate) async fn delete_signals_for_project(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<(), (StatusCode, String)> {
     let deleted = state
         .journal
@@ -1283,7 +1282,7 @@ fn file_belongs_to_signal(
         return false;
     }
     match &parsed.scope {
-        KeyScope::Project { project_id } | KeyScope::Asset { project_id } => *project_id == sig.project_id,
+        KeyScope::Project { project_id } | KeyScope::Asset { project_id } => *project_id == sig.project_id.to_string(),
         KeyScope::Exec { color } => sig.color.is_some_and(|c| c.to_string() == *color),
         KeyScope::Shared { .. } => true,
     }
@@ -1484,18 +1483,7 @@ impl TokenScope {
         if !self.row.allowed_tags.is_empty() {
             return false;
         }
-        // A token with no project scope covers every project of its
-        // tenant, and asks nothing about the id: it never has to parse,
-        // which is what keeps a row whose project_id is not a uuid
-        // cancellable by a wildcard token. A scoped token does have to
-        // compare, so an id it cannot read is no project it was given.
-        if self.row.allowed_projects.is_empty() {
-            return true;
-        }
-        let Ok(want) = sig.project_id.parse::<uuid::Uuid>() else {
-            return false;
-        };
-        self.row.covers_project(&want)
+        self.row.covers_project(&sig.project_id)
     }
 
     /// Run the SQL filter to enumerate every signal this token sees.
@@ -1537,10 +1525,10 @@ pub async fn signals_visible_to(
     let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(concat!(
         "SELECT ", crate::journal::postgres::signal_columns!("s."), " \
          FROM signal s \
-         LEFT JOIN project p ON p.id::text = s.project_id \
+         LEFT JOIN project p ON p.id = s.project_id \
          WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
            AND s.tenant_id = $1 \
-           AND ($2::uuid[] = '{}'::uuid[] OR s.project_id::uuid = ANY($2)) \
+           AND ($2::uuid[] = '{}'::uuid[] OR s.project_id = ANY($2)) \
            AND ($3::text[] = '{}'::text[] OR s.tags && $3) \
            AND ( \
              s.is_resume = FALSE \
@@ -1634,7 +1622,7 @@ pub async fn fire_public_entry(
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
          FROM signal s \
-         LEFT JOIN project p ON p.id::text = s.project_id \
+         LEFT JOIN project p ON p.id = s.project_id \
          WHERE s.token = $1",
     )
     .bind(&matched.token)
@@ -1646,7 +1634,7 @@ pub async fn fire_public_entry(
     let token: String = row
         .try_get("token")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let project_id: String = row
+    let project_id: uuid::Uuid = row
         .try_get("project_id")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let tenant_id: String = row
@@ -1875,7 +1863,6 @@ pub(crate) fn split_tenant(called: &str) -> Result<(&str, &str), (StatusCode, St
 /// alive before giving the caller a "retry shortly" error. Worker spawn +
 /// register is normally a few seconds.
 const LIVE_SPAWN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const LIVE_SPAWN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long the handshake waits for the chosen pod's per-pod cluster DNS
 /// record to become resolvable before failing the connection. A pod can be
 /// DB-alive and Ready a beat before its `<pod>.weft-workers.<ns>.svc` record
@@ -1890,8 +1877,11 @@ const LIVE_DNS_POLL: std::time::Duration = std::time::Duration::from_millis(100)
 /// Routing-token lifetime. Generous: it only needs to survive the caller
 /// following the redirect / opening the socket, but a slow client (mobile,
 /// cold DNS) should not race it. The connection, once attached, is not
-/// re-validated against the token's expiry.
-const LIVE_TOKEN_TTL_SECS: i64 = 120;
+/// re-validated against the token's expiry. 120 seconds in real time, at
+/// this install's pace (`weft_core::time_scale`).
+fn live_token_ttl_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(120)
+}
 
 /// How long the worker outlives the ticket it was held for.
 ///
@@ -1904,14 +1894,17 @@ const LIVE_TOKEN_TTL_SECS: i64 = 120;
 /// new one.
 ///
 /// It is not a second chance: an expired ticket is refused either way.
-/// It buys the refusal a voice.
-const LIVE_LATE_CALLER_GRACE_SECS: i64 = 120;
+/// It buys the refusal a voice. 120 seconds in real time, at this
+/// install's pace, like the ticket it outlives.
+fn live_late_caller_grace_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(120)
+}
 
 /// How long a pod is promised to a caller who has just been pointed at
 /// it: their ticket's whole life, plus the window in which a late
 /// arrival is told the ticket is spent.
 fn live_hold_until(now_unix: i64) -> i64 {
-    now_unix + LIVE_TOKEN_TTL_SECS + LIVE_LATE_CALLER_GRACE_SECS
+    now_unix + live_token_ttl_secs() + live_late_caller_grace_secs()
 }
 
 /// `ANY /connect/{*path}`: the live caller connection control handshake.
@@ -2031,14 +2024,14 @@ pub async fn connect_live(
     // the arrival refuses the birth there, and the caller retries.
     let tenant = state
         .tenant_router
-        .tenant_for_project(project_id)
+        .tenant_for_project(*project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    ensure_live_worker(&state, project_id, tenant.as_str(), &program.binary_hash).await?;
+    ensure_live_worker(&state, *project_id, tenant.as_str(), &program.binary_hash).await?;
     let issued_at = crate::lease::now_unix();
     let pod = reserve_live_pod(
         &state,
-        project_id,
+        *project_id,
         tenant.as_str(),
         &program.binary_hash,
         live_hold_until(issued_at),
@@ -2061,7 +2054,7 @@ pub async fn connect_live(
         &state.caller_token_secret,
         &weft_core::caller_token::CallerTokenClaims {
             color,
-            project_id: project_id.clone(),
+            project_id: *project_id,
             pod_name: pod.pod_name.clone(),
             signal: token.clone(),
             path: path.clone(),
@@ -2071,7 +2064,7 @@ pub async fn connect_live(
             // The same instant the hold was computed from, so the
             // ticket's life and the pod's promise cannot drift apart
             // (the DNS wait above sits between the two).
-            exp: issued_at + LIVE_TOKEN_TTL_SECS,
+            exp: issued_at + live_token_ttl_secs(),
         },
     );
     let url = build_pod_gateway_url(
@@ -2120,7 +2113,7 @@ pub async fn connect_live(
 /// the arrival (to give birth), by the signal token the routing token
 /// carries between the two.
 pub(crate) struct ArmedRoute {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub node_id: String,
     pub spec: weft_core::primitive::SignalSpec,
     pub protocol: weft_core::signal::Protocol,
@@ -2158,7 +2151,7 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
                 s.port_snapshot, s.program_json, s.source_version, \
                 COALESCE(p.status, 'inactive') AS status \
          FROM signal s \
-         LEFT JOIN project p ON p.id::text = s.project_id \
+         LEFT JOIN project p ON p.id = s.project_id \
          WHERE s.token = $1",
     )
     .bind(token)
@@ -2167,7 +2160,7 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?
     .ok_or((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))?;
 
-    let project_id: String = row.try_get("project_id").map_err(row_err)?;
+    let project_id: uuid::Uuid = row.try_get("project_id").map_err(row_err)?;
     let node_id: String = row.try_get("node_id").map_err(row_err)?;
     let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
     let status: String = row.try_get("status").map_err(row_err)?;
@@ -2218,12 +2211,15 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
 /// down. Then the ticket names a machine that is leaving.
 async fn reserve_live_pod(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tenant: &str,
     binary_hash: &str,
     held_until: i64,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
-    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
+    let deadline = tokio::time::Instant::now() + LIVE_SPAWN_WAIT;
+    // Subscribed before the first pick, so a pod coming alive between a
+    // failed pick and the wait still ends the wait.
+    let mut heard = state.signals.subscribe();
     loop {
         let picked = weft_task_store::worker_pod::reserve_pod_for_caller(
             &state.pg_pool,
@@ -2239,8 +2235,9 @@ async fn reserve_live_pod(
         }
         // No pod of this project can take the connection right now: spawn
         // one built from the armed image and retry.
-        spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
-        if std::time::Instant::now() >= deadline {
+        let spawn = spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
+        let changed = worker_news_before(&mut heard, deadline, project_id, spawn).await?;
+        if !changed {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no worker pod can take this connection: every pod of this project is \
@@ -2251,7 +2248,6 @@ async fn reserve_live_pod(
                     .into(),
             ));
         }
-        tokio::time::sleep(LIVE_SPAWN_POLL).await;
     }
 }
 
@@ -2274,13 +2270,11 @@ pub(crate) async fn birth_on_arrival(
     color: uuid::Uuid,
     pod_name: &str,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
-    let project_uuid: uuid::Uuid = route.project_id
-        .parse()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad project id: {e}")))?;
+    let project_id = route.project_id;
     let definition_hash = &route.program.definition_hash;
     let project_json = state
         .projects
-        .definition_for_hash(project_uuid, definition_hash)
+        .definition_for_hash(project_id, definition_hash)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e}")))?
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no definition for hash".into()))?;
@@ -2300,7 +2294,7 @@ pub(crate) async fn birth_on_arrival(
     // boundary the engine holds the run to (see `TriggerFire`).
     let (start, kick_events) = crate::api::project::execution_birth_events(
         color,
-        &route.project_id,
+        project_id,
         weft_core::context::Phase::Fire,
         &route.node_id,
         &kicks,
@@ -2324,7 +2318,7 @@ pub(crate) async fn birth_on_arrival(
     // caller) and the caller's request (so the connection carries it).
     let task = crate::task_kinds::execute::execution_task_spec(
         weft_task_store::TaskKind::Execute,
-        &route.project_id,
+        project_id,
         color,
         definition_hash,
         &route.program.binary_hash,
@@ -2412,7 +2406,7 @@ pub(crate) fn build_pod_gateway_url(
 /// inside `birth_on_arrival`.
 async fn ensure_live_worker(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tenant: &str,
     binary_hash: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -2427,11 +2421,13 @@ async fn ensure_live_worker(
     {
         return Ok(());
     }
-    // None alive: spawn one and wait for it.
-    spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
-    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
+    // None alive: ask for one (deduped against a spawn in flight) and wait
+    // for news, asking again on each (`worker_news_before`).
+    let mut heard = state.signals.subscribe();
+    let deadline = tokio::time::Instant::now() + LIVE_SPAWN_WAIT;
     loop {
-        tokio::time::sleep(LIVE_SPAWN_POLL).await;
+        let spawn = spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
+        let changed = worker_news_before(&mut heard, deadline, project_id, spawn).await?;
         if weft_task_store::worker_pod::has_live_for_project(
             &state.pg_pool,
             project_id,
@@ -2442,7 +2438,7 @@ async fn ensure_live_worker(
         {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if !changed {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no worker pod became available for the live connection; retry shortly".into(),
@@ -2451,7 +2447,9 @@ async fn ensure_live_worker(
     }
 }
 
-/// Enqueue a `spawn_pod` task for the project (deduped on `{project}:spawn`).
+/// Enqueue a `spawn_pod` task for the project (deduped on `{project}:spawn`),
+/// returning the task that will bring the pod up: the new one, or the one
+/// already in flight.
 /// Enqueued DIRECTLY rather than via `cold_start::spawn`, whose scan only
 /// fires for projects with a pending WORKER TASK: on the live path the first
 /// execute task is only inserted at admission (after a pod exists), so relying
@@ -2459,10 +2457,10 @@ async fn ensure_live_worker(
 /// collapses concurrent callers (and a later cold_start tick) onto one spawn.
 async fn spawn_worker_pod(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tenant: &str,
     binary_hash: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<uuid::Uuid, (StatusCode, String)> {
     // Worker placement via the single resolver (source-declares-infra
     // AND its own namespace exists -> project namespace, else shared).
     let placement = crate::placement::resolve_worker_placement(state, project_id)
@@ -2473,19 +2471,19 @@ async fn spawn_worker_pod(
             "project not found; may be unregistered".into(),
         ))?;
     let namespace = placement.namespace;
-    weft_task_store::tasks::enqueue_dedup(
+    let outcome = weft_task_store::tasks::enqueue_dedup(
         &state.pg_pool,
         weft_task_store::tasks::NewTask {
             kind: weft_task_store::TaskKind::SpawnPod.into(),
             target: weft_task_store::tasks::TaskTarget::Dispatcher,
-            project_id: Some(project_id.to_string()),
+            project_id: Some(project_id),
             dedup_key: Some(format!("{project_id}:{binary_hash}:spawn")),
             color: None,
             tenant_id: Some(tenant.to_string()),
             target_pod_name: None,
             binary_hash: Some(binary_hash.to_string()),
             payload: serde_json::to_value(weft_task_store::SpawnPodPayload {
-                project_id: project_id.to_string(),
+                project_id,
                 tenant: tenant.to_string(),
                 namespace,
                 owner_dispatcher: state.pod_id.as_str().to_string(),
@@ -2495,7 +2493,31 @@ async fn spawn_worker_pod(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue spawn_pod: {e}")))?;
-    Ok(())
+    outcome.id().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "enqueue spawn_pod: a local enqueue was fenced, which only a broker fire can be".into(),
+    ))
+}
+
+/// Wait until one of the project's pods changes or the spawn asked for
+/// (`spawn`) finishes, or `deadline` passes (`false`). Either news means a
+/// caller waiting for a worker should look again, and ask again: the pod a
+/// finished spawn brought up can already be gone (an idle exit racing the
+/// caller, a crash at boot), and nothing else would start the next one.
+async fn worker_news_before(
+    heard: &mut weft_task_store::pg_signal::Subscription,
+    deadline: tokio::time::Instant,
+    project_id: uuid::Uuid,
+    spawn: uuid::Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    let spawn = spawn.to_string();
+    heard
+        .woken_before(deadline, |c, p| {
+            weft_task_store::worker_pod::announces_project(c, p, project_id)
+                || (c == weft_task_store::terminal::TERMINAL_CHANNEL && p == spawn)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wait for a worker: {e}")))
 }
 
 /// Per-pod connection FQDN the gateway dynamic-resolves a live caller to:
@@ -2562,11 +2584,8 @@ async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (Status
 pub async fn live_signal(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((project_id, node)): Path<(String, String)>,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
 ) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
-    let id = project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
     authorize_project(&state, &caller.0, id).await?;
     Ok(Json(read_signal_live(&state, id, &node).await?))
 }
@@ -2592,7 +2611,7 @@ pub(crate) async fn read_signal_live(
     // never answers with one here.
     let entry = state
         .journal
-        .signal_entry_at(&id.to_string(), node)
+        .signal_entry_at(id, node)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
@@ -2694,7 +2713,7 @@ mod public_url_tests {
             program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
-            project_id: "p".into(),
+            project_id: uuid::Uuid::from_u128(0x100),
             color: None,
             node_id: "n".into(),
             is_resume: false,
@@ -2890,14 +2909,14 @@ mod can_cancel_tests {
         }
     }
 
-    fn signal(tenant: &str, project: &str) -> SignalRegistration {
+    fn signal(tenant: &str, project: uuid::Uuid) -> SignalRegistration {
         SignalRegistration {
             source_version: None,
             setup_color: None,
             program: None,
             token: "s".into(),
             tenant_id: tenant.into(),
-            project_id: project.into(),
+            project_id: project,
             color: None,
             node_id: "n".into(),
             is_resume: false,
@@ -2927,7 +2946,7 @@ mod can_cancel_tests {
         // account.
         let a = token("tenant-a", vec![], vec![]);
         assert!(
-            !a.same_tenant(&signal("tenant-b", "proj-1")),
+            !a.same_tenant(&signal("tenant-b", uuid::Uuid::from_u128(1))),
             "cross-tenant signal must not be same-tenant (handler returns 404)"
         );
     }
@@ -2935,7 +2954,7 @@ mod can_cancel_tests {
     #[test]
     fn same_tenant_wildcard_token_can_cancel() {
         let a = token("tenant-a", vec![], vec![]);
-        let sig = signal("tenant-a", "proj-1");
+        let sig = signal("tenant-a", uuid::Uuid::from_u128(1));
         assert!(a.same_tenant(&sig));
         assert!(a.can_cancel_within_tenant(&sig), "same-tenant wildcard token may cancel");
     }
@@ -2948,10 +2967,10 @@ mod can_cancel_tests {
         let pid = uuid::Uuid::from_u128(1);
         let a = token("tenant-a", vec![pid], vec![]);
         assert!(
-            !a.same_tenant(&signal("tenant-b", &pid.to_string())),
+            !a.same_tenant(&signal("tenant-b", pid)),
             "tenant wall (404) wins over a matching project id"
         );
-        let own = signal("tenant-a", &pid.to_string());
+        let own = signal("tenant-a", pid);
         assert!(a.same_tenant(&own));
         assert!(a.can_cancel_within_tenant(&own), "same tenant + covered project may cancel");
     }
@@ -2961,7 +2980,7 @@ mod can_cancel_tests {
         let covered = uuid::Uuid::from_u128(1);
         let other = uuid::Uuid::from_u128(2);
         let a = token("tenant-a", vec![covered], vec![]);
-        let sig = signal("tenant-a", &other.to_string());
+        let sig = signal("tenant-a", other);
         assert!(a.same_tenant(&sig), "same tenant, so it is a 403 (scope), not a 404");
         assert!(
             !a.can_cancel_within_tenant(&sig),
@@ -2974,7 +2993,7 @@ mod can_cancel_tests {
         // A tag restriction means the token sees a sub-project SLICE, so it must not
         // cancel (cancel reaches sibling signals of other tags in the same color).
         let a = token("tenant-a", vec![], vec!["support".into()]);
-        let sig = signal("tenant-a", "proj-1");
+        let sig = signal("tenant-a", uuid::Uuid::from_u128(1));
         assert!(a.same_tenant(&sig));
         assert!(
             !a.can_cancel_within_tenant(&sig),
@@ -2996,7 +3015,7 @@ mod signal_file_scope_tests {
             program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
-            project_id: "p".into(),
+            project_id: uuid::Uuid::from_u128(0x100),
             color: color.map(|c| c.parse().expect("a uuid")),
             node_id: "n".into(),
             is_resume: color.is_some(),
@@ -3024,12 +3043,13 @@ mod signal_file_scope_tests {
     fn a_file_is_the_forms_to_show_only_inside_its_own_walls() {
         let color = "11111111-1111-1111-1111-111111111111";
         let sig = signal(Some(color));
+        let p = sig.project_id;
         let ok = |key: &str| file_belongs_to_signal(&parse_key(key).expect(key), &sig);
-        assert!(ok("t/project/p/cat"));
-        assert!(ok("t/asset/p/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+        assert!(ok(&format!("t/project/{p}/cat")));
+        assert!(ok(&format!("t/asset/{p}/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")));
         assert!(ok(&format!("t/exec/{color}/cat")));
         assert!(ok("t/shared/pool/cat"));
-        assert!(!ok("other/project/p/cat"), "another tenant");
+        assert!(!ok(&format!("other/project/{p}/cat")), "another tenant");
         assert!(!ok("t/project/q/cat"), "another project");
         assert!(!ok("t/exec/22222222-2222-2222-2222-222222222222/cat"), "another run");
         let entry = signal(None);

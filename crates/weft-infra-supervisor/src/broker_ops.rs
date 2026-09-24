@@ -15,47 +15,54 @@ use async_trait::async_trait;
 
 use weft_broker_client::client::BrokerSupervisorClient;
 use weft_broker_client::protocol::{
-    SupervisorCommandRow, SupervisorInfraNode, SupervisorProject,
+    SupervisorClaim, SupervisorInfraNode, SupervisorProject, SupervisorSyncOwnershipResponse,
 };
 
 #[async_trait]
 pub trait BrokerSupervisorOps: Send + Sync {
-    /// Sync this supervisor's project ownership and return the set it
-    /// now owns: renew its existing exclusive `infra_owner` leases, claim
-    /// up to `saturation` more unowned projects' infra, return the full
-    /// owned set. The work loops act ONLY on the returned projects, so
-    /// two supervisors never reconcile the same project.
+    /// Sync this supervisor's project ownership: renew its existing
+    /// exclusive `infra_owner` leases, claim a batch more unowned
+    /// projects' infra while below saturation, and return the full owned
+    /// set plus the projects this tick took on. The work loops act ONLY
+    /// on the owned projects, so two supervisors never reconcile the
+    /// same project.
     async fn sync_ownership(
         &self,
         pod_name: &str,
         mem_pressure: f64,
-    ) -> Result<Vec<SupervisorProject>>;
+    ) -> Result<SupervisorSyncOwnershipResponse>;
     /// Pure read of the projects this pod owns (no claim/renew). The
     /// work loops iterate this; ownership breadth changes only via
     /// `sync_ownership` (the ownership tick).
     async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>>;
-    async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>>;
+    async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>>;
     async fn health_protocols(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> Result<Option<serde_json::Value>>;
+    /// The oldest waiting command of a project this pod owns and is not
+    /// already running a command for (`busy_projects`), holding up to
+    /// `wait` for one to be issued when none is waiting.
     async fn claim_command(
         &self,
         claimer_pod: &str,
-    ) -> Result<Option<SupervisorCommandRow>>;
+        busy_projects: &[uuid::Uuid],
+        wait: std::time::Duration,
+    ) -> Result<SupervisorClaim>;
     /// Record one typed infra_event. The kind + payload pair comes
     /// from the `InfraEvent` enum so writers can't typo the kind or
     /// drift the payload shape; see protocol.rs.
     async fn event_record(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: Option<&str>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64>;
     /// Set the `infra_node.status` row.
-    /// `command_id = Some(id)` for lifecycle-driven writes; the
-    /// broker rejects the UPDATE if the command is no longer
-    /// claimed by the caller's pod (returns `WriteOutcome::Displaced`).
+    /// `command_id = Some(id)` for lifecycle-driven writes. The broker
+    /// refuses the UPDATE when the caller's pod no longer owns the
+    /// project (its `infra_owner` lease moved), answering
+    /// `WriteOutcome::Displaced`.
     /// `command_id = None` for the health loop's autonomous
     /// Flaky/Running reconciliation (tenant scope still applies).
     /// `unit = Some` sets that unit's status (and recomputes the node
@@ -65,7 +72,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         pod_name: &str,
         command_id: Option<i64>,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
@@ -79,7 +86,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     async fn remove_node(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>>;
     /// `cancelled = true` records outcome `cancelled` (a user-honored
@@ -94,12 +101,12 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// Whether the user requested cancellation of a claimed command.
     /// Polled between kubectl steps and inside readiness/drain waits.
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
-    async fn running_count(&self, project_id: &str) -> Result<i64>;
+    async fn running_count(&self, project_id: uuid::Uuid) -> Result<i64>;
     /// True if a user infra action (any uncompleted
     /// infra_lifecycle_command: apply / stop / terminate) is in flight
     /// for the project. The health loop stands down while it holds so
     /// it never races a user action.
-    async fn infra_command_in_flight(&self, project_id: &str) -> Result<bool>;
+    async fn infra_command_in_flight(&self, project_id: uuid::Uuid) -> Result<bool>;
     /// Pre-apply commitment. Writes the infra_node row at
     /// Provisioning status with the locked-in (instance_id,
     /// namespace, preserve_pvcs) tuple. Subsequent kubectl-apply
@@ -109,7 +116,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         instance_id: &str,
         namespace: &str,
@@ -124,18 +131,18 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         instance_id: &str,
         applied_spec_hash: &str,
-        endpoints: BTreeMap<String, String>,
+        addresses: weft_broker_client::protocol::AppliedEndpoints,
         namespace: &str,
         preserve_pvcs: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>>;
     async fn project_image_tags(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
     ) -> Result<HashMap<String, String>>;
     /// Enqueue a dispatcher-targeted lifecycle command. The typed
@@ -145,7 +152,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// dispatch.
     async fn enqueue_lifecycle(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         spec: weft_broker_client::protocol::LifecycleSpec,
     ) -> Result<i64>;
 }
@@ -156,30 +163,32 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         &self,
         pod_name: &str,
         mem_pressure: f64,
-    ) -> Result<Vec<SupervisorProject>> {
+    ) -> Result<SupervisorSyncOwnershipResponse> {
         BrokerSupervisorClient::sync_ownership(self, pod_name, mem_pressure).await
     }
     async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>> {
         BrokerSupervisorClient::owned_projects(self, pod_name).await
     }
-    async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>> {
+    async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
     }
     async fn health_protocols(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> Result<Option<serde_json::Value>> {
         BrokerSupervisorClient::health_protocols(self, project_id).await
     }
     async fn claim_command(
         &self,
         claimer_pod: &str,
-    ) -> Result<Option<SupervisorCommandRow>> {
-        BrokerSupervisorClient::claim_command(self, claimer_pod).await
+        busy_projects: &[uuid::Uuid],
+        wait: std::time::Duration,
+    ) -> Result<SupervisorClaim> {
+        BrokerSupervisorClient::claim_command(self, claimer_pod, busy_projects, wait).await
     }
     async fn event_record(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: Option<&str>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64> {
@@ -189,7 +198,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         &self,
         pod_name: &str,
         command_id: Option<i64>,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
@@ -212,7 +221,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn remove_node(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>> {
         BrokerSupervisorClient::remove_node(self, pod_name, project_id, node_id).await
@@ -231,17 +240,17 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
         BrokerSupervisorClient::command_cancel_requested(self, command_id).await
     }
-    async fn running_count(&self, project_id: &str) -> Result<i64> {
+    async fn running_count(&self, project_id: uuid::Uuid) -> Result<i64> {
         BrokerSupervisorClient::running_count(self, project_id).await
     }
-    async fn infra_command_in_flight(&self, project_id: &str) -> Result<bool> {
+    async fn infra_command_in_flight(&self, project_id: uuid::Uuid) -> Result<bool> {
         BrokerSupervisorClient::infra_command_in_flight(self, project_id).await
     }
     async fn set_provisioning(
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         instance_id: &str,
         namespace: &str,
@@ -265,11 +274,11 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         instance_id: &str,
         applied_spec_hash: &str,
-        endpoints: BTreeMap<String, String>,
+        addresses: weft_broker_client::protocol::AppliedEndpoints,
         namespace: &str,
         preserve_pvcs: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
@@ -282,7 +291,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             node_id,
             instance_id,
             applied_spec_hash,
-            endpoints,
+            addresses,
             namespace,
             preserve_pvcs,
             units,
@@ -291,14 +300,14 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn project_image_tags(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
     ) -> Result<HashMap<String, String>> {
         BrokerSupervisorClient::project_image_tags(self, project_id, node_id).await
     }
     async fn enqueue_lifecycle(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         spec: weft_broker_client::protocol::LifecycleSpec,
     ) -> Result<i64> {
         BrokerSupervisorClient::enqueue_lifecycle(self, project_id, spec).await

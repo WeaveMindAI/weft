@@ -22,3 +22,8 @@ tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# `test-util` enables tokio's paused clock, so the read-retry backoff
+# tests run without sleeping.
+tokio = { workspace = true, features = ["test-util"] }

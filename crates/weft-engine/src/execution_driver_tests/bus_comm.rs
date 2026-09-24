@@ -155,7 +155,7 @@
             .record_event(
                 &ExecEvent::ExecutionStarted {
                     color,
-                    project_id: project.id.to_string(),
+                    project_id: project.id,
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
@@ -302,7 +302,7 @@
         let color = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id.to_string(), entry_node: "waiter".into(),
+            color, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
@@ -361,17 +361,17 @@
             + Send
             + Sync,
     >;
-    type BodyKey = (String, String); // (project_id, node_id)
+    type BodyKey = (uuid::Uuid, String); // (project_id, node_id)
     static NODE_BODIES: std::sync::OnceLock<StdMutex<std::collections::HashMap<BodyKey, NodeBody>>> =
         std::sync::OnceLock::new();
     fn bodies() -> &'static StdMutex<std::collections::HashMap<BodyKey, NodeBody>> {
         NODE_BODIES.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
     }
-    fn install_body(project_id: &str, node_id: &str, body: NodeBody) {
+    fn install_body(project_id: uuid::Uuid, node_id: &str, body: NodeBody) {
         bodies()
             .lock()
             .unwrap()
-            .insert((project_id.to_string(), node_id.to_string()), body);
+            .insert((project_id, node_id.to_string()), body);
     }
 
     struct Configurable;
@@ -379,7 +379,7 @@
     #[async_trait]
     impl Node for Configurable {
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-            let key = (ctx.project_id.clone(), ctx.node_id.clone());
+            let key = (ctx.project_id, ctx.node_id.clone());
             let body = bodies().lock().unwrap().get(&key).cloned();
             match body {
                 Some(b) => b(ctx).await,
@@ -554,7 +554,7 @@
         let color = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id.to_string(), entry_node: creator.into(),
+            color, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
@@ -586,8 +586,8 @@
     #[tokio::test]
     async fn panicking_node_body_fails_instead_of_re_running_forever() {
         let project = bus_topology("a", &[], "ch");
-        let pid = project.id.to_string();
-        install_body(&pid, "a", std::sync::Arc::new(|_ctx| Box::pin(async move {
+        let pid = project.id;
+        install_body(pid, "a", std::sync::Arc::new(|_ctx| Box::pin(async move {
             panic!("node body boom");
         })));
         let outcome = run_test(project, "a").await;
@@ -626,8 +626,8 @@
     #[tokio::test]
     async fn hole1_waits_while_peer_is_still_scheduled() {
         let project = bus_topology("creator", &["peer"], "ch");
-        let pid = project.id.to_string();
-        install_body(&pid, "creator", std::sync::Arc::new(|ctx| Box::pin(async move {
+        let pid = project.id;
+        install_body(pid, "creator", std::sync::Arc::new(|ctx| Box::pin(async move {
             let (mut bus, marker) = ctx.create_bus(Default::default())?;
             bus.register("creator").expect("register");
             emit_bus_marker(&ctx, "ch", marker).await?;
@@ -639,7 +639,7 @@
             bus.close();
             Ok(())
         })));
-        install_body(&pid, "peer", std::sync::Arc::new(|ctx| Box::pin(async move {
+        install_body(pid, "peer", std::sync::Arc::new(|ctx| Box::pin(async move {
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("peer").expect("register");
             // Drain until close.
@@ -662,8 +662,8 @@
     #[tokio::test]
     async fn hole2_cascading_failure_when_peer_crashes_before_registering() {
         let project = bus_topology("a", &["b", "c"], "ch");
-        let pid = project.id.to_string();
-        install_body(&pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
+        let pid = project.id;
+        install_body(pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
             let (mut bus, marker) = ctx.create_bus(Default::default())?;
             bus.register("a").expect("register a");
             emit_bus_marker(&ctx, "ch", marker).await?;
@@ -673,7 +673,7 @@
             ))?;
             Ok(())
         })));
-        install_body(&pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
+        install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("b").expect("register b");
             // B waits for C. When the engine closes the bus, this errors.
@@ -682,7 +682,7 @@
             ))?;
             Ok(())
         })));
-        install_body(&pid, "c", std::sync::Arc::new(|_ctx| Box::pin(async move {
+        install_body(pid, "c", std::sync::Arc::new(|_ctx| Box::pin(async move {
             // C crashes before registering: its handle drops without ever
             // claiming a name. B's `wait_for("c")` would hang forever
             // without the engine's dead-end detector.
@@ -705,8 +705,8 @@
     #[tokio::test]
     async fn hole3_node_holds_bus_without_registering_does_not_block_waits() {
         let project = bus_topology("producer", &["inspector", "consumer"], "ch");
-        let pid = project.id.to_string();
-        install_body(&pid, "producer", std::sync::Arc::new(|ctx| Box::pin(async move {
+        let pid = project.id;
+        install_body(pid, "producer", std::sync::Arc::new(|ctx| Box::pin(async move {
             let (mut bus, marker) = ctx.create_bus(Default::default())?;
             bus.register("producer").expect("register");
             emit_bus_marker(&ctx, "ch", marker).await?;
@@ -719,7 +719,7 @@
             bus.close();
             Ok(())
         })));
-        install_body(&pid, "inspector", std::sync::Arc::new(|ctx| Box::pin(async move {
+        install_body(pid, "inspector", std::sync::Arc::new(|ctx| Box::pin(async move {
             // Holds the bus, never registers, never recvs. Just stays
             // alive briefly then drops it. Simulates "a node that touches
             // the bus but does not participate" (the case where a holder
@@ -728,7 +728,7 @@
             let _bus = ctx.bus_from_input("ch")?;
             Ok(())
         })));
-        install_body(&pid, "consumer", std::sync::Arc::new(|ctx| Box::pin(async move {
+        install_body(pid, "consumer", std::sync::Arc::new(|ctx| Box::pin(async move {
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("consumer").expect("register");
             let mut cursor = bus.cursor();
@@ -764,8 +764,8 @@
         worker_threads: 4,
         async fn body() {
             let project = bus_topology("a", &["b"], "ch");
-            let pid = project.id.to_string();
-            install_body(&pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
+            let pid = project.id;
+            install_body(pid, "a", std::sync::Arc::new(|ctx| Box::pin(async move {
                 let (mut bus, marker) = ctx.create_bus(Default::default())?;
                 bus.register("a").expect("register");
                 emit_bus_marker(&ctx, "ch", marker).await?;
@@ -774,7 +774,7 @@
                 ))?;
                 Ok(())
             })));
-            install_body(&pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
+            install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
                 let mut bus = ctx.bus_from_input("ch")?;
                 bus.register("b").expect("register");
                 bus.wait_for("y").await.map_err(|e| weft_core::error::WeftError::Runtime(
@@ -812,9 +812,9 @@
         async fn body() {
             let exchanges = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let project = bus_topology("a", &["b"], "ch");
-            let pid = project.id.to_string();
+            let pid = project.id;
             let a_ex = exchanges.clone();
-            install_body(&pid, "a", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "a", std::sync::Arc::new(move |ctx| {
                 let a_ex = a_ex.clone();
                 Box::pin(async move {
                     let (mut bus, marker) = ctx.create_bus(Default::default())?;
@@ -847,7 +847,7 @@
                 })
             }));
             let b_ex = exchanges.clone();
-            install_body(&pid, "b", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "b", std::sync::Arc::new(move |ctx| {
                 let b_ex = b_ex.clone();
                 Box::pin(async move {
                     let mut bus = ctx.bus_from_input("ch")?;
@@ -915,9 +915,9 @@
         async fn body() {
             let exchanges = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let project = bus_topology("a", &["b"], "ch");
-            let pid = project.id.to_string();
+            let pid = project.id;
             let a_ex = exchanges.clone();
-            install_body(&pid, "a", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "a", std::sync::Arc::new(move |ctx| {
                 let a_ex = a_ex.clone();
                 Box::pin(async move {
                     let (mut bus, marker) = ctx.create_bus(Default::default())?;
@@ -946,7 +946,7 @@
                 })
             }));
             let b_ex = exchanges.clone();
-            install_body(&pid, "b", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "b", std::sync::Arc::new(move |ctx| {
                 let b_ex = b_ex.clone();
                 Box::pin(async move {
                     let mut bus = ctx.bus_from_input("ch")?;
@@ -1019,10 +1019,10 @@
                 "edges": [], "groups": []
             }))
             .expect("grant project");
-            let pid = project.id.to_string();
+            let pid = project.id;
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             let ready_tx = std::sync::Arc::new(StdMutex::new(Some(ready_tx)));
-            install_body(&pid, "payer", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "payer", std::sync::Arc::new(move |ctx| {
                 let ready_tx = ready_tx.clone();
                 Box::pin(async move {
                     let _conn = ctx
@@ -1042,7 +1042,7 @@
             let color = uuid::Uuid::new_v4();
             let journal = Arc::new(MemJournal::default());
             journal.record_event(&ExecEvent::ExecutionStarted {
-                color, project_id: pid.clone(), entry_node: "payer".into(),
+                color, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
             }, None).await.unwrap();
@@ -1108,9 +1108,9 @@
         async fn body() {
             let got_ping = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let project = bus_topology("a", &["b"], "ch");
-            let pid = project.id.to_string();
+            let pid = project.id;
             let a_got = got_ping.clone();
-            install_body(&pid, "a", std::sync::Arc::new(move |ctx| {
+            install_body(pid, "a", std::sync::Arc::new(move |ctx| {
                 let a_got = a_got.clone();
                 Box::pin(async move {
                     let (mut bus, marker) = ctx.create_bus(Default::default())?;
@@ -1148,7 +1148,7 @@
                     Ok(())
                 })
             }));
-            install_body(&pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
+            install_body(pid, "b", std::sync::Arc::new(|ctx| Box::pin(async move {
                 let mut bus = ctx.bus_from_input("ch")?;
                 bus.register("b").expect("register");
                 let _ = bus.send("ping", serde_json::json!({"v": 1}));
@@ -1248,6 +1248,7 @@
             &self,
             _p: &str,
             _f: weft_task_store::tasks::ClaimFilter,
+            _w: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
@@ -1279,7 +1280,7 @@
         let color = uuid::Uuid::new_v4();
         let entry = kicked[0].to_string();
         let kicked: Vec<String> = kicked.iter().map(|s| s.to_string()).collect();
-        let pid = project.id.to_string();
+        let pid = project.id;
         let j = journal.clone();
         let handle = tokio::spawn(async move {
             j.record_event(
@@ -1328,9 +1329,9 @@
     async fn await_without_bus_stalls_and_exits() {
         let project = bus_topology("waiter", &[], "ch");
         // (no bus consumer wired; the creator just awaits, never touches a bus)
-        let pid = project.id.to_string();
+        let pid = project.id;
         install_body(
-            &pid,
+            pid,
             "waiter",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1365,7 +1366,7 @@
     #[tokio::test]
     async fn await_with_live_bus_resumes_in_process() {
         let project = bus_plus_waiter_topology();
-        let pid = project.id.to_string();
+        let pid = project.id;
         // Shared flag: the waiter flips it on resume; the creator polls it
         // on the bus and closes once set. (A plain Arc<AtomicBool> is the
         // cross-node signal; the bus just keeps the worker warm.)
@@ -1373,7 +1374,7 @@
 
         let r_creator = resumed.clone();
         install_body(
-            &pid,
+            pid,
             "creator",
             std::sync::Arc::new(move |ctx| {
                 let resumed = r_creator.clone();
@@ -1394,7 +1395,7 @@
             }),
         );
         install_body(
-            &pid,
+            pid,
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1409,7 +1410,7 @@
         );
         let r_waiter = resumed.clone();
         install_body(
-            &pid,
+            pid,
             "waiter",
             std::sync::Arc::new(move |ctx| {
                 let resumed = r_waiter.clone();
@@ -1493,14 +1494,14 @@
     #[tokio::test]
     async fn two_awaits_on_live_bus_both_resume_in_process() {
         let project = bus_plus_waiter_topology();
-        let pid = project.id.to_string();
+        let pid = project.id;
         // Counts how many times the waiter has resumed (0 -> 1 -> 2). The
         // creator holds the bus open until BOTH resumes have landed.
         let resumes = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let c_resumes = resumes.clone();
         install_body(
-            &pid,
+            pid,
             "creator",
             std::sync::Arc::new(move |ctx| {
                 let resumes = c_resumes.clone();
@@ -1519,7 +1520,7 @@
             }),
         );
         install_body(
-            &pid,
+            pid,
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1533,7 +1534,7 @@
         );
         let w_resumes = resumes.clone();
         install_body(
-            &pid,
+            pid,
             "waiter",
             std::sync::Arc::new(move |ctx| {
                 let resumes = w_resumes.clone();
@@ -1656,14 +1657,14 @@
     #[tokio::test]
     async fn two_awaits_pulse_fed_waiter_both_resume() {
         let project = bus_plus_pulse_fed_waiter_topology();
-        let pid = project.id.to_string();
+        let pid = project.id;
         // 0 -> first await parked, 1 -> first resume done, 2 -> second
         // resume done. feeder2 uses it to time its second emit.
         let resumes = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let c_resumes = resumes.clone();
         install_body(
-            &pid,
+            pid,
             "creator",
             std::sync::Arc::new(move |ctx| {
                 let resumes = c_resumes.clone();
@@ -1681,7 +1682,7 @@
             }),
         );
         install_body(
-            &pid,
+            pid,
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1695,7 +1696,7 @@
         );
         // feeder1: one pulse on in1, then done.
         install_body(
-            &pid,
+            pid,
             "feeder1",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1706,7 +1707,7 @@
         );
         // feeder2: the ORIGINAL in2 pulse (before the first await).
         install_body(
-            &pid,
+            pid,
             "feeder2",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1723,7 +1724,7 @@
         // resume cannot re-satisfy `in2`.
         let f3_resumes = resumes.clone();
         install_body(
-            &pid,
+            pid,
             "feeder3",
             std::sync::Arc::new(move |ctx| {
                 let resumes = f3_resumes.clone();
@@ -1738,7 +1739,7 @@
         );
         let w_resumes = resumes.clone();
         install_body(
-            &pid,
+            pid,
             "waiter",
             std::sync::Arc::new(move |ctx| {
                 let resumes = w_resumes.clone();
@@ -1796,6 +1797,17 @@
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
+        // Resolve the second await only once b2 is in the run: the driver
+        // journals feeder3's `PortEmitted` after routing its pulse, and a
+        // resume wakes the moment its row lands, so resolving earlier
+        // would re-fire the waiter before b2 exists.
+        loop {
+            let events = journal.events_for_color(color).await.unwrap();
+            if events.iter().any(|e| matches!(e, ExecEvent::PortEmitted { node_id, .. } if node_id == "feeder3")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
@@ -1848,9 +1860,9 @@
     #[tokio::test]
     async fn bus_closes_before_fire_then_worker_exits_normally() {
         let project = bus_plus_waiter_topology();
-        let pid = project.id.to_string();
+        let pid = project.id;
         install_body(
-            &pid,
+            pid,
             "creator",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1867,7 +1879,7 @@
             }),
         );
         install_body(
-            &pid,
+            pid,
             "peer",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1879,7 +1891,7 @@
             }),
         );
         install_body(
-            &pid,
+            pid,
             "waiter",
             std::sync::Arc::new(|ctx| {
                 Box::pin(async move {
@@ -1952,9 +1964,9 @@
 
         for i in 0..100 {
             let project = producer_consumer_project();
-            let pid = project.id.to_string();
+            let pid = project.id;
             install_body(
-                &pid,
+                pid,
                 "producer",
                 std::sync::Arc::new(|ctx| {
                     Box::pin(async move {
@@ -1966,7 +1978,7 @@
                 }),
             );
             install_body(
-                &pid,
+                pid,
                 "consumer",
                 std::sync::Arc::new(|_ctx| Box::pin(async move { Ok(()) })),
             );
@@ -2043,7 +2055,7 @@
             .record_event(
                 &ExecEvent::ExecutionStarted {
                     color,
-                    project_id: project.id.to_string(),
+                    project_id: project.id,
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
@@ -2377,7 +2389,7 @@
         let journal = Arc::new(MemJournal::default());
         // Kick both reader nodes.
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id.to_string(), entry_node: "ra".into(),
+            color, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
@@ -2545,6 +2557,39 @@
         let has_cancel = journal.events.lock().unwrap().iter().any(|e| matches!(
             e, ExecEvent::ExecutionCancelled { color: c, .. } if *c == color));
         assert!(has_cancel, "tied live run must journal a cancellation (non-durable)");
+    }
+
+    /// A caller hanging up mid-hold ends the warm hold at once: the hold
+    /// wakes on the disconnect itself, not when a row lands or the (here
+    /// ten minute) hold runs out.
+    #[tokio::test]
+    async fn caller_hang_up_ends_the_warm_hold_promptly() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
+        let project = single_node_project("Awaiter");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 600));
+        let hang_up = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            hang_up.set_connected(false);
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_caller_tasks(
+                project, catalog, journal, color,
+                Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+            ),
+        )
+        .await
+        .expect("a hang-up must end the warm hold, not wait out the 600s hold");
+        assert!(
+            matches!(outcome, ExecutionOutcome::Stalled),
+            "with the caller gone the run leaves the hold on the not-warm path; got {outcome:?}"
+        );
     }
 
     /// Survivable (can_suspend = true) run hits the SAME durable wait and

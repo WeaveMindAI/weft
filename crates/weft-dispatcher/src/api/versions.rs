@@ -36,10 +36,6 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
 }
 
-fn parse_id(id: &str) -> Result<uuid::Uuid, ApiError> {
-    id.parse::<uuid::Uuid>().map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))
-}
-
 /// Every tree write that reads head and moves it happens inside this,
 /// holding the project's transition lock.
 ///
@@ -74,7 +70,7 @@ fn parse_id(id: &str) -> Result<uuid::Uuid, ApiError> {
 /// manifest) and folds its seed first, then writes both rows in here.
 async fn with_tree_lock<T, F, Fut>(
     state: &DispatcherState,
-    project: &str,
+    project: uuid::Uuid,
     body: F,
 ) -> Result<T, ApiError>
 where
@@ -119,13 +115,11 @@ pub struct VersionUpsert {
 pub async fn checkpoint(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     Json(body): Json<CheckpointRequest>,
 ) -> Result<Json<VersionUpsert>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
-    let upsert = with_tree_lock(&state, &project_id, || async {
+    let upsert = with_tree_lock(&state, id, || async {
         let (upsert, head) = upsert_version(&state, id, &body.manifest, body.label.as_deref(), body.root).await?;
         move_head_or_conflict(&state, id, &head, Some(&upsert.version), None).await?;
         Ok(upsert)
@@ -158,7 +152,7 @@ pub(crate) async fn record_program_source(
     project: uuid::Uuid,
     program: &weft_core::project::hash::ProgramIdentity,
 ) -> Result<String, ApiError> {
-    with_tree_lock(state, &project.to_string(), || async {
+    with_tree_lock(state, project, || async {
         record_program_source_locked(state, project, program).await
     }).await
 }
@@ -227,7 +221,7 @@ fn trigger_run_from_birth(color: Color, rows: &[weft_journal::ExecEvent]) -> any
     let mut spec = weft_core::run_spec::RunSpec::whole("");
     spec.fire = Some(fire);
     Ok(Some(RunRow {
-        color, project_id: project_id.parse()?, version_id: version, seed_color: None,
+        color, project_id: *project_id, version_id: version, seed_color: None,
         stale: Vec::new(), spec: Some(spec), definition_hash, example: None, created_at: *at_unix,
     }))
 }
@@ -445,7 +439,7 @@ fn refused(refusal: &Refusal) -> ApiError {
 /// row it has never heard of is not in flight; it is nothing.
 async fn in_flight_colors(
     state: &DispatcherState,
-    project: &str,
+    project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<Color>, ApiError> {
     let mut live: std::collections::HashSet<Color> = state
         .journal
@@ -476,7 +470,7 @@ async fn in_flight_colors(
 /// pool, so the in-memory journal can answer it too.
 async fn settled_colors(
     state: &DispatcherState,
-    project: &str,
+    project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<Color>, ApiError> {
     let mut settled = state
         .journal
@@ -548,10 +542,9 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     Json(body): Json<VersionRunRequest>,
 ) -> Result<Json<VersionRunResponse>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
     require_action(&state, id, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed {
@@ -572,7 +565,6 @@ pub async fn run(
     if program.binary_hash != body.binary_hash {
         return Err((StatusCode::CONFLICT, "the project's implementation changed since this run was prepared; run again".into()));
     }
-    let project_id = id.to_string();
 
     // The manifest is checked here, before the expensive part, but the
     // version ROW is written later, in the same locked breath as the
@@ -604,7 +596,7 @@ pub async fn run(
     let seed_run: Option<RunRow> = if body.seed && !body.root {
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let settled = settled_colors(&state, &project_id).await?;
+        let settled = settled_colors(&state, id).await?;
         match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
             SeedChoice::Run(color) => runs.into_iter().find(|r| r.color == color),
             SeedChoice::Nothing => None,
@@ -622,7 +614,7 @@ pub async fn run(
     let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
     let mut resolved = resolve_spec(&spec, &project).map_err(|r| refused(&r))?;
     let bakes = if spec.fire.is_some() {
-        state.journal.trigger_bakes(&project_id).await.map_err(|error| internal("read trigger bakes", error))?
+        state.journal.trigger_bakes(id).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
     // A fired CALLER trigger (a Route) gets a stand-in caller: there is
     // no socket coming, so the run serves the body the author typed and
@@ -672,7 +664,7 @@ pub async fn run(
             .map(|place| weft_core::project::address_of(&project, &place.id, &place.path))
             .collect(),
     );
-    let missing = crate::api::project::missing_infra_nodes(&state, &project_id, &project, bound.as_ref()).await?;
+    let missing = crate::api::project::missing_infra_nodes(&state, id, &project, bound.as_ref()).await?;
     if !missing.is_empty() {
         return Err((
             StatusCode::PRECONDITION_REQUIRED,
@@ -770,7 +762,7 @@ pub async fn run(
     // stays outside it.
     // A group's boundaries spell as the group, so a set dedupes them.
     let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
-    let (version, moved) = with_tree_lock(&state, &project_id, || async {
+    let (version, moved) = with_tree_lock(&state, id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
         // has to be where head is at the moment the row is written, or
@@ -796,7 +788,7 @@ pub async fn run(
         crate::api::project::start_queued_execution_with(
             &state,
             color,
-            &project_id,
+            id,
             weft_core::context::Phase::Fire,
             &entry_node,
             &kicks,
@@ -969,11 +961,10 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
 pub async fn trigger_bakes(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
-    let bakes = state.journal.trigger_bakes(&id.to_string()).await.map_err(|error| internal("read trigger bakes", error))?;
+    let bakes = state.journal.trigger_bakes(id).await.map_err(|error| internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
 }
 
@@ -1039,9 +1030,8 @@ pub struct TreeResponse {
 pub async fn tree(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<TreeResponse>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
     let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
     let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
@@ -1063,7 +1053,7 @@ pub async fn tree(
             manifest: v.manifest.clone(),
         })
         .collect();
-    let suspended = crate::api::project::suspended_color_set(&state, &id.to_string())
+    let suspended = crate::api::project::suspended_color_set(&state, id)
         .await
         .map_err(|e| internal("suspended", e))?;
     // ONE read for every run's status. Asked per run, a project with a
@@ -1071,7 +1061,7 @@ pub async fn tree(
     // tree` and every refresh of the editor's version sidebar.
     let summaries = state
         .journal
-        .execution_summaries_for_project(&id.to_string())
+        .execution_summaries_for_project(id)
         .await
         .map_err(|e| internal("execution summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
@@ -1124,13 +1114,11 @@ pub struct HeadResponse {
 pub async fn set_head(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     Json(body): Json<HeadRequest>,
 ) -> Result<Json<HeadResponse>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
-    with_tree_lock(&state, &project_id, || async {
+    with_tree_lock(&state, id, || async {
         // Resolve the destination under the same lock as prune and the head move.
         // Otherwise a valid destination can disappear between its read and use.
         let (version_id, run) = match (body.run, body.version) {
@@ -1186,10 +1174,9 @@ pub struct RunUpdate {
 pub async fn update_run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, color)): Path<(String, String)>,
+    Path((id, color)): Path<(uuid::Uuid, String)>,
     Json(body): Json<RunUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
     let color: Color = color.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
     // Read only to authorize the color to this project. What gets written
@@ -1241,12 +1228,10 @@ pub struct PruneResponse {
 pub async fn prune(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, version)): Path<(String, String)>,
+    Path((id, version)): Path<(uuid::Uuid, String)>,
     Query(query): Query<PruneQuery>,
 ) -> Result<Json<PruneResponse>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
     // Plan and delete under the project's tree lock: without it a run
     // started between the two lands under a version this call is about to
     // delete, and the plan's "nothing here is still running" was true only
@@ -1254,11 +1239,11 @@ pub async fn prune(
     // write, so a refusal in here stays a refusal instead of collapsing
     // into a 500 (which is why this body used to smuggle its reasons out
     // as an `Ok(Err(..))`).
-    let outcome = with_tree_lock(&state, &project_id, || async {
+    let outcome = with_tree_lock(&state, id, || async {
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let in_flight = in_flight_colors(&state, &project_id).await?;
+        let in_flight = in_flight_colors(&state, id).await?;
         let frozen: Vec<String> = query
             .frozen
             .as_deref()
@@ -1351,9 +1336,8 @@ pub struct SweepResponse {
 pub async fn sweep(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<SweepResponse>, ApiError> {
-    let id = parse_id(&id)?;
     authorize_project(&state, &caller.0, id).await?;
     Ok(Json(SweepResponse { swept: sweep_bare_versions(&state, id).await? }))
 }
@@ -1372,8 +1356,7 @@ pub(crate) async fn sweep_bare_versions(
     state: &DispatcherState,
     id: uuid::Uuid,
 ) -> Result<Vec<String>, ApiError> {
-    let project_id = id.to_string();
-    with_tree_lock(state, &project_id, || async {
+    with_tree_lock(state, id, || async {
         let mut swept: Vec<String> = Vec::new();
         // A sweep can free a parent: loop until nothing is bare. Head is
         // read inside the lock and re-read each pass: a checkpoint
@@ -1524,7 +1507,7 @@ mod fire_snapshot_tests {
         let project = uuid::Uuid::new_v4();
         let wake = serde_json::json!({"message": "original"});
         let (birth, mut kicks) = crate::api::project::execution_birth_events(
-            color, &project.to_string(), weft_core::context::Phase::Fire, "trigger",
+            color, project, weft_core::context::Phase::Fire, "trigger",
             &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
             "original-graph", None, None, None, Some("original-source"), 42,
         );

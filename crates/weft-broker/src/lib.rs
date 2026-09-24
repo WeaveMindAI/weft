@@ -103,7 +103,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/journal/record",
             post(handlers::journal_record).layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RECORD_BODY_LIMIT)),
         )
-        .route("/v1/journal/fetch", post(handlers::journal_fetch))
+        .route("/v1/journal/wait", post(handlers::journal_wait))
         .route(
             "/v1/journal/has_terminal",
             post(handlers::journal_has_terminal),

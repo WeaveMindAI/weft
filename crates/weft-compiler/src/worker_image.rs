@@ -641,10 +641,11 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// package, emitted at the same paths this build uses and pinned by
 /// the SAME `Cargo.lock`. So this per-project build:
 ///
-/// - compiles into ONE persistent BuildKit cache per
+/// - compiles into a persistent BuildKit cache per
 ///   `{{worker_cache_key}}` (`hash::compute_worker_cache_key`: the build
-///   environment and the builder), shared by every worker build on
-///   this host. The cache is seeded ONCE from the baked `/weft/target`
+///   environment and the builder) and compile lane (below), shared by
+///   every worker build on this host that holds that lane. Each cache
+///   is seeded ONCE from the baked `/weft/target`
 ///   (the marker file records a complete seed; a build interrupted
 ///   mid-copy seeds again), so the precompiled engine is there from the
 ///   first build. After that, cargo's own fingerprints decide what
@@ -663,21 +664,33 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 ///   linked them for [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`]
 ///   runs after every build); `weft clean --images` reports the mount's
 ///   size and `weft clean --build-cache` throws it away whole;
-/// - seeds the worker crate's `Cargo.lock` from the workspace lock
-///   baked at `/weft/Cargo.lock` so every dependency the workspace
-///   already pinned resolves to the SAME version here (cargo then
-///   adds only the project's extra `pkg_<node>` + node-specific deps
-///   on top, leaving the shared set untouched). A different
-///   resolution for a shared crate would re-fingerprint and recompile
-///   the whole tree, defeating the reuse.
+/// - seeds the worker crate's `Cargo.lock` from `{{seed_lock}}`: on the
+///   builder base, [`BASE_WORKER_LOCK`], the lock the stock worker
+///   resolved to, so every crate the base compiled resolves to the SAME
+///   version here and cargo only adds what the project's own nodes
+///   bring (a build with nothing new never fetches the crates.io
+///   index); without a base, the workspace lock at `/weft/Cargo.lock`.
+///   A different resolution for a shared crate would re-fingerprint and
+///   recompile the whole tree, defeating the reuse.
 ///
 /// The cache mounts at `/cache/target`, never over `/weft/target`: a
 /// mount there would shadow the baked layer the seed copies from. The
-/// registry cache mount is kept (crates.io artifacts are immutable per
-/// version+features, so it is shared and safe) to speed fetching any
-/// NEW node-specific deps a project pulls beyond the workspace set.
-/// `sharing=locked`: two worker builds on one host take turns in the
-/// cache instead of racing cargo's own lock inside it.
+/// registry cache mount keeps the crates.io sources a build fetched
+/// (immutable per version), so a lane downloads a crate once.
+///
+/// Both caches are one per LANE (`{{worker_cache_key}}-<lane>` for the
+/// compile cache), the lane a build-arg ([`COMPILE_LANE_ARG`]) the CLI
+/// fills with a lane it holds for the whole build. Cargo locks a target
+/// directory for a whole build, so one shared cache made every worker
+/// build on a host wait for the one before it (ten builds at once meant
+/// the last waited out nine); each lane is its own directory, seeded
+/// once from the baked layer on its first use, so builds in different
+/// lanes compile side by side and the host keeps at most one cache per
+/// lane. The registry is per lane for the same reason: cargo's lock on
+/// its package cache lives in `$CARGO_HOME`, outside the mount, so two
+/// builds sharing one registry unpack the same crate over each other.
+/// Both mounts are `sharing=locked`, which makes a build given the same
+/// lane as a running one wait for it rather than race it.
 ///
 /// `cargo build` (NOT `--locked`): the worker manifest carries extra
 /// path deps (the `pkg_<node>` crates) absent from the seeded
@@ -685,20 +698,36 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// those. Seeding the lock pins the shared set; cargo appends the rest.
 const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "ENV CARGO_TARGET_DIR=/cache/target\n",
-    "RUN --mount=type=cache,id=weft-worker-cargo-registry,target=/root/.cargo/registry,sharing=locked \\\n",
-    "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}},target=/cache/target,sharing=locked \\\n",
+    "ARG WEFT_COMPILE_LANE\n",
+    "RUN --mount=type=cache,id=weft-worker-cargo-registry-${WEFT_COMPILE_LANE},target=/root/.cargo/registry,sharing=locked \\\n",
+    "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}}-${WEFT_COMPILE_LANE},target=/cache/target,sharing=locked \\\n",
     "    ( [ -f /cache/target/.weft-seeded ] || ! [ -d /weft/target ] \\\n",
     "      || ( cp -a /weft/target/. /cache/target/ && touch /cache/target/.weft-seeded ) ) \\\n",
-    "    && cp /weft/Cargo.lock /work/Cargo.lock \\\n",
+    "    && cp {{seed_lock}} /work/Cargo.lock \\\n",
     "    && cargo build --release \\\n",
     "    && cp /cache/target/release/{{binary_name}} /worker \\\n",
     "    && ( sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} \\\n",
     "         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 )\n",
 );
 
-/// The id prefix of the shared compile cache mount, as `docker buildx du`
-/// reports it (`with id "/weft-worker-target-<key>"`): what a size
-/// report looks for.
+/// Where the builder base keeps the lock its stock worker resolved to,
+/// which a per-project build on that base starts from (see
+/// [`CARGO_BUILD_RUN_FRAGMENT`]).
+// SYNC: BASE_WORKER_LOCK <-> deploy/docker/worker-builder-base.Dockerfile (worker.Cargo.lock)
+pub const BASE_WORKER_LOCK: &str = "/weft/worker.Cargo.lock";
+
+/// What a build without the builder base seeds its lock from: the
+/// workspace lock its own `COPY weft/` brings.
+const WORKSPACE_LOCK: &str = "/weft/Cargo.lock";
+
+/// The build-arg naming the compile-cache lane a worker build uses (see
+/// [`CARGO_BUILD_RUN_FRAGMENT`]).
+// SYNC: COMPILE_LANE_ARG <-> the `ARG WEFT_COMPILE_LANE` line of CARGO_BUILD_RUN_FRAGMENT above
+pub const COMPILE_LANE_ARG: &str = "WEFT_COMPILE_LANE";
+
+/// The id prefix of the compile cache mounts, as `docker buildx du`
+/// reports them (`with id "/weft-worker-target-<key>-<lane>"`): what a
+/// size report looks for.
 pub const WORKER_CACHE_MOUNT_ID_PREFIX: &str = "weft-worker-target-";
 
 /// How long a compiled node package stays in the shared cache after the
@@ -830,7 +859,7 @@ fn default_template() -> String {
             "{{build_env_lines}}",
             "\n",
         ),
-        CARGO_BUILD_RUN_FRAGMENT,
+        &CARGO_BUILD_RUN_FRAGMENT.replace("{{seed_lock}}", WORKSPACE_LOCK),
         "\n",
         RUNTIME_STAGE_FRAGMENT,
     ]
@@ -839,7 +868,7 @@ fn default_template() -> String {
 
 /// Multi-stage template that FROMs the shared pre-built builder
 /// base. The base image already has debian build packages, rustup
-/// (with the workspace's pinned toolchain materialized), and the
+/// with the workspace's pinned toolchain installed, and the
 /// whole workspace COMPILED `--release` into `/weft/target`. The
 /// builder stage here adds only what's project-specific: per-node
 /// system build packages, the generated worker crate, and the
@@ -867,7 +896,7 @@ fn prebuilt_base_template() -> String {
             "{{build_env_lines}}",
             "\n",
         ),
-        CARGO_BUILD_RUN_FRAGMENT,
+        &CARGO_BUILD_RUN_FRAGMENT.replace("{{seed_lock}}", BASE_WORKER_LOCK),
         "\n",
         RUNTIME_STAGE_FRAGMENT,
     ]
@@ -1228,8 +1257,8 @@ mod tests {
             out.body
         );
         assert!(
-            out.body.contains("cp /weft/Cargo.lock /work/Cargo.lock"),
-            "prebuilt path seeds the worker lock from the workspace lock: {}",
+            out.body.contains("cp /weft/worker.Cargo.lock /work/Cargo.lock"),
+            "prebuilt path seeds the worker lock from the stock worker's lock: {}",
             out.body
         );
         // The binary is copied out of the shared cache inside the same

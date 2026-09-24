@@ -1,0 +1,25 @@
+{
+  "type": "DisplayService",
+  "label": "Display Service",
+  "description": "An infra node with a display: a single-container HTTP sidecar whose /live panel counts presses of its one button. Used by the e2e rig to read and press a display through the signal-token doors.",
+  "tags": [
+    "infra",
+    "e2e"
+  ],
+  "icon": "Server",
+  "color": "#22c55e",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "status",
+      "type": "String"
+    }
+  ],
+  "requires_infra": true,
+  "images": [
+    "images/display_service"
+  ],
+  "features": {
+    "liveEndpoint": "api"
+  }
+}

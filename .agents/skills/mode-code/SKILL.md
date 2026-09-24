@@ -63,7 +63,7 @@ Four layers; pick the right one and call it by its name.
 - **Layer 1: pure-function unit tests.** Values in, values out, no I/O. Fast, next to the function. This is where 80% of the test count lives.
 - **Layer 2: wire-shape tests.** Round-trip every cross-process type through its serialization format, next to the type. Catches "renamed a field, broke the contract".
 - **Layer 3: contract tests with fakes.** A subsystem's real code against hand-rolled in-memory fakes of its I/O, in the subsystem's test directory. Catches orchestration bugs the pure functions can't. This is the layer most projects skip.
-- **Layer 4: end-to-end integration tests.** Real binaries, real network, real backing services. Slow, few of them, CI nightly or pre-release, not every save.
+- **Layer 4: end-to-end integration tests.** Real binaries, real network, real backing services. Run after every fix and feature once the lower layers are green, only the files the change reaches, as `MEMORY.md` lays out ("Every fix and feature ends with setup.sh and the e2e that cover it"); never on every save.
 
 Rules when adding code:
 1. **No I/O inside subsystem code.** HTTP clients, clocks, subprocesses, DB drivers, file I/O, env vars go through a trait with a production impl and a fake impl.
@@ -74,11 +74,20 @@ Rules when adding code:
 6. **Tests at the right layer.** New pure function: layer-1 test. New orchestration path: layer-3 test. Never layer-4 tests for layer-1 bugs, or the reverse.
 
 **Run only the [test scope]** (defined in `.codex/config.toml`): the crate you
-edited plus each crate that depends on what you changed, one test by name
-while iterating (`cargo test -p <crate> --test <file> <name>`), then the
-crate. Runners take the same narrowing: `scripts/run-node-tests.sh <package>`,
-`scripts/run-db-tests.sh <crate>`, `scripts/run-e2e.sh <name>`.
+edited plus each crate that depends on what you changed. Rust tests run
+under `cargo nextest run`, never `cargo test`: nextest runs every test of
+every test binary side by side, `cargo test` runs the binaries one after
+another. While iterating, one test by name (`cargo nextest run -p <crate>
+<name>`), then the crates, in ONE command (`cargo nextest run -p a -p b`)
+so cargo builds them together. Clippy runs once, when the change is done,
+on the same `-p` list, never `--workspace`. Runners take the same
+narrowing: `scripts/run-node-tests.sh <package>`, `scripts/run-db-tests.sh
+<crate> [name] [file]` (nextest too, every database suite at once),
+`scripts/run-e2e.sh <name>`. Built, the layer 1 to 3 tests of the whole
+workspace run in about 20 seconds and the database ones in about 15: a run
+that takes minutes is compiling, so change fewer crates between runs rather
+than running less.
 
 **Flakes are bugs, never noise.** A test that fails 1-in-N is a bug; "just flaky" frames it as the test's fault and trains the eye to ignore it. Reject the frame. Reproduce deterministically first: loop it 20-50 times locally, under parallel load (generate contention if the plain loop doesn't trigger it), widening the load until it triggers. Find the root cause: the usual suspects are notification fired before a waiter is armed (use `notify_one`'s permit semantics), arm-then-check windows, order-dependent assertions under multi-thread, relaxed atomics that should be acquire/release. Fix cleanly in the code under test: never retries, sleeps, longer timeouts, `#[ignore]`, or "try N times" wrappers; those tolerate the race instead of fixing it. And never use flakiness as a permission slip: a failed test failed. Re-running to green is evidence the race is intermittent, not that the failure was spurious; investigate every failure on first observation.
 
-**Stress-loop timing-sensitive tests by construction.** Tests touching timing-sensitive primitives run many times by design, via a `stress_test!`-style macro generating N named variants so `cargo test` parallelizes them and any race surfaces loudly. Apply it to every test using a multi-thread runtime, `tokio::sync::Notify`, channels, or broadcast; depending on a firing order between tasks; asserting a stuck-detection deadline; or coordinating spawned tasks through shared state. A 10-second harness timeout that "succeeds" in 10s is a hung test the harness rescued: treat it as a failure.
+**Stress-loop timing-sensitive tests by construction.** Tests touching timing-sensitive primitives run many times by design, via a `stress_test!`-style macro generating N named variants so the test runner parallelizes them and any race surfaces loudly. Apply it to every test using a multi-thread runtime, `tokio::sync::Notify`, channels, or broadcast; depending on a firing order between tasks; asserting a stuck-detection deadline; or coordinating spawned tasks through shared state. A 10-second harness timeout that "succeeds" in 10s is a hung test the harness rescued: treat it as a failure.

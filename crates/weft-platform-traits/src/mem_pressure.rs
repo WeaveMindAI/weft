@@ -27,6 +27,8 @@ use std::sync::Arc;
 /// it is not already in trouble when it sheds load. Shared by BOTH
 /// pooled pods (listener + supervisor) so their saturation thresholds
 /// cannot drift. An honest default; an operator may tune it.
+/// SYNC: SATURATION_MEM_FRACTION <-> the `worker_pod_notify_on_change`
+///       trigger in crates/weft-task-store/src/worker_pod.rs (GROUP)
 pub const SATURATION_MEM_FRACTION: f64 = 0.75;
 
 /// Pure saturation decision: is `fraction` at or above `threshold`?

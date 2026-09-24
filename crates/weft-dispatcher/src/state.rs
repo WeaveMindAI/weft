@@ -60,6 +60,14 @@ pub struct DispatcherState {
     /// would release until it got one. A pool of its own makes holding a
     /// lock cost nothing that doing the work needs.
     pub lock_pool: sqlx::PgPool,
+    /// The pod's one Postgres `LISTEN` connection, on every channel in
+    /// [`crate::app::DISPATCHER_CHANNELS`]. Every loop and request that
+    /// waits on a row sleeps on it (`pg_wake`, the picker, command
+    /// waits) instead of polling.
+    pub signals: Arc<weft_task_store::pg_signal::PgSignalWatch>,
+    /// What the nodes on the graphs open against this pod are showing,
+    /// looked at only while an editor watches (see `display_feeds`).
+    pub displays: Arc<crate::display_feeds::DisplayFeeds>,
     pub workers: Arc<dyn WorkerBackend>,
     /// Builds a project's latest saved source on demand so a verb (`run` /
     /// `activate` / infra start) can just be clicked on a not-yet-built (or
@@ -125,16 +133,11 @@ pub struct DispatcherState {
     /// operator's actual CIDRs; defaults are Kind's.
     pub cluster_pod_cidr: String,
     pub cluster_service_cidr: String,
-    /// Kubernetes namespace name of the cluster's ingress controller
-    /// (ingress-nginx by default; Traefik / Contour / etc. use
-    /// different namespaces). Threaded into rendered infra-pod policies
-    /// so public-facing infra pods accept ingress from the right
-    /// controller.
-    pub cluster_ingress_namespace: String,
-    /// The control-plane namespace: where pooled, trusted, tenant-
-    /// agnostic services run (infra-supervisor pods; listener pods).
-    /// Defaults to the dispatcher's own namespace.
-    pub control_plane_namespace: String,
+    /// Which install this dispatcher belongs to, and so every namespace
+    /// it names: its own system namespace (where the pooled listener
+    /// and supervisor pods run), its db namespace (the broker), the
+    /// shared worker namespace, and the per-project namespace prefix.
+    pub instance: weft_core::infra::Instance,
     /// The in-cluster broker URL the dispatcher proxies the CLI `weft files`
     /// verbs to (the broker owns the runtime-file bucket + metadata; the
     /// dispatcher never touches bytes, it just fronts the CLI as the control

@@ -23,7 +23,7 @@ import { layoutToSvg } from './render-svg';
 import { autoOrganize } from '../auto-organize';
 import { translateProject } from '../../host-bridge';
 import type { ProjectDefinition } from '../../../protocol';
-import type { NodeInstance } from '../types';
+import { isContainerNodeType, type NodeInstance } from '../types';
 import whatsappSupportBot from './whatsapp-support-bot.project.json';
 import telegramImageBot from './telegram-image-bot.project.json';
 
@@ -138,7 +138,9 @@ function overlaps(a: Box, b: Box): boolean {
 
 async function layOut(name: string, def: unknown) {
 	const v1 = translateProject(def as ProjectDefinition, '', '');
-	const nodes = v1.nodes;
+	// Containers start collapsed; the corpus is about the inside of a
+	// group, so every container is opened first.
+	const nodes = v1.nodes.map(n => isContainerNodeType(n.nodeType) ? { ...n, config: { ...n.config, expanded: true } } : n);
 	const edges = v1.edges;
 	// `autoOrganize` throws when ELK refuses the graph, which fails the
 	// test with ELK's own message.

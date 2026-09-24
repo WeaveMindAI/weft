@@ -3,22 +3,28 @@
 //! This is the generic toolkit the pooled placement machinery is built
 //! on; it owns no table of its own. Two things live here:
 //!
-//! - **Row-ownership lease helpers** (`LEASE_DURATION_SECS`,
-//!   `LEASE_RENEW_INTERVAL_SECS`, `is_lease_live`, `now_unix`). A
+//! - **Row-ownership lease helpers** (`lease_duration_secs`,
+//!   `lease_renew_interval`, `is_lease_live`, `now_unix`). A
 //!   registry row (e.g. a `listener_pod` or `supervisor_pod` entry)
 //!   carries a `leased_until_unix`; its owning dispatcher Pod renews it
-//!   every `LEASE_RENEW_INTERVAL_SECS`, and on hard death the lease
-//!   expires after `LEASE_DURATION_SECS` so a sibling Pod can adopt it.
+//!   every `lease_renew_interval`, and on hard death the lease
+//!   expires after `lease_duration_secs` so a sibling Pod can adopt it.
 //! - **Advisory-lock key derivation** (`advisory_key` + the per-regime
 //!   domain constants). Serializes cross-Pod state transitions (listener
 //!   + supervisor pick-or-spawn) without a dedicated lock table.
 
-/// How long a row-ownership lease is valid before it must be renewed.
-pub const LEASE_DURATION_SECS: i64 = 30;
+/// How long a row-ownership lease is valid before it must be renewed,
+/// at this install's pace (`weft_core::time_scale`): 30 seconds in real
+/// time.
+pub fn lease_duration_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(30)
+}
 
 /// Soft renewal interval. Owners renew this often to stay ahead of
-/// expiry. Set well below `LEASE_DURATION_SECS`.
-pub const LEASE_RENEW_INTERVAL_SECS: u64 = 10;
+/// expiry: a third of [`lease_duration_secs`], 10 seconds in real time.
+pub fn lease_renew_interval() -> std::time::Duration {
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
+}
 
 /// Spawn grace for a freshly-placed pool pod (listener / supervisor).
 ///
@@ -34,6 +40,10 @@ pub const LEASE_RENEW_INTERVAL_SECS: u64 = 10;
 /// shortly after. Distinct from the ownership lease: the lease says
 /// "which dispatcher drives this pod," the grace says "this pod is too
 /// young to be judged idle yet."
+///
+/// Never scaled by `weft_core::time_scale`: what it waits for is real work
+/// (a pod starting, a first write under cluster load), which takes as long
+/// in a fast install as in any other.
 pub const SPAWN_GRACE_SECS: i64 = 30;
 
 pub fn is_lease_live(leased_until_unix: i64) -> bool {
@@ -140,6 +150,10 @@ pub const PROJECT_TRANSITION_DOMAIN: &str = "weft_project_transition";
 /// routes that claim the same call both armed (the e2e `api_overlap`
 /// shape). Held on the lock pool, so a waiter pins no work connection.
 pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
+/// Serializes each background reaper cluster-wide, keyed by the
+/// reaper's name, so one dispatcher replica runs a given sweep at a
+/// time and the others skip that turn (see `reaper`).
+pub const REAPER_DOMAIN: &str = "weft_reaper";
 
 /// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
 /// `key`, TRY-locking. Returns `Ok(None)` immediately if another holder
@@ -277,14 +291,14 @@ pub fn lock_answer(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, Str
 /// on the Pod. A waiter holds nothing between attempts.
 pub async fn with_project_transition_lock<T, F, Fut>(
     lock_pool: &sqlx::postgres::PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
     body: F,
 ) -> anyhow::Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let key = advisory_key(PROJECT_TRANSITION_DOMAIN, project_id);
+    let key = advisory_key(PROJECT_TRANSITION_DOMAIN, &project_id.to_string());
     let waiting_since = std::time::Instant::now();
     let mut said_at = std::time::Duration::ZERO;
     let mut backoff = std::time::Duration::from_millis(5);

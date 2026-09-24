@@ -11,7 +11,7 @@
 //! the caller is); this surface exists for LIVE tests, whose
 //! credential path only exists next to the broker.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -43,14 +43,13 @@ pub struct RunNodeTestResponse {
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     Json(body): Json<RunNodeTestRequest>,
 ) -> Result<Json<RunNodeTestResponse>, (StatusCode, String)> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
 
     let payload = RunNodeTestPayload {
-        project_id: id.to_string(),
+        project_id: id,
         tenant: caller.0 .0.clone(),
         image_ref: body.image_ref,
         list: false,
@@ -64,7 +63,7 @@ pub async fn run(
         weft_task_store::NewTask {
             kind: RUN_NODE_TEST_KIND.to_string(),
             target: weft_task_store::TaskTarget::Dispatcher,
-            project_id: Some(id.to_string()),
+            project_id: Some(id),
             dedup_key: None,
             color: None,
             tenant_id: Some(caller.0 .0.clone()),
@@ -97,26 +96,34 @@ pub struct NodeTestRunStatus {
 pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, task_id)): Path<(String, String)>,
+    Path((id, task_id)): Path<(uuid::Uuid, String)>,
+    Query(hold): Query<super::HoldQuery>,
 ) -> Result<Json<NodeTestRunStatus>, (StatusCode, String)> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     let task_id = task_id
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad task id".into()))?;
 
-    let outcome =
-        weft_task_store::tasks::peek_for_project(&state.pg_pool, task_id, &id.to_string())
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "no such node-test run for this project (terminal runs are kept about \
-                     an hour)"
-                        .to_string(),
-                )
-            })?;
+    // Every read is scoped to this project. A client waiting on a run
+    // holds here until it finishes, or the hold runs out, instead of
+    // asking on a timer; a zero hold is one read.
+    let outcome = weft_task_store::terminal::wait_for_terminal_in_project(
+        &state.pg_pool,
+        &state.signals,
+        task_id,
+        id,
+        hold.hold(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "no such node-test run for this project (terminal runs are kept about \
+             an hour)"
+                .to_string(),
+        )
+    })?;
 
     Ok(Json(NodeTestRunStatus {
         status: outcome.status,

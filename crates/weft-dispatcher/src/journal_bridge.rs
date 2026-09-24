@@ -1,7 +1,8 @@
 //! Bridge between the journal's `exec_event` table and the
 //! dispatcher's `EventBus` SSE fanout.
 //!
-//! Polls `exec_event` on a tick, picks up newly-inserted rows, folds
+//! Wakes on every journal row announced (`EXEC_EVENT_CHANNEL`), picks
+//! up newly-committed rows, folds
 //! each row into its execution's live projection
 //! (`crate::projection::ExecutionProjector`, one per open color on
 //! this pod), and publishes the `DispatcherEvent`s it paints to
@@ -22,10 +23,13 @@ use sqlx::Row;
 
 use weft_journal::ExecEvent;
 
+use crate::pg_wake::{self, DrainStep, WakeOn};
 use crate::projection::{execution_program, ExecutionProjector, ProgramLookup};
+use crate::settled::{Position, SettledReader};
 use crate::state::DispatcherState;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Rows read per look; a full batch means more may wait behind it.
+const BATCH: i64 = 1000;
 /// A projection that has seen no row for this long is dropped: a run
 /// parked on a form for days would otherwise hold its whole fold in
 /// this pod's RAM. The next row for the color rebuilds it from the
@@ -37,7 +41,7 @@ const PROJECTION_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const CURSOR_KEY: &str = "journal_bridge";
 
 /// Persistent cursor table. One row per cursor key. The bridge
-/// reads `last_id` on boot and writes it after every successful
+/// reads `(last_xid, last_id)` on boot and writes it after every successful
 /// drain so a Pod restart resumes where the cluster left off. The
 /// seed row's key literal is `CURSOR_KEY` (static DDL cannot bind).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
@@ -46,7 +50,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS dispatcher_cursor (
             key TEXT PRIMARY KEY,
-            last_id BIGINT NOT NULL
+            last_id BIGINT NOT NULL,
+            -- With `last_id`, the last row passed, in the order a settled
+            -- read goes (`crate::settled`). A cursor starts at xid 0,
+            -- below every writer: the rows a database held before
+            -- `writer_xid` existed were all given 0, so they keep their
+            -- `last_id` order behind the cursor, and any row written
+            -- since sorts after them.
+            last_xid XID8 NOT NULL DEFAULT '0'::xid8
         )"#,
     ],
     seed: &[
@@ -55,9 +66,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     ],
 };
 
-#[derive(Default)]
 struct Cursor {
-    last_id: i64,
+    /// The last row passed (`crate::settled`).
+    last: Position,
     /// One live projection per execution this pod has seen rows for
     /// recently and that has not reached its terminal. A color first
     /// seen mid-flight (this pod booted after the run started, or the
@@ -65,15 +76,8 @@ struct Cursor {
     /// rows before the cursor. RAM only: any pod rebuilds any of them
     /// from Postgres.
     projectors: HashMap<weft_core::Color, LiveProjection>,
-    /// Stall legibility: the inserting xid that last blocked the cursor
-    /// (the gap-safety guard stopping at an unsettled row), and how many
-    /// consecutive ticks it has blocked. The xmin guard correctly waits
-    /// for a long-open Postgres transaction to commit/abort, but that
-    /// can freeze the whole fleet's event publishing for the duration;
-    /// a breadcrumb after enough ticks names the culprit so the stall is
-    /// not invisible. Reset when the cursor advances.
-    blocked_on_xid: Option<i64>,
-    blocked_ticks: u32,
+    /// The settled read the cursor advances by (`crate::settled`).
+    reader: SettledReader,
 }
 
 struct LiveProjection {
@@ -82,6 +86,10 @@ struct LiveProjection {
 }
 
 impl Cursor {
+    fn new() -> Self {
+        Self { last: Position::default(), projectors: HashMap::new(), reader: SettledReader::new("journal_bridge") }
+    }
+
     /// Drop the projections that have folded nothing for a while. One
     /// that does not fold at all (a run with no program to read) holds
     /// no RAM worth freeing, and reopening it would republish its
@@ -93,38 +101,31 @@ impl Cursor {
     }
 }
 
-/// Long-running task. Spawn one per dispatcher Pod.
-pub async fn run(state: DispatcherState) {
-    let mut cursor = Cursor::default();
+const ON_EXEC_EVENT: &[WakeOn] = &[WakeOn::any(weft_journal::EXEC_EVENT_CHANNEL)];
 
-    if let Err(e) = bootstrap(&state.pg_pool, &mut cursor).await {
+/// Long-running task. Spawn one per dispatcher Pod. Sleeps until a
+/// journal row is announced on `EXEC_EVENT_CHANNEL`, then publishes
+/// everything new; the safety tick also drops idle projections.
+pub async fn run(state: DispatcherState) {
+    let cursor = tokio::sync::Mutex::new(Cursor::new());
+
+    if let Err(e) = bootstrap(&state.pg_pool, &mut *cursor.lock().await).await {
         tracing::warn!(target: "weft_dispatcher::journal_bridge", error = %e, "bootstrap failed");
     }
 
-    loop {
-        if let Err(e) = drain_new_rows(&state, &mut cursor).await {
-            tracing::warn!(
-                target: "weft_dispatcher::journal_bridge",
-                error = %e,
-                "drain failed; will retry"
-            );
-        }
-        cursor.evict_idle_projections(Instant::now());
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// True iff the transaction that inserted a row (`xmin`, 32-bit) is
-/// strictly below the snapshot's xmin horizon (xid8 as i64), i.e.
-/// every transaction old enough to have allocated a lower exec_event
-/// id has finished. The row's xmin wraps at 2^32 while the horizon
-/// carries the epoch, so the comparison is done modulo 2^32 with a
-/// signed wraparound distance (valid because Postgres keeps live
-/// xids within 2^31 of the current horizon).
-fn xid_settled(inserted_xid: i64, horizon_xid: i64) -> bool {
-    let row = inserted_xid as u32;
-    let horizon = horizon_xid as u32;
-    (horizon.wrapping_sub(row) as i32) > 0
+    pg_wake::run(
+        state.signals.subscribe(),
+        ON_EXEC_EVENT,
+        pg_wake::SAFETY_POLL_INTERVAL,
+        "weft_dispatcher::journal_bridge",
+        || async {
+            let mut cursor = cursor.lock().await;
+            let step = drain_new_rows(&state, &mut cursor).await;
+            cursor.evict_idle_projections(Instant::now());
+            step
+        },
+    )
+    .await;
 }
 
 async fn bootstrap(pool: &sqlx::PgPool, cursor: &mut Cursor) -> anyhow::Result<()> {
@@ -132,102 +133,56 @@ async fn bootstrap(pool: &sqlx::PgPool, cursor: &mut Cursor) -> anyhow::Result<(
     // run; subsequent runs pick up where the cluster left off so a
     // dispatcher restart doesn't strand `Deactivating` projects on
     // unprocessed terminal events.
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT last_id FROM dispatcher_cursor WHERE key = $1")
-            .bind(CURSOR_KEY)
-            .fetch_optional(pool)
-            .await?;
-    cursor.last_id = row.map(|(v,)| v).unwrap_or(0);
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT last_xid::text::bigint, last_id FROM dispatcher_cursor WHERE key = $1",
+    )
+    .bind(CURSOR_KEY)
+    .fetch_optional(pool)
+    .await?;
+    cursor.last = row.map(|(xid, id)| Position { xid, id }).unwrap_or_default();
     Ok(())
 }
 
+/// Publish every settled row past the cursor, in id order (one batch).
+/// The step says whether a full batch left more behind, or a row still
+/// being written held the cursor back (see `crate::settled`).
 async fn drain_new_rows(
     state: &DispatcherState,
     cursor: &mut Cursor,
-) -> anyhow::Result<()> {
-    // Gap-safety: `id` is BIGSERIAL, allocated at INSERT time, but
-    // transactions can COMMIT out of id order. A plain `id > cursor`
-    // poll that advances past the max id seen would permanently skip
-    // a lower-id row whose transaction commits after this poll. The
-    // guard: alongside each row, fetch the row's inserting xid
-    // (`xmin`) and the snapshot's xmin horizon
-    // (`pg_snapshot_xmin(pg_current_snapshot())`). A row whose
-    // inserting transaction is still at/above the horizon may have
-    // in-flight SIBLINGS holding lower ids, so we stop processing
-    // there and re-poll the same window next tick; the cursor only
-    // ever advances over rows whose entire lower-id neighborhood is
-    // settled.
-    let rows = sqlx::query(
-        "SELECT id, color, payload_json, \
-                xmin::text::bigint AS inserted_xid, \
-                pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS horizon_xid \
-         FROM exec_event \
-         WHERE id > $1 ORDER BY id ASC LIMIT 1000",
-    )
-    .bind(cursor.last_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
+) -> anyhow::Result<DrainStep> {
+    // Rows commit out of id order, so the cursor goes in writer order
+    // and stops at the horizon (`crate::settled`).
+    let batch = {
+        let mut conn = state.pg_pool.acquire().await?;
+        cursor
+            .reader
+            .read(&mut conn, "exec_event", "color, payload_json", cursor.last, BATCH)
+            .await?
+    };
     // Per-row processing returns Ok on both happy path AND
     // intentional skips (malformed payload, color/project parse
     // miss). Cursor advances on Ok. A hard error (DB write inside
     // `terminal_cleanup`, journal read, publish) bails via `?` and
     // leaves the cursor at the last successful row, so the next
     // tick retries.
-    let cursor_start_id = cursor.last_id;
-    let mut max_id_processed = cursor.last_id;
-    for row in rows {
-        let id: i64 = row.try_get("id")?;
-        let inserted_xid: i64 = row.try_get("inserted_xid")?;
-        let horizon_xid: i64 = row.try_get("horizon_xid")?;
-        if !xid_settled(inserted_xid, horizon_xid) {
-            // Re-polled next tick once every older transaction has
-            // committed or aborted (the horizon moves past it). Track
-            // the blocking xid so a prolonged stall (a long-open
-            // transaction holding the horizon back, freezing fleet-wide
-            // event publishing) becomes legible instead of silent.
-            const STALL_BREADCRUMB_TICKS: u32 = 30;
-            if cursor.blocked_on_xid == Some(inserted_xid) {
-                cursor.blocked_ticks += 1;
-            } else {
-                cursor.blocked_on_xid = Some(inserted_xid);
-                cursor.blocked_ticks = 1;
-            }
-            if cursor.blocked_ticks.is_multiple_of(STALL_BREADCRUMB_TICKS) {
-                tracing::warn!(
-                    target: "weft_dispatcher::journal_bridge",
-                    blocking_xid = inserted_xid,
-                    horizon_xid,
-                    ticks = cursor.blocked_ticks,
-                    after_id = cursor.last_id,
-                    "journal-bridge cursor held back: an uncommitted transaction (xid above the \
-                     snapshot horizon) is blocking event publishing for the whole fleet; this \
-                     self-clears when that transaction commits or aborts. A long-open Postgres \
-                     transaction is the usual cause."
-                );
-            }
-            break;
-        }
-        process_one_row(state, cursor, &row, id).await?;
-        cursor.last_id = id;
-        max_id_processed = id;
+    let cursor_start = cursor.last;
+    for row in batch.rows {
+        let at = Position::of(&row)?;
+        process_one_row(state, cursor, &row, at.id).await?;
+        cursor.last = at;
     }
-    // Cursor advanced (or there was nothing to block on): clear the
-    // stall tracker so the next genuine stall starts a fresh count.
-    if max_id_processed > cursor_start_id {
-        cursor.blocked_on_xid = None;
-        cursor.blocked_ticks = 0;
-    }
-    if max_id_processed > 0 {
+    if cursor.last > cursor_start {
         sqlx::query(
-            "UPDATE dispatcher_cursor SET last_id = $1 \
-             WHERE key = $2 AND last_id < $1",
+            "UPDATE dispatcher_cursor SET last_xid = $1::text::xid8, last_id = $2 \
+             WHERE key = $3 AND (last_xid, last_id) < ($1::text::xid8, $2)",
         )
-        .bind(max_id_processed)
+        .bind(cursor.last.xid.to_string())
+        .bind(cursor.last.id)
         .bind(CURSOR_KEY)
         .execute(&state.pg_pool)
         .await?;
     }
-    Ok(())
+    Ok(batch.next)
 }
 
 /// When an execution reaches a terminal state, strip every wake-
@@ -270,7 +225,7 @@ async fn process_one_row(
     let Some(owner) = state.journal.execution_owner(color).await? else {
         return Ok(());
     };
-    let project_id = owner.project_id.clone();
+    let project_id = owner.project_id;
     // Terminal events drive signal-row cleanup + the
     // deactivate-drain CAS. Idempotent across pods: only the
     // first pod observing the terminal row removes the signal
@@ -297,7 +252,7 @@ async fn process_one_row(
                     Ok(bake) => state.journal.finish_trigger_setup(color, bake.as_ref()).await?,
                     Err(error) => {
                         state.journal.finish_trigger_setup(color, None).await?;
-                        publish_unreadable(state, color, &project_id,
+                        publish_unreadable(state, color, project_id,
                             weft_core::primitive::CorruptionSite::UndecodableRow,
                             format!("cannot save trigger bake: {error:#}; the last good bake is preserved. Run `weft bake` again to refresh it."),
                         ).await;
@@ -329,7 +284,7 @@ async fn process_one_row(
         // `try_finish_drain` is idempotent, so the extra trigger is
         // free when nothing is draining.
         ExecEvent::SuspensionRegistered { .. } => {
-            try_finish_drain(state, &project_id, None).await?;
+            try_finish_drain(state, project_id, None).await?;
         }
         _ => {}
     }
@@ -350,9 +305,9 @@ async fn process_one_row(
         // nothing. Two exceptions open one: the birth row (the run's
         // node rows will need it) and a terminal (its completion
         // carries the run's outputs, which only a fold knows).
-        ExecutionProjector::new(color, ProgramLookup::NoProgram, project_id.clone()).project(&event)
+        ExecutionProjector::new(color, ProgramLookup::NoProgram, project_id).project(&event)
     } else {
-        let live = open_projection(state, cursor, color, project_id.clone(), id, &event).await?;
+        let live = open_projection(state, cursor, color, project_id, id, &event).await?;
         live.projector.project(&event)
     };
     for de in crate::events::IdentifiedEvent::recorded(id, ()).project(|()| projected) {
@@ -380,7 +335,7 @@ async fn open_projection<'c>(
     state: &DispatcherState,
     cursor: &'c mut Cursor,
     color: weft_core::Color,
-    project_id: String,
+    project_id: uuid::Uuid,
     row_id: i64,
     event: &ExecEvent,
 ) -> anyhow::Result<&'c mut LiveProjection> {
@@ -392,18 +347,18 @@ async fn open_projection<'c>(
     let program = match found.unpaintable() {
         Some((site, reason)) => {
             let reason = reason.to_string();
-            publish_unreadable(state, color, &project_id, site, reason).await;
+            publish_unreadable(state, color, project_id, site, reason).await;
             found.without_reason()
         }
         None => found,
     };
     let projector = if matches!(event, ExecEvent::ExecutionStarted { .. }) {
-        let inheritance = inheritance_or_unreadable(state, color, &project_id, std::slice::from_ref(event), &program).await;
+        let inheritance = inheritance_or_unreadable(state, color, project_id, std::slice::from_ref(event), &program).await;
         ExecutionProjector::new(color, program, project_id).with_inheritance(inheritance)
     } else {
         match rows_before(&state.pg_pool, color, row_id).await? {
             CatchUp::Rows(earlier) => {
-                let inheritance = inheritance_or_unreadable(state, color, &project_id, &earlier, &program).await;
+                let inheritance = inheritance_or_unreadable(state, color, project_id, &earlier, &program).await;
                 let mut projector = ExecutionProjector::new(color, program, project_id).with_inheritance(inheritance);
                 for row in &earlier {
                     projector.project(row);
@@ -414,7 +369,7 @@ async fn open_projection<'c>(
                 publish_unreadable(
                     state,
                     color,
-                    &project_id,
+                    project_id,
                     weft_core::primitive::CorruptionSite::UndecodableRow,
                     format!("row {row_id} of this execution no longer decodes: {reason}"),
                 )
@@ -436,7 +391,7 @@ async fn open_projection<'c>(
 async fn inheritance_or_unreadable(
     state: &DispatcherState,
     color: weft_core::Color,
-    project_id: &str,
+    project_id: uuid::Uuid,
     rows: &[ExecEvent],
     program: &ProgramLookup,
 ) -> weft_journal::SeedChain {
@@ -462,7 +417,7 @@ async fn inheritance_or_unreadable(
 async fn publish_unreadable(
     state: &DispatcherState,
     color: weft_core::Color,
-    project_id: &str,
+    project_id: uuid::Uuid,
     site: weft_core::primitive::CorruptionSite,
     reason: String,
 ) {
@@ -475,7 +430,7 @@ async fn publish_unreadable(
     let corruption = crate::events::IdentifiedEvent::transient(
         crate::events::DispatcherEvent::JournalCorruption {
             color,
-            project_id: project_id.to_string(),
+            project_id,
             site,
             reason,
         },
@@ -519,7 +474,7 @@ async fn rows_before(
 
 async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> anyhow::Result<()> {
     let removed = state.journal.signal_remove_for_color(color).await?;
-    let project_id = removed.first().map(|m| m.project_id.clone());
+    let project_id = removed.first().map(|m| m.project_id);
     state
         .listeners
         .unregister_many(&state.pg_pool, &removed)
@@ -533,7 +488,7 @@ async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> a
         None => state.journal.execution_owner(color).await?.map(|o| o.project_id),
     };
     if let Some(project_id) = project_id {
-        try_finish_drain(state, &project_id, None).await?;
+        try_finish_drain(state, project_id, None).await?;
     }
     Ok(())
 }
@@ -552,15 +507,11 @@ async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> a
 /// other caller passes `None`.
 pub(crate) async fn try_finish_drain(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<()> {
     use crate::project_store::ProjectStatus;
-    let id = match uuid::Uuid::parse_str(project_id) {
-        Ok(id) => id,
-        Err(_) => return Ok(()),
-    };
-    let Some(lifecycle) = state.projects.lifecycle(id).await? else {
+    let Some(lifecycle) = state.projects.lifecycle(project_id).await? else {
         return Ok(());
     };
     if lifecycle.status != ProjectStatus::Deactivating {
@@ -572,18 +523,18 @@ pub(crate) async fn try_finish_drain(
     }
     let flipped = state
         .projects
-        .cas_status(id, ProjectStatus::Deactivating, ProjectStatus::Inactive)
+        .cas_status(project_id, ProjectStatus::Deactivating, ProjectStatus::Inactive)
         .await?;
     if flipped {
         tracing::info!(
             target: "weft_dispatcher::journal_bridge",
-            project_id,
+            %project_id,
             "drain finished: deactivating -> inactive"
         );
         // Broadcast the landing so both frontends reconcile without a
         // verb (the backend-owns-state rule needs the exit of a
         // transitional state to be observable, not just its entry).
-        crate::transition::publish_transition_changed(state, id).await;
+        crate::transition::publish_transition_changed(state, project_id).await;
     }
     Ok(())
 }

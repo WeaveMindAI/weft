@@ -9,8 +9,31 @@ use sqlx::Row;
 
 use crate::tasks::unix_now;
 
-pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
-pub const HEARTBEAT_STALE_SECS: i64 = 30;
+/// The channel a worker pod row notifies on, with its project id as the
+/// payload, whenever what the row says about the project's capacity
+/// changes: a pod appears, changes status, starts or stops draining, or
+/// crosses the saturation threshold. From the `worker_pod_notify`
+/// trigger in [`GROUP`]; a heartbeat that changes none of these stays
+/// silent.
+pub const WORKER_POD_CHANNEL: &str = "weft_worker_pod";
+
+/// Whether a notification heard on a signal watch says one of
+/// `project_id`'s pods changed (see [`WORKER_POD_CHANNEL`]).
+pub fn announces_project(channel: &str, payload: &str, project_id: uuid::Uuid) -> bool {
+    channel == WORKER_POD_CHANNEL && payload.parse::<uuid::Uuid>().is_ok_and(|p| p == project_id)
+}
+
+/// How often a live worker renews its row, at this install's pace
+/// (`weft_core::time_scale`): 10 seconds in real time.
+pub fn heartbeat_interval() -> std::time::Duration {
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
+}
+
+/// How long a row may go without a heartbeat before its worker counts
+/// as dead: three heartbeats, 30 seconds in real time.
+pub fn heartbeat_stale_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(30)
+}
 
 /// How long a row may sit in `spawning` (reserved, kubectl-applied, but
 /// the worker never registered itself `alive`) before the reaper marks
@@ -89,7 +112,7 @@ impl PodStatus {
 #[derive(Debug, Clone)]
 pub struct WorkerPodRow {
     pub pod_name: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub namespace: String,
     pub last_heartbeat_unix: i64,
     pub created_at_unix: i64,
@@ -104,7 +127,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS worker_pod (
             pod_name TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
             namespace TEXT NOT NULL,
             status TEXT NOT NULL,
             owner_dispatcher TEXT NOT NULL,
@@ -210,6 +233,31 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_worker_pod_heartbeat
             ON worker_pod(last_heartbeat_unix)
             WHERE status = 'alive'"#,
+        // Wake whoever waits on a project's workers: the cold-start
+        // sweep (no pod can take the pending work), the orphan reaper
+        // (a pod died holding tasks), and a request waiting for a worker
+        // to come alive.
+        // SYNC: the 0.75 below <-> weft_platform_traits::SATURATION_MEM_FRACTION
+        //       (crates/weft-platform-traits/src/mem_pressure.rs)
+        r#"CREATE OR REPLACE FUNCTION worker_pod_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_worker_pod', NEW.project_id::text);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS worker_pod_notify_on_insert ON worker_pod"#,
+        r#"CREATE TRIGGER worker_pod_notify_on_insert
+            AFTER INSERT ON worker_pod
+            FOR EACH ROW
+            EXECUTE FUNCTION worker_pod_notify()"#,
+        r#"DROP TRIGGER IF EXISTS worker_pod_notify_on_change ON worker_pod"#,
+        r#"CREATE TRIGGER worker_pod_notify_on_change
+            AFTER UPDATE ON worker_pod
+            FOR EACH ROW
+            WHEN (NEW.status IS DISTINCT FROM OLD.status
+                  OR NEW.draining IS DISTINCT FROM OLD.draining
+                  OR (NEW.mem_pressure < 0.75) IS DISTINCT FROM (OLD.mem_pressure < 0.75))
+            EXECUTE FUNCTION worker_pod_notify()"#,
         // Generation fencing: a Pod whose row is not {spawning, alive}
         // cannot write to exec_event. NULL pod_name (listener /
         // dispatcher writes) bypasses the check.
@@ -351,7 +399,7 @@ pub enum AliveTransition {
 pub async fn register_alive(
     pool: &PgPool,
     pod_name: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     transition: AliveTransition,
 ) -> Result<()> {
     let sql = match transition {
@@ -391,7 +439,7 @@ pub async fn register_alive(
 pub async fn insert_spawning(
     pool: &PgPool,
     pod_name: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     namespace: &str,
     owner_dispatcher: &str,
     binary_hash: Option<&str>,
@@ -577,7 +625,7 @@ pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
 /// suppress a fresh spawn). `None` counts any alive/spawning pod.
 pub async fn has_live_for_project(
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
     binary_hash: Option<&str>,
 ) -> Result<bool> {
     // Cast literal to bigint so sqlx's i64 type expectation matches.
@@ -603,7 +651,7 @@ pub async fn has_live_for_project(
 /// namespace) must consider all of them, never just the first.
 pub async fn alive_pods_for_project_full(
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<Vec<(String, String, String)>> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
@@ -690,7 +738,7 @@ pub async fn count_alive_named(pool: &PgPool, pod_names: &[String]) -> Result<i6
 /// the current graph's node impls); `None` skips the check.
 pub async fn pick_admittable_for_project<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    project_id: &str,
+    project_id: uuid::Uuid,
     saturation: f64,
     binary_hash: Option<&str>,
 ) -> Result<Option<(String, String)>> {
@@ -707,7 +755,7 @@ pub async fn pick_admittable_for_project<'e>(
 /// is already made and the arrival is what redeems it.
 pub async fn admittable_pod_for_project<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    project_id: &str,
+    project_id: uuid::Uuid,
     saturation: f64,
     binary_hash: Option<&str>,
     pinned: Option<&str>,
@@ -757,7 +805,7 @@ const BEST_FIRST: &str = "ORDER BY mem_pressure ASC, created_at_unix ASC, pod_na
 /// at the same pod extends the promise, never shortens it.
 pub async fn reserve_pod_for_caller<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    project_id: &str,
+    project_id: uuid::Uuid,
     saturation: f64,
     binary_hash: Option<&str>,
     held_until_unix: i64,
@@ -796,7 +844,7 @@ pub async fn reserve_pod_for_caller<'e>(
 /// into the planner's shape at the call site.
 pub async fn pod_loads_for_project(
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<Vec<(String, f64)>> {
     let rows: Vec<(String, f64)> = sqlx::query_as(
         r#"SELECT pod_name, mem_pressure FROM worker_pod
@@ -821,8 +869,8 @@ pub async fn pod_loads_for_project(
 /// + one excluded worker would pass this gate but feed the planner a
 /// single pod, wasting a tick (the planner's own len() < 2 floor then
 /// no-ops). Same candidate set on both sides keeps this honest.
-pub async fn projects_with_multiple_workers(pool: &PgPool) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
+pub async fn projects_with_multiple_workers(pool: &PgPool) -> Result<Vec<uuid::Uuid>> {
+    let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
         r#"SELECT project_id FROM worker_pod
            WHERE status = 'alive' AND role = 'worker' AND NOT draining
              AND held_until_unix <= $1
@@ -863,7 +911,7 @@ pub async fn set_draining(pool: &PgPool, pod_name: &str) -> Result<()> {
 /// exactly what the drain is blocked on. Used only for periodic logging;
 /// a drain has no deadline.
 pub async fn draining_breadcrumbs(pool: &PgPool, now_unix: i64) -> Result<Vec<DrainingBreadcrumb>> {
-    let rows: Vec<(String, String, Option<i64>, i64, bool)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, uuid::Uuid, Option<i64>, i64, bool)> = sqlx::query_as(&format!(
         r#"SELECT wp.pod_name, wp.project_id, wp.drained_at_unix,
                   {POD_TASK_COUNT}::bigint,
                   wp.held_until_unix > $1
@@ -891,7 +939,7 @@ pub async fn draining_breadcrumbs(pool: &PgPool, now_unix: i64) -> Result<Vec<Dr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainingBreadcrumb {
     pub pod_name: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub drained_at_unix: i64,
     /// Worker tasks it has claimed or that are pinned to it.
     pub in_flight_tasks: i64,
@@ -939,7 +987,7 @@ pub async fn list_stale_spawning(pool: &PgPool, threshold_unix: i64) -> Result<V
 
 /// Non-terminal node-test rows whose owning task is gone, or has been
 /// terminal since before `terminal_before_unix` (pass
-/// `now - CLAIM_DURATION_SECS`): the executor that drives such a pod
+/// `now - claim_duration_secs()`): the executor that drives such a pod
 /// cleans it up on every exit path, but a cleanup step can itself
 /// fail (a pod delete or the row's `mark_done` erroring out after the
 /// task already went terminal), and nothing re-runs it. The reaper

@@ -1,5 +1,5 @@
 //! The realtime audio-to-text pipeline, end to end against the REAL
-//! ElevenLabs realtime API: a 50s public-domain WAV asset (JFK's
+//! ElevenLabs realtime API: a 25s public-domain WAV asset (JFK's
 //! inaugural) streamed live onto an ephemeral bus by AudioStream,
 //! transcribed over the connection's measured WebSocket by
 //! ElevenLabsTranscribe, segments relayed onto a text bus a Debug node
@@ -43,7 +43,7 @@ async fn assert_transcribed(
 
     // The transcript came through the whole pipe: audio bus -> realtime
     // session -> text bus -> full-text port. The exact words are the
-    // model's business; a real transcription of 50s of speech is not a
+    // model's business; a real transcription of 25s of speech is not a
     // few characters.
     let text = settled
         .input_of("out")
@@ -55,7 +55,7 @@ async fn assert_transcribed(
     );
 
     // The session was MEASURED: the meter's frame tap priced the audio
-    // actually sent (50s of it, a fraction of a cent) and booked one
+    // actually sent (25s of it, a fraction of a cent) and booked one
     // resolved cost record on the expected credential.
     settled.assert_measured("elevenlabs", origin, 1).await?;
 

@@ -72,7 +72,7 @@ const NEVER_SEEN_POLL_LIMIT: u32 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunNodeTestPayload {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tenant: String,
     /// The per-package node-test image to run (content-addressed;
     /// bare tag when loaded onto the node, registry-qualified when
@@ -162,7 +162,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
         // `SafeLabel::new` at render time instead (tenant ids are not
         // charset-bounded by us).
         require_image_ref_safe(&payload.image_ref)?;
-        require_identifier_safe("project_id", &payload.project_id)?;
+        let project_id = payload.project_id;
         if let Some(node) = &payload.node {
             require_identifier_safe("node", node)?;
         }
@@ -179,10 +179,11 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
         let task_short = &task.id.simple().to_string()[..8];
         let pod_name = format!(
             "weft-test-{}-{}",
-            short_project_id(&payload.project_id),
+            short_project_id(payload.project_id),
             task_short
         );
-        let namespace = crate::project_namespace::SHARED_WORKER_NAMESPACE;
+        let shared_namespace = state.instance.shared_worker_namespace();
+        let namespace = shared_namespace.as_str();
 
         // The ONE color derivation: on a live run the color IS the
         // task id (one task = one run = one attribution anchor), so
@@ -239,7 +240,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
                 .record_event_dedup(
                     &weft_journal::ExecEvent::ExecutionStarted {
                         color,
-                        project_id: payload.project_id.clone(),
+                        project_id: payload.project_id,
                         entry_node: format!("node-test:{node}::{test}"),
                         phase: weft_core::context::Phase::Fire,
                         // A node test executes the task payload's
@@ -315,7 +316,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
             weft_task_store::worker_pod::insert_spawning(
                 &state.pg_pool,
                 &pod_name,
-                &payload.project_id,
+                project_id,
                 namespace,
                 state.pod_id.as_str(),
                 None,
@@ -326,7 +327,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
             weft_task_store::worker_pod::register_alive(
                 &state.pg_pool,
                 &pod_name,
-                &payload.project_id,
+                project_id,
                 weft_task_store::worker_pod::AliveTransition::FromSpawningOrAlive,
             )
             .await
@@ -342,6 +343,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
                 crate::shared_worker_namespace::ensure(
                     &*state.kube,
                     &crate::shared_worker_namespace::SharedWorkerNamespaceArgs {
+                        instance: &state.instance,
                         pod_cidr: &state.cluster_pod_cidr,
                         service_cidr: &state.cluster_service_cidr,
                     },
@@ -566,7 +568,7 @@ async fn cleanup(state: &DispatcherState, namespace: &str, pod_name: &str, color
     // here costs nothing.
     if let Err(e) = state
         .kube
-        .delete_named(namespace, "pod", pod_name, DeleteOpts::wait())
+        .delete_named(namespace, weft_platform_traits::kube::NamedKind::Pod, pod_name, DeleteOpts::wait())
         .await
     {
         tracing::error!(
@@ -688,7 +690,7 @@ fn render_test_pod_manifest(
     runtime_class: Option<&str>,
     pull_secret: Option<&str>,
 ) -> String {
-    let project_label = crate::project_namespace::SafeLabel::new(&payload.project_id, 63);
+    let project_label = crate::project_namespace::SafeLabel::new(&payload.project_id.to_string(), 63);
     let tenant_label = crate::project_namespace::SafeLabel::new(&payload.tenant, 63);
     let runtime_class_line = match runtime_class {
         Some(rc) => format!("  runtimeClassName: {rc}\n"),
@@ -771,7 +773,7 @@ mod tests {
 
     fn payload() -> RunNodeTestPayload {
         RunNodeTestPayload {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::from_u128(0x101),
             tenant: "t1".into(),
             image_ref: "weft-node-tests:abc".into(),
             list: false,

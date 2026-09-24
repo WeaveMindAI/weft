@@ -48,7 +48,7 @@ async fn wait_for_owner(
 #[tokio::test]
 async fn two_workers_share_the_queue_and_drain_together() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = weft_e2e::Platform::connect().await?;
+    let platform = weft_e2e::Platform::connect(&disp).await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
 
@@ -87,7 +87,7 @@ async fn two_workers_share_the_queue_and_drain_together() -> anyhow::Result<()> 
     // Deactivate with Wait: the drain must hold while EITHER pod still
     // runs work, and complete once both do.
     let deact = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "deactivate".into(),
             "--mode".into(),
@@ -121,7 +121,7 @@ async fn two_workers_share_the_queue_and_drain_together() -> anyhow::Result<()> 
 #[tokio::test]
 async fn stale_fleet_is_drained_and_replaced_as_a_whole() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = weft_e2e::Platform::connect().await?;
+    let platform = weft_e2e::Platform::connect(&disp).await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
 
@@ -152,7 +152,7 @@ async fn stale_fleet_is_drained_and_replaced_as_a_whole() -> anyhow::Result<()> 
     // `wait` is asked for, never assumed: the shared default is cancel,
     // and this test is about what the drain does.
     let mut start = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "infra".into(),
             "start".into(),

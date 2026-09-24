@@ -117,7 +117,7 @@ async fn a_send_only_connection_cannot_arm_the_mail_trigger() -> Result<()> {
     // Generous window: when this is the suite's FIRST trigger after a
     // bring-up rollout, the pooled listener pod is spawned from
     // nothing before any prepare (and its refusal) can run.
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
     platform
         .wait_for_listener_log(
             "the listener to refuse the send-only connection (imap_host shortfall in its log)",

@@ -41,7 +41,7 @@ A [vulnerability] is a way an attacker can exploit the code: injection, XSS, ove
 The coding assistant already ran the build and the full test suite before review. Re-running them adds nothing and burns enormous time, multiplied by every agent in the batch.
 
 - **Verify statically first.** Reading code, tracing paths, and grepping settle almost every suspicion. This is your default and costs minutes.
-- **One targeted test when static can't settle it.** If a suspicion genuinely needs runtime proof, write ONE focused probe test and run ONLY that probe by name (e.g. `cargo test -p <crate> <exact_test_name>`), then remove the probe from the tree. Probe tests left behind are ghosts you created yourself; if the finding is real, the fixer writes the real regression test.
+- **One targeted test when static can't settle it.** If a suspicion genuinely needs runtime proof, write ONE focused probe test and run ONLY that probe by name (e.g. `cargo nextest run -p <crate> <exact_test_name>`), then remove the probe from the tree. Probe tests left behind are ghosts you created yourself; if the finding is real, the fixer writes the real regression test.
 - **Never run the full suite, `cargo test` bare, workspace-wide builds, or any broad command. Never start servers or services.**
 
 If you catch yourself about to run something broad, write verbatim "Wait, this is a review; the implementer already ran that. One targeted test or back to reading." and act accordingly.

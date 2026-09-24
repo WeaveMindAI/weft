@@ -29,7 +29,6 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
 
     // Two instances, two endpoints.
     let one = infra::start_and_wait_running(&mut project, "one.svc").await?;
-    project.mark_registered();
     let two = infra::wait_running(&project, "two.svc").await?;
     anyhow::ensure!(one != two, "each call's instance has its own endpoint: {one} / {two}");
     let listed = infra::status(project.dispatcher(), &project.id()).await?;

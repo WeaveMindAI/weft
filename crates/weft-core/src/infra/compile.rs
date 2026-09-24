@@ -19,7 +19,7 @@ use super::types::{
 /// itself. Threaded in by the apply executor.
 pub struct CompileContext<'a> {
     pub tenant_id: &'a str,
-    pub project_id: &'a str,
+    pub project_id: uuid::Uuid,
     pub node_id: &'a str,
     /// Stable instance id for this provision. Used as the base name
     /// for emitted resources (Deployment name, Service name prefix,
@@ -34,11 +34,20 @@ pub struct CompileContext<'a> {
     /// hash mixes it in and HashMap order would randomize).
     /// `Image::Upstream(...)` references bypass this map.
     pub local_image_tags: &'a std::collections::BTreeMap<String, String>,
-
+    /// The install this apply runs for. Only the default install owns a
+    /// door on the front door's `local` listener, so a named install
+    /// refuses a `TenantPublic` endpoint.
+    pub install: &'a super::instance::Instance,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
+    /// A `TenantPublic` endpoint on a named install: its route would hang
+    /// off the default install's gateway listener, which a named install
+    /// has no door on.
+    #[error("infra node '{node}': endpoint '{endpoint}' is tenant-public, but tenant-public \
+             endpoints are only served by the default install, and this is install '{install}'")]
+    TenantPublicOnNamedInstall { node: String, endpoint: String, install: String },
     /// The tag map the apply runs with has no entry for a local image
     /// the spec names. The map is filled by `weft infra start` (which
     /// builds the node's images and registers their tags), so on a
@@ -131,10 +140,21 @@ pub enum CompileError {
          (e.g. cpu utilization) or drop the autoscale block."
     )]
     AutoscaleWithoutMetrics { node: String, unit: String },
+    #[error(
+        "infra spec for node '{node}': endpoint '{endpoint}' is public at path '{path}', \
+         which is not a plain path. It must start with '/', and every segment between \
+         slashes must be non-empty, not '.' or '..', and use only letters, digits, \
+         '-', '_', '.' and '~' (no '%' escapes, no '//')."
+    )]
+    PublicPathInvalid {
+        node: String,
+        endpoint: String,
+        path: String,
+    },
 }
 
 /// k8s DNS-1123 label limit. Service, Deployment, StatefulSet,
-/// DaemonSet, Pod, PVC, ConfigMap, Secret, HPA, Ingress,
+/// DaemonSet, Pod, PVC, ConfigMap, Secret, HPA, HTTPRoute,
 /// NetworkPolicy names all sit under this cap.
 const DNS_1123_LABEL_MAX: usize = 63;
 
@@ -265,12 +285,20 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
         }
     }
 
-    // -- Services + optional Ingress per endpoint --
+    // -- Services + an HTTPRoute per public endpoint --
     for ep in &spec.endpoints {
         validate_endpoint(spec, ep, ctx)?;
         out.push(compile_service(ep, spec, ctx));
         if let Expose::TenantPublic { path } = &ep.expose {
-            out.push(compile_ingress(ep, path, ctx));
+            if let Some(install) = ctx.install.name() {
+                return Err(CompileError::TenantPublicOnNamedInstall {
+                    node: ctx.node_id.to_string(),
+                    endpoint: ep.name.clone(),
+                    install: install.to_string(),
+                });
+            }
+            validate_public_path(ep, path, ctx)?;
+            out.push(compile_http_route(ep, path, spec, ctx));
         }
     }
 
@@ -839,7 +867,7 @@ fn compile_config(cfg: &ConfigSource, ctx: &CompileContext<'_>) -> Option<Value>
 }
 
 // -----------------------------------------------------------------
-// Services + Ingress
+// Services + HTTPRoutes
 // -----------------------------------------------------------------
 
 fn compile_service(ep: &super::types::Endpoint, spec: &InfraSpec, ctx: &CompileContext<'_>) -> Value {
@@ -889,35 +917,114 @@ fn compile_service(ep: &super::types::Endpoint, spec: &InfraSpec, ctx: &CompileC
     })
 }
 
-fn compile_ingress(ep: &super::types::Endpoint, path: &str, ctx: &CompileContext<'_>) -> Value {
+/// Where a `TenantPublic` endpoint answers on the front door: under a
+/// prefix naming the project's namespace and the node instance, then
+/// the path the node declared. The front door also carries the
+/// dispatcher (a catch-all `/`) and every other project's endpoints,
+/// and the longest matching prefix wins, so a bare declared path like
+/// `/signal` would capture the dispatcher's capability links and two
+/// projects declaring `/hooks` would collide. Under this prefix
+/// neither can happen: no dispatcher route starts with `/infra/`, and
+/// the namespace plus instance id is unique per node.
+fn tenant_public_prefix(namespace: &str, instance_id: &str) -> String {
+    format!("/infra/{namespace}/{instance_id}")
+}
+
+/// The full front-door path of a `TenantPublic` endpoint declaring
+/// `path` (no trailing slash; the prefix alone for a declared `/`).
+/// See [`tenant_public_prefix`].
+pub fn tenant_public_path(namespace: &str, instance_id: &str, path: &str) -> String {
+    format!("{}{}", tenant_public_prefix(namespace, instance_id), path.trim_end_matches('/'))
+}
+
+/// The full outside address of a `TenantPublic` endpoint: the front
+/// door's base (the dispatcher's stable base URL, since both are served
+/// by the gateway's `local` listener) joined with the endpoint's
+/// [`tenant_public_path`]. The address is meant to be handed to whoever
+/// calls in, so it is built from the configured base, never from the
+/// host a particular request arrived on.
+pub fn tenant_public_url(front_door: &str, public_path: &str) -> String {
+    format!("{}{public_path}", front_door.trim_end_matches('/'))
+}
+
+/// A public path is matched by prefix at the front door and then
+/// rewritten back to what the node declared, so it has to be a plain
+/// path: anything Envoy would normalize differently from how it was
+/// written (`..`, `//`, `%2F`) is refused here, where the node author
+/// sees it.
+fn validate_public_path(
+    ep: &super::types::Endpoint,
+    path: &str,
+    ctx: &CompileContext<'_>,
+) -> Result<(), CompileError> {
+    let plain = match path.strip_prefix('/') {
+        None => false,
+        Some("") => true,
+        Some(body) => body.strip_suffix('/').unwrap_or(body).split('/').all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+        }),
+    };
+    if plain {
+        Ok(())
+    } else {
+        Err(CompileError::PublicPathInvalid {
+            node: crate::project::plain_id(ctx.node_id),
+            endpoint: ep.name.clone(),
+            path: path.to_string(),
+        })
+    }
+}
+
+/// A `TenantPublic` endpoint's route: an HTTPRoute on the front door's
+/// `local` listener (the Envoy Gateway every link of this install goes
+/// through), forwarding [`tenant_public_path`] and everything under it
+/// to the endpoint's Service, with the per-node prefix rewritten off so
+/// the service sees the path it declared. The route lives in the
+/// project's own namespace, next to its Service, so it needs no grant
+/// to reach it.
+// SYNC: gateway `weft-live-gateway` / namespace `envoy-gateway-system` /
+//       listener `local` <-> deploy/k8s/gateway.yaml
+fn compile_http_route(
+    ep: &super::types::Endpoint,
+    path: &str,
+    spec: &InfraSpec,
+    ctx: &CompileContext<'_>,
+) -> Value {
     let svc_name = service_name(ep, ctx);
-    // The actual host comes from the tenant's ingress config; we
-    // emit a path-only Ingress with the right service backend. The
-    // dispatcher's ingress-controller config layer can rewrite host
-    // matching as needed.
+    let (port_number, _) = resolve_endpoint_port(spec, ep)
+        .expect("endpoint validated by compile() entry path");
+    let front = tenant_public_path(ctx.namespace, ctx.instance_id, path);
+    let bare = match path.trim_end_matches('/') {
+        "" => "/",
+        p => p,
+    };
     json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
         "metadata": {
-            "name": format!("{}-{}", ctx.instance_id, ep.name),
+            "name": svc_name,
             "namespace": ctx.namespace,
         },
         "spec": {
+            "parentRefs": [{
+                "name": "weft-live-gateway",
+                "namespace": "envoy-gateway-system",
+                "sectionName": "local",
+            }],
             "rules": [{
-                "http": {
-                    "paths": [{
-                        "path": path,
-                        "pathType": "Prefix",
-                        "backend": {
-                            "service": {
-                                "name": svc_name,
-                                "port": { "name": ep.name }
-                            }
-                        }
-                    }]
-                }
-            }]
-        }
+                "matches": [{ "path": { "type": "PathPrefix", "value": front } }],
+                "filters": [{
+                    "type": "URLRewrite",
+                    "urlRewrite": {
+                        "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": bare },
+                    },
+                }],
+                "backendRefs": [{ "name": svc_name, "port": port_number }],
+            }],
+        },
     })
 }
 
@@ -1320,7 +1427,7 @@ fn emitted_names<'a>(spec: &'a InfraSpec, ctx: &'a CompileContext<'a>) -> Vec<Em
     }
 
     for ep in &spec.endpoints {
-        // Service + (optional) Ingress share the same name. k8s
+        // Service + (optional) HTTPRoute share the same name. k8s
         // treats them as distinct kinds (no collision); we only
         // emit one EmittedName under K8sKind::Service because the
         // length/char checks are identical and the user-facing
@@ -1419,11 +1526,12 @@ mod tests {
     fn ctx_with(tags: std::collections::BTreeMap<String, String>) -> CompileContext<'static> {
         CompileContext {
             tenant_id: "tenantA",
-            project_id: "projB",
+            project_id: uuid::Uuid::from_u128(0xb),
             node_id: "nodeC",
             instance_id: "inst1",
             namespace: "wft-project-tenantA-projB",
             local_image_tags: Box::leak(Box::new(tags)),
+            install: Box::leak(Box::new(super::super::instance::Instance::default_install())),
         }
     }
 
@@ -1578,7 +1686,7 @@ mod tests {
         for m in &out {
             let labels = &m["metadata"]["labels"];
             assert_eq!(labels["weft.dev/instance"], "inst1");
-            assert_eq!(labels["weft.dev/project"], "projB");
+            assert_eq!(labels["weft.dev/project"], "00000000-0000-0000-0000-00000000000b");
             assert_eq!(labels["weft.dev/tenant"], "tenantA");
             assert_eq!(labels["weft.dev/node"], super::super::node_label_value("nodeC"));
             assert_eq!(m["metadata"]["annotations"]["weft.dev/node-id"], "nodeC");
@@ -1971,6 +2079,79 @@ mod door_tests {
         out.iter()
             .find(|m| m["kind"] == "Service" && m["metadata"]["name"].as_str().unwrap().ends_with(name))
             .expect("service is emitted")
+    }
+
+    /// A `TenantPublic` endpoint is reached through the front door: a
+    /// ClusterIP Service, and an HTTPRoute on the gateway's `local`
+    /// listener forwarding its path to that Service's port. No node port.
+    #[test]
+    fn a_tenant_public_endpoint_is_routed_through_the_front_door() {
+        let mut spec = two_endpoint_spec();
+        spec.endpoints[1].expose = Expose::TenantPublic { path: "/hooks".into() };
+        let out = compile(&spec, &ctx()).expect("compile ok");
+        let svc = service_named(&out, "credential");
+        assert_eq!(svc["spec"]["type"], "ClusterIP");
+        let routes: Vec<&Value> = out.iter().filter(|m| m["kind"] == "HTTPRoute").collect();
+        assert_eq!(routes.len(), 1, "one route, for the one public endpoint");
+        let route = routes[0];
+        assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1");
+        assert_eq!(route["metadata"]["namespace"], svc["metadata"]["namespace"]);
+        assert_eq!(
+            route["spec"]["parentRefs"][0],
+            json!({ "name": "weft-live-gateway", "namespace": "envoy-gateway-system", "sectionName": "local" })
+        );
+        let rule = &route["spec"]["rules"][0];
+        let front = format!(
+            "/infra/{}/{}/hooks",
+            route["metadata"]["namespace"].as_str().unwrap(),
+            ctx().instance_id
+        );
+        assert_eq!(rule["matches"][0]["path"], json!({ "type": "PathPrefix", "value": front }));
+        assert_eq!(
+            rule["filters"][0],
+            json!({ "type": "URLRewrite", "urlRewrite": { "path": { "type": "ReplacePrefixMatch", "replacePrefixMatch": "/hooks" } } })
+        );
+        assert_eq!(rule["backendRefs"][0], json!({ "name": svc["metadata"]["name"], "port": 8099 }));
+        // Swept with the rest of the node by its labels.
+        assert_eq!(route["metadata"]["labels"], svc["metadata"]["labels"]);
+    }
+
+    /// A named install has no door on the default install's gateway
+    /// listener, so a tenant-public endpoint there is refused, naming the
+    /// node, the endpoint and the install.
+    #[test]
+    fn a_named_install_refuses_a_tenant_public_endpoint() {
+        let mut spec = two_endpoint_spec();
+        spec.endpoints[1].expose = Expose::TenantPublic { path: "/hooks".into() };
+        let install = super::super::instance::Instance::named("cella").unwrap();
+        let ctx = CompileContext { install: &install, ..ctx() };
+        let err = compile(&spec, &ctx).expect_err("a named install refuses it");
+        assert!(matches!(err, CompileError::TenantPublicOnNamedInstall { .. }), "{err}");
+        let msg = err.to_string();
+        for part in ["nodeC", &spec.endpoints[1].name, "cella", "only served by the default install"] {
+            assert!(msg.contains(part), "{msg} should name {part}");
+        }
+        spec.endpoints[1].expose = Expose::ClusterInternal;
+        compile(&spec, &ctx).expect("a named install still compiles internal endpoints");
+    }
+
+    /// A public path Envoy could read differently from how it was
+    /// written never reaches a route.
+    #[test]
+    fn a_public_path_that_is_not_plain_is_refused() {
+        for bad in ["hooks", "//hooks", "/a//b", "/a/../b", "/./a", "/a%2Fb", "/a b"] {
+            let mut spec = two_endpoint_spec();
+            spec.endpoints[1].expose = Expose::TenantPublic { path: bad.into() };
+            assert!(
+                matches!(compile(&spec, &ctx()), Err(CompileError::PublicPathInvalid { .. })),
+                "{bad} should be refused"
+            );
+        }
+        for good in ["/", "/hooks", "/hooks/", "/a/b.c~d_e-f"] {
+            let mut spec = two_endpoint_spec();
+            spec.endpoints[1].expose = Expose::TenantPublic { path: good.into() };
+            compile(&spec, &ctx()).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
     }
 
     /// An endpoint the author marked `SameNetwork` IS the door: the

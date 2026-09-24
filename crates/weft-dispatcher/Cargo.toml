@@ -70,10 +70,16 @@ weft-dispatcher = { path = ".", features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "macros", "migrate"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util`: the paused virtual clock the wake-loop tests (`pg_wake`)
+# run on, so their safety ticks pass without real waiting.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
+# Named after its crate: two examples of one name collide in the
+# shared target directory when both crates build together.
+# SYNC: the example name <-> setup.sh (--migration's `--example`)
 [[example]]
-name = "schema_migration"
+name = "dispatcher_schema_migration"
+path = "examples/schema_migration.rs"
 required-features = ["db-tests"]
 
 [lints]

@@ -282,22 +282,22 @@ pub(crate) async fn source_versions_in_use(
     include_bakes: bool,
 ) -> anyhow::Result<BTreeSet<String>> {
     let versions: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT source_version FROM signal WHERE project_id = $1::uuid::text \
+        "SELECT source_version FROM signal WHERE project_id = $1 \
          UNION SELECT e.payload_json::jsonb ->> 'source_version' FROM exec_event e \
-         WHERE e.kind = 'execution_started' AND e.payload_json::jsonb ->> 'project_id' = $1::uuid::text \
+         WHERE e.kind = 'execution_started' AND e.payload_json::jsonb ->> 'project_id' = $1::text \
            AND (EXISTS (SELECT 1 FROM trigger_setup s WHERE s.color = e.color) \
              OR NOT EXISTS (SELECT 1 FROM exec_event t WHERE t.color = e.color \
                  AND t.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled')) \
              OR (e.payload_json::jsonb ->> 'phase' = 'fire' AND e.payload_json::jsonb ->> 'node_test' IS DISTINCT FROM 'true' \
                  AND NOT EXISTS (SELECT 1 FROM version_run r WHERE r.color::text = e.color))) \
-         UNION SELECT bake_json::jsonb ->> 'source_version' FROM trigger_bake WHERE project_id = $1::uuid::text AND $2"
+         UNION SELECT bake_json::jsonb ->> 'source_version' FROM trigger_bake WHERE project_id = $1 AND $2"
     ).bind(project).bind(include_bakes).fetch_all(conn).await?;
     Ok(versions.into_iter().flatten().collect())
 }
 
-pub(crate) async fn retain_source_version(conn: &mut sqlx::PgConnection, project: &str, version: &str) -> anyhow::Result<()> {
+pub(crate) async fn retain_source_version(conn: &mut sqlx::PgConnection, project: uuid::Uuid, version: &str) -> anyhow::Result<()> {
     let found: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM project_version WHERE project_id = $1::uuid AND id = $2 FOR KEY SHARE"
+        "SELECT id FROM project_version WHERE project_id = $1 AND id = $2 FOR KEY SHARE"
     ).bind(project).bind(version).fetch_optional(conn).await?;
     anyhow::ensure!(found.is_some(), "source version {version} was removed during preparation; run the command again");
     Ok(())
@@ -394,7 +394,7 @@ impl VersionStoreOps for PostgresVersionStore {
         let protected = source_versions_in_use(&mut tx, project, false).await?;
         anyhow::ensure!(!ids.iter().any(|id| protected.contains(id)),
             "these versions still supply trigger settings or running executions; stop the runs and replace or wipe those trigger settings before pruning");
-        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1::uuid::text AND bake_json::jsonb ->> 'source_version' = ANY($2)")
+        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1 AND bake_json::jsonb ->> 'source_version' = ANY($2)")
             .bind(project).bind(ids).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM project_version WHERE project_id = $1 AND id = ANY($2)")
             .bind(project)

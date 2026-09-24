@@ -1165,7 +1165,7 @@ struct Args {{
     /// Project id this Pod serves. Worker only claims tasks scoped to
     /// this project.
     #[arg(long, env = "WEFT_PROJECT_ID")]
-    project_id: String,
+    project_id: uuid::Uuid,
 
     /// Broker base URL. The worker never touches Postgres directly;
     /// every journal write, task enqueue/claim, worker_pod heartbeat,

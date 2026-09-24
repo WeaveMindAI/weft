@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "weft_broker=info".into()),
         )
         .init();
+    weft_core::time_scale::announce();
 
     let database_url = std::env::var("WEFT_DATABASE_URL")
         .context("WEFT_DATABASE_URL is required")?;
@@ -30,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // different audience claim.
     let audience = std::env::var("WEFT_BROKER_AUDIENCE")
         .unwrap_or_else(|_| "weft-broker".into());
+    let instance = weft_core::infra::Instance::from_env().map_err(anyhow::Error::msg)?;
 
     // The object-store slot (the bundled SeaweedFS in open weft / local dev).
     // Required for the runtime-file plane; a deploy without it boots but the
@@ -44,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = weft_broker::BrokerState::new(
         &database_url,
-        weft_broker::AuthConfig { audience },
+        weft_broker::AuthConfig { audience, system_namespace: instance.system_namespace() },
         object_store,
         entitlements,
         // Provider keys come from the shared-credentials file's

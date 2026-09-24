@@ -43,10 +43,9 @@ async fn waiting_on(disp: &weft_e2e::Dispatcher, color: uuid::Uuid) -> anyhow::R
 #[tokio::test]
 async fn each_call_holds_its_own_wait_and_is_woken_on_its_own() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_twice", disp.clone()).await?;
+    let project = Project::prepare("include_twice", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "first", "--target", "second"]).await?;
-    project.mark_registered();
     let held = color_of(&stdout)?;
     // `waiting_for_input` means ONE wait is registered, not both: each
     // call registers its own, and the second can land a moment after the

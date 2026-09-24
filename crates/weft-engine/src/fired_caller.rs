@@ -44,7 +44,9 @@ pub struct FiredCaller {
     /// real connection keeps, so the rows read in the same order.
     offset: AtomicU64,
     started: AtomicBool,
-    terminated: AtomicBool,
+    /// The terminate latch, as a watch so `disconnected()` wakes when
+    /// the program ends the exchange.
+    terminated: tokio::sync::watch::Sender<bool>,
 }
 
 impl FiredCaller {
@@ -72,7 +74,7 @@ impl FiredCaller {
             journal,
             offset: AtomicU64::new(0),
             started: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
+            terminated: tokio::sync::watch::Sender::new(false),
         });
         let at = caller.next_offset();
         caller.journal.connected(color, at, Protocol::Http);
@@ -93,7 +95,7 @@ impl FiredCaller {
         chunk: Option<OutboundChunk>,
         terminal: bool,
     ) -> Result<(), CallerError> {
-        if self.terminated.load(Ordering::SeqCst) {
+        if *self.terminated.borrow() {
             return Err(CallerError::AlreadyTerminated);
         }
         if head.is_some() && self.started.swap(true, Ordering::SeqCst) {
@@ -101,7 +103,7 @@ impl FiredCaller {
         }
         self.started.store(true, Ordering::SeqCst);
         if terminal {
-            self.terminated.store(true, Ordering::SeqCst);
+            self.terminated.send_replace(true);
         }
         // A bare close carries no chunk, and NOTHING is recorded for it:
         // over a real connection the body simply ends, so inventing an
@@ -132,7 +134,12 @@ impl CallerConnection for FiredCaller {
     /// Always attached, right up until the program ends the exchange.
     /// Nothing can drop: there is no socket to lose.
     fn is_connected(&self) -> bool {
-        !self.terminated.load(Ordering::SeqCst)
+        !*self.terminated.borrow()
+    }
+
+    async fn disconnected(&self) {
+        let mut rx = self.terminated.subscribe();
+        let _ = rx.wait_for(|terminated| *terminated).await;
     }
 
     fn wire_started(&self) -> bool {

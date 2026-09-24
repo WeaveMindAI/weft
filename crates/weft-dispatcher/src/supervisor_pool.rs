@@ -159,6 +159,9 @@ pub struct K8sSupervisorBackend {
     supervisor_image: String,
     broker_url: String,
     kube: Arc<dyn weft_platform_traits::KubeClient>,
+    /// The dispatcher's own install, handed to every supervisor it
+    /// spawns so their compile knows which install it runs for.
+    instance: weft_core::infra::Instance,
 }
 
 impl K8sSupervisorBackend {
@@ -166,11 +169,13 @@ impl K8sSupervisorBackend {
         supervisor_image: String,
         broker_url: String,
         kube: Arc<dyn weft_platform_traits::KubeClient>,
+        instance: weft_core::infra::Instance,
     ) -> Self {
         Self {
             supervisor_image,
             broker_url,
             kube,
+            instance,
         }
     }
 }
@@ -184,6 +189,7 @@ impl SupervisorBackend for K8sSupervisorBackend {
             namespace,
             &self.supervisor_image,
             &self.broker_url,
+            &self.instance,
         );
         self.kube.apply_yaml(&manifest).await?;
         self.kube
@@ -200,7 +206,7 @@ impl SupervisorBackend for K8sSupervisorBackend {
         self.kube
             .delete_named(
                 namespace,
-                "deployment",
+                weft_platform_traits::kube::NamedKind::Deployment,
                 pod_name,
                 weft_platform_traits::DeleteOpts::wait_cascade(),
             )
@@ -221,6 +227,7 @@ fn render_supervisor_manifest(
     namespace: &str,
     image: &str,
     broker_url: &str,
+    instance: &weft_core::infra::Instance,
 ) -> String {
     // The supervisor's pod-level isolation comes from the control-plane
     // namespace NetworkPolicies (it talks only to the broker + the
@@ -294,6 +301,16 @@ spec:
               value: "{broker_url}"
             - name: WEFT_BROKER_TOKEN_PATH
               value: "/var/run/weft/sa/token"
+            # This install's pace, shared by every process in it: the
+            # supervisor's lease renewals are judged by the broker's
+            # expiry, so both must run at the same speed.
+            - name: {time_scale_env}
+              value: "{time_scale}"
+            # This install's name (empty for the default install): the
+            # supervisor's compile refuses what only the default install
+            # can serve.
+            - name: {instance_env}
+              value: "{instance_name}"
           volumeMounts:
             - name: weft-sa-token
               mountPath: /var/run/weft/sa
@@ -307,6 +324,10 @@ spec:
                   expirationSeconds: 3600
                   path: token
 "#,
+        time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        time_scale = weft_core::time_scale::factor(),
+        instance_env = weft_core::infra::INSTANCE_ENV,
+        instance_name = instance.name().unwrap_or(""),
     )
 }
 
@@ -316,7 +337,7 @@ spec:
 /// the row is gone (its loop only acts on projects it owns), and a row
 /// left behind would be renewed forever, keeping the pool from ever
 /// draining to zero.
-pub async fn release_project(pg_pool: &PgPool, project_id: &str) -> Result<u64> {
+pub async fn release_project(pg_pool: &PgPool, project_id: uuid::Uuid) -> Result<u64> {
     let res = sqlx::query("DELETE FROM infra_owner WHERE project_id = $1")
         .bind(project_id)
         .execute(pg_pool)
@@ -324,38 +345,20 @@ pub async fn release_project(pg_pool: &PgPool, project_id: &str) -> Result<u64> 
     Ok(res.rows_affected())
 }
 
-/// Whether any lifecycle command still awaits a supervisor: issued, not
-/// completed, of a SUPERVISOR-owned verb (apply / stop / terminate;
-/// deactivate / reactivate are dispatcher-claimed and must not keep this
-/// pool alive), against a project a supervisor can actually claim
-/// (`project_namespace <> ''`, the broker's claim precondition; a
-/// command whose project lost its namespace is unclaimable and must not
-/// pin the pool forever). A cancel-FLAGGED row still counts: the broker
-/// hands it out regardless, and only a supervisor executing it (and
-/// hitting the cancel check) drives it to completed, so it still needs a
-/// pod. Pending work means the pool is NOT idle even when no pod owns a
-/// project (see `reap_idle`'s gate), and an EMPTY pool with pending work
-/// is stranded and must be re-seeded (see `SupervisorPool::reconcile`).
-// SYNC: pending_commands_exist filter <-> crates/weft-broker/src/handlers.rs
-//       supervisor_claim_command (verb IN ('apply','stop','terminate')),
-//       crates/weft-broker/src/handlers.rs supervisor_sync_ownership (the
-//       `project_namespace <> ''` claim precondition; the claim SQL itself
-//       checks it only transitively, via infra_owner rows existing solely
-//       for namespaced projects)
+/// Whether any lifecycle command still awaits a supervisor
+/// (`pending_supervisor_command`: deactivate / reactivate are
+/// dispatcher-claimed and must not keep this pool alive, and a command
+/// whose project lost its namespace is unclaimable and must not pin the
+/// pool forever). Pending work means the pool is NOT idle even when no
+/// pod owns a project (see `reap_idle`'s gate), and an EMPTY pool with
+/// pending work is stranded and must be re-seeded (see
+/// `SupervisorPool::reconcile`).
 pub async fn pending_commands_exist(pg_pool: &PgPool) -> Result<bool> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT c.id FROM infra_lifecycle_command c \
-         WHERE c.completed_at_unix IS NULL \
-           AND c.verb IN ('apply', 'stop', 'terminate') \
-           AND EXISTS ( \
-               SELECT 1 FROM project p \
-               WHERE p.id::TEXT = c.project_id AND p.project_namespace <> '' \
-           ) \
-         LIMIT 1",
-    )
-    .fetch_optional(pg_pool)
-    .await?;
-    Ok(row.is_some())
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM infra_lifecycle_command c WHERE {pending})",
+        pending = weft_broker_client::lifecycle_command::pending_supervisor_command("c"),
+    );
+    Ok(sqlx::query_scalar(&sql).fetch_one(pg_pool).await?)
 }
 
 /// Drop `infra_owner` rows whose project no longer exists. Should never
@@ -366,7 +369,7 @@ pub async fn pending_commands_exist(pg_pool: &PgPool) -> Result<bool> {
 async fn release_ghost_leases(pg_pool: &PgPool) -> Result<()> {
     let res = sqlx::query(
         "DELETE FROM infra_owner io \
-         WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id::text = io.project_id)",
+         WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = io.project_id)",
     )
     .execute(pg_pool)
     .await?;
@@ -422,7 +425,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // currently owned by a supervisor. Keyed by project (1:1 with its
         // namespace), carrying the namespace + tenant the kubectl path needs.
         r#"CREATE TABLE IF NOT EXISTS infra_owner (
-            project_id        TEXT PRIMARY KEY,
+            project_id        UUID PRIMARY KEY,
             supervisor_pod    TEXT NOT NULL,
             namespace         TEXT NOT NULL,
             tenant_id         TEXT NOT NULL,
@@ -561,7 +564,7 @@ impl SupervisorPool {
         .bind(&handle.admin_url)
         .bind(&self.namespace)
         .bind(pod_id)
-        .bind(now + crate::lease::LEASE_DURATION_SECS)
+        .bind(now + crate::lease::lease_duration_secs())
         .bind(now + crate::lease::SPAWN_GRACE_SECS)
         .execute(pg_pool)
         .await
@@ -706,7 +709,7 @@ impl SupervisorPool {
     /// by a sibling dispatcher.
     pub async fn renew_owned(&self, pg_pool: &PgPool, pod_id: &str) -> Result<()> {
         sqlx::query("UPDATE supervisor_pod SET leased_until_unix = $1 WHERE owner_pod_id = $2")
-            .bind(crate::lease::now_unix() + crate::lease::LEASE_DURATION_SECS)
+            .bind(crate::lease::now_unix() + crate::lease::lease_duration_secs())
             .bind(pod_id)
             .execute(pg_pool)
             .await?;
@@ -942,6 +945,19 @@ mod tests {
     // definition (mem_pressure.rs). The supervisor's drain_one just feeds
     // it per-pod memory pressure read from `supervisor_pod.mem_pressure`.
 
+    /// A supervisor learns its install from the dispatcher that spawns
+    /// it: the dispatcher's install name, empty for the default one.
+    #[test]
+    fn supervisor_manifest_carries_the_dispatchers_install() {
+        let render = |instance: &weft_core::infra::Instance| {
+            render_supervisor_manifest("s", "weft-system", "img", "http://b", instance)
+        };
+        let named = render(&weft_core::infra::Instance::named("cella").unwrap());
+        assert!(named.contains("- name: WEFT_INSTANCE\n              value: \"cella\""), "{named}");
+        let default = render(&weft_core::infra::Instance::default_install());
+        assert!(default.contains("- name: WEFT_INSTANCE\n              value: \"\""), "{default}");
+    }
+
     /// The manifest's claim identity MUST be the literal Deployment name,
     /// not a fieldRef pod-name: the supervisor reports `WEFT_POD_NAME` as
     /// its claim id, which must equal the `supervisor_pod` placement key.
@@ -952,6 +968,7 @@ mod tests {
             "weft-system",
             "weft-infra-supervisor:local",
             "http://broker:9090",
+            &weft_core::infra::Instance::default_install(),
         );
         assert!(yaml.contains("name: WEFT_POD_NAME"));
         assert!(yaml.contains("value: \"weft-infra-supervisor-abc\""));
@@ -959,23 +976,24 @@ mod tests {
         assert!(yaml.contains("weft.dev/role: infra-supervisor"));
     }
 
-    /// The supervisor shells out to `kubectl`, so it MUST get the default
-    /// kube-API service-account token auto-mounted; without it kubectl
-    /// finds no in-cluster config and dials localhost:8080 (refused).
+    /// The supervisor talks to the Kubernetes API, so it MUST get the
+    /// default kube-API service-account token auto-mounted; without it
+    /// the client finds no in-cluster config and cannot connect.
     /// This differs from the listener (which disables the mount because it
     /// never touches the kube-apiserver). Pin it so a copy-paste from the
     /// listener manifest can't silently reintroduce the bug.
     #[test]
-    fn supervisor_manifest_automounts_kube_api_token_for_kubectl() {
+    fn supervisor_manifest_automounts_kube_api_token() {
         let yaml = render_supervisor_manifest(
             "weft-infra-supervisor-abc",
             "weft-system",
             "weft-infra-supervisor:local",
             "http://broker:9090",
+            &weft_core::infra::Instance::default_install(),
         );
         assert!(
             yaml.contains("automountServiceAccountToken: true"),
-            "supervisor needs the default kube-API token for kubectl"
+            "supervisor needs the default kube-API token"
         );
         assert!(
             !yaml.contains("automountServiceAccountToken: false"),

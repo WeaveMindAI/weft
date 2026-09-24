@@ -171,7 +171,7 @@ async fn scope_drift_is_refused_at_resolution() -> Result<()> {
     .bind(json!(["channels:read"]))
     .execute(&pool)
     .await?;
-    let seeded = SeededGrant::new(pool.clone(), grant_id);
+    let seeded = SeededGrant::new(pool.clone(), grant_id)?;
 
     let mut project = Project::prepare("access_slack_oauth", disp).await?;
     set_account(
@@ -238,7 +238,7 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     .bind(json!(["https://www.googleapis.com/auth/drive.file"]))
     .execute(&pool)
     .await?;
-    let seeded = SeededGrant::new(pool.clone(), grant_id);
+    let seeded = SeededGrant::new(pool.clone(), grant_id)?;
 
     let mut project = Project::prepare("access_gdrive", disp).await?;
     set_account(

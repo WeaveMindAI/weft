@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 
-use weft_task_store::tasks::{enqueue_dedup, NewTask, TaskTarget};
+use weft_task_store::tasks::{enqueue_or_rearm, NewTask, TaskTarget};
 use weft_task_store::{CancelExecutionPayload, ExecutionPayload, TaskKind};
 
 /// Enqueue a `resume` task for `color`. Dedup key is `{color}:resume`
@@ -33,9 +33,14 @@ use weft_task_store::{CancelExecutionPayload, ExecutionPayload, TaskKind};
 /// resume stays unpinned: cold_start spawns a fresh pod, it claims, and
 /// it legitimately takes over ownership. That handoff is the only time
 /// ownership moves.
+///
+/// A resume already claimed is asked to run once more rather than
+/// collapsed onto (`enqueue_or_rearm`): its worker may have read the
+/// journal for the last time before this wake was written, and would
+/// otherwise finish without driving it.
 pub async fn enqueue_resume(
     pool: &sqlx::PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
     color: weft_core::Color,
     definition_hash: &str,
     tenant_id: Option<&str>,
@@ -45,7 +50,6 @@ pub async fn enqueue_resume(
     let alive_owner = alive_color_owner(pool, color).await?;
     enqueue_execution(
         pool,
-        TaskKind::Resume,
         project_id,
         color,
         definition_hash,
@@ -93,7 +97,7 @@ async fn alive_color_owner<'e>(
 /// expects a caller to attach), `None` otherwise.
 pub fn execution_task_spec(
     kind: TaskKind,
-    project_id: &str,
+    project_id: uuid::Uuid,
     color: weft_core::Color,
     definition_hash: &str,
     binary_hash: &str,
@@ -108,7 +112,7 @@ pub fn execution_task_spec(
 ) -> Result<NewTask> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
-        project_id: project_id.to_string(),
+        project_id,
         color: color_str.clone(),
         definition_hash: definition_hash.to_string(),
         live_connection,
@@ -117,7 +121,7 @@ pub fn execution_task_spec(
     Ok(NewTask {
         kind: kind.into(),
         target: TaskTarget::Worker,
-        project_id: Some(project_id.to_string()),
+        project_id: Some(project_id),
         dedup_key: Some(dedup),
         color: Some(color_str),
         tenant_id: tenant_id.map(str::to_string),
@@ -129,8 +133,7 @@ pub fn execution_task_spec(
 
 async fn enqueue_execution(
     pool: &sqlx::PgPool,
-    kind: TaskKind,
-    project_id: &str,
+    project_id: uuid::Uuid,
     color: weft_core::Color,
     definition_hash: &str,
     tenant_id: Option<&str>,
@@ -146,7 +149,7 @@ async fn enqueue_execution(
     anyhow::ensure!(recorded_project == project_id && program.definition_hash == definition_hash,
         "execution {color} does not match the requested project and graph");
     let task = execution_task_spec(
-        kind,
+        TaskKind::Resume,
         project_id,
         color,
         definition_hash,
@@ -155,7 +158,7 @@ async fn enqueue_execution(
         target_pod_name,
         None,
     )?;
-    enqueue_dedup(pool, task).await?;
+    enqueue_or_rearm(pool, task).await?;
     Ok(())
 }
 
@@ -182,7 +185,7 @@ async fn enqueue_execution(
 /// lands whole or not at all.
 pub async fn enqueue_cancel_in(
     conn: &mut sqlx::PgConnection,
-    project_id: &str,
+    project_id: uuid::Uuid,
     color: weft_core::Color,
     tenant_id: Option<&str>,
     cause: &weft_core::exec::CancelCause,
@@ -192,7 +195,7 @@ pub async fn enqueue_cancel_in(
     };
     let color_str = color.to_string();
     let payload = CancelExecutionPayload {
-        project_id: project_id.to_string(),
+        project_id,
         color: color_str.clone(),
         cause: cause.clone(),
     };
@@ -202,7 +205,7 @@ pub async fn enqueue_cancel_in(
         NewTask {
             kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
-            project_id: Some(project_id.to_string()),
+            project_id: Some(project_id),
             dedup_key: Some(dedup),
             color: Some(color_str),
             tenant_id: tenant_id.map(str::to_string),

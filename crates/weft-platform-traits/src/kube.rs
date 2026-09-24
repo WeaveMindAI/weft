@@ -11,11 +11,9 @@
 //!   - `KubeClient`: union of both. Convenience when a subsystem
 //!     wants the full surface.
 //!
-//! The production impl (`KubectlClient`) shells out to `kubectl`.
-//! `kube-rs` would let us talk the API directly but doubles compile
-//! time; for v1 the supervisor's RBAC scope is already enforced
-//! cluster-side, so `kubectl` with the projected SA token is
-//! equivalent.
+//! The production impl (`KubeApiClient`) talks to the Kubernetes API in
+//! process, one client per process: no `kubectl` is ever started, and
+//! a watch replaces a list repeated on a timer.
 //!
 //! `FakeKube` is an in-memory drop-in for tests. It records every
 //! call so tests can assert "this scale was issued with these args."
@@ -26,23 +24,30 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Replica-managing workload kinds k8s exposes. Names carried on
-/// `WorkloadReplicaState.kind` so callers can target the right
-/// API (`kubectl scale deployment/x` vs `statefulset/x`).
+/// Replica-managing workload kinds k8s exposes. Carried on
+/// `WorkloadReplicaState.kind` so a caller scaling a workload reaches
+/// the right API (the Deployment one or the StatefulSet one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkloadKind {
     Deployment,
     StatefulSet,
 }
 
-impl WorkloadKind {
-    /// kubectl resource prefix: `deployment/<name>` or
-    /// `statefulset/<name>`.
-    pub fn kubectl_prefix(self) -> &'static str {
-        match self {
+/// The kinds of resource `KubeWriter::delete_named` deletes by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NamedKind {
+    Pod,
+    Service,
+    Deployment,
+}
+
+impl std::fmt::Display for NamedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pod => "pod",
+            Self::Service => "service",
             Self::Deployment => "deployment",
-            Self::StatefulSet => "statefulset",
-        }
+        })
     }
 }
 
@@ -59,16 +64,15 @@ pub struct WorkloadReplicaState {
     pub labels: HashMap<String, String>,
 }
 
-/// Options for `KubeWriter::delete_named`. The two orthogonal
-/// axes a `kubectl delete` cares about:
-///   - `wait`: block until the resource is gone (`--wait=true`)
-///     vs fire-and-forget (`--wait=false`). Listener teardown
-///     waits (so a fresh spawn doesn't collide); the worker-pod
-///     reaper does not (it shouldn't block the sweep loop).
-///   - `foreground_cascade`: `--cascade=foreground` so the
+/// Options for `KubeWriter::delete_named`. Two orthogonal axes:
+///   - `wait`: return only once the resource is gone, or as soon as
+///     the apiserver accepted the delete. Listener teardown waits (so
+///     a fresh spawn doesn't collide); the worker-pod reaper does not
+///     (it shouldn't block the sweep loop).
+///   - `foreground_cascade`: a foreground propagation policy, so the
 ///     resource's dependents (ReplicaSet, Pods) finish deleting
-///     before the call returns. Only meaningful for workloads;
-///     Services / Pods don't need it.
+///     before it does. Only meaningful for workloads; Services / Pods
+///     don't need it.
 /// Fields are private: construction goes through the named
 /// constructors so the nonsensical combo (`no_wait + cascade`)
 /// is unrepresentable. Impls read via `wait()` / `foreground_cascade()`.
@@ -103,6 +107,9 @@ impl DeleteOpts {
     }
 }
 
+/// A running watch of workloads (see `KubeReader::watch_replica_state`).
+pub type ReplicaWatch = futures::stream::BoxStream<'static, Result<Vec<WorkloadReplicaState>>>;
+
 /// One node port and the Service that holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePortHolder {
@@ -114,8 +121,7 @@ pub struct NodePortHolder {
 #[async_trait]
 pub trait KubeReader: Send + Sync {
     /// List Deployment + StatefulSet replica state in a namespace,
-    /// filtered by `selector` (label selector passed to kubectl's
-    /// `-l`). The selector value must match the labels the target
+    /// filtered by `selector` (a Kubernetes label selector). The selector value must match the labels the target
     /// workloads were minted with: `weft.dev/role=infra` for the
     /// user's infra NODES (project namespaces), `infra-supervisor`
     /// for the supervisor's OWN Deployment (tenant namespace). These
@@ -127,9 +133,19 @@ pub trait KubeReader: Send + Sync {
         selector: &str,
     ) -> Result<Vec<WorkloadReplicaState>>;
 
+    /// Every change to the Deployments and StatefulSets matching
+    /// `selector` in `namespace` (the same set `list_replica_state`
+    /// answers), each handed out as the whole matching set once it
+    /// changed; the first item is the set as it is now. A dropped
+    /// connection is picked back up inside the stream (relisted, then
+    /// resumed), so the stream lasts as long as its holder keeps it; an
+    /// error item says one look failed, and the stream carries on.
+    async fn watch_replica_state(&self, namespace: &str, selector: &str) -> Result<ReplicaWatch>;
+
     /// The first container's `state.waiting.reason` for a pod, or
     /// `None` if the container isn't waiting (running / not yet
-    /// scheduled / pod gone). Used by the worker spawn to detect
+    /// scheduled / pod gone). Any other failure to read the pod
+    /// propagates, never dressed up as "not waiting". Used by the worker spawn to detect
     /// `ImagePullBackOff` / `ErrImagePull` early instead of
     /// waiting out the full readiness timeout.
     async fn pod_waiting_reason(
@@ -156,8 +172,8 @@ pub trait KubeReader: Send + Sync {
     /// asking for a port already taken.
     async fn node_ports(&self) -> Result<Vec<NodePortHolder>>;
 
-    /// One named container's logs (full stdout+stderr as kubectl
-    /// serves them). Named explicitly so a pod that grows a second
+    /// One named container's logs (full stdout+stderr as the
+    /// apiserver serves them). Named explicitly so a pod that grows a second
     /// container keeps this call unambiguous. Errors when the pod has
     /// no readable logs; the node-test executor reads a completed
     /// pod's report through this.
@@ -167,7 +183,7 @@ pub trait KubeReader: Send + Sync {
 #[async_trait]
 pub trait KubeWriter: Send + Sync {
     /// Scale a workload (Deployment or StatefulSet) to `replicas`.
-    /// `kind` picks the kubectl API. Idempotent.
+    /// `kind` picks the API it goes through. Idempotent.
     async fn scale_workload(
         &self,
         namespace: &str,
@@ -177,12 +193,12 @@ pub trait KubeWriter: Send + Sync {
     ) -> Result<()>;
 
     /// Delete a single named resource (Service / Deployment / Pod
-    /// / etc.) from `namespace`. Always `--ignore-not-found`. The
-    /// wait + cascade behavior comes from `DeleteOpts`.
+    /// / Pod) from `namespace`. One already gone is fine. The wait +
+    /// cascade behavior comes from `DeleteOpts`.
     async fn delete_named(
         &self,
         namespace: &str,
-        kind: &str,
+        kind: NamedKind,
         name: &str,
         opts: DeleteOpts,
     ) -> Result<()>;
@@ -214,12 +230,12 @@ pub trait KubeWriter: Send + Sync {
     /// Apply a raw (multi-document) YAML manifest. Use this one when
     /// several resources are rendered together, as the dispatcher's
     /// listener spawn renders a Deployment + Service; for a single
-    /// resource, `apply` takes the JSON directly. Both routes converge
-    /// on `kubectl apply -f -` in the production impl.
+    /// resource, `apply` takes the JSON directly. Both routes end in a
+    /// server-side apply through the in-process API client.
     async fn apply_yaml(&self, manifest: &str) -> Result<()>;
 
     /// Delete a (cluster-scoped) namespace and everything in it.
-    /// Always `--ignore-not-found` and non-blocking (the namespace
+    /// One already gone is fine, and the call does not block (the namespace
     /// finalizer reaps contents asynchronously). Distinct from
     /// `delete_named`, which deletes a resource WITHIN a namespace.
     async fn delete_namespace(&self, name: &str) -> Result<()>;
@@ -234,8 +250,8 @@ pub trait KubeWriter: Send + Sync {
         timeout_seconds: u32,
     ) -> Result<()>;
 
-    /// Pipe a single manifest into `kubectl apply -f -`. Idempotent
-    /// from k8s' perspective (server-side apply).
+    /// Server-side apply a single manifest through the in-process API
+    /// client. Idempotent.
     async fn apply(&self, manifest: &serde_json::Value) -> Result<()>;
 }
 
@@ -248,14 +264,15 @@ impl<T: KubeReader + KubeWriter + ?Sized> KubeClient for T {}
 
 // ---------- production impl ----------
 
-mod kubectl;
-pub use kubectl::KubectlClient;
+mod api;
+pub use api::KubeApiClient;
 
-/// Construct a production kube client and sanity-check `kubectl` is
-/// on PATH. Returns `Arc<dyn KubeClient>` so call sites bind to the
-/// trait, not the struct.
+/// The production kube client for wherever this process runs (the
+/// pod's service account in the cluster, the kubeconfig outside it).
+/// Returns `Arc<dyn KubeClient>` so call sites bind to the trait, not
+/// the struct.
 pub async fn in_cluster() -> Result<Arc<dyn KubeClient>> {
-    KubectlClient::in_cluster().await
+    KubeApiClient::connect().await
 }
 
 // ---------- fake ----------

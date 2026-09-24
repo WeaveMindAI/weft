@@ -56,6 +56,7 @@ pub mod storage;
 #[cfg(feature = "runtime")]
 pub mod stream_journal;
 pub mod tag;
+pub mod time_scale;
 pub mod wait;
 pub mod weft_type;
 

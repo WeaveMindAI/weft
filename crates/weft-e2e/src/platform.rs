@@ -39,12 +39,9 @@ use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::client::poll_until;
+use tokio::io::AsyncBufReadExt;
 
-/// The local port the rig forwards Postgres onto. Fixed (not random) so a
-/// leaked port-forward from a previous crashed run is visibly the same port,
-/// and so this stays simple; the rig runs single-threaded against one cluster.
-const PG_LOCAL_PORT: u16 = 55432;
+use crate::client::{poll_until, Dispatcher};
 
 /// Postgres credentials for the LOCAL kind cluster. These are the
 /// well-known local-dev secret baked into `deploy/k8s/postgres.yaml`
@@ -57,42 +54,49 @@ const PG_USER: &str = "weft";
 const PG_PASSWORD: &str = "weft-local-dev";
 const PG_DBNAME: &str = "weft";
 
-/// Host-side handle to the cluster's platform state. Holds a Postgres pool
+/// Host-side handle to one install's platform state. Holds a Postgres pool
 /// (reached through a `kubectl port-forward` child this struct owns) plus the
-/// shell-out levers. One per test process, like [`crate::client::Dispatcher`].
+/// shell-out levers, all aimed at the install the dispatcher it was made from
+/// belongs to (the default one, or a [`crate::cell::Cell`]).
 pub struct Platform {
     pool: PgPool,
+    instance: weft_core::infra::Instance,
     /// The `kubectl port-forward` child. Owned so Drop tears it down with the
-    /// test process; a leaked forward would hold `PG_LOCAL_PORT` and break the
-    /// next run loudly (bind failure) rather than silently connect to a stale
-    /// tunnel.
+    /// handle. It listens on a port the system picks, so any number of tests
+    /// running side by side each hold their own.
     _port_forward: tokio::process::Child,
 }
 
 impl Platform {
-    /// Bring up a Postgres connection to the local cluster: spawn the
-    /// port-forward, wait for it, connect. Call once per test process.
-    pub async fn connect() -> Result<Self> {
-        let port_forward = tokio::process::Command::new("kubectl")
+    /// Bring up a Postgres connection to `disp`'s install: spawn the
+    /// port-forward, read the port it bound, connect.
+    pub async fn connect(disp: &Dispatcher) -> Result<Self> {
+        let instance = disp.instance().clone();
+        let mut port_forward = tokio::process::Command::new("kubectl")
             .args([
                 "port-forward",
                 "-n",
-                weft_core::infra::DB_NAMESPACE,
+                &instance.db_namespace(),
                 "svc/weft-postgres",
-                &format!("{PG_LOCAL_PORT}:5432"),
+                // No local port: kubectl picks a free one and says which.
+                ":5432",
             ])
             .kill_on_drop(true)
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
             .context(
                 "spawn `kubectl port-forward svc/weft-postgres`; is the cluster up \
                  (run setup.sh) and kubectl on PATH?",
             )?;
+        let stdout = port_forward.stdout.take().expect("stdout piped");
+        let local_port = tokio::time::timeout(Duration::from_secs(30), forwarded_port(stdout))
+            .await
+            .context("the Postgres port-forward never said which port it bound")??;
 
         let opts = PgConnectOptions::new()
             .host("127.0.0.1")
-            .port(PG_LOCAL_PORT)
+            .port(local_port)
             .username(PG_USER)
             .password(PG_PASSWORD)
             .database(PG_DBNAME);
@@ -123,24 +127,20 @@ impl Platform {
 
         Ok(Self {
             pool,
+            instance,
             _port_forward: port_forward,
         })
     }
 
-    /// STARTUP-ONLY blanket sweep of pooled-pod CLONES left behind by
-    /// EARLIER runs (a failed run preserves its clone for inspection, so
-    /// the next run reaps the straggler at `ensure::up`). Matches by the
-    /// `e2e` name marker, so it deletes EVERY e2e clone in the cluster.
-    /// Do NOT call this on a test's success path: it would delete a
-    /// concurrent test's in-flight clone if the suite ever runs tests in
-    /// parallel. A passing test cleans up its OWN clone by exact name via
-    /// [`Self::sweep_clone`] instead.
+    /// Remove every pooled-pod CLONE on this install: what `scripts/run-e2e.sh
+    /// --clean` runs once you are done with what failed runs kept. A test
+    /// never calls it: it would delete a clone a test running beside it is
+    /// using. A passing test's clones go with its project or its cell: a
+    /// worker clone's row names the project, so `weft rm` reaps it.
     ///
-    /// The extra listener / supervisor pods a scale-down test stood up
-    /// with [`Self::add_second_listener`] / [`Self::add_second_supervisor`].
-    /// A failed run leaves its clone up (the rig preserves failure state
-    /// for inspection), so the NEXT run sweeps the stragglers at startup
-    /// to keep the cluster from accumulating idle pods across runs.
+    /// The clones are the extra listener / supervisor pods a pool test stood
+    /// up with [`Self::add_second_listener`] / [`Self::add_second_supervisor`],
+    /// and the worker pods [`Self::add_second_worker`] made.
     ///
     /// Only e2e CLONES are touched (their names carry the `e2e` marker the
     /// clone helpers mint); a real pooled pod the dispatcher spawned is
@@ -175,11 +175,13 @@ impl Platform {
             }
         }
         // Worker clones (`add_second_worker` mints `wp-e2e-clone-*`) are bare
-        // Pods, not Deployments, and a no-infra project's teardown does NOT
-        // reap shared-pool workers, so a crashed multi_worker test would leave
-        // the clone Pod + its `alive` registry row behind forever, starving a
-        // fresh fixture. Sweep them here too: delete the Pod by name, then the
-        // row (row last so a failed kubectl delete retries next run).
+        // Pods, not Deployments. Their row carries role 'worker' and the
+        // source's project, so removing that project reaps them (the
+        // dispatcher's `sweep_removed_projects`, run by `weft rm` and by the
+        // reaper's loop). A failed test keeps its project, and with it the
+        // clone; sweep them here too so nothing waits on the reaper: delete
+        // the Pod by name, then the row (row last so a failed kubectl delete
+        // retries next run).
         let workers: Vec<(String, String)> = sqlx::query_as(
             "SELECT pod_name, namespace FROM worker_pod WHERE pod_name LIKE '%e2e%'",
         )
@@ -202,51 +204,6 @@ impl Platform {
             .execute(&self.pool)
             .await
             .context("delete leftover e2e worker clone rows")?;
-        Ok(())
-    }
-
-    /// Remove ONE clone this test created, by EXACT name: its Deployment +
-    /// Service + its registry row (listener_pod or supervisor_pod,
-    /// whichever holds it). This is the success-path cleanup a passing
-    /// clone-test calls, scoped to its own artifact so it can never touch a
-    /// concurrent test's clone (unlike the blanket startup
-    /// [`Self::sweep_e2e_clones`]). The namespace comes from the registry
-    /// row; if no row matches (already reaped by the dispatcher, e.g. a
-    /// scale-down test whose clone was consolidated away), it is a no-op.
-    pub async fn sweep_clone(&self, pod_name: &str) -> Result<()> {
-        // The clone is a listener OR a supervisor; find its namespace from
-        // whichever registry row exists.
-        // A clone lives in exactly one of the two registries; LIMIT 1 makes
-        // that explicit so `fetch_optional` can't trip on a surprise 2nd row.
-        let namespace: Option<(String,)> = sqlx::query_as(
-            "SELECT namespace FROM listener_pod WHERE pod_name = $1 \
-             UNION ALL \
-             SELECT namespace FROM supervisor_pod WHERE pod_name = $1 \
-             LIMIT 1",
-        )
-        .bind(pod_name)
-        .fetch_optional(&self.pool)
-        .await
-        .context("look up clone namespace for sweep_clone")?;
-        if let Some((namespace,)) = namespace {
-            for kind in ["deployment", "service"] {
-                self.kubectl_delete_ignore_missing(kind, &namespace, pod_name)
-                    .await?;
-            }
-        }
-        // Delete the registry row(s) last (a failed kubectl delete leaves
-        // the row for the startup sweep to retry). Both tables, by exact
-        // name: harmless if one matches nothing.
-        sqlx::query("DELETE FROM listener_pod WHERE pod_name = $1")
-            .bind(pod_name)
-            .execute(&self.pool)
-            .await
-            .context("delete clone listener_pod row")?;
-        sqlx::query("DELETE FROM supervisor_pod WHERE pod_name = $1")
-            .bind(pod_name)
-            .execute(&self.pool)
-            .await
-            .context("delete clone supervisor_pod row")?;
         Ok(())
     }
 
@@ -295,7 +252,7 @@ impl Platform {
              FROM worker_pod WHERE project_id = $1 AND role = 'worker' \
              ORDER BY created_at_unix DESC",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await
         .context("query worker_pod rows for project")?;
@@ -331,7 +288,7 @@ impl Platform {
         weft_task_store::worker_pod::insert_spawning(
             &self.pool,
             &new_name,
-            &src.project_id,
+            src.project_id,
             &src.namespace,
             &owner,
             Some(&src.binary_hash),
@@ -381,22 +338,30 @@ impl Platform {
         Ok(())
     }
 
+    /// How many live PUBLIC RELAY file links point at one run's files: its
+    /// execution's own (`<tenant>/exec/<color>/...`) and its project's
+    /// (`<tenant>/project/<project>/...`, `<tenant>/asset/<project>/...`).
+    /// A minted relay link (a media slot externalized as
+    /// `<base>/public/files/<token>`) leaves one row until it expires, so a
+    /// test that just externalized media can tell which path it took: rows
+    /// appeared = relay links; none = inline bytes (or the direct-bucket
+    /// path, which a local install never has). Only this run's, so a test
+    /// running beside it never changes the answer.
+    pub async fn public_file_link_count_for(&self, color: &Uuid, project: &Uuid) -> Result<i64> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM public_file_link \
+             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%'",
+        )
+        .bind(color.to_string())
+        .bind(project.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("count public file links")
+    }
+
     /// The pod that currently OWNS an execution's color (stamped by the
     /// claim trigger), or None while unclaimed. Lets a multi-worker e2e
     /// assert WHICH worker picked a run up.
-    /// How many live PUBLIC RELAY file links exist right now. A minted
-    /// relay link (a media slot externalized as `<base>/public/files/
-    /// <token>`) leaves one row until it expires, so a test that just
-    /// externalized media can tell which path it took: rows appeared =
-    /// relay links; none = inline bytes (or the direct-bucket path,
-    /// which a local install never has).
-    pub async fn public_file_link_count(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT count(*) FROM public_file_link")
-            .fetch_one(&self.pool)
-            .await
-            .context("count public file links")
-    }
-
     pub async fn execution_owner(&self, color: &Uuid) -> Result<Option<String>> {
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT owner_pod_name FROM execution_color WHERE color = $1")
@@ -430,7 +395,7 @@ impl Platform {
             "SELECT MAX(attempts) FROM task \
              WHERE project_id = $1 AND kind = 'spawn_pod'",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .fetch_one(&self.pool)
         .await
         .context("query spawn_pod attempts")?;
@@ -537,7 +502,7 @@ impl Platform {
              WHERE project_id = $1 AND status IN ('spawning', 'alive') \
                AND role = 'worker'",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await
         .context("query live worker pods to kill")?;
@@ -649,7 +614,7 @@ impl Platform {
                 "restart",
                 "statefulset/weft-dispatcher",
                 "-n",
-                weft_core::infra::SYSTEM_NAMESPACE,
+                &self.instance.system_namespace(),
             ])
             .status()
             .await
@@ -661,7 +626,7 @@ impl Platform {
                 "status",
                 "statefulset/weft-dispatcher",
                 "-n",
-                weft_core::infra::SYSTEM_NAMESPACE,
+                &self.instance.system_namespace(),
             ])
             .status()
             .await
@@ -675,17 +640,18 @@ impl Platform {
     /// Make every `alive` worker pod for `project_id` look heartbeat-stale, so
     /// the worker-pod reaper marks it dead on its next sweep. Backdates
     /// `last_heartbeat_unix` past the reaper's OWN staleness threshold
-    /// (`HEARTBEAT_STALE_SECS`) plus slack. This fakes "the worker stopped
+    /// (`heartbeat_stale_secs`, read at real time: a cell's scaled threshold
+    /// is never longer, so the backdate is past it too) plus slack. This fakes "the worker stopped
     /// heartbeating" (a crash the pod-kill didn't catch, or a hang) without
     /// waiting the real interval.
     pub async fn make_worker_pods_stale(&self, project_id: &Uuid) -> Result<u64> {
-        let cutoff = now_unix() - weft_task_store::worker_pod::HEARTBEAT_STALE_SECS - SLACK_SECS;
+        let cutoff = now_unix() - weft_task_store::worker_pod::heartbeat_stale_secs() - SLACK_SECS;
         let res = sqlx::query(
             "UPDATE worker_pod SET last_heartbeat_unix = $1 \
              WHERE project_id = $2 AND status = 'alive'",
         )
         .bind(cutoff)
-        .bind(project_id.to_string())
+        .bind(project_id)
         .execute(&self.pool)
         .await
         .context("backdate worker_pod heartbeats")?;
@@ -828,7 +794,7 @@ impl Platform {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT token FROM signal WHERE project_id = $1 AND node_id = $2",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .bind(node_id)
         .fetch_optional(&self.pool)
         .await
@@ -1082,7 +1048,7 @@ impl Platform {
             "SELECT supervisor_pod FROM infra_owner \
              WHERE project_id = $1 AND leased_until_unix >= $2",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .bind(now_unix())
         .fetch_optional(&self.pool)
         .await
@@ -1103,7 +1069,7 @@ impl Platform {
             "SELECT COUNT(*) FROM infra_owner \
              WHERE project_id = $1 AND leased_until_unix >= $2",
         )
-        .bind(project_id.to_string())
+        .bind(project_id)
         .bind(now_unix())
         .fetch_one(&self.pool)
         .await
@@ -1143,7 +1109,7 @@ impl Platform {
         )
         .bind(pod)
         .bind(now_unix() + POOL_CLONE_LEASE_SECS)
-        .bind(project_id.to_string())
+        .bind(project_id)
         .execute(&self.pool)
         .await
         .context("move infra_owner lease onto pod")?
@@ -1360,7 +1326,7 @@ fn is_notfound(stderr: &str) -> bool {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkerPodRow {
     pub pod_name: String,
-    pub project_id: String,
+    pub project_id: Uuid,
     pub namespace: String,
     pub status: String,
     pub last_heartbeat_unix: i64,
@@ -1501,4 +1467,34 @@ fn pick_free_local_port() -> Result<u16> {
         std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral local port")?;
     let port = listener.local_addr().context("read ephemeral port")?.port();
     Ok(port)
+}
+
+/// The local port a `kubectl port-forward` bound, from the line it prints
+/// once it listens (`Forwarding from 127.0.0.1:<port> -> 5432`). The rest of
+/// its output is drained for as long as it runs: it prints a line per
+/// connection, and a closed pipe would kill it at the first one.
+async fn forwarded_port(stdout: tokio::process::ChildStdout) -> Result<u16> {
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await? {
+        if let Some(port) = parse_forwarded_port(&line) {
+            tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("the port-forward exited before it listened")
+}
+
+/// Pure half of [`forwarded_port`].
+fn parse_forwarded_port(line: &str) -> Option<u16> {
+    let rest = line.strip_prefix("Forwarding from 127.0.0.1:")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(test)]
+mod forward_tests {
+    #[test]
+    fn the_bound_port_is_read_off_kubectls_line() {
+        assert_eq!(super::parse_forwarded_port("Forwarding from 127.0.0.1:41234 -> 5432"), Some(41234));
+        assert_eq!(super::parse_forwarded_port("Forwarding from [::1]:41234 -> 5432"), None);
+    }
 }

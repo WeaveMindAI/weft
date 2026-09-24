@@ -24,7 +24,6 @@ async fn an_untargeted_run_kicks_every_root() -> anyhow::Result<()> {
     let mut project = Project::prepare("aimed_run", disp).await?;
 
     let built = project.weft(&["build", "--json"]).await?;
-    project.mark_registered();
     anyhow::ensure!(built.contains("\"phase\":\"build_skip\"") && !built.contains("\"phase\":\"build_start\""),
         "an unchanged standard-library project must use the prepared worker without compiling: {built}");
 

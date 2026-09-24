@@ -1,5 +1,7 @@
-# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
-#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+# Namespaces are rendered per install by the daemon
+# (crates/weft-cli/src/commands/daemon.rs, manifest_template_vars) from
+# weft_core::infra::Instance, so a named install beside the default one
+# applies this same file into namespaces of its own.
 ---
 # ServiceAccount for the dispatcher. Lives in `weft-system` (the
 # system namespace, kept separate from tenant workloads). The
@@ -10,20 +12,20 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weft-dispatcher
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: weft-dispatcher
-# Two sources of scope: (1) what the dispatcher's own `kubectl
-# apply` / `kubectl delete` paths touch (tenant pods, the listener
+# Two sources of scope: (1) what the dispatcher's own applies and
+# deletes touch (tenant pods, the listener
 # Deployment+Service, tenant namespace bundles: Namespace + SA +
 # NetworkPolicy; sweeper `get`s pods), AND (2) the UNION of the
 # supervisor + listener ClusterRole verbs, which the dispatcher must
 # also hold to pass kube's escalation-prevention check when it
 # creates their RoleBindings (see the rule comment below). That's
-# why configmaps/secrets/pvc/jobs/ingress/hpa appear here even
+# why configmaps/secrets/pvc/jobs/httproutes/hpa appear here even
 # though dispatcher runtime code never calls them directly.
 rules:
   # K8s RBAC's escalation-prevention rule: when the dispatcher
@@ -36,9 +38,11 @@ rules:
   # resolution). The dispatcher needs all of those too, even though
   # its own runtime code doesn't call them, otherwise the RoleBinding
   # apply is rejected.
+  # `patch`: every apply is server side, a PATCH whether the object is
+  # new or not.
   - apiGroups: [""]
     resources: [namespaces]
-    verbs: [get, list, create, delete]
+    verbs: [get, list, create, patch, delete]
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, patch, delete]
@@ -72,7 +76,10 @@ rules:
     resources: [jobs]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [networking.k8s.io]
-    resources: [networkpolicies, ingresses]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [rolebindings]
@@ -84,11 +91,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: weft-dispatcher
+  # One binding per install on the cluster (the ClusterRole above is
+  # shared: every install holds the same verbs).
+  name: weft-dispatcher${WEFT_INSTANCE_SUFFIX}
 subjects:
   - kind: ServiceAccount
     name: weft-dispatcher
-    namespace: weft-system
+    namespace: ${WEFT_SYSTEM_NAMESPACE}
 roleRef:
   kind: ClusterRole
   name: weft-dispatcher
@@ -102,7 +111,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: weft-dispatcher
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
   labels:
     app: weft-dispatcher
     weft.dev/role: dispatcher
@@ -146,6 +155,18 @@ spec:
                   fieldPath: metadata.name
             - name: WEFT_HTTP_PORT
               value: "9999"
+            # Which install on the cluster this is (empty for the default
+            # one): every namespace the dispatcher names follows from it.
+            # SYNC: WEFT_INSTANCE / WEFT_TIME_SCALE <->
+            #       crates/weft-core/src/infra/instance.rs (INSTANCE_ENV),
+            #       crates/weft-core/src/time_scale.rs (TIME_SCALE_ENV),
+            #       deploy/k8s/broker.yaml
+            - name: WEFT_INSTANCE
+              value: "${WEFT_INSTANCE}"
+            # How fast the install's own timers run (1 = real time); the
+            # dispatcher hands it to every pod it spawns.
+            - name: WEFT_TIME_SCALE
+              value: "${WEFT_TIME_SCALE}"
             # The images the dispatcher spawns pooled pods from,
             # substituted by the apply path (content-addressed refs).
             # SYNC: WEFT_*_IMAGE names <-> crates/weft-cli/src/images.rs
@@ -172,7 +193,7 @@ spec:
             - name: WEFT_CLUSTER_SERVICE_CIDR
               value: "${WEFT_CLUSTER_SERVICE_CIDR}"
             - name: WEFT_BROKER_URL
-              value: "http://weft-broker.weft-db.svc.cluster.local:9090"
+              value: "http://weft-broker.${WEFT_DB_NAMESPACE}.svc.cluster.local:9090"
             # Public base URL surfaced to users in webhook / trigger /
             # activation URLs (<base>/<mount>, <base>/connect/...). This is a
             # CONTROL-PLANE origin: it routes those requests to the dispatcher.
@@ -254,7 +275,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: weft-dispatcher
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
   labels:
     app: weft-dispatcher
 spec:
@@ -272,7 +293,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: weft-dispatcher-headless
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
   labels:
     app: weft-dispatcher
 spec:

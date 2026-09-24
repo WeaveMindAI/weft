@@ -428,6 +428,11 @@ pub trait CallerConnection: Send + Sync {
     /// Is the caller attached right now? Never fails; pure status read.
     fn is_connected(&self) -> bool;
 
+    /// Resolves once the caller is gone, at once when it already is.
+    /// Lets a wait that holds for a caller notice a hang-up the moment
+    /// it happens instead of polling `is_connected`.
+    async fn disconnected(&self);
+
     /// Has anything been queued toward the wire yet (a chunk, a
     /// terminal, a head)? Once true the response head is committed and
     /// an explicit one is refused (`HeadAlreadySent`). Pure status
@@ -905,12 +910,14 @@ pub enum CallerCall {
 /// item commits the head" are the contracts under test.
 pub struct FakeCallerConnection {
     config: CallerRuntimeConfig,
+    /// The connected flag, as a watch so `disconnected()` wakes on a
+    /// scripted hang-up.
+    connected: tokio::sync::watch::Sender<bool>,
     inner: std::sync::Mutex<FakeCallerInner>,
 }
 
 #[derive(Default)]
 struct FakeCallerInner {
-    connected: bool,
     terminated: bool,
     /// Something already went to the wire (a head can no longer be set).
     wire_started: bool,
@@ -929,10 +936,8 @@ impl FakeCallerConnection {
     pub fn connected(config: CallerRuntimeConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            inner: std::sync::Mutex::new(FakeCallerInner {
-                connected: true,
-                ..Default::default()
-            }),
+            connected: tokio::sync::watch::Sender::new(true),
+            inner: std::sync::Mutex::new(FakeCallerInner::default()),
         })
     }
 
@@ -941,12 +946,13 @@ impl FakeCallerConnection {
     pub fn disconnected(config: CallerRuntimeConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
+            connected: tokio::sync::watch::Sender::new(false),
             inner: std::sync::Mutex::new(FakeCallerInner::default()),
         })
     }
 
     pub fn set_connected(&self, connected: bool) {
-        self.inner.lock().expect("fake caller poisoned").connected = connected;
+        self.connected.send_replace(connected);
     }
 
     /// Queue an inbound message for the next `receive` / `request`.
@@ -1041,7 +1047,14 @@ impl CallerConnection for FakeCallerConnection {
     }
 
     fn is_connected(&self) -> bool {
-        self.inner.lock().expect("fake caller poisoned").connected
+        *self.connected.borrow()
+    }
+
+    async fn disconnected(&self) {
+        let mut rx = self.connected.subscribe();
+        // `wait_for` reads the current value first, so a hang-up that
+        // already happened resolves at once.
+        let _ = rx.wait_for(|connected| !connected).await;
     }
 
     fn wire_started(&self) -> bool {
@@ -1072,7 +1085,7 @@ impl CallerConnection for FakeCallerConnection {
     ) -> Result<(), CallerError> {
         let mut g = self.inner.lock().expect("fake caller poisoned");
         g.calls.push(CallerCall::SendChunk { head: head.clone(), chunk });
-        if !g.connected {
+        if !self.is_connected() {
             return self.disconnected_outcome();
         }
         Self::commit_head(&mut g, &head)

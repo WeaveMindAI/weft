@@ -1,5 +1,7 @@
-# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
-#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+# Namespaces are rendered per install by the daemon
+# (crates/weft-cli/src/commands/daemon.rs, manifest_template_vars) from
+# weft_core::infra::Instance, so a named install beside the default one
+# applies this same file into namespaces of its own.
 ---
 # Postgres backing store. Lives in `weft-db`, fronted by `weft-broker`
 # for tenant pods (workers, listeners, infra pods). The dispatcher and
@@ -15,7 +17,8 @@
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: weft-postgres-data
+  # Cluster-wide, so named per install.
+  name: ${WEFT_POSTGRES_VOLUME}
   labels:
     app: weft-postgres
 spec:
@@ -31,14 +34,14 @@ spec:
   # Pre-bind to the one claim that may ever use this volume, so nothing
   # else can grab it and a fresh claim of this name binds immediately.
   claimRef:
-    namespace: weft-db
+    namespace: ${WEFT_DB_NAMESPACE}
     name: weft-postgres-data
   # Empty rather than absent: an empty class opts out of dynamic provisioning,
   # so the claim below binds to THIS volume instead of having the default
   # provisioner carve a fresh empty one inside the node.
   storageClassName: ""
   hostPath:
-    path: /var/weft-postgres
+    path: ${WEFT_POSTGRES_NODE_PATH}
     # This whole `hostPath` block sits inside spec.persistentVolumeSource,
     # which Kubernetes FREEZES at creation: any edit here can never be
     # applied to an existing volume (the apply is refused, and replacing
@@ -55,13 +58,13 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: weft-postgres-data
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     app: weft-postgres
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: ""
-  volumeName: weft-postgres-data
+  volumeName: ${WEFT_POSTGRES_VOLUME}
   resources:
     requests:
       storage: 5Gi
@@ -86,7 +89,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: weft-postgres-credentials
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     weft.dev/scope: local-dev-only
 type: Opaque
@@ -96,11 +99,12 @@ data:
   POSTGRES_USER: d2VmdA==
   POSTGRES_PASSWORD: d2VmdC1sb2NhbC1kZXY=
   POSTGRES_DB: d2VmdA==
-  # postgres://weft:weft-local-dev@weft-postgres.weft-db.svc.cluster.local:5432/weft
+  # postgres://weft:weft-local-dev@weft-postgres.<db namespace>.svc.cluster.local:5432/weft,
+  # rendered by the daemon for this install's db namespace.
   # The dispatcher and broker reference this via secretKeyRef so the
   # password never appears in `kubectl describe pod` env output. Prod
   # swaps this Secret only; the deployment env wiring stays the same.
-  WEFT_DATABASE_URL: cG9zdGdyZXM6Ly93ZWZ0OndlZnQtbG9jYWwtZGV2QHdlZnQtcG9zdGdyZXMud2VmdC1kYi5zdmMuY2x1c3Rlci5sb2NhbDo1NDMyL3dlZnQ=
+  WEFT_DATABASE_URL: ${WEFT_DATABASE_URL_BASE64}
 ---
 # Mirror of the credentials Secret into the weft-system namespace so
 # the dispatcher (which runs there) can `secretKeyRef` against a
@@ -112,18 +116,18 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: weft-postgres-credentials
-  namespace: weft-system
+  namespace: ${WEFT_SYSTEM_NAMESPACE}
   labels:
     weft.dev/scope: local-dev-only
 type: Opaque
 data:
-  WEFT_DATABASE_URL: cG9zdGdyZXM6Ly93ZWZ0OndlZnQtbG9jYWwtZGV2QHdlZnQtcG9zdGdyZXMud2VmdC1kYi5zdmMuY2x1c3Rlci5sb2NhbDo1NDMyL3dlZnQ=
+  WEFT_DATABASE_URL: ${WEFT_DATABASE_URL_BASE64}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: weft-postgres
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     app: weft-postgres
     weft.dev/role: postgres
@@ -177,7 +181,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: weft-postgres
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     app: weft-postgres
 spec:
@@ -194,7 +198,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-db-default-deny
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 spec:
   podSelector: {}
   policyTypes:
@@ -208,7 +212,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-db-postgres-allow
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
@@ -230,7 +234,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-system
+              kubernetes.io/metadata.name: ${WEFT_SYSTEM_NAMESPACE}
           podSelector:
             matchLabels:
               app: weft-dispatcher
@@ -244,7 +248,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-db-postgres-egress
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 spec:
   podSelector:
     matchLabels:

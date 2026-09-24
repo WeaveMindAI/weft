@@ -19,13 +19,12 @@ use weft_e2e::{ensure, human, project::Project, run, SettledRun};
 #[tokio::test]
 async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree_grow", disp).await?;
+    let project = Project::prepare("version_tree_grow", disp).await?;
 
     // The include alone: `src` never runs, the group's node does.
     let stdout = project
         .weft(&["run", "--json", "--group", r#"triage={"text":"quiet"}"#])
         .await?;
-    project.mark_registered();
     let settled = project.settled(color_of(&stdout)?).await?;
     settled.completed()?.assert_completed("triage.up")?.assert_completed("triage.unrelated")?.assert_untouched("src")?.assert_untouched("shout")?;
     settled.assert_input("triage.up", "text", &json!("quiet"))?;
@@ -107,13 +106,12 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
 #[tokio::test]
 async fn finite_supplied_streams_freeze_and_run_without_the_original_producer() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("range_stream", disp).await?;
+    let project = Project::prepare("range_stream", disp).await?;
     for (name, supply, expected) in [
         ("items", r#"nums={"values":[3,5]}"#, json!([6,10])),
         ("empty", r#"nums={"values":[]}"#, json!([])),
     ] {
         let out = project.weft(&["run", "--json", "--emit", supply]).await?;
-        project.mark_registered();
         let color = color_of(&out)?;
         SettledRun::observe(project.dispatcher(), color).await?.completed()?
             .assert_untouched("nums")?.assert_input("out", "data", &expected)?;
@@ -139,9 +137,8 @@ async fn finite_supplied_streams_freeze_and_run_without_the_original_producer() 
 #[tokio::test]
 async fn frozen_carved_inputs_survive_seed_cleanup_and_explicit_cut_repair() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree_grow", disp).await?;
+    let project = Project::prepare("version_tree_grow", disp).await?;
     let out = project.weft(&["run", "--json", "--target", "shout"]).await?;
-    project.mark_registered();
     let seed = color_of(&out)?;
     project.settled(seed).await?.completed()?;
     let out = project.weft(&["run", "--json", "--seed", "--from", "triage.up", "--target", "shout"]).await?;
@@ -172,12 +169,11 @@ async fn frozen_carved_inputs_survive_seed_cleanup_and_explicit_cut_repair() -> 
 #[tokio::test]
 async fn a_frozen_example_runs_with_a_new_human_answer_and_explicit_acceptance() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree_grow", disp.clone()).await?;
+    let project = Project::prepare("version_tree_grow", disp.clone()).await?;
     let pid = project.id();
 
     // A run to the gate parks on `review`; the rig plays the person.
     let stdout = project.weft(&["run", "--json", "--target", "gate"]).await?;
-    project.mark_registered();
     let first = color_of(&stdout)?;
     run::wait_for_status(&disp, first, "waiting_for_input").await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
@@ -217,10 +213,9 @@ async fn a_frozen_example_runs_with_a_new_human_answer_and_explicit_acceptance()
 #[tokio::test]
 async fn wake_resolves_a_timer_and_refuses_a_form() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree_grow", disp.clone()).await?;
+    let project = Project::prepare("version_tree_grow", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "late"]).await?;
-    project.mark_registered();
     let held = color_of(&stdout)?;
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
     let refused = project.weft_refused(&["wake", &held.to_string(), "src"]).await?;

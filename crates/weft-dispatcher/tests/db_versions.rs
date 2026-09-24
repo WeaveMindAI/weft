@@ -99,7 +99,7 @@ async fn retention_keeps_program_references_when_execution_selection_has_changed
     seed_project(&projects, project).await;
     let color = Uuid::new_v4();
     let birth = ExecEvent::ExecutionStarted {
-        color, project_id: project.to_string(), entry_node: "mid".into(),
+        color, project_id: project, entry_node: "mid".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
         program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
     };
@@ -108,11 +108,11 @@ async fn retention_keeps_program_references_when_execution_selection_has_changed
     row["subgraph"] = json!(["mid"]);
     sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE color = $1 AND kind = 'execution_started'")
         .bind(color.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
-    assert_eq!(journal.definition_hashes_in_use(&project.to_string()).await.unwrap(), vec!["def-1"]);
+    assert_eq!(journal.definition_hashes_in_use(project).await.unwrap(), vec!["def-1"]);
     row["definition_hash"] = json!(42);
     sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE color = $1 AND kind = 'execution_started'")
         .bind(color.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
-    assert!(journal.definition_hashes_in_use(&project.to_string()).await.is_err(), "an unreadable reference must block deletion");
+    assert!(journal.definition_hashes_in_use(project).await.is_err(), "an unreadable reference must block deletion");
 }
 
 /// A run's row round-trips whole (spec included) and lists under its
@@ -183,9 +183,8 @@ async fn head_and_activation_live_on_the_project_row(pool: PgPool) {
     // A lost race is Ok(false), never an error: the handler turns it
     // into a 409, and a decode failure here used to make it a 500.
     let stale = Head { head_version: Some("nowhere".into()), head_run: None, activation_version: None };
-    assert_eq!(
-        versions.move_head(project, &stale, Some("v2"), None).await.unwrap(),
-        false,
+    assert!(
+        !versions.move_head(project, &stale, Some("v2"), None).await.unwrap(),
         "head is not where the caller thought, so nothing moves"
     );
 }
@@ -206,7 +205,7 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
     journal
         .record_event(&ExecEvent::ExecutionStarted {
             color,
-            project_id: project.to_string(),
+            project_id: project,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
@@ -250,7 +249,7 @@ async fn deleting_versions_cascades_to_their_runs(pool: PgPool) {
     let (r1, r2) = (Uuid::new_v4(), Uuid::new_v4());
     versions.insert_run(&run(project, r1, &root.id, None, None, 3)).await.unwrap();
     versions.insert_run(&run(project, r2, &child.id, None, None, 4)).await.unwrap();
-    versions.delete_versions(project, &[child.id.clone()]).await.unwrap();
+    versions.delete_versions(project, std::slice::from_ref(&child.id)).await.unwrap();
     assert!(versions.run(r2).await.unwrap().is_none());
     assert!(versions.run(r1).await.unwrap().is_some());
     assert_eq!(versions.versions(project).await.unwrap().len(), 1);

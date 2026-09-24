@@ -69,6 +69,7 @@ impl Connection {
             .delete(&format!("/access/grants/{}", self.grant_id))
             .await
             .with_context(|| format!("teardown: delete connection {}", self.grant_id))?;
+        crate::kept::grant_gone(&self.grant_id)?;
         self.finished = true;
         Ok(())
     }
@@ -79,7 +80,7 @@ impl Drop for Connection {
         if self.finished {
             return;
         }
-        tracing::warn!(
+        eprintln!(
             "weft-e2e: connection {} NOT finished (test ended early); keeping it for \
              inspection. Recover with: DELETE /access/grants/{}",
             self.grant_id,
@@ -129,6 +130,7 @@ async fn connect_direct_inner(
         grant.get("id").and_then(Value::as_str).context("grant without id")?.to_string();
     let identity =
         grant.get("identity").cloned().context("connect answered a grant without an identity")?;
+    crate::kept::grant_made(disp, &grant_id)?;
     Ok(Connection {
         handle: json!({ "id": grant_id, "identity": identity }),
         grant_id,
@@ -161,9 +163,11 @@ pub struct SeededGrant {
 
 #[cfg(feature = "e2e")]
 impl SeededGrant {
-    /// Adopt a row the test just INSERTed under `grant_id`.
-    pub fn new(pool: sqlx::PgPool, grant_id: uuid::Uuid) -> Self {
-        Self { grant_id, pool, finished: false }
+    /// Adopt a row the test just INSERTed under `grant_id` into the default
+    /// install's store.
+    pub fn new(pool: sqlx::PgPool, grant_id: uuid::Uuid) -> Result<Self> {
+        crate::kept::default_install_grant_made(&grant_id.to_string())?;
+        Ok(Self { grant_id, pool, finished: false })
     }
 
     /// End-of-test teardown for a PASSING test: delete the seeded row,
@@ -174,6 +178,7 @@ impl SeededGrant {
             .execute(&self.pool)
             .await
             .with_context(|| format!("teardown: delete seeded grant {}", self.grant_id))?;
+        crate::kept::grant_gone(&self.grant_id.to_string())?;
         self.finished = true;
         Ok(())
     }
@@ -185,7 +190,7 @@ impl Drop for SeededGrant {
         if self.finished {
             return;
         }
-        tracing::warn!(
+        eprintln!(
             "weft-e2e: seeded grant {} NOT finished (test ended early); keeping the row for \
              inspection. Recover with: DELETE FROM access_grant WHERE id = '{}'",
             self.grant_id,

@@ -34,19 +34,26 @@
 //! itself is driven by the dispatcher's real scale-down sweep, not poked
 //! from the test: we create the precondition (a second pod) and let the
 //! production reaper consolidate.
+//!
+//! It runs in a cell of its own: it watches the WHOLE supervisor pool
+//! shrink, and another test's projects on a shared pool would be owned,
+//! moved and counted with these. The cell runs its timers at
+//! [`Cell::FAST`], so the reaper ticks and leases quoted above in real
+//! time (30s, 60s) come round ten times sooner.
 
 #![cfg(feature = "e2e")]
 
 use std::time::{Duration, Instant};
 
-use weft_e2e::{ensure, infra, platform::Platform, project::Project};
+use weft_e2e::{infra, platform::Platform, project::Project, Cell};
 
 const NODE: &str = "svc";
 
 #[tokio::test]
 async fn supervisor_cold_start_then_safe_consolidation() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let cell = Cell::start(Cell::FAST).await?;
+    let disp = cell.dispatcher();
+    let platform = Platform::connect(&disp).await?;
     let mut p1 = Project::prepare("infra_min", disp.clone()).await?;
     let mut p2 = Project::prepare("infra_min", disp.clone()).await?;
     let pid1 = p1.id();
@@ -103,7 +110,11 @@ async fn supervisor_cold_start_then_safe_consolidation() -> anyhow::Result<()> {
     // expire its grace so the scale-down planner treats it as an
     // established member and can consolidate it (the planner only considers
     // past-grace pods). Without this the pool never folds back to one.
+    // The original pod gets the same: it has owned a running project for
+    // a while, and its grace (real time, whatever the cell's pace, since
+    // it covers a pod starting) would otherwise be what this test waits on.
     platform.expire_supervisor_grace(&pod_b).await?;
+    platform.expire_supervisor_grace(&owner_a).await?;
 
     // Both pods idle (uncapped cgroup → 0 pressure), so the planner has
     // headroom to fold one onto the other. Whichever pod is drained, its
@@ -156,12 +167,11 @@ async fn supervisor_cold_start_then_safe_consolidation() -> anyhow::Result<()> {
     // ---- 4. Cleanup ----
     infra::terminate_and_wait_gone(&p1, NODE).await?;
     infra::terminate_and_wait_gone(&p2, NODE).await?;
-    // Success cleanup: remove the supervisor clone THIS test created (by
-    // exact name, so it never touches another test's clone). Success path
-    // only; a failing test keeps state for inspection.
-    platform.sweep_clone(&pod_b).await?;
     p1.finish().await?;
-    p2.finish().await
+    p2.finish().await?;
+    // Removing the cell takes the supervisor clone with it. Success path
+    // only; a failing test keeps the cell for inspection.
+    cell.finish().await
 }
 
 /// Poll until the project has exactly one live `infra_owner`, returning
@@ -197,8 +207,9 @@ async fn wait_for_single_owner(platform: &Platform, pid: &uuid::Uuid) -> anyhow:
 /// A dropped ownership fails by never converging. `initial_owners[i]` is
 /// the owner of `pids[i]` at entry.
 ///
-/// The deadline covers the scale-down sweep interval (60s) plus the
-/// survivor's adopt-and-reap with margin.
+/// The deadline covers the scale-down sweep interval (60s at real time,
+/// a tenth of it in the test's cell) plus the survivor's adopt-and-reap,
+/// with margin.
 async fn wait_for_consolidation_owner_stable(
     platform: &Platform,
     disp: &weft_e2e::client::Dispatcher,
@@ -206,7 +217,11 @@ async fn wait_for_consolidation_owner_stable(
     allowed_owners: &[String],
     initial_owners: &[String],
 ) -> anyhow::Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(150);
+    // What the pool looked like on the last look, logged when it changes,
+    // so a slow consolidation shows which step it sat on.
+    let mut last_seen = String::new();
     // Per project, the ordered list of DISTINCT owner values observed
     // (ignoring transient `None` gaps). A clean hand-off is at most
     // [initial, survivor]; a third distinct value means a flap.
@@ -238,6 +253,11 @@ async fn wait_for_consolidation_owner_stable(
         }
 
         let live = platform.live_supervisor_pods().await?;
+        let now_seen = format!("{} live, owners {seen:?}", live.len());
+        if now_seen != last_seen {
+            eprintln!("[e2e] {:.1}s into consolidation: {now_seen}", started.elapsed().as_secs_f64());
+            last_seen = now_seen;
+        }
         if live.len() == 1 {
             // Consolidated. Confirm the lone pod owns EVERY project.
             let survivor = live[0].pod_name.clone();
@@ -249,6 +269,10 @@ async fn wait_for_consolidation_owner_stable(
                 }
             }
             if all_owned {
+                eprintln!(
+                    "[e2e] waited {:.1}s for: the pool to consolidate onto one supervisor",
+                    started.elapsed().as_secs_f64()
+                );
                 return Ok(survivor);
             }
         }

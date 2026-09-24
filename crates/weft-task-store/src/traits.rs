@@ -11,6 +11,7 @@
 //! The engine takes `TaskStoreClient`, `WorkerPodClient` and
 //! `InfraReader`; the listener takes only `TaskStoreClient`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,6 +21,7 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::pg_signal::PgSignalWatch;
 use crate::worker_pod::WorkerStanding;
 use crate::tasks::{
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
@@ -35,8 +37,12 @@ pub trait TaskStoreClient: Send + Sync {
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome>;
 
     /// Picker primitive: claim one pending or stale-claimed row that
-    /// matches the filter. Used by both pickers.
-    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter) -> Result<Option<Task>>;
+    /// matches the filter, and when there is none, hold for up to
+    /// `wait` for one to become claimable (see
+    /// [`crate::tasks::TASK_READY_CHANNEL`]). `None` once `wait` passed
+    /// with nothing to claim; a zero `wait` answers at once. Used by
+    /// both pickers.
+    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
 
     async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool>;
 
@@ -56,7 +62,7 @@ pub trait WorkerPodClient: Send + Sync {
     async fn register_alive(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: Uuid,
     ) -> Result<()>;
 
     /// Heartbeat + self-reported memory pressure ([0,1]) in one call.
@@ -79,15 +85,19 @@ pub trait WorkerPodClient: Send + Sync {
 
 pub struct PostgresTaskStoreClient {
     pool: PgPool,
-    /// The one `LISTEN` connection this client's waits share, opened by
-    /// the first wait: a client that never waits (the dispatcher's
-    /// picker) never holds one.
-    terminal: tokio::sync::OnceCell<std::sync::Arc<crate::terminal::TerminalWatch>>,
+    /// The process's one `LISTEN` connection, which every wait here
+    /// sleeps on.
+    signals: Arc<PgSignalWatch>,
 }
 
 impl PostgresTaskStoreClient {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool, terminal: tokio::sync::OnceCell::new() }
+    /// `signals` must listen on the channels this client's waits sleep
+    /// on, [`crate::tasks::TASK_READY_CHANNEL`] and
+    /// [`crate::terminal::TERMINAL_CHANNEL`].
+    pub fn new(pool: PgPool, signals: Arc<PgSignalWatch>) -> Result<Self> {
+        signals.require(crate::tasks::TASK_READY_CHANNEL)?;
+        signals.require(crate::terminal::TERMINAL_CHANNEL)?;
+        Ok(Self { pool, signals })
     }
 }
 
@@ -98,15 +108,23 @@ impl TaskStoreClient for PostgresTaskStoreClient {
     }
 
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
-        let watch = self
-            .terminal
-            .get_or_try_init(|| crate::terminal::TerminalWatch::start(&self.pool))
-            .await?;
-        crate::terminal::wait_for_terminal(&self.pool, watch, task_id, timeout).await
+        crate::terminal::wait_for_terminal(&self.pool, &self.signals, task_id, timeout).await
     }
 
-    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter) -> Result<Option<Task>> {
-        crate::tasks::claim_one(&self.pool, pod_id, filter).await
+    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        // Subscribed before the first claim, so a task that lands
+        // between an empty claim and the wait still wakes it.
+        let mut signals = self.signals.subscribe();
+        let ready = filter.ready_payload();
+        loop {
+            if let Some(task) = crate::tasks::claim_one(&self.pool, pod_id, &filter).await? {
+                return Ok(Some(task));
+            }
+            if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
+                return Ok(None);
+            }
+        }
     }
 
     async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
@@ -141,7 +159,7 @@ impl WorkerPodClient for PostgresWorkerPodClient {
     async fn register_alive(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: Uuid,
     ) -> Result<()> {
         crate::worker_pod::register_alive(
             &self.pool,
@@ -169,37 +187,41 @@ impl WorkerPodClient for PostgresWorkerPodClient {
 /// provisions infrastructure.
 #[async_trait]
 pub trait InfraReader: Send + Sync {
-    /// The cluster-internal URL of one declared endpoint of an infra
-    /// node. `None` when the node is not Running or declares no endpoint
-    /// by that name. Backs `ctx.endpoint(name)` in node code.
-    async fn endpoint_url(
+    /// Where one declared endpoint of an infra node answers. `None` when
+    /// the node is not Running or declares no endpoint by that name.
+    /// Backs `ctx.endpoint(name)` in node code.
+    async fn endpoint_address(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         endpoint_name: &str,
-    ) -> Result<Option<String>>;
+    ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 }
 
 pub struct PostgresInfraReader {
     pool: PgPool,
+    /// The front door's base URL, which a `TenantPublic` endpoint's
+    /// stored path hangs off; `None` on an install that has none, and
+    /// then no endpoint has a public URL.
+    front_door: Option<String>,
 }
 
 impl PostgresInfraReader {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, front_door: Option<String>) -> Self {
+        Self { pool, front_door }
     }
 }
 
 #[async_trait]
 impl InfraReader for PostgresInfraReader {
-    async fn endpoint_url(
+    async fn endpoint_address(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         endpoint_name: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let row = sqlx::query(
-            "SELECT endpoints_json FROM infra_node \
+            "SELECT endpoints_json, public_paths_json FROM infra_node \
              WHERE project_id = $1 AND node_id = $2 AND status = 'running'",
         )
         .bind(project_id)
@@ -209,51 +231,60 @@ impl InfraReader for PostgresInfraReader {
         let Some(row) = row else {
             return Ok(None);
         };
-        // A corrupt `endpoints_json` fails loud rather than reading as
-        // "endpoint not available", which would send the node chasing an
-        // endpoint that is really there. Only a name the object does not
-        // hold is the legitimate `None`.
+        // A corrupt column fails loud rather than reading as "endpoint
+        // not available", which would send the node chasing an endpoint
+        // that is really there. Only a name the object does not hold is
+        // the legitimate `None`.
         let endpoints: Value = row.try_get("endpoints_json")?;
-        endpoint_in(&endpoints, endpoint_name)
+        let Some(url) = entry_in(&endpoints, "endpoints_json", endpoint_name)? else {
+            return Ok(None);
+        };
+        let public_paths: Value = row.try_get("public_paths_json")?;
+        let public_url = match (&self.front_door, entry_in(&public_paths, "public_paths_json", endpoint_name)?) {
+            (Some(base), Some(path)) => Some(weft_core::infra::tenant_public_url(base, &path)),
+            _ => None,
+        };
+        Ok(Some(weft_core::infra::EndpointAddress { url, public_url }))
     }
 }
 
-/// One endpoint's URL out of an `endpoints_json` object.
-fn endpoint_in(endpoints: &Value, endpoint_name: &str) -> Result<Option<String>> {
-    let Some(map) = endpoints.as_object() else {
-        anyhow::bail!("infra_node.endpoints_json is not an object: {endpoints}");
+/// One endpoint's string out of an `infra_node` name-to-string column
+/// (`column` names it in the error).
+fn entry_in(map: &Value, column: &str, endpoint_name: &str) -> Result<Option<String>> {
+    let Some(map) = map.as_object() else {
+        anyhow::bail!("infra_node.{column} is not an object: {map}");
     };
     match map.get(endpoint_name) {
         None => Ok(None),
-        Some(Value::String(url)) => Ok(Some(url.clone())),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => {
-            anyhow::bail!("infra_node endpoint '{endpoint_name}' is not a URL string: {other}")
+            anyhow::bail!("infra_node.{column} entry '{endpoint_name}' is not a string: {other}")
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_in;
+    use super::entry_in;
     use serde_json::json;
 
     #[test]
     fn a_declared_endpoint_gives_its_url() {
         let endpoints = json!({ "http": "http://pg.ns.svc:5432" });
         assert_eq!(
-            endpoint_in(&endpoints, "http").unwrap().as_deref(),
+            entry_in(&endpoints, "endpoints_json", "http").unwrap().as_deref(),
             Some("http://pg.ns.svc:5432"),
         );
     }
 
     #[test]
     fn an_undeclared_endpoint_is_none() {
-        assert_eq!(endpoint_in(&json!({}), "http").unwrap(), None);
+        assert_eq!(entry_in(&json!({}), "endpoints_json", "http").unwrap(), None);
     }
 
     #[test]
     fn a_corrupt_endpoints_value_is_an_error() {
-        assert!(endpoint_in(&json!(["http"]), "http").is_err());
-        assert!(endpoint_in(&json!({ "http": 5432 }), "http").is_err());
+        assert!(entry_in(&json!(["http"]), "endpoints_json", "http").is_err());
+        assert!(entry_in(&json!({ "http": 5432 }), "endpoints_json", "http").is_err());
     }
 }

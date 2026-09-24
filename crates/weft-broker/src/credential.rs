@@ -22,7 +22,7 @@ pub struct KeyRequest {
     pub tenant: String,
     /// The opening execution, verified against the tenant by the handler.
     pub color: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate: a source that books
     /// anything against the granted credential later (a measured cost)

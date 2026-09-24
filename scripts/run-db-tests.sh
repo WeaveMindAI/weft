@@ -22,16 +22,14 @@
 #
 # Set DATABASE_URL yourself and the script uses that server instead of
 # starting a container, which is what CI does.
-# pipefail matters: the filtered branch pipes cargo through tee, and
-# without it the pipeline's exit code is tee's, so a failing filtered
-# run would report green.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
 
 # Every crate whose tests need a database. A new one goes here.
-CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store)
+ALL_CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store)
+CRATES=("${ALL_CRATES[@]}")
 
 only_crate="${1:-}"
 filter="${2:-}"
@@ -42,13 +40,18 @@ if [ "$#" -gt 3 ] || { [ -n "$test_target" ] && { [ -z "$only_crate" ] || [ -z "
 fi
 if [ -n "$only_crate" ]; then
   found=0
-  for c in "${CRATES[@]}"; do [ "$c" = "$only_crate" ] && found=1; done
+  for c in "${ALL_CRATES[@]}"; do [ "$c" = "$only_crate" ] && found=1; done
   if [ "$found" -eq 0 ]; then
-    echo "no db tests in '$only_crate'; it is one of: ${CRATES[*]}" >&2
+    echo "no db tests in '$only_crate'; it is one of: ${ALL_CRATES[*]}" >&2
     exit 1
   fi
   CRATES=("$only_crate")
 fi
+
+command -v cargo-nextest >/dev/null 2>&1 || {
+  echo "cargo-nextest is missing; install it with: cargo install cargo-nextest --locked" >&2
+  exit 1
+}
 
 if [ -z "${DATABASE_URL:-}" ]; then
   # shellcheck source=lib/throwaway-postgres.sh
@@ -63,43 +66,28 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 echo "running against $DATABASE_URL"
-# A plain string, not an array: expanding an empty array under `set -u`
-# is an error on the bash 3.2 macOS ships.
-failed=""
-for crate in "${CRATES[@]}"; do
-  echo
-  echo "=== $crate"
-  if [ -n "$filter" ]; then
-    crate_failed=0
-    cargo_args=(-p "$crate" --features db-tests)
-    if [ -n "$test_target" ]; then
-      cargo_args+=(--test "$test_target")
-    fi
-    out="$(cargo test "${cargo_args[@]}" -- "$filter" 2>&1 | tee /dev/stderr)" \
-      || crate_failed=1
-    # A filter that matches nothing "passes" with zero tests run, which
-    # would report green on a suite where nothing executed. Filters
-    # match TEST NAMES, not file names. Matched with a bash regex, not
-    # a grep pipe (`grep -q` closes the pipe on the first hit, and
-    # under pipefail the producer's SIGPIPE would read as a failure),
-    # held in a variable so no escaping is needed (portable to the
-    # bash 3.2 macOS ships). Checked only when the crate BUILT and
-    # PASSED: a compile error or a test failure must not also blame
-    # the filter.
-    ran_some='test result:.* [1-9][0-9]* passed'
-    if [ "$crate_failed" -eq 0 ] && [[ ! "$out" =~ $ran_some ]]; then
-      echo "the filter '$filter' matched no test in $crate (filters match test names, not files)" >&2
-      crate_failed=1
-    fi
-    [ "$crate_failed" -eq 1 ] && failed="$failed $crate"
-  else
-    cargo test -p "$crate" --features db-tests || failed="$failed $crate"
-  fi
+# Every crate in ONE nextest run: cargo builds them all at once, and
+# nextest runs every test of every test binary side by side (cargo test
+# runs the binaries one after another). Each test makes its own database,
+# so nothing they share needs them in order.
+# Every crate is BUILT every time, with the same features, and the crate,
+# file and name narrow only what RUNS: building one crate alone unifies
+# its dependencies' features differently, and cargo would rebuild them
+# each time a run switched between one crate and all of them.
+nextest_args=()
+for crate in "${ALL_CRATES[@]}"; do
+  nextest_args+=(-p "$crate" --features "$crate/db-tests")
 done
-
-echo
-if [ -n "$failed" ]; then
-  echo "FAILED:$failed" >&2
-  exit 1
-fi
-echo "all green"
+selection=""
+for crate in "${CRATES[@]}"; do
+  selection="${selection:+$selection | }package($crate)"
+done
+selection="($selection)"
+[ -n "$test_target" ] && selection="$selection & binary(=$test_target)"
+# A filter is a plain substring of TEST NAMES (`~`, nextest's contains
+# matcher), not a regex and not a file name. nextest refuses a run in
+# which no test matched, so a filter that selects nothing fails loudly
+# instead of reporting green on a suite where nothing executed.
+[ -n "$filter" ] && selection="$selection & test(~$filter)"
+nextest_args+=(-E "$selection")
+cargo nextest run --no-fail-fast "${nextest_args[@]}"

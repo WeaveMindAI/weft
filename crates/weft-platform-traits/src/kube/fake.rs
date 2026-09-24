@@ -1,7 +1,8 @@
 //! In-memory `KubeClient` for tests. Records every call, returns
 //! seeded state from `list_replica_state`. Tests inject the
 //! "current k8s state of the world" by calling `set_workloads`;
-//! the supervisor's loops then observe whatever is in there.
+//! the supervisor's loops then observe whatever is in there, and every
+//! open watch of that namespace is handed the new state.
 
 use std::collections::HashMap;
 use parking_lot::Mutex;
@@ -16,6 +17,10 @@ use super::{KubeReader, KubeWriter, WorkloadKind, WorkloadReplicaState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeCall {
     ListReplicaState {
+        namespace: String,
+        selector: String,
+    },
+    WatchReplicaState {
         namespace: String,
         selector: String,
     },
@@ -39,7 +44,7 @@ pub enum KubeCall {
     },
     DeleteNamed {
         namespace: String,
-        kind: String,
+        kind: super::NamedKind,
         name: String,
         opts: super::DeleteOpts,
     },
@@ -93,12 +98,47 @@ struct Inner {
     /// (awaits `pending()`). Lets tests exercise a hung-action path
     /// (e.g. the HealthProtocol action timeout). Sticky.
     hang_delete_pods: bool,
+    /// Open watches: the namespace, the selector's terms, and where
+    /// each new set goes. A watch whose holder dropped it is pruned on
+    /// the next send.
+    watches: Vec<OpenWatch>,
+    /// Namespaces whose new watches do not hand out the set as it is
+    /// now: a watch that has not answered yet. Sticky.
+    unanswered_namespaces: std::collections::HashSet<String>,
     /// Append-only call log.
     calls: Vec<KubeCall>,
 }
 
+/// One open watch: the namespace, the selector's terms, and where each
+/// new set goes.
+type OpenWatch = (String, Vec<(String, String)>, tokio::sync::mpsc::UnboundedSender<Result<Vec<WorkloadReplicaState>>>);
+
 pub struct FakeKube {
     inner: Mutex<Inner>,
+}
+
+impl Inner {
+    /// The workloads of `namespace` a selector's terms match.
+    fn matching(&self, namespace: &str, needles: &[(String, String)]) -> Vec<WorkloadReplicaState> {
+        self.workloads
+            .get(namespace)
+            .map(|ws| ws.iter().filter(|w| label_matches(&w.labels, needles)).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Hand every open watch of `namespace` its set as it is now.
+    fn send_to_watches(&mut self, namespace: &str) {
+        self.watches.retain(|(_, _, tx)| !tx.is_closed());
+        let sends: Vec<_> = self
+            .watches
+            .iter()
+            .filter(|(ns, _, _)| ns == namespace)
+            .map(|(ns, needles, tx)| (tx.clone(), self.matching(ns, needles)))
+            .collect();
+        for (tx, set) in sends {
+            let _ = tx.send(Ok(set));
+        }
+    }
 }
 
 impl FakeKube {
@@ -113,10 +153,33 @@ impl FakeKube {
     /// Replace the workload list for a namespace. The supervisor's
     /// next `list_replica_state` call returns this.
     pub fn set_workloads(&self, namespace: &str, workloads: Vec<WorkloadReplicaState>) {
-        self.inner
-            .lock()
-            .workloads
-            .insert(namespace.to_string(), workloads);
+        let mut inner = self.inner.lock();
+        inner.workloads.insert(namespace.to_string(), workloads);
+        inner.send_to_watches(namespace);
+    }
+
+    /// Watches of `namespace` started from now on stay silent until the
+    /// next `set_workloads` of it (they never hand out a first set).
+    pub fn leave_watches_unanswered(&self, namespace: &str) {
+        self.inner.lock().unanswered_namespaces.insert(namespace.to_string());
+    }
+
+    /// Hand every open watch of `namespace` a failed look.
+    pub fn fail_watches(&self, namespace: &str, error: &str) {
+        let mut inner = self.inner.lock();
+        inner.watches.retain(|(_, _, tx)| !tx.is_closed());
+        for (ns, _, tx) in &inner.watches {
+            if ns == namespace {
+                let _ = tx.send(Err(anyhow::anyhow!("{error}")));
+            }
+        }
+    }
+
+    /// How many watches are still held by somebody.
+    pub fn live_watches(&self) -> usize {
+        let mut inner = self.inner.lock();
+        inner.watches.retain(|(_, _, tx)| !tx.is_closed());
+        inner.watches.len()
     }
 
     /// Seed a container-waiting reason for a pod. The next
@@ -248,16 +311,27 @@ impl KubeReader for FakeKube {
         } else {
             parse_selector(selector)
         };
-        Ok(inner
-            .workloads
-            .get(namespace)
-            .map(|ws| {
-                ws.iter()
-                    .filter(|w| label_matches(&w.labels, &needles))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(inner.matching(namespace, &needles))
+    }
+
+    /// Hands out the set as it is now (unless the namespace was left
+    /// unanswered), then again on every
+    /// `set_workloads` of the namespace.
+    async fn watch_replica_state(&self, namespace: &str, selector: &str) -> Result<super::ReplicaWatch> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(KubeCall::WatchReplicaState {
+            namespace: namespace.to_string(),
+            selector: selector.to_string(),
+        });
+        let needles = if selector.is_empty() { Vec::new() } else { parse_selector(selector) };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if !inner.unanswered_namespaces.contains(namespace) {
+            let _ = tx.send(Ok(inner.matching(namespace, &needles)));
+        }
+        inner.watches.push((namespace.to_string(), needles, tx));
+        Ok(futures::StreamExt::boxed(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|set| (set, rx))
+        })))
     }
 
     async fn pod_waiting_reason(
@@ -440,27 +514,22 @@ impl KubeWriter for FakeKube {
     async fn delete_named(
         &self,
         namespace: &str,
-        kind: &str,
+        kind: super::NamedKind,
         name: &str,
         opts: super::DeleteOpts,
     ) -> Result<()> {
         let mut inner = self.inner.lock();
         inner.calls.push(KubeCall::DeleteNamed {
             namespace: namespace.to_string(),
-            kind: kind.to_string(),
+            kind,
             name: name.to_string(),
             opts,
         });
         // Mirror onto the workload list when applicable: Deployment
         // delete removes the row.
-        let kind_matches = match kind {
-            "deployment" | "Deployment" => Some(WorkloadKind::Deployment),
-            "statefulset" | "StatefulSet" => Some(WorkloadKind::StatefulSet),
-            _ => None,
-        };
-        if let Some(wk) = kind_matches {
+        if kind == super::NamedKind::Deployment {
             if let Some(ws) = inner.workloads.get_mut(namespace) {
-                ws.retain(|w| !(w.name == name && w.kind == wk));
+                ws.retain(|w| !(w.name == name && w.kind == WorkloadKind::Deployment));
             }
         }
         Ok(())

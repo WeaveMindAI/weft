@@ -7,6 +7,9 @@ repository.workspace = true
 
 [dependencies]
 weft-core = { workspace = true }
+# The process's signal watch, which a journal read waiting for new rows
+# sleeps on (`PostgresJournalClient::raw_rows_after`).
+weft-task-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

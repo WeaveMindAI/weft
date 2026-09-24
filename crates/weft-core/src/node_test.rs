@@ -713,6 +713,10 @@ struct FakeState {
     /// by endpoint name. Declared by `endpoint`; an undeclared name
     /// fails the way an unprovisioned one does in a real run.
     endpoints: Mutex<BTreeMap<String, String>>,
+    /// The outside address of a declared endpoint, by endpoint name.
+    /// Declared by `declare_public_url`; absent reads as an endpoint
+    /// that is not public.
+    public_urls: Mutex<BTreeMap<String, String>>,
     /// Canned answers, keyed by WHICH endpoint was called as well as
     /// the method and path, and popped in order.
     ///
@@ -798,6 +802,7 @@ impl FakeState {
             execution_tags: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
             endpoints: Mutex::new(BTreeMap::new()),
+            public_urls: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
             endpoint_calls: Mutex::new(Vec::new()),
             journal: Mutex::new(BTreeMap::new()),
@@ -1044,6 +1049,17 @@ impl FakeRig {
         endpoints.insert(name.to_string(), url.to_string());
     }
 
+    /// Declare that the endpoint `name` (already declared with
+    /// `declare_endpoint`) is public and reached from outside at `url`:
+    /// what `ctx.endpoint(name)?.public_url()` answers.
+    pub fn declare_public_url(&self, name: &str, url: &str) {
+        assert!(
+            self.state.endpoints.lock().unwrap().contains_key(name),
+            "declare endpoint '{name}' with declare_endpoint before giving it a public url"
+        );
+        self.state.public_urls.lock().unwrap().insert(name.to_string(), url.to_string());
+    }
+
     /// Declare what the NEXT call to `path` on the `endpoint` endpoint
     /// answers. Call it once per expected call, in order.
     ///
@@ -1162,7 +1178,7 @@ impl FakeRig {
             Err(e) => return RunOutcome { result: Err(e), ..empty() },
         };
         let ictx = crate::infra::InfraProvisionContext::new(
-            "node-test-project".to_string(),
+            uuid::Uuid::new_v4(),
             NODE_UNDER_TEST_ID.to_string(),
             "wft-project-node-test".to_string(),
             "node-test".to_string(),
@@ -1545,7 +1561,7 @@ fn test_context(
 ) -> ExecutionContext {
     ExecutionContext::new(
         format!("node-test-{}", uuid::Uuid::new_v4().simple()),
-        "node-test".to_string(),
+        uuid::Uuid::new_v4(),
         NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
@@ -1881,14 +1897,16 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
-    async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
-        self.state.endpoints.lock().unwrap().get(name).cloned().ok_or_else(|| {
+    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress> {
+        let url = self.state.endpoints.lock().unwrap().get(name).cloned().ok_or_else(|| {
             WeftError::Config(format!(
                 "the node asked for its '{name}' endpoint but the test declared no address \
                  for it; declare one with rig.declare_endpoint(\"{name}\", \"http://..\") \
                  before rig.run(..)"
             ))
-        })
+        })?;
+        let public_url = self.state.public_urls.lock().unwrap().get(name).cloned();
+        Ok(crate::infra::EndpointAddress { url, public_url })
     }
 
     async fn endpoint_call(
@@ -2684,8 +2702,8 @@ impl ContextHandle for CapturingHandle {
         self.inner.register_signal(spec, port_snapshot).await
     }
 
-    async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
-        self.inner.endpoint_url(name).await
+    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress> {
+        self.inner.endpoint_address(name).await
     }
 
     async fn endpoint_call(

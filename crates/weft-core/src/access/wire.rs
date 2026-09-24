@@ -92,7 +92,7 @@ pub struct GrantSummary {
     /// The owning project for a `coexisting`-class grant; `None` for an
     /// `exclusive`-class shared grant (every project referencing it
     /// follows its rotations).
-    pub project_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
     pub identity: Option<String>,
     /// The connection list's middle column: the app's label, or the
     /// name the user typed for a pasted credential. `None` only for
@@ -187,7 +187,7 @@ pub struct ConnectDirect {
     /// The connecting project (grants are per-project by default; an
     /// exclusive-class OAuth grant ignores it, but direct connects are
     /// per-paste anyway).
-    pub project_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
 }
 
 fn own_door() -> Door {
@@ -253,7 +253,7 @@ pub struct BeginOAuth {
     /// the chosen app's fixed `covers` on the shared door (overwritten
     /// by the broker; nothing the client sent survives there).
     pub permissions: Vec<String>,
-    pub project_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
     /// Upgrade/rotate this existing exclusive-class grant in place
     /// instead of minting a new row.
     pub upgrade_grant_id: Option<uuid::Uuid>,
@@ -348,7 +348,7 @@ mod wire_tests {
             door: Door::Own,
             registration: None,
             permissions: vec![],
-            project_id: Some("p".into()),
+            project_id: Some(uuid::Uuid::nil()),
             upgrade_grant_id: None,
             redirect_uri: String::new(),
         };
@@ -411,7 +411,7 @@ mod wire_tests {
                 permissions: vec!["read".into()],
                 registration: Some(reg.clone()),
                 paste: true,
-                project_id: Some("p1".into()),
+                project_id: Some(uuid::Uuid::nil()),
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
@@ -422,7 +422,7 @@ mod wire_tests {
         assert_eq!(back.inner.label.as_deref(), Some("named"));
         assert_eq!(back.inner.permissions, vec!["read"]);
         assert!(back.inner.paste);
-        assert_eq!(back.inner.project_id.as_deref(), Some("p1"));
+        assert_eq!(back.inner.project_id, Some(uuid::Uuid::nil()));
         let breg = back.inner.registration.expect("registration survives");
         assert_eq!(breg.client_id, "cid");
         assert_eq!(breg.client_secret.as_deref(), Some("sec"));

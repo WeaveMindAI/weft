@@ -133,7 +133,7 @@ async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyho
     // the panic had left the execution's state behind, this is where it
     // shows: a cancel flag and a live config for a dead colour, and a
     // worker that refuses to retire.
-    let platform = weft_e2e::platform::Platform::connect().await?;
+    let platform = weft_e2e::platform::Platform::connect(&disp).await?;
     let pid = project.id();
     let before = platform.execution_owner(&settled.color).await?
         .ok_or_else(|| anyhow::anyhow!("the panicking run has no recorded worker owner"))?;

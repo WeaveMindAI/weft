@@ -44,6 +44,10 @@ use weft_journal::{ExecEvent, JournalClient};
 use weft_task_store::tasks as task_store;
 use weft_task_store::{InfraReader, TaskKind, TaskStoreClient};
 
+/// How often a run that `stop_tagged` reached warns while it waits for
+/// its own stop to land.
+const SELF_STOP_BREADCRUMB: Duration = Duration::from_secs(60);
+
 /// Serialize a frame stack into the canonical string used in task dedup keys.
 /// One definition so the side-effect-task and register-signal-task
 /// dedup keys can't drift, and so a serialization failure is surfaced
@@ -166,13 +170,14 @@ pub trait ExecutionSteeringClient: Send + Sync {
         pod_name: &str,
     ) -> anyhow::Result<()>;
     /// Queue a stop of every live sibling of `color` carrying `tag`.
+    /// `true` when the stop reaches `color` itself.
     async fn stop_tagged(
         &self,
         color: Color,
         tag: String,
         stop_self: weft_core::StopSelf,
         pod_name: &str,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -192,11 +197,12 @@ impl ExecutionSteeringClient for weft_broker_client::BrokerExecutionClient {
         tag: String,
         stop_self: weft_core::StopSelf,
         pod_name: &str,
-    ) -> anyhow::Result<()> {
-        <weft_broker_client::BrokerExecutionClient>::stop_tagged(
+    ) -> anyhow::Result<bool> {
+        Ok(<weft_broker_client::BrokerExecutionClient>::stop_tagged(
             self, color, tag, stop_self, pod_name,
         )
-        .await
+        .await?
+        .stops_asker)
     }
 }
 
@@ -216,7 +222,7 @@ pub trait ProjectClient: Send + Sync {
     /// either has a row or it doesn't.
     async fn fetch_definition(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         expected_hash: &str,
     ) -> anyhow::Result<Option<weft_core::ProjectDefinition>>;
 }
@@ -225,7 +231,7 @@ pub trait ProjectClient: Send + Sync {
 impl ProjectClient for weft_broker_client::BrokerProjectClient {
     async fn fetch_definition(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         expected_hash: &str,
     ) -> anyhow::Result<Option<weft_core::ProjectDefinition>> {
         // Inherent method on the concrete type, called via
@@ -249,8 +255,8 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 /// broker-backed HTTP client.
 ///
 /// The trait has two operations: `enqueue_apply` (ship a fresh spec
-/// to the supervisor) and `wait_apply` (poll the resulting command
-/// row to terminal). The supervisor owns every other concern
+/// to the supervisor) and `wait_apply` (wait on the resulting command
+/// row until it is terminal). The supervisor owns every other concern
 /// end-to-end: read prior `infra_node`, compile + hash, decide
 /// skip / fresh / replace, run kubectl, update the row. The worker
 /// just hands off the spec and waits.
@@ -258,15 +264,17 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 pub trait InfraStateClient: Send + Sync {
     async fn enqueue_apply(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         spec_json: serde_json::Value,
     ) -> anyhow::Result<i64>;
 
+    /// The command's state, once it completed or `wait` passed.
     async fn wait_apply(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         command_id: i64,
+        wait: Duration,
     ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse>;
 }
 
@@ -274,7 +282,7 @@ pub trait InfraStateClient: Send + Sync {
 impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
     async fn enqueue_apply(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node_id: &str,
         spec_json: serde_json::Value,
     ) -> anyhow::Result<i64> {
@@ -282,10 +290,11 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
     }
     async fn wait_apply(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         command_id: i64,
+        wait: Duration,
     ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
-        self.wait_apply(project_id, command_id).await
+        self.wait_apply(project_id, command_id, wait).await
     }
 }
 
@@ -1164,10 +1173,11 @@ pub enum EmitKind {
 /// Round-trip timeout for control-plane tasks. Generous because
 /// some involve listener spawn + Pod readiness wait.
 pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
-/// How often an infrastructure apply's command row is read while the
-/// supervisor works on it. The apply itself takes seconds to minutes,
-/// so the reading cadence adds nothing a person notices.
-const INFRA_APPLY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long one wait on an infrastructure apply lasts before the worker
+/// leaves a breadcrumb and waits again. The apply has no deadline (it
+/// can take minutes, or hours behind a slow pull); this only paces how
+/// often a still-running one says so.
+const INFRA_APPLY_REPORT_EVERY: Duration = Duration::from_secs(30);
 
 /// The runtime output-type gate: a node may only emit on a port a value
 /// its declared type accepts (`WeftType::accepts_runtime_value`: a
@@ -1238,15 +1248,13 @@ impl JournalClient for PoisonOnWriteFailure {
         r
     }
 
-    async fn events_for_color(
+    async fn raw_rows_after(
         &self,
         color: Color,
-    ) -> anyhow::Result<Vec<ExecEvent>> {
-        self.inner.events_for_color(color).await
-    }
-
-    async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
-        self.inner.raw_events_for_color(color).await
+        after_id: i64,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
+        self.inner.raw_rows_after(color, after_id, wait).await
     }
 
     async fn has_terminal_event(&self, color: Color) -> anyhow::Result<bool> {
@@ -1267,7 +1275,7 @@ struct PortClaims {
 
 pub struct RunnerHandle {
     execution_id: String,
-    project_id: String,
+    project_id: uuid::Uuid,
     color: Color,
     node_id: String,
     /// The PLACE this firing runs at, spelled the way a person writes
@@ -1431,7 +1439,7 @@ impl RunnerHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: String,
-        project_id: String,
+        project_id: uuid::Uuid,
         color: Color,
         node_id: String,
         place: String,
@@ -1605,12 +1613,13 @@ impl RunnerHandle {
             WeftError::Config(format!("{dedup_prefix} payload: {e}"))
         })?;
         let dedup_key = self.side_effect_dedup_key(dedup_prefix, seq)?;
+        let project_id = self.project_id;
         self.clients
             .tasks
             .enqueue_dedup(weft_task_store::NewTask {
                 kind: kind.into(),
                 target: weft_task_store::TaskTarget::Dispatcher,
-                project_id: Some(self.project_id.clone()),
+                project_id: Some(project_id),
                 dedup_key: Some(dedup_key),
                 color: Some(self.color.to_string()),
                 tenant_id: Some(self.tenant_id.clone()),
@@ -2305,16 +2314,16 @@ impl ContextHandle for RunnerHandle {
         self.clients.storage.public_link(self.color, key, ttl_secs, reach).await
     }
 
-    async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
+    async fn endpoint_address(&self, name: &str) -> WeftResult<weft_core::infra::EndpointAddress> {
         // By place (see `name`): the instance provisioned for THIS call
         // of the file, never another call's.
         let endpoint = self
             .clients
             .infra
-            .endpoint_url(&self.project_id, &self.place, name)
+            .endpoint_address(self.project_id, &self.place, name)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
-        let url = endpoint.ok_or_else(|| {
+        let address = endpoint.ok_or_else(|| {
             WeftError::Config(format!(
                 "endpoint '{}' for node '{}' is not available; either the infra isn't running \
                  or the endpoint name is not declared. Check `weft infra status` and the node's \
@@ -2322,8 +2331,8 @@ impl ContextHandle for RunnerHandle {
                 name, self.place
             ))
         })?;
-        self.wait_until_routable_logging(&url, &format!("endpoint '{name}'")).await?;
-        Ok(url)
+        self.wait_until_routable_logging(&address.url, &format!("endpoint '{name}'")).await?;
+        Ok(address)
     }
 
     async fn endpoint_call(
@@ -2522,7 +2531,7 @@ impl ContextHandle for RunnerHandle {
             tasks: self.clients.tasks.clone(),
             pending: self.clients.pending_costs.clone(),
             open_charges: self.clients.open_charges.clone(),
-            project_id: self.project_id.clone(),
+            project_id: self.project_id,
             tenant_id: self.tenant_id.clone(),
             color: self.color,
             node_id: self.node_id.clone(),
@@ -2595,12 +2604,37 @@ impl ContextHandle for RunnerHandle {
     /// Queues the stop through the broker, which anchors the ordering
     /// at this instant. Re-running it after a crash asks again for the
     /// same set (anything it already stopped is terminal and skipped).
+    /// A stop that reaches this run too never returns: the body waits
+    /// for its own cancel, which the dispatcher carries out a moment
+    /// later, so nothing after the stop runs. While it waits, a warning
+    /// every [`SELF_STOP_BREADCRUMB`] says so, so a stop that never
+    /// lands reads as stuck in the logs (`weft stop` ends it).
     async fn stop_tagged(&self, tag: String, stop_self: weft_core::StopSelf) -> WeftResult<()> {
-        self.clients
+        let stops_self = self
+            .clients
             .steering
             .stop_tagged(self.color, tag, stop_self, &self.pod_name)
             .await
-            .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))
+            .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))?;
+        if !stops_self {
+            return Ok(());
+        }
+        let cancelled = self.cancellation.cancelled_err();
+        tokio::pin!(cancelled);
+        let mut breadcrumb = tokio::time::interval(SELF_STOP_BREADCRUMB);
+        breadcrumb.tick().await;
+        loop {
+            tokio::select! {
+                err = &mut cancelled => return Err(err),
+                _ = breadcrumb.tick() => tracing::warn!(
+                    target: "weft_engine::context",
+                    color = %self.color,
+                    node = %self.node_id,
+                    "stop_tagged reached this run, which is waiting for its own stop to land; \
+                     if it never does, `weft stop` ends the run"
+                ),
+            }
+        }
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -3093,7 +3127,7 @@ mod replay_tests {
         };
         RunnerHandle::new(
             "exec-1".into(),
-            "00000000-0000-0000-0000-000000000000".into(),
+            uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             "node-x".into(),
             "node-x".into(),
@@ -3163,7 +3197,7 @@ mod replay_tests {
         };
         RunnerHandle::new(
             "exec-1".into(),
-            "00000000-0000-0000-0000-000000000000".into(),
+            uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             "node-x".into(),
             "node-x".into(),
@@ -3192,7 +3226,7 @@ mod replay_tests {
     fn ctx_over_arc(handle: Arc<RunnerHandle>) -> weft_core::ExecutionContext {
         weft_core::ExecutionContext::new(
             "exec-1".into(),
-            "00000000-0000-0000-0000-000000000000".into(),
+            uuid::Uuid::nil(),
             "node-x".into(),
             "TestNode".into(),
             None,
@@ -3429,7 +3463,7 @@ mod replay_tests {
         let color = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
             color.to_string(),
-            "project-1".into(),
+            uuid::Uuid::from_u128(0x108),
             color,
             "node-x".into(),
             "node-x".into(),
@@ -3470,7 +3504,7 @@ mod replay_tests {
             test_catalog(),
             "test-pod-1".into(),
             "tenant-1".into(),
-            "project-1".into(),
+            uuid::Uuid::from_u128(0x108),
             Some(color),
         );
         let rig = runner.rig("id-1", "openrouter");
@@ -3649,7 +3683,7 @@ mod replay_tests {
             _: String,
             _: weft_core::StopSelf,
             _: &str,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<bool> {
             unreachable!("these tests steer no executions")
         }
     }
@@ -3674,6 +3708,7 @@ mod replay_tests {
             &self,
             _pod_id: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
+            _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
@@ -3711,12 +3746,12 @@ mod replay_tests {
     struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_url(
+        async fn endpoint_address(
             &self,
-            _project_id: &str,
+            _project_id: uuid::Uuid,
             _node_id: &str,
             _endpoint_name: &str,
-        ) -> anyhow::Result<Option<String>> {
+        ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
             Ok(None)
         }
     }
@@ -3726,7 +3761,7 @@ mod replay_tests {
     impl InfraStateClient for NoopInfraState {
         async fn enqueue_apply(
             &self,
-            _project_id: &str,
+            _project_id: uuid::Uuid,
             _node_id: &str,
             _spec_json: serde_json::Value,
         ) -> anyhow::Result<i64> {
@@ -3734,8 +3769,9 @@ mod replay_tests {
         }
         async fn wait_apply(
             &self,
-            _project_id: &str,
+            _project_id: uuid::Uuid,
             _command_id: i64,
+            _wait: Duration,
         ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,
@@ -3770,7 +3806,7 @@ mod replay_tests {
     impl crate::context::ProjectClient for NoopProject {
         async fn fetch_definition(
             &self,
-            _project_id: &str,
+            _project_id: uuid::Uuid,
             _expected_hash: &str,
         ) -> anyhow::Result<Option<weft_core::ProjectDefinition>> {
             // Replay tests don't take this path (they exercise
@@ -3993,8 +4029,8 @@ mod replay_tests {
 /// skip/fresh/replace. The supervisor owns all of those: it reads
 /// the prior `infra_node` row, compiles the new spec with the real
 /// image-tag map + instance id (fresh-mint or reused), hashes,
-/// makes the decision, and executes. The worker just polls the
-/// command row for terminal state.
+/// makes the decision, and executes. The worker just waits on the
+/// command row until it is terminal.
 ///
 /// This is a single round-trip from the engine's perspective:
 /// "supervisor, please apply this spec; tell me when you're done."
@@ -4003,7 +4039,7 @@ mod replay_tests {
 pub async fn apply_via_supervisor(
     infra_state: &dyn InfraStateClient,
     clock: &dyn weft_platform_traits::Clock,
-    project_id: &str,
+    project_id: uuid::Uuid,
     place: &str,
     spec: &weft_core::infra::InfraSpec,
 ) -> anyhow::Result<()> {
@@ -4016,9 +4052,8 @@ pub async fn apply_via_supervisor(
         .enqueue_apply(project_id, place, spec_json)
         .await?;
     let started = clock.now();
-    let mut next_report = started + Duration::from_secs(30);
     loop {
-        let resp = infra_state.wait_apply(project_id, cmd_id).await?;
+        let resp = infra_state.wait_apply(project_id, cmd_id, INFRA_APPLY_REPORT_EVERY).await?;
         if resp.completed {
             use weft_broker_client::protocol::LifecycleOutcome;
             match resp.outcome {
@@ -4031,7 +4066,7 @@ pub async fn apply_via_supervisor(
                     let reason = resp.outcome_message.as_deref().unwrap_or("cancelled");
                     tracing::info!(
                         target: "weft_engine::context",
-                        project_id,
+                        %project_id,
                         node = place,
                         reason,
                         "supervisor apply cancelled; no longer applicable"
@@ -4053,15 +4088,11 @@ pub async fn apply_via_supervisor(
                 }
             }
         }
-        if clock.now() >= next_report {
-            tracing::info!(
-                project_id, node = place, command_id = cmd_id,
-                elapsed_secs = clock.now().duration_since(started).as_secs(),
-                "infrastructure apply is still running; inspect it with `weft infra status`"
-            );
-            next_report = clock.now() + Duration::from_secs(30);
-        }
-        clock.sleep(INFRA_APPLY_POLL_INTERVAL).await;
+        tracing::info!(
+            %project_id, node = place, command_id = cmd_id,
+            elapsed_secs = clock.now().duration_since(started).as_secs(),
+            "infrastructure apply is still running; inspect it with `weft infra status`"
+        );
     }
 }
 
@@ -4079,11 +4110,12 @@ mod infra_apply_tests {
 
     #[async_trait]
     impl InfraStateClient for ApplyState {
-        async fn enqueue_apply(&self, _: &str, _: &str, _: Value) -> anyhow::Result<i64> {
+        async fn enqueue_apply(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<i64> {
             Ok(42)
         }
-        async fn wait_apply(&self, _: &str, id: i64) -> anyhow::Result<InfraWaitApplyResponse> {
+        async fn wait_apply(&self, _: uuid::Uuid, id: i64, wait: Duration) -> anyhow::Result<InfraWaitApplyResponse> {
             assert_eq!(id, 42);
+            assert_eq!(wait, INFRA_APPLY_REPORT_EVERY);
             self.clock.advance(Duration::from_secs(3600));
             Ok(self.responses.lock().unwrap().pop_front().expect("unexpected extra poll"))
         }
@@ -4097,7 +4129,7 @@ mod infra_apply_tests {
             InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
         ])) };
-        apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap();
+        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", &Default::default()).await.unwrap();
         assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
         assert!(state.responses.lock().unwrap().is_empty());
     }
@@ -4108,7 +4140,7 @@ mod infra_apply_tests {
         let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
         ])) };
-        let error = apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap_err();
+        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", &Default::default()).await.unwrap_err();
         assert!(error.to_string().contains("image cannot start"));
     }
 }
@@ -4157,10 +4189,14 @@ mod test_journal {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        async fn events_for_color(&self, _color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-            Ok(Vec::new())
-        }
-        async fn raw_events_for_color(&self, _color: Color) -> anyhow::Result<Vec<String>> {
+        /// Captures are for asserting writes; nothing reads them back.
+        async fn raw_rows_after(
+            &self,
+            _color: Color,
+            _after_id: i64,
+            wait: Duration,
+        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
+            tokio::time::sleep(wait).await;
             Ok(Vec::new())
         }
         async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {

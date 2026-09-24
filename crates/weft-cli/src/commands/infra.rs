@@ -406,15 +406,20 @@ async fn wait_for_command(
     command_id: i64,
     verb: &str,
 ) -> Result<()> {
-    let interval = std::time::Duration::from_millis(500);
     let breadcrumb_every = std::time::Duration::from_secs(10);
     let start = std::time::Instant::now();
     let mut next_breadcrumb = start + breadcrumb_every;
     loop {
+        // Held by the dispatcher until the command completes or the hold
+        // runs out (at most `COMMAND_HOLD`), so the loop asks again at
+        // once either way.
         let resp: serde_json::Value = client
-            .get_json(&format!("/projects/{project_id}/infra/commands/{command_id}"))
+            .get_json(&format!(
+                "/projects/{project_id}/infra/commands/{command_id}?wait_ms={}",
+                COMMAND_HOLD.as_millis()
+            ))
             .await
-            .with_context(|| format!("polling infra {verb} command {command_id}"))?;
+            .with_context(|| format!("waiting on infra {verb} command {command_id}"))?;
         // No `unwrap_or` on the contract fields: a missing `done` must
         // NOT be silently read as "not done" (now an UNBOUNDED wait, it
         // would loop forever), and a missing `outcome` must not be read
@@ -453,9 +458,13 @@ async fn wait_for_command(
             progress.infra_wait(verb, (now - start).as_secs());
             next_breadcrumb = now + breadcrumb_every;
         }
-        tokio::time::sleep(interval).await;
     }
 }
+
+/// How long one wait on an infra command is held by the dispatcher
+/// before the CLI asks again: short enough that the breadcrumb above
+/// keeps its pace.
+const COMMAND_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `weft infra logs [node]`: the infra containers' own output, which is
 /// where a service says what went wrong when it went wrong. The pods
@@ -578,6 +587,15 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("(no endpoint)");
         println!("  {node} [{status}] -> {url}");
+        // A public endpoint's outside address: what to hand to whoever
+        // calls in (the node declared only its own path).
+        if let Some(public) = n.get("public_urls").and_then(|v| v.as_object()) {
+            for (endpoint, address) in public {
+                if let Some(address) = address.as_str() {
+                    println!("    {endpoint} is public at {address}");
+                }
+            }
+        }
     }
 }
 
@@ -655,6 +673,7 @@ async fn build_infra_images(
                 &img.context_dir,
                 &[label],
                 None,
+                &[],
             )
             .await?;
             progress.build_done(&tag);

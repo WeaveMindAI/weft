@@ -648,16 +648,17 @@ mod tests {
         let obs = |q: &str| ELEVENLABS.observe_session(REALTIME_STT, q).unwrap();
         let base = {
             let mut o = obs("");
-            o.on_frame_to_provider(&chunk(32_000 * 3600));
+            o.on_frame_to_provider(&chunk(32_000 * 60));
             o.accrued_usd()
         };
-        assert!((base - 0.39).abs() < 1e-9);
+        // One minute of audio, at the hourly rates.
+        assert!((base - 0.39 / 60.0).abs() < 1e-9);
         let with_addons = {
             let mut o = obs("entity_detection=true&keyterms=alpha");
-            o.on_frame_to_provider(&chunk(32_000 * 3600));
+            o.on_frame_to_provider(&chunk(32_000 * 60));
             o.accrued_usd()
         };
-        assert!((with_addons - 0.51).abs() < 1e-9);
+        assert!((with_addons - 0.51 / 60.0).abs() < 1e-9);
         // The slice pre-carves one minute at the dearest possible rate.
         let slice = ELEVENLABS.session_slice_usd(REALTIME_STT).unwrap();
         assert!((slice - 0.51 / 60.0).abs() < 1e-9);

@@ -449,6 +449,7 @@ mod tests {
             &self,
             _pod_id: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
+            _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
@@ -594,7 +595,7 @@ mod tests {
             tasks,
             pending,
             open_charges: crate::metering::OpenCharges::new(),
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
             color: uuid::Uuid::nil(),
             node_id: "node-x".into(),

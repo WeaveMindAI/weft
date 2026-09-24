@@ -1,13 +1,15 @@
-//! Per-tenant infra supervisor pod entry point.
+//! Pooled infra supervisor pod entry point. One pod serves the
+//! namespaced projects of every tenant whose infra it owns.
 //!
-//! Discovers projects via the broker, polls k8s API for replica
-//! state, evaluates health protocols, and executes
-//! `infra_lifecycle_command` rows (apply / stop / terminate).
+//! Claims and renews project ownership through the broker, watches the
+//! owned projects' workloads for replica state, evaluates health
+//! protocols, and executes `infra_lifecycle_command` rows (apply /
+//! stop / terminate).
 //!
 //! The binary is thin: it parses args, constructs a
 //! `SupervisorState` from production trait impls, and spawns the
-//! two loops. Everything testable lives in the library
-//! (`src/lib.rs`).
+//! three loops (ownership, lifecycle, health). Everything testable
+//! lives in the library (`src/lib.rs`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,10 +40,14 @@ struct Args {
     /// projects.
     #[arg(long, env = "WEFT_POD_NAME")]
     pod_name: String,
-    /// How often to poll for new projects, lifecycle commands, and
-    /// health changes.
-    #[arg(long, default_value_t = 5)]
-    poll_interval_seconds: u64,
+    /// How often to renew this pod's project leases and claim more, in
+    /// real time (it runs at this install's pace, `weft_core::time_scale`).
+    /// Keep it well under the lease (`infra_owner_lease_secs`, 45s).
+    #[arg(long, default_value_t = 15)]
+    ownership_interval_seconds: u64,
+    /// How often to look at every owned project's health, in real time.
+    #[arg(long, default_value_t = 30)]
+    health_interval_seconds: u64,
 }
 
 #[tokio::main]
@@ -55,6 +61,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    weft_core::time_scale::announce();
+    let install = weft_core::infra::Instance::from_env()
+        .map_err(anyhow::Error::msg)
+        .context("reading this supervisor's install")?;
     tracing::info!(
         pod = %args.pod_name,
         "weft-infra-supervisor starting (pooled, all-tenant)"
@@ -70,31 +80,41 @@ async fn main() -> Result<()> {
         pod_name: args.pod_name.clone(),
         kube: kube_client,
         clock: SystemClock::new(),
-        poll_interval: Duration::from_secs(args.poll_interval_seconds),
+        ownership_interval: weft_core::time_scale::scaled(Duration::from_secs(
+            args.ownership_interval_seconds,
+        )),
+        health_interval: weft_core::time_scale::scaled(Duration::from_secs(
+            args.health_interval_seconds,
+        )),
         health: Arc::new(tokio::sync::Mutex::new(health::HealthRegistry::default())),
         mem_pressure: weft_platform_traits::mem_pressure::CgroupMemPressure::new(),
+        ownership_wanted: Arc::new(tokio::sync::Notify::new()),
+        install,
     };
 
     // Ownership loop: the single site that claims + renews this pod's
     // exclusive project leases. Must run for the lifecycle/health loops
     // to have anything to act on (they read only owned projects).
+    // What each ownership tick changed reaches both work loops here.
+    let (lifecycle_changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
+    let (health_changes, health_ownership_changed) = tokio::sync::mpsc::unbounded_channel();
     let ownership_state = supervisor.clone();
     let ownership_handle = tokio::spawn(async move {
-        if let Err(e) = ownership::run_loop(ownership_state).await {
+        if let Err(e) = ownership::run_loop(ownership_state, vec![lifecycle_changes, health_changes]).await {
             tracing::error!(error = %e, "ownership loop exited");
         }
     });
 
     let lifecycle_state = supervisor.clone();
     let lifecycle_handle = tokio::spawn(async move {
-        if let Err(e) = lifecycle::run_loop(lifecycle_state).await {
+        if let Err(e) = lifecycle::run_loop(lifecycle_state, ownership_changed).await {
             tracing::error!(error = %e, "lifecycle loop exited");
         }
     });
 
     let health_state = supervisor.clone();
     let health_handle = tokio::spawn(async move {
-        if let Err(e) = health::run_loop(health_state).await {
+        if let Err(e) = health::run_loop(health_state, health_ownership_changed).await {
             tracing::error!(error = %e, "health loop exited");
         }
     });

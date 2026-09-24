@@ -686,6 +686,18 @@ pub struct Endpoint {
     pub expose: Expose,
 }
 
+/// Where one declared endpoint of a running infra node answers: what
+/// `ctx.endpoint(name)` resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointAddress {
+    /// The cluster-internal URL, for the project's own workers.
+    pub url: String,
+    /// The full address a caller outside the cluster uses, for an
+    /// [`Expose::TenantPublic`] endpoint on an install that has a
+    /// front-door address; `None` for every other endpoint.
+    pub public_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Expose {
@@ -693,8 +705,12 @@ pub enum Expose {
     /// other infra nodes that have egress allowed).
     #[default]
     ClusterInternal,
-    /// ClusterIP + Ingress at `<tenant-host>/<path>`. IP-level
-    /// restriction comes from `NetworkAccess.ingress` (e.g. FromCidrs).
+    /// ClusterIP + an HTTPRoute on the front door (the Envoy Gateway's
+    /// `local` listener), served at `/infra/<namespace>/<instance>/<path>`
+    /// and rewritten to `<path>` on the way in. Only the default install
+    /// serves it: a named install has no door on that listener, so its
+    /// compile refuses this. IP-level restriction comes from
+    /// `NetworkAccess.ingress` (e.g. FromCidrs).
     TenantPublic { path: String },
     /// Open to the network the cluster runs on. This IS the door:
     /// saying it here compiles to a NodePort Service plus the one
@@ -721,7 +737,7 @@ pub enum Expose {
     /// compiles to admits the port by address and no address rule can
     /// tell one pod from another (see `compile_network_policy`). Never
     /// the internet: no `Expose` reaches that except `TenantPublic`,
-    /// which is HTTP and goes through the ingress.
+    /// which is HTTP and goes through the front door.
     SameNetwork,
 }
 
@@ -947,7 +963,7 @@ fn default_stabilization_seconds() -> u32 { 60 }
 /// passed to `execute` post-apply.
 #[derive(Debug, Clone)]
 pub struct InfraProvisionContext {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// The node being provisioned, spelled the way the program writes
     /// it (`db`, or `one.db` inside the file the site `one` includes).
     /// One per INSTANCE: a file included twice provisions its infra
@@ -961,7 +977,7 @@ pub struct InfraProvisionContext {
 
 impl InfraProvisionContext {
     pub fn new(
-        project_id: String,
+        project_id: uuid::Uuid,
         node: String,
         namespace: String,
         tenant_id: String,
@@ -1074,12 +1090,12 @@ mod tests {
     #[test]
     fn provision_context_construction() {
         let ctx = InfraProvisionContext::new(
-            "proj".into(),
+            uuid::Uuid::nil(),
             "node".into(),
             "wft-project-x-y".into(),
             "x".into(),
         );
-        assert_eq!(ctx.project_id, "proj");
+        assert_eq!(ctx.project_id, uuid::Uuid::nil());
         assert_eq!(ctx.node, "node");
         assert_eq!(ctx.namespace, "wft-project-x-y");
         assert_eq!(ctx.tenant_id, "x");

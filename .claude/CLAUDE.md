@@ -56,7 +56,11 @@ The [test scope] of a change is the smallest set of tests that the changed lines
 
 Deriving it: name the unit you edited (a crate, a package, a module), then each unit that depends on the thing you changed. That list is the [test scope]. While iterating, run one test by name; when done, run the unit. Every test runner takes a narrowing argument (a crate, a package, a test name); find it and use it.
 
-Never outside it: no whole-workspace run, no runner invoked bare, no integration or end-to-end suite, no install or deploy script, no re-running a suite that already passed on the same code. The one exception is a change that is genuinely global (a shared context type, a code generator, a type every unit serializes), and even then say so before running. CI runs everything; you do not.
+Never outside it: no whole-workspace run, no runner invoked bare, no re-running a suite that already passed on the same code. The one exception is a change that is genuinely global (a shared context type, a code generator, a type every unit serializes), and even then say so before running. CI runs everything; you do not.
+
+**An agent you dispatch obeys the [test scope] too, and a narrower one.** Every agent in this checkout builds into the same `target/`, and cargo runs one build there at a time, so agents started side by side spend most of their time waiting on each other's builds; the ones that went workspace-wide once turned an hour of fixes into several. So every brief for an agent that edits code names its crates and says: `cargo check -p <those crates>` while editing, then `cargo nextest run -p <those crates>` and clippy on the same list once, at the end; nothing `--workspace`, no database, node-test or e2e runner. You run those yourself, once, after the last agent reports. Split parallel edits by crate, so no two agents build the same crate at once. A reviewing agent reads; it builds nothing unless one probe test must settle a finding.
+
+The end-to-end suite has a scope of its own, run the same way: once a fix or a feature is done and its [test scope] is green, you run `./setup.sh` and the e2e files the change reaches, and iterate on only the ones not yet passing until all pass. The steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
 
 If you catch yourself about to run more than the [test scope], write verbatim "Wait, that is outside the [test scope], I'll run only <list>" and run that.
 

@@ -85,11 +85,27 @@ async fn one_file_two_fetches_and_a_run_that_reads_back() -> Result<()> {
     anyhow::ensure!(setups["total"].as_u64().unwrap_or(0) >= 1, "activate made a setup run: {setups}");
 
     // A log line names the node that wrote it (Debug logs what it saw).
-    let logs: Value = disp.get_json(&format!("/executions/{color}/logs")).await?;
-    anyhow::ensure!(
-        logs["lines"].as_array().is_some_and(|lines| lines.iter().any(|l| l["node"] == "out")),
-        "the Debug node's line names it: {logs}"
-    );
+    // The worker hands each line over as a task that a dispatcher writes
+    // into the journal when it gets to it, so a line can land after the
+    // run already reads as finished: wait for it rather than read once.
+    let path = format!("/executions/{color}/logs");
+    let seen = std::sync::Mutex::new(Value::Null);
+    weft_e2e::poll_until_describing(
+        "the Debug node's log line, naming it",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+        || {
+            let (disp, path, seen) = (&disp, &path, &seen);
+            async move {
+                let logs: Value = disp.get_json(path).await?;
+                let named = logs["lines"].as_array().is_some_and(|lines| lines.iter().any(|l| l["node"] == "out"));
+                *seen.lock().expect("log read lock") = logs;
+                Ok(named.then_some(()))
+            }
+        },
+        || format!("last read {}", seen.lock().expect("log read lock")),
+    )
+    .await?;
 
     project.finish().await?;
     conn.finish().await

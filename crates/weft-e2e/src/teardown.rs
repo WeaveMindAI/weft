@@ -13,7 +13,7 @@
 //!     unpredictably) and warns, printing the exact recovery commands so the
 //!     kept-for-post-mortem state is always cleanable by hand.
 //!
-//! The guard is backing-agnostic: it owns the id, the registered/finished
+//! The guard is backing-agnostic: it owns the id, the finished
 //! bookkeeping, and the Drop warning, but knows nothing about HOW a project is
 //! removed (CLI `weft rm`, or an HTTP `DELETE` from an API-driven harness). Each
 //! suite writes its own small removal body and supplies the recovery-hint string;
@@ -32,10 +32,6 @@ pub struct Teardown {
     /// A short label for messages (the fixture name, or the project name in an
     /// API-driven harness) so a kept-on-fail warning says WHICH project.
     label: String,
-    /// Whether the project was registered on the dispatcher, so a suite's
-    /// `finish` knows whether a remote remove is even needed (an unregistered
-    /// project has no remote state to drop, only local artifacts).
-    registered: bool,
     /// Set once `complete` has run, so `Drop` neither warns nor double-removes.
     finished: bool,
     /// The exact commands to recover the kept state by hand, printed by `Drop`
@@ -53,7 +49,6 @@ impl Teardown {
         Self {
             id,
             label: label.into(),
-            registered: false,
             finished: false,
             recovery_hint: recovery_hint.into(),
         }
@@ -62,25 +57,6 @@ impl Teardown {
     /// The project id.
     pub fn id(&self) -> Uuid {
         self.id
-    }
-
-    /// Whether the project is marked registered on the dispatcher (so a suite's
-    /// `finish` knows to issue the remote remove).
-    pub fn registered(&self) -> bool {
-        self.registered
-    }
-
-    /// Mark the project registered on the dispatcher, so teardown removes it.
-    pub fn mark_registered(&mut self) {
-        self.registered = true;
-    }
-
-    /// The test removed the project itself, so teardown has nothing
-    /// remote left to drop. For a test whose SUBJECT is the removal:
-    /// without this its `finish` would remove a project that is
-    /// already gone and fail on the second try.
-    pub fn mark_removed(&mut self) {
-        self.registered = false;
     }
 
     /// Mark teardown DONE: the suite has removed the project (and local
@@ -101,7 +77,9 @@ impl Drop for Teardown {
         // removal that failed before reaching `complete`). Keep the remote
         // project + any local artifacts for post-mortem and print the exact
         // recovery commands. No remote teardown here: Drop cannot await.
-        tracing::warn!(
+        // Printed, not logged: a test binary runs no log subscriber, and this
+        // line is what the reader of a failed file's log is looking for.
+        eprintln!(
             "weft-e2e: project '{}' ({}) NOT finished (test ended early); keeping it for \
              inspection. Recover with: {}",
             self.label,

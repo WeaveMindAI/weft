@@ -55,7 +55,7 @@ pub trait WorkerBackend: Send + Sync {
 /// tenants), claims tasks for that project, and scale-to-zeros when idle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnPodSpec {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tenant: String,
     /// The PROJECT namespace (`wft-project-<tenant>-<project>`), not
     /// the tenant namespace. Workers live in the project namespace
@@ -187,7 +187,7 @@ pub trait ProjectBuilder: Send + Sync {
 /// hash) so push and pull read one source of truth.
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tenant: String,
     pub context_dir: PathBuf,
     pub image_ref: String,
@@ -343,7 +343,7 @@ mod tests {
         // start mints an id and records the request.
         let handle = b
             .start(BuildRequest {
-                project_id: "p".into(),
+                project_id: uuid::Uuid::from_u128(0x100),
                 tenant: "t".into(),
                 context_dir: std::path::PathBuf::from("/tmp/ctx"),
                 image_ref: "reg/weft-worker:x".into(),

@@ -18,21 +18,27 @@
 //!      fires exactly one execution: the held signal survived the move
 //!      (re-placed + the new holder re-subscribed through its own code).
 //!
-//! The drain is driven by the dispatcher's real 60s scale-down sweep,
-//! not poked from the test; we only create the precondition (a second
-//! pod) and let the production reaper consolidate.
+//! The drain is driven by the dispatcher's real scale-down sweep, not
+//! poked from the test; we only create the precondition (a second pod)
+//! and let the production reaper consolidate.
+//!
+//! It runs in a cell of its own: it watches the WHOLE listener pool fold
+//! to one pod, and another test's triggers on a shared pool would keep a
+//! second pod busy. The cell runs its timers at [`Cell::FAST`], so the
+//! sweep that ticks every 60s at real time comes round in six.
 
 #![cfg(feature = "e2e")]
 
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use weft_e2e::{ensure, fakes::SseFake, platform::Platform, project::Project, run, SettledRun};
+use weft_e2e::{fakes::SseFake, platform::Platform, project::Project, run, Cell, SettledRun};
 
 #[tokio::test]
 async fn listener_pool_consolidates_without_dropping_the_signal() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let cell = Cell::start(Cell::FAST).await?;
+    let disp = cell.dispatcher();
+    let platform = Platform::connect(&disp).await?;
     let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
     let pid = project.id();
 
@@ -137,12 +143,10 @@ async fn listener_pool_consolidates_without_dropping_the_signal() -> anyhow::Res
         after.difference(&b1).count()
     );
 
-    // Success cleanup: consolidation already reaped the clone (sweep_clone
-    // is then a no-op: no registry row, kubectl delete --ignore-not-found),
-    // but call it by exact name to clear any residue. Success path only; a
-    // failing test keeps state for inspection.
-    platform.sweep_clone(&pod_b).await?;
-    project.finish().await
+    // Removing the cell takes any residue of the clone with it. Success
+    // path only; a failing test keeps the cell for inspection.
+    project.finish().await?;
+    cell.finish().await
 }
 
 /// The single live listener pod the dispatcher spawned for the project
@@ -159,9 +163,10 @@ async fn first_listener_pod(platform: &Platform) -> anyhow::Result<String> {
 }
 
 /// Wait for the listener pool to consolidate back to ONE live pod. The
-/// deadline covers the scale-down sweep interval (60s) plus the
-/// re-place-and-reap with margin; this is a system transition the rig set
-/// up (two partially-loaded pods), so a bound is correct.
+/// deadline covers the scale-down sweep interval (60s at real time, a
+/// tenth of it in the test's cell) plus the re-place-and-reap with margin;
+/// this is a system transition the rig set up (two partially-loaded pods),
+/// so a bound is correct.
 async fn wait_for_pool_size_one(platform: &Platform) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(150);
     loop {

@@ -5,7 +5,8 @@
 //!     deactivate / reactivate) serializes via the per-command
 //!     `claimed_by_pod` claim lease (`claimable_predicate`), because the
 //!     dispatcher has no per-project ownership lease of its own;
-//!   - the broker's `supervisor_claim_command` handler (supervisor
+//!   - the broker's `supervisor_claim_command` handler
+//!     (`lifecycle_writes::next_command`; supervisor
 //!     verbs: apply / stop / terminate) serializes via the EXCLUSIVE
 //!     `infra_owner` lease (`owns_project_predicate`): a supervisor runs
 //!     a project's command, and writes its `infra_node` state, only
@@ -41,8 +42,11 @@ pub const CLAIM_LEASE_TTL: Duration = Duration::from_secs(300);
 /// Kept short relative to `CLAIM_LEASE_TTL` so a crashed supervisor's
 /// infra is re-owned quickly (health monitoring resumes), but well above
 /// the supervisor's ownership-tick interval so a slow tick never drops a
-/// lease it still wants.
-pub const INFRA_OWNER_LEASE_SECS: i64 = 45;
+/// lease it still wants. 45 seconds in real time, at this install's
+/// pace (`weft_core::time_scale`).
+pub fn infra_owner_lease_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(45)
+}
 
 /// Max projects a supervisor claims in ONE ownership tick. Claiming is
 /// memory-gated (a pod stops claiming once its memory pressure reaches
@@ -94,8 +98,8 @@ pub fn claimable_predicate() -> String {
 /// the dispatcher's own verbs and is the right tool there), the
 /// supervisor needs no per-command claim lease at all: `infra_owner` is
 /// exclusive (one pod per project) and continuously renewed on each
-/// ownership tick, and a single owner's work loop is sequential, so two
-/// supervisors can never run kubectl for one project. The supervisor's
+/// ownership tick, and the owner runs one project's commands in order,
+/// so two supervisors can never run kubectl for one project. The supervisor's
 /// kubectl ops are declarative (apply manifests, scale-to-N, delete-by-
 /// label), so even the bounded window of one in-flight call from a
 /// just-displaced owner converges rather than corrupts: it is the SAME
@@ -112,12 +116,154 @@ pub fn claimable_predicate() -> String {
 /// auth token's (suffixed) pod name.
 // SYNC: supervisor pod_name (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.pod_name), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.pod_name), crates/weft-dispatcher/src/supervisor_pool.rs (render_supervisor_manifest WEFT_POD_NAME env)
 pub fn owns_project_predicate(pod_param: &str, project_col: &str) -> String {
+    live_lease_exists(Some(pod_param), project_col)
+}
+
+/// SQL `EXISTS (...)` fragment that is true iff a LIVE `infra_owner`
+/// lease covers the project named by `project_col`: held by the pod
+/// bound at `pod_param` when one is given (that is
+/// [`owns_project_predicate`]), by any supervisor otherwise. Time comes
+/// from the DB clock.
+pub fn live_lease_exists(pod_param: Option<&str>, project_col: &str) -> String {
+    let pod = pod_param
+        .map(|p| format!("AND io.supervisor_pod = {p} "))
+        .unwrap_or_default();
     format!(
         "EXISTS ( \
             SELECT 1 FROM infra_owner io \
             WHERE io.project_id = {project_col} \
-              AND io.supervisor_pod = {pod_param} \
-              AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
+              {pod}AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
          )"
     )
+}
+
+/// SQL condition that is true iff the `project` row aliased
+/// `project_alias` is one a supervisor may own: only a namespaced
+/// (paid-tier) project has infra. The ownership tick claims only these,
+/// so every `infra_owner` row names one.
+pub fn claimable_project(project_alias: &str) -> String {
+    format!("{project_alias}.project_namespace <> ''")
+}
+
+/// The verbs a supervisor claims, as the SQL list inside `verb IN (...)`.
+/// A macro so a partial index's DDL (a `&'static str` that cannot call a
+/// function) splices the same text in with `concat!`; every other query
+/// uses [`SUPERVISOR_VERBS_SQL`].
+// SYNC: the supervisor verbs <-> crates/weft-broker-client/src/protocol.rs
+//       (InfraLifecycleVerb Apply / Stop / Terminate)
+#[macro_export]
+macro_rules! supervisor_verbs_sql {
+    () => {
+        "'apply', 'stop', 'terminate'"
+    };
+}
+
+/// [`supervisor_verbs_sql!`] as a constant.
+pub const SUPERVISOR_VERBS_SQL: &str = supervisor_verbs_sql!();
+
+/// The verbs the dispatcher's `lifecycle_claimer` claims, as the SQL
+/// list inside `verb IN (...)`. A macro for the same reason as
+/// [`supervisor_verbs_sql!`]: its partial index splices it in.
+// SYNC: the dispatcher verbs <-> crates/weft-broker-client/src/protocol.rs
+//       (InfraLifecycleVerb Deactivate / Reactivate)
+#[macro_export]
+macro_rules! dispatcher_verbs_sql {
+    () => {
+        "'deactivate', 'reactivate'"
+    };
+}
+
+/// [`dispatcher_verbs_sql!`] as a constant.
+pub const DISPATCHER_VERBS_SQL: &str = dispatcher_verbs_sql!();
+
+/// SQL condition that is true iff the `infra_lifecycle_command` row
+/// aliased `command_alias` still waits on a supervisor: not completed,
+/// of a supervisor verb (apply / stop / terminate; deactivate and
+/// reactivate are the dispatcher's), on a [`claimable_project`]. A
+/// cancel-flagged row still counts: only a supervisor running it (and
+/// hitting the cancel check) completes it.
+pub fn pending_supervisor_command(command_alias: &str) -> String {
+    format!(
+        "{c}.verb IN ({verbs}) \
+         AND {c}.completed_at_unix IS NULL \
+         AND EXISTS ( \
+             SELECT 1 FROM project cp \
+             WHERE cp.id = {c}.project_id AND {claimable} \
+         )",
+        c = command_alias,
+        verbs = SUPERVISOR_VERBS_SQL,
+        claimable = claimable_project("cp"),
+    )
+}
+
+/// The channel an `infra_lifecycle_command` row notifies on, from the
+/// `infra_command_notify` trigger in the dispatcher's
+/// `infra_lifecycle_command::GROUP`: once when the command is issued,
+/// and once when it completes. The claimers wake on the first, and
+/// whoever waits on a command's outcome wakes on the second.
+pub const INFRA_COMMAND_CHANNEL: &str = "weft_infra_command";
+
+/// What an [`INFRA_COMMAND_CHANNEL`] notification says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfraCommandSignal<'a> {
+    /// A command was issued for this project (`issued:<project_id>`).
+    Issued { project_id: &'a str },
+    /// This command completed (`done:<id>`).
+    Done { id: i64 },
+}
+
+impl<'a> InfraCommandSignal<'a> {
+    /// Read a notification's payload; `None` for one this build does
+    /// not know, which concerns nobody here.
+    // SYNC: the payload shapes <-> the `infra_command_notify` function in
+    //       crates/weft-dispatcher/src/infra_lifecycle_command.rs (GROUP)
+    pub fn parse(payload: &'a str) -> Option<Self> {
+        if let Some(project_id) = payload.strip_prefix("issued:") {
+            return Some(Self::Issued { project_id });
+        }
+        payload.strip_prefix("done:")?.parse().ok().map(|id| Self::Done { id })
+    }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use crate::protocol::InfraLifecycleVerb;
+
+    /// The literal list names exactly the supervisor's verbs.
+    #[test]
+    fn the_supervisor_verb_list_names_the_supervisor_verbs() {
+        let want = [InfraLifecycleVerb::Apply, InfraLifecycleVerb::Stop, InfraLifecycleVerb::Terminate]
+            .map(|v| format!("'{}'", v.as_str()))
+            .join(", ");
+        assert_eq!(super::SUPERVISOR_VERBS_SQL, want);
+    }
+
+    /// The literal list names exactly the dispatcher's verbs.
+    #[test]
+    fn the_dispatcher_verb_list_names_the_dispatcher_verbs() {
+        let want = [InfraLifecycleVerb::Deactivate, InfraLifecycleVerb::Reactivate]
+            .map(|v| format!("'{}'", v.as_str()))
+            .join(", ");
+        assert_eq!(super::DISPATCHER_VERBS_SQL, want);
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::InfraCommandSignal;
+
+    #[test]
+    fn both_payloads_read_back() {
+        assert_eq!(
+            InfraCommandSignal::parse("issued:00000000-0000-0000-0000-000000000001"),
+            Some(InfraCommandSignal::Issued { project_id: "00000000-0000-0000-0000-000000000001" }),
+        );
+        assert_eq!(InfraCommandSignal::parse("done:42"), Some(InfraCommandSignal::Done { id: 42 }));
+    }
+
+    #[test]
+    fn an_unknown_payload_concerns_nobody() {
+        assert_eq!(InfraCommandSignal::parse("done:x"), None);
+        assert_eq!(InfraCommandSignal::parse("started:1"), None);
+    }
 }

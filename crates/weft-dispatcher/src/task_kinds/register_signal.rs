@@ -103,7 +103,7 @@ pub(crate) fn pattern_of_mount_path(mount_path: &str, tenant: &str) -> String {
 pub(crate) struct RegisteredRoute {
     pub pattern: String,
     pub methods: Vec<String>,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub node_id: String,
 }
 
@@ -256,13 +256,10 @@ impl RegisterSignalExecutor {
         // Read off the original program, the one this registration's
         // node was compiled into, so the spelling is the one that
         // program's source reads.
-        let project_uuid: uuid::Uuid = project_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
         let project_def = crate::projection::execution_program(state, color).await?
             .program().context("register_signal: original program is unavailable")?;
         let (place, node) = registered_place(&project_def, &payload.node_id, &payload.frames)
-            .with_context(|| format!("register_signal: project_id={project_uuid}"))?;
+            .with_context(|| format!("register_signal: project_id={project_id}"))?;
         // Tags drive the signal-token enumeration filter; charset
         // already validated at parse time.
         let tags = node.tags();
@@ -298,7 +295,7 @@ impl RegisterSignalExecutor {
                 "SELECT token, kind_state, kind_state_seq FROM signal \
                  WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE",
             )
-            .bind(&project_id)
+            .bind(project_id)
             .bind(&place)
             .fetch_optional(&state.pg_pool)
             .await?;
@@ -320,7 +317,6 @@ impl RegisterSignalExecutor {
 
         let token_call = token.clone();
         let prior_state_call = prior_kind_state;
-        let project_id_call = project_id.clone();
         let node_id_call = place.clone();
         let spec_call = payload.spec.clone();
         let resume_color_owned = resume_color.clone();
@@ -408,14 +404,14 @@ impl RegisterSignalExecutor {
                                 let mine = weft_core::route::RoutePattern::parse(path)
                                     .map_err(anyhow::Error::msg)?;
                                 let others: Vec<RegisteredRoute> =
-                                    sqlx::query_as::<_, (String, Vec<String>, String, String)>(
+                                    sqlx::query_as::<_, (String, Vec<String>, uuid::Uuid, String)>(
                                         "SELECT mount_path, mount_methods, project_id, node_id \
                                          FROM signal \
                                          WHERE tenant_id = $1 AND mount_path IS NOT NULL \
                                            AND NOT (project_id = $2 AND node_id = $3)",
                                     )
                                     .bind(&tenant_for_register)
-                                    .bind(&project_id_call)
+                                    .bind(project_id)
                                     .bind(&node_id_call)
                                     .fetch_all(&pool_call)
                                     .await?
@@ -743,7 +739,7 @@ mod tests {
         RegisteredRoute {
             pattern: pattern.into(),
             methods: methods.iter().map(|m| m.to_string()).collect(),
-            project_id: "p2".into(),
+            project_id: uuid::Uuid::from_u128(0x106),
             node_id: "other".into(),
         }
     }

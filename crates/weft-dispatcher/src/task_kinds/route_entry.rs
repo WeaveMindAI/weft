@@ -147,7 +147,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             };
             let (start, kick_events) = crate::api::project::execution_birth_events(
                 color,
-                &signal.project_id,
+                signal.project_id,
                 weft_core::context::Phase::Fire,
                 &signal.node_id,
                 &fire.kicks,
@@ -164,7 +164,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             // but failed to acknowledge re-parks too, and the drained twin
             // finds the color born (above) and finishes it.
             let execution_task = crate::task_kinds::execute::execution_task_spec(
-                weft_task_store::TaskKind::Execute, &signal.project_id, color,
+                weft_task_store::TaskKind::Execute, signal.project_id, color,
                 &candidate_hash, &program.binary_hash, Some(&payload.tenant_id), None, None,
             )?;
             if let Err(e) = state
@@ -199,7 +199,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
 /// interval). A failure here must NOT fail the task (the fire's fate is
 /// already settled); log it loud.
 async fn refinish_drain(state: &DispatcherState, task: &Task) {
-    let Some(project_id) = task.project_id.as_deref() else { return };
+    let Some(project_id) = task.project_id else { return };
     if let Err(e) = crate::journal_bridge::try_finish_drain(state, project_id, Some(task.id)).await {
         tracing::error!(
             target: "weft_dispatcher::route_entry",
@@ -263,11 +263,9 @@ async fn pre_journal_route(
         .signal_get(&payload.token)
         .await?
         .ok_or_else(|| anyhow::anyhow!("signal {} not found", payload.token))?;
-    let project_uuid: Uuid = signal.project_id.parse()?;
-
     let lifecycle = state
         .projects
-        .lifecycle(project_uuid)
+        .lifecycle(signal.project_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("project {} not found; cannot route fire", signal.project_id))?;
     if lifecycle.status != crate::project_store::ProjectStatus::Active {
@@ -280,7 +278,7 @@ async fn pre_journal_route(
 
     let program = signal.program.clone()
         .ok_or_else(|| anyhow::anyhow!("trigger '{}' has no armed code identity; activate it again", signal.node_id))?;
-    let project_def = definition_for(state, project_uuid, &signal.project_id, &program.definition_hash).await?;
+    let project_def = definition_for(state, signal.project_id, &program.definition_hash).await?;
     let fire = crate::api::project::compute_trigger_fire(
         &project_def,
         &signal.node_id,
@@ -318,13 +316,12 @@ fn color_for_fire(payload: &RouteEntryPayload) -> Result<Uuid> {
 /// before the journal write, fail the color after) is the caller's.
 async fn definition_for(
     state: &DispatcherState,
-    project_uuid: Uuid,
-    project_id: &str,
+    project_id: Uuid,
     hash: &str,
 ) -> Result<weft_core::ProjectDefinition> {
     let project_json = state
         .projects
-        .definition_for_hash(project_uuid, hash)
+        .definition_for_hash(project_id, hash)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(

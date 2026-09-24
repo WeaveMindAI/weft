@@ -1475,11 +1475,12 @@ export interface LiveDataItem {
   };
 }
 
-/// State of one node's display. The poller emits one of these per
-/// tick: `ok` carries the items, `error` carries a short
-/// user-facing message the webview shows in their place. There is NO
-/// silent fallback: if the poller cannot reach the backend, the user
-/// sees the error verbatim.
+/// State of one node's display. The dispatcher pushes one of these
+/// each time it changes: `ok` carries the items, `error` carries a
+/// short user-facing message the webview shows in their place. There is
+/// NO silent fallback: if the display cannot be read, the user sees the
+/// error verbatim.
+// SYNC: NodeFeedState <-> crates/weft-dispatcher/src/display_feeds.rs (NodeFeed)
 export type NodeFeedState =
   | { state: 'ok'; items: LiveDataItem[] }
   // The feed's SOURCE does not exist yet (infra not provisioned, the

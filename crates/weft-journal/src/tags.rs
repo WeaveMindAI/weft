@@ -36,7 +36,9 @@ pub struct TaggedExecution {
 /// row (and its `seq`): a body re-run after a crash lands on the same
 /// state, and a tag's position in the order is the FIRST time the run
 /// claimed it. `pod_name` stamps the event for the fencing trigger,
-/// exactly like every other worker-originated write.
+/// exactly like every other worker-originated write. The journal row
+/// is this function's first write; a caller that writes before it takes
+/// [`crate::lock_colors`] first (the ordering invariant on `write`).
 pub async fn tag_execution_in(
     tx: &mut sqlx::PgConnection,
     color: Color,
@@ -113,7 +115,7 @@ pub async fn max_tag_seq<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> Result<i64
 /// SQL stays a plain read and the rule has a layer-1 test.
 pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tag: &str,
 ) -> Result<Vec<TaggedExecution>, sqlx::Error> {
     // The NOT EXISTS kind list below is the SQL copy of the terminal set;

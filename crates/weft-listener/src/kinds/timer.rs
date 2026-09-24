@@ -160,6 +160,10 @@ fn spawn_loop(
     fire: crate::event_context::FireContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The signal's row is written right around now, so an unknown
+        // token only means "not committed yet" within a short window of
+        // this moment (see `redeliver`).
+        let armed = Instant::now();
         // For After: use the pinned absolute time from kind_state if
         // present (set at register time, survives listener restarts).
         // Only consumed on the first iteration; After is one-shot so
@@ -185,15 +189,82 @@ fn spawn_loop(
                 "scheduledTime": deadline.to_rfc3339(),
                 "actualTime": Utc::now().to_rfc3339(),
             });
-            // A timer tick has no replay cursor; the delivery outcome
-            // is already logged by the fire path.
-            let _ = fire.fire(payload, "timer").await;
+            deliver(&fire, payload, armed).await;
 
             if matches!(spec, TimerSpec::After { .. } | TimerSpec::At { .. }) {
                 return;
             }
         }
     })
+}
+
+/// How long a tick waits before it is offered again after a failed
+/// delivery, doubling from the first to the longest.
+const REDELIVER_FIRST: Duration = Duration::from_millis(250);
+const REDELIVER_LONGEST: Duration = Duration::from_secs(30);
+
+/// How long after arming an unknown token still reads as "the row is
+/// not committed yet". The row is written right around arming, so past
+/// this window the signal is gone.
+fn unknown_token_grace() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(120))
+}
+
+/// Offer one tick until it lands. A tick is the whole of what a timer
+/// has to say and nothing re-offers it later (a feed kind keeps a
+/// cursor and offers an item again on its next poll; a timer has no
+/// next poll for an `After`), so a delivery that fails would leave the
+/// run waiting on it for ever. The failure that happens in practice is
+/// the tick beating its own registration: this pod is armed before the
+/// dispatcher has written the signal's row, a wait counted from when
+/// the node asked can already be due by then, and the broker refuses a
+/// token it does not know yet. The broker answers the same for a
+/// signal that is gone, so an unknown token is retried only within
+/// [`unknown_token_grace`] of arming; past it the tick is dropped with
+/// a warning. Every other failure is logged by the fire path and
+/// retried with backoff.
+async fn deliver(fire: &crate::event_context::FireContext, payload: Value, armed: Instant) {
+    let mut wait = REDELIVER_FIRST;
+    loop {
+        let outcome = fire.fire(payload.clone(), "timer").await;
+        match redeliver(outcome, armed.elapsed()) {
+            Redeliver::Done => return,
+            Redeliver::Again => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(REDELIVER_LONGEST);
+            }
+            Redeliver::Gone => {
+                tracing::warn!(
+                    target: "weft_listener::timer",
+                    token = %fire.token(),
+                    "the broker does not know this timer's signal token long after it was \
+                     armed; the signal is gone, dropping the tick"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// What a tick does after one delivery attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum Redeliver {
+    /// Delivered, filtered or fenced: nothing more to offer.
+    Done,
+    /// Not delivered and may still land: offer it again.
+    Again,
+    /// The signal is gone: stop.
+    Gone,
+}
+
+fn redeliver(outcome: crate::event_context::FireOutcome, since_armed: Duration) -> Redeliver {
+    use crate::event_context::FireOutcome;
+    match outcome {
+        FireOutcome::Fired | FireOutcome::Filtered | FireOutcome::Fenced => Redeliver::Done,
+        FireOutcome::EnqueueFailed => Redeliver::Again,
+        FireOutcome::UnknownSignal if since_armed < unknown_token_grace() => Redeliver::Again,
+        FireOutcome::UnknownSignal => Redeliver::Gone,
+    }
 }
 
 /// The next fire as both the monotonic `Instant` to sleep on AND the
@@ -336,5 +407,38 @@ mod schedule_tests {
             .expect("a fixed instant")
             .with_timezone(&chrono::Utc);
         assert!(schedule_line(&TimerSpec::At { when }).contains("2026-09-19T08:00:00"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_context::FireOutcome;
+
+    #[test]
+    fn a_delivered_filtered_or_fenced_tick_is_done() {
+        for outcome in [FireOutcome::Fired, FireOutcome::Filtered, FireOutcome::Fenced] {
+            assert_eq!(redeliver(outcome, Duration::ZERO), Redeliver::Done);
+        }
+    }
+
+    #[test]
+    fn a_failed_enqueue_is_retried_however_long_ago_it_armed() {
+        assert_eq!(redeliver(FireOutcome::EnqueueFailed, Duration::ZERO), Redeliver::Again);
+        assert_eq!(
+            redeliver(FireOutcome::EnqueueFailed, unknown_token_grace() * 10),
+            Redeliver::Again
+        );
+    }
+
+    #[test]
+    fn an_unknown_token_is_retried_only_within_the_grace_after_arming() {
+        let grace = unknown_token_grace();
+        assert_eq!(redeliver(FireOutcome::UnknownSignal, Duration::ZERO), Redeliver::Again);
+        assert_eq!(
+            redeliver(FireOutcome::UnknownSignal, grace - Duration::from_millis(1)),
+            Redeliver::Again
+        );
+        assert_eq!(redeliver(FireOutcome::UnknownSignal, grace), Redeliver::Gone);
     }
 }

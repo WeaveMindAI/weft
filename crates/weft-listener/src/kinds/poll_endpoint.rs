@@ -238,11 +238,13 @@ fn spawn_loop(
                 let mut advanced = state.clone();
                 for (payload, state_after) in fires {
                     match ctx.fire.fire(payload, "poll_endpoint").await {
-                        // Not delivered (transient failure, or this pod
-                        // was drained and the fire fenced): hold the
-                        // cursor so the item is re-offered.
+                        // Not delivered (transient failure, a token the
+                        // broker does not know, or this pod was drained
+                        // and the fire fenced): hold the cursor so the
+                        // item is re-offered.
                         crate::event_context::FireOutcome::EnqueueFailed
-                        | crate::event_context::FireOutcome::Fenced => break,
+                        | crate::event_context::FireOutcome::Fenced
+                        | crate::event_context::FireOutcome::UnknownSignal => break,
                         crate::event_context::FireOutcome::Fired
                         | crate::event_context::FireOutcome::Filtered => {
                             advanced = Some(state_after);

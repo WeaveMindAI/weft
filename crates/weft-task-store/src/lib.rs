@@ -12,6 +12,9 @@
 //!     journal schema must be applied BEFORE this group.
 //!   - `executor`: `TaskExecutor` and `WorkerTaskKind` traits, plus
 //!     the dispatcher and worker picker loops.
+//!   - `pg_signal`: the process's one Postgres `LISTEN` connection,
+//!     which every wait on a row sleeps on (`terminal` is the task
+//!     waiter built on it).
 //!   - `schema_guard`: the schema runner every boot routes its
 //!     `SchemaGroup`s through. It builds a new database from the canonical
 //!     `CREATE TABLE` text and carries an existing one forward with the
@@ -19,6 +22,7 @@
 
 pub mod executor;
 pub mod kinds;
+pub mod pg_signal;
 pub mod schema_guard;
 pub mod tasks;
 pub mod terminal;
@@ -28,7 +32,7 @@ pub mod worker_pod;
 pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 
 pub use executor::{
-    run_dispatcher_picker, run_worker_picker, TaskExecutor, TaskRegistry, TaskRegistryBuilder,
+    run_dispatcher_picker, run_worker_picker, PodStanding, TaskExecutor, TaskRegistry, TaskRegistryBuilder,
     WorkerTaskKind, WorkerTaskRegistry, WorkerTaskRegistryBuilder,
 };
 pub use kinds::{
@@ -38,7 +42,7 @@ pub use kinds::{
 pub use tasks::{
     claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus,
-    TaskTarget, CLAIM_DURATION_SECS, CLAIM_HEARTBEAT_INTERVAL_SECS, TERMINAL_RETENTION_SECS,
+    TaskTarget, claim_duration_secs, claim_heartbeat_interval, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{
     InfraReader, PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
@@ -48,6 +52,6 @@ pub use worker_pod::{
     delete_row, has_live_for_project,
     insert_spawning, list_orphaned_node_test, list_stale, list_stale_spawning, list_terminal,
     mark_dead, mark_done, mark_done_if_idle, register_alive, AliveTransition, PodStatus,
-    WorkerPodRow, WorkerStanding, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_STALE_SECS,
+    WorkerPodRow, WorkerStanding, heartbeat_interval, heartbeat_stale_secs,
     SPAWN_BOOT_DEADLINE_SECS,
 };

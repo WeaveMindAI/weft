@@ -116,7 +116,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         program: None,
         token: token.to_string(),
         tenant_id: TENANT.to_string(),
-        project_id: project_id.to_string(),
+        project_id,
         color: None,
         node_id: "feed".to_string(),
         is_resume: false,
@@ -169,12 +169,12 @@ async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
         definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
     };
     let start = weft_journal::ExecEvent::ExecutionStarted {
-        color, project_id: id.to_string(), entry_node: "entry".into(),
+        color, project_id: id, entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
         program: Some(program), source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 1,
     };
     let task = weft_dispatcher::task_kinds::execute::execution_task_spec(
-        weft_task_store::TaskKind::Execute, &id.to_string(), color, "def-1", "bin-A", Some(TENANT), None, None,
+        weft_task_store::TaskKind::Execute, id, color, "def-1", "bin-A", Some(TENANT), None, None,
     ).unwrap();
     seed_project(&projects, id, "bin-B").await;
     journal.start_execution(&start, &[], task, None).await.unwrap();
@@ -192,7 +192,7 @@ async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
         Some("bin-A"),
         "the execute task must carry the image it was enqueued for"
     );
-    weft_dispatcher::task_kinds::execute::enqueue_resume(&pool, &id.to_string(), color, "def-1", Some(TENANT)).await.unwrap();
+    weft_dispatcher::task_kinds::execute::enqueue_resume(&pool, id, color, "def-1", Some(TENANT)).await.unwrap();
     let resume_hash: String = sqlx::query_scalar("SELECT binary_hash FROM task WHERE color = $1 AND kind = 'resume'")
         .bind(color.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(resume_hash, "bin-A");
@@ -392,12 +392,12 @@ fn trigger_setup_birth(id: Uuid, color: Uuid) -> (weft_journal::ExecEvent, weft_
         definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
     };
     let start = weft_journal::ExecEvent::ExecutionStarted {
-        color, project_id: id.to_string(), entry_node: "entry".into(),
+        color, project_id: id, entry_node: "entry".into(),
         phase: weft_core::context::Phase::TriggerSetup, definition_hash: Some("def-1".into()),
         program: Some(program), source_version: Some("source".into()), node_test: false, subgraph: None, seed: None, at_unix: 1,
     };
     let task = weft_dispatcher::task_kinds::execute::execution_task_spec(
-        weft_task_store::TaskKind::Execute, &id.to_string(), color, "def-1", "bin-A", Some(TENANT), None, None,
+        weft_task_store::TaskKind::Execute, id, color, "def-1", "bin-A", Some(TENANT), None, None,
     ).unwrap();
     (start, task)
 }
@@ -420,7 +420,7 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPo
     let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete]).unwrap().unwrap();
     journal.finish_trigger_setup(color, Some(&bake)).await.unwrap();
     versions.delete_versions(id, &["source".into()]).await.unwrap();
-    assert!(journal.trigger_bakes(&id.to_string()).await.unwrap().is_empty());
+    assert!(journal.trigger_bakes(id).await.unwrap().is_empty());
     assert!(versions.version(id, "source").await.unwrap().is_none());
 }
 
@@ -508,12 +508,12 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
     projects.end_activating(id, second, &weft_dispatcher::project_store::ProjectLifecycle::active(), false).await.unwrap();
     assert!(journal.signal_insert(&entry, &placement).await.is_err(), "no late registration after activation ends");
     journal.finish_trigger_setup(second, None).await.unwrap();
-    assert_eq!(journal.trigger_bakes(&id.to_string()).await.unwrap()[0].color, first);
+    assert_eq!(journal.trigger_bakes(id).await.unwrap()[0].color, first);
     journal.delete_execution(first).await.unwrap();
-    assert_eq!(journal.trigger_bakes(&id.to_string()).await.unwrap()[0].color, first);
-    assert!(journal.trigger_bakes(&Uuid::new_v4().to_string()).await.unwrap().is_empty());
+    assert_eq!(journal.trigger_bakes(id).await.unwrap()[0].color, first);
+    assert!(journal.trigger_bakes(Uuid::new_v4()).await.unwrap().is_empty());
     projects.remove(id).await.unwrap();
-    assert!(journal.trigger_bakes(&id.to_string()).await.unwrap().is_empty());
+    assert!(journal.trigger_bakes(id).await.unwrap().is_empty());
 }
 
 /// The birth of an execution (`ExecutionStarted` + `execution_color` seed +
@@ -531,7 +531,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let now = 1_700_000_000u64;
     let start = weft_journal::ExecEvent::ExecutionStarted {
         color,
-        project_id: missing_project.to_string(),
+        project_id: missing_project,
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
@@ -552,7 +552,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let task = weft_task_store::tasks::NewTask {
         kind: weft_task_store::TaskKind::Execute.into(),
         target: weft_task_store::TaskTarget::Worker,
-        project_id: Some(missing_project.to_string()),
+        project_id: Some(missing_project),
         dedup_key: Some(format!("{color}:execute")),
         color: Some(color.to_string()),
         tenant_id: Some(TENANT.into()),
@@ -592,7 +592,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let color2 = weft_core::Color::new_v4();
     let start2 = weft_journal::ExecEvent::ExecutionStarted {
         color: color2,
-        project_id: registered.to_string(),
+        project_id: registered,
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
@@ -604,7 +604,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let task2 = weft_task_store::tasks::NewTask {
         color: Some(color2.to_string()),
         dedup_key: Some(format!("{color2}:execute")),
-        project_id: Some(registered.to_string()),
+        project_id: Some(registered),
         ..task
     };
     journal
@@ -681,7 +681,7 @@ async fn seed_supervisor_pod(pool: &PgPool, pod_name: &str, owner: &str, past_gr
     .expect("seed supervisor_pod");
 }
 
-async fn seed_pending_command(pool: &PgPool, project_id: &str) -> i64 {
+async fn seed_pending_command(pool: &PgPool, project_id: Uuid) -> i64 {
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, issued_by_pod, issued_at_unix) \
@@ -735,7 +735,7 @@ async fn reap_spares_the_pool_while_a_command_is_pending(pool: PgPool) {
 
     let project = seed_claimable_project(&pool, &projects).await;
     seed_supervisor_pod(&pool, "sup-1", "disp-1", true).await;
-    let cmd = seed_pending_command(&pool, &project.to_string()).await;
+    let cmd = seed_pending_command(&pool, project).await;
 
     sup.reap_idle(&backend, &pool, "disp-1").await.expect("reap");
     assert!(
@@ -797,12 +797,12 @@ async fn reconcile_reseeds_an_empty_pool_when_a_command_pends(pool: PgPool) {
          VALUES ($1, $2, NULL, 'deactivate', 'test-pod', $3)",
     )
     .bind(TENANT)
-    .bind(claimable.to_string())
+    .bind(claimable)
     .bind(weft_dispatcher::lease::now_unix())
     .execute(&pool)
     .await
     .expect("seed dispatcher-verb command");
-    seed_pending_command(&pool, &Uuid::new_v4().to_string()).await;
+    seed_pending_command(&pool, Uuid::new_v4()).await;
     sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
     assert!(
         backend.spawned.lock().unwrap().is_empty(),
@@ -810,7 +810,7 @@ async fn reconcile_reseeds_an_empty_pool_when_a_command_pends(pool: PgPool) {
     );
 
     // A claimable supervisor-verb command does.
-    seed_pending_command(&pool, &claimable.to_string()).await;
+    seed_pending_command(&pool, claimable).await;
     sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
     assert_eq!(
         backend.spawned.lock().unwrap().len(),
@@ -832,12 +832,12 @@ async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
     // was never (or is no longer) registered.
     let live = Uuid::new_v4();
     seed_project(&projects, live, "hash-live").await;
-    for (project, pod) in [(live.to_string(), "sup-live"), (Uuid::new_v4().to_string(), "sup-ghost")] {
+    for (project, pod) in [(live, "sup-live"), (Uuid::new_v4(), "sup-ghost")] {
         sqlx::query(
             "INSERT INTO infra_owner (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
              VALUES ($1, $2, 'ns', $3, $4)",
         )
-        .bind(&project)
+        .bind(project)
         .bind(pod)
         .bind(TENANT)
         .bind(weft_dispatcher::lease::now_unix() + 60)
@@ -847,18 +847,18 @@ async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
     }
 
     sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
-    let leases: Vec<(String,)> = sqlx::query_as("SELECT project_id FROM infra_owner")
+    let leases: Vec<(Uuid,)> = sqlx::query_as("SELECT project_id FROM infra_owner")
         .fetch_all(&pool)
         .await
         .expect("list leases");
     assert_eq!(
         leases,
-        vec![(live.to_string(),)],
+        vec![(live,)],
         "ghost lease dropped, live project's lease kept"
     );
 
     let released =
-        weft_dispatcher::supervisor_pool::release_project(&pool, &live.to_string())
+        weft_dispatcher::supervisor_pool::release_project(&pool, live)
             .await
             .expect("release");
     assert_eq!(released, 1, "project removal releases its lease");
@@ -910,9 +910,7 @@ async fn referenced_images_cover_projects_pods_tasks_maps_and_unit_refs(
          (project_id, node_id, instance_id, namespace, status, units_json) \
          VALUES ($1, 'n1', 'inst1', 'ns', 'running', $2)",
     )
-    // `infra_node.project_id` is TEXT (the row keys by the id's string
-    // form), unlike `project.id`.
-    .bind(with_infra.to_string())
+    .bind(with_infra)
     .bind(serde_json::json!({
         "frozen": {
             "status": "running",
@@ -946,7 +944,7 @@ async fn referenced_images_cover_projects_pods_tasks_maps_and_unit_refs(
             "INSERT INTO worker_pod \
              (pod_name, project_id, namespace, status, owner_dispatcher, \
               last_heartbeat_unix, created_at_unix, terminal_at_unix, binary_hash) \
-             VALUES ($1, 'p', 'ns', 'alive', 'disp-1', $2, $2, $3, $4)",
+             VALUES ($1, gen_random_uuid(), 'ns', 'alive', 'disp-1', $2, $2, $3, $4)",
         )
         .bind(pod)
         .bind(now)
@@ -964,7 +962,7 @@ async fn referenced_images_cover_projects_pods_tasks_maps_and_unit_refs(
         sqlx::query(
             "INSERT INTO task \
              (id, kind, target, project_id, status, binary_hash, payload, attempts, created_at_unix) \
-             VALUES ($4, 'execute', 'worker', 'p', $1, $2, '{}'::jsonb, 0, $3)",
+             VALUES ($4, 'execute', 'worker', gen_random_uuid(), $1, $2, '{}'::jsonb, 0, $3)",
         )
         .bind(status)
         .bind(hash)
@@ -1453,7 +1451,7 @@ async fn a_supervisor_the_cluster_no_longer_has_is_forgotten_and_its_projects_re
          (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
          VALUES ($1, 'sup-gone', 'weft-system', $2, $3)",
     )
-    .bind(project.to_string())
+    .bind(project)
     .bind(TENANT)
     .bind(weft_dispatcher::lease::now_unix() + 60)
     .execute(&pool)
@@ -1491,7 +1489,7 @@ async fn a_supervisor_the_cluster_no_longer_has_is_forgotten_and_its_projects_re
     // touches nothing that is running.
     let owners: Vec<(String,)> =
         sqlx::query_as("SELECT supervisor_pod FROM infra_owner WHERE project_id = $1")
-            .bind(project.to_string())
+            .bind(project)
             .fetch_all(&pool)
             .await
             .expect("query infra_owner");
@@ -1508,7 +1506,7 @@ async fn start_execution(journal: &PostgresJournal, project: Uuid) -> weft_core:
     journal
         .record_event(&weft_journal::ExecEvent::ExecutionStarted {
             color,
-            project_id: project.to_string(),
+            project_id: project,
             entry_node: "start".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
@@ -1574,7 +1572,7 @@ async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgP
         .expect("tag");
     tx.commit().await.unwrap();
     sqlx::query("INSERT INTO trigger_setup (project_id, color) VALUES ($1, $2)")
-        .bind(doomed.to_string())
+        .bind(doomed)
         .bind(first.to_string())
         .execute(&pool)
         .await
@@ -1590,7 +1588,7 @@ async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgP
         )
         .bind(token)
         .bind(TENANT)
-        .bind(doomed.to_string())
+        .bind(doomed)
         .bind(color.map(|c| c.to_string()))
         .bind(is_resume)
         .execute(&pool)
@@ -1600,7 +1598,7 @@ async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgP
     assert!(footprint(&pool, first).await > 0, "the run left something behind to erase");
 
     let erased = journal
-        .delete_project_executions(&doomed.to_string())
+        .delete_project_executions(doomed)
         .await
         .expect("erase the project's executions");
     assert_eq!(erased, 2, "both of the project's executions");
@@ -1639,9 +1637,9 @@ async fn executions_of_a_gone_project_can_be_found_again(pool: PgPool) {
 
     projects.remove(gone).await.expect("remove the project row");
     let orphaned = journal.projects_with_orphan_executions().await.expect("sweep");
-    assert_eq!(orphaned, vec![gone.to_string()], "the gone project's executions are findable");
+    assert_eq!(orphaned, vec![gone], "the gone project's executions are findable");
 
-    journal.delete_project_executions(&gone.to_string()).await.expect("erase");
+    journal.delete_project_executions(gone).await.expect("erase");
     assert_eq!(footprint(&pool, orphan).await, 0);
     assert!(
         journal.projects_with_orphan_executions().await.expect("sweep again").is_empty(),
@@ -1660,7 +1658,7 @@ async fn seed_worker_pod(pool: &PgPool, pod_name: &str, project: Uuid, binary_ha
          VALUES ($1, $2, 'weft-workers', 'alive', 'disp-1', $3, $3, $4)",
     )
     .bind(pod_name)
-    .bind(project.to_string())
+    .bind(project)
     .bind(now)
     .bind(binary_hash)
     .execute(pool)
@@ -1708,7 +1706,7 @@ async fn a_worker_promised_to_a_caller_does_not_shut_itself_down(pool: PgPool) {
     let now = weft_dispatcher::lease::now_unix();
     let reserved = weft_task_store::worker_pod::reserve_pod_for_caller(
         &pool,
-        &project.to_string(),
+        project,
         weft_platform_traits::SATURATION_MEM_FRACTION,
         Some("bin-A"),
         now + 240,
@@ -1777,13 +1775,13 @@ async fn reserving_a_pod_promises_it_and_never_shortens_the_promise(pool: PgPool
     };
     assert_eq!(held_until("wp-one").await, 0, "a fresh pod is promised to nobody");
 
-    let project_id = project.to_string();
+    let project_id = project;
     let reserve = |until: i64| {
-        let (pool, project_id) = (pool.clone(), project_id.clone());
+        let (pool, project_id) = (pool.clone(), project_id);
         async move {
             weft_task_store::worker_pod::reserve_pod_for_caller(
                 &pool,
-                &project_id,
+                project_id,
                 weft_platform_traits::SATURATION_MEM_FRACTION,
                 Some("bin-A"),
                 until,
@@ -1813,11 +1811,105 @@ async fn reserving_a_pod_promises_it_and_never_shortens_the_promise(pool: PgPool
 async fn reserve_other(pool: &PgPool, project: Uuid, until: i64) -> Option<(String, String)> {
     weft_task_store::worker_pod::reserve_pod_for_caller(
         pool,
-        &project.to_string(),
+        project,
         weft_platform_traits::SATURATION_MEM_FRACTION,
         Some("bin-OTHER"),
         until,
     )
     .await
     .expect("reserve")
+}
+
+/// A removed project's queued work and workers are found for clearing;
+/// a live project's never are, and neither is a node-test pod (its
+/// scratch project is never a row).
+#[sqlx::test]
+async fn a_removed_projects_work_and_workers_are_cleared_and_nothing_else(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let live = Uuid::from_u128(1);
+    let removed = Uuid::from_u128(2);
+    seed_project(&projects, live, "bin").await;
+    let queue = |project: Uuid, key: &'static str| {
+        let pool = pool.clone();
+        async move {
+            weft_task_store::tasks::enqueue_dedup(
+                &pool,
+                weft_task_store::tasks::NewTask {
+                    kind: "execute".into(),
+                    target: weft_task_store::TaskTarget::Worker,
+                    project_id: Some(project),
+                    dedup_key: Some(key.into()),
+                    color: None,
+                    tenant_id: Some(TENANT.into()),
+                    target_pod_name: None,
+                    binary_hash: Some("bin".into()),
+                    payload: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    };
+    queue(live, "a").await;
+    queue(removed, "b").await;
+    // Work of the removed project the sweep must leave alone: a worker
+    // task already claimed (its worker finishes or the orphan sweep
+    // recovers it), and a pending task for the dispatcher.
+    queue(removed, "claimed").await;
+    sqlx::query("UPDATE task SET status = 'claimed' WHERE dedup_key = 'claimed'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    weft_task_store::tasks::enqueue_dedup(
+        &pool,
+        weft_task_store::tasks::NewTask {
+            kind: "execute".into(),
+            target: weft_task_store::TaskTarget::Dispatcher,
+            project_id: Some(removed),
+            dedup_key: Some("dispatcher".into()),
+            color: None,
+            tenant_id: Some(TENANT.into()),
+            target_pod_name: None,
+            binary_hash: None,
+            payload: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    for (pod, project, role) in [("wp-live", live, "worker"), ("wp-gone", removed, "worker"), ("nt-gone", removed, "node-test")] {
+        weft_task_store::worker_pod::insert_spawning(&pool, pod, project, "ns", "d", Some("bin"), role, None)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(weft_dispatcher::reaper::drop_work_of_removed_projects(&pool).await.unwrap(), 1);
+    let left: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT project_id, dedup_key FROM task ORDER BY dedup_key").fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        left,
+        vec![(live, "a".to_string()), (removed, "claimed".to_string()), (removed, "dispatcher".to_string())]
+    );
+    let workers: Vec<String> = weft_dispatcher::reaper::workers_of_removed_projects(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.pod_name)
+        .collect();
+    assert_eq!(workers, vec!["wp-gone".to_string()]);
+}
+
+/// A spawn queued for a project removed since completes as a no-op: a
+/// worker brought up for it would only be killed by the removed-projects
+/// sweep. A live project with no pod still spawns.
+#[sqlx::test]
+async fn a_spawn_for_a_removed_project_does_nothing(pool: PgPool) {
+    use weft_dispatcher::task_kinds::spawn_pod::{nothing_to_spawn, SKIP_PROJECT_REMOVED};
+    let (_journal, projects) = setup(&pool).await;
+    let live = Uuid::from_u128(1);
+    seed_project(&projects, live, "bin").await;
+    assert_eq!(nothing_to_spawn(&pool, live, "bin").await.unwrap(), None);
+    assert_eq!(
+        nothing_to_spawn(&pool, Uuid::from_u128(2), "bin").await.unwrap(),
+        Some(SKIP_PROJECT_REMOVED)
+    );
 }

@@ -57,7 +57,7 @@ impl std::fmt::Display for TenantId {
 /// loud rather than forking it into optional/required variants).
 #[async_trait]
 pub trait TenantRouter: Send + Sync {
-    async fn tenant_for_project(&self, project_id: &str) -> Result<TenantId>;
+    async fn tenant_for_project(&self, project_id: uuid::Uuid) -> Result<TenantId>;
 }
 
 /// The built-in router: every project belongs to tenant `local`. No I/O; the
@@ -66,7 +66,7 @@ pub struct LocalTenantRouter;
 
 #[async_trait]
 impl TenantRouter for LocalTenantRouter {
-    async fn tenant_for_project(&self, _project_id: &str) -> Result<TenantId> {
+    async fn tenant_for_project(&self, _project_id: uuid::Uuid) -> Result<TenantId> {
         Ok(TenantId::local())
     }
 }
@@ -83,7 +83,7 @@ mod tests {
     async fn local_router_returns_local_tenant() {
         let r = LocalTenantRouter;
         assert_eq!(
-            r.tenant_for_project("any-project").await.unwrap(),
+            r.tenant_for_project(uuid::Uuid::from_u128(0x107)).await.unwrap(),
             TenantId::local()
         );
     }

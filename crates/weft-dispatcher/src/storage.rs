@@ -441,7 +441,21 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
-        "#],
+        "#,
+        // Wake the sweep reaper when a color is queued.
+        // SYNC: 'weft_storage_sweep' <-> crate::reaper::STORAGE_SWEEP_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION storage_sweep_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_storage_sweep', NEW.color);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS storage_sweep_notify_on_insert ON storage_sweep"#,
+        r#"CREATE TRIGGER storage_sweep_notify_on_insert
+            AFTER INSERT ON storage_sweep
+            FOR EACH ROW
+            EXECUTE FUNCTION storage_sweep_notify()"#,
+    ],
     seed: &[],
 };
 

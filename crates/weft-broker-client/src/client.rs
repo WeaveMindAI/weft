@@ -13,7 +13,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use weft_core::Color;
-use weft_journal::{ExecEvent, JournalClient};
+use weft_journal::{ExecEvent, JournalClient, RawJournalRow};
 use weft_task_store::tasks::{
     ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
 };
@@ -24,16 +24,18 @@ use crate::token::TokenSource;
 
 #[derive(Clone)]
 struct HttpCore {
-    /// Default-timeout client for short-call endpoints. Long-poll
-    /// callers (`wait_for_terminal`) build a per-call client via
-    /// `with_timeout` instead so the HTTP deadline doesn't fire
-    /// before the broker's own polling deadline.
+    /// One client (one connection pool) for every call, short or held;
+    /// a held call sets its own per-request timeout.
     client: reqwest::Client,
     base_url: String,
     token: TokenSource,
 }
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much longer than the hold the HTTP layer waits for a held
+/// answer, so the network never cuts a hold the broker is about to end.
+const HOLD_GRACE: Duration = Duration::from_secs(5);
 
 impl HttpCore {
     pub fn new(base_url: String, token: TokenSource) -> Self {
@@ -53,47 +55,42 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<Res> {
-        self.post_with(path, body, &self.client).await
+        let resp = self.post_raw(path, body, None).await?;
+        Self::parse_success(resp, path).await
     }
 
-    /// Long-poll variant: caller supplies the broker-side timeout
-    /// budget; the HTTP client gets `budget + buffer` so reqwest
-    /// can't abort before the broker's own deadline fires.
-    async fn post_with_timeout<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
+    /// A call the broker holds open for up to `hold` (never more than
+    /// `MAX_HOLD`, which it enforces). The HTTP deadline is the hold plus
+    /// [`HOLD_GRACE`], so it never fires before the broker's own.
+    async fn post_held<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
         path: &str,
         body: &Req,
-        budget: Duration,
+        hold: Duration,
     ) -> Result<Res> {
-        let http_budget = budget + Duration::from_secs(5);
-        let client = reqwest::Client::builder()
-            .timeout(http_budget)
-            .build()
-            .expect("reqwest client builds");
-        self.post_with(path, body, &client).await
+        let resp = self.post_raw(path, body, Some(hold + HOLD_GRACE)).await?;
+        Self::parse_success(resp, path).await
     }
 
     /// Single POST core: build the request (url join, bearer token,
-    /// JSON body), send, hand back the raw response. Status
-    /// interpretation lives in the thin wrappers (`post_with` =
-    /// 2xx-or-error, `post_or_404` = 404 is "no row", `post_fenced`
-    /// = 410 / 409 are the two stale `WriteOutcome`s) so the build/send
-    /// body exists exactly once.
+    /// JSON body, the timeout when it is not the client's), send, hand
+    /// back the raw response. Status interpretation lives in the thin
+    /// wrappers (`post` = 2xx-or-error, `post_or_404` = 404 is "no row",
+    /// `post_fenced` = 410 / 409 are the two stale `WriteOutcome`s) so
+    /// the build/send body exists exactly once.
     async fn post_raw<Req: Serialize>(
         &self,
         path: &str,
         body: &Req,
-        client: &reqwest::Client,
+        timeout: Option<Duration>,
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let bearer = self.token.read().await.context("read SA token")?;
-        client
-            .post(&url)
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {path}"))
+        let mut request = self.client.post(&url).bearer_auth(bearer).json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        request.send().await.with_context(|| format!("POST {path}"))
     }
 
     /// Shared 2xx gate + JSON parse for the status-interpreting
@@ -104,20 +101,10 @@ impl HttpCore {
     ) -> Result<Res> {
         if !resp.status().is_success() {
             let code = resp.status();
-            let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!("broker {path} returned {code}: {txt}");
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BrokerRefused { path: path.to_string(), status: code, body }.into());
         }
         resp.json().await.with_context(|| format!("parse {path}"))
-    }
-
-    async fn post_with<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
-        &self,
-        path: &str,
-        body: &Req,
-        client: &reqwest::Client,
-    ) -> Result<Res> {
-        let resp = self.post_raw(path, body, client).await?;
-        Self::parse_success(resp, path).await
     }
 
     /// Variant of `post` for content-addressed reads where 404 means
@@ -131,7 +118,7 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<Option<Res>> {
-        let resp = self.post_raw(path, body, &self.client).await?;
+        let resp = self.post_raw(path, body, None).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -150,13 +137,24 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<WriteOutcome<Res>> {
-        let resp = self.post_raw(path, body, &self.client).await?;
+        let resp = self.post_raw(path, body, None).await?;
         match resp.status() {
             reqwest::StatusCode::GONE => Ok(WriteOutcome::Displaced),
             reqwest::StatusCode::CONFLICT => Ok(WriteOutcome::Gone),
             _ => Ok(WriteOutcome::Applied(Self::parse_success(resp, path).await?)),
         }
     }
+}
+
+/// The broker answered a non-2xx status. Typed so a caller can tell
+/// one refusal from another (`anyhow::Error::downcast_ref`) instead of
+/// reading the message.
+#[derive(Debug, thiserror::Error)]
+#[error("broker {path} returned {status}: {body}")]
+pub struct BrokerRefused {
+    pub path: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
 }
 
 /// Outcome of a fenced lifecycle write. `Applied(_)`: the write
@@ -191,6 +189,77 @@ impl<T> WriteOutcome<T> {
     }
     pub fn is_gone(&self) -> bool {
         matches!(self, WriteOutcome::Gone)
+    }
+}
+
+/// Wait up to `wait` in holds the broker grants (each at most
+/// `MAX_HOLD`, which it enforces), asking again after a hold that ended
+/// without the answer `done` looks for. Hands back the last answer. A
+/// `hold` that waits out an unavailable broker ([`read_until_answered`])
+/// stretches past `wait` by as long as the broker stays down.
+async fn held<T, F, Fut>(wait: Duration, mut hold: F, done: impl Fn(&T) -> bool) -> Result<T>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let answer = hold(left.min(weft_task_store::pg_signal::MAX_HOLD)).await?;
+        if done(&answer) || left <= weft_task_store::pg_signal::MAX_HOLD {
+            return Ok(answer);
+        }
+    }
+}
+
+/// The first wait before asking again after the broker could not answer
+/// a read; each further failure doubles it, up to
+/// [`READ_RETRY_LONGEST`].
+const READ_RETRY_FIRST: Duration = Duration::from_millis(200);
+const READ_RETRY_LONGEST: Duration = Duration::from_secs(5);
+
+/// Whether a failed broker call means the broker could not answer right
+/// now: it could not be reached, or it said so (503, which it answers
+/// when its database is unreachable). Any other status, including a 500
+/// (a row that does not decode fails the same way every time), or an
+/// answer that does not parse, would say the same thing again, so it is
+/// not.
+// SYNC: 503 = ask again <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
+fn broker_unavailable(e: &anyhow::Error) -> bool {
+    if let Some(refused) = e.downcast_ref::<BrokerRefused>() {
+        return refused.status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+    }
+    e.downcast_ref::<reqwest::Error>().is_some_and(|e| !e.is_decode())
+}
+
+/// Run a read of a run's history until the broker answers it. Reading
+/// again is free (nothing is written), and one failed read would
+/// otherwise fail the whole run, so an unavailable broker is waited out
+/// with a short backoff, every miss logged; a refusal still fails at
+/// once. No deadline: the run is waiting on its own history, and a
+/// broker that stays down shows in these warnings (`weft stop` ends the
+/// run).
+async fn read_until_answered<T, F, Fut>(path: &str, mut read: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut retry = READ_RETRY_FIRST;
+    loop {
+        match read().await {
+            Err(e) if broker_unavailable(&e) => {
+                tracing::warn!(
+                    target: "weft_broker_client",
+                    path,
+                    error = %format!("{e:#}"),
+                    retry_in_ms = retry.as_millis() as u64,
+                    "the broker could not answer a read of this run's history; asking again"
+                );
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(READ_RETRY_LONGEST);
+            }
+            answer => return answer,
+        }
     }
 }
 
@@ -231,36 +300,44 @@ impl JournalClient for BrokerJournalClient {
         Ok(())
     }
 
-    async fn events_for_color(&self, color: Color) -> Result<Vec<ExecEvent>> {
-        let payloads = self.raw_events_for_color(color).await?;
-        let mut out = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            // The broker ferried raw bytes; THIS side decodes, so a
-            // field the broker's build does not know can never be
-            // silently stripped in transit, and an undecodable row
-            // fails the resume fold loudly (same contract as the
-            // direct-postgres client).
-            out.push(
-                weft_journal::decode_event(color, &payload).map_err(anyhow::Error::msg)?,
-            );
-        }
-        Ok(out)
-    }
-
-    async fn raw_events_for_color(&self, color: Color) -> Result<Vec<String>> {
-        let req = JournalFetchRequest {
-            color: color.to_string(),
-        };
-        let resp: JournalFetchResponse = self.http.post("/v1/journal/fetch", &req).await?;
-        Ok(resp.payloads)
+    async fn raw_rows_after(
+        &self,
+        color: Color,
+        after_id: i64,
+        wait: Duration,
+    ) -> Result<Vec<RawJournalRow>> {
+        // The broker ferries raw bytes; the trait's `rows_after` decodes
+        // on THIS side, so a field the broker's build does not know can
+        // never be silently stripped in transit, and an undecodable row
+        // fails the fold loudly (same contract as the direct-postgres
+        // client).
+        held(
+            wait,
+            |hold| async move {
+                let req = JournalWaitRequest {
+                    color: color.to_string(),
+                    after_id,
+                    wait_ms: hold.as_millis() as u64,
+                };
+                let resp: JournalWaitResponse = read_until_answered("/v1/journal/wait", || {
+                    self.http.post_held("/v1/journal/wait", &req, hold)
+                })
+                .await?;
+                Ok(resp.rows)
+            },
+            |rows| !rows.is_empty(),
+        )
+        .await
     }
 
     async fn has_terminal_event(&self, color: Color) -> Result<bool> {
         let req = JournalHasTerminalRequest {
             color: color.to_string(),
         };
-        let resp: JournalHasTerminalResponse =
-            self.http.post("/v1/journal/has_terminal", &req).await?;
+        let resp: JournalHasTerminalResponse = read_until_answered("/v1/journal/has_terminal", || {
+            self.http.post("/v1/journal/has_terminal", &req)
+        })
+        .await?;
         Ok(resp.terminal)
     }
 }
@@ -296,24 +373,36 @@ impl TaskStoreClient for BrokerTaskStoreClient {
     }
 
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
-        let req = TaskWaitTerminalRequest::new(task_id, timeout);
-        // The broker-side wait can run for the full `timeout` budget,
-        // so the HTTP layer must not abort sooner. Per-call client
-        // gets `timeout + 5s` of grace.
-        let resp: TaskWaitTerminalResponse = self
-            .http
-            .post_with_timeout("/v1/task/wait_terminal", &req, timeout)
-            .await?;
-        Ok(resp.into_outcome())
+        held(
+            timeout,
+            |hold| async move {
+                let req = TaskWaitTerminalRequest { task_id, wait_ms: hold.as_millis() as u64 };
+                let resp: TaskWaitTerminalResponse =
+                    self.http.post_held("/v1/task/wait_terminal", &req, hold).await?;
+                Ok(resp.into_outcome())
+            },
+            |outcome| outcome.status.is_terminal(),
+        )
+        .await
     }
 
-    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter) -> Result<Option<Task>> {
-        let req = TaskClaimOneRequest {
-            pod_id: pod_id.to_string(),
-            filter,
-        };
-        let resp: TaskClaimOneResponse = self.http.post("/v1/task/claim_one", &req).await?;
-        Ok(resp.task)
+    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
+        held(
+            wait,
+            |hold| {
+                let req = TaskClaimOneRequest {
+                    pod_id: pod_id.to_string(),
+                    filter: filter.clone(),
+                    wait_ms: hold.as_millis() as u64,
+                };
+                async move {
+                    let resp: TaskClaimOneResponse = self.http.post_held("/v1/task/claim_one", &req, hold).await?;
+                    Ok(resp.task)
+                }
+            },
+            Option::is_some,
+        )
+        .await
     }
 
     async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
@@ -374,11 +463,11 @@ impl WorkerPodClient for BrokerWorkerPodClient {
     async fn register_alive(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: Uuid,
     ) -> Result<()> {
         let req = WorkerPodRegisterAliveRequest {
             pod_name: pod_name.to_string(),
-            project_id: project_id.to_string(),
+            project_id,
         };
         let _: WorkerPodRegisterAliveResponse = self
             .http
@@ -495,20 +584,20 @@ impl BrokerInfraClient {
 
 #[async_trait]
 impl InfraReader for BrokerInfraClient {
-    async fn endpoint_url(
+    async fn endpoint_address(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         endpoint_name: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let req = InfraEndpointUrlRequest {
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
             endpoint_name: endpoint_name.to_string(),
         };
         let resp: InfraEndpointUrlResponse =
             self.http.post("/v1/infra/endpoint_url", &req).await?;
-        Ok(resp.endpoint_url)
+        Ok(resp.address)
     }
 }
 
@@ -600,16 +689,14 @@ impl BrokerExecutionClient {
         tag: String,
         stop_self: weft_core::StopSelf,
         pod_name: &str,
-    ) -> Result<()> {
+    ) -> Result<ExecutionStopTaggedResponse> {
         let req = ExecutionStopTaggedRequest {
             color: color.to_string(),
             tag,
             stop_self,
             pod_name: pod_name.to_string(),
         };
-        let _: ExecutionStopTaggedResponse =
-            self.http.post("/v1/execution/stop_tagged", &req).await?;
-        Ok(())
+        self.http.post("/v1/execution/stop_tagged", &req).await
     }
 }
 
@@ -642,11 +729,11 @@ impl BrokerProjectClient {
     /// upstream, not a recoverable race.
     pub async fn fetch_definition(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         expected_hash: &str,
     ) -> Result<Option<ProjectFetchDefinitionResponse>> {
         let req = ProjectFetchDefinitionRequest {
-            project_id: project_id.to_string(),
+            project_id,
             expected_hash: expected_hash.to_string(),
         };
         self.http
@@ -671,14 +758,15 @@ impl BrokerSupervisorClient {
     }
 
     /// Sync this supervisor pod's project ownership: renew its existing
-    /// leases, claim up to `saturation` more unowned projects' infra
-    /// (the exclusive `infra_owner` lease), and return the full set it
-    /// now owns. The supervisor acts ONLY on the returned projects.
+    /// leases, claim a batch more unowned projects' infra while below
+    /// saturation (the exclusive `infra_owner` lease), and return the
+    /// full set it now owns plus the ones this tick took on. The
+    /// supervisor acts ONLY on the owned projects.
     pub async fn sync_ownership(
         &self,
         pod_name: &str,
         mem_pressure: f64,
-    ) -> Result<Vec<SupervisorProject>> {
+    ) -> Result<SupervisorSyncOwnershipResponse> {
         let req = SupervisorSyncOwnershipRequest {
             pod_name: pod_name.to_string(),
             mem_pressure,
@@ -687,7 +775,7 @@ impl BrokerSupervisorClient {
             .http
             .post("/v1/supervisor/sync_ownership", &req)
             .await?;
-        Ok(resp.owned)
+        Ok(resp)
     }
 
     /// Pure read of the projects this pod owns (no claim/renew). The work
@@ -703,9 +791,9 @@ impl BrokerSupervisorClient {
         Ok(resp.owned)
     }
 
-    pub async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>> {
+    pub async fn infra_nodes(&self, project_id: Uuid) -> Result<Vec<SupervisorInfraNode>> {
         let req = SupervisorInfraNodesRequest {
-            project_id: project_id.to_string(),
+            project_id,
         };
         let resp: SupervisorInfraNodesResponse =
             self.http.post("/v1/supervisor/infra_nodes", &req).await?;
@@ -714,10 +802,10 @@ impl BrokerSupervisorClient {
 
     pub async fn health_protocols(
         &self,
-        project_id: &str,
+        project_id: Uuid,
     ) -> Result<Option<serde_json::Value>> {
         let req = SupervisorHealthProtocolsRequest {
-            project_id: project_id.to_string(),
+            project_id,
         };
         let resp: SupervisorHealthProtocolsResponse = self
             .http
@@ -726,27 +814,41 @@ impl BrokerSupervisorClient {
         Ok(resp.protocols)
     }
 
+    /// The oldest waiting command of a project this supervisor owns and
+    /// is not already running a command for (`busy_projects`), holding
+    /// up to `wait` for one to be issued when none is waiting.
     pub async fn claim_command(
         &self,
         claimer_pod: &str,
-    ) -> Result<Option<SupervisorCommandRow>> {
-        let req = SupervisorClaimCommandRequest {
-            claimer_pod: claimer_pod.to_string(),
-        };
-        let resp: SupervisorClaimCommandResponse =
-            self.http.post("/v1/supervisor/claim_command", &req).await?;
-        Ok(resp.command)
+        busy_projects: &[Uuid],
+        wait: Duration,
+    ) -> Result<SupervisorClaim> {
+        held(
+            wait,
+            |hold| {
+                let req = SupervisorClaimCommandRequest {
+                    claimer_pod: claimer_pod.to_string(),
+                    busy_projects: busy_projects.to_vec(),
+                    wait_ms: hold.as_millis() as u64,
+                };
+                async move {
+                    self.http.post_held("/v1/supervisor/claim_command", &req, hold).await
+                }
+            },
+            |claim| !matches!(claim, SupervisorClaim::Nothing),
+        )
+        .await
     }
 
     pub async fn event_record(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: Option<&str>,
         event: crate::protocol::InfraEvent,
     ) -> Result<i64> {
         let (kind, payload) = event.into_record();
         let req = SupervisorEventRecordRequest {
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.map(|s| s.to_string()),
             kind,
             payload,
@@ -760,7 +862,7 @@ impl BrokerSupervisorClient {
         &self,
         pod_name: &str,
         command_id: Option<i64>,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         unit: Option<&str>,
         status: crate::protocol::InfraNodeStatus,
@@ -770,7 +872,7 @@ impl BrokerSupervisorClient {
         let req = SupervisorSetStatusRequest {
             pod_name: pod_name.to_string(),
             command_id,
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
             unit: unit.map(|s| s.to_string()),
             status,
@@ -788,12 +890,12 @@ impl BrokerSupervisorClient {
     pub async fn remove_node(
         &self,
         pod_name: &str,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
     ) -> Result<WriteOutcome<SupervisorRemoveNodeResponse>> {
         let req = SupervisorRemoveNodeRequest {
             pod_name: pod_name.to_string(),
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
         };
         self.http
@@ -833,9 +935,9 @@ impl BrokerSupervisorClient {
         Ok(resp.cancel_requested)
     }
 
-    pub async fn running_count(&self, project_id: &str) -> Result<i64> {
+    pub async fn running_count(&self, project_id: Uuid) -> Result<i64> {
         let req = SupervisorRunningCountRequest {
-            project_id: project_id.to_string(),
+            project_id,
         };
         let resp: SupervisorRunningCountResponse =
             self.http.post("/v1/supervisor/running_count", &req).await?;
@@ -846,9 +948,9 @@ impl BrokerSupervisorClient {
     /// infra_lifecycle_command: apply / stop / terminate) is in flight
     /// for the project. The health loop stands down for the project
     /// while this holds, so it never fights the action.
-    pub async fn infra_command_in_flight(&self, project_id: &str) -> Result<bool> {
+    pub async fn infra_command_in_flight(&self, project_id: Uuid) -> Result<bool> {
         let req = SupervisorInfraCommandInFlightRequest {
-            project_id: project_id.to_string(),
+            project_id,
         };
         let resp: SupervisorInfraCommandInFlightResponse = self
             .http
@@ -859,10 +961,10 @@ impl BrokerSupervisorClient {
 
     pub async fn trigger_deps(
         &self,
-        project_id: &str,
+        project_id: Uuid,
     ) -> Result<Vec<SupervisorTriggerDep>> {
         let req = SupervisorTriggerDepsRequest {
-            project_id: project_id.to_string(),
+            project_id,
         };
         let resp: SupervisorTriggerDepsResponse =
             self.http.post("/v1/supervisor/trigger_deps", &req).await?;
@@ -873,11 +975,11 @@ impl BrokerSupervisorClient {
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         instance_id: &str,
         applied_spec_hash: &str,
-        endpoints: std::collections::BTreeMap<String, String>,
+        addresses: AppliedEndpoints,
         namespace: &str,
         preserve_pvcs: Vec<String>,
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
@@ -885,11 +987,11 @@ impl BrokerSupervisorClient {
         let req = SupervisorSetAppliedRequest {
             pod_name: pod_name.to_string(),
             command_id,
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
             instance_id: instance_id.to_string(),
             applied_spec_hash: applied_spec_hash.to_string(),
-            endpoints,
+            addresses,
             namespace: namespace.to_string(),
             preserve_pvcs,
             units,
@@ -909,7 +1011,7 @@ impl BrokerSupervisorClient {
         &self,
         pod_name: &str,
         command_id: i64,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         instance_id: &str,
         namespace: &str,
@@ -919,7 +1021,7 @@ impl BrokerSupervisorClient {
         let req = SupervisorSetProvisioningRequest {
             pod_name: pod_name.to_string(),
             command_id,
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
             instance_id: instance_id.to_string(),
             namespace: namespace.to_string(),
@@ -936,11 +1038,11 @@ impl BrokerSupervisorClient {
 
     pub async fn project_image_tags(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
         let req = SupervisorProjectImageTagsRequest {
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
         };
         let resp: SupervisorProjectImageTagsResponse = self
@@ -957,11 +1059,11 @@ impl BrokerSupervisorClient {
     /// accidentally enqueue a supervisor-owned verb.
     pub async fn enqueue_lifecycle(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         spec: crate::protocol::LifecycleSpec,
     ) -> Result<i64> {
         let req = SupervisorEnqueueLifecycleRequest {
-            project_id: project_id.to_string(),
+            project_id,
             spec,
         };
         let resp: SupervisorEnqueueLifecycleResponse = self
@@ -989,12 +1091,12 @@ impl BrokerInfraStateClient {
 
     pub async fn enqueue_apply(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         node_id: &str,
         spec_json: serde_json::Value,
     ) -> Result<i64> {
         let req = InfraEnqueueApplyRequest {
-            project_id: project_id.to_string(),
+            project_id,
             node_id: node_id.to_string(),
             spec_json,
         };
@@ -1003,17 +1105,75 @@ impl BrokerInfraStateClient {
         Ok(resp.command_id)
     }
 
+    /// The apply command's state, holding up to `wait` for it to
+    /// complete.
     pub async fn wait_apply(
         &self,
-        project_id: &str,
+        project_id: Uuid,
         command_id: i64,
+        wait: Duration,
     ) -> Result<InfraWaitApplyResponse> {
-        let req = InfraWaitApplyRequest {
-            project_id: project_id.to_string(),
-            command_id,
-        };
-        let resp: InfraWaitApplyResponse =
-            self.http.post("/v1/infra/wait_apply", &req).await?;
-        Ok(resp)
+        held(
+            wait,
+            |hold| {
+                let req = InfraWaitApplyRequest {
+                    project_id,
+                    command_id,
+                    wait_ms: hold.as_millis() as u64,
+                };
+                async move { self.http.post_held("/v1/infra/wait_apply", &req, hold).await }
+            },
+            |resp: &InfraWaitApplyResponse| resp.completed,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod read_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn refused(status: reqwest::StatusCode) -> anyhow::Error {
+        BrokerRefused { path: "/v1/journal/wait".into(), status, body: String::new() }.into()
+    }
+
+    #[test]
+    fn only_a_503_or_no_answer_is_unavailable() {
+        assert!(broker_unavailable(&refused(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(!broker_unavailable(&refused(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(!broker_unavailable(&refused(reqwest::StatusCode::FORBIDDEN)));
+        assert!(!broker_unavailable(&refused(reqwest::StatusCode::NOT_FOUND)));
+        assert!(!broker_unavailable(&anyhow::anyhow!("read SA token")));
+    }
+
+    /// A broker that fails twice and then answers: the read waits it out
+    /// and hands back the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waits_out_an_unavailable_broker() {
+        let calls = AtomicU32::new(0);
+        let answer = read_until_answered("/v1/journal/wait", || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(refused(reqwest::StatusCode::SERVICE_UNAVAILABLE)),
+                _ => Ok(7),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A refusal would say the same thing again: it fails at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_fails_at_once() {
+        let calls = AtomicU32::new(0);
+        let answer: Result<u32> = read_until_answered("/v1/journal/wait", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(refused(reqwest::StatusCode::FORBIDDEN))
+        })
+        .await;
+        assert!(answer.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

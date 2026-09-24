@@ -751,7 +751,7 @@
 					while (pid) {
 						const parent = nodeById.get(pid);
 						if (!parent) break;
-						const parentExpanded = (parent.data.config as Record<string, boolean>)?.expanded ?? true;
+						const parentExpanded = (parent.data.config as Record<string, boolean>)?.expanded ?? false;
 						if (!parentExpanded) return true;
 						pid = (parent.data.config as Record<string, string>)?.parentId;
 					}
@@ -766,7 +766,7 @@
 					if (hidden) hiddenNodeIds.add(n.id);
 					// Check if the direct parent is expanded (for xyflow parentId assignment)
 					const directParent = nodeById.get(rawParentId);
-					const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? true) : false;
+					const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? false) : false;
 					const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
 					// Hidden through xyflow's own flag, never through a display:none
 					// style: a node styled away keeps its last measured size (the
@@ -1313,7 +1313,7 @@
 				// the node's pre-collapse footprint, so the parent never shrinks.
 				const pinned = pinnedIds.has(n.id);
 				const drawsAtConfigDims = n.nodeType === 'Annotation'
-					|| drawnExpanded(pinned, cfg, isContainer);
+					|| drawnExpanded(pinned, cfg);
 				// Simplified leaf: prefer the MEASURED size (real drawn footprint of the
 				// square or the live-display card), falling back to the base square as a
 				// lower bound before the DOM is measured. NEVER the builder min-width
@@ -1360,7 +1360,7 @@
 				return {
 					id: n.id,
 					parentId: cfg?.parentId as string | undefined,
-					container: isContainer && drawnExpanded(pinned, cfg, true),
+					container: isContainer && drawnExpanded(pinned, cfg),
 					x: entry?.x ?? n.position.x,
 					y: entry?.y ?? n.position.y,
 					w,
@@ -1381,14 +1381,14 @@
 			if (rawParentId) {
 				const directParent = projectNodes.find(g => g.id === rawParentId);
 				parentGroupExpanded = directParent
-					? drawnExpanded(pinnedIds.has(directParent.id), directParent.config as Record<string, unknown>, true)
+					? drawnExpanded(pinnedIds.has(directParent.id), directParent.config as Record<string, unknown>)
 					: false;
 				// Check full ancestor chain
 				let pid: string | undefined = rawParentId;
 				while (pid) {
 					const ancestor = projectNodes.find(g => g.id === pid);
 					if (!ancestor) break;
-					if (!drawnExpanded(pinnedIds.has(ancestor.id), ancestor.config as Record<string, unknown>, true)) {
+					if (!drawnExpanded(pinnedIds.has(ancestor.id), ancestor.config as Record<string, unknown>)) {
 						hiddenByCollapsedGroup = true;
 						break;
 					}
@@ -1400,7 +1400,7 @@
 			const configWidth = (n.config as Record<string, number>)?.width;
 			const configHeight = (n.config as Record<string, number>)?.height;
 			const isExpanded =
-				drawnExpanded(pinnedIds.has(n.id), n.config as Record<string, unknown>, isGroup);
+				drawnExpanded(pinnedIds.has(n.id), n.config as Record<string, unknown>);
 
 			// Nesting depth so child groups render above parent groups.
 			let nestingDepth = 0;
@@ -2478,12 +2478,12 @@
 	}
 
 	/// The drawn expanded state: the unconnected-access pin wins, then
-	/// config, then the container default. THE one rule for every sizing
+	/// config, else collapsed (containers too: every group and loop starts closed). THE one rule for every sizing
 	/// and containment reader, so no path can draw a pinned node
 	/// collapsed under its open body (ProjectNode's render derived is
 	/// the same expression over `data.pinnedOpen`).
-	function drawnExpanded(pinned: boolean, cfg: Record<string, unknown> | undefined, isGroup: boolean): boolean {
-		return pinned || ((cfg?.expanded as boolean | undefined) ?? (isGroup ? true : false));
+	function drawnExpanded(pinned: boolean, cfg: Record<string, unknown> | undefined): boolean {
+		return pinned || ((cfg?.expanded as boolean | undefined) ?? false);
 	}
 
 	// Restyle a live xyflow node from its (possibly just-edited) data, via the
@@ -2495,7 +2495,7 @@
 		const sizing = computeSizing({
 			isGroup,
 			isAnnotation: n.type === 'annotation',
-			isExpanded: drawnExpanded(!!newData.pinnedOpen, cfg, isGroup),
+			isExpanded: drawnExpanded(!!newData.pinnedOpen, cfg),
 			configWidth: cfg?.width as number | undefined,
 			configHeight: cfg?.height as number | undefined,
 			fallbackWidth: rect?.width,
@@ -3735,7 +3735,7 @@
 	 *  preflight; the rejected-gesture path stays singular. */
 	function checkGroupCapturesNodes(group: Node, draggedIds: Set<string> = new Set()) {
 		// Collapsed groups don't capture nodes
-		if (!((group.data.config as Record<string, unknown>)?.expanded ?? true)) return;
+		if (!((group.data.config as Record<string, unknown>)?.expanded ?? false)) return;
 
 		const groupAbs = getAbsolutePosition(group);
 		let blocked = false;

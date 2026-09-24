@@ -1001,7 +1001,7 @@ async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
 
 /// What the two compile caches on this host take on disk and how to
 /// drop each: the node-test cache `weft test-node` builds into, and the
-/// worker compile cache every image build shares, per cache key.
+/// worker compile caches image builds share, per cache key and lane.
 async fn report_compile_cache_size() -> anyhow::Result<()> {
     match super::test_node::cache_size_bytes()? {
         None => println!("node-test cache: nothing built on this host"),
@@ -1017,12 +1017,16 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
         return Ok(());
     }
     let sizes: Vec<String> = caches.iter().map(|cache| {
-        if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) }
+        let mut line = if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) };
+        if let Some(suffix) = &cache.unreadable_lane {
+            line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id));
+        }
+        line
     }).collect();
     println!(
-        "worker compile cache: {} across {} key(s); a build drops the per-project crates no build on this host \
-         has linked for {} days, `weft clean --images --all` drops retired caches unused that long, \
-         `weft clean --build-cache` drops everything now",
+        "worker compile cache: {} across {} cache(s) (one per key and compile lane); a build drops the per-project crates no build on this host \
+         has linked for {} days, `weft clean --images --all` drops another key's spare lanes once unused for a day \
+         and its first lane once unused that long, `weft clean --build-cache` drops everything now",
         sizes.join(" + "),
         caches.len(),
         weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
@@ -1030,28 +1034,70 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer (`--all` only): compile caches under a RETIRED key that no build
-/// has used for the retention period. The key changes with the build
-/// environment or the builder, and nothing ever mounts the old one again,
+/// Layer (`--all` only): compile caches under a RETIRED key. The key
+/// changes with the build environment or the builder, and nothing mounts
+/// the old one again unless a checkout goes back to it (a branch switch),
 /// so its own sweep never runs; this is the only thing that reclaims it.
-/// The current checkout's key is never dropped, however long since the
-/// last build: it is the one the next build wants.
+/// A key that is not this checkout's may still be another worktree's on
+/// this machine, so a lane goes only once no build has used it for a
+/// while: a spare lane after [`SPARE_LANE_IDLE_DAYS`], the first lane
+/// after the retention period. The current checkout's key is never
+/// dropped, however long since the last build: it is the
+/// one the next build wants.
 async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
     let retention = u64::from(weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS);
     let weft_root = weft_compiler::build::resolve_weft_root()?;
     let current = weft_compiler::hash::compute_worker_cache_key(&weft_root, "builder-base")?;
     let mut failures = Vec::new();
     for cache in crate::images::worker_compile_caches().await? {
-        if cache.key == current || cache.idle_days < retention {
-            continue;
+        let Some(why) = retired_cache_drop(&cache, &current, retention) else { continue };
+        if why == RetiredDrop::SpareLane {
+            println!("dropping a retired worker compile cache's spare lane {} ({})", cache.lane.unwrap_or_default(), cache.size);
+        } else {
+            println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size);
         }
-        println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size);
         if let Err(error) = crate::images::prune_build_record(&cache.id).await {
             failures.push(format!("{error:#}"));
         }
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
+}
+
+/// A spare lane of another key goes once unused this long. Lanes only
+/// pay off while builds under their key run side by side, so a key
+/// nobody built with for a day keeps its first lane alone; a key being
+/// built with (another worktree's, say) touches its lanes every build.
+const SPARE_LANE_IDLE_DAYS: u64 = 1;
+
+/// Why [`retired_compile_cache_sweep`] drops a cache.
+#[derive(Debug, PartialEq, Eq)]
+enum RetiredDrop {
+    /// Another key's lane other than its first, unused for
+    /// [`SPARE_LANE_IDLE_DAYS`].
+    SpareLane,
+    /// A retired key's first lane, unused for the retention period.
+    Unused,
+}
+
+/// Whether a compile cache goes, and why: never under the `current` key;
+/// under any other, a spare lane once unused for
+/// [`SPARE_LANE_IDLE_DAYS`] and the first lane once unused for
+/// `retention` days. A key that is not this checkout's may still be
+/// another worktree's on this machine, so how recently a lane was used
+/// is the only sign it is retired.
+fn retired_cache_drop(
+    cache: &crate::images::CompileCacheRecord,
+    current: &str,
+    retention: u64,
+) -> Option<RetiredDrop> {
+    if cache.key == current {
+        None
+    } else if cache.lane.is_some_and(|lane| lane > 0) {
+        (cache.idle_days >= SPARE_LANE_IDLE_DAYS).then_some(RetiredDrop::SpareLane)
+    } else {
+        (cache.idle_days >= retention).then_some(RetiredDrop::Unused)
+    }
 }
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
@@ -1076,6 +1122,28 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Another key's spare lanes go once unused for a day and its first
+    /// lane once unused for the retention period (a lane used today may be
+    /// another worktree's); the current key keeps everything, however idle.
+    #[test]
+    fn a_retired_key_keeps_one_compile_cache() {
+        use super::{retired_cache_drop, RetiredDrop};
+        let cache = |key: &str, lane: Option<u32>, idle_days: u64| crate::images::CompileCacheRecord {
+            id: "x".into(),
+            key: key.into(),
+            lane,
+            unreadable_lane: None,
+            size: "1GB".into(),
+            idle_days,
+        };
+        assert_eq!(retired_cache_drop(&cache("now", Some(3), 99), "now", 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(2), 0), "now", 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(2), 1), "now", 30), Some(RetiredDrop::SpareLane));
+        assert_eq!(retired_cache_drop(&cache("old", Some(0), 0), "now", 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(0), 30), "now", 30), Some(RetiredDrop::Unused));
+        assert_eq!(retired_cache_drop(&cache("old", None, 5), "now", 30), None);
+    }
+
     use super::{event_line, EventsFilter, Reclaimed};
     use serde_json::json;
 

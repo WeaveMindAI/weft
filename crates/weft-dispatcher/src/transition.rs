@@ -29,17 +29,23 @@ use crate::events::DispatcherEvent;
 use crate::project_store::{ProjectStore, ProjectTransition};
 use crate::state::DispatcherState;
 
-/// How often a driving pod bumps the transition heartbeat.
-pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+/// How often a driving pod bumps the transition heartbeat, at this
+/// install's pace (`weft_core::time_scale`): 10 seconds in real time.
+pub fn heartbeat_interval() -> std::time::Duration {
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
+}
 
 /// How stale a heartbeat must be before the stuck-transition reaper
-/// treats the driver as dead. Comfortably above the bump interval so
-/// a briefly-starved driver is never false-positived, while an
-/// orphaned transition is repaired within about a minute.
-pub const HEARTBEAT_STALE_SECS: i64 = 60;
+/// treats the driver as dead: six bumps, 60 seconds in real time.
+/// Comfortably above the bump interval so a briefly-starved driver is
+/// never false-positived, while an orphaned transition is repaired
+/// within about a minute.
+pub fn heartbeat_stale_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(60)
+}
 
 /// Drop-guarded heartbeat: bumps `transition_heartbeat_unix` every
-/// `HEARTBEAT_INTERVAL_SECS` until dropped. Hold it for exactly the
+/// [`heartbeat_interval`] until dropped. Hold it for exactly the
 /// window the transition is driven in-process (the activate window,
 /// the build await); dropping it stops the bumps so an orphaned row
 /// goes stale and the reaper repairs it.
@@ -50,8 +56,7 @@ pub struct TransitionHeartbeat {
 impl TransitionHeartbeat {
     pub fn spawn(projects: ProjectStore, id: uuid::Uuid) -> Self {
         let handle = tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            let mut tick = tokio::time::interval(heartbeat_interval());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The entry CAS already stamped `now`; skip the immediate
             // first tick.
@@ -111,7 +116,7 @@ pub(crate) async fn publish_transition_changed(state: &DispatcherState, id: uuid
     state
         .events
         .publish(DispatcherEvent::ProjectTransitionChanged {
-            project_id: id.to_string(),
+            project_id: id,
             status,
             transition,
         })

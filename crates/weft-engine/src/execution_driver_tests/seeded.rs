@@ -131,7 +131,7 @@
         }
         ExecEvent::ExecutionStarted {
             color,
-            project_id: project.id.to_string(),
+            project_id: project.id,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),

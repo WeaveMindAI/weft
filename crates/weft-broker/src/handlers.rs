@@ -15,6 +15,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
 use weft_broker_client::protocol::*;
 use weft_task_store::tasks::{ClaimFilter, DedupOutcome, TaskTarget};
 use weft_task_store::TaskKind;
@@ -169,20 +170,34 @@ pub async fn execution_stop_tagged(
     weft_core::tag::validate_tag(&req.tag)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let color_scope = require_worker_owns_color(&state, &caller, color, &req.pod_name).await?;
+    let own_seq = weft_journal::tags::tag_seq(&state.pool, color, &req.tag)
+        .await
+        .map_err(internal)?;
     let before_seq = match req.stop_self {
         weft_core::StopSelf::Include => None,
-        weft_core::StopSelf::Keep => Some(
-            match weft_journal::tags::tag_seq(&state.pool, color, &req.tag)
-                .await
-                .map_err(internal)?
-            {
-                Some(own) => own,
-                None => weft_journal::tags::max_tag_seq(&state.pool).await.map_err(internal)? + 1,
-            },
-        ),
+        weft_core::StopSelf::Keep => Some(match own_seq {
+            Some(own) => own,
+            None => weft_journal::tags::max_tag_seq(&state.pool).await.map_err(internal)? + 1,
+        }),
+    };
+    // Whether the asker is among the runs this stop reaches, answered by
+    // the same read and the same rule the dispatcher applies to carry
+    // it out: a run the dispatcher would never cancel (a node test, which
+    // `live_tagged_executions` leaves out) must not be told to wait for
+    // its own cancel.
+    let stops_asker = match req.stop_self {
+        weft_core::StopSelf::Keep => false,
+        weft_core::StopSelf::Include => {
+            let live =
+                weft_journal::tags::live_tagged_executions(&state.pool, color_scope.project, &req.tag)
+                    .await
+                    .map_err(internal)?;
+            weft_journal::tags::select_stop_targets(&live, color, before_seq, req.stop_self)
+                .contains(&color)
+        }
     };
     let payload = weft_task_store::StopTaggedPayload {
-        project_id: color_scope.project.clone(),
+        project_id: color_scope.project,
         tag: req.tag,
         by: color.to_string(),
         before_seq,
@@ -203,7 +218,7 @@ pub async fn execution_stop_tagged(
         payload: serde_json::to_value(&payload).map_err(internal)?,
     };
     state.tasks.enqueue_dedup(task).await.map_err(internal)?;
-    Ok(Json(ExecutionStopTaggedResponse {}))
+    Ok(Json(ExecutionStopTaggedResponse { stops_asker }))
 }
 
 /// Seconds since the unix epoch, the stamp every broker-side write
@@ -215,11 +230,20 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-pub async fn journal_fetch(
+/// How long a held request may actually be held: what the pod asked
+/// for, never more than `MAX_HOLD` (a pod that wants longer asks again).
+fn held(wait_ms: u64) -> Duration {
+    Duration::from_millis(wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
+}
+
+/// The rows of one execution after the last one the worker applied,
+/// held open until one lands (woken by the row's own notification) or
+/// the hold ends.
+pub async fn journal_wait(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalFetchRequest>,
-) -> Resp<JournalFetchResponse> {
+    Json(req): Json<JournalWaitRequest>,
+) -> Resp<JournalWaitResponse> {
     scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &req.color).await?;
     let color: weft_core::Color = req
         .color
@@ -228,8 +252,12 @@ pub async fn journal_fetch(
     // RAW rows, never decode-and-re-encode: the broker only ferries
     // these, and a typed hop would silently strip any event field this
     // build predates. The worker decodes them, loudly.
-    let payloads = state.journal.raw_events_for_color(color).await.map_err(internal)?;
-    Ok(Json(JournalFetchResponse { payloads }))
+    let rows = state
+        .journal
+        .raw_rows_after(color, req.after_id, held(req.wait_ms))
+        .await
+        .map_err(unavailable_or_internal)?;
+    Ok(Json(JournalWaitResponse { rows }))
 }
 
 pub async fn journal_has_terminal(
@@ -242,7 +270,7 @@ pub async fn journal_has_terminal(
         .color
         .parse()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad color: {e}")))?;
-    let terminal = state.journal.has_terminal_event(color).await.map_err(internal)?;
+    let terminal = state.journal.has_terminal_event(color).await.map_err(unavailable_or_internal)?;
     Ok(Json(JournalHasTerminalResponse { terminal }))
 }
 
@@ -401,7 +429,7 @@ pub async fn task_enqueue_dedup(
     // color C in tenant B) rather than silently picking one, so the
     // stamped tenant is never ambiguous.
     let mut anchor_tenant: Option<String> = None;
-    if let Some(project_id) = req.spec.project_id.as_deref() {
+    if let Some(project_id) = req.spec.project_id {
         let t =
             scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, project_id)
                 .await?;
@@ -511,7 +539,7 @@ pub async fn task_wait_terminal(
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let outcome = state
         .tasks
-        .wait_for_terminal(req.task_id, Duration::from_millis(req.timeout_ms))
+        .wait_for_terminal(req.task_id, held(req.wait_ms))
         .await
         .map_err(internal)?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
@@ -530,7 +558,7 @@ pub async fn task_claim_one(
             &state.scope_cache,
             &state.pool,
             &caller,
-            project_id,
+            *project_id,
         )
         .await?;
     } else {
@@ -541,7 +569,7 @@ pub async fn task_claim_one(
     }
     let task = state
         .tasks
-        .claim_one(&req.pod_id, filter)
+        .claim_one(&req.pod_id, filter, held(req.wait_ms))
         .await
         .map_err(internal)?;
     // Latest-claim-wins color ownership is bound IN the claim's own
@@ -629,11 +657,11 @@ pub async fn worker_pod_register_alive(
 ) -> Resp<WorkerPodRegisterAliveResponse> {
     require_worker(&caller)?;
     require_pod_name_matches(&caller, &req.pod_name)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     state
         .worker_pods
-        .register_alive(&req.pod_name, &req.project_id)
+        .register_alive(&req.pod_name, req.project_id)
         .await
         .map_err(internal)?;
     Ok(Json(WorkerPodRegisterAliveResponse {}))
@@ -707,14 +735,14 @@ pub async fn infra_endpoint_url(
     if !matches!(caller.role, Role::Worker | Role::Listener) {
         return Err((StatusCode::FORBIDDEN, "worker or listener only".into()));
     }
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let endpoint_url = state
+    let address = state
         .infra
-        .endpoint_url(&req.project_id, &req.node_id, &req.endpoint_name)
+        .endpoint_address(req.project_id, &req.node_id, &req.endpoint_name)
         .await
         .map_err(internal)?;
-    Ok(Json(InfraEndpointUrlResponse { endpoint_url }))
+    Ok(Json(InfraEndpointUrlResponse { address }))
 }
 
 /// Worker fetches a project definition at execution claim time,
@@ -739,17 +767,13 @@ pub async fn project_fetch_definition(
     if !matches!(caller.role, Role::Worker) {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let project_uuid: uuid::Uuid = req
-        .project_id
-        .parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad project_id: {e}")))?;
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT project_json FROM project_definition \
          WHERE project_id = $1 AND definition_hash = $2",
     )
-    .bind(project_uuid)
+    .bind(req.project_id)
     .bind(&req.expected_hash)
     .fetch_optional(&state.pool)
     .await
@@ -850,7 +874,7 @@ pub async fn resolve_connection(
             let key_req = crate::credential::KeyRequest {
                 tenant,
                 color: req.color.clone(),
-                project_id: owner.project.clone(),
+                project_id: owner.project,
                 node_id: req.node_id,
                 frames: req.frames,
                 node_type: req.node_type,
@@ -970,7 +994,7 @@ pub async fn published_access(
     let found = weft_access_store::published_connection(
         &state.pool,
         &owner.tenant,
-        &owner.project,
+        owner.project,
         &req.node_id,
         &req.service,
     )
@@ -1008,132 +1032,10 @@ pub async fn supervisor_sync_ownership(
     Json(req): Json<SupervisorSyncOwnershipRequest>,
 ) -> Resp<SupervisorSyncOwnershipResponse> {
     require_supervisor(&caller)?;
-    // The pooled supervisor's ownership tick, done atomically so two
-    // supervisors never end up owning one project. Steps in one
-    // transaction:
-    //   0. Record this pod's reported memory pressure on its registry row
-    //      (the dispatcher's placement + scale-down read it).
-    //   1. Renew this pod's existing leases (it is alive and working).
-    //   2. Claim a BATCH of MORE projects, but only while the pod is
-    //      below the shared memory saturation threshold (a saturated pod
-    //      keeps what it owns and takes on no more; the dispatcher then
-    //      spawns another supervisor). Claiming is memory-gated, not
-    //      count-gated, so load is the SAME metric as the listener.
-    //      `FOR UPDATE SKIP LOCKED` + `ON CONFLICT` make concurrent
-    //      supervisors partition the free projects without double-claiming.
-    //   3. Return the full owned set (the work loops act only on these).
-    // A project is eligible only if it has a namespace (only namespaced/
-    // paid-tier projects have infra). All time comes from the DB clock
-    // (`EXTRACT(EPOCH FROM NOW())`), never the app clock, so a skewed
-    // dispatcher/broker host can't mis-judge lease expiry.
-    let lease_secs = weft_broker_client::lifecycle_command::INFRA_OWNER_LEASE_SECS;
-    let mut tx = state
-        .pool
-        .begin()
+    let synced = crate::lifecycle_writes::sync_ownership(&state.pool, &req.pod_name, req.mem_pressure)
         .await
-        .map_err(|e| internal(anyhow::anyhow!("begin sync_ownership tx: {e}")))?;
-
-    // 0. Record reported memory pressure and read back whether the
-    //    dispatcher has marked this pod draining (scaled down). Best-
-    //    effort: a fresh pod's row may not exist yet if the dispatcher
-    //    spawn hasn't committed; the UPDATE then returns no row and the
-    //    next tick records it. A draining pod must renew + claim nothing
-    //    (its leases were released for re-adoption; re-grabbing them would
-    //    defeat consolidation).
-    let draining: bool = sqlx::query_scalar(
-        "UPDATE supervisor_pod SET mem_pressure = $1 WHERE pod_name = $2 RETURNING draining",
-    )
-    .bind(req.mem_pressure)
-    .bind(&req.pod_name)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("record supervisor mem_pressure: {e}")))?
-    .unwrap_or(false);
-
-    // 1. Renew owned leases, UNLESS draining (then we want the leases to
-    //    lapse / stay released so survivors adopt them; the drain already
-    //    deleted them, this guards against a renew racing that delete).
-    if !draining {
-        sqlx::query(
-            "UPDATE infra_owner \
-             SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
-             WHERE supervisor_pod = $2",
-        )
-        .bind(lease_secs)
-        .bind(&req.pod_name)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| internal(anyhow::anyhow!("renew infra_owner leases: {e}")))?;
-    }
-
-    // 2. Claim a batch, but only while under the memory saturation
-    //    threshold AND not draining. At/above saturation, or while
-    //    draining, claim nothing (a saturated pod keeps what it owns; a
-    //    draining pod is being removed and must take on nothing).
-    let saturated = weft_platform_traits::is_saturated(
-        req.mem_pressure,
-        weft_platform_traits::SATURATION_MEM_FRACTION,
-    );
-    let headroom = if saturated || draining {
-        0
-    } else {
-        weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH
-    };
-    if headroom > 0 {
-        // Atomic claim via a CTE: `free` selects projects with no live
-        // owner and LOCKS them `FOR UPDATE OF p SKIP LOCKED`, so a
-        // sibling supervisor's concurrent claim takes a DISJOINT set
-        // (never the same row). The INSERT then takes the EXCLUSIVE
-        // `infra_owner` lease for each. ON CONFLICT covers a stale
-        // (expired-lease) row still physically present: we overwrite it
-        // ONLY if its lease is actually expired, so a live owner is
-        // never stolen. Rows we lock are guaranteed free at insert time
-        // because the lock is held to the end of the tx.
-        // SYNC: the `project_namespace <> ''` precondition <->
-        //       crates/weft-dispatcher/src/supervisor_pool.rs
-        //       pending_commands_exist, crates/weft-broker/src/handlers.rs
-        //       supervisor_claim_command (its ownership term inherits this
-        //       precondition transitively)
-        sqlx::query(
-            "WITH free AS ( \
-                 SELECT p.id::TEXT AS project_id, p.project_namespace, p.tenant_id \
-                 FROM project p \
-                 WHERE p.project_namespace <> '' \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM infra_owner io \
-                       WHERE io.project_id = p.id::TEXT \
-                         AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
-                   ) \
-                 ORDER BY p.id \
-                 LIMIT $2 \
-                 FOR UPDATE OF p SKIP LOCKED \
-             ) \
-             INSERT INTO infra_owner \
-                 (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
-             SELECT project_id, $1, project_namespace, tenant_id, \
-                    EXTRACT(EPOCH FROM NOW())::BIGINT + $3 \
-             FROM free \
-             ON CONFLICT (project_id) DO UPDATE \
-               SET supervisor_pod = EXCLUDED.supervisor_pod, \
-                   namespace = EXCLUDED.namespace, \
-                   tenant_id = EXCLUDED.tenant_id, \
-                   leased_until_unix = EXCLUDED.leased_until_unix \
-               WHERE infra_owner.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT",
-        )
-        .bind(&req.pod_name)
-        .bind(headroom)
-        .bind(lease_secs)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| internal(anyhow::anyhow!("claim infra_owner rows: {e}")))?;
-    }
-
-    // 3. Return the full owned set (joined to current project state).
-    let projects = owned_projects_in(&mut *tx, &req.pod_name).await?;
-    tx.commit()
-        .await
-        .map_err(|e| internal(anyhow::anyhow!("commit sync_ownership tx: {e}")))?;
-    Ok(Json(SupervisorSyncOwnershipResponse { owned: projects }))
+        .map_err(internal)?;
+    Ok(Json(synced))
 }
 
 /// Pure read: the projects a supervisor pod currently owns, joined to
@@ -1146,65 +1048,10 @@ pub async fn supervisor_owned_projects(
     Json(req): Json<SupervisorOwnedProjectsRequest>,
 ) -> Resp<SupervisorOwnedProjectsResponse> {
     require_supervisor(&caller)?;
-    let owned = owned_projects_in(&state.pool, &req.pod_name).await?;
+    let owned = crate::lifecycle_writes::owned_projects(&state.pool, &req.pod_name)
+        .await
+        .map_err(internal)?;
     Ok(Json(SupervisorOwnedProjectsResponse { owned }))
-}
-
-/// Decode the owned `SupervisorProject` set for a pod against any
-/// executor (a pool ref or a transaction). The single source of the
-/// owned-set query + row decode, shared by `sync_ownership` (inside its
-/// tx) and `owned_projects` (against the pool).
-async fn owned_projects_in<'e, E>(
-    executor: E,
-    pod_name: &str,
-) -> Result<Vec<SupervisorProject>, (StatusCode, String)>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT p.id::TEXT AS project_id, p.tenant_id, p.project_namespace, p.status, \
-                p.deactivated_by_health \
-         FROM infra_owner io \
-         JOIN project p ON p.id::TEXT = io.project_id \
-         WHERE io.supervisor_pod = $1 AND p.project_namespace <> ''",
-    )
-    .bind(pod_name)
-    .fetch_all(executor)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let mut projects = Vec::with_capacity(rows.len());
-    for r in rows {
-        let project_id: String = r
-            .try_get("project_id")
-            .map_err(|e| internal(anyhow::anyhow!("decode project_id: {e}")))?;
-        let tenant_id: String = r
-            .try_get("tenant_id")
-            .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?;
-        let project_namespace: String = r
-            .try_get("project_namespace")
-            .map_err(|e| internal(anyhow::anyhow!("decode project_namespace: {e}")))?;
-        let status_str: String = r
-            .try_get("status")
-            .map_err(|e| internal(anyhow::anyhow!("decode status: {e}")))?;
-        let status = weft_broker_client::protocol::ProjectStatus::parse(&status_str)
-            .ok_or_else(|| {
-                internal(anyhow::anyhow!(
-                    "project.status='{status_str}' is not a known ProjectStatus"
-                ))
-            })?;
-        let deactivated_by_health: bool = r
-            .try_get("deactivated_by_health")
-            .map_err(|e| internal(anyhow::anyhow!("decode deactivated_by_health: {e}")))?;
-        projects.push(SupervisorProject {
-            project_id,
-            tenant_id,
-            project_namespace,
-            status,
-            deactivated_by_health,
-        });
-    }
-    Ok(projects)
 }
 
 pub async fn supervisor_infra_nodes(
@@ -1213,15 +1060,15 @@ pub async fn supervisor_infra_nodes(
     Json(req): Json<SupervisorInfraNodesRequest>,
 ) -> Resp<SupervisorInfraNodesResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT node_id, instance_id, status, applied_spec_hash, \
-                endpoints_json, preserve_pvcs_json, units_json \
+                endpoints_json, public_paths_json, preserve_pvcs_json, units_json \
          FROM infra_node WHERE project_id = $1",
     )
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1259,6 +1106,15 @@ pub async fn supervisor_infra_nodes(
                 "infra_node.endpoints_json for node='{node_id}' is not a string-to-string map: {e}"
             ))
         })?;
+        let public_paths_json: serde_json::Value = r
+            .try_get("public_paths_json")
+            .map_err(|e| internal(anyhow::anyhow!("decode public_paths_json: {e}")))?;
+        let public_paths: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(public_paths_json).map_err(|e| {
+                internal(anyhow::anyhow!(
+                    "infra_node.public_paths_json for node='{node_id}' is not a string-to-string map: {e}"
+                ))
+            })?;
         let preserve_pvcs_json: serde_json::Value = r
             .try_get("preserve_pvcs_json")
             .map_err(|e| internal(anyhow::anyhow!("decode preserve_pvcs_json: {e}")))?;
@@ -1272,7 +1128,7 @@ pub async fn supervisor_infra_nodes(
             .map_err(|e| internal(anyhow::anyhow!("decode units_json: {e}")))?;
         let units = weft_broker_client::protocol::decode_units_json(
             units_json,
-            &req.project_id,
+            req.project_id,
             &node_id,
         )
         .map_err(internal)?;
@@ -1281,7 +1137,7 @@ pub async fn supervisor_infra_nodes(
             instance_id,
             status,
             applied_spec_hash,
-            endpoints,
+            addresses: weft_broker_client::protocol::AppliedEndpoints { urls: endpoints, public_paths },
             preserve_pvcs,
             units,
         });
@@ -1295,12 +1151,9 @@ pub async fn supervisor_health_protocols(
     Json(req): Json<SupervisorHealthProtocolsRequest>,
 ) -> Resp<SupervisorHealthProtocolsResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let id = req
-        .project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project_id".to_string()))?;
+    let id = req.project_id;
     use sqlx::Row;
     let row = sqlx::query("SELECT health_protocols_json FROM project WHERE id = $1")
         .bind(id)
@@ -1320,105 +1173,61 @@ pub async fn supervisor_claim_command(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<SupervisorClaimCommandRequest>,
-) -> Resp<SupervisorClaimCommandResponse> {
+) -> Resp<SupervisorClaim> {
     require_supervisor(&caller)?;
-    // A pooled supervisor claims a lifecycle command ONLY for a project
-    // whose infra it currently OWNS (the `infra_owner` exclusive lease).
-    // Ownership is the supervisor's ONE single-actor authority: it is
-    // exclusive (one pod per project), continuously renewed on each
-    // ownership tick, and the owner's work loop is sequential, so two
-    // supervisors can never run kubectl for one project. There is NO
-    // per-command claim lease here (it would be redundant with exclusive
-    // ownership, and its fixed expiry would wrongly let a sibling re-run
-    // a long command mid-flight). The command simply remains uncompleted
-    // until its owner finishes it; if ownership moves mid-command, every
-    // write from the old owner is rejected (see `owns_project_predicate`
-    // on the set_* / complete handlers) and the new owner re-runs it.
+    // Which command is next, and why that answer is safe without a row
+    // lock: `lifecycle_writes::next_command`.
     //
-    // Verb filter: the supervisor claims only the verbs it owns.
-    // Dispatcher verbs (`deactivate`, `reactivate`) are claimed by
-    // dispatcher pods directly (via their own `claimed_by_pod` lease);
-    // the supervisor MUST skip them.
+    // Held: with nothing waiting, the request sleeps until a command is
+    // issued anywhere (the row's own trigger announces it) and looks
+    // again. Any issue wakes it, not only one for a project this pod
+    // owns: ownership can move during the hold, and the look is one
+    // indexed read.
     //
-    // No row UPDATE here: claiming is a pure SELECT of the oldest
-    // uncompleted owned command. No row lock is needed: the owning pod
-    // runs a sequential work loop (one command at a time), and ownership
-    // is exclusive, so no two claim queries ever target this project's
-    // commands concurrently. Re-running an already-claimed-but-unfinished
-    // command after a crash is correct and idempotent (declarative
-    // kubectl), so there is nothing to serialize against.
-    //
-    // SYNC: the verb list below <->
-    //       crates/weft-dispatcher/src/supervisor_pool.rs pending_commands_exist,
-    //       crates/weft-broker/src/handlers.rs supervisor_sync_ownership (whose
-    //       `project_namespace <> ''` precondition is what makes the
-    //       ownership term here imply a namespaced project)
-    let sql = format!(
-        "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
-                c.drain_timeout_secs \
-         FROM infra_lifecycle_command c \
-         WHERE c.verb IN ('apply', 'stop', 'terminate') \
-           AND c.completed_at_unix IS NULL \
-           AND {owns} \
-         ORDER BY c.id ASC \
-         LIMIT 1",
-        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "c.project_id"),
-    );
-    let row = sqlx::query(&sql)
-        .bind(&req.claimer_pod)
-        .fetch_optional(&state.pool)
+    // A wake that finds nothing for this pod may be a command for a
+    // project nobody owns yet (ownership is taken on the supervisors'
+    // own ticks): the answer then says so, and the pod takes ownership
+    // at once instead of on its next tick. Only after a wake, and only to
+    // a pod that takes on projects (registered, not draining, below
+    // saturation: `lifecycle_writes::takes_on_projects`, the rule its
+    // ownership tick claims by); any other pod would tick, claim
+    // nothing, and come straight back, so it holds as usual.
+    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let mut heard = state.signals.subscribe();
+    let mut woken_once = false;
+    loop {
+        let next = crate::lifecycle_writes::next_command(
+            &state.pool,
+            &req.claimer_pod,
+            &req.busy_projects,
+        )
         .await
-        .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let command = match row {
-        None => None,
-        Some(r) => Some(decode_claimed_command(&r).map_err(internal)?),
-    };
-    Ok(Json(SupervisorClaimCommandResponse { command }))
-}
-
-/// Decode one `infra_lifecycle_command` row into the typed
-/// `SupervisorCommandRow` wire shape. EVERY column read propagates
-/// errors; unknown enum values (verb / running_policy) become 500s
-/// rather than silent fallbacks. Shared by every handler that hands
-/// claimed rows to the supervisor.
-fn decode_claimed_command(
-    r: &sqlx::postgres::PgRow,
-) -> anyhow::Result<SupervisorCommandRow> {
-    use sqlx::Row;
-    let id: i64 = r.try_get("id")?;
-    let project_id: String = r.try_get("project_id")?;
-    let node_id: Option<String> = r.try_get::<Option<String>, _>("node_id")?;
-    let verb_str: String = r.try_get("verb")?;
-    let verb = weft_broker_client::protocol::InfraLifecycleVerb::parse(&verb_str)
-        .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command.id={id}: unknown verb '{verb_str}'"))?;
-    // Nullable: dispatcher verbs (deactivate / reactivate) carry
-    // policy inside spec_json; Apply ignores it. Stop / Terminate
-    // populate it.
-    let running_policy_str: Option<String> = r.try_get("running_policy")?;
-    let running_policy = match running_policy_str.as_deref() {
-        None => None,
-        Some(s) => Some(
-            weft_broker_client::protocol::RunningPolicy::parse(s).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "infra_lifecycle_command.id={id}: unknown running_policy '{s}'"
-                )
-            })?,
-        ),
-    };
-    let spec_json: Option<serde_json::Value> =
-        r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
-    let force: bool = r.try_get("force")?;
-    let drain_timeout_secs: i64 = r.try_get("drain_timeout_secs")?;
-    Ok(SupervisorCommandRow {
-        id,
-        project_id,
-        node_id,
-        verb,
-        running_policy,
-        spec_json,
-        force,
-        drain_timeout_secs: drain_timeout_secs.max(0) as u64,
-    })
+        .map_err(internal)?;
+        if let Some(command) = next {
+            return Ok(Json(SupervisorClaim::Command(command)));
+        }
+        if woken_once
+            && crate::lifecycle_writes::unowned_work_waiting(&state.pool)
+                .await
+                .map_err(internal)?
+            && crate::lifecycle_writes::pod_takes_on_projects(&state.pool, &req.claimer_pod)
+                .await
+                .map_err(internal)?
+        {
+            return Ok(Json(SupervisorClaim::UnownedWork));
+        }
+        let woken = heard
+            .woken_before(deadline, |channel, payload| {
+                channel == INFRA_COMMAND_CHANNEL
+                    && matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. }))
+            })
+            .await
+            .map_err(internal)?;
+        if !woken {
+            return Ok(Json(SupervisorClaim::Nothing));
+        }
+        woken_once = true;
+    }
 }
 
 pub async fn supervisor_event_record(
@@ -1432,38 +1241,22 @@ pub async fn supervisor_event_record(
     // tenant of its own, so the row's tenant always comes from the
     // resource, never the caller identity.
     let project_tenant =
-        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO infra_event \
-         (tenant_id, project_id, node_id, kind, payload, at_unix) \
-         VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT) \
-         RETURNING id",
+    let id = crate::lifecycle_writes::record_event(
+        &state.pool,
+        &project_tenant,
+        req.project_id,
+        req.node_id.as_deref(),
+        req.kind.as_str(),
+        &req.payload,
     )
-    .bind(&project_tenant)
-    .bind(&req.project_id)
-    .bind(req.node_id.as_deref())
-    .bind(req.kind.as_str())
-    .bind(&req.payload)
-    .fetch_one(&state.pool)
     .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // Wake the dispatcher's bridge. Same shape as lifecycle_cmd:
-    // best-effort, dropped NOTIFY is caught by the bridge's safety
-    // poll.
-    if let Err(e) = sqlx::query("SELECT pg_notify('weft_infra_event', $1)")
-        .bind(row.0.to_string())
-        .execute(&state.pool)
-        .await
-    {
-        tracing::warn!(
-            target: "weft_broker::handlers",
-            error = %e,
-            event_id = row.0,
-            "pg_notify(weft_infra_event) failed; bridge safety poll will catch it"
-        );
-    }
-    Ok(Json(SupervisorEventRecordResponse { id: row.0 }))
+    .map_err(internal)?
+    .ok_or_else(|| project_gone(req.project_id))?;
+    // The dispatcher's bridge is woken by the row's own trigger
+    // (`infra_event::GROUP`), when this insert commits.
+    Ok(Json(SupervisorEventRecordResponse { id }))
 }
 
 /// Map a fenced lifecycle write's outcome to the wire: Applied is the
@@ -1490,7 +1283,7 @@ pub async fn supervisor_set_status(
 ) -> Resp<SupervisorSetStatusResponse> {
     require_supervisor(&caller)?;
     require_node_id(&mut req.node_id)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     // The write, its fence and its stale answers live in
     // `lifecycle_writes::set_status` (pool-level, db-tested); this is
@@ -1536,12 +1329,13 @@ struct ApplyRowState {
     /// false for provisioning (leaves it NULL).
     stamp_applied_at: bool,
     endpoints_json: serde_json::Value,
+    public_paths_json: serde_json::Value,
 }
 
 async fn write_apply_row(
     state: &BrokerState,
     op: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: &str,
     instance_id: &str,
     namespace: &str,
@@ -1563,10 +1357,10 @@ async fn write_apply_row(
         &format!("INSERT INTO infra_node \
          (project_id, node_id, instance_id, namespace, status, \
           failure_stage, failure_message, applied_spec_hash, \
-          applied_at_unix, endpoints_json, preserve_pvcs_json, units_json) \
+          applied_at_unix, endpoints_json, public_paths_json, preserve_pvcs_json, units_json) \
          SELECT $1, $2, $3, $4, $5, NULL, NULL, $6, \
                 CASE WHEN $7 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
-                $8, $9, $10 \
+                $8, $13, $9, $10 \
          FROM infra_lifecycle_command \
          WHERE id = $11 \
            AND project_id = $1 \
@@ -1583,6 +1377,7 @@ async fn write_apply_row(
             applied_spec_hash  = EXCLUDED.applied_spec_hash, \
             applied_at_unix    = EXCLUDED.applied_at_unix, \
             endpoints_json     = EXCLUDED.endpoints_json, \
+            public_paths_json  = EXCLUDED.public_paths_json, \
             preserve_pvcs_json = EXCLUDED.preserve_pvcs_json, \
             units_json         = EXCLUDED.units_json",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$12", "$1"),
@@ -1600,6 +1395,7 @@ async fn write_apply_row(
     .bind(units_json)
     .bind(command_id)
     .bind(owner_pod)
+    .bind(row.public_paths_json)
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1619,16 +1415,18 @@ pub async fn supervisor_set_applied(
 ) -> Resp<SupervisorSetAppliedResponse> {
     require_supervisor(&caller)?;
     require_node_id(&mut req.node_id)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let endpoints_json = serde_json::to_value(&req.endpoints)
+    let endpoints_json = serde_json::to_value(&req.addresses.urls)
         .map_err(|e| internal(anyhow::anyhow!("endpoints serialize: {e}")))?;
+    let public_paths_json = serde_json::to_value(&req.addresses.public_paths)
+        .map_err(|e| internal(anyhow::anyhow!("public_paths serialize: {e}")))?;
     let units_json = serde_json::to_value(&req.units)
         .map_err(|e| internal(anyhow::anyhow!("units serialize: {e}")))?;
     write_apply_row(
         &state,
         "set_applied",
-        &req.project_id,
+        req.project_id,
         &req.node_id,
         &req.instance_id,
         &req.namespace,
@@ -1648,6 +1446,7 @@ pub async fn supervisor_set_applied(
             applied_spec_hash: Some(req.applied_spec_hash.clone()),
             stamp_applied_at: true,
             endpoints_json,
+            public_paths_json,
         },
     )
     .await?;
@@ -1668,14 +1467,14 @@ pub async fn supervisor_set_provisioning(
 ) -> Resp<SupervisorSetProvisioningResponse> {
     require_supervisor(&caller)?;
     require_node_id(&mut req.node_id)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     let units_json = serde_json::to_value(&req.units)
         .map_err(|e| internal(anyhow::anyhow!("units serialize: {e}")))?;
     write_apply_row(
         &state,
         "set_provisioning",
-        &req.project_id,
+        req.project_id,
         &req.node_id,
         &req.instance_id,
         &req.namespace,
@@ -1690,6 +1489,7 @@ pub async fn supervisor_set_provisioning(
             applied_spec_hash: None,
             stamp_applied_at: false,
             endpoints_json: serde_json::json!({}),
+            public_paths_json: serde_json::json!({}),
         },
     )
     .await?;
@@ -1712,7 +1512,7 @@ pub async fn supervisor_enqueue_lifecycle(
     // The command's tenant is the project's tenant (control-plane
     // supervisor has none of its own).
     let project_tenant =
-        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
     // Verify the typed spec's (mode, policy) combo is coherent
     // before persisting. The rule lives next to `DeactivateSpec`
@@ -1733,47 +1533,31 @@ pub async fn supervisor_enqueue_lifecycle(
     // None for both variants (Deactivate carries it inside
     // spec_json; Reactivate has no policy). Bind NULL.
     let (verb, running_policy, spec_json) = req.spec.into_row_columns();
-    let running_policy_str = running_policy.map(|p| p.as_str());
     let issued_by_pod = caller.pod_name.as_deref().ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
             "supervisor token missing pod claim".to_string(),
         )
     })?;
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, \
-          spec_json, issued_by_pod, issued_at_unix) \
-         VALUES ($1, $2, NULL, $3, $4, $5, $6, \
-                 EXTRACT(EPOCH FROM NOW())::BIGINT) \
-         RETURNING id",
+    let command_id = crate::lifecycle_writes::issue_command(
+        &state.pool,
+        &crate::lifecycle_writes::IssuedCommand {
+            tenant_id: &project_tenant,
+            project_id: req.project_id,
+            node_id: None,
+            verb,
+            running_policy,
+            spec_json: spec_json.as_ref(),
+            issued_by_pod,
+        },
     )
-    .bind(&project_tenant)
-    .bind(&req.project_id)
-    .bind(verb.as_str())
-    .bind(running_policy_str)
-    .bind(&spec_json)
-    .bind(issued_by_pod)
-    .fetch_one(&state.pool)
     .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // Wake any dispatcher pod's `lifecycle_claimer` listener.
-    // Best-effort: a missed NOTIFY (dropped connection) falls back
-    // to the 30s safety poll in the claimer. We log on failure but
-    // don't bail; the row is already persisted.
-    if let Err(e) = sqlx::query("SELECT pg_notify('weft_lifecycle_cmd', $1)")
-        .bind(row.0.to_string())
-        .execute(&state.pool)
-        .await
-    {
-        tracing::warn!(
-            target: "weft_broker::handlers",
-            error = %e,
-            command_id = row.0,
-            "pg_notify(weft_lifecycle_cmd) failed; claimer's safety poll will catch it"
-        );
-    }
-    Ok(Json(SupervisorEnqueueLifecycleResponse { command_id: row.0 }))
+    .map_err(internal)?
+    .ok_or_else(|| project_gone(req.project_id))?;
+    // The dispatcher's `lifecycle_claimer` is woken by the row's own
+    // trigger (`infra_lifecycle_command::GROUP`), when this insert
+    // commits.
+    Ok(Json(SupervisorEnqueueLifecycleResponse { command_id }))
 }
 
 /// Supervisor reads the project's per-(node, image_name) hash map so
@@ -1786,12 +1570,9 @@ pub async fn supervisor_project_image_tags(
     Json(req): Json<SupervisorProjectImageTagsRequest>,
 ) -> Resp<SupervisorProjectImageTagsResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let id = req
-        .project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project_id".to_string()))?;
+    let id = req.project_id;
     use sqlx::Row;
     let row = sqlx::query("SELECT infra_image_tags_json FROM project WHERE id = $1")
         .bind(id)
@@ -1827,8 +1608,8 @@ pub async fn supervisor_project_image_tags(
 }
 
 /// Worker-callable: enqueue an Apply lifecycle command after the
-/// engine's local skip/fresh/replace decision. The supervisor picks
-/// up the command on its next poll.
+/// engine's local skip/fresh/replace decision. The owning supervisor's
+/// held claim wakes on the row's own notification and picks it up.
 pub async fn infra_enqueue_apply(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -1842,20 +1623,10 @@ pub async fn infra_enqueue_apply(
     // since the ownership check passed). Uniform with the supervisor
     // enqueue paths: the row tenant always comes from the resource.
     let project_tenant =
-        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
-    // Dedup against an in-flight apply for the same (project, node):
-    // a worker restart that retries this call must NOT double-enqueue.
-    // The partial unique index `uq_lifecycle_cmd_pending_apply`
-    // enforces "at most one pending apply per (project_id, node_id)".
-    //
-    // Single-statement ON CONFLICT DO UPDATE: the no-op SET on
-    // `issued_at_unix = excluded value` causes the UPDATE branch to
-    // be taken AND `RETURNING id` to fire. (DO NOTHING would skip
-    // the RETURNING and force a separate SELECT, leaving a race
-    // window where the existing row could be completed between
-    // INSERT and SELECT.) The "update" is a no-op on real values
-    // because we set the same `issued_at_unix` we'd have written.
+    // Deduplicated against an in-flight apply for the same (project,
+    // node): `lifecycle_writes::issue_command`.
     let issued_by_pod = caller.pod_name.as_deref().ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
@@ -1863,34 +1634,28 @@ pub async fn infra_enqueue_apply(
         )
     })?;
     // Apply doesn't carry a running_policy (no in-flight executions
-    // to drain; the supervisor just applies). NULL the column.
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, \
-          spec_json, issued_by_pod, issued_at_unix) \
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, \
-                 EXTRACT(EPOCH FROM NOW())::BIGINT) \
-         ON CONFLICT (project_id, node_id) \
-           WHERE completed_at_unix IS NULL AND verb = 'apply' \
-           DO UPDATE SET issued_at_unix = \
-             infra_lifecycle_command.issued_at_unix \
-         RETURNING id",
+    // to drain; the supervisor just applies).
+    let command_id = crate::lifecycle_writes::issue_command(
+        &state.pool,
+        &crate::lifecycle_writes::IssuedCommand {
+            tenant_id: &project_tenant,
+            project_id: req.project_id,
+            node_id: Some(&req.node_id),
+            verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply,
+            running_policy: None,
+            spec_json: Some(&req.spec_json),
+            issued_by_pod,
+        },
     )
-    .bind(&project_tenant)
-    .bind(&req.project_id)
-    .bind(&req.node_id)
-    .bind(weft_broker_client::protocol::InfraLifecycleVerb::Apply.as_str())
-    .bind(&req.spec_json)
-    .bind(issued_by_pod)
-    .fetch_one(&state.pool)
     .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    Ok(Json(InfraEnqueueApplyResponse { command_id: row.0 }))
+    .map_err(internal)?
+    .ok_or_else(|| project_gone(req.project_id))?;
+    Ok(Json(InfraEnqueueApplyResponse { command_id }))
 }
 
-/// Worker-callable: poll a previously-issued apply command for its
-/// terminal state. Worker calls this in a loop. One round-trip per
-/// poll tick keeps the broker stateless w.r.t. wait semantics.
+/// Worker-callable: a previously-issued apply command's state, held
+/// open until it completes (woken by the row's own notification) or the
+/// hold ends. The worker asks again until it completes.
 pub async fn infra_wait_apply(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -1899,8 +1664,33 @@ pub async fn infra_wait_apply(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
+    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let mut heard = state.signals.subscribe();
+    loop {
+        let answer = apply_command_state(&state, &req).await?;
+        if answer.completed {
+            return Ok(Json(answer));
+        }
+        let woken = heard
+            .woken_before(deadline, |channel, payload| {
+                channel == INFRA_COMMAND_CHANNEL
+                    && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Done { id: req.command_id })
+            })
+            .await
+            .map_err(internal)?;
+        if !woken {
+            return Ok(Json(answer));
+        }
+    }
+}
+
+/// One read of an apply command's row, as the wire answers it.
+async fn apply_command_state(
+    state: &BrokerState,
+    req: &InfraWaitApplyRequest,
+) -> Result<InfraWaitApplyResponse, (StatusCode, String)> {
     use sqlx::Row;
     let row = sqlx::query(
         "SELECT completed_at_unix, outcome, outcome_message, project_id \
@@ -1914,7 +1704,7 @@ pub async fn infra_wait_apply(
         return Err((StatusCode::NOT_FOUND, "no such command".into()));
     };
     // Defense-in-depth: the command must belong to the caller's project.
-    let cmd_project: String = r
+    let cmd_project: uuid::Uuid = r
         .try_get("project_id")
         .map_err(|e| internal(anyhow::anyhow!("decode project_id: {e}")))?;
     if cmd_project != req.project_id {
@@ -1948,11 +1738,11 @@ pub async fn infra_wait_apply(
             )));
         }
     };
-    Ok(Json(InfraWaitApplyResponse {
+    Ok(InfraWaitApplyResponse {
         completed: done.is_some(),
         outcome,
         outcome_message: message,
-    }))
+    })
 }
 
 pub async fn supervisor_remove_node(
@@ -1963,7 +1753,7 @@ pub async fn supervisor_remove_node(
     require_supervisor(&caller)?;
     require_node_id(&mut req.node_id)?;
     let tenant =
-        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
     // Ownership gate: only the pod that currently OWNS the project may
     // cascade-delete its infra_node + cancel its pending commands. A
@@ -1989,7 +1779,7 @@ pub async fn supervisor_remove_node(
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "$2"),
     ))
     .bind(&req.pod_name)
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("remove_node ownership check: {e}")))?;
@@ -2007,7 +1797,7 @@ pub async fn supervisor_remove_node(
         ));
     }
     let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2")
-        .bind(&req.project_id)
+        .bind(req.project_id)
         .bind(&req.node_id)
         .execute(&mut *tx)
         .await
@@ -2015,7 +1805,7 @@ pub async fn supervisor_remove_node(
     sqlx::query(
         "DELETE FROM infra_event WHERE project_id = $1 AND node_id = $2",
     )
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .bind(&req.node_id)
     .execute(&mut *tx)
     .await
@@ -2033,7 +1823,7 @@ pub async fn supervisor_remove_node(
           WHERE project_id = $1 AND node_id = $2 \
             AND completed_at_unix IS NULL",
     )
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .bind(&req.node_id)
     .bind(LifecycleOutcome::Cancelled.as_str())
     .execute(&mut *tx)
@@ -2046,7 +1836,7 @@ pub async fn supervisor_remove_node(
     let published = weft_access_store::delete_published_grants(
         &mut *tx,
         &tenant,
-        &req.project_id,
+        req.project_id,
         Some(&req.node_id),
     )
     .await
@@ -2076,12 +1866,9 @@ pub async fn supervisor_trigger_deps(
     Json(req): Json<SupervisorTriggerDepsRequest>,
 ) -> Resp<SupervisorTriggerDepsResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let id = req
-        .project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project_id".to_string()))?;
+    let id = req.project_id;
     use sqlx::Row;
     let row = sqlx::query("SELECT project_json FROM project WHERE id = $1")
         .bind(id)
@@ -2110,7 +1897,7 @@ pub async fn supervisor_running_count(
     Json(req): Json<SupervisorRunningCountRequest>,
 ) -> Resp<SupervisorRunningCountResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     // "Running" = has a live worker pod. Parked / suspended
     // executions (form trigger waiting for input, timer waiting to
@@ -2129,7 +1916,7 @@ pub async fn supervisor_running_count(
            AND status IN ('spawning', 'alive') \
            AND role = 'worker'",
     )
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -2148,7 +1935,7 @@ pub async fn supervisor_infra_command_in_flight(
     Json(req): Json<SupervisorInfraCommandInFlightRequest>,
 ) -> Resp<SupervisorInfraCommandInFlightResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     use sqlx::Row;
     let row = sqlx::query(
@@ -2157,7 +1944,7 @@ pub async fn supervisor_infra_command_in_flight(
            WHERE project_id = $1 AND completed_at_unix IS NULL \
          ) AS in_flight",
     )
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -2261,6 +2048,16 @@ fn require_node_id(node_id: &mut String) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// The answer to an insert that found its project row gone
+/// (`lifecycle_writes::issue_command` / `record_event` read it live,
+/// since the caller's authorization can outlive the removal).
+fn project_gone(project_id: uuid::Uuid) -> (StatusCode, String) {
+    (
+        StatusCode::NOT_FOUND,
+        format!("project {project_id} no longer exists; nothing was recorded for it"),
+    )
+}
+
 fn require_supervisor(caller: &CallerIdentity) -> Result<(), (StatusCode, String)> {
     if caller.role != Role::InfraSupervisor {
         return Err((StatusCode::FORBIDDEN, "infra-supervisor only".into()));
@@ -2349,7 +2146,7 @@ async fn require_worker_pod_owned_by(
     caller: &CallerIdentity,
     pod_name: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let row: Option<(String,)> = sqlx::query_as(
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
         "SELECT project_id FROM worker_pod WHERE pod_name = $1",
     )
     .bind(pod_name)
@@ -2377,7 +2174,7 @@ async fn require_worker_pod_owned_by(
         ));
     };
     // Enforce ownership; the returned tenant is not needed here.
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, caller, &project_id)
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, caller, project_id)
         .await
         .map(|_| ())
 }
@@ -2406,9 +2203,49 @@ pub(crate) fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
 }
 
+/// A failed database call, as a caller that can wait must tell it
+/// apart: 503 when the database could not be reached right now (asking
+/// again will work once it can), 500 for anything else (a row that does
+/// not decode fails the same way every time). The worker's journal
+/// client waits out a 503 and fails the run on a 500.
+// SYNC: 503 = ask again <-> crates/weft-broker-client/src/client.rs broker_unavailable
+pub(crate) fn unavailable_or_internal(e: anyhow::Error) -> (StatusCode, String) {
+    if e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(database_unreachable) {
+        tracing::warn!(target: "weft_broker", "could not reach the database: {e:#}");
+        return (StatusCode::SERVICE_UNAVAILABLE, "the database is unavailable; ask again".into());
+    }
+    internal(e)
+}
+
+/// Whether a database error means the server could not be reached or
+/// is restarting, rather than that the statement itself failed: no
+/// connection to be had, a connection that broke, or the server
+/// refusing because it is shutting down or starting up (SQLSTATE class
+/// 08, and 57P01 to 57P03).
+fn database_unreachable(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::Protocol(_) => {
+            true
+        }
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|code| code.starts_with("08") || matches!(&*code, "57P01" | "57P02" | "57P03")),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_unreachable_database_asks_the_caller_again() {
+        let pool_gone = anyhow::Error::from(sqlx::Error::PoolTimedOut).context("color lookup");
+        assert_eq!(unavailable_or_internal(pool_gone).0, StatusCode::SERVICE_UNAVAILABLE);
+        let bad_row = anyhow::Error::from(sqlx::Error::RowNotFound);
+        assert_eq!(unavailable_or_internal(bad_row).0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(unavailable_or_internal(anyhow::anyhow!("undecodable row")).0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn stale_fire_below_current_generation_is_fenced() {

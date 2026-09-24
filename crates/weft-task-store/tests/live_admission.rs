@@ -33,7 +33,7 @@ use weft_task_store::worker_pod::{
 };
 use weft_task_store::{TaskKind, TaskTarget};
 
-const PROJECT: &str = "proj-1";
+const PROJECT: Uuid = Uuid::from_u128(0x1);
 const TENANT: Option<&str> = Some("tenant-1");
 /// The saturation threshold the production code uses (mirrored here so the
 /// tests drive pressure relative to the real cutoff).
@@ -106,7 +106,7 @@ fn live_payload(color: &str) -> Value {
 /// admission, `None` when saturated.
 async fn admit_live_execution(
     pool: &PgPool,
-    project: &str,
+    project: Uuid,
     color: &str,
     tenant: Option<&str>,
     binary_hash: Option<&str>,
@@ -117,7 +117,7 @@ async fn admit_live_execution(
     let spec = tasks::NewTask {
         kind: TaskKind::Execute.into(),
         target: TaskTarget::Worker,
-        project_id: Some(project.to_string()),
+        project_id: Some(project),
         dedup_key: Some(format!("{color}:execute")),
         color: Some(color.to_string()),
         tenant_id: tenant.map(str::to_string),
@@ -321,7 +321,7 @@ async fn scaledown_candidates_and_loads(pool: PgPool) {
     // A second worker makes it a candidate.
     alive_pod(&pool, "pod-b").await;
     let cands = projects_with_multiple_workers(&pool).await.expect("candidates");
-    assert_eq!(cands, vec![PROJECT.to_string()]);
+    assert_eq!(cands, vec![PROJECT]);
 
     set_pressure(&pool, "solo", 0.1).await;
     set_pressure(&pool, "pod-b", 0.2).await;
@@ -409,7 +409,7 @@ fn node_test_task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
         kind: "run_node_test".to_string(),
         target: TaskTarget::Dispatcher,
-        project_id: Some(PROJECT.to_string()),
+        project_id: Some(PROJECT),
         dedup_key: Some(dedup.to_string()),
         color: None,
         tenant_id: TENANT.map(str::to_string),
@@ -428,7 +428,7 @@ fn node_test_task(dedup: &str) -> tasks::NewTask {
 #[sqlx::test]
 async fn node_test_orphan_listing_has_grace(pool: PgPool) {
     setup(&pool).await;
-    let threshold = now_unix() - tasks::CLAIM_DURATION_SECS;
+    let threshold = now_unix() - tasks::claim_duration_secs();
 
     // A LIVE (pending) owning task keeps its pod row out of the orphan list.
     let live_task = tasks::enqueue(&pool, node_test_task("live")).await.expect("enqueue live");
@@ -512,7 +512,7 @@ async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
     // Unclaimed row: nothing to record on, fail loud.
     assert!(tasks::store_result_partial(&pool, task_id, "disp-1", &report).await.is_err());
 
-    let claimed = claim_one(&pool, "disp-1", ClaimFilter::Dispatcher)
+    let claimed = claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("the task");
@@ -547,7 +547,7 @@ async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
 async fn surrender_requeues_only_while_claim_is_ours(pool: PgPool) {
     setup(&pool).await;
     let task_id = tasks::enqueue(&pool, node_test_task("t1")).await.expect("enqueue");
-    let claimed = claim_one(&pool, "disp-1", ClaimFilter::Dispatcher)
+    let claimed = claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("the task");
@@ -575,7 +575,7 @@ async fn surrender_requeues_only_while_claim_is_ours(pool: PgPool) {
 
     // The next claim sees a second attempt (how a non-re-runnable
     // executor tells a re-claim from a fresh run).
-    let reclaimed = claim_one(&pool, "disp-2", ClaimFilter::Dispatcher)
+    let reclaimed = claim_one(&pool, "disp-2", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("the requeued task");
@@ -612,7 +612,7 @@ async fn draining_pod_does_not_claim_unpinned(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::Execute.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -628,7 +628,7 @@ async fn draining_pod_does_not_claim_unpinned(pool: PgPool) {
     let drained = claim_one(
         &pool,
         "pod-drain",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim");
@@ -638,7 +638,7 @@ async fn draining_pod_does_not_claim_unpinned(pool: PgPool) {
     let live = claim_one(
         &pool,
         "pod-live",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim")
@@ -660,7 +660,7 @@ async fn draining_pod_still_claims_pinned_to_it(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -675,7 +675,7 @@ async fn draining_pod_still_claims_pinned_to_it(pool: PgPool) {
     let claimed = claim_one(
         &pool,
         "pod-drain",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim")
@@ -711,7 +711,7 @@ async fn in_flight_of_named_pods_is_their_claimed_and_pinned_work(pool: PgPool) 
                 tasks::NewTask {
                     kind: TaskKind::Execute.into(),
                     target: TaskTarget::Worker,
-                    project_id: Some(PROJECT.to_string()),
+                    project_id: Some(PROJECT),
                     dedup_key: None,
                     color: Some(Uuid::new_v4().to_string()),
                     tenant_id: TENANT.map(str::to_string),
@@ -727,7 +727,7 @@ async fn in_flight_of_named_pods_is_their_claimed_and_pinned_work(pool: PgPool) 
     // One task the doomed pod claims, one pinned to it and still pending,
     // one pinned to the fresh sibling (not ours to wait on).
     enqueue(None).await;
-    claim_one(&pool, "pod-doomed", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+    claim_one(&pool, "pod-doomed", &ClaimFilter::Worker { project_id: PROJECT })
         .await
         .expect("claim")
         .expect("the unpinned task");
@@ -800,7 +800,7 @@ async fn claim_binds_color_owner(pool: PgPool) {
     // Admission only INSERTS the pinned task; ownership binds on CLAIM.
     assert_eq!(color_owner(&pool, &color).await, None, "not owned until claimed");
 
-    claim_one(&pool, "pod-a", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+    claim_one(&pool, "pod-a", &ClaimFilter::Worker { project_id: PROJECT })
         .await
         .expect("claim")
         .expect("the task");
@@ -827,7 +827,7 @@ async fn reclaim_moves_color_owner_to_fresh_pod(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -838,7 +838,7 @@ async fn reclaim_moves_color_owner_to_fresh_pod(pool: PgPool) {
     )
     .await
     .expect("enqueue");
-    claim_one(&pool, "pod-old", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+    claim_one(&pool, "pod-old", &ClaimFilter::Worker { project_id: PROJECT })
         .await
         .expect("claim")
         .expect("task");
@@ -852,7 +852,7 @@ async fn reclaim_moves_color_owner_to_fresh_pod(pool: PgPool) {
     let reclaimed = claim_one(
         &pool,
         "pod-new",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim")
@@ -889,7 +889,7 @@ async fn cancel_claim_does_not_move_color_owner(pool: PgPool) {
             .expect("admit")
             .expect("chosen");
     assert_eq!(admitted.pod_name, "pod-owner", "admit must pin to the least-pressured pod");
-    claim_one(&pool, "pod-owner", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+    claim_one(&pool, "pod-owner", &ClaimFilter::Worker { project_id: PROJECT })
         .await
         .expect("claim")
         .expect("the execute task");
@@ -903,7 +903,7 @@ async fn cancel_claim_does_not_move_color_owner(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -914,7 +914,7 @@ async fn cancel_claim_does_not_move_color_owner(pool: PgPool) {
     )
     .await
     .expect("enqueue cancel");
-    claim_one(&pool, "pod-other", ClaimFilter::Worker { project_id: PROJECT.to_string() })
+    claim_one(&pool, "pod-other", &ClaimFilter::Worker { project_id: PROJECT })
         .await
         .expect("claim")
         .expect("the cancel task");
@@ -1000,7 +1000,7 @@ async fn draining_pod_exits_despite_busy_sibling(pool: PgPool) {
     claim_one(
         &pool,
         "pod-busy",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim")
@@ -1054,7 +1054,7 @@ async fn orphan_sweep_requeues_non_live_task(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -1093,7 +1093,7 @@ async fn orphan_sweep_leaves_dispatcher_claimed_tasks_alone(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::FireSignal.into(),
             target: TaskTarget::Dispatcher,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: None,
             tenant_id: TENANT.map(str::to_string),
@@ -1104,7 +1104,7 @@ async fn orphan_sweep_leaves_dispatcher_claimed_tasks_alone(pool: PgPool) {
     )
     .await
     .expect("enqueue");
-    let task = claim_one(&pool, "weft-dispatcher-0", ClaimFilter::Dispatcher)
+    let task = claim_one(&pool, "weft-dispatcher-0", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("claimed");
@@ -1133,7 +1133,7 @@ async fn expired_dispatcher_claim_is_rescued_by_the_next_claim(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::FireSignal.into(),
             target: TaskTarget::Dispatcher,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: None,
             tenant_id: TENANT.map(str::to_string),
@@ -1144,12 +1144,12 @@ async fn expired_dispatcher_claim_is_rescued_by_the_next_claim(pool: PgPool) {
     )
     .await
     .expect("enqueue");
-    let task = claim_one(&pool, "weft-dispatcher-0", ClaimFilter::Dispatcher)
+    let task = claim_one(&pool, "weft-dispatcher-0", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("claimed");
 
-    let stolen = claim_one(&pool, "weft-dispatcher-1", ClaimFilter::Dispatcher)
+    let stolen = claim_one(&pool, "weft-dispatcher-1", &ClaimFilter::Dispatcher)
         .await
         .expect("claim");
     assert!(stolen.is_none(), "a live claim is not stealable");
@@ -1165,7 +1165,7 @@ async fn expired_dispatcher_claim_is_rescued_by_the_next_claim(pool: PgPool) {
     let orphans = reclaim_orphaned_tasks(&pool).await.expect("reclaim");
     assert!(orphans.is_empty(), "the sweep still leaves dispatcher rows alone");
 
-    let rescued = claim_one(&pool, "weft-dispatcher-1", ClaimFilter::Dispatcher)
+    let rescued = claim_one(&pool, "weft-dispatcher-1", &ClaimFilter::Dispatcher)
         .await
         .expect("claim")
         .expect("a lapsed claim is re-claimable");
@@ -1192,7 +1192,7 @@ async fn stale_image_pod_cannot_claim_stamped_task(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::Execute.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -1207,7 +1207,7 @@ async fn stale_image_pod_cannot_claim_stamped_task(pool: PgPool) {
     let stale_claim = claim_one(
         &pool,
         "pod-stale",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim");
@@ -1226,7 +1226,7 @@ async fn stale_image_pod_cannot_claim_stamped_task(pool: PgPool) {
     let fresh_claim = claim_one(
         &pool,
         "pod-fresh",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim");
@@ -1250,7 +1250,7 @@ async fn pinned_task_bypasses_image_check(pool: PgPool) {
         tasks::NewTask {
             kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
-            project_id: Some(PROJECT.to_string()),
+            project_id: Some(PROJECT),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
@@ -1265,7 +1265,7 @@ async fn pinned_task_bypasses_image_check(pool: PgPool) {
     let claim = claim_one(
         &pool,
         "pod-owner",
-        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+        &ClaimFilter::Worker { project_id: PROJECT },
     )
     .await
     .expect("claim");

@@ -55,7 +55,7 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
         route.require_active().map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
         let tenant = state
             .tenant_router
-            .tenant_for_project(&route.project_id)
+            .tenant_for_project(route.project_id)
             .await
             .context("tenant for the arriving caller's project")?;
         let request = weft_core::caller::LiveRequest {

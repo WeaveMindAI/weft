@@ -25,6 +25,12 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# Removes what failed runs kept; `scripts/run-e2e.sh --clean` runs it.
+[[bin]]
+name = "weft-e2e-clean"
+path = "src/bin/weft-e2e-clean.rs"
+required-features = ["e2e"]
+
 [features]
 # OFF by default. Gates the live-cluster test bodies and the runtime they need.
 # Without it the crate still type-checks (the toolkit is always compiled) but no

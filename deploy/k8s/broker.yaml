@@ -1,5 +1,7 @@
-# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
-#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
+# Namespaces are rendered per install by the daemon
+# (crates/weft-cli/src/commands/daemon.rs, manifest_template_vars) from
+# weft_core::infra::Instance, so a named install beside the default one
+# applies this same file into namespaces of its own.
 ---
 # weft-broker. The trusted proxy that fronts Postgres for tenant
 # pods. Validates each request's projected SA token via TokenReview,
@@ -14,7 +16,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weft-broker-sa
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -28,11 +30,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: weft-broker-tokenreview
+  # One binding per install on the cluster (the ClusterRole above is
+  # shared).
+  name: weft-broker-tokenreview${WEFT_INSTANCE_SUFFIX}
 subjects:
   - kind: ServiceAccount
     name: weft-broker-sa
-    namespace: weft-db
+    namespace: ${WEFT_DB_NAMESPACE}
 roleRef:
   kind: ClusterRole
   name: weft-broker-tokenreview
@@ -42,7 +46,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: weft-broker
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     app: weft-broker
     weft.dev/role: broker
@@ -85,6 +89,18 @@ spec:
               value: "9090"
             - name: WEFT_BROKER_AUDIENCE
               value: "weft-broker"
+            # Which install on the cluster this broker serves (empty for
+            # the default one): only that install's system namespace
+            # counts as its control plane.
+            # SYNC: WEFT_INSTANCE / WEFT_TIME_SCALE <->
+            #       crates/weft-core/src/infra/instance.rs (INSTANCE_ENV),
+            #       crates/weft-core/src/time_scale.rs (TIME_SCALE_ENV),
+            #       deploy/k8s/dispatcher.yaml
+            - name: WEFT_INSTANCE
+              value: "${WEFT_INSTANCE}"
+            # How fast the install's own timers run (1 = real time).
+            - name: WEFT_TIME_SCALE
+              value: "${WEFT_TIME_SCALE}"
             # The deployment's public base URL (same value the
             # dispatcher publishes): what event subscribe calls tell a
             # provider to post to. Substituted by the daemon at apply.
@@ -163,7 +179,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: weft-broker
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
   labels:
     app: weft-broker
 spec:
@@ -182,7 +198,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-broker-ingress
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
@@ -243,7 +259,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: weft-broker-egress
-  namespace: weft-db
+  namespace: ${WEFT_DB_NAMESPACE}
 spec:
   podSelector:
     matchLabels:
