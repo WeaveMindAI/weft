@@ -387,18 +387,20 @@ async fn overlay_suspended(
     summaries: &mut [crate::journal::ExecutionSummary],
 ) -> Result<(), StatusCode> {
     use std::collections::HashMap;
-    let mut sets: HashMap<String, std::collections::HashSet<Color>> = HashMap::new();
+    let mut sets: HashMap<uuid::Uuid, std::collections::HashSet<Color>> = HashMap::new();
     for s in summaries.iter_mut() {
         if s.status != "running" {
             continue;
         }
-        if !sets.contains_key(&s.project_id) {
-            let set = crate::api::project::suspended_color_set(state, &s.project_id)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            sets.insert(s.project_id.clone(), set);
-        }
-        if sets[&s.project_id].contains(&s.color) {
+        let set = match sets.entry(s.project_id) {
+            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
+                crate::api::project::suspended_color_set(state, s.project_id)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ),
+        };
+        if set.contains(&s.color) {
             s.status = "waiting_for_input".to_string();
         }
     }
@@ -655,7 +657,7 @@ pub async fn replay(
             weft_journal::SeedChain::default()
         }
     };
-    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id.clone())
+    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id)
         .with_inheritance(inheritance);
     let mut out: Vec<crate::events::LiveEvent> = Vec::new();
     for record in raw_events {
@@ -670,7 +672,7 @@ pub async fn replay(
     for (site, reason) in corruptions {
         out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
-            project_id: project_id.clone(),
+            project_id,
             site,
             reason,
         }));
@@ -685,7 +687,7 @@ pub async fn replay(
 pub struct ListExecutionsParams {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
-    pub project_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
     /// Inclusive lower bound on start time (unix seconds).
     pub started_after: Option<u64>,
     /// Exclusive upper bound on start time (unix seconds).
@@ -732,9 +734,8 @@ pub async fn list_executions(
 pub async fn latest_for_project(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<crate::journal::ExecutionSummary>, StatusCode> {
-    let id = id_str.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
     authorize_project(&state, &caller.0, id)
         .await
         .map_err(|(s, _)| s)?;
@@ -743,7 +744,7 @@ pub async fn latest_for_project(
     let query = ExecutionQuery {
         limit: 1,
         offset: 0,
-        project_id: Some(id.to_string()),
+        project_id: Some(id),
         started_after: None,
         started_before: None,
         phase: None,
@@ -851,17 +852,14 @@ pub async fn delete_execution(
     // The run IS deleted, which is what was asked for, so a sweep that
     // cannot run is said out loud and does not fail the delete: the
     // reaper and the next `weft clean` both reach the same rows.
-    let swept = match project_id.parse::<uuid::Uuid>() {
-        Ok(id) => crate::api::versions::sweep_bare_versions(&state, id).await.unwrap_or_else(|(status, message)| {
-            tracing::warn!(
-                target: "weft_dispatcher::versions",
-                %color, project_id = %project_id, %status, %message,
-                "the run is deleted; the version it may have left bare could not be swept"
-            );
-            Vec::new()
-        }),
-        Err(_) => Vec::new(),
-    };
+    let swept = crate::api::versions::sweep_bare_versions(&state, project_id).await.unwrap_or_else(|(status, message)| {
+        tracing::warn!(
+            target: "weft_dispatcher::versions",
+            %color, project_id = %project_id, %status, %message,
+            "the run is deleted; the version it may have left bare could not be swept"
+        );
+        Vec::new()
+    });
     Ok(axum::Json(serde_json::json!({ "project": project_id, "swept": swept })))
 }
 
@@ -873,7 +871,7 @@ pub(crate) async fn clean_execution(
     state: &DispatcherState,
     caller: &crate::tenant::TenantId,
     color: Color,
-) -> Result<String, StatusCode> {
+) -> Result<uuid::Uuid, StatusCode> {
     // The gate already read the owning row; keep it rather than asking
     // again. Its tenant is the one the storage prefix was WRITTEN
     // under, so the wipe below addresses the same bytes the run
@@ -930,14 +928,14 @@ pub(crate) async fn clean_execution(
     // NOTIFY, not the journal: the journal is what was just erased.
     state
         .events
-        .publish(DispatcherEvent::ExecutionDeleted { color, project_id: owner.project_id.clone() })
+        .publish(DispatcherEvent::ExecutionDeleted { color, project_id: owner.project_id })
         .await;
     // This may have been the last run keeping a removed project's code
     // and tree rows on file. A failure here leaves rows nobody reads and
     // nothing else, and the reaper's `retired_rows` sweep comes back for
     // them, so it is logged rather than failing a clean that has already
     // done its work.
-    if let Err(e) = crate::api::project::retire_what_no_run_needs(state, &owner.project_id).await {
+    if let Err(e) = crate::api::project::retire_what_no_run_needs(state, owner.project_id).await {
         tracing::warn!(
             target: "weft_dispatcher::projection",
             %color, project_id = %owner.project_id, error = %e,
@@ -958,7 +956,7 @@ mod waits_tests {
             program: None,
             token: token.into(),
             tenant_id: "t".into(),
-            project_id: "p".into(),
+            project_id: uuid::Uuid::from_u128(0x100),
             color,
             node_id: node.into(),
             is_resume,

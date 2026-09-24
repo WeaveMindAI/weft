@@ -25,17 +25,23 @@ use crate::state::BrokerState;
 pub struct AuthConfig {
     /// Audience claim every projected SA token must carry.
     pub audience: String,
+    /// The namespace this broker's own install runs its control plane
+    /// in (`weft_core::infra::Instance::system_namespace`). The only
+    /// namespace whose dispatcher, listener and supervisor accounts
+    /// count as control plane: an account of the same name in another
+    /// install on the same cluster verifies just as well at TokenReview,
+    /// and must still be a stranger here.
+    pub system_namespace: String,
 }
 
-// Service-account names + the dispatcher namespace, defined ONCE.
-// `from_sa_name` and `resolve_storage_caller` both branch on these; without
+// Service-account names, defined ONCE.
+// `from_sa_name` and `classify_caller` both branch on these; without
 // shared consts a rename would update one site and silently break the
 // other (e.g. workers losing their storage identity).
 pub(crate) const WORKER_SA: &str = "weft-worker-sa";
 pub(crate) const LISTENER_SA: &str = "weft-listener-sa";
 pub(crate) const INFRA_SUPERVISOR_SA: &str = "weft-infra-supervisor-sa";
 pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
-pub(crate) const DISPATCHER_NS: &str = weft_core::infra::SYSTEM_NAMESPACE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -107,7 +113,7 @@ pub enum CallerScope {
     /// from the pod's own kubelet-stamped identity and the row the
     /// dispatcher wrote for it, never from anything the pod supplies,
     /// so a handler can hold a request to them.
-    Tenant { tenant: String, project: String },
+    Tenant { tenant: String, project: uuid::Uuid },
     ControlPlane,
 }
 
@@ -123,9 +129,9 @@ impl CallerScope {
 
     /// The project this caller is pinned to, or `None` for a
     /// control-plane caller that acts for any of them.
-    pub fn pinned_project(&self) -> Option<&str> {
+    pub fn pinned_project(&self) -> Option<uuid::Uuid> {
         match self {
-            Self::Tenant { project, .. } => Some(project),
+            Self::Tenant { project, .. } => Some(*project),
             Self::ControlPlane => None,
         }
     }
@@ -278,37 +284,84 @@ pub async fn reviewed_token(
     Ok(reviewed)
 }
 
-/// Resolve a runtime-storage caller from its presented token, into the
-/// pure key-wall identity (`CallerAuth`). This is the identity authority
-/// behind the runtime-file plane's prefix wall, run IN-PROCESS by the
-/// broker's own runtime-storage handlers (the broker is both the authority
 /// Additional CONTROL-PLANE service accounts, from the deploy config:
 /// `WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS` is a comma list of
 /// `namespace/serviceaccount` pairs the runtime trusts with the admin
 /// surface alongside the dispatcher. TokenReview still verifies every
 /// token; this only extends WHICH verified identities count as control
 /// plane, and each stays distinct in audit logs. Parsed once per process.
-fn is_extra_control_plane(namespace: &str, sa_name: &str) -> bool {
+fn extra_control_plane_sas() -> &'static [(String, String)] {
     static EXTRA: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-    EXTRA
-        .get_or_init(|| {
-            std::env::var("WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|pair| {
-                    let (ns, sa) = pair.trim().split_once('/')?;
-                    (!ns.is_empty() && !sa.is_empty())
-                        .then(|| (ns.to_string(), sa.to_string()))
-                })
-                .collect()
-        })
-        .iter()
-        .any(|(ns, sa)| ns == namespace && sa == sa_name)
+    EXTRA.get_or_init(|| {
+        std::env::var("WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|pair| {
+                let (ns, sa) = pair.trim().split_once('/')?;
+                (!ns.is_empty() && !sa.is_empty()).then(|| (ns.to_string(), sa.to_string()))
+            })
+            .collect()
+    })
 }
 
+/// What a verified service account is to this install, before any
+/// tenant lookup. Both identity planes (the broker surface's
+/// `extract_identity`, the runtime-storage plane's
+/// `resolve_storage_caller`) start from this one answer, so they cannot
+/// disagree about who is control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallerClass {
+    /// A trusted account of THIS install's control plane. `role` is its
+    /// broker role; `None` for the dispatcher and the deploy's extra
+    /// admin accounts, which reach only the admin surface.
+    ControlPlane { role: Option<Role> },
+    /// A worker account: its tenant and project come from a lookup.
+    Worker,
+    /// No identity here; the message says why.
+    Refused(String),
+}
+
+/// Classify a reviewed token's account. A control-plane account counts
+/// only in `system_namespace`: another install sharing the cluster runs
+/// the same account names in its own system namespace, and its
+/// dispatcher, listener or supervisor is no authority over this one.
+/// `extra` is the deploy's extra control-plane `(namespace, account)`
+/// pairs, each already namespace-qualified.
+pub(crate) fn classify_caller(
+    sa_name: &str,
+    namespace: &str,
+    system_namespace: &str,
+    extra: &[(String, String)],
+) -> CallerClass {
+    if extra.iter().any(|(ns, sa)| ns == namespace && sa == sa_name) {
+        return CallerClass::ControlPlane { role: None };
+    }
+    let role = if sa_name == DISPATCHER_SA {
+        None
+    } else {
+        match Role::from_sa_name(sa_name) {
+            Some(role) if !role.is_control_plane() => return CallerClass::Worker,
+            Some(role) => Some(role),
+            None => return CallerClass::Refused(format!("unknown service account '{sa_name}'")),
+        }
+    };
+    if namespace != system_namespace {
+        return CallerClass::Refused(format!(
+            "service account '{sa_name}' in '{namespace}' is not this install's control plane"
+        ));
+    }
+    CallerClass::ControlPlane { role }
+}
+
+/// Resolve a runtime-storage caller from its presented token, into the
+/// pure key-wall identity (`CallerAuth`). This is the identity authority
+/// behind the runtime-file plane's prefix wall, run IN-PROCESS by the
+/// broker's own runtime-storage handlers (the broker is both the authority
 /// and the data path, so there is no relay):
-///   - the dispatcher (`weft-dispatcher` in `weft-system`) -> ControlPlane
-///     (the CLI admin verbs: list/usage/delete/presign/wipe for a tenant).
+///   - the dispatcher (`weft-dispatcher` in this install's system
+///     namespace) or a deploy-configured extra admin account ->
+///     ControlPlane (the CLI admin verbs: list/usage/delete/presign/wipe
+///     for a tenant).
 ///   - a worker (`weft-worker-sa`) -> Worker { tenant, project, color },
 ///     resolving tenant + project from the token's namespace (or, in the
 ///     shared worker namespace, from the worker's pod identity), and
@@ -316,8 +369,9 @@ fn is_extra_control_plane(namespace: &str, sa_name: &str) -> bool {
 ///     color's owning pod must be the caller, and the color must belong to
 ///     the caller's project).
 /// A `color` claim that is absent yields `color: None` (execution-scoped
-/// keys then unreachable, which the wall enforces). Any other SA has no
-/// runtime-storage identity (403).
+/// keys then unreachable, which the wall enforces). Any other account,
+/// the listener and supervisor included, has no runtime-storage
+/// identity (403).
 pub async fn resolve_storage_caller(
     state: &Arc<BrokerState>,
     headers: &HeaderMap,
@@ -325,12 +379,19 @@ pub async fn resolve_storage_caller(
 ) -> Result<weft_core::storage::key::CallerAuth, (StatusCode, String)> {
     use weft_core::storage::key::CallerAuth;
     let reviewed = reviewed_token(state, headers).await?;
-    if is_extra_control_plane(&reviewed.namespace, &reviewed.sa_name) {
-        return Ok(CallerAuth::ControlPlane);
-    }
-    match reviewed.sa_name.as_str() {
-        DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => Ok(CallerAuth::ControlPlane),
-        WORKER_SA => {
+    match classify_caller(
+        &reviewed.sa_name,
+        &reviewed.namespace,
+        &state.auth.system_namespace,
+        extra_control_plane_sas(),
+    ) {
+        CallerClass::ControlPlane { role: None } => Ok(CallerAuth::ControlPlane),
+        CallerClass::ControlPlane { role: Some(_) } => Err((
+            StatusCode::FORBIDDEN,
+            format!("service account '{}' has no runtime-storage identity", reviewed.sa_name),
+        )),
+        CallerClass::Refused(why) => Err((StatusCode::FORBIDDEN, why)),
+        CallerClass::Worker => {
             // Who this worker is, from its own unforgeable identity.
             // One resolver, shared with `extract_identity`, so the two
             // planes cannot end up with different ideas of a caller.
@@ -345,7 +406,7 @@ pub async fn resolve_storage_caller(
             let color = match color {
                 None => None,
                 Some(color) => {
-                    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                    let row: Option<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
                         "SELECT tenant_id, project_id, owner_pod_name \
                          FROM execution_color WHERE color = $1",
                     )
@@ -381,12 +442,8 @@ pub async fn resolve_storage_caller(
                     Some(color.to_string())
                 }
             };
-            Ok(CallerAuth::Worker { tenant: tenant_id, project_id, color })
+            Ok(CallerAuth::Worker { tenant: tenant_id, project_id: project_id.to_string(), color })
         }
-        other => Err((
-            StatusCode::FORBIDDEN,
-            format!("service account '{other}' has no runtime-storage identity"),
-        )),
     }
 }
 
@@ -414,10 +471,6 @@ pub async fn extract_identity(
     headers: &HeaderMap,
 ) -> Result<CallerIdentity, (StatusCode, String)> {
     let reviewed = reviewed_token(state, headers).await?;
-    let role = Role::from_sa_name(&reviewed.sa_name).ok_or((
-        StatusCode::FORBIDDEN,
-        format!("unknown service account '{}'", reviewed.sa_name),
-    ))?;
     // Control-plane services (pooled listener / supervisor) run in the
     // control-plane namespace and are not pinned to a tenant: their
     // scope is ControlPlane and per-op validation derives the tenant
@@ -433,17 +486,30 @@ pub async fn extract_identity(
     // `worker_pod` row -> project -> tenant). Both paths derive the
     // tenant from trusted, dispatcher-written state, never from
     // anything the pod supplies.
-    let scope = if role.is_control_plane() {
-        CallerScope::ControlPlane
-    } else {
-        let resolved = crate::scope::lookup_worker_scope(
-            &state.scope_cache,
-            &state.pool,
-            &reviewed.namespace,
-            reviewed.pod_name.as_deref(),
-        )
-        .await?;
-        CallerScope::Tenant { tenant: resolved.tenant, project: resolved.project }
+    let (role, scope) = match classify_caller(
+        &reviewed.sa_name,
+        &reviewed.namespace,
+        &state.auth.system_namespace,
+        extra_control_plane_sas(),
+    ) {
+        CallerClass::ControlPlane { role: Some(role) } => (role, CallerScope::ControlPlane),
+        CallerClass::ControlPlane { role: None } => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("service account '{}' has no broker role", reviewed.sa_name),
+            ))
+        }
+        CallerClass::Refused(why) => return Err((StatusCode::FORBIDDEN, why)),
+        CallerClass::Worker => {
+            let resolved = crate::scope::lookup_worker_scope(
+                &state.scope_cache,
+                &state.pool,
+                &reviewed.namespace,
+                reviewed.pod_name.as_deref(),
+            )
+            .await?;
+            (Role::Worker, CallerScope::Tenant { tenant: resolved.tenant, project: resolved.project })
+        }
     };
     Ok(CallerIdentity {
         scope,
@@ -481,3 +547,56 @@ where
     }
 }
 
+#[cfg(test)]
+mod classify_tests {
+    use super::{classify_caller, CallerClass, Role, DISPATCHER_SA, INFRA_SUPERVISOR_SA, LISTENER_SA, WORKER_SA};
+
+    const OURS: &str = "weft-system";
+    const THEIRS: &str = "weft-system-other";
+
+    fn classify(sa: &str, ns: &str) -> CallerClass {
+        classify_caller(sa, ns, OURS, &[])
+    }
+
+    #[test]
+    fn our_dispatcher_is_control_plane() {
+        assert_eq!(classify(DISPATCHER_SA, OURS), CallerClass::ControlPlane { role: None });
+    }
+
+    #[test]
+    fn another_installs_dispatcher_is_refused() {
+        assert!(matches!(classify(DISPATCHER_SA, THEIRS), CallerClass::Refused(_)));
+    }
+
+    #[test]
+    fn another_installs_listener_and_supervisor_are_refused() {
+        assert!(matches!(classify(LISTENER_SA, THEIRS), CallerClass::Refused(_)));
+        assert!(matches!(classify(INFRA_SUPERVISOR_SA, THEIRS), CallerClass::Refused(_)));
+    }
+
+    #[test]
+    fn our_listener_and_supervisor_carry_their_role() {
+        assert_eq!(classify(LISTENER_SA, OURS), CallerClass::ControlPlane { role: Some(Role::Listener) });
+        assert_eq!(
+            classify(INFRA_SUPERVISOR_SA, OURS),
+            CallerClass::ControlPlane { role: Some(Role::InfraSupervisor) }
+        );
+    }
+
+    #[test]
+    fn a_worker_anywhere_needs_a_lookup() {
+        assert_eq!(classify(WORKER_SA, "wft-project-a"), CallerClass::Worker);
+    }
+
+    #[test]
+    fn an_unknown_account_is_refused() {
+        assert!(matches!(classify("default", OURS), CallerClass::Refused(_)));
+    }
+
+    #[test]
+    fn an_extra_account_counts_only_in_its_own_namespace() {
+        let extra = [("ops".to_string(), "admin".to_string())];
+        assert_eq!(classify_caller("admin", "ops", OURS, &extra), CallerClass::ControlPlane { role: None });
+        assert!(matches!(classify_caller("admin", "elsewhere", OURS, &extra), CallerClass::Refused(_)));
+    }
+}

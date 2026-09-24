@@ -1,26 +1,67 @@
 # weft-e2e: Layer-4 end-to-end tests
 
 A test is plain Rust that prepares a fixture, drives it through the dispatcher's
-public API exactly as the outside world sees it, and asserts. The rig brings the
-cluster up on current code itself (`ensure::up()` runs `./setup.sh --cli --daemon`,
-which skips the VS Code extension build the rig has no use for), so you only
-ever touch the two sanctioned commands below. Gated behind the `e2e` feature (off
-by default), so `cargo test --workspace` compiles but runs none of it.
+public API exactly as the outside world sees it, and asserts. Gated behind the
+`e2e` feature (off by default), so `cargo test --workspace` compiles but runs
+none of it.
 
 ## Run
 
-Always via the runner. It runs one test binary at a time and STOPS at the first
-failure, leaving the cluster in that state for inspection:
+Always through the runner:
 
 ```bash
-scripts/run-e2e.sh                # whole suite
-scripts/run-e2e.sh live_chat      # one test, by file name
-scripts/run-e2e.sh --from live_chat   # resume the suite at that test
+scripts/run-e2e.sh                          # every test
+scripts/run-e2e.sh live_chat plain          # every test in these files
+scripts/run-e2e.sh accesses::some_test      # one test
+scripts/run-e2e.sh --failed                 # the tests that did not pass last time
+scripts/run-e2e.sh -j 8                     # 8 tests at once instead of 16
+scripts/run-e2e.sh --keep-going             # keep going after a failure, to see them all
+scripts/run-e2e.sh --clean                  # only remove what failed runs kept
 ```
 
-Need another subset or flag? Add it to `run-e2e.sh`. Do NOT hand-write a `cargo test`
-invocation. First run is slow (cluster bring-up + per-fixture worker-image
-compiles); that is expected, never shortcut it.
+The runner brings the cluster to current code once (`setup.sh --cli --daemon`),
+builds every test binary once, then runs every TEST on its own, side by side,
+longest first (by how long each took last time). Each test's output lands in
+`~/.local/share/weft/e2e/run/<file>::<test>.log`, and the summary prints one
+line per test with how long it took.
+
+How many run at once is `-j`. The whole cluster is one kind node on your
+machine, so past a point more at once only makes each test slower: watch the
+per-test times in the summary grow when you raise it. On a 24-core machine the
+whole suite takes under three minutes at the default of 16.
+
+If you want to know where a slow test spends its time, read its log: every
+`weft` command it ran and every wait it sat through is a line of its own
+(`[e2e] 38.3s: weft infra start`, `[e2e] waited 4.0s for: execution ... to
+reach a terminal status`).
+
+If you want to know what happens when something fails: the test keeps what it
+made (its projects, its cell if it had one), the runner stops starting new
+tests and lets the running ones finish, and it writes a post-mortem next to the
+log (`<file>::<test>.post-mortem/`: every pod, the recent events, the logs of
+the dispatcher, the listeners and the infra supervisors, and of the worker pods
+of every project the test kept). The cluster is left as it was, so you can poke at it. What
+the failure kept stays until the next run starts: every run begins by removing
+what earlier failed runs kept (cells, projects and connections the suite
+made, marked as e2e), then runs `weft clean --images --all`. That last step is
+machine-wide and reaches past the suite: it removes every worker image no
+project on the default install references (yours too, once nothing runs them),
+infra images no project references, the kind node's cached copies of both,
+every builder base but the current one, and worker compile caches of a retired
+key that sat unused. `--clean` does only this, without bringing the cluster to
+current code first, so a failure's dispatcher is still the one that failed.
+`--failed` re-runs just the tests that did not pass: the ones that failed, the
+ones the stop kept from starting, and, if you pressed Ctrl-C, the ones it cut
+short. Ctrl-C stops every running test (and what each one started) before the
+runner lets go of the cluster, so nothing keeps running into the next run.
+
+The runner needs bash 5.1 or newer, and only one run (or `--clean`) at a time
+on a machine, from any checkout: a second one is refused while the first is
+alive.
+
+When a whole run passes, nothing is left behind: every test removed its own
+projects, cells and connections, and the runner runs the same
+`weft clean --images --all`, with the same machine-wide reach.
 
 ## Credentials, and what the runner provides for you
 
@@ -61,8 +102,8 @@ The rule and its whole list of never-dos live in
 for every part of this repo, not just this suite.
 
 The one thing worth repeating here: time is never a reason to deviate. A
-reinstall and a full e2e run is slow (per-fixture worker image compiles, serial
-scenarios), and that is expected. Take the slow reproducible path, so a fresh
+reinstall is slow (image builds, per-fixture worker compiles), and that is
+expected. Take the slow reproducible path, so a fresh
 machine and CI end up with the same working system you have.
 
 ```bash
@@ -86,19 +127,22 @@ use weft_e2e::{ensure, project::Project, run};
 
 #[tokio::test]
 async fn my_scenario() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;                                // system up on current code
+    let disp = ensure::up().await?;                                // the default install
     let mut project = Project::prepare("my_fixture", disp).await?; // fixtures/my_fixture -> isolated project
     let settled = run::run_and_settle(&mut project).await?;        // drive it
     settled.completed()?;                                          // assert (folds the replay log)
     settled.assert_input("out", "data", &serde_json::json!("x"))?;
-    project.finish().await                                         // teardown (pass only; a fail keeps it for inspection)
+    project.finish().await                                         // removes it (pass only; a fail keeps it)
 }
 ```
 
-A **fixture** is `fixtures/<name>/` with a `weft.toml` (any id; the rig rewrites
-it) + a `src/main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`.
-For a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
-`src/main.weft` and call `project.substitute_in_main(...)` before building.
+A **fixture** is `fixtures/<name>/` with a `weft.toml` + a `src/main.weft`; a
+custom node goes under `fixtures/<name>/nodes/<node>/`. Its `[package]` name
+must start with `e2e_`: that is how `--clean` tells test projects from yours,
+and `Project::prepare` refuses a fixture without it. The id does not matter,
+the rig gives every copy a fresh one. For a runtime value baked into the graph,
+put a `__E2E_TOKEN__` placeholder in `src/main.weft` and call
+`project.substitute_in_main(...)` before building.
 
 To write the `.weft` graph itself, see the language reference under
 `../../docs/src/language/` (and `../../docs/src/nodes/` for custom nodes). Get the project
@@ -108,11 +152,79 @@ right there; a malformed `src/main.weft` fails at build, not as a test assertion
 (`src/`), not the test.** Keep test bodies about WHAT they assert; the HOW (HTTP,
 SQL, kubectl) lives in the toolkit so it stays DRY and reviewable.
 
+### Your test runs beside the others
+
+Every test runs at the same time as a few others, on the same cluster, so a
+test may only touch and count what it made itself. In practice:
+
+- Assert on your own project, your own run, your own pods. A query over a whole
+  table ("how many links exist", "how many pods are alive") counts your
+  neighbours too; scope it to your color or your project, the way
+  `Platform::public_file_link_count_for` does.
+- Never delete anything you did not create, and never clean up at the start of
+  a test. A failed test's leftovers are evidence, and the next run removes them.
+- End a passing test with `project.finish()` (and `cell.finish()` if it made a
+  cell). A failing test skips that on purpose.
+- Fakes bind a port the system picks, and the platform layer's port-forwards do
+  too. Never pick a fixed port.
+- Make connections through `access::connect_direct` / `connect_paste` (and wrap
+  a grant you seed by hand in `access::SeededGrant`): a connection carries no
+  name that says it is a test's, so those record it in a ledger, and the next
+  run removes what a failed test left in it.
+
+### When your test needs its own install: a cell
+
+Some things are shared by every project on an install, and a test that watches
+them change cannot share them. The listener and supervisor POOLS are the case
+today: a scale-down test waits for the whole pool to fold to one pod, and
+another test's trigger on the same pool keeps a second pod busy.
+
+If your test watches something install-wide, start a cell: a whole install of
+its own (dispatcher, Postgres, broker, pools) in the same cluster, in
+namespaces of its own. It starts from the images already built, and everything
+else in the toolkit follows its dispatcher there:
+
+```rust
+use weft_e2e::{platform::Platform, project::Project, Cell};
+
+let cell = Cell::start(Cell::FAST).await?;              // an install of this test's own
+let disp = cell.dispatcher();
+let platform = Platform::connect(&disp).await?;          // this cell's Postgres and namespaces
+let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
+// ... drive, assert ...
+project.finish().await?;
+cell.finish().await                                      // removes the cell (pass only)
+```
+
+The number you hand `Cell::start` is how fast the cell's own timers run: `1.0`
+is real time, and `Cell::FAST` (`0.1`) runs them ten times faster. That is
+every heartbeat, lease, reaper tick and silence window the runtime keeps for
+itself, all together, so the protocol behaves the same, only sooner: the
+scale-down sweep that comes round every 60 seconds at real time comes round
+every 6. What a person configured (a wait's timeout, a trigger's poll interval)
+and budgets for real work (a new pod's spawn grace) keep their real length. If
+your test waits on one of the runtime's own timers, `cell.scaled(...)` turns a
+real-time duration into the cell's.
+
+Use real time when a faster clock would end the thing you are observing before
+you observe it: `listener_move` holds a two-pod overlap open, and a fast
+scale-down would fold it early.
+
+Pick something between the two when one of those timers also has to cover real
+work, which no clock compresses. A live caller's ticket starts counting before
+the worker it names is ready, and at a tenth of its two minutes a busy cluster
+starting that worker used up most of what was left, so `api_ticket` runs at
+`0.25`.
+
+A cell costs its own startup, so a test that does not watch anything
+install-wide stays on the default install.
+
 ## Toolkit
 
 | Module | What it does |
 | --- | --- |
-| `ensure` | Bring the system up on current code; wait for health. |
+| `ensure` | Reach the default install (the runner brought it up); wait for health. |
+| `cell::Cell` | A whole install of a test's own, with its own pace; see above. |
 | `project::Project` | Fixture -> isolated project: `prepare`, `build`, `activate`, `weft(args)`, `substitute_in_main`, `finish`. |
 | `run` | `run_and_settle`, `start`, `wait_for_triggered_execution`, `SettledRun::observe`. |
 | `assert` (`SettledRun`) | `completed`, `failed_with`, `assert_input/output/skipped`, `assert_loop_iterations`. |

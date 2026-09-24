@@ -26,6 +26,22 @@ use crate::state::DispatcherState;
 /// webhook payloads. Trusted routes keep axum's default limit.
 const PUBLIC_FIRE_BODY_LIMIT: usize = 256 * 1024;
 
+/// `?wait_ms=` on a read whose answer a client waits on: hold the read
+/// for up to that long for the answer to change (never past `MAX_HOLD`;
+/// a client that wants longer asks again). Absent, the read answers at
+/// once.
+#[derive(serde::Deserialize, Default)]
+pub struct HoldQuery {
+    #[serde(default)]
+    wait_ms: u64,
+}
+
+impl HoldQuery {
+    pub fn hold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
+    }
+}
+
 pub mod project;
 // `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
 // is exercised by the db-test rig in `tests/db_tags.rs` against a real
@@ -35,7 +51,7 @@ mod events;
 mod provider_events;
 mod signal_token;
 mod signal_token_names;
-mod infra;
+pub(crate) mod infra;
 mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
 // helpers (`append_parked_fire` and siblings) are the dispatcher's
@@ -46,6 +62,7 @@ pub mod access;
 pub mod node_tests;
 pub mod storage;
 pub mod versions;
+mod public_page;
 
 /// The dispatcher routes, not yet bound to state. Additional routes can be
 /// `.merge`d onto this `Router<DispatcherState>` before binding state (so the
@@ -130,6 +147,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         )
         .route("/executions", get(execution::list_executions))
         .route("/events/project/{id}", get(events::project_stream))
+        .route("/events/project/{id}/displays", get(events::display_stream))
         .route("/events/execution/{color}", get(events::execution_stream))
         // Token administration (tenant-authenticated): mint returns the value
         // ONCE, list returns metadata only, revoke addresses the id.
@@ -248,6 +266,10 @@ fn outside_caller_routes() -> Router<DispatcherState> {
         // media link here; the unguessable expiring token in the path
         // is the credential (see api/storage.rs public_file).
         .route("/public/files/{token}", get(storage::public_file))
+        // The public trigger surface's root page, which the front door's
+        // public listener rewrites `/` onto.
+        .route(&format!("{}/index.html", public_page::PUBLIC_PAGE_PREFIX), get(public_page::index))
+        .route(&format!("{}/logo.png", public_page::PUBLIC_PAGE_PREFIX), get(public_page::logo))
         // Live caller connection handshake: an outside caller hits
         // `/connect/<tenant>/<path>` to open a held connection. The
         // handler matches the route (pattern + method), gates the

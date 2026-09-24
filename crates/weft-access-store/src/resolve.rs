@@ -458,7 +458,13 @@ pub fn events_recipe_hash(events: &BTreeMap<String, EventsSpec>) -> Option<Strin
     if events.is_empty() {
         return None;
     }
-    let canonical = serde_json::to_string(events).expect("events recipes serialize");
+    // Canonical key order: the recipe's JSON values keep insertion order
+    // in any build with serde_json's `preserve_order` (the broker's), so a
+    // plain serialization would hash one recipe two ways depending on
+    // whether it was just parsed or read back out of a jsonb column.
+    let canonical = weft_core::project::hash::canonical_json(
+        &serde_json::to_value(events).expect("events recipes serialize"),
+    );
     Some(weft_core::access::hex_of(&sha2::Sha256::digest(canonical.as_bytes())))
 }
 

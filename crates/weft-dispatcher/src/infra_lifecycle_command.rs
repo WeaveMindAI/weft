@@ -37,7 +37,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TABLE IF NOT EXISTS infra_lifecycle_command (
             id                BIGSERIAL PRIMARY KEY,
             tenant_id         TEXT NOT NULL,
-            project_id        TEXT NOT NULL,
+            project_id        UUID NOT NULL,
             node_id           TEXT,
             verb              TEXT NOT NULL,
             -- Nullable because dispatcher-owned verbs
@@ -94,18 +94,26 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // does NOT use the `claimed_by_pod` lease (that is the
         // dispatcher's mechanism). This partial index keyed on id covers
         // that scan and skips dispatcher-owned + completed rows.
-        r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_supervisor_claim
+        concat!(
+            r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_supervisor_claim
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
-                AND verb IN ('apply', 'stop', 'terminate')"#,
+                AND verb IN ("#,
+            weft_broker_client::supervisor_verbs_sql!(),
+            ")",
+        ),
         // Mirror for the dispatcher claim loop (deactivate /
         // reactivate). No tenant filter: the dispatcher pool claims
         // across all tenants.
-        r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
+        concat!(
+            r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
                 AND claimed_by_pod IS NULL
-                AND verb IN ('deactivate', 'reactivate')"#,
+                AND verb IN ("#,
+            weft_broker_client::dispatcher_verbs_sql!(),
+            ")",
+        ),
         // Partial unique index: at most one pending apply for a
         // given (project_id, node_id). Stops a worker restart from
         // double-enqueueing the same apply; `infra_enqueue_apply`
@@ -113,6 +121,32 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
               ON infra_lifecycle_command(project_id, node_id)
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
+        // Announce a command when it is issued (its claimers wake) and
+        // when it completes (whoever waits on its outcome wakes), from
+        // a trigger so no writer (the dispatcher's own verbs, the
+        // broker's supervisor and worker paths) can forget.
+        // SYNC: the payloads <-> weft_broker_client::lifecycle_command::InfraCommandSignal
+        r#"CREATE OR REPLACE FUNCTION infra_command_notify() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    PERFORM pg_notify('weft_infra_command', 'issued:' || NEW.project_id::text);
+                ELSE
+                    PERFORM pg_notify('weft_infra_command', 'done:' || NEW.id::text);
+                END IF;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS infra_command_notify_on_issue ON infra_lifecycle_command"#,
+        r#"CREATE TRIGGER infra_command_notify_on_issue
+            AFTER INSERT ON infra_lifecycle_command
+            FOR EACH ROW
+            EXECUTE FUNCTION infra_command_notify()"#,
+        r#"DROP TRIGGER IF EXISTS infra_command_notify_on_done ON infra_lifecycle_command"#,
+        r#"CREATE TRIGGER infra_command_notify_on_done
+            AFTER UPDATE OF completed_at_unix ON infra_lifecycle_command
+            FOR EACH ROW
+            WHEN (NEW.completed_at_unix IS NOT NULL AND OLD.completed_at_unix IS NULL)
+            EXECUTE FUNCTION infra_command_notify()"#,
     ],
     seed: &[],
 };
@@ -122,7 +156,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 pub async fn issue_lifecycle(
     pool: &PgPool,
     tenant_id: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: Option<&str>,
     verb: InfraLifecycleVerb,
     running_policy: RunningPolicy,
@@ -160,7 +194,7 @@ pub async fn issue_lifecycle(
 pub async fn issue_apply(
     pool: &PgPool,
     tenant_id: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: &str,
     spec: &Value,
     issued_by_pod: &str,
@@ -213,90 +247,28 @@ pub enum WaitOutcome {
     Timeout,
 }
 
+/// Wait for one command to reach a terminal state, or `timeout` to
+/// pass. See [`wait_for_commands`].
 pub async fn wait_for_command(
     pool: &PgPool,
+    signals: &weft_task_store::pg_signal::PgSignalWatch,
     command_id: i64,
     timeout: std::time::Duration,
 ) -> Result<WaitOutcome> {
-    use weft_broker_client::protocol::LifecycleOutcome;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        use sqlx::Row;
-        let row = sqlx::query(
-            "SELECT completed_at_unix, outcome, outcome_message \
-             FROM infra_lifecycle_command WHERE id = $1",
-        )
-        .bind(command_id)
-        .fetch_optional(pool)
-        .await?;
-        if let Some(r) = row {
-            let done: Option<i64> = r.try_get("completed_at_unix")?;
-            if done.is_some() {
-                let outcome_str: Option<String> = r.try_get("outcome")?;
-                let message: Option<String> = r.try_get("outcome_message")?;
-                let outcome = outcome_str
-                    .as_deref()
-                    .and_then(LifecycleOutcome::parse)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "infra_lifecycle_command.id={command_id} has no/unknown outcome \
-                             '{outcome_str:?}' but completed_at_unix is set"
-                        )
-                    })?;
-                return Ok(match outcome {
-                    LifecycleOutcome::Succeeded => WaitOutcome::Succeeded,
-                    LifecycleOutcome::Failed => WaitOutcome::Failed {
-                        error: message.unwrap_or_else(|| "unspecified error".into()),
-                    },
-                    LifecycleOutcome::Cancelled => WaitOutcome::Cancelled {
-                        reason: message.unwrap_or_else(|| "cancelled".into()),
-                    },
-                });
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(WaitOutcome::Timeout);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+    let mut outcomes = wait_for_commands(pool, signals, &[command_id], timeout).await?;
+    Ok(outcomes.pop().expect("one outcome per id").1)
 }
 
-/// Non-blocking single read of a command's terminal state. `None`
-/// means still pending (or the row is gone, treated as pending). The
-/// HTTP command-status endpoint uses this so clients can poll a stop /
-/// terminate to completion without the CLI guessing at rollup state
-/// (a NoOp unit staying up means the rollup never reaches "stopped",
-/// so the command outcome is the only honest "is it done" signal).
-pub async fn read_command_outcome(
-    pool: &PgPool,
-    project_id: &str,
-    command_id: i64,
-) -> Result<Option<WaitOutcome>> {
+/// A completed command row's outcome, or `None` while it is pending.
+fn completed_outcome(command_id: i64, row: &sqlx::postgres::PgRow) -> Result<Option<WaitOutcome>> {
     use sqlx::Row;
     use weft_broker_client::protocol::LifecycleOutcome;
-    // Scope by project, NOT just the (globally unique) id: the HTTP
-    // endpoint is `/projects/{project}/infra/commands/{id}`, and a
-    // caller authorized for one project must not read another's command
-    // outcome (which carries raw supervisor error strings). A command
-    // under a different project returns None, indistinguishable from
-    // pending, so no existence leak.
-    let row = sqlx::query(
-        "SELECT completed_at_unix, outcome, outcome_message \
-         FROM infra_lifecycle_command WHERE id = $1 AND project_id = $2",
-    )
-    .bind(command_id)
-    .bind(project_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(r) = row else {
-        return Ok(None);
-    };
-    let done: Option<i64> = r.try_get("completed_at_unix")?;
+    let done: Option<i64> = row.try_get("completed_at_unix")?;
     if done.is_none() {
         return Ok(None);
     }
-    let outcome_str: Option<String> = r.try_get("outcome")?;
-    let message: Option<String> = r.try_get("outcome_message")?;
+    let outcome_str: Option<String> = row.try_get("outcome")?;
+    let message: Option<String> = row.try_get("outcome_message")?;
     let outcome = outcome_str.as_deref().and_then(LifecycleOutcome::parse).ok_or_else(|| {
         anyhow::anyhow!(
             "infra_lifecycle_command.id={command_id} completed with no/unknown outcome '{outcome_str:?}'"
@@ -313,28 +285,94 @@ pub async fn read_command_outcome(
     }))
 }
 
+/// Non-blocking single read of a command's terminal state. `None`
+/// means still pending (or the row is gone, treated as pending). The
+/// HTTP command-status endpoint uses this so clients can poll a stop /
+/// terminate to completion without the CLI guessing at rollup state
+/// (a NoOp unit staying up means the rollup never reaches "stopped",
+/// so the command outcome is the only honest "is it done" signal).
+pub async fn read_command_outcome(
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+    command_id: i64,
+) -> Result<Option<WaitOutcome>> {
+    // Scope by project, NOT just the (globally unique) id: the HTTP
+    // endpoint is `/projects/{project}/infra/commands/{id}`, and a
+    // caller authorized for one project must not read another's command
+    // outcome (which carries raw supervisor error strings). A command
+    // under a different project returns None, indistinguishable from
+    // pending, so no existence leak.
+    let row = sqlx::query(
+        "SELECT completed_at_unix, outcome, outcome_message \
+         FROM infra_lifecycle_command WHERE id = $1 AND project_id = $2",
+    )
+    .bind(command_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => completed_outcome(command_id, &r),
+        None => Ok(None),
+    }
+}
+
+/// [`read_command_outcome`], held for up to `hold` while the command is
+/// still pending: the read ends when the command completes (announced by
+/// its row's own trigger) or the hold runs out. For a client that waits
+/// on one command and asks again after each hold.
+pub async fn held_command_outcome(
+    pool: &PgPool,
+    signals: &weft_task_store::pg_signal::PgSignalWatch,
+    project_id: uuid::Uuid,
+    command_id: i64,
+    hold: std::time::Duration,
+) -> Result<Option<WaitOutcome>> {
+    use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
+    let deadline = tokio::time::Instant::now() + hold;
+    let mut heard = signals.subscribe();
+    loop {
+        let outcome = read_command_outcome(pool, project_id, command_id).await?;
+        if outcome.is_some() {
+            return Ok(outcome);
+        }
+        let woken = heard
+            .woken_before(deadline, |channel, payload| {
+                channel == INFRA_COMMAND_CHANNEL
+                    && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Done { id: command_id })
+            })
+            .await?;
+        if !woken {
+            return Ok(None);
+        }
+    }
+}
+
 /// Wait for ALL the given commands to reach a terminal state, or
-/// the deadline expires. One poll per cycle reads every row via
-/// `WHERE id = ANY($1)`, collapsing N concurrent `wait_for_command`
-/// calls into one. Returns `(id, outcome)` pairs in stable order.
+/// the deadline expires. Each look reads every row via
+/// `WHERE id = ANY($1)`, and between looks the wait sleeps until one of
+/// them is announced done on `INFRA_COMMAND_CHANNEL` (by the row's own
+/// trigger). Returns `(id, outcome)` pairs in input order, `Timeout`
+/// for any that did not finish in time.
 ///
 /// Used by `reap_orphans` and `delete_project::terminate`, both of
-/// which fan out N terminate commands and need to wait for the
-/// set. The non-batched `wait_for_command` is still appropriate
-/// for single-command waits (e.g. the worker's
-/// `wait_apply` after `enqueue_apply`).
+/// which fan out N terminate commands and need to wait for the set, and
+/// through [`wait_for_command`] by every single-command wait.
 pub async fn wait_for_commands(
     pool: &PgPool,
+    signals: &weft_task_store::pg_signal::PgSignalWatch,
     command_ids: &[i64],
     timeout: std::time::Duration,
 ) -> Result<Vec<(i64, WaitOutcome)>> {
-    use weft_broker_client::protocol::LifecycleOutcome;
+    use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
     if command_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut done: std::collections::HashMap<i64, WaitOutcome> =
         std::collections::HashMap::with_capacity(command_ids.len());
+    // Subscribed before the first read, so a command finishing between
+    // a read and the wait still ends the wait.
+    let mut heard = signals.subscribe();
     loop {
         use sqlx::Row;
         let rows = sqlx::query(
@@ -346,41 +384,20 @@ pub async fn wait_for_commands(
         .await?;
         for r in rows {
             let id: i64 = r.try_get("id")?;
-            if done.contains_key(&id) {
-                continue;
+            if let Some(outcome) = completed_outcome(id, &r)? {
+                done.insert(id, outcome);
             }
-            let completed: Option<i64> = r.try_get("completed_at_unix")?;
-            if completed.is_none() {
-                continue;
-            }
-            let outcome_str: Option<String> = r.try_get("outcome")?;
-            let message: Option<String> = r.try_get("outcome_message")?;
-            let outcome = outcome_str
-                .as_deref()
-                .and_then(LifecycleOutcome::parse)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "infra_lifecycle_command.id={id} has no/unknown outcome \
-                         '{outcome_str:?}' but completed_at_unix is set"
-                    )
-                })?;
-            done.insert(
-                id,
-                match outcome {
-                    LifecycleOutcome::Succeeded => WaitOutcome::Succeeded,
-                    LifecycleOutcome::Failed => WaitOutcome::Failed {
-                        error: message.unwrap_or_else(|| "unspecified error".into()),
-                    },
-                    LifecycleOutcome::Cancelled => WaitOutcome::Cancelled {
-                        reason: message.unwrap_or_else(|| "cancelled".into()),
-                    },
-                },
-            );
         }
         if done.len() == command_ids.len() {
             break;
         }
-        if std::time::Instant::now() >= deadline {
+        let woken = heard
+            .woken_before(deadline, |channel, payload| {
+                channel == INFRA_COMMAND_CHANNEL
+                    && matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Done { id }) if command_ids.contains(&id))
+            })
+            .await?;
+        if !woken {
             // Fill the remaining with Timeout outcomes so the
             // caller sees one entry per requested id.
             for id in command_ids {
@@ -388,15 +405,13 @@ pub async fn wait_for_commands(
             }
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     // Return in input order. Contract: `command_ids` are distinct
-    // (each is a fresh BIGSERIAL from a separate INSERT). The poll
-    // loop only exits once every id has an entry: either
-    // `done.len() == command_ids.len()` (all terminal) or the
-    // deadline branch (inserts Timeout for any missing id). So
-    // `.expect` is honest: a missing id here is a logic bug, not a
-    // runtime case to paper over.
+    // (each is a fresh BIGSERIAL from a separate INSERT). The loop only
+    // exits once every id has an entry: either all are terminal or the
+    // deadline branch filled the rest with Timeout. So `.expect` is
+    // honest: a missing id here is a logic bug, not a runtime case to
+    // paper over.
     Ok(command_ids
         .iter()
         .map(|id| (*id, done.get(id).cloned().expect("loop filled every id")))
@@ -411,15 +426,16 @@ pub async fn wait_for_commands(
 /// a stop/terminate drain (the drain waits for the running set to
 /// empty; a new run would keep refilling it). In-flight work is
 /// untouched; only new launches are gated.
-pub async fn any_in_flight(pool: &PgPool, project_id: &str) -> Result<bool> {
-    let (exists,): (bool,) = sqlx::query_as(
+pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(&format!(
         "SELECT EXISTS( \
              SELECT 1 FROM infra_lifecycle_command \
              WHERE project_id = $1 \
                AND completed_at_unix IS NULL \
-               AND verb IN ('apply', 'stop', 'terminate') \
+               AND verb IN ({verbs}) \
          )",
-    )
+        verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
+    ))
     .bind(project_id)
     .fetch_one(pool)
     .await?;
@@ -434,7 +450,7 @@ pub async fn any_in_flight(pool: &PgPool, project_id: &str) -> Result<bool> {
 /// claimed between the two statements has its flag already set, so no
 /// window exists where a command escapes the cancel. Returns how many
 /// rows were touched.
-pub async fn request_cancel_project(pool: &PgPool, project_id: &str) -> Result<u64> {
+pub async fn request_cancel_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<u64> {
     let flagged = sqlx::query(
         "UPDATE infra_lifecycle_command SET cancel_requested = TRUE \
          WHERE project_id = $1 AND completed_at_unix IS NULL",
@@ -461,7 +477,7 @@ pub async fn request_cancel_project(pool: &PgPool, project_id: &str) -> Result<u
     // is informational.
     tracing::info!(
         target: "weft_dispatcher::infra_lifecycle_command",
-        project_id,
+        project_id = %project_id,
         flagged,
         cancelled_unclaimed = completed,
         "infra cancel requested"
@@ -485,10 +501,13 @@ pub async fn cancel_requested(pool: &PgPool, command_id: i64) -> Result<bool> {
 }
 
 /// Drop every row for a project. Called on `weft rm`.
-pub async fn remove_project(pool: &PgPool, project_id: &str) -> Result<u64> {
+pub async fn remove_project<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    project_id: uuid::Uuid,
+) -> Result<u64> {
     let res = sqlx::query("DELETE FROM infra_lifecycle_command WHERE project_id = $1")
         .bind(project_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected())
 }

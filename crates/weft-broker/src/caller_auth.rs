@@ -137,3 +137,23 @@ pub async fn verify_caller(
     let claims: Value = crate::events::decode_jwt(token, &validation, &jwks_url.0).await?;
     Ok(claims)
 }
+
+#[cfg(test)]
+mod tests {
+    /// jsonwebtoken carries no crypto of its own; a build without a backend
+    /// feature compiles and then panics at the first signature it checks,
+    /// which is how every genuine token once took the broker down.
+    #[test]
+    fn the_jwt_library_has_a_crypto_backend() {
+        let key = jsonwebtoken::EncodingKey::from_secret(b"k");
+        let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &serde_json::json!({ "sub": "x", "exp": 4_000_000_000u64 }), &key)
+            .expect("signs");
+        let data = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(b"k"),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+        )
+        .expect("verifies");
+        assert_eq!(data.claims["sub"], "x");
+    }
+}

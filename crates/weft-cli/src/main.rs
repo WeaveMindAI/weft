@@ -939,6 +939,14 @@ enum DaemonAction {
     /// Stop the running daemon. Scales the dispatcher to 0. The kind
     /// cluster and persistent state stay intact.
     Stop,
+    /// Take a NAMED install (`WEFT_INSTANCE`) off the cluster, leaving
+    /// nothing of it: its namespaces and every project in them, its
+    /// database, its bucket. A named install is one that lives beside
+    /// the default install in the same cluster, like a test cell;
+    /// `WEFT_INSTANCE=<name> weft daemon start` brings one up (add
+    /// `WEFT_TIME_SCALE` to run its own timers faster). Refused for the
+    /// default install, which `./setup.sh --uninstall` removes.
+    Remove,
     /// Report whether the daemon is reachable.
     Status,
     /// Tail the daemon's stderr log.
@@ -1038,6 +1046,7 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
                 }
             }
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
+            DaemonAction::Remove => commands::daemon::DaemonAction::Remove,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }

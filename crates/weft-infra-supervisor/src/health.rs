@@ -1,5 +1,5 @@
-//! Health loop. Polls the tenant's project namespaces for replica
-//! readiness, evaluates the project's HealthProtocols, and emits
+//! Health loop. Watches the owned projects' workloads for replica
+//! readiness, evaluates each project's HealthProtocols, and emits
 //! `infra_event` rows via the broker when a node's status changes.
 //!
 //! Two concerns:
@@ -8,8 +8,20 @@
 //!      Drives `infra_event` flaky / recovered + `infra_node.status`.
 //!   2. HealthProtocols evaluation: ordered (condition → action)
 //!      rules. First match fires; while a project's protocol is in
-//!      flight, subsequent matches queue (next tick re-checks once
+//!      flight, subsequent matches queue (next look re-checks once
 //!      the current one settles).
+//!
+//! When it looks: one watch per owned project hands over every change
+//! to its workloads the moment the cluster makes it, and that project
+//! is evaluated then. Every `health_interval` all of them are evaluated
+//! anyway, from the watched state: the flaky and recovery windows are
+//! about TIME passing with nothing changing, which no watch announces.
+//! What this pod owns is followed as the ownership loop changes it: a
+//! lost project's watch is dropped the moment the loss is known, so no
+//! evaluation of it starts after that (one already running when the
+//! loss lands finishes; its status write is fenced by ownership), and a
+//! claim runs a tick right away, which starts the new project's watch.
+//! The tick also reconciles the watches against the owned set.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -54,66 +66,293 @@ pub struct HealthRegistry {
     /// Per-(project, node, unit) state tracking. Records when the
     /// unit was last seen Ready vs Not-Ready so we can apply windowed
     /// transitions (flaky_after, recovery_after). Health is per-unit.
-    state: HashMap<(String, String, String), NodeHealthState>,
+    state: HashMap<(uuid::Uuid, String, String), NodeHealthState>,
     /// Per-project "currently in flight" protocol names. While a
     /// protocol is in flight, the supervisor doesn't re-fire any
     /// protocol for that project (avoids action storms when health
     /// flaps mid-action).
-    in_flight: HashSet<String>,
+    in_flight: HashSet<uuid::Uuid>,
     /// Per-project "already fired" protocol names since the most
     /// recent recovery. Re-armed when every condition in the project
     /// becomes false (i.e. the project is fully healthy).
-    fired: HashMap<String, HashSet<String>>,
+    fired: HashMap<uuid::Uuid, HashSet<String>>,
     /// Per-(project, protocol) exponential backoff after a failed
     /// action. A matched protocol whose entry's `next_retry_at` is in
     /// the future is skipped this tick. Cleared on success.
-    backoff: HashMap<(String, String), BackoffState>,
+    backoff: HashMap<(uuid::Uuid, String), BackoffState>,
 }
 
 impl HealthRegistry {
+    /// Drop every entry of a project `keep` refuses (deleted, or no
+    /// longer this pod's): a project this loop stops looking at would
+    /// otherwise keep its entries forever, and a reclaimed one would
+    /// start from stale windows.
+    fn keep_only(&mut self, keep: impl Fn(uuid::Uuid) -> bool) {
+        self.state.retain(|(project, _, _), _| keep(*project));
+        self.in_flight.retain(|project| keep(*project));
+        self.fired.retain(|project, _| keep(*project));
+        self.backoff.retain(|(project, _), _| keep(*project));
+    }
+
     /// True if a protocol action is currently in flight for the
     /// project. Exposed for introspection (e.g. asserting a hung
     /// action's timeout freed the slot).
-    pub fn is_in_flight(&self, project_id: &str) -> bool {
-        self.in_flight.contains(project_id)
+    pub fn is_in_flight(&self, project_id: uuid::Uuid) -> bool {
+        self.in_flight.contains(&project_id)
     }
 
     /// True if `protocol_name` is latched in the project's fired set
     /// (a successful action suppresses re-fire until re-arm). Exposed
     /// for introspection (e.g. asserting a failed action un-latched).
-    pub fn is_fired(&self, project_id: &str, protocol_name: &str) -> bool {
+    pub fn is_fired(&self, project_id: uuid::Uuid, protocol_name: &str) -> bool {
         self.fired
-            .get(project_id)
+            .get(&project_id)
             .is_some_and(|names| names.contains(protocol_name))
     }
 
     /// Consecutive-failure count for a (project, protocol)'s backoff,
     /// 0 if none. Exposed for introspection (e.g. asserting a failed
     /// action armed backoff and a success cleared it).
-    pub fn backoff_failures(&self, project_id: &str, protocol_name: &str) -> u32 {
+    pub fn backoff_failures(&self, project_id: uuid::Uuid, protocol_name: &str) -> u32 {
         self.backoff
-            .get(&(project_id.to_string(), protocol_name.to_string()))
+            .get(&(project_id, protocol_name.to_string()))
             .map(|b| b.consecutive_failures)
             .unwrap_or(0)
     }
 }
 
-pub async fn run_loop(state: SupervisorState) -> Result<()> {
-    loop {
-        if let Err(e) = tick(&state).await {
-            tracing::warn!(error = %e, "health tick failed");
+/// This pod's watches of its owned projects' workloads, and the last
+/// set each handed out. Held by the loop that evaluates them (and by a
+/// test stepping it), never shared: the next change is awaited on it.
+#[derive(Default)]
+pub struct Watches {
+    by_project: HashMap<uuid::Uuid, ProjectWatch>,
+}
+
+struct ProjectWatch {
+    /// The project as the last tick read it (its namespace, status),
+    /// what a change-driven evaluation is run with.
+    project: weft_broker_client::protocol::SupervisorProject,
+    stream: weft_platform_traits::kube::ReplicaWatch,
+    /// The last set the watch handed out. `None` until its first
+    /// answer: a project whose watch has not answered is not evaluated.
+    latest: Option<Vec<weft_platform_traits::kube::WorkloadReplicaState>>,
+    /// Why the watch's last look failed, cleared by its next answer.
+    /// While set, `latest` may be stale, so the project is not
+    /// evaluated on it.
+    failing: Option<String>,
+}
+
+impl ProjectWatch {
+    fn take(&mut self, item: Result<Vec<weft_platform_traits::kube::WorkloadReplicaState>>) {
+        match item {
+            Ok(set) => {
+                self.latest = Some(set);
+                self.failing = None;
+            }
+            Err(e) => {
+                tracing::warn!(project_id = %self.project.project_id, error = %e, "the watch of the project's workloads failed a look");
+                self.failing = Some(format!("{e:#}"));
+            }
         }
-        state.clock.sleep(state.poll_interval).await;
     }
 }
 
-/// One iteration of the health loop. Exposed (rather than only
-/// running inside `run_loop`) so integration tests can step the
-/// loop one tick at a time.
-pub async fn tick(state: &SupervisorState) -> Result<()> {
+/// What a watch says about its project right now.
+enum Watched<'a> {
+    /// Not watched, or started and not answered yet: nothing to
+    /// evaluate until it answers.
+    Unanswered,
+    /// The watch's last look failed; its last set may be stale.
+    Failing(&'a str),
+    Set(&'a [weft_platform_traits::kube::WorkloadReplicaState]),
+}
+
+impl Watches {
+    /// Watch every project in `projects`, starting the ones not watched
+    /// yet (or watched in another namespace) and dropping the rest. A
+    /// started watch is kept without waiting for its first answer,
+    /// which arrives through `changed` like any other.
+    async fn reconcile(
+        &mut self,
+        kube: &dyn weft_platform_traits::kube::KubeClient,
+        projects: &[weft_broker_client::protocol::SupervisorProject],
+    ) {
+        let live: HashSet<uuid::Uuid> = projects.iter().map(|p| p.project_id).collect();
+        self.by_project.retain(|id, _| live.contains(id));
+        for project in projects {
+            match self.by_project.get_mut(&project.project_id) {
+                Some(watch) if watch.project.project_namespace == project.project_namespace => {
+                    watch.project = project.clone();
+                    continue;
+                }
+                _ => {}
+            }
+            match kube.watch_replica_state(&project.project_namespace, crate::lifecycle::INFRA_SELECTOR).await {
+                Ok(stream) => {
+                    self.by_project.insert(
+                        project.project_id,
+                        ProjectWatch { project: project.clone(), stream, latest: None, failing: None },
+                    );
+                }
+                Err(e) => {
+                    // The project is not evaluated until its watch
+                    // starts; the next tick tries again.
+                    self.by_project.remove(&project.project_id);
+                    tracing::warn!(project_id = %project.project_id, error = %e, "could not watch the project's workloads");
+                }
+            }
+        }
+    }
+
+    /// The project's workloads as its watch last said, after taking in
+    /// every change already waiting.
+    fn latest(&mut self, project_id: uuid::Uuid) -> Watched<'_> {
+        use futures::FutureExt;
+        let Some(watch) = self.by_project.get_mut(&project_id) else {
+            return Watched::Unanswered;
+        };
+        loop {
+            match futures::StreamExt::next(&mut watch.stream).now_or_never() {
+                Some(Some(item)) => watch.take(item),
+                // Ended: dropped, and started again on the next tick.
+                Some(None) => {
+                    self.by_project.remove(&project_id);
+                    return Watched::Unanswered;
+                }
+                None => break,
+            }
+        }
+        let watch = &self.by_project[&project_id];
+        match (&watch.failing, &watch.latest) {
+            (Some(why), _) => Watched::Failing(why),
+            (None, Some(set)) => Watched::Set(set),
+            (None, None) => Watched::Unanswered,
+        }
+    }
+
+    /// Wait for the next answer on any watch and hand back the project
+    /// it concerns (a failed look included, so it is reported). Pending
+    /// for ever with nothing watched. Cancel safe: an answer is taken
+    /// in synchronously the moment it is read.
+    async fn changed(&mut self) -> weft_broker_client::protocol::SupervisorProject {
+        loop {
+            if self.by_project.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            let (project_id, item) = {
+                let nexts = self.by_project.iter_mut().map(|(id, watch)| {
+                    Box::pin(async move { (*id, futures::StreamExt::next(&mut watch.stream).await) })
+                });
+                futures::future::select_all(nexts).await.0
+            };
+            match item {
+                Some(item) => {
+                    let watch = self.by_project.get_mut(&project_id).expect("it just answered");
+                    watch.take(item);
+                    return watch.project.clone();
+                }
+                None => {
+                    self.by_project.remove(&project_id);
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_loop(
+    state: SupervisorState,
+    mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+) -> Result<()> {
+    let mut watches = Watches::default();
+    loop {
+        if let Err(e) = tick(&state, &mut watches).await {
+            tracing::warn!(error = %e, "health tick failed");
+        }
+        between_ticks(&state, &mut watches, &mut changes, state.clock.sleep(state.health_interval)).await?;
+    }
+}
+
+/// Until `next_tick` resolves, evaluate a project the moment its
+/// workloads change, and follow every ownership change the moment it
+/// arrives ([`on_ownership_change`]). Fails when the ownership loop is
+/// gone: nothing would tell this loop about a lost project any more. Only the WAIT races the tick: an evaluation, once
+/// started, runs to its end (it may be mid protocol action, holding the
+/// project's in-flight slot), and the tick comes after it. Exposed so
+/// integration tests can step this half of the loop.
+pub async fn between_ticks(
+    state: &SupervisorState,
+    watches: &mut Watches,
+    changes: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+    next_tick: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    tokio::pin!(next_tick);
+    loop {
+        // Ownership first: with a loss and a watch change ready at once,
+        // the lost project's watch is dropped before anything evaluates it.
+        tokio::select! {
+            biased;
+            change = changes.recv() => {
+                let change = change.ok_or_else(|| {
+                    anyhow::anyhow!("the ownership loop is gone; the health loop cannot follow what this pod owns")
+                })?;
+                if let Err(e) = on_ownership_change(state, watches, &change).await {
+                    tracing::warn!(error = %e, "health tick after a claim failed");
+                }
+            }
+            _ = &mut next_tick => return Ok(()),
+            project = watches.changed() => evaluate_logged(state, watches, &project).await,
+        }
+    }
+}
+
+/// Follow one ownership change: a lost project's watch and health state
+/// are dropped at once, so no evaluation of it starts while another pod
+/// owns it; a claim runs a tick now, which starts the new project's
+/// watch instead of leaving it unwatched until the next tick. Exposed
+/// so integration tests can step it.
+pub async fn on_ownership_change(
+    state: &SupervisorState,
+    watches: &mut Watches,
+    change: &crate::ownership::OwnershipChange,
+) -> Result<()> {
+    if !change.lost.is_empty() {
+        watches.by_project.retain(|id, _| !change.lost.contains(id));
+        state.health.lock().await.keep_only(|project| !change.lost.contains(&project));
+    }
+    if !change.claimed.is_empty() {
+        tick(state, watches).await?;
+    }
+    Ok(())
+}
+
+/// Wait for the next change to any watched project's workloads, and
+/// evaluate that project. Exposed so integration tests can step the
+/// change-driven half of the loop.
+pub async fn on_change(state: &SupervisorState, watches: &mut Watches) {
+    let project = watches.changed().await;
+    evaluate_logged(state, watches, &project).await;
+}
+
+async fn evaluate_logged(
+    state: &SupervisorState,
+    watches: &mut Watches,
+    project: &weft_broker_client::protocol::SupervisorProject,
+) {
+    if let Err(e) = evaluate(state, watches, project).await {
+        tracing::warn!(project_id = %project.project_id, error = %e, "health look (project) failed");
+    }
+}
+
+/// One tick of the health loop: watch what this pod owns now, then
+/// evaluate every owned project. Exposed (rather than only running
+/// inside `run_loop`) so integration tests can step the loop one tick
+/// at a time.
+pub async fn tick(state: &SupervisorState, watches: &mut Watches) -> Result<()> {
     let projects = state.broker.owned_projects(&state.pod_name).await?;
+    watches.reconcile(state.kube.as_ref(), &projects).await;
     for project in &projects {
-        if let Err(e) = tick_project(state, project).await {
+        if let Err(e) = evaluate(state, watches, project).await {
             tracing::warn!(
                 project_id = %project.project_id,
                 error = %e,
@@ -130,20 +369,33 @@ pub async fn tick(state: &SupervisorState) -> Result<()> {
     // node leaves running, but a deleted project's nodes never get
     // iterated, so it must be swept here too.)
     {
-        let live: std::collections::HashSet<&str> =
-            projects.iter().map(|p| p.project_id.as_str()).collect();
-        let mut registry = state.health.lock().await;
-        registry.state.retain(|(proj, _, _), _| live.contains(proj.as_str()));
-        registry.in_flight.retain(|proj| live.contains(proj.as_str()));
-        registry.fired.retain(|proj, _| live.contains(proj.as_str()));
-        registry.backoff.retain(|(proj, _), _| live.contains(proj.as_str()));
+        let live: std::collections::HashSet<uuid::Uuid> =
+            projects.iter().map(|p| p.project_id).collect();
+        state.health.lock().await.keep_only(|project| live.contains(&project));
     }
     Ok(())
+}
+
+/// Evaluate one project from its watched workloads. A project whose
+/// watch has not answered yet is left until it does; one whose watch is
+/// failing is an error, never evaluated on a set that may be stale.
+async fn evaluate(
+    state: &SupervisorState,
+    watches: &mut Watches,
+    project: &weft_broker_client::protocol::SupervisorProject,
+) -> Result<()> {
+    let workloads = match watches.latest(project.project_id) {
+        Watched::Unanswered => return Ok(()),
+        Watched::Failing(why) => anyhow::bail!("the watch of the project's workloads is failing: {why}"),
+        Watched::Set(set) => set.to_vec(),
+    };
+    tick_project(state, project, &workloads).await
 }
 
 async fn tick_project(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
+    workloads: &[weft_platform_traits::kube::WorkloadReplicaState],
 ) -> Result<()> {
     // Stand down while a user infra action is running: any uncompleted
     // infra_lifecycle_command (apply / stop / terminate) for this
@@ -152,19 +404,15 @@ async fn tick_project(
     // etc.) but must NOT write, or its autonomous reconcile would race
     // and clobber the user action's transition. Re-arms automatically
     // on the next tick once the command completes (status has settled).
-    if state.broker.infra_command_in_flight(&project.project_id).await? {
+    if state.broker.infra_command_in_flight(project.project_id).await? {
         // Clear in-memory health state so the post-action tick starts
         // clean (no stale flaky-window arithmetic from before the
         // action), matching the per-node skip below.
-        state.health.lock().await.state.retain(|(p, _, _), _| p != &project.project_id);
+        state.health.lock().await.state.retain(|(p, _, _), _| *p != project.project_id);
         return Ok(());
     }
 
-    let workloads = state
-        .kube
-        .list_replica_state(&project.project_namespace, crate::lifecycle::INFRA_SELECTOR)
-        .await?;
-    let nodes = state.broker.infra_nodes(&project.project_id).await?;
+    let nodes = state.broker.infra_nodes(project.project_id).await?;
 
     // Group workloads by `(weft.dev/node, weft.dev/unit)`. Health is
     // PER-UNIT: one infra node deploys N units (workloads), each with
@@ -174,7 +422,7 @@ async fn tick_project(
     // (`node_label_value`), never the id itself, so the key is that
     // value on both sides.
     let mut by_unit: HashMap<(String, String), (i64, i64)> = HashMap::new();
-    for w in &workloads {
+    for w in workloads {
         let (Some(node_label), Some(unit)) =
             (w.labels.get(weft_core::infra::NODE_LABEL), w.labels.get("weft.dev/unit"))
         else {
@@ -256,7 +504,7 @@ async fn tick_project(
         let mut registry = state.health.lock().await;
         for n in &nodes {
             for (unit, unit_rt) in &n.units {
-                let key = (project.project_id.clone(), n.node_id.clone(), unit.clone());
+                let key = (project.project_id, n.node_id.clone(), unit.clone());
                 // A unit's status implies whether it should be running.
                 // Skip non-running ones (clearing window state) just
                 // like the node-level skip did, but per-unit.
@@ -300,7 +548,7 @@ async fn tick_project(
         // action of the next degradation episode).
         if all_units_healthy(&ready_ratio) {
             registry.fired.remove(&project.project_id);
-            registry.backoff.retain(|(proj, _), _| proj != &project.project_id);
+            registry.backoff.retain(|(proj, _), _| *proj != project.project_id);
         }
     }
 
@@ -339,7 +587,7 @@ async fn tick_project(
             };
             state
                 .broker
-                .event_record(&project.project_id, Some(&node_id), infra_event)
+                .event_record(project.project_id, Some(&node_id), infra_event)
                 .await?;
         }
         if observed_status != decision.desired_status {
@@ -357,7 +605,7 @@ async fn tick_project(
                 .set_status(
                     &state.pod_name,
                     None,
-                    &project.project_id,
+                    project.project_id,
                     &node_id,
                     Some(&unit),
                     decision.desired_status,
@@ -381,7 +629,7 @@ async fn tick_project(
     // fires, if any) lives in `health_engine::evaluate_protocols`.
     // This block just gathers the inputs, calls the pure fn, then
     // dispatches the matched action.
-    let protocols_value = state.broker.health_protocols(&project.project_id).await?;
+    let protocols_value = state.broker.health_protocols(project.project_id).await?;
     let protocols: protocol::HealthProtocols = match protocols_value {
         Some(v) => match serde_json::from_value(v.clone()) {
             Ok(p) => p,
@@ -403,7 +651,7 @@ async fn tick_project(
                 state
                     .broker
                     .event_record(
-                        &project.project_id,
+                        project.project_id,
                         None,
                         weft_broker_client::protocol::InfraEvent::ProtocolConfigError(
                             weft_broker_client::protocol::ProtocolConfigErrorPayload {
@@ -457,7 +705,7 @@ async fn tick_project(
     // action recently failed, skip until its backoff window elapses:
     // the protocol stays un-latched from `fired` (so it WILL retry),
     // just not on every poll tick.
-    let backoff_key = (project.project_id.clone(), matched_name.clone());
+    let backoff_key = (project.project_id, matched_name.clone());
     {
         let mut registry = state.health.lock().await;
         if let Some(b) = registry.backoff.get(&backoff_key) {
@@ -465,10 +713,10 @@ async fn tick_project(
                 return Ok(());
             }
         }
-        registry.in_flight.insert(project.project_id.clone());
+        registry.in_flight.insert(project.project_id);
         registry
             .fired
-            .entry(project.project_id.clone())
+            .entry(project.project_id)
             .or_default()
             .insert(matched_name.clone());
     }
@@ -668,21 +916,21 @@ async fn run_action(
     // resolve node_id → instance_id. EnqueueLifecycle / Notify don't
     // need it; pay the broker round-trip up front to keep the
     // planner pure regardless.
-    let nodes = state.broker.infra_nodes(&project.project_id).await?;
+    let nodes = state.broker.infra_nodes(project.project_id).await?;
     let plan = plan_action(proto, &nodes);
     match plan {
         ActionPlan::Notify { payload } => {
             state
                 .broker
                 .event_record(
-                    &project.project_id,
+                    project.project_id,
                     None,
                     weft_broker_client::protocol::InfraEvent::Notify(payload),
                 )
                 .await?;
         }
         ActionPlan::EnqueueLifecycle { spec } => {
-            state.broker.enqueue_lifecycle(&project.project_id, spec).await?;
+            state.broker.enqueue_lifecycle(project.project_id, spec).await?;
         }
         ActionPlan::Scale {
             instance_id,
@@ -754,7 +1002,7 @@ mod tests {
             instance_id: instance_id.to_string(),
             status: weft_broker_client::protocol::InfraNodeStatus::Running,
             applied_spec_hash: None,
-            endpoints: Default::default(),
+            addresses: Default::default(),
             preserve_pvcs: Vec::new(),
             units: Default::default(),
         }

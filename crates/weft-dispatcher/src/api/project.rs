@@ -151,13 +151,13 @@ pub async fn referenced_images_query(
     // All rows, all units, regardless of status: over-keeping a ref is
     // bounded (rows die with the node on terminate) and the safe
     // direction for a set reclamation deletes against.
-    let unit_rows: Vec<(String, String, serde_json::Value)> =
+    let unit_rows: Vec<(uuid::Uuid, String, serde_json::Value)> =
         sqlx::query_as("SELECT project_id, node_id, units_json FROM infra_node")
             .fetch_all(pool)
             .await?;
     for (project_id, node_id, units) in unit_rows {
         let by_unit =
-            weft_broker_client::protocol::decode_units_json(units, &project_id, &node_id)?;
+            weft_broker_client::protocol::decode_units_json(units, project_id, &node_id)?;
         for runtime in by_unit.into_values() {
             for image_ref in runtime.image_refs {
                 if !image_ref.is_empty() {
@@ -294,7 +294,7 @@ pub async fn register(
     state
         .events
         .publish(DispatcherEvent::ProjectRegistered {
-            project_id: summary.id.to_string(),
+            project_id: summary.id,
             name: weft_core::truncate_user_string(&summary.name, 4096),
         })
         .await;
@@ -309,11 +309,8 @@ pub async fn register(
 pub async fn get(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<ProjectSummary>, StatusError> {
-    let id = id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
     authorize_project_marked(&state, &caller.0, id).await?;
     let summary = state
         .projects
@@ -337,12 +334,9 @@ pub struct RemoveQuery {
 pub async fn remove(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     axum::extract::Query(query): axum::extract::Query<RemoveQuery>,
 ) -> Result<StatusCode, StatusError> {
-    let id = id
-        .parse::<uuid::Uuid>()
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     // Marked gate, not `authorize_project`: rm is a delete, so the CLI
     // retries it idempotently and needs the `x-weft-not-found` marker
     // to treat "already gone" as the desired end state instead of an
@@ -421,7 +415,17 @@ pub async fn remove(
         // than before AND still took the space. There is also no way
         // back to it: `rm` cannot run again with the project row gone,
         // and `weft clean` has no project to clean.
-        match state.journal.delete_project_executions(&id.to_string()).await {
+        // Its queued work and its workers go too: nothing can serve
+        // them now. Logged, not fatal, for the same reason as below;
+        // the reaper's loop repeats it.
+        if let Err(e) = crate::reaper::sweep_removed_projects(&state).await {
+            tracing::warn!(
+                target: "weft_dispatcher::project",
+                project_id = %id, error = %e,
+                "could not clear the removed project's queued work and workers; the reaper will retry"
+            );
+        }
+        match state.journal.delete_project_executions(id).await {
             Ok(erased) => tracing::info!(
                 target: "weft_dispatcher::project",
                 project_id = %id, executions = erased,
@@ -438,7 +442,7 @@ pub async fn remove(
                 "could not erase the removed project's executions; the reaper will retry"
             ),
         }
-        if let Err(e) = retire_what_no_run_needs(&state, &id.to_string()).await {
+        if let Err(e) = retire_what_no_run_needs(&state, id).await {
             // Same reasoning: logged, not fatal, the reaper retries.
             tracing::warn!(
                 target: "weft_dispatcher::project",
@@ -474,9 +478,8 @@ pub async fn remove(
 /// so calling it there is a no-op rather than a mistake.
 pub(crate) async fn retire_what_no_run_needs(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<u64> {
-    let id: uuid::Uuid = project_id.parse()?;
     // The cheap discriminator first. Both stores refuse to drop anything
     // while the project row is there, so on a live project everything
     // below is thrown away, and `definition_hashes_in_use` is not cheap:
@@ -484,16 +487,16 @@ pub(crate) async fn retire_what_no_run_needs(
     // calls this unconditionally and `prune` calls clean once per run in
     // the subtree, so pruning N runs paid for N full scans, all of them
     // wasted.
-    if state.projects.get(id).await?.is_some() {
+    if state.projects.get(project_id).await?.is_some() {
         return Ok(0);
     }
     let in_use = state.journal.definition_hashes_in_use(project_id).await?;
-    let definitions = state.projects.retire_unused_definitions(id, &in_use).await?;
+    let definitions = state.projects.retire_unused_definitions(project_id, &in_use).await?;
     // The colors the JOURNAL still holds. A tree row outside that set
     // describes a run nothing can read, and with the project row gone
     // nothing else could ever delete it.
     let known = state.journal.colors_for_project(project_id).await?;
-    let versions = state.versions.retire_unused_versions(id, &known).await?;
+    let versions = state.versions.retire_unused_versions(project_id, &known).await?;
     Ok(definitions + versions)
 }
 
@@ -634,7 +637,7 @@ pub(crate) fn kick_place(project: &ProjectDefinition, kick: &Kick) -> String {
 /// subworkflow); the infra-cancel verb interrupts them.
 pub(crate) async fn non_terminal_infra_setup_colors(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<weft_core::Color>> {
     use sqlx::Row;
     let rows = sqlx::query(
@@ -657,7 +660,7 @@ pub(crate) async fn non_terminal_infra_setup_colors(
             Err(e) => {
                 tracing::warn!(
                     target: "weft_dispatcher::api::project",
-                    project_id, %color_str, error = %e,
+                    %project_id, %color_str, error = %e,
                     "skipping infra_setup color with bad uuid"
                 );
             }
@@ -683,7 +686,7 @@ pub(crate) async fn non_terminal_infra_setup_colors(
 /// journal was missing, which is what lets the next start through.
 pub(crate) async fn infra_setup_in_flight(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<bool> {
     let colors = non_terminal_infra_setup_colors(state, project_id).await?;
     if colors.is_empty() {
@@ -697,7 +700,7 @@ pub(crate) async fn infra_setup_in_flight(
         }
         tracing::warn!(
             target: "weft_dispatcher::infra_setup",
-            project_id, %color,
+            %project_id, %color,
             "an infra setup is recorded as running but nothing is working on it \
              (an earlier start was interrupted); ending it so this project can \
              provision again"
@@ -718,7 +721,7 @@ pub(crate) async fn infra_setup_in_flight(
 pub struct InfraSetupRun {
     color: weft_core::Color,
     events: tokio::sync::broadcast::Receiver<crate::events::LiveEvent>,
-    project_id: String,
+    project_id: uuid::Uuid,
 }
 
 /// Start an execution: journal `ExecutionStarted` + one `NodeKicked` per kick
@@ -731,7 +734,7 @@ pub struct InfraSetupRun {
 async fn start_queued_execution(
     state: &DispatcherState,
     color: weft_core::Color,
-    project_id: &str,
+    project_id: uuid::Uuid,
     phase: weft_core::context::Phase,
     entry_node: &str,
     kicks: &[Kick],
@@ -740,8 +743,7 @@ async fn start_queued_execution(
     seed: Option<weft_journal::Seed>,
     expected_activation: Option<weft_core::Color>,
 ) -> Result<(), (StatusCode, String)> {
-    let id = project_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("project id: {e}")))?;
-    let source_version = super::versions::record_program_source(state, id, program).await?;
+    let source_version = super::versions::record_program_source(state, project_id, program).await?;
     start_queued_execution_with(state, color, project_id, phase, entry_node, kicks, &[], program, subgraph, seed, expected_activation, Some(&source_version), None)
         .await
 }
@@ -754,7 +756,7 @@ async fn start_queued_execution(
 pub(crate) async fn start_queued_execution_with(
     state: &DispatcherState,
     color: weft_core::Color,
-    project_id: &str,
+    project_id: uuid::Uuid,
     phase: weft_core::context::Phase,
     entry_node: &str,
     kicks: &[Kick],
@@ -816,7 +818,7 @@ pub(crate) async fn start_queued_execution_with(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execution_birth_events(
     color: weft_core::Color,
-    project_id: &str,
+    project_id: uuid::Uuid,
     phase: weft_core::context::Phase,
     entry_node: &str,
     kicks: &[Kick],
@@ -831,7 +833,7 @@ pub(crate) fn execution_birth_events(
 ) -> (weft_journal::ExecEvent, Vec<weft_journal::ExecEvent>) {
     let start = weft_journal::ExecEvent::ExecutionStarted {
         color,
-        project_id: project_id.to_string(),
+        project_id,
         entry_node: entry_node.to_string(),
         phase,
         definition_hash: Some(definition_hash.to_string()),
@@ -896,7 +898,7 @@ pub(crate) fn run_infra_ready(has_infra: bool, infra_rollup: &str) -> bool {
 /// whole-graph run needs.
 pub(crate) async fn missing_infra_nodes(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     project: &ProjectDefinition,
     within: Option<&HashSet<String>>,
 ) -> Result<Vec<String>, (StatusCode, String)> {
@@ -931,31 +933,30 @@ pub(crate) async fn missing_infra_nodes(
 /// (serializing the flip) and do the unbounded wait OUTSIDE it.
 pub async fn start_infra_setup(
     state: &DispatcherState,
-    project_id_uuid: uuid::Uuid,
+    project_id: uuid::Uuid,
 ) -> Result<Option<InfraSetupRun>, (StatusCode, String)> {
     // One coherent (hash, shape) pair: the kicks below and the
     // journaled/enqueued hash must come from the SAME definition (see
     // `coherent_definition`).
-    let (program, project) = coherent_definition(state, project_id_uuid).await?;
+    let (program, project) = coherent_definition(state, project_id).await?;
     let selection = weft_core::project::selection::RunSelection::setup(&project, &infra_places(&project))
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let kicks = compute_infra_setup_kicks(&project).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if kicks.is_empty() {
         return Ok(None);
     }
-    let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to the
     // completion event.
-    let events = state.events.subscribe_project(&project_id).await;
+    let events = state.events.subscribe_project(project_id).await;
 
     // Infra reconciliation already holds the project transition lock.
-    let source_version = super::versions::record_program_source_locked(state, project_id_uuid, &program).await?;
+    let source_version = super::versions::record_program_source_locked(state, project_id, &program).await?;
     start_queued_execution_with(
         state,
         color,
-        &project_id,
+        project_id,
         weft_core::context::Phase::InfraSetup,
         &kick_place(&project, &kicks[0]),
         &kicks,
@@ -1189,7 +1190,7 @@ pub struct ActivationUrl {
 ///    the listener-minted URLs.
 #[derive(Debug, Serialize)]
 pub struct ProjectStatusResponse {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     /// Raw status enum: "registered" | "activating" | "active" |
     /// "deactivating" | "inactive". Mirrors `project.status`.
@@ -1452,12 +1453,9 @@ async fn authorize_project_marked(
 pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     axum::extract::Query(query): axum::extract::Query<StatusQuery>,
 ) -> Result<Json<ProjectStatusResponse>, StatusError> {
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
     // The `x-weft-not-found: project` marker lets a client tell "no
     // project I may see under this id" apart from a version-skew
     // routing 404 it must bubble. We must NOT call
@@ -1480,10 +1478,9 @@ pub async fn status(
         // inconsistency, NOT "no such project": Other (no marker), so
         // the CLI bubbles it loudly instead of skipping the gate.
         .ok_or((StatusCode::NOT_FOUND, "project definition missing".to_string()))?;
-    let project_id = id.to_string();
     let listener_running = state
         .listeners
-        .project_has_live_listener(&project_id, &state.pg_pool)
+        .project_has_live_listener(id, &state.pg_pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener status: {e}")))?;
 
@@ -1532,7 +1529,7 @@ pub async fn status(
             &crate::journal::ExecutionQuery {
                 limit: 1,
                 offset: 0,
-                project_id: Some(project_id.clone()),
+                project_id: Some(id),
                 started_after: None,
                 started_before: None,
                 phase: None,
@@ -1543,7 +1540,7 @@ pub async fn status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     let last = execs.executions.first();
-    let (running, _) = running_colors(&state, &project_id, None)
+    let (running, _) = running_colors(&state, id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_colors: {e}")))?;
     // Oldest first, so the LAST is the most recently started. The
@@ -1602,7 +1599,7 @@ pub async fn status(
     });
 
     Ok(Json(ProjectStatusResponse {
-        id: project_id,
+        id,
         name: summary.name,
         status: snapshot.lifecycle.status.as_str().to_string(),
         transition: snapshot.transition.as_str().to_string(),
@@ -1653,7 +1650,6 @@ pub(crate) async fn gather_action_snapshot(
     id: uuid::Uuid,
     project: &ProjectDefinition,
 ) -> Result<ActionSnapshot, (StatusCode, String)> {
-    let project_id = id.to_string();
     let lifecycle = state
         .projects
         .lifecycle(id)
@@ -1666,7 +1662,7 @@ pub(crate) async fn gather_action_snapshot(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("transition: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let infra_rows = crate::infra_node::list_for_project(&state.pg_pool, &project_id)
+    let infra_rows = crate::infra_node::list_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
 
@@ -1765,19 +1761,19 @@ pub(crate) async fn gather_action_snapshot(
 
     // Infra-op-in-flight fact the rollup can't always see (a claimed
     // stop mid-drain; a provisioning execution before any row flips).
-    let infra_busy = crate::infra_lifecycle_command::any_in_flight(&state.pg_pool, &project_id)
+    let infra_busy = crate::infra_lifecycle_command::any_in_flight(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commands in flight: {e}")))?
-        || infra_setup_in_flight(state, &project_id)
+        || infra_setup_in_flight(state, id)
             .await
             .map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}"))
             })?;
 
-    let preservation = preservation_counts(state, &project_id)
+    let preservation = preservation_counts(state, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("preservation_counts: {e}")))?;
-    let running_now = running_count(state, &project_id, None)
+    let running_now = running_count(state, id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
     Ok(ActionSnapshot {
@@ -1871,7 +1867,7 @@ pub(crate) async fn require_action(
 /// based on whether either count is non-zero.
 async fn preservation_counts(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<PreservationCounts> {
     let (parked, suspended): (i64, i64) = sqlx::query_as(
         "SELECT \
@@ -2242,11 +2238,9 @@ pub struct ActivationTarget {
 pub async fn bake(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<RunningChoice>>,
 ) -> Result<Json<crate::journal::TriggerBake>, (StatusCode, String)> {
-    let id = id_str.parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     crate::transition::ensure_built_gated(&state, id).await?;
     let (program, project) = coherent_definition(&state, id).await?;
@@ -2280,7 +2274,7 @@ pub async fn bake(
 /// of the rule, which the per-node infra stop guard reads too.
 async fn require_trigger_infra(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     project: &ProjectDefinition,
 ) -> Result<(), (StatusCode, String)> {
     // Validation first: a trigger setup that cannot be selected at all
@@ -2318,20 +2312,16 @@ async fn prepare_trigger_setup(
     running_policy: crate::infra_lifecycle_command::RunningPolicy,
     drain_timeout_secs: u64,
 ) -> Result<(), (StatusCode, String)> {
-    let project_id = id.to_string();
-    require_trigger_infra(state, &project_id, project).await?;
-    reconcile_worker(state, &project_id, running_policy, drain_timeout_secs).await
+    require_trigger_infra(state, id, project).await?;
+    reconcile_worker(state, id, running_policy, drain_timeout_secs).await
 }
 
 pub async fn activate(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<ActivateRequest>>,
 ) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     // Enforce against the reconciliation BEFORE the auto-build (same
     // discipline as `run`): this one endpoint serves three table verbs
@@ -2394,7 +2384,6 @@ async fn activate_trigger_setup_window(
     state: &DispatcherState,
     id: uuid::Uuid,
     activation: uuid::Uuid,
-    project_id: &str,
     choice: &str,
     project: &ProjectDefinition,
     program: &weft_core::project::hash::ProgramIdentity,
@@ -2415,7 +2404,7 @@ async fn activate_trigger_setup_window(
 
     // Apply the reactivate choice's destructive effect now that we
     // hold the exclusive Activating transition (validated by caller).
-    apply_reactivate_choice(state, project_id, activation, choice).await.map_err(unstick)?;
+    apply_reactivate_choice(state, id, activation, choice).await.map_err(unstick)?;
 
     // Capture first, then arm that completed capture. Arming refreshes
     // existing entry rows while retaining their tokens and parked fires.
@@ -2429,10 +2418,10 @@ async fn activate_trigger_setup_window(
                 rollback: ActivateRollback::WipeSignals,
             },
         )?;
-        let mut tx = activation_write(state, project_id, activation).await
+        let mut tx = activation_write(state, id, activation).await
             .map_err(|e| unstick((StatusCode::CONFLICT, e.to_string())))?;
-        sqlx::query("UPDATE project SET activation_version = $2, activation_program = $3 WHERE id::text = $1")
-            .bind(project_id).bind(&bake.source_version).bind(sqlx::types::Json(&bake.program)).execute(&mut *tx).await
+        sqlx::query("UPDATE project SET activation_version = $2, activation_program = $3 WHERE id = $1")
+            .bind(id).bind(&bake.source_version).bind(sqlx::types::Json(&bake.program)).execute(&mut *tx).await
             .map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e}"))))?;
         tx.commit().await.map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e}"))))?;
         for (node_id, capture) in &bake.captured {
@@ -2461,7 +2450,7 @@ async fn activate_trigger_setup_window(
 
     // Drop orphan entry rows: nodes that previously had triggers but
     // no longer do (user edited source while deactivated).
-    drop_orphan_entry_rows(state, project_id, activation, &captured)
+    drop_orphan_entry_rows(state, id, activation, &captured)
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("drop_orphan_entry_rows: {e}"))))?;
 
@@ -2472,7 +2461,7 @@ async fn activate_trigger_setup_window(
     // re-placed by the next fire via `ensure_placed_handle`.
     state
         .listeners
-        .rehydrate_project(project_id, &state.pg_pool)
+        .rehydrate_project(id, &state.pg_pool)
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("listener rehydrate: {e}"))))?;
 
@@ -2537,7 +2526,6 @@ pub async fn activate_inner(
     // must come from the definition recorded under the hash that
     // trigger-setup will journal (see `coherent_definition`).
     let (program, project) = coherent_definition(state, id).await?;
-    let project_id = id.to_string();
 
     // Activate is the trigger-setup verb. A project without any
     // trigger nodes has nothing to register, so flipping its status
@@ -2630,7 +2618,7 @@ pub async fn activate_inner(
     // block with ONE rollback site below. A future step added here
     // can't forget the un-stick.
     let setup = activate_trigger_setup_window(
-        state, id, activation, &project_id, choice, &project,
+        state, id, activation, choice, &project,
         &program,
     )
     .await;
@@ -2665,7 +2653,7 @@ pub async fn activate_inner(
                 // spawned is cancelled by that failure, not by anyone's
                 // decision.
                 wipe_activating_state(
-                    state, id, &project_id, activation,
+                    state, id, activation,
                     &weft_core::exec::CancelCause::Runtime {
                         detail: "the activation failed and rolled back its setup run".into(),
                     },
@@ -2695,18 +2683,18 @@ pub async fn activate_inner(
     // Resume vs Entry vs Drop based on what the listener returns,
     // exactly like a live fire. Runs after the Active CAS so the
     // gate relays instead of re-queueing.
-    drain_parked_fires(state, &project_id)
+    drain_parked_fires(state, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drain_parked_fires: {e}")))?;
 
-    let urls = collect_listener_urls(state, &project_id).await.map_err(|e| {
+    let urls = collect_listener_urls(state, id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("collect_listener_urls: {e}"))
     })?;
     for url in &urls {
         state
             .events
             .publish(DispatcherEvent::TriggerUrlChanged {
-                project_id: project_id.clone(),
+                project_id: id,
                 // User strings on a NOTIFY-path event: node ids are
                 // user-authored and the url embeds the user's mount
                 // path. Bound at construction.
@@ -2717,7 +2705,7 @@ pub async fn activate_inner(
     }
     state
         .events
-        .publish(DispatcherEvent::ProjectActivated { project_id: project_id.clone() })
+        .publish(DispatcherEvent::ProjectActivated { project_id: id })
         .await;
     Ok(Json(ActivateResponse { urls }))
 }
@@ -2753,7 +2741,7 @@ pub async fn activate_inner(
 /// threshold so the row becomes drainable again.
 async fn drain_parked_fires(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
     use sqlx::Row;
 
@@ -2789,7 +2777,7 @@ async fn drain_parked_fires(
         }
         tracing::debug!(
             target: "weft_dispatcher::activate",
-            project_id, pass, count = rows.len(),
+            %project_id, pass, count = rows.len(),
             "drain_parked_fires pass"
         );
         for row in rows {
@@ -2809,7 +2797,7 @@ async fn drain_parked_fires(
     if leftover.0 > 0 {
         tracing::warn!(
             target: "weft_dispatcher::activate",
-            project_id, leftover = leftover.0,
+            %project_id, leftover = leftover.0,
             "drain_parked_fires exceeded MAX_DRAIN_PASSES; \
              leftover fires will drain on next activate"
         );
@@ -2833,7 +2821,7 @@ pub(crate) async fn drain_due_parked_fires(state: &DispatcherState) -> anyhow::R
     // pop and re-stamp is fenced on the claim nonce.
     release_stale_drain_claims(&state.pg_pool).await?;
     for (token, project_id) in due_parked_tokens(&state.pg_pool, crate::lease::now_unix()).await? {
-        if let Err(e) = drain_one_token(state, &project_id, &token).await {
+        if let Err(e) = drain_one_token(state, project_id, &token).await {
             // One token's dispatch failure must not stop the others;
             // the failed head was re-stamped with a longer backoff by
             // the drain itself, so this token comes back when due.
@@ -2860,10 +2848,10 @@ pub(crate) async fn drain_due_parked_fires(state: &DispatcherState) -> anyhow::R
 pub async fn due_parked_tokens(
     pool: &sqlx::PgPool,
     now: i64,
-) -> anyhow::Result<Vec<(String, String)>> {
-    Ok(sqlx::query_as::<_, (String, String)>(
+) -> anyhow::Result<Vec<(String, uuid::Uuid)>> {
+    Ok(sqlx::query_as::<_, (String, uuid::Uuid)>(
         "SELECT s.token, s.project_id FROM signal s \
-         JOIN project p ON p.id::text = s.project_id \
+         JOIN project p ON p.id = s.project_id \
          WHERE p.status = 'active' \
            AND jsonb_array_length(s.parked_fires) > 0 \
            AND s.drain_claimed_at_unix IS NULL \
@@ -2871,6 +2859,22 @@ pub async fn due_parked_tokens(
     )
     .bind(now)
     .fetch_all(pool)
+    .await?)
+}
+
+/// When the earliest queued head the sweep would drain becomes due
+/// (`None` when no Active project has one waiting): the same rows as
+/// [`due_parked_tokens`], without the "due now" cut.
+pub async fn next_parked_fire_due(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MIN(COALESCE((s.parked_fires -> 0 ->> 'not_before_unix')::bigint, 0)) \
+         FROM signal s \
+         JOIN project p ON p.id = s.project_id \
+         WHERE p.status = 'active' \
+           AND jsonb_array_length(s.parked_fires) > 0 \
+           AND s.drain_claimed_at_unix IS NULL",
+    )
+    .fetch_one(pool)
     .await?)
 }
 
@@ -2906,7 +2910,7 @@ pub async fn release_stale_drain_claims(pool: &sqlx::PgPool) -> anyhow::Result<(
 /// drain raced; or our pop sequence finished), we exit cleanly.
 pub(crate) async fn drain_one_token(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     token: &str,
 ) -> anyhow::Result<()> {
     use sqlx::Row;
@@ -2982,7 +2986,7 @@ pub(crate) async fn drain_one_token(
         if fire.not_before_unix > now {
             tracing::debug!(
                 target: "weft_dispatcher::activate",
-                project_id, token, fire_id = %fire.id, attempts = fire.attempts,
+                %project_id, token, fire_id = %fire.id, attempts = fire.attempts,
                 due_in_secs = fire.not_before_unix - now,
                 "head of the parked queue is backing off; leaving the token for the sweep"
             );
@@ -3059,7 +3063,7 @@ pub(crate) async fn drain_one_token(
                 }
                 tracing::warn!(
                     target: "weft_dispatcher::activate",
-                    project_id, token, fire_id = %fire_id, %status,
+                    %project_id, token, fire_id = %fire_id, %status,
                     attempts, retry_in_secs = backoff,
                     error = %msg,
                     "drain: dispatch failed; head re-stamped, retries when due"
@@ -3094,7 +3098,7 @@ pub(crate) async fn drain_one_token(
 /// suspended execution is the source of truth for them.
 async fn drop_orphan_entry_rows(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     activation: uuid::Uuid,
     captured: &std::collections::BTreeMap<String, crate::journal::TriggerCapture>,
 ) -> anyhow::Result<()> {
@@ -3114,12 +3118,12 @@ async fn drop_orphan_entry_rows(
 /// Hold the activation identity while changing its persistent signal state.
 async fn activation_write(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     activation: uuid::Uuid,
 ) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
     let mut tx = state.pg_pool.begin().await?;
     let found: Option<(uuid::Uuid,)> = sqlx::query_as(
-        "SELECT id FROM project WHERE id = $1::uuid AND status = 'activating' AND activating_ts_color = $2 FOR UPDATE",
+        "SELECT id FROM project WHERE id = $1 AND status = 'activating' AND activating_ts_color = $2 FOR UPDATE",
     ).bind(project_id).bind(activation).fetch_optional(&mut *tx).await?;
     anyhow::ensure!(found.is_some(), "activation {activation} no longer owns project {project_id}");
     Ok(tx)
@@ -3135,7 +3139,7 @@ async fn activation_write(
 ///   - `wipe_all`: drop every signal row.
 async fn apply_reactivate_choice(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     activation: uuid::Uuid,
     choice: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -3205,7 +3209,6 @@ async fn unstick_activating(
 pub(crate) async fn wipe_activating_state(
     state: &DispatcherState,
     id: uuid::Uuid,
-    project_id: &str,
     activation: uuid::Uuid,
     cause: &weft_core::exec::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
@@ -3217,7 +3220,7 @@ pub(crate) async fn wipe_activating_state(
     state.listeners.unregister_many(&state.pg_pool, &removed).await;
     crate::api::execution::cancel_color(state, activation, cause)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation {project_id}: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation {id}: {e}")))?;
     Ok(())
 }
 
@@ -3227,7 +3230,7 @@ pub(crate) async fn wipe_activating_state(
 /// in-flight workers; row drop unregisters from the listener.
 async fn wipe_project_signals(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<(), (StatusCode, String)> {
     let colors: Vec<weft_core::Color> = state
         .journal
@@ -3316,12 +3319,9 @@ pub async fn execute_trigger_deactivation(
 pub async fn deactivate(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     Json(spec): Json<weft_broker_client::protocol::DeactivateSpec>,
 ) -> Result<StatusCode, StatusError> {
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
     // Marked gate: deactivate is part of teardown flows (`weft rm
     // --journal` quiesces through it), so its "no such project" must
     // be tellable apart from a routing 404, same as `remove`/`status`.
@@ -3376,16 +3376,12 @@ pub struct ResyncRequest {
 pub async fn resync(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<ResyncRequest>>,
 ) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
     use crate::project_store::ProjectStatus;
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let project_id = id.to_string();
 
     // 1. Refuse unless the project is Active. Resync means "the
     //    listeners fire an older program; register them against this
@@ -3436,7 +3432,7 @@ pub async fn resync(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
-    require_trigger_infra(&state, &project_id, &built).await?;
+    require_trigger_infra(&state, id, &built).await?;
 
     // 3. Take the triggers down with the user's spec.
     execute_trigger_deactivation(&state, id, spec).await?;
@@ -3454,7 +3450,7 @@ pub async fn resync(
             std::time::Duration::from_secs(cap),
             "resync",
             || async {
-                running_count(&state, &project_id, None)
+                running_count(&state, id, None)
                     .await
                     .map(|n| n as i64)
                     .map_err(|e| {
@@ -3466,14 +3462,14 @@ pub async fn resync(
         if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
             tracing::warn!(
                 target: "weft_dispatcher::api::project",
-                project_id = %project_id,
+                project_id = %id,
                 still_running,
                 drain_timeout_secs = cap,
                 "resync drain cap reached; cancelling remaining executions"
             );
-            cancel_running_non_suspended(&state, &project_id, None, weft_core::exec::CancelCause::User).await?;
+            cancel_running_non_suspended(&state, id, None, weft_core::exec::CancelCause::User).await?;
         }
-        crate::journal_bridge::try_finish_drain(&state, &project_id, None)
+        crate::journal_bridge::try_finish_drain(&state, id, None)
             .await
             .map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("try_finish_drain: {e}"))
@@ -3490,7 +3486,7 @@ pub async fn resync(
     // drained the triggers and then cancelled the same executions under
     // a stale worker would be the verb overriding the person.
     let reactivate = ActivateRequest { target: body.target, running: spec.running_choice() };
-    activate(State(state), caller, Path(id_str), Some(Json(reactivate))).await
+    activate(State(state), caller, Path(id), Some(Json(reactivate))).await
 }
 
 /// Reconcile the project's live worker pod with what current state
@@ -3532,16 +3528,12 @@ pub async fn resync(
 /// Idempotent: a no-op when both axes match, or when no pod is alive.
 pub async fn reconcile_worker(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     running_policy: crate::infra_lifecycle_command::RunningPolicy,
     drain_timeout_secs: u64,
 ) -> Result<(), (StatusCode, String)> {
     let internal = |e: anyhow::Error| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("reconcile_worker: {e:#}"))
-    };
-    let project_uuid: uuid::Uuid = match project_id.parse() {
-        Ok(u) => u,
-        Err(_) => return Ok(()),
     };
     // ALL alive pods: a project under parallel load runs N workers,
     // and any subset can be stale. No live worker: nothing to compare
@@ -3560,7 +3552,7 @@ pub async fn reconcile_worker(
     // invariant (sync writes the hash before any task that spawns).
     let want_hash = state
         .projects
-        .running_binary_hash(project_uuid)
+        .running_binary_hash(project_id)
         .await
         .map_err(internal)?
         .ok_or_else(|| {
@@ -3589,7 +3581,7 @@ pub async fn reconcile_worker(
     let doomed_names: Vec<String> = doomed.iter().map(|(p, _, _)| p.clone()).collect();
     tracing::info!(
         target: "weft_dispatcher::api::project",
-        project_id,
+        %project_id,
         doomed = ?doomed_names,
         want_hash = %want_hash,
         to_namespace = %placement.namespace,
@@ -3648,7 +3640,7 @@ pub async fn reconcile_worker(
             if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
                 tracing::warn!(
                     target: "weft_dispatcher::api::project",
-                    project_id,
+                    %project_id,
                     still_running,
                     drain_timeout_secs,
                     "runningPolicy=wait drain cap reached; cancelling what the stale \
@@ -3683,7 +3675,7 @@ pub async fn reconcile_worker(
                 if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
                     tracing::warn!(
                         target: "weft_dispatcher::api::project",
-                        project_id,
+                        %project_id,
                         still_alive = still_running,
                         drain_timeout_secs,
                         "runningPolicy=wait drain cap reached with the stale workers' work \
@@ -3731,6 +3723,10 @@ pub async fn reconcile_worker(
             })?;
     }
 
+    // Subscribed before the spawn is asked for, so the replacement
+    // coming alive can never slip between the ask and the wait below.
+    let mut heard = state.signals.subscribe();
+
     // Enqueue ONE SpawnPod task for a fresh worker in the resolver's
     // namespace (parallel load re-scales via cold_start on demand).
     // Dedup key matches cold_start's so a concurrent sweep collapses
@@ -3747,7 +3743,7 @@ pub async fn reconcile_worker(
         weft_task_store::tasks::NewTask {
             kind: weft_task_store::TaskKind::SpawnPod.into(),
             target: weft_task_store::tasks::TaskTarget::Dispatcher,
-            project_id: Some(project_id.to_string()),
+            project_id: Some(project_id),
             dedup_key: Some(dedup),
             color: None,
             tenant_id: Some(placement.tenant.as_str().to_string()),
@@ -3759,11 +3755,12 @@ pub async fn reconcile_worker(
     .await
     .map_err(internal)?;
 
-    // Wait for a correct replacement to register itself alive. Bounded
-    // so a wedged image build doesn't block the verb indefinitely.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // Wait for a correct replacement to register itself alive, woken
+    // each time one of the project's pods changes. Bounded so a wedged
+    // image build doesn't block the verb indefinitely.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut ready = false;
-    while std::time::Instant::now() < deadline {
+    loop {
         let now_alive = weft_task_store::worker_pod::alive_pods_for_project_full(
             &state.pg_pool,
             project_id,
@@ -3776,12 +3773,18 @@ pub async fn reconcile_worker(
             ready = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let changed = heard
+            .woken_before(deadline, |c, p| weft_task_store::worker_pod::announces_project(c, p, project_id))
+            .await
+            .map_err(internal)?;
+        if !changed {
+            break;
+        }
     }
     if !ready {
         tracing::warn!(
             target: "weft_dispatcher::api::project",
-            project_id,
+            %project_id,
             "replacement worker did not come up within 60s; \
              cold_start will retry as soon as a worker task lands"
         );
@@ -3860,7 +3863,6 @@ pub async fn deactivate_project_with_mode(
 ) -> Result<bool, (StatusCode, String)> {
     use crate::project_store::{ProjectLifecycle, ProjectStatus, ProjectTransition};
 
-    let project_id = id.to_string();
 
     // Reject BEFORE any destructive step (the signal wipe below runs
     // ahead of the status write): a project mid-activation is
@@ -3923,7 +3925,7 @@ pub async fn deactivate_project_with_mode(
     // observe accepting=false and start killing the listener
     // mid-cleanup.
     if mode == DeactivationMode::Wipe {
-        wipe_project_signals(state, &project_id).await?;
+        wipe_project_signals(state, id).await?;
     } else {
         // hibernate / park: KEEP the DB signal rows (the parking
         // gate needs them to recognise incoming fires) but
@@ -3935,7 +3937,7 @@ pub async fn deactivate_project_with_mode(
         // clears the cache, reactivate restores it from DB.
         let signals = state
             .journal
-            .signal_list_for_project(&project_id)
+            .signal_list_for_project(id)
             .await
             .map_err(|e| {
                 (
@@ -3977,7 +3979,7 @@ pub async fn deactivate_project_with_mode(
             ..ProjectLifecycle::deactivating_to(target)
         }
     } else if running_policy == RunningPolicy::Cancel && mode != DeactivationMode::Wipe {
-        cancel_running_non_suspended(state, &project_id, None, weft_core::exec::CancelCause::User).await?;
+        cancel_running_non_suspended(state, id, None, weft_core::exec::CancelCause::User).await?;
         target
     } else {
         // Wipe + cancel: its rows and executions were dropped above,
@@ -4015,13 +4017,13 @@ pub async fn deactivate_project_with_mode(
         state
             .events
             .publish(DispatcherEvent::ProjectDeactivated {
-                project_id: project_id.clone(),
+                project_id: id,
             })
             .await;
         // Wait mode: if there's actually nothing running, fast-path
         // the CAS to Inactive so the user doesn't see a transient
         // Deactivating that's already done.
-        let running_now = running_count(state, &project_id, None)
+        let running_now = running_count(state, id, None)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
         if drains
@@ -4044,7 +4046,7 @@ pub async fn deactivate_project_with_mode(
                 Err(e) => {
                     tracing::warn!(
                         target: "weft_dispatcher::api::project",
-                        project_id = %project_id,
+                        project_id = %id,
                         error = %e,
                         "fast-path cas_status(deactivating -> inactive) failed; \
                          drain-watcher will retry"
@@ -4066,18 +4068,10 @@ pub async fn deactivate_project_with_mode(
 pub async fn cancel_running(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
-    // The canonical form, never the caller's text: every row stores
-    // `id.to_string()`, while `parse_str` also accepts uppercase,
-    // braced and unhyphenated spellings. Keying rows off the raw path
-    // would authorize on one id and query on another.
-    let project_id = id.to_string();
-    cancel_running_non_suspended(&state, &project_id, None, weft_core::exec::CancelCause::User).await?;
+    cancel_running_non_suspended(&state, id, None, weft_core::exec::CancelCause::User).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4095,11 +4089,8 @@ pub async fn cancel_running(
 pub async fn cancel_build(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
     let flipped = state
         .projects
@@ -4138,18 +4129,10 @@ pub async fn cancel_build(
 pub async fn cancel_activate(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     use crate::project_store::ProjectStatus;
-    let id = id_str
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
-    // The canonical form, never the caller's text: every row stores
-    // `id.to_string()`, while `parse_str` also accepts uppercase,
-    // braced and unhyphenated spellings. Keying rows off the raw path
-    // would authorize on one id and query on another.
-    let project_id = id.to_string();
     let lifecycle = state
         .projects
         .lifecycle(id)
@@ -4169,10 +4152,10 @@ pub async fn cancel_activate(
     // the helper. The cause is the person's: they pressed Cancel.
     let activation = lifecycle.activating_ts_color.ok_or((StatusCode::INTERNAL_SERVER_ERROR,
         "activating project has no reserved setup identity".into()))?;
-    wipe_activating_state(&state, id, &project_id, activation, &weft_core::exec::CancelCause::User).await?;
+    wipe_activating_state(&state, id, activation, &weft_core::exec::CancelCause::User).await?;
     state
         .events
-        .publish(DispatcherEvent::ProjectDeactivated { project_id })
+        .publish(DispatcherEvent::ProjectDeactivated { project_id: id })
         .await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -4193,7 +4176,7 @@ pub async fn cancel_activate(
 /// or the runtime decided.
 pub(crate) async fn cancel_running_non_suspended(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     owned_by: Option<&[String]>,
     cause: weft_core::exec::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
@@ -4251,7 +4234,7 @@ pub(crate) async fn cancel_running_non_suspended(
 /// a terminal event for stalls).
 pub(crate) async fn suspended_color_set(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<std::collections::HashSet<weft_core::Color>> {
     let signals = state.journal.signal_list_for_project(project_id).await?;
     Ok(signals
@@ -4279,7 +4262,7 @@ pub(crate) async fn suspended_color_set(
 /// `journal_bridge::try_finish_drain`.
 pub(crate) async fn running_count(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<usize> {
     let (running, colorless) = running_colors(state, project_id, exclude_task).await?;
@@ -4293,7 +4276,7 @@ pub(crate) async fn running_count(
 /// counted but not nameable).
 pub(crate) async fn running_colors(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<(Vec<(weft_core::Color, weft_core::context::Phase)>, usize)> {
     let suspended_colors = suspended_color_set(state, project_id).await?;
@@ -4363,7 +4346,7 @@ pub(crate) async fn running_colors(
 /// suspended/running work from prior cycles.
 async fn run_trigger_setup(
     state: &DispatcherState,
-    project_id_uuid: uuid::Uuid,
+    project_id: uuid::Uuid,
     project: &ProjectDefinition,
     kicks: Vec<Kick>,
     // The hash of the SAME definition the caller computed `kicks`
@@ -4373,20 +4356,19 @@ async fn run_trigger_setup(
     program: &weft_core::project::hash::ProgramIdentity,
     activation: Option<uuid::Uuid>,
 ) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
-    let project_id = project_id_uuid.to_string();
     let color = activation.unwrap_or_else(uuid::Uuid::new_v4);
     let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_places(project))
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to
     // the completion event.
-    let mut events = state.events.subscribe_project(&project_id).await;
+    let mut events = state.events.subscribe_project(project_id).await;
 
     // The activation reserved this color when it began. A cancelled
     // driver cannot replace a newer activation's identity.
     let recorded = activation.is_none() || state
         .projects
-        .lifecycle(project_id_uuid)
+        .lifecycle(project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read activation: {e}")))?
         .is_some_and(|l| l.status == crate::project_store::ProjectStatus::Activating
@@ -4405,7 +4387,7 @@ async fn run_trigger_setup(
     start_queued_execution(
         state,
         color,
-        &project_id,
+        project_id,
         weft_core::context::Phase::TriggerSetup,
         &kick_place(project, &kicks[0]),
         &kicks,
@@ -4420,7 +4402,7 @@ async fn run_trigger_setup(
     // Recheck ownership so this driver also cancels a run born during that race.
     let still_ours = activation.is_none() || state
         .projects
-        .lifecycle(project_id_uuid)
+        .lifecycle(project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
         .is_some_and(|l| {
@@ -4523,7 +4505,7 @@ async fn run_trigger_setup(
 /// `urls` in ActivateResponse.
 async fn collect_listener_urls(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<ActivationUrl>> {
     let signals = state.journal.signal_list_for_project(project_id).await?;
     let mut out = Vec::new();
@@ -5203,7 +5185,7 @@ mod trigger_infra_ready_tests {
 
     fn row(node_id: &str, status: InfraNodeStatus) -> InfraNodeRow {
         InfraNodeRow {
-            project_id: "p".into(),
+            project_id: uuid::Uuid::nil(),
             node_id: node_id.into(),
             instance_id: String::new(),
             namespace: "ns".into(),
@@ -5213,6 +5195,7 @@ mod trigger_infra_ready_tests {
             applied_spec_hash: None,
             applied_at_unix: None,
             endpoints: Default::default(),
+            public_paths: Default::default(),
             preserve_pvcs: Vec::new(),
             units: Default::default(),
         }

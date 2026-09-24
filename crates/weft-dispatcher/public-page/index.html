@@ -1,10 +1,10 @@
 <!doctype html>
-<!-- The page the public trigger surface serves on its bare root
-     (deploy/k8s/public-tunnel.yaml routes `/`, `/index.html`, and
-     `/logo.png` here; every other unlisted path answers 404). The
-     daemon ships this directory into the cluster as the
-     weft-public-page ConfigMap on every start, so editing these files
-     and re-running `weft daemon start` redeploys the page. -->
+<!-- The page the public trigger surface serves on its bare root. The
+     front door's public listener (deploy/k8s/gateway.yaml) rewrites `/`,
+     `/index.html` and `/logo.png` onto the dispatcher's `/public-page/`
+     routes; every other unlisted path answers 404. The files are built
+     into the dispatcher (crates/weft-dispatcher/src/api/public_page.rs),
+     so editing them ships with the next dispatcher image. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">

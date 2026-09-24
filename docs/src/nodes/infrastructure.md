@@ -93,6 +93,20 @@ moment Kubernetes says the pod is ready.
 | `url()` | The address, cached, no round trip |
 | `host_and_port()` | The two apart, for a client that wants them that way |
 | `call(method, path, body)` | An HTTP request against it, retried once through a routing gap |
+| `public_url()` | For an endpoint exposed with `TenantPublic`, the address a caller outside the cluster uses; `None` for any other endpoint |
+
+If you want something outside the cluster to call your node (a provider
+delivering webhooks, say), expose the endpoint with
+`Expose::TenantPublic { path: "/hooks" }` and hand the caller `public_url()`.
+The front door serves every project, so your `/hooks` lives under a prefix of
+its own: `public_url()` is `<front door>/infra/<namespace>/<instance>/hooks`,
+and the door strips the prefix again, so your container still sees `/hooks`.
+`weft infra status` prints the same address under the node. On a local install
+that address is on your own machine (`http://127.0.0.1:<port>/infra/...`), and
+the public tunnel does not carry it, so only a deployed cluster, whose base is
+its internet host, gives an address a provider can reach. A named install
+(`WEFT_INSTANCE`) has no front door for these, so it refuses `TenantPublic` at
+compile time.
 
 It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the

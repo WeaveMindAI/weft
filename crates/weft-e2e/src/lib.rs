@@ -8,18 +8,20 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo test -p weft-e2e --features e2e -- --test-threads=1
+//! scripts/run-e2e.sh
 //! ```
 //!
-//! The `e2e` feature is OFF by default, so `cargo test --workspace` compiles
-//! this crate but runs none of its cluster-touching tests. The rig invokes
-//! `setup.sh` once at suite start to bring the cluster to current code, then
-//! each test prepares an isolated project, drives it, and asserts.
+//! The runner brings the cluster to current code once, then runs the test
+//! files side by side. The `e2e` feature is OFF by default, so
+//! `cargo test --workspace` compiles this crate but runs none of its
+//! cluster-touching tests. How to write a test that runs well beside the
+//! others is in the crate's README.
 //!
 //! ## The toolkit (this library)
 //!
 //! - [`client`] : HTTP client over the dispatcher API + `weft` CLI shell-out.
-//! - [`ensure`] : suite-shared "bring the system up on current code" step.
+//! - [`ensure`] : reach the default install (the runner brought it up).
+//! - [`cell`]   : a whole install of a test's own, with its own pace.
 //! - [`event`]  : the execution replay event stream, typed-accessor over JSON.
 //! - [`project`]: fixture -> isolated project lifecycle (prepare/build/run/rm).
 //! - [`run`]    : start a run, wait for it to settle, fetch its replay.
@@ -47,14 +49,19 @@
 //! [`client::AuthProvider`] (None here, where there is no login). A harness that
 //! needs tokens can depend on THIS crate and reuse that toolkit, injecting a
 //! provider that signs a token per request (everything API + token, no CLI). What
-//! stays specific to this harness and is NOT reused: [`ensure`] (drives
-//! `setup.sh` on kind), `platform` (kind/Postgres direct), and
+//! stays specific to this harness and is NOT reused: [`ensure`] and [`cell`]
+//! (installs on kind), `platform` (kind/Postgres direct), and
 //! [`project::Project`] (shells out to the `weft` CLI). This harness is
 //! unauthenticated by construction (its authenticator only ever issues `local`).
 
 pub mod access;
 pub mod assert;
 pub mod bus;
+pub mod cell;
+// Removing what failed runs kept (`scripts/run-e2e.sh --clean`). Reaches
+// behind the API through the platform layer, so `e2e` only.
+#[cfg(feature = "e2e")]
+pub mod cleanup;
 pub mod client;
 pub mod display;
 pub mod ensure;
@@ -62,6 +69,7 @@ pub mod event;
 pub mod fakes;
 pub mod human;
 pub mod infra;
+pub mod kept;
 pub mod live;
 // The platform layer reaches behind the public API (direct Postgres + kubectl)
 // to observe and drive what the SYSTEM does underneath a program. It needs the
@@ -82,6 +90,7 @@ pub mod teardown;
 pub use client::{cli, cli_ok, poll_until, poll_until_describing, tail, Dispatcher};
 #[cfg(feature = "e2e")]
 pub use platform::Platform;
+pub use cell::Cell;
 pub use ensure::up;
 pub use event::{Event, Replay};
 pub use project::Project;

@@ -20,7 +20,7 @@ pub async fn signals_held_by_pod(pool: &PgPool, pod_name: &str) -> anyhow::Resul
         "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.color, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
                 s.kind_state, s.kind_state_seq, s.placement_generation \
-         FROM signal s JOIN project p ON p.id::TEXT = s.project_id \
+         FROM signal s JOIN project p ON p.id = s.project_id \
          WHERE s.listener_pod = $1 AND p.status = ANY($2)",
     )
     .bind(pod_name)

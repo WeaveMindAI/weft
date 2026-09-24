@@ -66,7 +66,7 @@ use crate::state::DispatcherState;
 /// One node that has something to show, as the listing gives it.
 #[derive(Debug, Serialize)]
 pub struct NodeDisplayEntry {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub project_name: String,
     /// The node, spelled the way a person writes it (`test.whatsapp`),
     /// which is also what the read door's path takes. The compiled id
@@ -134,7 +134,7 @@ pub async fn list_displays(
                 continue;
             }
             out.push(NodeDisplayEntry {
-                project_id: summary.id.to_string(),
+                project_id: summary.id,
                 project_name: summary.name.clone(),
                 node: address.clone(),
                 node_type: node.node_type.clone(),

@@ -62,8 +62,10 @@ RUN apt-get update \
 {{install_build_system_packages}}
 
 # rustup with `--default-toolchain none`: the pinned toolchain comes
-# from `rust-toolchain.toml`, materialized on the first `cargo`
-# invocation below.
+# from `rust-toolchain.toml` and is installed here, in this stage, so
+# the published image carries it. Left to materialize on the first
+# `cargo` call it lived only in the compile stage below, and every
+# per-project build downloaded the whole toolchain again.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -73,6 +75,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # and relies on this image's layer instead).
 WORKDIR /weft
 COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY Cargo.toml Cargo.lock ./
 
 # The compile stage: everything above, plus the sources, plus one cargo
@@ -148,6 +151,7 @@ RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/r
     && ( sh /work/weft-cache-gc.sh /cache/target/release 30 /work {{worker_binary}} \
          || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 ) \
     && sh /usr/local/bin/weft-split-artifacts /cache/target /out \
+    && cp /work/Cargo.lock /out/worker.Cargo.lock \
     && rm -rf /work /weft/project-nodes
 
 # The two halves, in the order that makes the big one stick.
@@ -177,5 +181,12 @@ RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/r
 FROM toolchain
 COPY --from=compile /out/vendor/ /weft/target/
 COPY --from=compile /out/weft/ /weft/target/
+# The lock the stock worker resolved to: the workspace lock plus every
+# crate the stdlib packages pull in, at the versions compiled above.
+# A per-project build starts from it, so it resolves nothing it shares
+# with the stock worker (no crates.io index fetch) and cannot drift to a
+# newer version of a crate this image already compiled.
+# SYNC: worker.Cargo.lock <-> crates/weft-compiler/src/worker_image.rs (BASE_WORKER_LOCK)
+COPY --from=compile /out/worker.Cargo.lock /weft/worker.Cargo.lock
 COPY crates ./crates
 {{build_env_lines}}

@@ -100,20 +100,20 @@ async fn cross_tenant_project_id_takeover_is_refused() {
 #[tokio::test]
 async fn list_executions_is_scoped_to_the_caller_tenant() {
     let journal = FakeJournal::new();
-    let proj_a = Uuid::new_v4().to_string();
-    let proj_b = Uuid::new_v4().to_string();
+    let proj_a = Uuid::new_v4();
+    let proj_b = Uuid::new_v4();
     // Mirror the project->tenant mapping the Postgres execution_color seed reads.
-    journal.set_project_tenant(&proj_a, TENANT_A);
-    journal.set_project_tenant(&proj_b, TENANT_B);
+    journal.set_project_tenant(proj_a, TENANT_A);
+    journal.set_project_tenant(proj_b, TENANT_B);
 
     let color_a = Uuid::new_v4();
     let color_b = Uuid::new_v4();
     journal
-        .record_event(&started(color_a, &proj_a))
+        .record_event(&started(color_a, proj_a))
         .await
         .unwrap();
     journal
-        .record_event(&started(color_b, &proj_b))
+        .record_event(&started(color_b, proj_b))
         .await
         .unwrap();
 
@@ -146,11 +146,11 @@ async fn an_executions_owner_outlives_its_project() {
     let store = FakeProjectStore::new();
     let journal = FakeJournal::new();
     let project = Uuid::new_v4();
-    let project_id = project.to_string();
+    let project_id = project;
     register(&store, project, "doomed", TENANT_A).await;
-    journal.set_project_tenant(&project_id, TENANT_A);
+    journal.set_project_tenant(project_id, TENANT_A);
     let color = Uuid::new_v4();
-    journal.record_event(&started(color, &project_id)).await.unwrap();
+    journal.record_event(&started(color, project_id)).await.unwrap();
 
     let owner = journal.execution_owner(color).await.unwrap().expect("owner while alive");
     assert_eq!(owner.tenant, TENANT_A);
@@ -241,9 +241,9 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
     let store = FakeProjectStore::new();
     let journal = FakeJournal::new();
     let project = Uuid::new_v4();
-    let project_id = project.to_string();
+    let project_id = project;
     register(&store, project, "doomed", TENANT_A).await;
-    journal.set_project_tenant(&project_id, TENANT_A);
+    journal.set_project_tenant(project_id, TENANT_A);
 
     // Two recorded versions; only one of them ever ran.
     store
@@ -255,14 +255,14 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
         .await
         .expect("record a version nothing ran");
     let color = Uuid::new_v4();
-    let mut birth = started(color, &project_id);
+    let mut birth = started(color, project_id);
     if let weft_journal::ExecEvent::ExecutionStarted { definition_hash, .. } = &mut birth {
         *definition_hash = Some("ran".to_string());
     }
     journal.record_event(&birth).await.unwrap();
 
     store.remove(project).await.expect("remove project");
-    let in_use = journal.definition_hashes_in_use(&project_id).await.unwrap();
+    let in_use = journal.definition_hashes_in_use(project_id).await.unwrap();
     assert_eq!(in_use, vec!["ran".to_string()], "the journal names the version its run used");
     let dropped = store.retire_unused_definitions(project, &in_use).await.unwrap();
     assert_eq!(dropped, 1, "the version nothing ran is dropped");
@@ -278,7 +278,7 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
 
     // `weft clean` on that last run: now nothing needs the version.
     journal.delete_execution(color).await.unwrap();
-    let in_use = journal.definition_hashes_in_use(&project_id).await.unwrap();
+    let in_use = journal.definition_hashes_in_use(project_id).await.unwrap();
     assert!(in_use.is_empty(), "no run left to need a version");
     store.retire_unused_definitions(project, &in_use).await.unwrap();
     assert_eq!(
@@ -288,10 +288,10 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
     );
 }
 
-fn started(color: Uuid, project_id: &str) -> weft_journal::ExecEvent {
+fn started(color: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {
     weft_journal::ExecEvent::ExecutionStarted {
         color,
-        project_id: project_id.to_string(),
+        project_id,
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),

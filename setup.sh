@@ -82,10 +82,12 @@
 #   install starts a fresh one.
 #
 # Public trigger surface (event triggers delivered BY providers):
-#   --public-url    expose /events/... and /signal/... to the internet
-#                   through an outbound tunnel + a filtering proxy, so
-#                   provider event pushes reach this local install.
-#                   Nothing else is exposed. Persisted across runs.
+#   --public-url    expose the public trigger surface (/events/...,
+#                   /signal/..., the file relay, the OAuth callback) to
+#                   the internet through an outbound tunnel onto an
+#                   allowlisting door, so provider event pushes reach
+#                   this local install. Nothing else is exposed.
+#                   Persisted across runs.
 #   --no-public-url close it again.
 #
 # Browser-target flags (default: every browser):
@@ -419,7 +421,8 @@ remove_docker_images_by_id() { # label ids [note] [warn_reason]
 # and roughly four minutes of an install that has about one minute of
 # real work in it. The 20 GB LRU bound the CLI section applies is what
 # keeps the dead layers from accumulating, and being least recently
-# used is exactly what makes them the ones it drops.
+# used (none of them in the last day) is exactly what makes them the
+# ones it drops.
 #
 # Worker images are deliberately NOT this sweep's to take:
 # a running project keeps using its old-engine image until the user
@@ -1040,7 +1043,7 @@ if [[ -n "${write_migration}" ]]; then
   release_flag=""
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
-    # SYNC: weft-db <-> crates/weft-core/src/infra/mod.rs (DB_NAMESPACE)
+    # SYNC: weft-db <-> crates/weft-core/src/infra/instance.rs (the default install's db_namespace)
     if ! kubectl get namespace weft-db >/dev/null 2>&1; then
       fail "releasing has to reach the database you have been working against, and no cluster is up"
       exit 1
@@ -1067,7 +1070,8 @@ if [[ -n "${write_migration}" ]]; then
   # after its released file is recorded on the live database, and a
   # released crate answers "nothing changed" on the re-run.
   for pkg in weft-dispatcher weft-broker; do
-    if ! cargo run -q -p "${pkg}" --features db-tests --example schema_migration \
+    # SYNC: the example name <-> crates/weft-dispatcher/Cargo.toml, crates/weft-broker/Cargo.toml
+    if ! cargo run -q -p "${pkg}" --features db-tests --example "${pkg#weft-}_schema_migration" \
         -- "${write_migration}" ${release_flag}; then
       fail "writing the migration failed in ${pkg}; fix the cause and re-run the same command"
       exit 1
@@ -1631,9 +1635,13 @@ if [[ $build_cli -eq 1 ]]; then
   # on a machine whose docker isn't running must still produce a
   # binary. With a live daemon, a failed prune fails loud; with none,
   # SAY the bound was skipped instead of letting silence read as done.
+  # Only what nothing used in the last day is eligible: the bound counts
+  # the image layers in use too, which it can never free, so on a busy
+  # machine it went on to take every reclaimable record, the compile
+  # caches every build of the day had just used included.
   if docker_reachable; then
-    spin "bound BuildKit cache to 20GB (LRU)" \
-      docker builder prune --force --max-used-space 20GB
+    spin "bound BuildKit cache to 20GB (LRU, sparing what was used in the last day)" \
+      docker builder prune --force --max-used-space 20GB --filter until=24h
   else
     warn "docker unreachable; the BuildKit cache bound is skipped this install"
   fi
@@ -2059,10 +2067,17 @@ if [[ $build_vscode -eq 1 ]]; then
   # (check:webview) needs the same redirect, so point the package's node_modules at
   # the extension's install. Created up-front (not inside the rebuild branch) so a
   # bare `pnpm run check:webview` resolves too. One symlink, no dep-list dup.
-  ln -sfn ../../extension-vscode/node_modules ../packages/weft-graph/node_modules
+  # A real directory there (a `pnpm install` run inside the package) is
+  # replaced: `ln -sfn` onto a directory would nest the link INSIDE it
+  # and leave the package resolving against the wrong install.
   # Same borrow for the grammars package: its only dependency is the
   # highlight.js the extension already installs, for its own tests.
-  ln -sfn ../../extension-vscode/node_modules ../packages/weft-syntax/node_modules
+  for borrower in ../packages/weft-graph ../packages/weft-syntax; do
+    if [[ -d "${borrower}/node_modules" && ! -L "${borrower}/node_modules" ]]; then
+      rm -rf "${borrower}/node_modules"
+    fi
+    ln -sfn ../../extension-vscode/node_modules "${borrower}/node_modules"
+  done
 
   # Skip rebuild if nothing under src/ + config + package.json has
   # changed since the last successful build. We hash inputs and
@@ -2390,7 +2405,7 @@ if [[ $build_cli -eq 1 ]]; then
     printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
 
     printf '%s%sRunning:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    # SYNC: weft-system <-> crates/weft-core/src/infra/mod.rs (SYSTEM_NAMESPACE)
+    # SYNC: weft-system <-> crates/weft-core/src/infra/instance.rs (the default install's system_namespace)
     printf '  %s%s%s dispatcher  %s%s%s  %s(kind cluster, weft-system ns)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
       "${C_DIM}" "http://127.0.0.1:9999" "${C_RESET}" \

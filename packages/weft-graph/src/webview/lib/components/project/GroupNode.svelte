@@ -129,7 +129,7 @@
 	// A container takes no `@require_one_of` (the directive lives on the
 	// node inside that needs the ports), so no port here is one-of-required.
 	const oneOfRequiredPorts: Set<string> = new Set();
-	const isExpanded = $derived((data.config?.expanded as boolean) ?? true);
+	const isExpanded = $derived((data.config?.expanded as boolean) ?? false);
 	const groupDescription = $derived((data.config?.description as string) ?? '');
 	let descExpanded = $state(false);
 

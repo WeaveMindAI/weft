@@ -15,29 +15,32 @@
 //! `FOR UPDATE SKIP LOCKED` in the claim SQL keeps them from
 //! double-claiming.
 //!
-//! Wake mechanism: writers (the broker's `supervisor_enqueue_lifecycle`)
-//! call `pg_notify(LIFECYCLE_CMD_CHANNEL, ...)` after the INSERT.
-//! The claim loop's `PgListener` wakes on each notification and
-//! drains everything pending. A long safety-poll catches missed
-//! notifications (transient listener restart, dropped connection
-//! between INSERT and pg_notify).
+//! Wake mechanism: every command row announces itself on
+//! `INFRA_COMMAND_CHANNEL` (`issued:<project>`) from its own trigger when
+//! it commits, whoever wrote it. The claim loop wakes on each and drains
+//! everything pending; a long safety tick catches a lost notification
+//! and a dead claimer's lapsed lease, which nothing announces.
 
 use anyhow::Result;
 use sqlx::PgPool;
+use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
 
 use crate::infra_lifecycle_command::InfraLifecycleVerb;
-use crate::pg_wake::{self, DrainStep};
+use crate::pg_wake::{self, DrainStep, WakeOn};
 use crate::state::DispatcherState;
 
-/// Postgres NOTIFY channel writers use to wake the claim loop.
-/// Also published by `supervisor_enqueue_lifecycle` in the broker.
-pub const LIFECYCLE_CMD_CHANNEL: &str = "weft_lifecycle_cmd";
+/// A command being issued, for any project: the claimer serves them all.
+const WAKE_ON: &[WakeOn] = &[WakeOn {
+    channel: INFRA_COMMAND_CHANNEL,
+    concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. })),
+}];
 
 pub fn spawn(state: DispatcherState) {
     crate::app::spawn_supervised("lifecycle_claimer", async move {
         pg_wake::run(
-            state.pg_pool.clone(),
-            LIFECYCLE_CMD_CHANNEL,
+            state.signals.subscribe(),
+            WAKE_ON,
+            pg_wake::SAFETY_POLL_INTERVAL,
             "weft_dispatcher::lifecycle_claimer",
             || async {
                 match claim_and_run_one(&state).await? {
@@ -106,9 +109,7 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
 /// `weft-broker-client::protocol`.
 async fn run_claimed(state: &DispatcherState, row: &ClaimedCommand) -> Result<RunOutcome> {
     use weft_broker_client::protocol::LifecycleSpec;
-    let project_id = row.project_id.parse::<uuid::Uuid>().map_err(|e| {
-        anyhow::anyhow!("infra_lifecycle_command.id={} bad project_id: {e}", row.id)
-    })?;
+    let project_id = row.project_id;
     let spec = LifecycleSpec::from_row_columns(row.verb, row.spec_json.clone())
         .map_err(|e| anyhow::anyhow!("infra_lifecycle_command.id={}: {e}", row.id))?;
     match spec {
@@ -122,7 +123,7 @@ async fn run_claimed(state: &DispatcherState, row: &ClaimedCommand) -> Result<Ru
 /// state).
 struct ClaimedCommand {
     id: i64,
-    project_id: String,
+    project_id: uuid::Uuid,
     verb: InfraLifecycleVerb,
     spec_json: Option<serde_json::Value>,
 }
@@ -148,13 +149,14 @@ async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<ClaimedCom
          SET claimed_by_pod = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
             SELECT id FROM infra_lifecycle_command \
-            WHERE verb IN ('deactivate', 'reactivate') \
+            WHERE verb IN ({verbs}) \
               AND {predicate} \
             ORDER BY id ASC \
             FOR UPDATE SKIP LOCKED \
             LIMIT 1 \
          ) \
          RETURNING id, project_id, verb, spec_json",
+        verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
         predicate = weft_broker_client::lifecycle_command::claimable_predicate(),
     );
     let row = sqlx::query(&sql)
@@ -186,7 +188,7 @@ async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<ClaimedCom
 fn decode_row(r: &sqlx::postgres::PgRow) -> Result<ClaimedCommand> {
     use sqlx::Row;
     let id: i64 = r.try_get("id")?;
-    let project_id: String = r.try_get("project_id")?;
+    let project_id: uuid::Uuid = r.try_get("project_id")?;
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("unknown verb '{verb_str}' on id={id}"))?;

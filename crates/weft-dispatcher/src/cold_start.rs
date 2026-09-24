@@ -1,6 +1,7 @@
 //! Cold-start + scale-up trigger: scan for projects with pending worker
 //! tasks but no ADMITTABLE worker Pod, and enqueue a `spawn_pod` task.
-//! Run as a background loop on every dispatcher.
+//! Run as a background loop on every dispatcher, woken by the writes
+//! that can change the answer.
 //!
 //! "Admittable" = a `spawning`/`alive` pod that is not draining and is
 //! below the memory-saturation threshold. This one condition serves
@@ -11,36 +12,46 @@
 //!
 //! Dedup: `spawn_pod` tasks key on project and requested binary, so one spawn
 //! is in flight per image; concurrent dispatchers converge on one task,
-//! and a sustained-saturation project ramps one worker per tick (spawn,
+//! and a sustained-saturation project ramps one worker per wake (spawn,
 //! wait for it to come alive, and if still saturated spawn the next)
 //! rather than bursting N workers for one spike.
 
-use std::time::Duration;
-
 use sqlx::Row;
-use tokio::time::sleep;
 
+use crate::pg_wake::{self, DrainStep, WakeOn};
 use crate::state::DispatcherState;
-use weft_task_store::tasks::{enqueue_dedup, NewTask, TaskTarget};
+use weft_task_store::tasks::{enqueue_dedup, NewTask, TaskTarget, TASK_READY_CHANNEL};
+use weft_task_store::worker_pod::WORKER_POD_CHANNEL;
 use weft_task_store::{SpawnPodPayload, TaskKind};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// What changes the answer: worker work becoming claimable, and a
+/// project's pods changing (one appears, dies, drains, or crosses the
+/// saturation line). A spawn that failed announces neither; the safety
+/// tick retries it.
+const WAKE_ON: &[WakeOn] = &[
+    WakeOn { channel: TASK_READY_CHANNEL, concerns: |payload| payload.starts_with("worker:") },
+    WakeOn::any(WORKER_POD_CHANNEL),
+];
 
+/// Every dispatcher pod runs the sweep; the enqueue is dedup-keyed, so
+/// siblings woken by the same write converge on one spawn.
 pub fn spawn(state: DispatcherState) {
     crate::app::spawn_supervised("cold_start", async move {
-        loop {
-            if let Err(e) = sweep_once(&state).await {
-                tracing::warn!(
-                    target: "weft_dispatcher::cold_start",
-                    error = %e,
-                    "sweep error; backing off"
-                );
-            }
-            sleep(POLL_INTERVAL).await;
-        }
+        pg_wake::run(
+            state.signals.subscribe(),
+            WAKE_ON,
+            pg_wake::SAFETY_POLL_INTERVAL,
+            "weft_dispatcher::cold_start",
+            || async { sweep_once(&state).await.map(|()| DrainStep::Done) },
+        )
+        .await;
     });
 }
 
+/// One pass over every project that needs a worker. Not batched: a
+/// project already given its spawn stays in the answer until the pod
+/// comes alive, so a batch would keep returning the same projects and
+/// starve the rest.
 async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
     // Find projects with pending worker tasks that have no ADMITTABLE
     // pod (none alive/spawning, OR every one draining / memory-
@@ -65,7 +76,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
     let rows = sqlx::query(
         r#"SELECT DISTINCT t.project_id, COALESCE(t.binary_hash, p.running_binary_hash) AS binary_hash
            FROM task t
-           JOIN project p ON p.id::text = t.project_id
+           JOIN project p ON p.id = t.project_id
            WHERE t.target = 'worker'
              AND t.status = 'pending'
              AND t.project_id IS NOT NULL
@@ -78,22 +89,21 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                    AND NOT wp.draining
                    AND wp.mem_pressure < $1
                    AND (t.binary_hash IS NULL OR wp.binary_hash = t.binary_hash)
-             )
-           LIMIT 100"#,
+             )"#,
     )
     .bind(saturation)
     .fetch_all(&state.pg_pool)
     .await?;
 
     for row in rows {
-        let project_id: String = row.try_get("project_id")?;
+        let project_id: uuid::Uuid = row.try_get("project_id")?;
         let binary_hash: String = row.try_get("binary_hash")?;
         // Worker placement via the single resolver (source-declares-
         // infra AND its own namespace exists -> project namespace, else
         // shared pool). A None here means the project was unregistered
         // between the task enqueue and now. Skip; the task will time
         // out and the user retries. DB errors propagate via `?`.
-        let Some(placement) = crate::placement::resolve_worker_placement(state, &project_id).await?
+        let Some(placement) = crate::placement::resolve_worker_placement(state, project_id).await?
         else {
             tracing::warn!(
                 target: "weft_dispatcher::cold_start",
@@ -106,7 +116,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
         // stamp (see the query comment above).
         let tenant = placement.tenant.as_str().to_string();
         let payload = SpawnPodPayload {
-            project_id: project_id.clone(),
+            project_id,
             tenant: tenant.clone(),
             namespace: placement.namespace,
             owner_dispatcher: state.pod_id.as_str().to_string(),

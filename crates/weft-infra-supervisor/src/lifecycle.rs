@@ -1,5 +1,5 @@
-//! Lifecycle loop. Claims `infra_lifecycle_command` rows for this
-//! tenant and executes them via kubectl. Three verbs:
+//! Lifecycle loop. Claims the `infra_lifecycle_command` rows of the
+//! projects this pod owns and executes them via kubectl. Three verbs:
 //!
 //! - **apply**: compile the InfraSpec (weft-core), resolve local
 //!   image tags, kubectl-apply, wait for readiness, write the
@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
 
+use weft_broker_client::protocol::SupervisorClaim;
 use weft_core::infra::{self, CompileContext, InfraSpec};
 
 use crate::SupervisorState;
@@ -312,7 +313,7 @@ async fn wait_for_drain(
     state: &SupervisorState,
     command_id: i64,
     drain_timeout_secs: u64,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<()> {
     let outcome = weft_platform_traits::drain_until_zero(
         state.clock.as_ref(),
@@ -326,7 +327,7 @@ async fn wait_for_drain(
     .await?;
     if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
         tracing::warn!(
-            project_id,
+            %project_id,
             still_running,
             drain_timeout_secs,
             "running_policy=wait drain timeout; proceeding with lifecycle op"
@@ -335,34 +336,118 @@ async fn wait_for_drain(
     Ok(())
 }
 
-pub async fn run_loop(state: SupervisorState) -> Result<()> {
+/// How long the lifecycle loop waits after a failed claim before it
+/// asks again, so a broker that is down is not asked in a tight loop.
+const CLAIM_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Claim and run commands for as long as the pod lives, one project's
+/// commands in order and different projects' side by side: an apply
+/// waiting minutes on a slow database's readiness, or a stop draining
+/// its runs, holds up only its own project.
+///
+/// With nothing waiting, the claim itself sleeps: the broker holds it
+/// until a command is issued (or the hold ends). Two things on this pod
+/// end the hold early and ask again: a command finishing, since the
+/// project it frees may already have its next command waiting and the
+/// held claim still names it busy; and the ownership loop reporting a
+/// change (`changes`). A project this pod took on may have had its
+/// command issued while nobody owned it; a project it lost has a new
+/// owner, which runs its command again from the start, so the command
+/// running here is stopped rather than left issuing kubectl calls for a
+/// project that is no longer this pod's. When the broker answers that a
+/// command waits on a project nobody owns, the ownership loop is asked
+/// to tick now.
+pub async fn run_loop(
+    state: SupervisorState,
+    mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+) -> Result<()> {
+    let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // The project each running task serves, and how to stop it.
+    let mut busy: std::collections::HashMap<tokio::task::Id, (Uuid, tokio::task::AbortHandle)> =
+        std::collections::HashMap::new();
     loop {
-        match tick(&state).await {
-            Ok(true) => {
-                // Got work; loop immediately to drain any queue.
-                continue;
+        let busy_projects: Vec<Uuid> = busy.values().map(|(project, _)| *project).collect();
+        // Ownership first: a claim can only hand out a project this pod
+        // took back AFTER the loss that is already queued here, so the
+        // loss is applied before that claim spawns anything, and never
+        // stops the command the new claim started. Dropping a claim that
+        // lost the race is free: claiming marks nothing on the broker.
+        tokio::select! {
+            biased;
+            change = changes.recv() => {
+                let change = change.ok_or_else(|| {
+                    anyhow!("the ownership loop is gone; the lifecycle loop cannot follow what this pod owns")
+                })?;
+                busy.retain(|_, (project_id, task)| {
+                    if !change.lost.contains(project_id) {
+                        return true;
+                    }
+                    tracing::info!(
+                        %project_id,
+                        "this pod no longer owns the project; stopping its running command, the new owner runs it again"
+                    );
+                    task.abort();
+                    false
+                });
             }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "lifecycle tick failed");
-            }
+            claimed = state.broker.claim_command(
+                &state.pod_name,
+                &busy_projects,
+                weft_broker_client::protocol::MAX_HOLD,
+            ) => match claimed {
+                Ok(SupervisorClaim::Command(cmd)) => {
+                    let project_id = cmd.project_id;
+                    let task_state = state.clone();
+                    let task = running.spawn(async move {
+                        if let Err(e) = run_command(&task_state, cmd).await {
+                            tracing::warn!(error = %e, "lifecycle command could not be recorded");
+                        }
+                    });
+                    busy.insert(task.id(), (project_id, task));
+                }
+                Ok(SupervisorClaim::UnownedWork) => state.ownership_wanted.notify_one(),
+                Ok(SupervisorClaim::Nothing) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "lifecycle claim failed");
+                    state.clock.sleep(CLAIM_ERROR_BACKOFF).await;
+                }
+            },
+            Some(done) = running.join_next_with_id() => match done {
+                Ok((id, ())) => {
+                    busy.remove(&id);
+                }
+                // Stopped above, its busy entry already gone.
+                Err(e) if e.is_cancelled() => {}
+                // A command that panicked leaves its project's state
+                // unknown to this pod: exit, so the pod restarts clean.
+                Err(e) => return Err(anyhow!("a lifecycle command panicked: {e}")),
+            },
         }
-        state.clock.sleep(state.poll_interval).await;
     }
 }
 
-/// Returns true when work was done.
+/// Claim one command, holding up to `wait` for one to be issued, and
+/// run it. Returns true when work was done.
 ///
-/// Exposed for integration tests. The real `run_loop` calls this
-/// in a hot loop; tests call it once per scenario step.
-pub async fn tick(state: &SupervisorState) -> Result<bool> {
-    let Some(cmd) = state
+/// Exposed for integration tests, which step the loop one command at a
+/// time with no wait; the real [`run_loop`] claims and runs side by side.
+pub async fn tick(state: &SupervisorState, wait: Duration) -> Result<bool> {
+    let SupervisorClaim::Command(cmd) = state
         .broker
-        .claim_command(&state.pod_name)
+        .claim_command(&state.pod_name, &[], wait)
         .await?
     else {
         return Ok(false);
     };
+    run_command(state, cmd).await?;
+    Ok(true)
+}
+
+/// Run one claimed command and record how it ended.
+async fn run_command(
+    state: &SupervisorState,
+    cmd: weft_broker_client::protocol::SupervisorCommandRow,
+) -> Result<()> {
     tracing::info!(
         command_id = cmd.id,
         project_id = %cmd.project_id,
@@ -383,8 +468,8 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
     // longer owns the project (drain / lease takeover moved it
     // mid-command). In the displaced case the command stays
     // UNCOMPLETED on purpose, so the new owner re-runs and finishes it
-    // (the user never re-acts). Either way, log + move on; never
-    // propagate as a failure of this tick.
+    // (the user never re-acts). Either way, log + move on; neither is
+    // a failure of this command's run.
     match state
         .broker
         .command_complete(&state.pod_name, cmd.id, error.as_deref(), cancelled)
@@ -415,7 +500,7 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
             );
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 async fn execute(
@@ -434,9 +519,9 @@ async fn execute(
     // already ran cancel_running_non_suspended when it issued the
     // command, so any colors still alive are draining naturally.
     if cmd.running_policy == Some(RunningPolicy::Wait) {
-        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, &cmd.project_id).await?;
+        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, cmd.project_id).await?;
     }
-    let nodes = state.broker.infra_nodes(&cmd.project_id).await?;
+    let nodes = state.broker.infra_nodes(cmd.project_id).await?;
     let targets: Vec<&weft_broker_client::protocol::SupervisorInfraNode> = match &cmd.node_id {
         Some(node_id) => nodes.iter().filter(|n| n.node_id == *node_id).collect(),
         None => nodes.iter().collect(),
@@ -544,7 +629,7 @@ async fn execute(
                         .set_status(
                             &state.pod_name,
                             Some(cmd.id),
-                            &cmd.project_id,
+                            cmd.project_id,
                             &n.node_id,
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopping,
@@ -570,7 +655,7 @@ async fn execute(
                         .set_status(
                             &state.pod_name,
                             Some(cmd.id),
-                            &cmd.project_id,
+                            cmd.project_id,
                             &n.node_id,
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopped,
@@ -623,7 +708,7 @@ async fn execute(
                     state
                         .broker
                         .event_record(
-                            &cmd.project_id,
+                            cmd.project_id,
                             Some(&n.node_id),
                             weft_broker_client::protocol::InfraEvent::Stopped,
                         )
@@ -666,7 +751,7 @@ async fn execute(
                     .set_status(
                         &state.pod_name,
                         Some(cmd.id),
-                        &cmd.project_id,
+                        cmd.project_id,
                         &n.node_id,
                         None,
                         weft_broker_client::protocol::InfraNodeStatus::Terminating,
@@ -706,7 +791,7 @@ async fn execute(
                 // taken down.
                 if !state
                     .broker
-                    .remove_node(&state.pod_name, &cmd.project_id, &n.node_id)
+                    .remove_node(&state.pod_name, cmd.project_id, &n.node_id)
                     .await?
                     .is_applied()
                 {
@@ -725,7 +810,7 @@ async fn execute(
                 state
                     .broker
                     .event_record(
-                        &cmd.project_id,
+                        cmd.project_id,
                         Some(&n.node_id),
                         weft_broker_client::protocol::InfraEvent::Terminated,
                     )
@@ -788,7 +873,7 @@ async fn execute_apply(
     // hash).
     let image_tags_unsorted = state
         .broker
-        .project_image_tags(&cmd.project_id, node_id)
+        .project_image_tags(cmd.project_id, node_id)
         .await?;
     let image_tags: std::collections::BTreeMap<String, String> =
         image_tags_unsorted.into_iter().collect();
@@ -796,7 +881,7 @@ async fn execute_apply(
     // Read the prior infra_node row. Drives skip / fresh / replace.
     let prior = state
         .broker
-        .infra_nodes(&cmd.project_id)
+        .infra_nodes(cmd.project_id)
         .await?
         .into_iter()
         .find(|n| n.node_id == node_id);
@@ -822,17 +907,18 @@ async fn execute_apply(
         }
         _ => (
             ApplyMode::Fresh,
-            mint_instance_id(&cmd.project_id, node_id),
+            mint_instance_id(cmd.project_id, node_id),
         ),
     };
 
     let compile_ctx = CompileContext {
         tenant_id: &project_tenant,
-        project_id: &cmd.project_id,
+        project_id: cmd.project_id,
         node_id,
         instance_id: &instance_id,
         namespace: &namespace,
         local_image_tags: &image_tags,
+        install: &state.install,
     };
 
     // Hash the typed spec FIRST (with image_tags mixed in) so the
@@ -851,22 +937,29 @@ async fn execute_apply(
         prior.as_ref().map(|p| p.units.clone()).unwrap_or_default();
     let reconcile = units_to_reconcile(&spec, &prior_units);
 
-    // Full skip: every declared unit is already up AND the hash
-    // matches. Cluster state is already what we want; no kubectl. The
-    // row keeps its instance_id, hash, endpoints. (`reconcile` empty
-    // means every unit is up; hash match means the up units are at the
-    // current spec, so there's genuinely nothing to do.)
+    // Where the endpoints answer, from the spec and the instance: pure,
+    // so it is known before anything is applied.
+    let addresses = compute_endpoints(&spec, &instance_id, &namespace)?;
+
+    // Full skip: every declared unit is already up, the hash matches,
+    // AND the row already carries these addresses. Cluster state is
+    // already what we want; no kubectl. The row keeps its instance_id,
+    // hash, endpoints. (`reconcile` empty means every unit is up; hash
+    // match means the up units are at the current spec; the address
+    // check catches a row stamped before a column existed, which would
+    // otherwise keep its stale addresses for as long as it is skipped.)
     let hash_matches = prior
         .as_ref()
         .and_then(|p| p.applied_spec_hash.as_deref())
         == Some(applied_spec_hash.as_str());
-    if matches!(mode, ApplyMode::ReplaceOrSkip) && reconcile.is_empty() && hash_matches {
+    let addresses_match = prior.as_ref().is_some_and(|p| p.addresses == addresses);
+    if matches!(mode, ApplyMode::ReplaceOrSkip) && reconcile.is_empty() && hash_matches && addresses_match {
         // Re-fire `started` so the dispatcher's SSE bus wakes any
         // subscribers waiting on this command. Nothing else changed.
         state
             .broker
             .event_record(
-                &cmd.project_id,
+                cmd.project_id,
                 Some(node_id),
                 weft_broker_client::protocol::InfraEvent::Started(
                     weft_broker_client::protocol::StartedPayload {
@@ -910,7 +1003,7 @@ async fn execute_apply(
             .set_status(
                 &state.pod_name,
                 Some(cmd.id),
-                &cmd.project_id,
+                cmd.project_id,
                 node_id,
                 None,
                 weft_broker_client::protocol::InfraNodeStatus::Terminating,
@@ -960,7 +1053,7 @@ async fn execute_apply(
         .set_provisioning(
             &state.pod_name,
             cmd.id,
-            &cmd.project_id,
+            cmd.project_id,
             node_id,
             &instance_id,
             &namespace,
@@ -1003,7 +1096,7 @@ async fn execute_apply(
         weft_broker_client::protocol::StartMode::Fresh
     };
 
-    let apply_result: Result<std::collections::BTreeMap<String, String>> = async {
+    let apply_result: Result<()> = async {
         // Interruptible between the phases below (sweep / apply /
         // readiness). A cancel mid-apply bails through the error path,
         // which stamps the node `Failed("cancelled by user (...)")`:
@@ -1055,12 +1148,11 @@ async fn execute_apply(
                     .map_err(|e| explain_apply_failure(manifest, e))?,
             }
         }
-        wait_for_readiness(state, cmd.id, &namespace, &instance_id).await?;
-        compute_endpoints(&spec, &instance_id, &namespace)
+        wait_for_readiness(state, cmd.id, &namespace, &instance_id).await
     }
     .await;
-    let endpoints = match apply_result {
-        Ok(eps) => eps,
+    match apply_result {
+        Ok(()) => {}
         Err(e) => {
             let msg = e.to_string();
             // Best-effort row-status hint. The PRIMARY error record
@@ -1076,7 +1168,7 @@ async fn execute_apply(
                 .set_status(
                     &state.pod_name,
                     Some(cmd.id),
-                    &cmd.project_id,
+                    cmd.project_id,
                     node_id,
                     None, // apply failure fails the whole node, all units
                     weft_broker_client::protocol::InfraNodeStatus::Failed,
@@ -1101,11 +1193,11 @@ async fn execute_apply(
         .set_applied(
             &state.pod_name,
             cmd.id,
-            &cmd.project_id,
+            cmd.project_id,
             node_id,
             &instance_id,
             &applied_spec_hash,
-            endpoints,
+            addresses,
             &namespace,
             spec.lifecycle.on_terminate.preserve_pvcs.clone(),
             // `transitioning = false`: readiness waited, the reconciled
@@ -1139,7 +1231,7 @@ async fn execute_apply(
     state
         .broker
         .event_record(
-            &cmd.project_id,
+            cmd.project_id,
             Some(node_id),
             weft_broker_client::protocol::InfraEvent::Started(
                 weft_broker_client::protocol::StartedPayload {
@@ -1163,11 +1255,11 @@ enum ApplyMode {
     ReplaceOrSkip,
 }
 
-fn mint_instance_id(project_id: &str, node_id: &str) -> String {
+fn mint_instance_id(project_id: uuid::Uuid, node_id: &str) -> String {
     // K8s names: lowercase alphanum + `-`, max 63. The instance id
     // ends up as a Deployment / Service / PVC name; leave room for
     // suffixes like `-data` or `-api`.
-    let pid = infra::name_segment(project_id).chars().take(8).collect::<String>();
+    let pid = infra::name_segment(&project_id.to_string()).chars().take(8).collect::<String>();
     let nid = infra::name_segment(node_id).chars().take(20).collect::<String>();
     let suffix = Uuid::new_v4().simple().to_string();
     // 10 hex chars = 40 bits of entropy. 6 was a birthday-risk
@@ -1178,13 +1270,16 @@ fn mint_instance_id(project_id: &str, node_id: &str) -> String {
     format!("wn-{pid}-{nid}-{short_suffix}")
 }
 
+/// Where each declared endpoint answers: its cluster-internal URL, and
+/// for a `TenantPublic` one the path the front door serves it at (the
+/// same path `weft_core::infra::compile` routes, from the same helper).
 fn compute_endpoints(
     spec: &InfraSpec,
     instance_id: &str,
     namespace: &str,
-) -> Result<std::collections::BTreeMap<String, String>> {
-    use weft_core::infra::Protocol;
-    let mut out = std::collections::BTreeMap::new();
+) -> Result<weft_broker_client::protocol::AppliedEndpoints> {
+    use weft_core::infra::{Expose, Protocol};
+    let mut out = weft_broker_client::protocol::AppliedEndpoints::default();
     for ep in &spec.endpoints {
         // Spec validation (`weft-core::infra::compile::validate_endpoint`)
         // already rejected endpoints whose (unit, container, port)
@@ -1222,7 +1317,13 @@ fn compute_endpoints(
             namespace = namespace,
             p = port.port,
         );
-        out.insert(ep.name.clone(), url);
+        out.urls.insert(ep.name.clone(), url);
+        if let Expose::TenantPublic { path } = &ep.expose {
+            out.public_paths.insert(
+                ep.name.clone(),
+                weft_core::infra::tenant_public_path(namespace, instance_id, path),
+            );
+        }
     }
     Ok(out)
 }
@@ -1233,7 +1334,7 @@ mod tests {
 
     #[test]
     fn mint_instance_id_format() {
-        let id = mint_instance_id("Project-Id-Long-12345", "node_one");
+        let id = mint_instance_id(Uuid::new_v4(), "node_one");
         assert!(id.starts_with("wn-"));
         assert!(id.len() <= 50);
         assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
@@ -1265,10 +1366,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        let map = compute_endpoints(&spec, "inst1", "wft-project-x-y").unwrap();
+        let addresses = compute_endpoints(&spec, "inst1", "wft-project-x-y").unwrap();
         assert_eq!(
-            map.get("api").unwrap(),
+            addresses.urls.get("api").unwrap(),
             "http://inst1-api.wft-project-x-y.svc.cluster.local:8080"
+        );
+        assert!(addresses.public_paths.is_empty(), "a cluster-internal endpoint has no public path");
+
+        let mut public = spec.clone();
+        public.endpoints[0].expose = Expose::TenantPublic { path: "/hooks/".into() };
+        let addresses = compute_endpoints(&public, "inst1", "wft-project-x-y").unwrap();
+        assert_eq!(
+            addresses.public_paths.get("api").unwrap(),
+            "/infra/wft-project-x-y/inst1/hooks"
         );
     }
 

@@ -9,7 +9,6 @@
 //! dead-code warnings per binary.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -82,12 +81,14 @@ pub fn graph_trigger_infra_hold(sse_url: &str, event_name: &str, release_url: &s
 /// drain the test is about to observe from the outside). Returns the join
 /// handle; the test joins it once the drain resolves.
 pub fn spawn_weft(
-    dir: PathBuf,
+    project: &Project,
     args: Vec<String>,
 ) -> tokio::task::JoinHandle<anyhow::Result<CliOutput>> {
+    let disp = project.dispatcher().clone();
+    let dir = project.dir().to_path_buf();
     tokio::spawn(async move {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        cli(&dir, &arg_refs).await
+        cli(&disp, &dir, &arg_refs).await
     })
 }
 
@@ -113,7 +114,7 @@ pub async fn assert_verb_rejected(disp: &Dispatcher, path: &str, why: &str) -> a
 /// project), `INFRA_GATE` for the run's own infra pre-flight (declared
 /// infra not running).
 pub async fn assert_run_rejected(project: &Project, why: &str, gate: &str) -> anyhow::Result<()> {
-    let out = cli(project.dir(), &["run", "--json"]).await?;
+    let out = cli(project.dispatcher(), project.dir(), &["run", "--json"]).await?;
     anyhow::ensure!(!out.success, "`weft run` must be refused ({why}), but it ran:\n{}", out.stdout);
     let text = format!("{}\n{}", out.stdout, out.stderr);
     anyhow::ensure!(

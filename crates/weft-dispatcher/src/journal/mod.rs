@@ -27,7 +27,7 @@ use weft_core::Color;
 /// A successful setup, independent of whether its listeners are armed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriggerBake {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub source_version: String,
     pub program: weft_core::project::hash::ProgramIdentity,
     pub color: Color,
@@ -72,7 +72,7 @@ impl TriggerBake {
                 }).is_none(), "trigger '{node_id}' captured twice in setup {color}");
             }
         }
-        Ok(Some(Self { project_id: project_id.clone(), program: program.clone(), color: *color,
+        Ok(Some(Self { project_id: *project_id, program: program.clone(), color: *color,
             source_version: source_version.clone(),
             captured, at_unix: *at_unix }))
     }
@@ -103,7 +103,7 @@ pub trait Journal: Send + Sync {
     /// A failed/cancelled setup releases ownership without replacing any bake.
     async fn finish_trigger_setup(&self, color: Color, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
 
-    async fn trigger_bakes(&self, project_id: &str) -> anyhow::Result<Vec<TriggerBake>>;
+    async fn trigger_bakes(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<TriggerBake>>;
 
     // ----- Event log (state source of truth) -------------------------
 
@@ -266,7 +266,7 @@ pub trait Journal: Send + Sync {
     /// programs are still needed: the journal outlives the project, so
     /// the programs its runs point at have to as well, or the rows are
     /// there and unreadable.
-    async fn definition_hashes_in_use(&self, project_id: &str) -> anyhow::Result<Vec<String>>;
+    async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
 
     /// The LAST `limit` log lines of a color, oldest first: every
     /// event `LogEntry::from_event` projects (node log lines and the
@@ -308,7 +308,7 @@ pub trait Journal: Send + Sync {
     /// every birth payload, every terminal payload and every tag array to
     /// build a status nobody here looks at, and the reaper asks this
     /// hourly for every removed project it still holds rows for.
-    async fn colors_for_project(&self, project_id: &str) -> anyhow::Result<Vec<Color>>;
+    async fn colors_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<Color>>;
 
     /// Every execution of `project_id`, by color, in ONE read.
     ///
@@ -320,7 +320,7 @@ pub trait Journal: Send + Sync {
     /// `execution_summary` gives as `None`.
     async fn execution_summaries_for_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<std::collections::HashMap<Color, ExecutionSummary>>;
 
     /// Every execution color of `tenant`'s that starts with `prefix`
@@ -345,7 +345,7 @@ pub trait Journal: Send + Sync {
     /// on the color, so the answer is stable across calls.
     async fn list_non_terminal_colors_for_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>>;
 
     /// Every color belonging to `project_id` whose journal HAS a
@@ -356,7 +356,7 @@ pub trait Journal: Send + Sync {
     /// whose execution is already finished.
     async fn list_terminal_colors_for_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<std::collections::HashSet<Color>>;
 
     /// Every live (non-terminal, project-kind) execution of `project_id`
@@ -366,7 +366,7 @@ pub trait Journal: Send + Sync {
     /// `weft_journal::tags::select_stop_targets`.
     async fn live_tagged_executions(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         tag: &str,
     ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>>;
 
@@ -393,7 +393,7 @@ pub trait Journal: Send + Sync {
     /// and is never this.
     async fn signal_entry_at(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
         node: &str,
     ) -> anyhow::Result<Option<SignalRegistration>>;
 
@@ -433,7 +433,7 @@ pub trait Journal: Send + Sync {
     /// All signals currently registered for a project.
     async fn signal_list_for_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// All signals tied to one execution color (resume signals).
@@ -447,7 +447,7 @@ pub trait Journal: Send + Sync {
     /// after color-by-color cancel has run.
     async fn signal_remove_for_project(
         &self,
-        project_id: &str,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
     // ----- Administrative ---------------------------------------------
@@ -469,7 +469,7 @@ pub trait Journal: Send + Sync {
     /// and `weft clean` has no project to clean, which left rows nobody
     /// could reach or free. What survives a removal is what the person
     /// still has: their files on disk.
-    async fn delete_project_executions(&self, project_id: &str) -> anyhow::Result<u64>;
+    async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64>;
 
     /// Every project id that still has executions while the project
     /// itself is gone. What the reaper sweeps.
@@ -480,7 +480,7 @@ pub trait Journal: Send + Sync {
     /// rows afterwards (`weft rm` refuses a project it cannot find, and
     /// `weft clean` needs a project), so without this one transient
     /// failure would keep them for good.
-    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<String>>;
+    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -493,7 +493,7 @@ pub struct SignalRegistration {
     pub program: Option<weft_core::project::hash::ProgramIdentity>,
     pub token: String,
     pub tenant_id: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// `Some(color)` for resume (suspension) signals; `None` for
     /// entry signals registered during trigger setup.
     pub color: Option<Color>,
@@ -674,7 +674,7 @@ pub struct CancelWrite {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionOwner {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tenant: String,
 }
 
@@ -683,7 +683,7 @@ pub struct ExecutionOwner {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecutionSummary {
     pub color: Color,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub entry_node: String,
     /// One of `running`, `completed`, `failed`, `cancelled`, or
     /// `corrupt` (the row no longer decodes; `entry_node` is empty
@@ -725,7 +725,7 @@ pub struct ExecutionSummary {
 pub struct ExecutionQuery {
     pub limit: u32,
     pub offset: u32,
-    pub project_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
     pub started_after: Option<u64>,
     pub started_before: Option<u64>,
     /// Only runs of this phase (the `execution_color.phase` column):
@@ -1004,7 +1004,7 @@ mod bake_tests {
         let color = Color::new_v4();
         vec![
             ExecEvent::ExecutionStarted {
-                color, project_id: "p".into(), entry_node: "trigger".into(),
+                color, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::TriggerSetup,
                 definition_hash: Some("graph".into()),
                 program: Some(weft_core::project::hash::ProgramIdentity {

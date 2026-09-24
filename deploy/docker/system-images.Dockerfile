@@ -60,27 +60,8 @@ RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,shari
           /usr/local/bin/
 
 # ---
-# Shared runtime bases. `runtime-kubectl` for the two images whose only
-# k8s interaction surface is the kubectl binary (dispatcher +
-# supervisor), pinned to one version so the two can't drift;
-# `runtime-plain` for the rest.
-
-FROM debian:bookworm-slim AS runtime-kubectl
-# TARGETARCH is BuildKit's name for the platform being built
-# (amd64/arm64, the exact spelling the k8s download URLs use), so the
-# kubectl matches the image's architecture on every leg of a
-# multi-arch build. The `kubectl version` run right after is the
-# arch assertion: a wrong-arch binary fails the BUILD with `exec
-# format error` instead of failing every pod at run time.
-ARG TARGETARCH
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl -fsSLo /usr/local/bin/kubectl \
-        "https://dl.k8s.io/release/v1.31.0/bin/linux/${TARGETARCH}/kubectl" \
-    && chmod +x /usr/local/bin/kubectl \
-    && kubectl version --client >/dev/null \
-    && apt-get purge -y --auto-remove curl \
-    && rm -rf /var/lib/apt/lists/*
+# The shared runtime base. No image carries `kubectl`: the dispatcher
+# and the supervisor talk to the Kubernetes API in process.
 
 FROM debian:bookworm-slim AS runtime-plain
 RUN apt-get update \
@@ -92,7 +73,7 @@ RUN apt-get update \
 # SYNC: the `AS <stage>` names of the four runtime stages below <->
 #       SystemService::dockerfile_stage in crates/weft-cli/src/images.rs
 
-FROM runtime-kubectl AS dispatcher
+FROM runtime-plain AS dispatcher
 COPY --from=builder /usr/local/bin/weft-dispatcher /usr/local/bin/weft-dispatcher
 # Dispatcher listens on 9999 by default; map via WEFT_HTTP_PORT.
 ENV WEFT_HTTP_PORT=9999
@@ -123,9 +104,10 @@ CMD ["weft-broker"]
 # ---
 # weft-infra-supervisor: pooled pod that owns runtime infra
 # lifecycle: claims infra_lifecycle_command rows from the broker,
-# executes them via kubectl, polls k8s for replica state, evaluates
+# executes them through the in-process Kubernetes API client
+# (server-side apply), watches k8s for replica state, evaluates
 # HealthProtocols, emits infra_event rows.
 
-FROM runtime-kubectl AS supervisor
+FROM runtime-plain AS supervisor
 COPY --from=builder /usr/local/bin/weft-infra-supervisor /usr/local/bin/weft-infra-supervisor
 CMD ["weft-infra-supervisor"]

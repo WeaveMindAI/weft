@@ -20,9 +20,8 @@ use weft_e2e::{ensure, project::Project};
 #[tokio::test]
 async fn a_file_included_three_times_runs_once_per_call() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_calls", disp).await?;
+    let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json"]).await?;
-    project.mark_registered();
     let settled = project.settled(color_of(&stdout)?).await?;
     settled.completed()?;
     // The chain: " hello " is trimmed and shouted twice over.
@@ -55,10 +54,9 @@ async fn a_file_included_three_times_runs_once_per_call() -> anyhow::Result<()> 
 #[tokio::test]
 async fn a_cut_spelled_through_a_site_runs_that_one_call() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_calls", disp).await?;
+    let project = Project::prepare("include_calls", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--from", r#"one.strip={"text":" cut "}"#, "--target", "two.strip"]).await?;
-    project.mark_registered();
     let settled = project.settled(color_of(&stdout)?).await?;
     settled.completed()?
         .assert_input("one.strip", "text", &json!(" cut "))?
@@ -97,9 +95,8 @@ async fn a_cut_spelled_through_a_site_runs_that_one_call() -> anyhow::Result<()>
 #[tokio::test]
 async fn events_are_addressed_through_the_site() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_calls", disp).await?;
+    let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json"]).await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     project.settled(color).await?.completed()?;
     let rows: Vec<Value> = serde_json::from_str(project.weft(&["events", &color.to_string(), "--node", "one.strip", "--json"]).await?.trim())?;
@@ -118,9 +115,8 @@ async fn events_are_addressed_through_the_site() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_frozen_cut_inside_an_included_file_replays() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_calls", disp).await?;
+    let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json", "--from", r#"one.strip={"text":" frozen "}"#, "--target", "two.strip"]).await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     project.settled(color).await?.completed()?.assert_input("two.strip", "text", &json!("FROZEN"))?;
     project.weft(&["freeze", "inner", &color.to_string(), "--expect", "two.strip"]).await?;

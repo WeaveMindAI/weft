@@ -46,7 +46,7 @@ use weft_e2e::{ensure, human, infra, run, Project, SettledRun};
 #[tokio::test]
 async fn source_flips_infra_and_orphan_lifecycle() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = weft_e2e::Platform::connect().await?;
+    let platform = weft_e2e::Platform::connect(&disp).await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
 
@@ -130,13 +130,12 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     // Run before infra is up: the CLI registers, then the dispatcher rejects
     // (declared infra not running). That registration makes the resting row
     // observable.
-    let attempt = cli(project.dir(), &["run", "--json"]).await?;
+    let attempt = cli(project.dispatcher(), project.dir(), &["run", "--json"]).await?;
     anyhow::ensure!(
         !attempt.success,
         "run must fail while declared infra is not running; stdout: {}",
         attempt.stdout
     );
-    project.mark_registered();
     let s = status::fetch(&disp, &pid).await?;
     s.assert_actions_exactly(&["infra_start"])?;
     assert_run_rejected(&project, "infra resting", INFRA_GATE).await?;
@@ -156,7 +155,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     // flight the master rule collapses the table to its cancel, and nothing
     // new is admitted.
     let stop = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "infra".into(),
             "stop".into(),
@@ -238,7 +237,7 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     // Deactivate with Wait: the drain holds the verb open. The window offers
     // exactly give-up (cancel_running) and change-your-mind (resume_active).
     let deact = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "deactivate".into(),
             "--mode".into(),
@@ -269,7 +268,7 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     // Second deactivate, same window, but this time GIVE UP the wait:
     // cancel_running finishes the drain immediately by cancelling.
     let deact = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "deactivate".into(),
             "--mode".into(),

@@ -23,6 +23,10 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The Envoy Gateway controller's config file (a YAML document inside a
+# ConfigMap) is edited as a document, not as text, and the front door's
+# manifest is read back by its tests.
+serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 terminal_size = { workspace = true }

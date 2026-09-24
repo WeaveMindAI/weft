@@ -91,7 +91,7 @@ async fn seed_slack_grant(
     )?)
     .execute(pool)
     .await?;
-    let seeded = SeededGrant::new(pool.clone(), grant_id);
+    let seeded = SeededGrant::new(pool.clone(), grant_id)?;
     sqlx::query(
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json)
          VALUES ('slack', $1, $2)
@@ -299,7 +299,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
             "SELECT token FROM signal \
              WHERE project_id = $1 AND node_id = 'wait' AND is_resume",
         )
-        .bind(pid.to_string())
+        .bind(pid)
         .fetch_optional(&pool)
         .await
         .context("poll for the parked resume signal")?;
@@ -418,7 +418,7 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
     // ride the firehose too). Generous window: when this is the
     // suite's first trigger after a bring-up rollout, the pooled
     // listener pod is spawned from nothing first.
-    Platform::connect()
+    Platform::connect(&disp)
         .await?
         .wait_for_listener_log(
             "the listener to dial the app socket ('socket connected' in its log)",

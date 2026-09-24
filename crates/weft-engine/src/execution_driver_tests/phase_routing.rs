@@ -163,7 +163,7 @@
             .record_event(
                 &ExecEvent::ExecutionStarted {
                     color,
-                    project_id: project.id.to_string(),
+                    project_id: project.id,
                     entry_node: kicks[0].to_string(),
                     phase,
                     definition_hash: Some("test-hash".into()),
@@ -434,7 +434,7 @@
             .record_event(
                 &ExecEvent::ExecutionStarted {
                     color,
-                    project_id: project.id.to_string(),
+                    project_id: project.id,
                     entry_node: "trig".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),

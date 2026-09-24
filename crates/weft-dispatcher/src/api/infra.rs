@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -103,7 +103,7 @@ pub struct SyncResponse {
 /// here: the supervisor drains before acting.
 async fn settle_running_before_infra_op(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     running_policy: RunningPolicy,
     trigger_deactivation_ran: bool,
 ) -> Result<(), (StatusCode, String)> {
@@ -137,6 +137,10 @@ pub struct InfraStatusEntry {
     pub node: String,
     pub status: String,
     pub endpoint_url: Option<String>,
+    /// Endpoint name to the address a caller outside the cluster uses,
+    /// for each `TenantPublic` endpoint (the same address
+    /// `ctx.endpoint(name)?.public_url()` gives the node).
+    pub public_urls: std::collections::BTreeMap<String, String>,
     pub failure_stage: Option<String>,
     pub failure_message: Option<String>,
 }
@@ -180,10 +184,9 @@ pub struct PerNodeRequest {
 pub async fn sync(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<SyncRequest>>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
@@ -201,7 +204,6 @@ pub(super) async fn sync_inner(
     id: uuid::Uuid,
     body: SyncRequest,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
-    let project_id = id.to_string();
 
     // The running-hash trio + infra image-tag map is written LATER, only after
     // every reject gate below has passed AND the upgrade stop leg (if any) has
@@ -247,7 +249,7 @@ pub(super) async fn sync_inner(
     }
     // Fast reject before any side effect; re-checked under the lock
     // below (the locked re-check is the race-safe one).
-    if crate::api::project::infra_setup_in_flight(&state, &project_id)
+    if crate::api::project::infra_setup_in_flight(&state, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}")))?
     {
@@ -340,10 +342,10 @@ pub(super) async fn sync_inner(
     // legitimately slow drain is never misread as a wedged supervisor.
     if body.upgrade {
         let (running_policy, drain_timeout_secs) = body.running.resolve(body.trigger_deactivation.as_ref());
-        settle_running_before_infra_op(&state, &project_id, running_policy, was_active).await?;
+        settle_running_before_infra_op(&state, id, running_policy, was_active).await?;
         let command_id = issue_lifecycle_ensuring_supervisor(
             &state,
-            &project_id,
+            id,
             None,
             InfraLifecycleVerb::Stop,
             running_policy,
@@ -352,7 +354,7 @@ pub(super) async fn sync_inner(
         )
         .await?;
         let wait = std::time::Duration::from_secs(drain_timeout_secs + 300);
-        match crate::infra_lifecycle_command::wait_for_command(&state.pg_pool, command_id, wait)
+        match crate::infra_lifecycle_command::wait_for_command(&state.pg_pool, &state.signals, command_id, wait)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wait for stop leg: {e}")))?
         {
@@ -462,11 +464,11 @@ pub(super) async fn sync_inner(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
 
     ensure_project_namespace_if_infra(&state, id).await?;
-    crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
+    crate::api::project::reconcile_worker(&state, id, running_policy, drain_timeout_secs)
         .await?;
     let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
-        crate::lease::with_project_transition_lock(&state.lock_pool, &project_id, || async {
-            if crate::api::project::infra_setup_in_flight(&state, &project_id).await? {
+        crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
+            if crate::api::project::infra_setup_in_flight(&state, id).await? {
                 return Ok(Err((
                     StatusCode::CONFLICT,
                     "an infra sync is already in flight for this project; wait for it \
@@ -485,10 +487,10 @@ pub(super) async fn sync_inner(
     // The landing flip: relocate the worker to match post-apply
     // placement (drain outside the lock), then tear down an
     // infra-less namespace under it.
-    crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
+    crate::api::project::reconcile_worker(&state, id, running_policy, drain_timeout_secs)
         .await?;
     let landing: Result<(), (StatusCode, String)> =
-        crate::lease::with_project_transition_lock(&state.lock_pool, &project_id, || async {
+        crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
             Ok(teardown_project_namespace_if_no_infra(&state, id).await)
         })
         .await
@@ -504,35 +506,33 @@ pub(super) async fn sync_inner(
     // there is no human to click.
 
     Ok(Json(SyncResponse {
-        nodes: read_infra_entries(&state, &project_id).await?,
+        nodes: read_infra_entries(&state, id).await?,
     }))
 }
 
 pub async fn stop(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<StopRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
     // Reject-don't-crash against the same reconciliation the action
     // bar renders (a stale tab firing stop into a transitional /
     // already-stopped project).
     crate::api::project::require_action(&state, id, &["infra_stop"]).await?;
-    issue_destroy(state, id_str, InfraLifecycleVerb::Stop, body).await
+    issue_destroy(state, id, InfraLifecycleVerb::Stop, body).await
 }
 
 pub async fn terminate(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
     body: Option<Json<StopRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
     crate::api::project::require_action(&state, id, &["infra_terminate"]).await?;
-    issue_destroy(state, id_str, InfraLifecycleVerb::Terminate, body).await
+    issue_destroy(state, id, InfraLifecycleVerb::Terminate, body).await
 }
 
 /// `POST /projects/{id}/infra/cancel`. Cancel the project's in-flight
@@ -548,19 +548,17 @@ pub async fn terminate(
 pub async fn cancel(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
 
-    let touched = infra_lifecycle_command::request_cancel_project(&state.pg_pool, &project_id)
+    let touched = infra_lifecycle_command::request_cancel_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request cancel: {e}")))?;
 
     // Cancel the provisioning sub-execution too (the InfraSetup worker
     // run that computes specs and enqueues applies).
-    let colors = crate::api::project::non_terminal_infra_setup_colors(&state, &project_id)
+    let colors = crate::api::project::non_terminal_infra_setup_colors(&state, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e}")))?;
     let had_setup = !colors.is_empty();
@@ -589,12 +587,10 @@ pub async fn cancel(
 /// the event SSE for the post-action shape.
 async fn issue_destroy(
     state: DispatcherState,
-    id_str: String,
+    id: uuid::Uuid,
     verb: InfraLifecycleVerb,
     body: Option<Json<StopRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
-    let project_id = id.to_string();
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let lifecycle = state
         .projects
@@ -646,10 +642,10 @@ async fn issue_destroy(
         };
         crate::api::project::execute_trigger_deactivation(&state, id, deactivation).await?;
     }
-    settle_running_before_infra_op(&state, &project_id, running_policy, was_active).await?;
+    settle_running_before_infra_op(&state, id, running_policy, was_active).await?;
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
-        &project_id,
+        id,
         None,
         verb,
         running_policy,
@@ -668,33 +664,31 @@ async fn issue_destroy(
 pub async fn stop_node(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node)): Path<(String, String)>,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
-    issue_per_node(state, id_str, node, InfraLifecycleVerb::Stop, body).await
+    authorize_project(&state, &caller.0, id).await?;
+    issue_per_node(state, id, node, InfraLifecycleVerb::Stop, body).await
 }
 
 /// `POST /projects/{id}/infra/nodes/{node}/terminate`; see `stop_node`.
 pub async fn terminate_node(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node)): Path<(String, String)>,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
-    issue_per_node(state, id_str, node, InfraLifecycleVerb::Terminate, body).await
+    authorize_project(&state, &caller.0, id).await?;
+    issue_per_node(state, id, node, InfraLifecycleVerb::Terminate, body).await
 }
 
 async fn issue_per_node(
     state: DispatcherState,
-    id_str: String,
+    id: uuid::Uuid,
     node: String,
     verb: InfraLifecycleVerb,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
-    let project_id = id.to_string();
     let body = body.map(|Json(b)| b).unwrap_or_default();
     // Validation is in the type: serde rejected unknown variants at
     // deserialize. No picker on a per-node verb, so the body's answer
@@ -713,7 +707,7 @@ async fn issue_per_node(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let declared = weft_core::project::infra_place_spellings(&project).contains(&node);
-    let live = infra_node::get(&state.pg_pool, &project_id, &node)
+    let live = infra_node::get(&state.pg_pool, id, &node)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
         .is_some();
@@ -784,10 +778,10 @@ async fn issue_per_node(
     // execution of the project is cancelled, the ones that never
     // touched it included. The verb's help says so, and `wait` is the
     // way to let them land first.
-    settle_running_before_infra_op(&state, &project_id, running_policy, false).await?;
+    settle_running_before_infra_op(&state, id, running_policy, false).await?;
     let command_id = issue_lifecycle_ensuring_supervisor(
         &state,
-        &project_id,
+        id,
         Some(&node),
         verb,
         running_policy,
@@ -804,13 +798,11 @@ async fn issue_per_node(
 pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
     Ok(Json(SyncResponse {
-        nodes: read_infra_entries(&state, &project_id).await?,
+        nodes: read_infra_entries(&state, id).await?,
     }))
 }
 
@@ -841,12 +833,10 @@ pub struct DoorsResponse {
 pub async fn doors(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(id_str): Path<String>,
+    Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<DoorsResponse>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
-    let rows = infra_node::list_for_project(&state.pg_pool, &project_id)
+    let rows = infra_node::list_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
     let held = state
@@ -901,19 +891,23 @@ pub struct CommandStatusResponse {
 pub async fn command_status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, cmd_id)): Path<(String, i64)>,
+    Path((id, cmd_id)): Path<(uuid::Uuid, i64)>,
+    Query(hold): Query<super::HoldQuery>,
 ) -> Result<Json<CommandStatusResponse>, (StatusCode, String)> {
     // Scope the command read to this project: the command is looked up
     // by `(id, project_id)`, so a caller can't read another project's
     // command outcome by enumerating the sequential id.
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
     use infra_lifecycle_command::WaitOutcome;
-    let outcome =
-        infra_lifecycle_command::read_command_outcome(&state.pg_pool, &project_id, cmd_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read command: {e}")))?;
+    let outcome = infra_lifecycle_command::held_command_outcome(
+        &state.pg_pool,
+        &state.signals,
+        id,
+        cmd_id,
+        hold.hold(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read command: {e}")))?;
     Ok(Json(match outcome {
         None => CommandStatusResponse { done: false, outcome: None, message: None },
         Some(WaitOutcome::Succeeded) => {
@@ -939,9 +933,8 @@ pub async fn command_status(
 pub async fn live(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node)): Path<(String, String)>,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
 ) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
     Ok(Json(read_live(&state, id, &node).await?))
 }
@@ -1019,10 +1012,9 @@ pub struct InfraActionBody {
 pub async fn action(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id_str, node)): Path<(String, String)>,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
     Json(body): Json<InfraActionBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
     authorize_project(&state, &caller.0, id).await?;
     Ok(Json(press_live(&state, id, &node, &body.kind, &body.payload).await?))
 }
@@ -1063,6 +1055,18 @@ pub(crate) async fn press_live(
         };
         return Err((code, format!("the container answered {status}: {text}")));
     }
+    // The press changed what the node shows (a fresh QR code, a new
+    // key): an editor watching it through any pod sees it now rather
+    // than at the next look.
+    crate::display_feeds::DisplayFeeds::announce_look_now(
+        &state.pg_pool,
+        &crate::display_feeds::DisplayKey {
+            project: id,
+            source: crate::display_feeds::DisplaySource::Infra,
+            node: node.to_string(),
+        },
+    )
+    .await;
     let answer = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action parse: {e}")))?;
     infra_action_result(kind, answer)
@@ -1099,7 +1103,6 @@ pub(crate) async fn live_endpoint_url(
     id: uuid::Uuid,
     node: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let project_id = id.to_string();
     let project = state
         .projects
         .project(id)
@@ -1118,7 +1121,7 @@ pub(crate) async fn live_endpoint_url(
         StatusCode::NOT_FOUND,
         "node does not expose a /live endpoint".to_string(),
     ))?;
-    let row = infra_node::get(&state.pg_pool, &project_id, node)
+    let row = infra_node::get(&state.pg_pool, id, node)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "no such infra node".into()))?;
@@ -1134,16 +1137,21 @@ pub(crate) async fn live_endpoint_url(
 
 async fn read_infra_entries(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<Vec<InfraStatusEntry>, (StatusCode, String)> {
     let rows = infra_node::list_for_project(&state.pg_pool, project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
-    Ok(rows.into_iter().map(row_to_entry).collect())
+    Ok(rows.into_iter().map(|row| row_to_entry(row, &state.public_base_url)).collect())
 }
 
-fn row_to_entry(row: InfraNodeRow) -> InfraStatusEntry {
+fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
     InfraStatusEntry {
+        public_urls: row
+            .public_paths
+            .iter()
+            .map(|(name, path)| (name.clone(), weft_core::infra::tenant_public_url(front_door, path)))
+            .collect(),
         node: row.node_id,
         status: row.status.as_str().to_string(),
         // Coarse UI hint: the first endpoint by name (BTreeMap, so
@@ -1153,11 +1161,6 @@ fn row_to_entry(row: InfraNodeRow) -> InfraStatusEntry {
         failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
         failure_message: row.failure_message,
     }
-}
-
-fn parse_id(raw: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
-    raw.parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))
 }
 
 /// Project deletion entry point. Called by `weft rm`.
@@ -1214,21 +1217,20 @@ async fn ensure_project_namespace_if_infra(
     if !weft_core::has_infra(&project) {
         return Ok(());
     }
-    let project_id_str = id.to_string();
     let tenant = state
         .tenant_router
-        .tenant_for_project(&project_id_str)
+        .tenant_for_project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let project_namespace = crate::project_namespace::name_for(tenant.as_str(), &project_id_str);
+    let project_namespace =
+        crate::project_namespace::name_for(&state.instance, tenant.as_str(), id);
     let args = crate::project_namespace::ProjectNamespaceArgs {
-        project_id: &project_id_str,
+        project_id: id,
         tenant_id: tenant.as_str(),
         namespace: &project_namespace,
         pod_cidr: &state.cluster_pod_cidr,
         service_cidr: &state.cluster_service_cidr,
-        ingress_namespace: &state.cluster_ingress_namespace,
-        control_plane_namespace: &state.control_plane_namespace,
+        instance: &state.instance,
     };
     crate::project_namespace::ensure(&*state.kube, &args)
         .await
@@ -1292,23 +1294,22 @@ async fn teardown_project_namespace_if_no_infra(
     if weft_core::has_infra(&project) {
         return Ok(());
     }
-    let project_id_str = id.to_string();
     let existing = state
         .projects
-        .project_namespace(&project_id_str)
+        .project_namespace(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project_namespace: {e}")))?
         .unwrap_or_default();
     if existing.is_empty() {
         return Ok(());
     }
-    if crate::infra_node::any_for_project(&state.pg_pool, &project_id_str)
+    if crate::infra_node::any_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?
     {
         tracing::warn!(
             target: "weft_dispatcher::api::infra",
-            project_id = %project_id_str,
+            project_id = %id,
             namespace = %existing,
             "namespace teardown skipped: live infra rows remain (orphaned infra whose \
              terminate has not completed); terminate it via the infra controls, then \
@@ -1336,7 +1337,7 @@ async fn teardown_project_namespace_if_no_infra(
         tracing::warn!(
             target: "weft_dispatcher::api::infra",
             error = %e,
-            project_id = %project_id_str,
+            project_id = %id,
             "delete now-infra-less project namespace failed (continuing); \
              row already cleared so no supervisor manages it"
         );
@@ -1356,7 +1357,7 @@ async fn teardown_project_namespace_if_no_infra(
 /// into `ensure_supervisor`.
 async fn issue_lifecycle_ensuring_supervisor(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: Option<&str>,
     verb: InfraLifecycleVerb,
     running_policy: RunningPolicy,
@@ -1408,7 +1409,6 @@ async fn reap_orphans(
     state: &DispatcherState,
     id: uuid::Uuid,
 ) -> Result<(), (StatusCode, String)> {
-    let project_id = id.to_string();
     let project = state
         .projects
         .project(id)
@@ -1416,7 +1416,7 @@ async fn reap_orphans(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let declared = weft_core::project::infra_place_spellings(&project);
-    let rows = crate::infra_node::list_for_project(&state.pg_pool, &project_id)
+    let rows = crate::infra_node::list_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
     let orphans: Vec<String> = rows
@@ -1429,7 +1429,7 @@ async fn reap_orphans(
     }
     let tenant = state
         .tenant_router
-        .tenant_for_project(&project_id)
+        .tenant_for_project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1438,7 +1438,6 @@ async fn reap_orphans(
     // regardless of orphan count.
     let issue_futures = orphans.iter().map(|node_id| {
         let tenant_str = tenant.as_str().to_string();
-        let project_id = project_id.clone();
         let node_id = node_id.clone();
         let pool = state.pg_pool.clone();
         let pod = state.pod_id.as_str().to_string();
@@ -1446,7 +1445,7 @@ async fn reap_orphans(
             let res = infra_lifecycle_command::issue_lifecycle(
                 &pool,
                 &tenant_str,
-                &project_id,
+                id,
                 Some(&node_id),
                 InfraLifecycleVerb::Terminate,
                 RunningPolicy::Cancel,
@@ -1479,7 +1478,7 @@ async fn reap_orphans(
             Err(e) => {
                 tracing::warn!(
                     target: "weft_dispatcher::api::infra",
-                    project_id = %project_id,
+                    project_id = %id,
                     node_id = %node_id,
                     error = %e,
                     "orphan reap: failed to issue terminate; skipping"
@@ -1488,7 +1487,7 @@ async fn reap_orphans(
         }
     }
     let outcomes =
-        infra_lifecycle_command::wait_for_commands(&state.pg_pool, &cmd_ids, deadline)
+        infra_lifecycle_command::wait_for_commands(&state.pg_pool, &state.signals, &cmd_ids, deadline)
             .await
             .map_err(|e| {
                 (
@@ -1506,27 +1505,27 @@ async fn reap_orphans(
         match outcome {
             infra_lifecycle_command::WaitOutcome::Succeeded => tracing::info!(
                 target: "weft_dispatcher::api::infra",
-                project_id = %project_id,
+                project_id = %id,
                 node_id = %node_id,
                 "orphan terminated"
             ),
             infra_lifecycle_command::WaitOutcome::Failed { error } => tracing::warn!(
                 target: "weft_dispatcher::api::infra",
-                project_id = %project_id,
+                project_id = %id,
                 node_id = %node_id,
                 error = %error,
                 "orphan reap: supervisor reported error"
             ),
             infra_lifecycle_command::WaitOutcome::Cancelled { reason } => tracing::info!(
                 target: "weft_dispatcher::api::infra",
-                project_id = %project_id,
+                project_id = %id,
                 node_id = %node_id,
                 reason = %reason,
                 "orphan reap: command cancelled (likely raced a node removal)"
             ),
             infra_lifecycle_command::WaitOutcome::Timeout => tracing::warn!(
                 target: "weft_dispatcher::api::infra",
-                project_id = %project_id,
+                project_id = %id,
                 node_id = %node_id,
                 "orphan reap: supervisor did not complete within 60s"
             ),
@@ -1545,7 +1544,6 @@ pub async fn delete_project(
     tenant: &str,
     force: bool,
 ) -> Result<(), (StatusCode, String)> {
-    let project_id = id.to_string();
     // Step 0: does this project have infra at all? A no-infra project has NOTHING
     // for the supervisor to terminate, so enqueuing a Terminate + waiting on it is
     // pure waste: no supervisor owns the project, the command is never marked
@@ -1555,7 +1553,7 @@ pub async fn delete_project(
     // already unregistered) is also "nothing to terminate".
     let has_infra = state
         .projects
-        .project_has_infra(&project_id)
+        .project_has_infra(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project_has_infra: {e}")))?
         .unwrap_or(false);
@@ -1568,7 +1566,7 @@ pub async fn delete_project(
         // refuse the rm and let the user retry.
         let cmd_id = issue_lifecycle_ensuring_supervisor(
             state,
-            &project_id,
+            id,
             None,
             InfraLifecycleVerb::Terminate,
             RunningPolicy::Cancel,
@@ -1584,6 +1582,7 @@ pub async fn delete_project(
         if !force {
         match infra_lifecycle_command::wait_for_command(
             &state.pg_pool,
+            &state.signals,
             cmd_id,
             std::time::Duration::from_secs(120),
         )
@@ -1592,7 +1591,7 @@ pub async fn delete_project(
             Ok(infra_lifecycle_command::WaitOutcome::Failed { error }) => {
                 tracing::warn!(
                     target: "weft_dispatcher::api::infra",
-                    project_id = %project_id,
+                    project_id = %id,
                     error = %error,
                     "supervisor reported terminate failure; continuing with rm cleanup"
                 );
@@ -1600,7 +1599,7 @@ pub async fn delete_project(
             Ok(infra_lifecycle_command::WaitOutcome::Cancelled { reason }) => {
                 tracing::info!(
                     target: "weft_dispatcher::api::infra",
-                    project_id = %project_id,
+                    project_id = %id,
                     reason = %reason,
                     "terminate cancelled (race with node removal); continuing with rm cleanup"
                 );
@@ -1609,7 +1608,7 @@ pub async fn delete_project(
             Ok(infra_lifecycle_command::WaitOutcome::Timeout) => {
                 tracing::warn!(
                     target: "weft_dispatcher::api::infra",
-                    project_id = %project_id,
+                    project_id = %id,
                     "supervisor did not complete terminate within 120s; \
                      continuing with rm cleanup (orphans will be swept by the \
                      next supervisor sweep cycle)"
@@ -1618,7 +1617,7 @@ pub async fn delete_project(
             Err(e) => {
                 tracing::warn!(
                     target: "weft_dispatcher::api::infra",
-                    project_id = %project_id,
+                    project_id = %id,
                     error = %e,
                     "wait_for_command errored; continuing with rm cleanup"
                 );
@@ -1626,33 +1625,13 @@ pub async fn delete_project(
         }
         }
     }
-    // Step 3: drop the broker-side rows. All three MUST succeed
-    // (per the cascade contract on `remove_node`). If the DB writes
-    // fail, the next `weft rm` retry is a clean replay.
-    infra_node::remove_project(&state.pg_pool, &project_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("infra_node::remove_project: {e}"),
-            )
-        })?;
-    crate::infra_event::remove_project(&state.pg_pool, &project_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("infra_event::remove_project: {e}"),
-            )
-        })?;
-    crate::infra_lifecycle_command::remove_project(&state.pg_pool, &project_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("infra_lifecycle_command::remove_project: {e}"),
-            )
-        })?;
+    // Step 3: the project's infra rows (`infra_node`, `infra_event`,
+    // `infra_lifecycle_command`) are NOT dropped here: they go with the
+    // project row itself, in `ProjectStore::remove`'s one transaction,
+    // because the broker inserts commands and events for as long as the
+    // project row is visible. Dropped earlier, a health tick or a
+    // worker's apply landing in between left rows nobody would ever run
+    // or read.
     // The connections this project's nodes published opened services
     // this project ran; with the project gone they name nothing. The
     // per-node cleanup on terminate does not cover this path (a forced
@@ -1660,7 +1639,7 @@ pub async fn delete_project(
     // with no infra rows never issues one at all), and a credential
     // nobody can place is exactly the junk the cleanup rule forbids. Connections a PERSON
     // connected are untouched: those are theirs.
-    weft_access_store::delete_published_grants(&state.pg_pool, tenant, &project_id, None)
+    weft_access_store::delete_published_grants(&state.pg_pool, tenant, id, None)
         .await
         .map_err(|e| {
             (
@@ -1679,7 +1658,7 @@ pub async fn delete_project(
     // means the project never had a per-project namespace (a no-infra
     // project, whose worker lives in the shared namespace); nothing to
     // delete and nothing to clear.
-    let namespace = state.projects.project_namespace(&project_id).await.map_err(|e| {
+    let namespace = state.projects.project_namespace(id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("project_namespace: {e}"),
@@ -1693,7 +1672,7 @@ pub async fn delete_project(
             tracing::warn!(
                 target: "weft_dispatcher::api::infra",
                 error = %e,
-                project_id = %project_id,
+                project_id = %id,
                 "clear project_namespace row failed (continuing)"
             );
         }
@@ -1701,7 +1680,7 @@ pub async fn delete_project(
             tracing::warn!(
                 target: "weft_dispatcher::api::infra",
                 error = %e,
-                project_id = %project_id,
+                project_id = %id,
                 "delete project namespace failed (continuing); row already cleared"
             );
         }
@@ -1715,7 +1694,7 @@ pub async fn delete_project(
     // reconciling its infra). Left behind, the owning supervisor would
     // renew a lease on a ghost forever: it never becomes idle, the pool
     // never drains to zero, and rows accumulate one per removed project.
-    crate::supervisor_pool::release_project(&state.pg_pool, &project_id)
+    crate::supervisor_pool::release_project(&state.pg_pool, id)
         .await
         .map_err(|e| {
             (

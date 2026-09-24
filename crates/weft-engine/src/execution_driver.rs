@@ -83,14 +83,11 @@ use crate::wait_tracker::DeliveryGate;
 /// have several hundred entries across all buses to flush.
 const BUS_PUMP_SHUTDOWN_DEADLINE_SECS: u64 = 10;
 
-/// How often a bus-held worker re-checks the journal for a resolved
-/// suspension while it can't exit (a live bus keeps `in_flight`
-/// non-empty so the outer re-fetch loop never runs). Only polls in
-/// that exact state; the common path never touches it. 250ms keeps
-/// resume latency low without hammering the journal: a bus-held
-/// worker waiting on human input would poll ~4x/sec, cheap against a
-/// single indexed read.
-const RESUME_POLL_INTERVAL_MS: u64 = 250;
+/// How long a worker waits for its run's birth row to be readable. The
+/// dispatcher journals `ExecutionStarted` before it enqueues the task
+/// this worker claimed, so the row is normally there already; the wait
+/// only covers a read that lands just ahead of that commit.
+const FIRST_ROWS_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Outcome the loop reports back to the binary wrapper.
 #[derive(Debug, Clone)]
@@ -375,32 +372,23 @@ async fn drive_color(
         crate::context::PoisonOnWriteFailure::wrap(clients.journal.clone());
     let clients = EngineClients { journal: wrapped_journal, ..clients };
     let journal = clients.journal.clone();
-    let mut events = fetch_events(journal.as_ref(), color).await?;
-    if events.is_empty() {
-        // Wait up to 6s (30 * 200ms) for the producer to commit. The
-        // sleep yields to cancellation: a cancel landing mid-wait
-        // breaks us out instead of forcing the worker to sit idle.
-        // Driven by `clients.clock` so layer-3 tests can fast-forward.
-        for _ in 0..30 {
-            tokio::select! {
-                _ = clients.clock.sleep(std::time::Duration::from_millis(200)) => {}
-                _ = cancellation.cancelled() => {
-                    return Ok(Drove {
-                        outcome: ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) },
-                        pulses,
-                        executions,
-                        loop_runtime: LoopRuntime::new(),
-                        kicked,
-                    });
-                }
-            }
-            let evs = fetch_events(journal.as_ref(), color).await?;
-            if !evs.is_empty() {
-                events = evs;
-                break;
-            }
+    // The run's log from its birth row, waited for briefly (see
+    // `FIRST_ROWS_WAIT`). The wait yields to cancellation: a cancel
+    // landing mid-wait breaks us out instead of forcing the worker to
+    // sit idle.
+    let rows = tokio::select! {
+        rows = journal.rows_after(color, 0, FIRST_ROWS_WAIT) => rows?,
+        _ = cancellation.cancelled() => {
+            return Ok(Drove {
+                outcome: ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) },
+                pulses,
+                executions,
+                loop_runtime: LoopRuntime::new(),
+                kicked,
+            });
         }
-    }
+    };
+    let events: Vec<weft_journal::ExecEvent> = rows.iter().map(|row| row.event.clone()).collect();
     // The dispatcher's contract is "ExecutionStarted is journaled
     // before the worker boots." If we sat through the full wait
     // and the journal is STILL empty, that contract is broken: bail
@@ -410,7 +398,8 @@ async fn drive_color(
     if events.is_empty() {
         anyhow::bail!(
             "worker booted for color {color} but no ExecutionStarted \
-             arrived within 6s; the dispatcher contract is broken"
+             arrived within {}s; the dispatcher contract is broken",
+            FIRST_ROWS_WAIT.as_secs()
         );
     }
     // A terminal already in the journal means this color is finished:
@@ -487,10 +476,14 @@ async fn drive_color(
     // their rows never change.
     let projects = &clients.project;
     let seed_chain = weft_journal::seed_chain(&events, |seed| journal.events_for_color(seed), |id, hash| async move {
-        projects.fetch_definition(&id, &hash).await?
+        projects.fetch_definition(id, &hash).await?
             .map(Arc::new).ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {id}"))
     }).await?;
-    let snap = fold_journal(color, &project_arc, &events, &seed_chain)?;
+    // The run's fold, kept for the whole drive and fed only the rows
+    // that land after it (`LiveFold`).
+    let mut live = weft_journal::LiveFold::start(color, project_arc.clone(), &seed_chain, &rows)?;
+    drop(events);
+    let snap = checked_snapshot(color, &live)?;
     let mut loop_runtime = LoopRuntime::new();
     let doomed = apply_snapshot(
         project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
@@ -503,18 +496,18 @@ async fn drive_color(
     .await;
 
     let exec_id = uuid::Uuid::new_v4().to_string();
-    // Drive in a re-fetch loop. drive() folds the journal once at
-    // boot and works off that snapshot; SuspensionResolved rows that
-    // arrive while drive() is running are invisible to it. When
-    // drive() returns Stalled/Stuck, refetch the journal: if new
-    // deliveries arrived, fold the new state on top and re-drive.
+    // Drive in a re-fetch loop. drive() works off the snapshot folded
+    // so far; SuspensionResolved rows that arrive while drive() is
+    // running are invisible to it. When drive() returns Stalled/Stuck,
+    // read the rows that landed since: if new deliveries arrived, fold
+    // them on top and re-drive.
     //
-    // The natural termination is "no new rows since the last fetch"
-    // (`fresh.len() == event_count_before`): a drive() that ends
-    // Stalled/Stuck and finds no new events in the journal can't make
-    // progress no matter how many times we re-loop. That gives us a
-    // sharper invariant than a magic iteration cap and lets a chatty
-    // journal (long burst of deliveries) keep absorbing rows.
+    // The natural termination is "no new rows since the last read": a
+    // drive() that ends Stalled/Stuck and finds nothing new in the
+    // journal can't make progress no matter how many times we re-loop.
+    // That gives us a sharper invariant than a magic iteration cap and
+    // lets a chatty journal (long burst of deliveries) keep absorbing
+    // rows.
     //
     // A wall-clock safety net guards against a pathological producer
     // (a buggy node that keeps emitting indefinitely, an external
@@ -528,7 +521,6 @@ async fn drive_color(
     let refetch_deadline =
         std::time::Duration::from_secs(REFETCH_WALL_CLOCK_DEADLINE_SECS);
     let refetch_start = clients.clock.now();
-    let mut event_count_before = events.len();
     let mut outcome;
     loop {
         outcome = drive(
@@ -553,8 +545,7 @@ async fn drive_color(
             &mut loop_runtime,
             phase,
             dispatchable.as_ref(),
-            event_count_before,
-            &seed_chain,
+            &mut live,
         )
         .await?;
         if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck { .. }) {
@@ -589,7 +580,8 @@ async fn drive_color(
             }
             _ => refetch_deadline,
         };
-        if clients.clock.now().saturating_duration_since(refetch_start) > effective_deadline {
+        let held_for = clients.clock.now().saturating_duration_since(refetch_start);
+        if held_for > effective_deadline {
             if caller_warm {
                 // Tied run, hold expired with the caller still attached and
                 // no resolving signal: it cannot make progress and must not
@@ -622,28 +614,38 @@ async fn drive_color(
             );
             break;
         }
-        let fresh = fetch_events(journal.as_ref(), color).await?;
-        // Append-only journal: fresh.len() can only grow or stay equal.
-        // No new events since the last fetch means we're parked behind
-        // a signal the dispatcher hasn't resolved yet.
-        debug_assert!(fresh.len() >= event_count_before, "journal shrank under us");
-        if fresh.len() == event_count_before {
-            // No resolving signal yet. A caller-tied warm run holds (sleep
-            // a poll interval and re-fetch, keeping the connection alive
-            // until the signal lands, the caller drops, or the hold expires
-            // above). A suspendable run exits cleanly and respawns on the
-            // fire.
+        // A caller-tied warm run holds for the resolving signal, keeping
+        // the connection alive until the signal lands, the caller drops,
+        // or the hold expires above: the read waits on the journal
+        // itself. A suspendable run only reads what is already there,
+        // and exits cleanly when nothing new came; it respawns on the
+        // fire.
+        let hold = if caller_warm {
+            effective_deadline.saturating_sub(held_for)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let fresh = tokio::select! {
+            fresh = journal.rows_after(color, live.last_id(), hold) => fresh?,
+            // A cancel while parked: nothing is running, so the cancel
+            // walk below closes what is open and journals the terminal.
+            _ = cancellation.cancelled() => {
+                outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
+                break;
+            }
+            // The caller hung up mid-hold: loop so `caller_warm` is read
+            // again and the run takes the not-warm path at once instead
+            // of holding for a caller that is gone.
+            _ = caller_gone(caller.as_ref(), caller_warm) => continue,
+        };
+        if fresh.is_empty() {
             if caller_warm {
-                clients
-                    .clock
-                    .sleep(std::time::Duration::from_millis(RESUME_POLL_INTERVAL_MS))
-                    .await;
                 continue;
             }
             break;
         }
-        event_count_before = fresh.len();
-        let snap = fold_journal(color, &project_arc, &fresh, &seed_chain)?;
+        live.apply(&fresh)?;
+        let snap = checked_snapshot(color, &live)?;
         let doomed = apply_snapshot(
             project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
             &mut loop_runtime,
@@ -656,7 +658,7 @@ async fn drive_color(
         tracing::info!(
             target: "weft_engine::resume",
             color = %color,
-            "re-fetched journal after stall/stuck; re-driving"
+            "read the journal's new rows after stall/stuck; re-driving"
         );
     }
 
@@ -711,32 +713,21 @@ async fn drive_color(
     Ok(Drove { outcome, pulses, executions, loop_runtime, kicked })
 }
 
-/// Fold the journal over the program, refusing to resume over a row
-/// the fold could not apply: a state rebuilt from a partial log is a
-/// state that never existed (skips un-happen, closures never cascade),
-/// so the execution fails loudly here and `weft clean` removes it,
-/// instead of resuming wrong.
+/// The run's state as its fold says, refusing to resume over a row the
+/// fold could not apply: a state rebuilt from a partial log is a state
+/// that never existed (skips un-happen, closures never cascade), so the
+/// execution fails loudly here and `weft clean` removes it, instead of
+/// resuming wrong. A rejected row stays on the fold, so every later
+/// snapshot of the same run refuses the same way.
 ///
-/// The seed chain, read once per drive.
-///
-/// A run's chain is fixed the moment it is born: it hangs off the birth
-/// row's `seed`, and every ancestor is a terminal, immutable run. It
-/// used to be rebuilt on every fold, which meant re-reading every
-/// ancestor's ENTIRE journal once per new row on a chatty color, times
-/// the depth of the chain.
-///
-/// A seeded run (`ExecutionStarted.seed`) first inherits from its seed
-/// chain: the seeds' rows are read through the same journal client and
-/// folded in before this run's own (`weft_journal::seed`), so the
-/// inherited nodes sit Completed in the table and only the stale ones
-/// dispatch. A seed that cannot be read is refused the same way.
-fn fold_journal(
-    color: Color,
-    project: &Arc<ProjectDefinition>,
-    events: &[weft_journal::ExecEvent],
-    chain: &weft_journal::SeedChain,
-) -> anyhow::Result<ExecutionSnapshot> {
-    let snap = weft_journal::fold_seeded(color, project.clone(), chain, events)?;
+/// The fold (`LiveFold`) is built once per drive, on top of the run's
+/// seed chain: a seeded run (`ExecutionStarted.seed`) first inherits
+/// from its ancestors (terminal runs whose rows never change, read once),
+/// so the inherited nodes sit Completed in the table and only the stale
+/// ones dispatch. After that, each wake folds only the rows that landed
+/// since the last one.
+fn checked_snapshot(color: Color, live: &weft_journal::LiveFold) -> anyhow::Result<ExecutionSnapshot> {
+    let snap = live.snapshot();
     if snap.corruptions.is_empty() {
         return Ok(snap);
     }
@@ -751,6 +742,18 @@ fn fold_journal(
         reasons.len(),
         reasons.join("; "),
     )
+}
+
+/// Resolves when a warm hold's caller hangs up. Pending forever when the
+/// run is not holding for a caller, so the arm never fires there.
+async fn caller_gone(
+    caller: Option<&Arc<dyn weft_core::caller::CallerConnection>>,
+    caller_warm: bool,
+) {
+    match caller {
+        Some(conn) if caller_warm => conn.disconnected().await,
+        _ => std::future::pending().await,
+    }
 }
 
 /// A spawned node task ended: forget its firing, so the location is
@@ -936,7 +939,7 @@ fn apply_snapshot(
     // stream items are not in it: their pulses refolded Pending and
     // the routing pass re-ingests them.
     *loop_runtime = snap.loop_runtime;
-    // `snap.corruptions` is empty here: `fold_journal` refused the
+    // `snap.corruptions` is empty here: `checked_snapshot` refused the
     // snapshot otherwise.
 
     // A WaitingForInput exec re-dispatches ONLY if the suspension it
@@ -1037,7 +1040,7 @@ async fn fail_unresumable_stream_consumers(
 /// the bus-held mid-drive resume poll: a live bus keeps unrelated nodes
 /// genuinely Running in-flight, so a full `apply_snapshot` would
 /// re-dispatch them (double-run). This touches ONLY the resolved
-/// waiters: it folds the journal solely to recover the resolved
+/// waiters: it reads the run's fold solely to recover the resolved
 /// `awaited_sequences` entries, then for each WaitingForInput exec
 /// whose `callback_id` token is now resolved it (a) installs that
 /// node's fresh await sequence into the live map and (b) un-absorbs the
@@ -1049,15 +1052,13 @@ async fn fail_unresumable_stream_consumers(
 /// exec is a live task, not a dead one).
 fn resume_resolved_suspensions_in_place(
     color: Color,
-    project: &Arc<ProjectDefinition>,
-    events: &[weft_journal::ExecEvent],
-    seed_chain: &weft_journal::SeedChain,
+    live: &weft_journal::LiveFold,
     executions: &NodeExecutionTable,
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> anyhow::Result<usize> {
-    let snap = fold_journal(color, project, events, seed_chain)?;
+    let snap = checked_snapshot(color, live)?;
 
     // Which parked nodes have their CURRENT suspension resolved now?
     // Computed against the FRESHLY-FOLDED sequences (the live map is
@@ -1115,12 +1116,10 @@ async fn drive(
     // The nodes this run may dispatch (see `run_one_execution_observed`
     // where it is derived); None = the whole graph.
     dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
-    // Number of journal events the caller already folded into the
-    // snapshot it handed us. The bus-held resume poll compares against
-    // this to detect newly-landed rows without a redundant re-fetch.
-    journaled_baseline: usize,
-    // The drive's seed chain, read once and shared with every re-fold.
-    seed_chain: &weft_journal::SeedChain,
+    // The run's fold, as far as the caller read the journal to seed the
+    // snapshot it handed us. The bus-held resume wait reads on from its
+    // last row and folds what lands.
+    live: &mut weft_journal::LiveFold,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project: &ProjectDefinition = project_arc;
     let journal = clients.journal.as_ref();
@@ -1189,9 +1188,12 @@ async fn drive(
     // other live worker, the bus just prevents the worker from dying.
     // Without a bus, a parked node empties `in_flight`, drive() returns
     // Stalled, and the normal die-then-respawn path handles the resume.
-    // The caller already folded the journal to seed the snapshot, so it
-    // passes the event count in rather than us re-fetching it here.
-    let mut journaled_count = journaled_baseline;
+    //
+    // The wait is one held read of the journal (it ends when a row for
+    // this run lands, or the hold runs out), kept across turns of the
+    // loop: a chatty bus turns the loop many times a second, and a read
+    // started afresh on every turn would ask the journal as often.
+    let mut resume_wait: Option<futures::future::BoxFuture<'_, anyhow::Result<Vec<weft_journal::JournalRow>>>> = None;
     loop {
         // Poison checkpoint: a journal write failed somewhere since
         // the last iteration. The journal is now a strict prefix of
@@ -1907,7 +1909,7 @@ async fn drive(
             };
             let mut runner = RunnerHandle::new(
                 exec_id.to_string(),
-                project.id.to_string(),
+                project.id,
                 group.color,
                 node_id.clone(),
                 place.clone(),
@@ -1960,7 +1962,7 @@ async fn drive(
             let provision_input = inputs.clone();
             let mut ctx = ExecutionContext::new(
                 exec_id.to_string(),
-                project.id.to_string(),
+                project.id,
                 node_id.clone(),
                 node_def.node_type.clone(),
                 node_def.label.clone(),
@@ -2041,7 +2043,8 @@ async fn drive(
             // contract). No allocation or unsafe needed.
             let is_infra_setup_provision =
                 matches!(phase, weft_core::context::Phase::InfraSetup) && node_def.requires_infra;
-            let provision_project_id = project.id.to_string();
+            let provision_project_id = project.id;
+            let provision_project = project.id;
             let provision_place = place;
             let provision_tenant_id = tenant_id.to_string();
             let provision_namespace = namespace.to_string();
@@ -2050,7 +2053,7 @@ async fn drive(
                 if is_infra_setup_provision {
                     // 1. Call the node's provision body.
                     let infra_ctx = weft_core::infra::InfraProvisionContext::new(
-                        provision_project_id.clone(),
+                        provision_project_id,
                         provision_place.clone(),
                         provision_namespace.clone(),
                         provision_tenant_id.clone(),
@@ -2092,7 +2095,7 @@ async fn drive(
                     if let Err(e) = crate::context::apply_via_supervisor(
                         provision_clients.infra_state.as_ref(),
                         provision_clients.clock.as_ref(),
-                        &provision_project_id,
+                        provision_project,
                         &provision_place,
                         &spec,
                     )
@@ -2381,23 +2384,24 @@ async fn drive(
         // DO NOT poll `result_rx` here: `recv().await` would consume
         // the message and drop it. Same reason we don't drain emit_rx
         // here; we just need the wakeup.
-        // Poll the journal for a resume ONLY when a bus is holding the
+        // Wait on the journal for a resume ONLY when a bus is holding the
         // worker alive AND a suspension is pending. In that state the
         // worker can't exit (bus tasks in-flight) so the outer re-fetch
-        // loop never runs; this in-loop poll is the only way an arriving
-        // `SuspensionResolved` reaches the parked node. Disabled
-        // otherwise (a never-resolving sleep) so the common no-bus /
-        // no-suspension path doesn't poll the journal at all.
-        let resume_poll_active =
-            bus_coordinator.has_live_buses() && waiting_count(executions) > 0;
+        // loop never runs; this in-loop wait is the only way an arriving
+        // `SuspensionResolved` reaches the parked node. Not armed
+        // otherwise, so the common no-bus / no-suspension path never
+        // reads the journal here.
+        if bus_coordinator.has_live_buses() && waiting_count(executions) > 0 {
+            if resume_wait.is_none() {
+                resume_wait = Some(journal.rows_after(color, live.last_id(), weft_task_store::pg_signal::MAX_HOLD));
+            }
+        } else {
+            resume_wait = None;
+        }
         let resume_poll = async {
-            if resume_poll_active {
-                clients
-                    .clock
-                    .sleep(std::time::Duration::from_millis(RESUME_POLL_INTERVAL_MS))
-                    .await;
-            } else {
-                std::future::pending::<()>().await;
+            match resume_wait.as_mut() {
+                Some(wait) => wait.await,
+                None => std::future::pending().await,
             }
         };
         tokio::pin!(resume_poll);
@@ -2406,23 +2410,25 @@ async fn drive(
         tokio::pin!(on_wait_change);
         on_wait_change.as_mut().enable();
         tokio::select! {
-            _ = resume_poll.as_mut() => {
-                // Bus-held worker with a pending suspension. Re-fetch the
-                // journal; if a new row landed, SURGICALLY resume only the
-                // parked nodes whose current suspension just resolved. We
-                // do NOT `apply_snapshot` (a full re-fold): mid-flight the
-                // in-RAM `executions`/`pulses` are AHEAD of the journal
-                // for the live bus tasks (Running execs that are genuinely
-                // in-flight, not crashed), and a full re-fold would
-                // re-dispatch them (double-run) and reset their state. The
-                // surgical path touches only the resolved waiters; the bus
-                // tasks and their state are left exactly as they are.
-                let fresh = fetch_events(journal, color).await?;
-                debug_assert!(fresh.len() >= journaled_count, "journal shrank under us");
-                if fresh.len() > journaled_count {
-                    journaled_count = fresh.len();
+            fresh = resume_poll.as_mut() => {
+                // Bus-held worker with a pending suspension, and the
+                // journal answered. If a new row landed, SURGICALLY resume
+                // only the parked nodes whose current suspension just
+                // resolved. We do NOT `apply_snapshot` (a full re-fold):
+                // mid-flight the in-RAM `executions`/`pulses` are AHEAD of
+                // the journal for the live bus tasks (Running execs that
+                // are genuinely in-flight, not crashed), and a full re-fold
+                // would re-dispatch them (double-run) and reset their
+                // state. The surgical path touches only the resolved
+                // waiters; the bus tasks and their state are left exactly
+                // as they are. An empty answer is a hold that ran out: the
+                // next turn asks again.
+                resume_wait = None;
+                let fresh = fresh?;
+                if !fresh.is_empty() {
+                    live.apply(&fresh)?;
                     let resumed = resume_resolved_suspensions_in_place(
-                        color, project_arc, &fresh, seed_chain, executions, pulses, kicked, &mut awaited_sequences,
+                        color, live, executions, pulses, kicked, &mut awaited_sequences,
                     )?;
                     if resumed > 0 {
                         tracing::info!(
@@ -4689,13 +4695,6 @@ fn node_body_for(
         Phase::Fire => NodeBody::SkipTrigger,
         Phase::InfraSetup => NodeBody::SkipTrigger,
     }
-}
-
-async fn fetch_events(
-    journal: &dyn JournalClient,
-    color: Color,
-) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
-    journal.events_for_color(color).await
 }
 
 /// The cause the canceller recorded on the flag. Read only once the

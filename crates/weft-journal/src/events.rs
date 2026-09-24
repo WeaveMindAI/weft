@@ -52,7 +52,7 @@ pub struct Seed {
 pub enum ExecEvent {
     ExecutionStarted {
         color: Color,
-        project_id: String,
+        project_id: uuid::Uuid,
         entry_node: String,
         phase: weft_core::context::Phase,
         /// `running_definition_hash` snapshotted at execution-start
@@ -867,7 +867,7 @@ mod wire_tests {
         let rows = vec![
             ExecEvent::ExecutionStarted {
                 color: color(),
-                project_id: "p".into(),
+                project_id: uuid::Uuid::nil(),
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
@@ -881,7 +881,7 @@ mod wire_tests {
             },
             ExecEvent::ExecutionStarted {
                 color: color(),
-                project_id: "p".into(),
+                project_id: uuid::Uuid::nil(),
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,

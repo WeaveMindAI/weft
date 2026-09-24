@@ -56,8 +56,10 @@ enum Args {
         pod_name: String,
         #[arg(long, env = "WEFT_TENANT_ID", default_value = "local")]
         tenant_id: String,
-        #[arg(long, env = "WEFT_PROJECT_ID", default_value = "node-test")]
-        project_id: String,
+        /// Live only: the project the run's cost and leases belong to
+        /// (the worker pod's own project in a cluster).
+        #[arg(long, env = "WEFT_PROJECT_ID")]
+        project_id: Option<uuid::Uuid>,
     },
     /// Run every basic/fake test in the registry.
     RunAll {
@@ -220,11 +222,13 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                     report_of(&node, declared.name, declared.tier, result, Vec::new())
                 }
                 TestTier::Live => {
-                    let (Some(connection), Some(broker_url)) = (live_connection, broker_url)
+                    let (Some(connection), Some(broker_url), Some(project_id)) =
+                        (live_connection, broker_url, project_id)
                     else {
                         eprintln!(
-                            "a live test needs --live-connection <grant id> and a broker \
-                             (--broker-url / WEFT_BROKER_URL): it runs the production \
+                            "a live test needs --live-connection <grant id>, a broker \
+                             (--broker-url / WEFT_BROKER_URL) and the project it runs for \
+                             (--project-id / WEFT_PROJECT_ID): it runs the production \
                              credential path"
                         );
                         return ExitCode::from(2);

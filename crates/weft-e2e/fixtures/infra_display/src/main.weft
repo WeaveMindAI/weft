@@ -1,0 +1,5 @@
+# An infra node with a display: DisplayService runs a tiny sidecar whose
+# /live panel counts presses of its one button. The rig reads and presses
+# it through the signal-token display doors, as an outside app would.
+
+panel = DisplayService

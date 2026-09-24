@@ -26,9 +26,6 @@
 
 use weft_e2e::{ensure, infra, platform::Platform, project::Project, run};
 
-/// The shared worker namespace name.
-// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE
-const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 const INFRA_NODE: &str = "svc";
 
 /// A no-infra project's worker runs in the shared namespace, and the project
@@ -36,7 +33,8 @@ const INFRA_NODE: &str = "svc";
 #[tokio::test]
 async fn no_infra_worker_runs_in_shared_namespace() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
+    let shared_namespace = disp.instance().shared_worker_namespace();
     let mut project = Project::prepare("plain", disp).await?;
     let pid = project.id();
 
@@ -50,7 +48,7 @@ async fn no_infra_worker_runs_in_shared_namespace() -> anyhow::Result<()> {
     anyhow::ensure!(!pods.is_empty(), "no worker pod row for the project");
     for pod in &pods {
         anyhow::ensure!(
-            pod.namespace == SHARED_WORKER_NAMESPACE,
+            pod.namespace == shared_namespace,
             "no-infra worker must run in the shared namespace; pod {} is in {}",
             pod.pod_name,
             pod.namespace
@@ -77,7 +75,8 @@ async fn no_infra_worker_runs_in_shared_namespace() -> anyhow::Result<()> {
 #[tokio::test]
 async fn infra_worker_runs_in_project_namespace() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
+    let shared_namespace = disp.instance().shared_worker_namespace();
     let mut project = Project::prepare("infra_min", disp.clone()).await?;
     let pid = project.id();
 
@@ -89,7 +88,7 @@ async fn infra_worker_runs_in_project_namespace() -> anyhow::Result<()> {
     anyhow::ensure!(!pods.is_empty(), "no worker pod row for the infra project");
     for pod in &pods {
         anyhow::ensure!(
-            pod.namespace != SHARED_WORKER_NAMESPACE
+            pod.namespace != shared_namespace
                 && pod.namespace.starts_with("wft-project-"),
             "an infra project's worker must run in the project's own namespace; \
              pod {} is in {}",

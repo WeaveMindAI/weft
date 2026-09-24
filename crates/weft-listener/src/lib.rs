@@ -3,8 +3,8 @@
 //! tenants, placed per signal by the dispatcher.
 //!
 //! Endpoints (network-trusted; only reachable from `weft-system`):
-//!   POST /register, /unregister, /process, /render, /live,
-//!   /rehydrate; GET /signals, /load, /health.
+//!   POST /register, /unregister, /process, /match_push, /wake_by_hand,
+//!   /render, /live, /rehydrate; GET /signals, /load, /health.
 //! Held-connection loops per stateful kind (Timer, SSE) enqueue a
 //! `FireSignal` task through the broker when their event fires; the
 //! dispatcher's task picker then runs the same `dispatch_listener_outcome`

@@ -108,7 +108,16 @@ impl K8sWorkerBackend {
         let deadline = self.clock.now() + Duration::from_secs(PULL_WATCH_SECS);
         while self.clock.now() < deadline {
             self.clock.sleep(PULL_POLL).await;
-            if let Some(reason) = self.kube.pod_waiting_reason(namespace, pod_name).await? {
+            // A failed look is not a pull failure: say so and look again
+            // on the next turn.
+            let reason = match self.kube.pod_waiting_reason(namespace, pod_name).await {
+                Ok(reason) => reason,
+                Err(e) => {
+                    tracing::warn!(pod_name, namespace, error = %format!("{e:#}"), "could not read the worker pod's state while watching its image pull");
+                    continue;
+                }
+            };
+            if let Some(reason) = reason {
                 if matches!(reason.as_str(), "ImagePullBackOff" | "ErrImagePull") {
                     anyhow::bail!(
                         "ImagePullBackOff for pod {pod_name}: image weft-worker-* not present in cluster"
@@ -141,7 +150,7 @@ impl WorkerBackend for K8sWorkerBackend {
         let image = self.worker_image_ref(hash);
         let pull_secret = self.registry.as_ref().and_then(|r| r.pull_secret.as_deref());
 
-        let project_label = SafeLabel::new(&spec.project_id, 63);
+        let project_label = SafeLabel::new(&spec.project_id.to_string(), 63);
         // Apply the headless Service FIRST (idempotent), so a pod's DNS
         // A-record is publishable the moment it is Ready. One Service per
         // NAMESPACE (selecting all workers by role), so in the shared
@@ -177,7 +186,7 @@ impl WorkerBackend for K8sWorkerBackend {
         // Fire-and-forget: the reaper's sweep loop must not block
         // on a slow pod delete.
         self.kube
-            .delete_named(&namespace, "pod", &pod_name, DeleteOpts::no_wait())
+            .delete_named(&namespace, weft_platform_traits::kube::NamedKind::Pod, &pod_name, DeleteOpts::no_wait())
             .await
     }
 
@@ -186,12 +195,8 @@ impl WorkerBackend for K8sWorkerBackend {
     }
 }
 
-pub(crate) fn short_project_id(project_id: &str) -> String {
-    project_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(8)
-        .collect()
+pub(crate) fn short_project_id(project_id: uuid::Uuid) -> String {
+    project_id.simple().to_string()[..8].to_string()
 }
 
 /// Render the per-project headless Service. `clusterIP: None` = no
@@ -347,6 +352,10 @@ spec:
           value: "{conn_port}"
         - name: WEFT_CALLER_TOKEN_SECRET
           value: "{caller_token_secret_hex}"
+        # This install's pace: the worker's heartbeat and the
+        # dispatcher's stale check must run at the same speed.
+        - name: {time_scale_env}
+          value: "{time_scale}"
       volumeMounts:
         - name: weft-sa-token
           mountPath: /var/run/weft/sa
@@ -360,6 +369,8 @@ spec:
               expirationSeconds: 3600
               path: token
 "#,
+        time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        time_scale = weft_core::time_scale::factor(),
     )
 }
 
@@ -371,7 +382,7 @@ mod tests {
 
     fn spec() -> SpawnPodSpec {
         SpawnPodSpec {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::from_u128(0x101),
             tenant: "t1".into(),
             namespace: "wft-p1".into(),
             owner_dispatcher: "disp-0".into(),

@@ -38,7 +38,12 @@ fn unit_map(
 }
 
 const TENANT: &str = "tenant-test";
-const PROJECT: &str = "proj1";
+const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
+const PROJ_USER_OFF: uuid::Uuid = uuid::Uuid::from_u128(0x5eaa6fdd30862fd);
+const PROJ_INACTIVE: uuid::Uuid = uuid::Uuid::from_u128(0xb2cdde0277773ee);
+const PROJ_ACTIVE: uuid::Uuid = uuid::Uuid::from_u128(0xb8a5f259a9ea55d);
+const INACTIVE_BROKEN: uuid::Uuid = uuid::Uuid::from_u128(0x53bf4ec8cd4f847);
+const ACTIVE_HEALTHY: uuid::Uuid = uuid::Uuid::from_u128(0xe78b1a9b48520b1);
 const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
 
@@ -760,11 +765,11 @@ async fn default_protocol_parks_active_project_on_infra_broken() {
     let rig = rig();
     // Project starts Active.
     rig.broker.add_project_with_status(
-        "proj-active",
+        PROJ_ACTIVE,
         "wft-project-test-active",
         weft_broker_client::protocol::ProjectStatus::Active,
     );
-    rig.broker.add_infra_node("proj-active", NODE, "inst1", Status::Running);
+    rig.broker.add_infra_node(PROJ_ACTIVE, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-project-test-active",
         vec![workload("inst1-bridge", NODE, 1, 0)],
@@ -776,7 +781,7 @@ async fn default_protocol_parks_active_project_on_infra_broken() {
     let enqueued = calls.iter().any(|c| matches!(
         c,
         BrokerCall::EnqueueLifecycle { project_id, spec }
-            if project_id == "proj-active"
+            if *project_id == PROJ_ACTIVE
             && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Deactivate(_))
     ));
     assert!(
@@ -792,13 +797,13 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
     // health loop is the one that deactivated it (`deactivated_by_health`).
     let rig = rig();
     rig.broker.add_project_with_status(
-        "proj-inactive",
+        PROJ_INACTIVE,
         "wft-project-test-inactive",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The health loop parked it: auto-recover is allowed to undo it.
-    rig.broker.set_deactivated_by_health("proj-inactive", true);
-    rig.broker.add_infra_node("proj-inactive", NODE, "inst1", Status::Running);
+    rig.broker.set_deactivated_by_health(PROJ_INACTIVE, true);
+    rig.broker.add_infra_node(PROJ_INACTIVE, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-project-test-inactive",
         vec![workload("inst1-bridge", NODE, 1, 1)],
@@ -811,7 +816,7 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
     let reactivated = calls.iter().any(|c| matches!(
         c,
         BrokerCall::EnqueueLifecycle { project_id, spec }
-            if project_id == "proj-inactive"
+            if *project_id == PROJ_INACTIVE
             && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate)
     ));
     assert!(
@@ -832,12 +837,12 @@ async fn default_protocol_does_not_reactivate_user_deactivated_project() {
     // left the user with active triggers but no/just-stopped infra.
     let rig = rig();
     rig.broker.add_project_with_status(
-        "proj-user-off",
+        PROJ_USER_OFF,
         "wft-project-test-user-off",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The USER deactivated: the flag stays false (default).
-    rig.broker.add_infra_node("proj-user-off", NODE, "inst1", Status::Running);
+    rig.broker.add_infra_node(PROJ_USER_OFF, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-project-test-user-off",
         vec![workload("inst1-bridge", NODE, 1, 1)], // pods still healthy
@@ -848,7 +853,7 @@ async fn default_protocol_does_not_reactivate_user_deactivated_project() {
     let any_reactivate = rig.broker.calls().iter().any(|c| matches!(
         c,
         BrokerCall::EnqueueLifecycle { project_id, spec }
-            if project_id == "proj-user-off"
+            if *project_id == PROJ_USER_OFF
             && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate)
     ));
     assert!(
@@ -868,11 +873,11 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
     // gates each stage.
     let rig = rig();
     rig.broker.add_project_with_status(
-        "active-healthy",
+        ACTIVE_HEALTHY,
         "wft-active-healthy",
         weft_broker_client::protocol::ProjectStatus::Active,
     );
-    rig.broker.add_infra_node("active-healthy", NODE, "inst1", Status::Running);
+    rig.broker.add_infra_node(ACTIVE_HEALTHY, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-active-healthy",
         vec![workload("inst1-bridge", NODE, 1, 1)],
@@ -880,11 +885,11 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
     rig.tick_health().await.unwrap();
 
     rig.broker.add_project_with_status(
-        "inactive-broken",
+        INACTIVE_BROKEN,
         "wft-inactive-broken",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
-    rig.broker.add_infra_node("inactive-broken", NODE, "inst1", Status::Running);
+    rig.broker.add_infra_node(INACTIVE_BROKEN, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-inactive-broken",
         vec![workload("inst1-bridge", NODE, 1, 0)],
@@ -1011,4 +1016,177 @@ async fn three_stage_recovery_deactivate_bounce_reactivate() {
     }).count();
     assert_eq!(deactivates, 1, "exactly one deactivate across the cycle");
     assert_eq!(reactivates, 1, "exactly one reactivate across the cycle");
+}
+
+// ---------- watch-driven looks ----------
+
+/// A replica drop the watch hands over is evaluated when it arrives, not
+/// at the next tick: once the flaky window has passed, the change alone
+/// fires the same flaky event the tick would have.
+#[tokio::test]
+async fn a_change_the_watch_hands_over_is_evaluated_without_a_tick() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
+
+    // The replica drops: evaluated on the change, the window starts.
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.health_change().await;
+    assert!(rig.broker.events().is_empty(), "still inside the flaky window");
+
+    // Still down past the window: the next change (any change to the
+    // project's workloads) fires flaky, with no tick in between.
+    rig.advance(Duration::from_secs(35));
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 2, 0)]);
+    rig.health_change().await;
+    let flaky: Vec<_> = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").collect();
+    assert_eq!(flaky.len(), 1);
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Flaky);
+    // No list: the watch is the only read of the cluster.
+    assert!(!rig.kube.calls().iter().any(|c| matches!(c, KubeCall::ListReplicaState { .. })));
+}
+
+/// A project stops being watched when this pod stops owning it, and one
+/// it starts owning is watched from the next tick.
+#[tokio::test]
+async fn watches_follow_what_the_pod_owns() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 1);
+    let watched = rig
+        .kube
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, KubeCall::WatchReplicaState { namespace, .. } if namespace == NAMESPACE))
+        .count();
+    assert_eq!(watched, 1);
+
+    // Ticks keep the one watch.
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 1);
+
+    rig.broker.set_project_owned(PROJECT, false);
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 0, "a released project's watch is dropped");
+
+    rig.broker.set_project_owned(PROJECT, true);
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 1);
+}
+
+/// A lost project is dropped the moment the ownership loop says so, not
+/// on the next tick: its watch stops and a change to its workloads fires
+/// nothing while another pod owns it. A claim starts the watch at once.
+#[tokio::test(start_paused = true)]
+async fn ownership_changes_reach_the_health_loop_between_ticks() {
+    use weft_infra_supervisor::ownership::OwnershipChange;
+    let rig = rig_with_bounce_protocol();
+    rig.kube.set_workloads(NAMESPACE, vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 1)]);
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 1);
+
+    let (ownership, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    rig.broker.set_project_owned(PROJECT, false);
+    ownership.send(OwnershipChange { claimed: vec![], lost: vec![PROJECT] }).unwrap();
+    rig.health_between_ticks(&mut changes, tokio::time::sleep(Duration::from_secs(1))).await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 0, "the lost project's watch is dropped before the tick");
+
+    // The workloads break while another pod owns the project: nothing
+    // here looks at them, so no action fires.
+    rig.kube.set_workloads(NAMESPACE, vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 0)]);
+    rig.advance(Duration::from_secs(35));
+    rig.health_between_ticks(&mut changes, tokio::time::sleep(Duration::from_secs(1))).await.unwrap();
+    assert_eq!(delete_pods_count(&rig), 0, "a project this pod lost is never acted on");
+
+    rig.broker.set_project_owned(PROJECT, true);
+    ownership.send(OwnershipChange { claimed: vec![PROJECT], lost: vec![] }).unwrap();
+    rig.health_between_ticks(&mut changes, tokio::time::sleep(Duration::from_secs(1))).await.unwrap();
+    assert_eq!(rig.kube.live_watches(), 1, "a claimed project is watched without waiting for a tick");
+
+    drop(ownership);
+    assert!(
+        rig.health_between_ticks(&mut changes, std::future::pending()).await.is_err(),
+        "with the ownership loop gone the health loop stops"
+    );
+}
+
+/// A change arriving just before the tick is due fires an action that
+/// runs past the tick: the tick waits for it, it is never cut halfway,
+/// so the project's in-flight slot is always given back.
+#[tokio::test(start_paused = true)]
+async fn a_tick_due_mid_action_does_not_cut_the_action() {
+    let rig = rig_with_bounce_protocol();
+    rig.kube.set_workloads(NAMESPACE, vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 1)]);
+    rig.tick_health().await.unwrap();
+    rig.kube.hang_delete_pods();
+
+    // The change fires the action, which hangs until its 5s timeout;
+    // the tick is due after 1s.
+    rig.kube.set_workloads(NAMESPACE, vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 0)]);
+    let (_ownership, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        rig.health_between_ticks(&mut changes, tokio::time::sleep(Duration::from_secs(1))),
+    )
+    .await
+    .expect("the between-ticks half never gave way to the tick")
+    .unwrap();
+
+    assert_eq!(delete_pods_count(&rig), 1, "the change fired the action");
+    let reg = rig.state.health.lock().await;
+    assert!(!reg.is_in_flight(PROJECT), "the action ran to its end and freed in_flight");
+    assert_eq!(reg.backoff_failures(PROJECT, "bounce-on-zero"), 1, "the action reached its timeout");
+}
+
+/// A project whose watch never answers is not waited on: the tick still
+/// evaluates every other project.
+#[tokio::test]
+async fn a_watch_that_never_answers_does_not_block_other_projects() {
+    const SILENT: uuid::Uuid = uuid::Uuid::from_u128(2);
+    const SILENT_NS: &str = "wft-project-test-silent";
+    let rig = rig();
+    rig.broker.add_project(SILENT, SILENT_NS);
+    rig.kube.leave_watches_unanswered(SILENT_NS);
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    for ready in [1, 0] {
+        rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, ready)]);
+        tokio::time::timeout(Duration::from_secs(5), rig.tick_health())
+            .await
+            .expect("the tick waited on the silent watch")
+            .unwrap();
+    }
+    rig.advance(Duration::from_secs(35));
+    tokio::time::timeout(Duration::from_secs(5), rig.tick_health())
+        .await
+        .expect("the tick waited on the silent watch")
+        .unwrap();
+
+    let flaky = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").count();
+    assert_eq!(flaky, 1, "the answering project was evaluated");
+    assert_eq!(rig.kube.live_watches(), 2, "the silent watch is kept, not restarted");
+}
+
+/// A watch whose look failed is not evaluated on the set it handed out
+/// before: that set may say healthy about a project that is not. Its
+/// next answer makes it evaluated again.
+#[tokio::test]
+async fn a_failing_watch_is_not_evaluated() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap(); // the flaky window starts
+
+    rig.kube.fail_watches(NAMESPACE, "the API server went away");
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    assert!(rig.broker.events().is_empty(), "a failing watch was evaluated on its stale set");
+
+    rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap();
+    let flaky = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").count();
+    assert_eq!(flaky, 1, "the watch answered again and is evaluated");
 }

@@ -14,7 +14,7 @@ use weft_infra_supervisor::testing::SupervisorTestRig;
 use weft_platform_traits::kube::{WorkloadKind, WorkloadReplicaState};
 
 const TENANT: &str = "tenant-test";
-const PROJECT: &str = "proj1";
+const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
 const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
 
@@ -65,7 +65,7 @@ fn workload_for(instance: &str, name: &str, desired: i64, ready: i64) -> Workloa
 fn cmd(id: i64, verb: Verb, node: Option<&str>) -> SupervisorCommandRow {
     SupervisorCommandRow {
         id,
-        project_id: PROJECT.into(),
+        project_id: PROJECT,
         node_id: node.map(|s| s.to_string()),
         verb,
         running_policy: Some(Policy::Cancel),
@@ -418,7 +418,7 @@ fn apply_cmd(id: i64) -> SupervisorCommandRow {
     });
     SupervisorCommandRow {
         id,
-        project_id: PROJECT.into(),
+        project_id: PROJECT,
         node_id: Some(NODE.into()),
         verb: Verb::Apply,
         running_policy: None,
@@ -554,6 +554,85 @@ async fn apply_skip_path_no_provisioning() {
         !rig.kube.calls().iter().any(|c| matches!(c, KubeCall::ApplyYaml { .. } | KubeCall::Apply { .. })),
         "skip path must not kube-apply"
     );
+}
+
+/// A row stamped before its public paths were recorded (every unit up,
+/// the hash matching) is applied again rather than skipped: skipping
+/// would leave it without its public address for as long as it runs.
+#[tokio::test]
+async fn apply_does_not_skip_a_row_missing_its_public_paths() {
+    let rig = rig();
+    let spec = serde_json::json!({
+        "units": [{
+            "name": "bridge",
+            "kind": "deployment",
+            "containers": [{
+                "name": "c",
+                "image": { "kind": "upstream", "reference": "nginx:1" },
+                "ports": [{ "name": "http", "port": 8080 }]
+            }]
+        }],
+        "endpoints": [{
+            "name": "api", "unit": "bridge", "container": "c", "port": "http",
+            "expose": { "kind": "tenant_public", "path": "/hooks" }
+        }]
+    });
+    let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
+    let hash = weft_core::infra::hash_spec(&parsed, &std::collections::BTreeMap::new()).unwrap();
+    let applied = |rig: &SupervisorTestRig| -> Vec<(String, weft_broker_client::protocol::AppliedEndpoints)> {
+        rig.broker
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                weft_infra_supervisor::broker_ops::BrokerCall::SetApplied { instance_id, addresses, .. } => {
+                    Some((instance_id, addresses))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A first apply records where the endpoint answers.
+    let mut first = apply_cmd(1);
+    first.spec_json = Some(spec.clone());
+    rig.broker.enqueue_command(first);
+    rig.tick_lifecycle().await.unwrap();
+    let (instance_id, stamped) = applied(&rig).pop().expect("the first apply stamps its addresses");
+    let public_path = stamped.public_paths.get("api").expect("a public endpoint has a path").clone();
+    assert!(public_path.starts_with("/infra/") && public_path.ends_with("/hooks"), "{public_path}");
+
+    // The same row as an older build left it: up, same hash, same URL,
+    // no public path.
+    rig.broker.add_infra_node_with(
+        PROJECT,
+        NODE,
+        &instance_id,
+        Status::Running,
+        Some(hash),
+        stamped.urls.clone(),
+        {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "bridge".to_string(),
+                weft_broker_client::protocol::UnitRuntime {
+                    status: Status::Running,
+                    stop_behavior: weft_core::StopBehavior::ScaleToZero,
+                    flaky_after_seconds: 30,
+                    recovery_after_seconds: 30,
+                    image_refs: Default::default(),
+                },
+            );
+            m
+        },
+    );
+    let mut again = apply_cmd(2);
+    again.spec_json = Some(spec);
+    rig.broker.enqueue_command(again);
+    rig.tick_lifecycle().await.unwrap();
+
+    let stamps = applied(&rig);
+    assert_eq!(stamps.len(), 2, "the second apply is not skipped");
+    assert_eq!(stamps[1].1.public_paths.get("api"), Some(&public_path));
 }
 
 #[tokio::test]
@@ -705,9 +784,9 @@ async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     rig.kube
         .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
-    // Ownership has already moved to another pod by the time the per-unit
-    // `set_status` write lands. The broker rejects it (Displaced).
-    rig.broker.set_project_owned(PROJECT, false);
+    // Ownership moves to another pod right after the claim, so the
+    // per-unit `set_status` write lands displaced (the broker rejects it).
+    rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
 
     let did_work = rig.tick_lifecycle().await.unwrap();
@@ -727,7 +806,7 @@ async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     rig.kube
         .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
-    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
@@ -759,7 +838,7 @@ async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
 #[tokio::test]
 async fn apply_does_not_complete_when_ownership_moves_mid_command() {
     let rig = rig();
-    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(apply_cmd(3));
 
     rig.tick_lifecycle().await.unwrap();
@@ -790,7 +869,7 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
         .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
 
     // First owner: loses ownership mid-stop, leaves the command.
-    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(cmd(7, Verb::Stop, Some(NODE)));
     rig.tick_lifecycle().await.unwrap();
     assert!(
@@ -798,10 +877,9 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
         "displaced owner left the command uncompleted"
     );
 
-    // New owner: holds the lease, the command is re-enqueued (the broker's
-    // claim re-surfaces the still-uncompleted row), runs to completion.
+    // New owner: holds the lease, and the claim hands out the same
+    // still-uncompleted command again; it runs to completion.
     rig.broker.set_project_owned(PROJECT, true);
-    rig.broker.enqueue_command(cmd(7, Verb::Stop, Some(NODE)));
     rig.tick_lifecycle().await.unwrap();
 
     assert_eq!(
@@ -815,3 +893,175 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
         "the new owner actually performed the stop"
     );
 }
+
+// ---------- the running loop ----------
+//
+// These drive the real `lifecycle::run_loop`, not the one-command `tick`.
+// A `wait`-policy stop on a project whose running count is gated stays
+// mid-drain until the test opens the gate, which is how a command is
+// kept running while the loop's other behavior is observed. The claim
+// holds up to `MAX_HOLD` (25s) when nothing is waiting, so every wait
+// below is bounded well under it: a loop that failed to ask again would
+// hold past the bound and fail the test.
+
+const P2: uuid::Uuid = uuid::Uuid::from_u128(2);
+
+/// A stop of `project` with no infra rows: after its drain it completes
+/// as a no-op.
+fn stop_of(id: i64, project: uuid::Uuid, policy: Policy) -> SupervisorCommandRow {
+    SupervisorCommandRow {
+        id,
+        project_id: project,
+        node_id: None,
+        verb: Verb::Stop,
+        running_policy: Some(policy),
+        spec_json: None,
+        force: false,
+        drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+    }
+}
+
+/// Wait until `cond` holds, failing well before a claim's full hold.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    let bounded = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !cond() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    });
+    bounded.await.unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+fn completed_ids(rig: &SupervisorTestRig) -> Vec<i64> {
+    rig.broker.completed_commands().iter().map(|(id, _, _)| *id).collect()
+}
+
+fn running_count_calls(rig: &SupervisorTestRig, project: uuid::Uuid) -> usize {
+    use weft_infra_supervisor::broker_ops::BrokerCall;
+    rig.broker
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, BrokerCall::RunningCount { project_id } if *project_id == project))
+        .count()
+}
+
+weft_core::stress_test!(
+    name: one_projects_commands_run_in_order_beside_another_projects,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        use weft_infra_supervisor::broker_ops::BrokerCall;
+        let rig = rig();
+        rig.broker.add_project(P2, "wft-project-test-proj2");
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Wait));
+        rig.broker.enqueue_command(stop_of(2, PROJECT, Policy::Cancel));
+        rig.broker.enqueue_command(stop_of(3, P2, Policy::Cancel));
+        let (lifecycle, _changes) = rig.spawn_lifecycle_loop();
+
+        // P2's command runs while P1's first is held mid-drain, and P1's
+        // second waits behind it: the claims name P1 busy.
+        until("the other project's command completed", || completed_ids(&rig) == vec![3]).await;
+        assert!(rig.broker.calls().iter().any(|c| matches!(
+            c,
+            BrokerCall::ClaimCommand { busy_projects, .. } if busy_projects == &vec![PROJECT]
+        )));
+
+        // The finished task frees its project: the second command runs next.
+        rig.broker.open_running_count(PROJECT);
+        until("both of P1's commands completed", || completed_ids(&rig).len() == 3).await;
+        assert_eq!(completed_ids(&rig), vec![3, 1, 2], "P1's commands run in the order issued");
+        lifecycle.abort();
+    }
+);
+
+weft_core::stress_test!(
+    name: a_project_taken_on_ends_the_held_claim,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        let rig = rig();
+        // The command was issued while nobody owned its project, so no
+        // held claim of this pod's woke for it.
+        rig.broker.set_project_unowned(PROJECT);
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Cancel));
+        let (lifecycle, changes) = rig.spawn_lifecycle_loop();
+        until("the loop holds a claim", || {
+            rig.broker.calls().iter().any(|c| matches!(
+                c,
+                weft_infra_supervisor::broker_ops::BrokerCall::ClaimCommand { .. }
+            ))
+        })
+        .await;
+
+        let change = rig.tick_ownership().await.unwrap().expect("the tick took the project on");
+        assert_eq!(change.claimed, vec![PROJECT]);
+        changes.send(change).unwrap();
+        until("the command completed", || completed_ids(&rig) == vec![1]).await;
+        lifecycle.abort();
+    }
+);
+
+weft_core::stress_test!(
+    name: unowned_work_asks_the_ownership_loop_to_tick,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        let rig = rig();
+        rig.broker.set_project_unowned(PROJECT);
+        let wanted = rig.state.ownership_wanted.clone();
+        let (lifecycle, _changes) = rig.spawn_lifecycle_loop();
+        until("the loop holds a claim", || {
+            rig.broker.calls().iter().any(|c| matches!(
+                c,
+                weft_infra_supervisor::broker_ops::BrokerCall::ClaimCommand { .. }
+            ))
+        })
+        .await;
+
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Cancel));
+        tokio::time::timeout(std::time::Duration::from_secs(10), wanted.notified())
+            .await
+            .expect("unowned work must ask the ownership loop to tick");
+        assert!(completed_ids(&rig).is_empty(), "nobody owns the project yet");
+        lifecycle.abort();
+    }
+);
+
+weft_core::stress_test!(
+    name: a_lost_project_stops_its_running_command,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        use weft_infra_supervisor::broker_ops::BrokerCall;
+        let rig = rig();
+        rig.tick_ownership().await.unwrap();
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Wait));
+        let (lifecycle, changes) = rig.spawn_lifecycle_loop();
+        until("the command is mid-drain", || running_count_calls(&rig, PROJECT) == 1).await;
+
+        rig.broker.set_project_owned(PROJECT, false);
+        let change = rig.tick_ownership().await.unwrap().expect("the tick lost the project");
+        assert_eq!(change.lost, vec![PROJECT]);
+        changes.send(change).unwrap();
+
+        // Given back, the project is not busy any more: the same command
+        // is claimed and started again, which only happens once the
+        // stopped task's busy entry is gone.
+        rig.broker.set_project_unowned(PROJECT);
+        let change = rig.tick_ownership().await.unwrap().expect("the tick took it back");
+        changes.send(change).unwrap();
+        until("the command started again", || running_count_calls(&rig, PROJECT) == 2).await;
+
+        rig.broker.open_running_count(PROJECT);
+        until("the command completed", || completed_ids(&rig) == vec![1]).await;
+        let completions = rig
+            .broker
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, BrokerCall::CommandComplete { .. }))
+            .count();
+        assert_eq!(completions, 1, "the stopped run never reached its completion write");
+        lifecycle.abort();
+    }
+);

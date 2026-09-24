@@ -62,34 +62,53 @@
 
     /// In-memory recording journal: stores every event and replays them
     /// for the boot fold. Unlike the Noop journals in `replay_tests`,
-    /// this actually drives a live execution.
+    /// this actually drives a live execution. A row's id is its place in
+    /// the log, and a held read wakes on the next write, as the real
+    /// journal's does.
     #[derive(Default)]
     pub(super) struct MemJournal {
         pub(super) events: StdMutex<Vec<ExecEvent>>,
+        written: tokio::sync::Notify,
+    }
+    impl MemJournal {
+        fn rows_after_now(&self, color: Color, after_id: i64) -> Vec<weft_journal::RawJournalRow> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i as i64 + 1, e))
+                .filter(|(id, e)| *id > after_id && e.color() == color)
+                .map(|(id, e)| weft_journal::RawJournalRow {
+                    id,
+                    payload: serde_json::to_string(e).expect("serialize ExecEvent"),
+                })
+                .collect()
+        }
     }
     #[async_trait]
     impl JournalClient for MemJournal {
         async fn record_event(&self, event: &ExecEvent, _pod: Option<&str>) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(event.clone());
+            self.written.notify_waiters();
             Ok(())
         }
-        async fn events_for_color(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-            Ok(self
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.color() == color)
-                .cloned()
-                .collect())
-        }
-        async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
-            Ok(self
-                .events_for_color(color)
-                .await?
-                .iter()
-                .map(|e| serde_json::to_string(e).expect("serialize ExecEvent"))
-                .collect())
+        async fn raw_rows_after(
+            &self,
+            color: Color,
+            after_id: i64,
+            wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let written = self.written.notified();
+                tokio::pin!(written);
+                written.as_mut().enable();
+                let rows = self.rows_after_now(color, after_id);
+                if !rows.is_empty() || tokio::time::timeout_at(deadline, written).await.is_err() {
+                    return Ok(rows);
+                }
+            }
         }
         async fn has_terminal_event(&self, color: Color) -> anyhow::Result<bool> {
             Ok(self.events.lock().unwrap().iter().any(|e| matches!(
@@ -110,7 +129,7 @@
         async fn wait_for_terminal(&self, _t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!()
         }
-        async fn claim_one(&self, _p: &str, _f: weft_task_store::tasks::ClaimFilter) -> anyhow::Result<Option<weft_task_store::tasks::Task>> { Ok(None) }
+        async fn claim_one(&self, _p: &str, _f: weft_task_store::tasks::ClaimFilter, _w: std::time::Duration) -> anyhow::Result<Option<weft_task_store::tasks::Task>> { Ok(None) }
         async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
         async fn requeue(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
         async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> { Ok(()) }
@@ -122,20 +141,20 @@
         async fn tag_execution(&self, _c: Color, _t: Vec<String>, _p: &str) -> anyhow::Result<()> {
             unreachable!("rig tests steer no executions")
         }
-        async fn stop_tagged(&self, _c: Color, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<()> {
+        async fn stop_tagged(&self, _c: Color, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<bool> {
             unreachable!("rig tests steer no executions")
         }
     }
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_url(&self, _p: &str, _n: &str, _e: &str) -> anyhow::Result<Option<String>> { Ok(None) }
+        async fn endpoint_address(&self, _p: uuid::Uuid, _n: &str, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]
     impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(&self, _p: &str, _n: &str, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
-        async fn wait_apply(&self, _p: &str, _c: i64) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
+        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
+        async fn wait_apply(&self, _p: uuid::Uuid, _c: i64, _w: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,
                 outcome: Some(weft_broker_client::protocol::LifecycleOutcome::Succeeded),
@@ -148,7 +167,7 @@
     impl crate::context::ProjectClient for NoopProject {
         async fn fetch_definition(
             &self,
-            _project_id: &str,
+            _project_id: uuid::Uuid,
             _expected_hash: &str,
         ) -> anyhow::Result<Option<ProjectDefinition>> {
             // These execution_driver tests inject the project into
@@ -162,8 +181,8 @@
 
     #[async_trait]
     impl crate::context::ProjectClient for ProjectHistory {
-        async fn fetch_definition(&self, project_id: &str, expected_hash: &str) -> anyhow::Result<Option<ProjectDefinition>> {
-            Ok(self.0.get(&(project_id.into(), expected_hash.into())).cloned())
+        async fn fetch_definition(&self, project_id: uuid::Uuid, expected_hash: &str) -> anyhow::Result<Option<ProjectDefinition>> {
+            Ok(self.0.get(&(project_id.to_string(), expected_hash.into())).cloned())
         }
     }
 
@@ -254,7 +273,7 @@
         let color = uuid::Uuid::new_v4();
         let mut rows = vec![ExecEvent::ExecutionStarted {
             color,
-            project_id: project.id.to_string(),
+            project_id: project.id,
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
@@ -594,7 +613,7 @@
             let chain = weft_journal::seed_chain(&events, |c| journal.events_for_color(c), |id, hash| {
                 let projects = projects.clone();
                 async move {
-                    projects.fetch_definition(&id, &hash).await?.map(Arc::new)
+                    projects.fetch_definition(id, &hash).await?.map(Arc::new)
                         .ok_or_else(|| anyhow::anyhow!("test seed program {id}/{hash} was not registered"))
                 }
             })

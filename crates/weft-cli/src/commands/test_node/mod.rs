@@ -1206,10 +1206,15 @@ async fn run_one_live_pod(
     let started = std::time::Instant::now();
     let mut last_breadcrumb = std::time::Instant::now();
     let report = loop {
+        // Held by the dispatcher until the run finishes or the hold runs
+        // out, so the loop asks again at once either way.
         let status = client
-            .get_json(&format!("/projects/{project_id}/node-tests/runs/{task_id}"))
+            .get_json(&format!(
+                "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
+                RUN_HOLD.as_millis()
+            ))
             .await
-            .context("poll the node-test run")?;
+            .context("wait on the node-test run")?;
         match status.get("status").and_then(Value::as_str) {
             Some("complete") => {
                 break status.get("report").cloned().context("completed without a report")?
@@ -1229,7 +1234,6 @@ async fn run_one_live_pod(
                         started.elapsed().as_secs(),
                     ));
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             other => bail!(
                 "unexpected node-test run status {other:?} for task {task_id}; \
@@ -1241,6 +1245,11 @@ async fn run_one_live_pod(
     progress.finished(&run.package, &run.test, report.passed, report.error.as_deref());
     Ok(report)
 }
+
+/// How long one wait on a node-test run is held by the dispatcher
+/// before the CLI asks again, and so how often a still-running run gets
+/// its breadcrumb checked.
+const RUN_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Build + load the package's content-addressed test image, skipping
 /// on a tag hit (the same skip rule worker images use).
@@ -1261,7 +1270,7 @@ async fn ensure_test_image(
         // scope to "this package's older test images": every package's
         // test image shares the one scratch project id, so the project
         // label alone would make packages evict each other's images.
-        crate::images::docker_build(
+        crate::images::docker_build_worker(
             &tag,
             &artifact.build_context.join("Dockerfile"),
             &artifact.build_context,
@@ -1269,7 +1278,6 @@ async fn ensure_test_image(
                 format!("weft.dev/project={}", project.id()),
                 format!("weft.dev/node-test-package={package}"),
             ],
-            None,
         )
         .await?;
     }

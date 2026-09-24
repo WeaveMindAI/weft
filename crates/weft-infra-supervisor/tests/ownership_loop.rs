@@ -15,10 +15,13 @@
 use weft_infra_supervisor::broker_ops::BrokerCall;
 use weft_infra_supervisor::testing::SupervisorTestRig;
 
+
+const P1: uuid::Uuid = uuid::Uuid::from_u128(1);
+
 #[tokio::test]
 async fn ownership_tick_syncs_under_this_pods_identity_and_pressure() {
     let rig = SupervisorTestRig::with_tenant("alice");
-    rig.broker.add_project("p1", "wft-project-alice-p1");
+    rig.broker.add_project(P1, "wft-project-alice-p1");
     rig.mem.set(0.3);
 
     rig.tick_ownership().await.unwrap();
@@ -41,7 +44,7 @@ async fn work_loops_read_owned_projects_not_a_global_list() {
     // owned_projects), never a global all-projects read. Pin that the
     // health tick goes through owned_projects for THIS pod.
     let rig = SupervisorTestRig::with_tenant("alice");
-    rig.broker.add_project("p1", "wft-project-alice-p1");
+    rig.broker.add_project(P1, "wft-project-alice-p1");
 
     rig.tick_health().await.unwrap();
 

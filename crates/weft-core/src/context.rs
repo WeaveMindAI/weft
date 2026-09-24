@@ -35,7 +35,7 @@ pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::fr
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub execution_id: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub node_id: String,
     pub node_type: String,
     /// The node's user-facing label (the title shown at the top of
@@ -129,7 +129,7 @@ impl ExecutionContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: String,
-        project_id: String,
+        project_id: uuid::Uuid,
         node_id: String,
         node_type: String,
         node_label: Option<String>,
@@ -454,10 +454,11 @@ impl ExecutionContext {
     /// isn't applied. The dispatcher resolves the URL from the
     /// `infra_node` row so node code never touches k8s.
     pub async fn endpoint(&self, name: &str) -> WeftResult<EndpointHandle> {
-        let url = self.handle.endpoint_url(name).await?;
+        let address = self.handle.endpoint_address(name).await?;
         Ok(EndpointHandle {
             handle: self.handle.clone(),
-            url,
+            url: address.url,
+            public_url: address.public_url,
         })
     }
 
@@ -627,8 +628,9 @@ impl ExecutionContext {
     /// "stop the others, keep me" a few milliseconds apart therefore
     /// leave the LATER one alive instead of killing each other. With
     /// [`StopSelf::Include`] every live run carrying the tag goes,
-    /// this one too: its current await returns cancelled at the next
-    /// cancellation point, exactly as `weft stop` would end it.
+    /// this one too: if this run carries the tag, the call never
+    /// returns and the run ends cancelled, exactly as `weft stop` would
+    /// end it, with nothing after the stop running.
     ///
     /// The stop is asynchronous: this call returns once the request is
     /// durably queued, and the runtime carries it out. A node that
@@ -1397,6 +1399,7 @@ pub enum EndpointMethod {
 pub struct EndpointHandle {
     handle: Arc<dyn ContextHandle>,
     url: String,
+    public_url: Option<String>,
 }
 
 /// The host and port an infra endpoint URL addresses.
@@ -1463,6 +1466,16 @@ impl EndpointHandle {
     /// URL was resolved by `ctx.endpoint(name)`.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The address a caller outside the cluster reaches this endpoint
+    /// at, to hand to whoever calls in (a provider's webhook target, a
+    /// browser). `Some` only for an `Expose::TenantPublic` endpoint, on
+    /// an install that has a front-door address. The node declares
+    /// `/hooks`; this is `<front door>/infra/<namespace>/<instance>/hooks`,
+    /// which the door rewrites back to `/hooks` on the way in.
+    pub fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
     }
 
     /// HTTP call to this endpoint. `path` MUST start with `/`.
@@ -1976,11 +1989,10 @@ pub trait ContextHandle: Send + Sync {
     /// dispatcher stores it with the signal and replays it onto the
     /// trigger's ports at every fire.
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()>;
-    /// Resolve the cluster-internal URL for a declared endpoint of
-    /// the current node. Used internally by
-    /// [`ExecutionContext::endpoint`] to build an `EndpointHandle`;
-    /// nodes shouldn't call this directly.
-    async fn endpoint_url(&self, name: &str) -> WeftResult<String>;
+    /// Resolve where a declared endpoint of the current node answers.
+    /// Used internally by [`ExecutionContext::endpoint`] to build an
+    /// `EndpointHandle`; nodes shouldn't call this directly.
+    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress>;
     /// HTTP call against a pre-resolved endpoint URL. Used
     /// internally by [`EndpointHandle::call`]; nodes shouldn't
     /// call this directly. Takes the URL the handle cached at
@@ -2381,7 +2393,7 @@ mod value_bag_tests {
     impl ContextHandle for DeadHandle {
         async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
-        async fn endpoint_url(&self, _: &str) -> WeftResult<String> { unreachable!() }
+        async fn endpoint_address(&self, _: &str) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -2437,7 +2449,7 @@ mod value_bag_tests {
     impl ContextHandle for StorageProbeHandle {
         async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
-        async fn endpoint_url(&self, _: &str) -> WeftResult<String> { unreachable!() }
+        async fn endpoint_address(&self, _: &str) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -2518,7 +2530,7 @@ mod value_bag_tests {
         };
         let mut ctx = ExecutionContext::new(
             "exec-1".into(),
-            "project-1".into(),
+            uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
@@ -2550,7 +2562,7 @@ mod value_bag_tests {
         let handle = Arc::new(StorageProbeHandle { public_link: None, presign_fails: false, puts: Default::default() });
         let ctx = ExecutionContext::new(
             "exec-1".into(),
-            "project-1".into(),
+            uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
@@ -2588,7 +2600,7 @@ mod value_bag_tests {
         };
         let mut ctx = ExecutionContext::new(
             "exec-1".into(),
-            "project-1".into(),
+            uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
@@ -2629,7 +2641,7 @@ mod value_bag_tests {
         let with_link = |link: Option<&str>| {
             ExecutionContext::new(
                 "exec-1".into(),
-                "project-1".into(),
+                uuid::Uuid::nil(),
                 "node-1".into(),
                 "TestNode".into(),
                 None,
@@ -2663,7 +2675,7 @@ mod value_bag_tests {
     fn ctx(inputs_json: serde_json::Value) -> ExecutionContext {
         ExecutionContext::new(
             "exec-1".into(),
-            "project-1".into(),
+            uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,

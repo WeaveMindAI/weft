@@ -100,7 +100,7 @@ impl From<TaskKind> for String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPayload {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub color: String,
     /// `running_definition_hash` snapshotted at enqueue time (same
     /// value the journal's `ExecutionStarted` carries). The worker
@@ -222,7 +222,7 @@ pub struct UpdateSignalKindStatePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelExecutionPayload {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub color: String,
     /// Why the run is being cancelled. The owning worker flips the
     /// color's flag WITH this cause, so the terminal event it writes
@@ -239,7 +239,7 @@ pub struct CancelExecutionPayload {
 /// after the ask.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopTaggedPayload {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tag: String,
     /// The execution that asked. Excluded from the targets under
     /// `StopSelf::Keep`, named as the canceller on every stopped run.
@@ -253,7 +253,7 @@ pub struct StopTaggedPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnPodPayload {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub tenant: String,
     pub namespace: String,
     pub owner_dispatcher: String,
@@ -345,7 +345,7 @@ mod tests {
             [(Some(17), weft_core::StopSelf::Keep), (None, weft_core::StopSelf::Include)]
         {
             let payload = StopTaggedPayload {
-                project_id: "p1".into(),
+                project_id: uuid::Uuid::nil(),
                 tag: "user_7".into(),
                 by: "c1".into(),
                 before_seq,
@@ -358,7 +358,7 @@ mod tests {
             assert_eq!(back.tag, "user_7");
         }
         let cancel = CancelExecutionPayload {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::nil(),
             color: "c2".into(),
             cause: weft_core::exec::CancelCause::Execution { by: uuid::Uuid::nil(), tag: "user_7".into() },
         };
@@ -420,7 +420,7 @@ mod tests {
         request.params.insert("room".into(), "room7".into());
         request.caller = Some(serde_json::json!({ "key": 1 }));
         let payload = ExecutionPayload {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::nil(),
             color: "c1".into(),
             definition_hash: "h".into(),
             live_connection: Some(LiveConnectionStart {
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(back.live_connection.unwrap().request, request);
 
         let plain = ExecutionPayload {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::nil(),
             color: "c1".into(),
             definition_hash: "h".into(),
             live_connection: None,
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn a_fired_run_survives_the_wire() {
         let payload = ExecutionPayload {
-            project_id: "p1".into(),
+            project_id: uuid::Uuid::nil(),
             color: "c1".into(),
             definition_hash: "h".into(),
             live_connection: Some(LiveConnectionStart {

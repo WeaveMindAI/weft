@@ -200,7 +200,7 @@
                 let root = if selected { "producer" } else { "consumer" };
                 let rows = vec![
                     ExecEvent::ExecutionStarted {
-                        color, project_id: project.id.to_string(), entry_node: root.into(),
+                        color, project_id: project.id, entry_node: root.into(),
                         phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, node_test: false,
                         subgraph: Some(selection), seed: None, at_unix: 0,
                     },

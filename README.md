@@ -288,6 +288,9 @@ You can build and run typed graphs with groups, loops, live channels,
 infrastructure and waits today. The editor displays execution records,
 node inputs and outputs, and live node panels.
 
+If your program needs a web app, Tangle builds one next to it, in `front/`,
+talking to your program through its own HTTP routes.
+
 The [catalog](catalog/) includes messaging, databases, model providers,
 image and audio generation, web search and more. Nodes share the ctx for
 connections, files and execution machinery. Cost meters record the calls they
@@ -303,7 +306,6 @@ Weft is early, and breaking changes are still possible. This is what we are work
 - running outside Kubernetes (a local LLM, or an AWS, GCP or Azure service) and
   connecting it to the rest of the runtime;
 - a guide to deploying weft on your cloud provider;
-- extending Tangle to write frontend code that plugs into weft;
 - letting the program hoster handle multiple user logins for the same program
   natively;
 

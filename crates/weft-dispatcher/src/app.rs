@@ -124,6 +124,21 @@ impl Defaults {
     }
 }
 
+/// Every channel a dispatcher pod listens on, all on its one `LISTEN`
+/// connection.
+pub const DISPATCHER_CHANNELS: &[&str] = &[
+    weft_task_store::tasks::TASK_READY_CHANNEL,
+    weft_task_store::terminal::TERMINAL_CHANNEL,
+    weft_task_store::worker_pod::WORKER_POD_CHANNEL,
+    weft_journal::EXEC_EVENT_CHANNEL,
+    weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
+    crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
+    crate::events::NOTIFY_CHANNEL,
+    crate::reaper::PARKED_FIRE_CHANNEL,
+    crate::reaper::STORAGE_SWEEP_CHANNEL,
+    crate::display_feeds::LOOK_NOW_CHANNEL,
+];
+
 /// Build the dispatcher state: connect Postgres, run the core migrations, wire
 /// the env-driven backends (kube, listener/supervisor/worker), resolve the
 /// cluster knobs, and assemble `DispatcherState` from `defaults` plus the shared
@@ -171,7 +186,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
 
     let kube = weft_platform_traits::kube::in_cluster()
         .await
-        .context("init kubectl client (dispatcher needs `kubectl` in PATH)")?;
+        .context("connect to the Kubernetes API")?;
 
     let listener_backend: Arc<dyn ListenerBackend> =
         match std::env::var("WEFT_LISTENER_BACKEND").as_deref() {
@@ -261,9 +276,6 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         }
     }
 
-    let cluster_ingress_namespace = std::env::var("WEFT_CLUSTER_INGRESS_NAMESPACE")
-        .unwrap_or_else(|_| "ingress-nginx".to_string());
-
     // Live caller connection provisioning. The signing secret (hex) is shared
     // with every worker pod (the dispatcher injects it into the spawn spec);
     // empty = live connections disabled (handshake fails loud). The gateway base
@@ -294,12 +306,19 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
     )
     .await
     .with_context(|| format!("connect the lock pool at {database_url}"))?;
-    let event_bus = crate::EventBus::with_notify(pg_pool.clone()).await?;
+    let signals = weft_task_store::pg_signal::PgSignalWatch::start(&pg_pool, DISPATCHER_CHANNELS)
+        .await
+        .context("listen for Postgres signals")?;
+    let event_bus = crate::EventBus::with_notify(pg_pool.clone(), &signals)?;
+    let displays = crate::display_feeds::DisplayFeeds::with_look_now(&signals)?;
 
-    // The control-plane namespace: where pooled, trusted, tenant-agnostic
-    // services run (the infra-supervisor; pooled listeners). They serve many
-    // tenants, so they do not live in any one tenant's namespace.
-    let control_plane_namespace = weft_core::infra::SYSTEM_NAMESPACE.to_string();
+    // Which install this is: every namespace the dispatcher names follows
+    // from it. The control-plane namespace is where pooled, trusted,
+    // tenant-agnostic services run (the infra-supervisor; pooled
+    // listeners). They serve many tenants, so they do not live in any one
+    // tenant's namespace.
+    let instance = weft_core::infra::Instance::from_env().map_err(anyhow::Error::msg)?;
+    let control_plane_namespace = instance.system_namespace();
     let listener_pool = ListenerPool::new(control_plane_namespace.clone());
 
     // Pooled infra-supervisor backend + pool, mirroring the listener.
@@ -324,7 +343,12 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
                 // marker covers both names).
                 let image = std::env::var("WEFT_SUPERVISOR_IMAGE").ok().filter(|v| !v.is_empty())
                     .context("WEFT_SUPERVISOR_IMAGE must name the infra-supervisor image to spawn")?;
-                Arc::new(K8sSupervisorBackend::new(image, broker_url.clone(), kube.clone()))
+                Arc::new(K8sSupervisorBackend::new(
+                    image,
+                    broker_url.clone(),
+                    kube.clone(),
+                    instance.clone(),
+                ))
             }
         };
     let supervisor_pool = SupervisorPool::new(control_plane_namespace.clone());
@@ -358,6 +382,8 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         journal: Arc::new(journal),
         pg_pool,
         lock_pool,
+        signals,
+        displays,
         workers: worker_backend,
         ensure_built,
         projects,
@@ -376,8 +402,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         internet_url,
         cluster_pod_cidr,
         cluster_service_cidr,
-        cluster_ingress_namespace,
-        control_plane_namespace,
+        instance,
         broker_url,
         broker_token_path,
         http: reqwest::Client::builder()
@@ -498,8 +523,10 @@ pub fn spawn_core_loops(state: DispatcherState, registry: crate::task_executor::
     // Task picker loop. Each dispatcher Pod runs one and competes for tasks via
     // SKIP LOCKED.
     let picker_state = state.clone();
-    let picker_store: Arc<dyn weft_task_store::TaskStoreClient> =
-        Arc::new(weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone()));
+    let picker_store: Arc<dyn weft_task_store::TaskStoreClient> = Arc::new(
+        weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone(), state.signals.clone())
+            .expect("the dispatcher's signal watch listens on every task channel"),
+    );
     let picker_pod = state.pod_id.as_str().to_string();
     spawn_supervised("task_picker", async move {
         crate::task_executor::run_picker_loop(picker_store, picker_state, registry, picker_pod)
@@ -538,7 +565,7 @@ pub async fn run(http_port: u16) -> anyhow::Result<()> {
 /// failure is not recovered here; the next sweep adopts an expired lease.
 async fn lease_renewer(state: DispatcherState) {
     use crate::lease;
-    let interval = std::time::Duration::from_secs(lease::LEASE_RENEW_INTERVAL_SECS);
+    let interval = lease::lease_renew_interval();
     let pod_id = state.pod_id.as_str().to_string();
     loop {
         tokio::time::sleep(interval).await;

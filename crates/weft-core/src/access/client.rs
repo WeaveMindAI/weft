@@ -857,11 +857,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_declared_call_never_echoes_interpolated_values() {
-        // Port 9 on localhost refuses; the send fails, and the error must
-        // name the call by its TEMPLATE, never the resolved URL (the query
-        // interpolates a secret here).
+        // A port just freed refuses at once; the send fails, and the error
+        // must name the call by its TEMPLATE, never the resolved URL (the
+        // query interpolates a secret here).
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let call: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({
-            "url": "http://127.0.0.1:9/exchange?client_secret={client_secret}",
+            "url": format!("http://127.0.0.1:{port}/exchange?client_secret={{client_secret}}"),
         }))
         .unwrap();
         let err = run_connect_call(&call, &values(&[("client_secret", "s3cr3t-value")]))

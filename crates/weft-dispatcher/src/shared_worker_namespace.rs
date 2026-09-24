@@ -1,6 +1,6 @@
 //! The shared worker namespace bundle.
 //!
-//! One namespace (`project_namespace::SHARED_WORKER_NAMESPACE`) holds
+//! One namespace per install (`Instance::shared_worker_namespace`) holds
 //! every NO-INFRA project's worker, across all tenants. A no-infra
 //! project never gets its own namespace (that would burn the cluster's
 //! namespace ceiling for a project that needs no infra pods next to its
@@ -35,9 +35,12 @@
 use anyhow::Result;
 use weft_platform_traits::KubeClient;
 
-use crate::project_namespace::SHARED_WORKER_NAMESPACE;
+use weft_core::infra::Instance;
 
 pub struct SharedWorkerNamespaceArgs<'a> {
+    /// The install whose shared namespace this is, and whose broker
+    /// (in its db namespace) the workers call.
+    pub instance: &'a Instance,
     /// Pod CIDR for NetworkPolicy egress exclusions.
     pub pod_cidr: &'a str,
     /// Service CIDR for the same purpose.
@@ -58,8 +61,9 @@ pub async fn ensure(
 }
 
 pub fn render(args: &SharedWorkerNamespaceArgs<'_>) -> String {
-    let SharedWorkerNamespaceArgs { pod_cidr, service_cidr } = args;
-    let namespace = SHARED_WORKER_NAMESPACE;
+    let SharedWorkerNamespaceArgs { instance, pod_cidr, service_cidr } = args;
+    let namespace = instance.shared_worker_namespace();
+    let db_namespace = instance.db_namespace();
     let gateway_namespace = crate::backend::k8s_worker::GATEWAY_NAMESPACE;
     let connection_port = crate::backend::k8s_worker::WORKER_CONNECTION_PORT;
     format!(
@@ -134,11 +138,11 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Broker (cross-ns to weft-db).
+    # Broker (cross-ns to the install's db namespace).
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-db
+              kubernetes.io/metadata.name: {db_namespace}
           podSelector:
             matchLabels:
               weft.dev/role: broker
@@ -185,6 +189,7 @@ mod tests {
 
     fn rendered() -> String {
         render(&SharedWorkerNamespaceArgs {
+            instance: &Instance::default_install(),
             pod_cidr: "10.244.0.0/16",
             service_cidr: "10.96.0.0/12",
         })
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn render_creates_namespace_and_worker_sa() {
         let yaml = rendered();
-        assert!(yaml.contains(&format!("name: {SHARED_WORKER_NAMESPACE}")));
+        assert!(yaml.contains("name: wft-shared-workers"));
         assert!(yaml.contains("name: weft-worker-sa"));
     }
 

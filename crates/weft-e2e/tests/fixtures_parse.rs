@@ -87,14 +87,14 @@ const FILLED_IN_BY_THE_RIG: [&str; 7] = [
 #[test]
 fn every_fixture_graph_compiles() -> anyhow::Result<()> {
     let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;
-    let mut never_needed: Vec<&str> = Vec::new();
-    let mut broken: Vec<String> = Vec::new();
-    for fixture in fixtures()? {
-        let name =
-            fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // One fixture's errors, or `None` when it has no program or its
+    // catalog does not load. Every fixture compiles on its own thread:
+    // they share nothing, and one after another this is among the
+    // slowest tests in the workspace.
+    let errors_of = |fixture: &std::path::Path| -> anyhow::Result<Option<Vec<String>>> {
         let main = fixture.join("src").join("main.weft");
         if !main.is_file() {
-            continue;
+            return Ok(None);
         }
         let source = std::fs::read_to_string(&main)?;
         // The project's own node roots (`nodes/` AND `src/`, since a node
@@ -102,7 +102,7 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         // rig copies the stdlib into each project at deploy time; here
         // every root is read where it already is, so this stays a plain
         // cargo test with no copying and no cluster.
-        let mut roots = weft_compiler::project::node_roots(&fixture).to_vec();
+        let mut roots = weft_compiler::project::node_roots(fixture).to_vec();
         roots.push(stdlib.clone());
         let catalog = match weft_catalog::FsCatalog::discover_roots_with_policy(
             &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
@@ -111,7 +111,7 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
             Ok(c) => c,
             // The catalog's own failure is the other test's finding; not
             // repeating it here keeps one mistake to one report.
-            Err(_) => continue,
+            Err(_) => return Ok(None),
         };
         // The two anchors the CLI gives a program, and they differ:
         // `@file("assets/...")` resolves from the PROJECT ROOT, while
@@ -121,16 +121,40 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         let (_, diagnostics) = weft_compiler::compile_strict(
             &source,
             uuid::Uuid::new_v4(),
-            weft_compiler::CompileFs::disk(&fixture).anchored_at(Some(&src)),
+            weft_compiler::CompileFs::disk(fixture).anchored_at(Some(&src)),
             &catalog,
             weft_compiler::validate::ValidationMode::Structural,
             None,
         );
-        let errors: Vec<String> = diagnostics
-            .into_iter()
-            .filter(|d| d.severity == weft_compiler::Severity::Error)
-            .map(|d| format!("{}: {}", d.code.clone().unwrap_or_default(), d.message))
+        Ok(Some(
+            diagnostics
+                .into_iter()
+                .filter(|d| d.severity == weft_compiler::Severity::Error)
+                .map(|d| format!("{}: {}", d.code.clone().unwrap_or_default(), d.message))
+                .collect(),
+        ))
+    };
+    let fixtures = fixtures()?;
+    let results: Vec<(String, anyhow::Result<Option<Vec<String>>>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = fixtures
+            .iter()
+            .map(|fixture| {
+                let name = fixture
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (name, scope.spawn(|| errors_of(fixture)))
+            })
             .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| (name, handle.join().expect("a fixture's compile panicked")))
+            .collect()
+    });
+    let mut never_needed: Vec<&str> = Vec::new();
+    let mut broken: Vec<String> = Vec::new();
+    for (name, result) in results {
+        let Some(errors) = result? else { continue };
         let excused = FILLED_IN_BY_THE_RIG.contains(&name.as_str());
         if !errors.is_empty() && !excused {
             broken.push(format!("{name}:\n    {}", errors.join("\n    ")));

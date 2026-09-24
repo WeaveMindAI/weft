@@ -37,7 +37,7 @@ weft-core = { workspace = true }
 weft-task-store = { workspace = true }
 # MintJwt acquisitions (GitHub App class): RS256 over the pasted private
 # key, exchanged for the working token at resolution time.
-jsonwebtoken = "10"
+jsonwebtoken = { workspace = true }
 # Per-subscription secret mint (the token a push must echo back).
 rand = "0.8"
 # At-rest sealing of stored credential material (crypt.rs).

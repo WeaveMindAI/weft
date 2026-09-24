@@ -43,7 +43,7 @@ pub async fn list_grants(
     let rows: Vec<(
         uuid::Uuid,
         String,
-        Option<String>,
+        Option<uuid::Uuid>,
         Option<String>,
         Option<String>,
         Value,
@@ -396,7 +396,7 @@ pub(crate) fn value_names_of(values: &BTreeMap<String, String>) -> Value {
 struct NewGrant<'a> {
     spec: &'a AccessSpec,
     registration: &'a Option<AppRegistration>,
-    project_id: Option<String>,
+    project_id: Option<uuid::Uuid>,
     /// Set only by [`publish_grant`]; a person's connect leaves it None.
     published_by_node: Option<String>,
     values: BTreeMap<String, String>,
@@ -500,7 +500,7 @@ async fn insert_grant(
     .bind(&grant.spec.service)
     .bind(registration_snapshot(grant.registration)?)
     .bind(grant.registration.as_ref().map(|r| r.client_id.clone()))
-    .bind(&grant.project_id)
+    .bind(grant.project_id)
     .bind(serde_json::to_value(grant.spec)?)
     .bind(crate::resolve::events_recipe_hash(&grant.spec.events))
     .bind(crate::seal_json(&serde_json::to_value(&grant.values)?)?)
@@ -850,7 +850,7 @@ pub async fn begin_oauth(
     .bind(tenant)
     .bind(&spec.service)
     .bind(crate::seal_json(&serde_json::to_value(registration)?)?)
-    .bind(&req.project_id)
+    .bind(req.project_id)
     .bind(serde_json::to_value(spec)?)
     .bind(serde_json::to_value(&req.permissions)?)
     .bind(verifier.as_deref().map(crate::seal_str))
@@ -918,7 +918,7 @@ struct ClaimedConnect {
     tenant: String,
     service: String,
     registration: AppRegistration,
-    project_id: Option<String>,
+    project_id: Option<uuid::Uuid>,
     spec_json: Value,
     ticked_json: Value,
     verifier: Option<String>,
@@ -943,7 +943,7 @@ async fn complete_oauth_inner(
         String,
         String,
         String,
-        Option<String>,
+        Option<uuid::Uuid>,
         Value,
         Value,
         Option<String>,
@@ -1168,7 +1168,7 @@ async fn finish_connect(
         None => {
             let project = match spec.grants {
                 GrantCoexistence::Exclusive => None,
-                GrantCoexistence::Coexisting => project_id.clone(),
+                GrantCoexistence::Coexisting => project_id,
             };
             // The same write path a pasted connection and a published
             // one take. A consent is a third way a connection comes
@@ -1180,7 +1180,7 @@ async fn finish_connect(
                 NewGrant {
                     spec: &spec,
                     registration: &Some(registration.clone()),
-                    project_id: project.clone(),
+                    project_id: project,
                     published_by_node: None,
                     values: values.clone(),
                     granted: granted.clone(),
@@ -1516,7 +1516,7 @@ mod tests {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublishAccess {
     pub spec: AccessSpec,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// The node doing the publishing. Its connection, so a second
     /// publish updates that one row instead of piling up a new one,
     /// and terminating the node takes it away with it.
@@ -1579,7 +1579,7 @@ pub async fn publish_grant(
 pub async fn published_connection(
     pool: &PgPool,
     tenant: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: &str,
     service: &str,
 ) -> anyhow::Result<Option<PublishedConnection>> {
@@ -1611,7 +1611,7 @@ pub async fn published_connection(
 pub async fn delete_published_grants<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     tenant: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: Option<&str>,
 ) -> anyhow::Result<u64> {
     Ok(sqlx::query(

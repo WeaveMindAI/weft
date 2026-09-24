@@ -25,10 +25,9 @@ use weft_e2e::{ensure, run, project::Project};
 #[tokio::test]
 async fn wake_reaches_a_timer_inside_an_included_file_through_its_site() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_addressing", disp.clone()).await?;
+    let project = Project::prepare("include_addressing", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let held = color_of(&stdout)?;
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
 
@@ -54,10 +53,9 @@ async fn wake_reaches_a_timer_inside_an_included_file_through_its_site() -> anyh
 #[tokio::test]
 async fn a_parked_run_names_the_node_it_waits_on_through_its_site() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("include_addressing", disp.clone()).await?;
+    let project = Project::prepare("include_addressing", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let held = color_of(&stdout)?;
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
 

@@ -32,7 +32,7 @@ pub use weft_broker_client::protocol::{FailureStage, InfraNodeStatus, UnitRuntim
 /// One row in `infra_node`.
 #[derive(Debug, Clone)]
 pub struct InfraNodeRow {
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// The instance's place, spelled (see the module doc).
     pub node_id: String,
     /// Stable per-apply id (Deployment name etc). Empty string when
@@ -52,6 +52,11 @@ pub struct InfraNodeRow {
     /// resolve endpoints by name, and a deterministic order keeps any
     /// "first" semantics stable.
     pub endpoints: BTreeMap<String, String>,
+    /// Endpoint name → the path a `TenantPublic` endpoint answers at on
+    /// the front door (`/infra/<namespace>/<instance>/<declared path>`),
+    /// for that kind of endpoint only. A path, not a URL: the front
+    /// door's address is the install's, joined on read.
+    pub public_paths: BTreeMap<String, String>,
     /// PVC names to KEEP on terminate. Carried from
     /// `InfraSpec.lifecycle.on_terminate.preserve_pvcs` at apply
     /// time so the supervisor can honor it at terminate time
@@ -70,7 +75,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &["infra_node"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_node (
-            project_id          TEXT NOT NULL,
+            project_id          UUID NOT NULL,
             node_id             TEXT NOT NULL,
             instance_id         TEXT NOT NULL DEFAULT '',
             namespace           TEXT NOT NULL,
@@ -80,6 +85,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             applied_spec_hash   TEXT,
             applied_at_unix     BIGINT,
             endpoints_json      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- Endpoint name to its front-door path, for TenantPublic
+            -- endpoints only. Stamped at apply.
+            public_paths_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
             -- PVC names to preserve on terminate. JSON array;
             -- empty means "delete all matching PVCs."
             preserve_pvcs_json  JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -100,7 +108,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// stop/terminate API handlers for transient states like Stopping.
 pub async fn set_status(
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: &str,
     status: InfraNodeStatus,
 ) -> Result<()> {
@@ -115,11 +123,11 @@ pub async fn set_status(
 
 /// Read one (project, node) row. Returns None when the row doesn't
 /// exist (no infra was ever applied for this node).
-pub async fn get(pool: &PgPool, project_id: &str, node_id: &str) -> Result<Option<InfraNodeRow>> {
+pub async fn get(pool: &PgPool, project_id: uuid::Uuid, node_id: &str) -> Result<Option<InfraNodeRow>> {
     let row = sqlx::query(
         "SELECT project_id, node_id, instance_id, namespace, status, \
                 failure_stage, failure_message, applied_spec_hash, \
-                applied_at_unix, endpoints_json, preserve_pvcs_json, units_json \
+                applied_at_unix, endpoints_json, public_paths_json, preserve_pvcs_json, units_json \
          FROM infra_node WHERE project_id = $1 AND node_id = $2",
     )
     .bind(project_id)
@@ -135,12 +143,12 @@ pub async fn get(pool: &PgPool, project_id: &str, node_id: &str) -> Result<Optio
 /// List every row for a project. Drives the project status response.
 pub async fn list_for_project(
     pool: &PgPool,
-    project_id: &str,
+    project_id: uuid::Uuid,
 ) -> Result<Vec<InfraNodeRow>> {
     let rows = sqlx::query(
         "SELECT project_id, node_id, instance_id, namespace, status, \
                 failure_stage, failure_message, applied_spec_hash, \
-                applied_at_unix, endpoints_json, preserve_pvcs_json, units_json \
+                applied_at_unix, endpoints_json, public_paths_json, preserve_pvcs_json, units_json \
          FROM infra_node WHERE project_id = $1",
     )
     .bind(project_id)
@@ -155,7 +163,7 @@ pub async fn list_for_project(
 /// terminated) has no rows, so its worker (including the InfraSetup
 /// provisioning execution) runs in the shared pool; the first apply
 /// writes a row and subsequent workers land in the project namespace.
-pub async fn any_for_project(pool: &PgPool, project_id: &str) -> Result<bool> {
+pub async fn any_for_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
     let (exists,): (bool,) =
         sqlx::query_as("SELECT EXISTS(SELECT 1 FROM infra_node WHERE project_id = $1)")
             .bind(project_id)
@@ -166,7 +174,7 @@ pub async fn any_for_project(pool: &PgPool, project_id: &str) -> Result<bool> {
 
 /// Delete a row by (project, node). Idempotent. Called by the
 /// supervisor after a successful terminate.
-pub async fn remove(pool: &PgPool, project_id: &str, node_id: &str) -> Result<bool> {
+pub async fn remove(pool: &PgPool, project_id: uuid::Uuid, node_id: &str) -> Result<bool> {
     let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2")
         .bind(project_id)
         .bind(node_id)
@@ -177,10 +185,13 @@ pub async fn remove(pool: &PgPool, project_id: &str, node_id: &str) -> Result<bo
 
 /// Drop every row for a project. Called on `weft rm` after the
 /// project's terminate has completed.
-pub async fn remove_project(pool: &PgPool, project_id: &str) -> Result<u64> {
+pub async fn remove_project<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    project_id: uuid::Uuid,
+) -> Result<u64> {
     let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1")
         .bind(project_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected())
 }
@@ -192,7 +203,7 @@ pub async fn remove_project(pool: &PgPool, project_id: &str) -> Result<u64> {
 /// to None / empty (which would let downstream observe a half-valid
 /// row).
 fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
-    let project_id: String = row.try_get("project_id")?;
+    let project_id: uuid::Uuid = row.try_get("project_id")?;
     let node_id: String = row.try_get("node_id")?;
     let instance_id: String = row.try_get("instance_id")?;
     let namespace: String = row.try_get("namespace")?;
@@ -224,6 +235,14 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
+    let public_paths_json: Value = row.try_get("public_paths_json")?;
+    let public_paths: BTreeMap<String, String> = serde_json::from_value(public_paths_json)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "infra_node.public_paths_json for project={project_id} node={node_id} \
+                 is not a string-to-string map: {e}"
+            )
+        })?;
     let preserve_pvcs_json: Value = row.try_get("preserve_pvcs_json")?;
     let preserve_pvcs: Vec<String> = serde_json::from_value(preserve_pvcs_json)
         .map_err(|e| {
@@ -233,7 +252,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
             )
         })?;
     let units_json: Value = row.try_get("units_json")?;
-    let units = weft_broker_client::protocol::decode_units_json(units_json, &project_id, &node_id)?;
+    let units = weft_broker_client::protocol::decode_units_json(units_json, project_id, &node_id)?;
     Ok(InfraNodeRow {
         project_id,
         node_id,
@@ -245,6 +264,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         applied_spec_hash,
         applied_at_unix,
         endpoints,
+        public_paths,
         preserve_pvcs,
         units,
     })

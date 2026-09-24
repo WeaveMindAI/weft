@@ -34,10 +34,9 @@ use weft_e2e::{ensure, project::Project, run, SettledRun};
 #[tokio::test]
 async fn an_unparseable_example_file_is_never_overwritten() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?;
 
     // A spec with one character wrong: valid-looking, not valid JSON.
@@ -69,10 +68,9 @@ async fn an_unparseable_example_file_is_never_overwritten() -> anyhow::Result<()
 #[tokio::test]
 async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), color).await?.completed()?;
     project.weft(&["freeze", "chain", &color.to_string()]).await?;
@@ -108,7 +106,7 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
 #[tokio::test]
 async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     // Build output, and two folders that merely look like it. What
     // makes `nodes/pkg/target` cargo's is the `Cargo.toml` beside it;
@@ -121,7 +119,6 @@ async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result
     // The first gesture in this project is the checkpoint: nothing has
     // run, nothing is built, and a save point still has to work.
     let first = project.weft(&["checkpoint", "--json"]).await?;
-    project.mark_registered();
     let first: Value = serde_json::from_str(first.trim())?;
     let version = first["version"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!version.is_empty(), "checkpoint answers a version: {first}");
@@ -182,11 +179,10 @@ async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result
 #[tokio::test]
 async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
     // The head the two sessions will then race to move. It is also what
     // registers the project: nothing has run here.
     project.weft(&["checkpoint", "--json"]).await?;
-    project.mark_registered();
 
     // A second checkout of the SAME project, and a different edit in
     // each, so the two checkpoints are two versions rather than one.
@@ -195,8 +191,8 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
     std::fs::write(other.join("prompts/greeting.txt"), "from the second session\n")?;
 
     let (a, b) = tokio::join!(
-        weft_e2e::client::cli(project.dir(), &["checkpoint", "first", "--json"]),
-        weft_e2e::client::cli(&other, &["checkpoint", "second", "--json"]),
+        weft_e2e::client::cli(project.dispatcher(), project.dir(), &["checkpoint", "first", "--json"]),
+        weft_e2e::client::cli(project.dispatcher(), &other, &["checkpoint", "second", "--json"]),
     );
     let (a, b) = (a?, b?);
 
@@ -296,7 +292,7 @@ async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<
     // Deactivate with a Wait drain: it holds open while the run holds.
     let pid = project.id();
     let deact = spawn_weft(
-        project.dir().to_path_buf(),
+        &project,
         vec![
             "deactivate".into(),
             "--mode".into(),

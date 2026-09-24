@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "weft_dispatcher=info,tower_http=debug".into()),
         )
         .init();
+    weft_core::time_scale::announce();
 
     let args = Args::parse();
     run(args.http_port).await

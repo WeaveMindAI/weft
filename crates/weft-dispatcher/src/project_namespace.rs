@@ -18,40 +18,38 @@
 //!     ClusterRoles (defined in cluster-rbac.yaml) into this namespace.
 //!
 //! Naming convention:
-//!   `wft-project-<tenant>--<project>` (both ids sanitized + truncated to
-//!   a stable 12-char prefix, joined by a DOUBLE dash, to fit in the
-//!   63-char DNS label limit). See [`name_for`].
+//!   `<install prefix><tenant>--<project>`, `wft-project-<tenant>--<project>`
+//!   on the default install (both ids sanitized + truncated to a stable
+//!   12-char prefix, joined by a DOUBLE dash, to fit in the 63-char DNS
+//!   label limit). See [`name_for`].
 
 use anyhow::Result;
-
-/// The single shared namespace that holds every no-infra project's
-/// worker, across all tenants. Created once, lazily, the first time a
-/// no-infra worker is placed (see `shared_worker_namespace::ensure`);
-/// never torn down (it is cluster-singleton infrastructure). Cross-
-/// tenant isolation inside it is a blanket pod-to-pod-deny
-/// NetworkPolicy: workers never talk to each other.
-// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
-pub const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
+use weft_core::infra::Instance;
 
 /// The k8s namespace a project's WORKER pods run in, the single source
 /// of truth for worker placement. A project with infra gets its own
 /// per-project namespace (the worker sits next to its infra pods); a
-/// project with no infra shares [`SHARED_WORKER_NAMESPACE`]. Every
-/// worker spawn, DNS computation, and teardown routes through this one
-/// function so there is no second answer to "where does this project's
-/// worker live."
-pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> String {
+/// project with no infra shares the install's shared worker namespace
+/// (`Instance::shared_worker_namespace`: created lazily the first time a
+/// no-infra worker is placed, never torn down, every worker walled off
+/// from the others by a pod-to-pod-deny NetworkPolicy). Every worker
+/// spawn, DNS computation, and teardown routes through this one function
+/// so there is no second answer to "where does this project's worker
+/// live."
+pub fn worker_namespace(instance: &Instance, has_infra: bool, tenant: &str, project_id: uuid::Uuid) -> String {
     if has_infra {
-        name_for(tenant, project_id)
+        name_for(instance, tenant, project_id)
     } else {
-        SHARED_WORKER_NAMESPACE.to_string()
+        instance.shared_worker_namespace()
     }
 }
 
 /// Compute the project namespace name from tenant + project ids.
 /// Both are sanitized + truncated so the resulting name fits in 63
 /// chars and uses only `[a-z0-9-]`.
-/// Project namespace name: `wft-project-<tenant>--<project>`.
+/// Project namespace name: the install's project prefix, then
+/// `<tenant>--<project>` (`wft-project-<tenant>--<project>` on the
+/// default install).
 ///
 /// The DOUBLE dash between tenant and project is the unambiguous
 /// separator: both tenant and project labels may contain single
@@ -61,10 +59,10 @@ pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> Stri
 /// Nothing resolves a tenant from this string, and nothing resolves
 /// one from the namespace at all: the broker identifies a worker by
 /// its pod, so a crafted namespace name names nobody.
-pub fn name_for(tenant: &str, project_id: &str) -> String {
+pub fn name_for(instance: &Instance, tenant: &str, project_id: uuid::Uuid) -> String {
     let t = short_label(tenant, 12);
-    let p = short_label(project_id, 12);
-    format!("wft-project-{t}--{p}")
+    let p = short_label(&project_id.to_string(), 12);
+    format!("{}{t}--{p}", instance.project_namespace_prefix())
 }
 
 /// A string that has been sanitized to a k8s-label-safe form
@@ -142,7 +140,7 @@ pub struct ProjectNamespaceArgs<'a> {
     // can forget to sanitize; this one is the module that owns
     // `short_label` and needs the raw value regardless, so it
     // sanitizes inline at the one interpolation point.
-    pub project_id: &'a str,
+    pub project_id: uuid::Uuid,
     pub tenant_id: &'a str,
     /// Namespace name (as produced by [`name_for`]).
     pub namespace: &'a str,
@@ -151,16 +149,16 @@ pub struct ProjectNamespaceArgs<'a> {
     pub pod_cidr: &'a str,
     /// Service CIDR for the same purpose.
     pub service_cidr: &'a str,
-    /// The ingress controller's namespace (typically `ingress-nginx`).
-    pub ingress_namespace: &'a str,
-    /// The control-plane namespace, where the pooled (trusted, tenant-agnostic)
-    /// listener + supervisor pods run. Their RoleBindings into this project
-    /// namespace bind the SAs HERE, and the NetworkPolicies allow
-    /// listener/supervisor traffic FROM here. (There is no per-tenant `storage`
-    /// pod: a worker's runtime file bytes go DIRECTLY to the object store via
-    /// presigned URLs, so the worker egress allows the broker (control) + the
-    /// object store (bytes), not a storage-pod relay.)
-    pub control_plane_namespace: &'a str,
+    /// The install this namespace belongs to. Its system namespace is where
+    /// the pooled (trusted, tenant-agnostic) listener + supervisor pods and
+    /// the dispatcher run: their RoleBindings into this project namespace
+    /// bind the SAs THERE, and the NetworkPolicies allow their traffic FROM
+    /// there. Its db namespace is where the broker the workers call runs.
+    /// (There is no per-tenant `storage` pod: a worker's runtime file bytes
+    /// go DIRECTLY to the object store via presigned URLs, so the worker
+    /// egress allows the broker (control) + the object store (bytes), not a
+    /// storage-pod relay.)
+    pub instance: &'a Instance,
 }
 
 /// Render the project-namespace bundle as a single multi-doc YAML.
@@ -175,15 +173,16 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
         namespace,
         pod_cidr,
         service_cidr,
-        ingress_namespace,
-        control_plane_namespace,
+        instance,
     } = args;
+    let control_plane_namespace = instance.system_namespace();
+    let db_namespace = instance.db_namespace();
     // Sanitize the ids for the manifest LABEL values (the raw
     // `tenant_id` is kept by `ensure` for the registry key). `_label`
     // shadows so the raw values can't accidentally be interpolated
     // below.
     let tenant_id = SafeLabel::new(tenant_id, 63);
-    let project_id = SafeLabel::new(project_id, 63);
+    let project_id = SafeLabel::new(&project_id.to_string(), 63);
     // Namespace the Envoy Gateway runs in (its default install namespace);
     // the only source allowed to reach worker connection ports. Worker
     // port pulled from the one constant so it can't drift from the pod
@@ -250,11 +249,11 @@ spec:
         - protocol: TCP
           port: {connection_port}
   egress:
-    # Broker (cross-ns to weft-db).
+    # Broker (cross-ns to the install's db namespace).
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-db
+              kubernetes.io/metadata.name: {db_namespace}
           podSelector:
             matchLabels:
               weft.dev/role: broker
@@ -331,22 +330,24 @@ spec:
           podSelector:
             matchLabels:
               weft.dev/role: infra-supervisor
-    # Dispatcher (cross-ns from weft-system) for /live-proxy.
+    # Dispatcher (cross-ns from the install's system namespace) for
+    # /live-proxy.
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weft-system
+              kubernetes.io/metadata.name: {control_plane_namespace}
           podSelector:
             matchLabels:
               weft.dev/role: dispatcher
-    # Ingress controller for TenantPublic endpoints.
+    # The front door's proxy, for TenantPublic endpoints (an HTTPRoute
+    # on its `local` listener, see weft-core `infra::compile`).
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {ingress_namespace}
+              kubernetes.io/metadata.name: {gateway_namespace}
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: ingress-nginx
+              app.kubernetes.io/name: envoy
   egress:
     # Internet egress. Per-node InfraSpec.access.egress may further
     # restrict via additional NetworkPolicies stamped at apply time.
@@ -416,9 +417,21 @@ pub async fn delete(kube: &dyn weft_platform_traits::KubeClient, namespace: &str
 mod tests {
     use super::*;
 
+    fn default_install() -> Instance {
+        Instance::default_install()
+    }
+
+    fn name_for(tenant: &str, project_id: uuid::Uuid) -> String {
+        super::name_for(&default_install(), tenant, project_id)
+    }
+
+    fn worker_namespace(has_infra: bool, tenant: &str, project_id: uuid::Uuid) -> String {
+        super::worker_namespace(&default_install(), has_infra, tenant, project_id)
+    }
+
     #[test]
     fn name_for_truncates_and_normalizes() {
-        let n = name_for("Tenant-FOO", "abcdef-12345678-9999");
+        let n = name_for("Tenant-FOO", uuid::Uuid::from_u128(u128::MAX));
         assert!(n.starts_with("wft-project-"));
         assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         assert!(n.len() <= 63);
@@ -446,36 +459,35 @@ mod tests {
 
     #[test]
     fn name_for_is_deterministic() {
-        let a = name_for("local", "deadbeef");
-        let b = name_for("local", "deadbeef");
+        let a = name_for("local", uuid::Uuid::from_u128(0xdeadbeef));
+        let b = name_for("local", uuid::Uuid::from_u128(0xdeadbeef));
         assert_eq!(a, b);
     }
+
+    // Distinct in the leading characters the namespace keeps, the way
+    // two random project ids are.
+    const P1: uuid::Uuid = uuid::Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+    const P2: uuid::Uuid = uuid::Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
 
     #[test]
     fn worker_namespace_routes_on_has_infra() {
         // No infra: the shared namespace, regardless of tenant/project.
-        assert_eq!(
-            worker_namespace(false, "local", "p1"),
-            SHARED_WORKER_NAMESPACE
-        );
-        assert_eq!(
-            worker_namespace(false, "tenant-xyz", "p2"),
-            SHARED_WORKER_NAMESPACE
-        );
+        assert_eq!(worker_namespace(false, "local", P1), "wft-shared-workers");
+        assert_eq!(worker_namespace(false, "tenant-xyz", P2), "wft-shared-workers");
         // Infra: the project's own namespace (== name_for).
         assert_eq!(
-            worker_namespace(true, "local", "p1"),
-            name_for("local", "p1")
+            worker_namespace(true, "local", P1),
+            name_for("local", P1)
         );
         // Two infra projects never collide; a no-infra and an infra
         // project never share a namespace.
         assert_ne!(
-            worker_namespace(true, "local", "p1"),
-            worker_namespace(true, "local", "p2")
+            worker_namespace(true, "local", P1),
+            worker_namespace(true, "local", P2)
         );
         assert_ne!(
-            worker_namespace(false, "local", "p1"),
-            worker_namespace(true, "local", "p1")
+            worker_namespace(false, "local", P1),
+            worker_namespace(true, "local", P1)
         );
     }
 
@@ -483,18 +495,18 @@ mod tests {
     fn name_for_uses_distinct_components() {
         // Different tenants for the same project id must yield
         // distinct namespaces.
-        let a = name_for("t1", "p1");
-        let b = name_for("t2", "p1");
+        let a = name_for("t1", P1);
+        let b = name_for("t2", P1);
         assert_ne!(a, b);
         // And vice versa.
-        let c = name_for("t1", "p1");
-        let d = name_for("t1", "p2");
+        let c = name_for("t1", P1);
+        let d = name_for("t1", P2);
         assert_ne!(c, d);
     }
 
     #[test]
     fn name_for_uses_double_dash_separator() {
-        let n = name_for("local", "88d7eec8-6ffc-4cb4-8582-380fd65f2643");
+        let n = name_for("local", uuid::Uuid::from_u128(0x88d7eec86ffc4cb48582380fd65f2643));
         // The double-dash is the unambiguous separator between
         // tenant + project, keeping the namespace name a lossless
         // join of its two parts. Nothing resolves a tenant by parsing
@@ -507,22 +519,42 @@ mod tests {
     fn short_label_collapses_dash_runs() {
         // The double-dash separator only works if neither component
         // produces `--`. Multi-dash tenant inputs must collapse.
-        let n = name_for("user--x", "proj1");
-        // After collapsing runs: tenant="user-x", project="proj1".
-        // Separator stays "--".
-        assert_eq!(n, "wft-project-user-x--proj1");
+        let n = name_for("user--x", uuid::Uuid::from_u128(1));
+        // After collapsing runs: tenant="user-x", project cut to its
+        // first 12 characters. Separator stays "--".
+        assert_eq!(n, "wft-project-user-x--00000000-000");
     }
 
-    fn args() -> ProjectNamespaceArgs<'static> {
+    #[test]
+    fn a_named_install_places_workers_in_its_own_namespaces() {
+        let cell = Instance::named("cell1").unwrap();
+        assert_eq!(super::worker_namespace(&cell, false, "local", uuid::Uuid::from_u128(1)), "wft-cell1-shared-workers");
+        assert_eq!(super::name_for(&cell, "local", uuid::Uuid::from_u128(1)), "wft-cell1-project-local--00000000-000");
+    }
+
+    fn args_for(instance: &Instance) -> ProjectNamespaceArgs<'_> {
         ProjectNamespaceArgs {
-            project_id: "proj1",
+            project_id: uuid::Uuid::from_u128(1),
             tenant_id: "alice",
             namespace: "wft-project-alice--proj1",
             pod_cidr: "10.244.0.0/16",
             service_cidr: "10.96.0.0/12",
-            ingress_namespace: "ingress-nginx",
-            control_plane_namespace: "weft-system",
+            instance,
         }
+    }
+
+    fn args() -> ProjectNamespaceArgs<'static> {
+        static DEFAULT: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
+        args_for(DEFAULT.get_or_init(Instance::default_install))
+    }
+
+    #[test]
+    fn render_names_the_installs_own_control_plane_and_broker() {
+        let cell = Instance::named("cell1").unwrap();
+        let yaml = render(&args_for(&cell));
+        assert!(yaml.contains("kubernetes.io/metadata.name: weft-cell1-db"), "{yaml}");
+        assert!(yaml.contains("namespace: weft-cell1-system"), "{yaml}");
+        assert!(!yaml.contains("weft-system") && !yaml.contains("name: weft-db"), "{yaml}");
     }
 
     #[test]
@@ -581,7 +613,7 @@ mod tests {
     fn render_stamps_project_and_tenant_labels() {
         let yaml = render(&args());
         assert!(yaml.contains("weft.dev/tenant: \"alice\""));
-        assert!(yaml.contains("weft.dev/project: \"proj1\""));
+        assert!(yaml.contains("weft.dev/project: \"00000000-0000-0000-0000-000000000001\""));
     }
 
     #[test]
@@ -600,8 +632,11 @@ mod tests {
     }
 
     #[test]
-    fn render_infra_policy_allows_ingress_controller() {
+    fn render_infra_policy_admits_the_front_door_proxy() {
         let yaml = render(&args());
-        assert!(yaml.contains("ingress-nginx"));
+        let infra = &yaml[yaml.find("name: infra-policy").expect("an infra policy")..];
+        assert!(infra.contains("kubernetes.io/metadata.name: envoy-gateway-system"));
+        assert!(infra.contains("app.kubernetes.io/name: envoy"));
+        assert!(!yaml.contains("ingress-nginx"));
     }
 }

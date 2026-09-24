@@ -76,14 +76,20 @@ fn every_stdlib_node_test_passes() {
         .unwrap_or_else(|e| panic!("prepare the test workspace: {e}"));
     let binaries = weft_compiler::build::build_node_test_binaries(&workspace)
         .unwrap_or_else(|e| panic!("build the node-test binaries: {e}"));
-    for package in &packages {
-        let binary = binaries
-            .get(package)
-            .unwrap_or_else(|| panic!("no binary built for '{package}'"));
-        run_package(binary, package);
-        // Same as `weft test-node`: the binary is an output, not a
-        // cache, and keeping 29 of them left 3.2GB in every dev's
-        // target/tmp for nothing. Relinking costs no measurable time.
-        weft_compiler::build::drop_built_binary(binary);
-    }
+    // Every package's binary runs at once: they share nothing, and one
+    // after another the sweep is the slowest test in the workspace.
+    std::thread::scope(|scope| {
+        for package in &packages {
+            let binary = binaries
+                .get(package)
+                .unwrap_or_else(|| panic!("no binary built for '{package}'"));
+            scope.spawn(move || {
+                run_package(binary, package);
+                // Same as `weft test-node`: the binary is an output, not a
+                // cache, and keeping 29 of them left 3.2GB in every dev's
+                // target/tmp for nothing. Relinking costs no measurable time.
+                weft_compiler::build::drop_built_binary(binary);
+            });
+        }
+    });
 }

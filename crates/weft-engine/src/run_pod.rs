@@ -5,8 +5,9 @@
 //!
 //! Lifecycle:
 //!   1. `register_alive` writes the worker_pod row (via the broker).
-//!   2. The heartbeat task keeps it fresh; if the row goes away
-//!      (drained, reaped) we set `shutdown=true`.
+//!   2. The heartbeat task keeps it fresh and reads the pod's standing
+//!      off it (`PodStanding`): draining, or gone (reaped), which shuts
+//!      the pod down.
 //!   3. The picker claims worker tasks for our project_id. `execute`
 //!      / `resume` are spawned in the background (per-task heartbeat
 //!      keeps the claim alive while they run). `cancel_execution`
@@ -16,9 +17,7 @@
 //!      their endings, settle the money, mark the row done.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
@@ -39,8 +38,11 @@ use crate::execution_driver::{run_one_execution, ExecutionOutcome};
 /// How long the worker picker sits idle (no claimable work) before
 /// attempting its guarded self-exit. The grace this gives a burst
 /// of executions: a new exec arriving within this window reuses the
-/// warm pod instead of paying a cold respawn.
-const WORKER_IDLE_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// warm pod instead of paying a cold respawn. 30 seconds in real time, at
+/// this install's pace (`weft_core::time_scale`).
+fn worker_idle_exit() -> std::time::Duration {
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(30))
+}
 
 /// Pod-scoped registry: per-color cancellation flag for an in-flight
 /// execution. cancel_execution looks up by color and fires the flag.
@@ -163,7 +165,7 @@ impl weft_task_store::executor::IdleExit for WorkerIdleExit {
 /// round trip.
 #[derive(Clone)]
 struct WorkerCtx {
-    project_id: String,
+    project_id: uuid::Uuid,
     catalog: Arc<dyn NodeCatalog>,
     clients: EngineClients,
     pod_name: String,
@@ -327,7 +329,7 @@ pub async fn run_pod(
     clients: EngineClients,
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
-    project_id: String,
+    project_id: uuid::Uuid,
     tenant_id: String,
     namespace: String,
     // Live caller connection server: the TCP port the worker accepts
@@ -344,22 +346,21 @@ pub async fn run_pod(
     token_secret: Option<Vec<u8>>,
 ) -> Result<()> {
     weft_core::net::install_crypto_provider();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    // Set by the heartbeat once the row says so; read by the picker to
-    // drop its idle grace. The pod cannot know it is draining any other
-    // way: the decision is made on its row by a replacement or a
+    weft_core::time_scale::announce();
+    // What the heartbeat learns off the pod's own row (draining, or
+    // gone), read by the picker. The pod cannot know it is draining any
+    // other way: the decision is made on its row by a replacement or a
     // scale-down, never by the pod.
-    let draining = Arc::new(AtomicBool::new(false));
+    let standing = weft_task_store::PodStanding::new();
     let cancel_registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     worker_pods
-        .register_alive(&pod_name, &project_id)
+        .register_alive(&pod_name, project_id)
         .await?;
     spawn_heartbeat(
         worker_pods.clone(),
         pod_name.clone(),
-        shutdown.clone(),
-        draining.clone(),
+        standing.clone(),
         weft_platform_traits::CgroupMemPressure::new(),
     );
 
@@ -390,7 +391,7 @@ pub async fn run_pod(
     }
     let picker_tasks = clients.tasks.clone();
     let ctx = WorkerCtx {
-        project_id: project_id.clone(),
+        project_id,
         catalog,
         clients,
         pod_name: pod_name.clone(),
@@ -409,7 +410,7 @@ pub async fn run_pod(
         .register(TaskKind::CancelExecution, Arc::new(CancelExecutionKind))
         .build();
 
-    // Idle self-exit: after `WORKER_IDLE_EXIT` of no claimable
+    // Idle self-exit: after `worker_idle_exit()` of no claimable
     // work, the picker attempts the guarded `alive -> done` CAS via
     // the broker. The CAS (not the timer) is the correctness gate.
     let pending_costs = ctx.clients.pending_costs.clone();
@@ -430,10 +431,9 @@ pub async fn run_pod(
         registry,
         pod_name.clone(),
         project_id,
-        shutdown.clone(),
+        standing.clone(),
         idle_exit,
-        WORKER_IDLE_EXIT,
-        draining,
+        worker_idle_exit(),
         background.clone(),
     )
     .await;
@@ -455,7 +455,7 @@ pub async fn run_pod(
         )
         .await;
     }
-    shutdown.store(true, Ordering::Relaxed);
+    standing.shut_down();
     // Then WAIT for them. A cancel asks an execution to stop; it does
     // not stop it. The driver checks the flag at the top of each
     // iteration, lets its in-flight node tasks finish, folds the journal
@@ -519,30 +519,29 @@ async fn cancel_color(
     }
 }
 
-/// Background heartbeat. Sets `shutdown` to true if the worker_pod
-/// row stops being alive (mark_done / mark_dead, row deleted), or if
-/// the broker has been unreachable long enough that the row's lease
-/// would have lapsed anyway. Bounding consecutive errors prevents an
-/// orphaned pod from running forever after the broker disappears.
+/// Background heartbeat. Shuts the pod down (`PodStanding::shut_down`)
+/// if the worker_pod row stops being alive (mark_done / mark_dead, row
+/// deleted), or if the broker has been unreachable long enough that the
+/// row's lease would have lapsed anyway, and marks it draining when the
+/// row says so. Bounding consecutive errors prevents an orphaned pod
+/// from running forever after the broker disappears.
 fn spawn_heartbeat(
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
-    shutdown: Arc<AtomicBool>,
-    draining: Arc<AtomicBool>,
+    standing: Arc<weft_task_store::PodStanding>,
     mem_pressure: Arc<dyn weft_platform_traits::MemPressure>,
 ) {
-    let interval = Duration::from_secs(weft_task_store::HEARTBEAT_INTERVAL_SECS);
+    let interval = weft_task_store::heartbeat_interval();
     // After this many consecutive errors, the row's stale-recovery
     // window has elapsed and the dispatcher will (or already has)
     // reaped this pod's row. The pod must self-terminate.
-    let max_consecutive_errors = (weft_task_store::HEARTBEAT_STALE_SECS as u64
-        / weft_task_store::HEARTBEAT_INTERVAL_SECS) as u32
-        + 1;
+    let max_consecutive_errors =
+        (weft_task_store::heartbeat_stale_secs() as f64 / interval.as_secs_f64()) as u32 + 1;
     tokio::spawn(async move {
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
-            if shutdown.load(Ordering::Relaxed) {
+            if standing.is_shut_down() {
                 break;
             }
             // Read the pod's own cgroup memory pressure each tick and
@@ -551,9 +550,9 @@ fn spawn_heartbeat(
             // there is no cgroup limit, so one worker until squeezed).
             let pressure = mem_pressure.fraction();
             match worker_pods.heartbeat(&pod_name, pressure).await {
-                Ok(Some(standing)) => {
+                Ok(Some(row)) => {
                     consecutive_errors = 0;
-                    if standing.draining && !draining.swap(true, Ordering::Relaxed) {
+                    if row.draining && standing.start_draining() {
                         tracing::info!(
                             target: "weft_engine::run_pod",
                             %pod_name,
@@ -567,7 +566,7 @@ fn spawn_heartbeat(
                         %pod_name,
                         "worker_pod row no longer alive; signalling shutdown"
                     );
-                    shutdown.store(true, Ordering::Relaxed);
+                    standing.shut_down();
                     break;
                 }
                 Err(e) => {
@@ -578,7 +577,7 @@ fn spawn_heartbeat(
                             %pod_name, error = %e, consecutive_errors,
                             "heartbeat unreachable past stale-recovery window; signalling shutdown"
                         );
-                        shutdown.store(true, Ordering::Relaxed);
+                        standing.shut_down();
                         break;
                     }
                     tracing::warn!(
@@ -1205,7 +1204,7 @@ async fn fetch_or_cached_project(
     match ctx
         .clients
         .project
-        .fetch_definition(&ctx.project_id, definition_hash)
+        .fetch_definition(ctx.project_id, definition_hash)
         .await?
     {
         Some(def) => {

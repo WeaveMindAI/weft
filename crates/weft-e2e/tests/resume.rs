@@ -30,7 +30,7 @@ use weft_e2e::{ensure, fakes::SseFake, human, platform::Platform, project::Proje
 #[tokio::test]
 async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
     let mut project = Project::prepare("human_form", disp.clone()).await?;
     let pid = project.id();
 

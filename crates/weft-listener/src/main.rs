@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "weft_listener=info".into()),
         )
         .init();
+    weft_core::time_scale::announce();
 
     let config = ListenerConfig {
         pod_name: std::env::var("WEFT_POD_NAME").context("WEFT_POD_NAME")?,

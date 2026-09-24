@@ -38,7 +38,7 @@ impl TaskExecutor<DispatcherState> for StopTaggedExecutor {
             .parse()
             .map_err(|e| anyhow::anyhow!("bad `by` color in stop_tagged payload: {e}"))?;
         let stopped = stop_tagged(
-            state, &payload.project_id, &payload.tag, by, payload.before_seq, payload.stop_self,
+            state, payload.project_id, &payload.tag, by, payload.before_seq, payload.stop_self,
         )
         .await?;
         Ok(serde_json::json!({ "stopped": stopped.len() }))
@@ -51,7 +51,7 @@ impl TaskExecutor<DispatcherState> for StopTaggedExecutor {
 /// `cancel_colors`, nothing here is a third path.
 pub async fn stop_tagged(
     state: &DispatcherState,
-    project_id: &str,
+    project_id: uuid::Uuid,
     tag: &str,
     by: weft_core::Color,
     before_seq: Option<i64>,

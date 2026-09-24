@@ -90,7 +90,7 @@ async fn multipart_uploads_round_trip_across_sizes() -> anyhow::Result<()> {
 #[tokio::test]
 async fn an_interrupted_upload_leaves_no_leftover() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
 
     let mut project = Project::prepare("storage_file", disp.clone()).await?;
     let pid = project.id();
@@ -151,7 +151,7 @@ async fn an_interrupted_upload_leaves_no_leftover() -> anyhow::Result<()> {
 #[tokio::test]
 async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = Platform::connect().await?;
+    let platform = Platform::connect(&disp).await?;
 
     let mut project = Project::prepare("storage_concurrent", disp.clone()).await?;
     let pid = project.id();

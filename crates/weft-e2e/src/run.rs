@@ -31,14 +31,12 @@ pub const RUN_SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 const RUN_SETTLE_POLL: Duration = Duration::from_millis(300);
 
 /// Fire a plain (non-triggered) run of `project` via `weft run` and return its
-/// color. Builds + registers as a side effect (so the project is marked
-/// registered for teardown). Does NOT wait for the run to finish; pair with
-/// [`SettledRun::observe`].
+/// color. Builds + registers as a side effect. Does NOT wait for the run to
+/// finish; pair with [`SettledRun::observe`].
 pub async fn start(project: &mut Project) -> Result<Uuid> {
     // `--json` makes the CLI emit one progress event per line and detach (it
     // does not stream logs), so we get the color without holding the run open.
     let stdout = project.weft(&["run", "--json"]).await?;
-    project.mark_registered();
     parse_color(&stdout).context("parse color from `weft run --json` output")
 }
 
@@ -62,7 +60,6 @@ pub async fn run_targeted_and_settle(
         args.push(t);
     }
     let stdout = project.weft(&args).await?;
-    project.mark_registered();
     let color =
         parse_color(&stdout).context("parse color from `weft run --target --json` output")?;
     SettledRun::observe(project.dispatcher(), color).await

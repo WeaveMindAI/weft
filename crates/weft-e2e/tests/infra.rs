@@ -27,7 +27,6 @@ out.data = scope.status
     // builds the sidecar image, applies the manifests, and waits for the pod's
     // readiness probe.
     let endpoint = infra::start_and_wait_running(&mut project, "scope.svc").await?;
-    project.mark_registered();
     eprintln!("mini_service endpoint: {endpoint}");
     let setups = run::execution_colors(project.dispatcher(), &project.id()).await?;
     anyhow::ensure!(setups.len() == 1, "one infra setup, got {setups:?}");
@@ -102,7 +101,6 @@ out = Debug
 out.data = svc.status
 "#)?;
     infra::start_and_wait_running(&mut project, "svc").await?;
-    project.mark_registered();
     let none = project.weft(&["infra", "list-doors"]).await?;
     anyhow::ensure!(none.contains("no doors"), "nothing is reachable by default: {none}");
 

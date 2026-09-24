@@ -310,7 +310,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// the worker namespace via `project_namespace::worker_namespace`).
     /// `Ok(Some(has_infra))` for any registered project; `Ok(None)` ONLY
     /// when the project doesn't exist; `Err` on DB failure.
-    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>>;
+    async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>>;
 
     /// The project's OWN k8s namespace (where its infra pods live), or
     /// `Ok(Some(""))` / `Ok(None)` when it has none. EMPTY string means
@@ -320,7 +320,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// delete". `Ok(None)` ONLY when the project doesn't exist. This is
     /// the INFRA namespace, NOT the worker namespace: for worker
     /// placement use `project_has_infra` + `worker_namespace`.
-    async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>>;
+    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
     /// Set the project's own k8s namespace, called when the per-project
     /// namespace is provisioned (first infra apply). Idempotent.
@@ -340,23 +340,6 @@ pub trait ProjectStoreOps: Send + Sync {
     // through the broker, and the referenced-images keep-set reads the
     // whole column (api/project.rs), both via the canonical decode in
     // weft-broker-client.
-
-    /// Persist the project's HealthProtocols override (JSON shape
-    /// per supervisor `HealthProtocols`). `None` payload = use weft
-    /// defaults. `Ok(true)` iff a row was updated.
-    async fn set_health_protocols(
-        &self,
-        id: uuid::Uuid,
-        protocols: Option<serde_json::Value>,
-    ) -> anyhow::Result<bool>;
-
-    /// Read the project's HealthProtocols override. `Ok(None)` when
-    /// the project uses defaults OR no such project; `Err` on DB
-    /// failure.
-    async fn health_protocols(
-        &self,
-        project_id_str: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>>;
 }
 
 /// Snapshot of every lifecycle field on a project row. Returned
@@ -1100,15 +1083,23 @@ impl ProjectStoreOps for PostgresProjectStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM trigger_setup WHERE project_id = $1")
-            .bind(id.to_string()).execute(&mut *tx).await?;
+            .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1")
-            .bind(id.to_string()).execute(&mut *tx).await?;
+            .bind(id).execute(&mut *tx).await?;
         // The version tree goes with the project (its runs cascade):
         // versions left behind kept naming stored files for a project
         // that no longer existed, and the same id registered again
         // inherited a tree it never made.
         sqlx::query("DELETE FROM project_version WHERE project_id = $1")
             .bind(id).execute(&mut *tx).await?;
+        // The infra rows go in the same transaction, AFTER the project
+        // row: the broker's command and event inserts lock the project
+        // row they read (`FOR KEY SHARE`), so an insert racing this
+        // either commits first and is deleted below, or waits for this
+        // commit and then finds no project to insert for.
+        crate::infra_node::remove_project(&mut *tx, id).await?;
+        crate::infra_event::remove_project(&mut *tx, id).await?;
+        crate::infra_lifecycle_command::remove_project(&mut *tx, id).await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
@@ -1338,7 +1329,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                  updated_at = $6, \
                  transition_heartbeat_unix = $6 \
              WHERE id = $7 AND status <> 'activating' AND transition = 'none' \
-             AND NOT EXISTS (SELECT 1 FROM trigger_setup WHERE project_id = $7::text)",
+             AND NOT EXISTS (SELECT 1 FROM trigger_setup WHERE project_id = $7)",
         )
         .bind(activating.status.as_str())
         .bind(activating.accepting_fires)
@@ -1394,7 +1385,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         .fetch_optional(&mut *tx)
         .await?;
         let removed = if row.is_some() && remove_signals {
-            crate::journal::postgres::remove_project_signals(&mut *tx, &id.to_string()).await?
+            crate::journal::postgres::remove_project_signals(&mut *tx, id).await?
         } else { Vec::new() };
         tx.commit().await?;
         Ok(row.map(|_| removed))
@@ -1512,10 +1503,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         }
     }
 
-    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>> {
-        let id = id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+    async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>> {
         let row: Option<(bool,)> =
             sqlx::query_as("SELECT has_infra FROM project WHERE id = $1")
                 .bind(id)
@@ -1524,10 +1512,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.map(|(b,)| b))
     }
 
-    async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>> {
-        let id = id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT project_namespace FROM project WHERE id = $1")
                 .bind(id)
@@ -1553,39 +1538,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(())
     }
 
-    async fn set_health_protocols(
-        &self,
-        id: uuid::Uuid,
-        protocols: Option<serde_json::Value>,
-    ) -> anyhow::Result<bool> {
-        let res = sqlx::query("UPDATE project SET health_protocols_json = $1 WHERE id = $2")
-            .bind(protocols)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    async fn health_protocols(
-        &self,
-        project_id_str: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        use sqlx::Row;
-        let id = project_id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{project_id_str}': {e}"))?;
-        let row = sqlx::query("SELECT health_protocols_json FROM project WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(r) = row else {
-            return Ok(None);
-        };
-        let value: Option<serde_json::Value> = r
-            .try_get("health_protocols_json")
-            .map_err(|e| anyhow::anyhow!("decode health_protocols_json: {e}"))?;
-        Ok(value)
-    }
 }
 
 // Canonical wall-clock helper lives in `crate::lease::now_unix`.
@@ -2176,17 +2128,11 @@ impl ProjectStoreOps for FakeProjectStore {
             .collect())
     }
 
-    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>> {
-        let id = id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+    async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>> {
         Ok(self.has_infra.read().await.get(&id).copied())
     }
 
-    async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>> {
-        let id = id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         // Mirror Postgres: a registered project always has a row (empty
         // string until its namespace is provisioned); only an
         // unregistered project returns None.
@@ -2208,18 +2154,4 @@ impl ProjectStoreOps for FakeProjectStore {
         Ok(())
     }
 
-    async fn set_health_protocols(
-        &self,
-        _id: uuid::Uuid,
-        _protocols: Option<serde_json::Value>,
-    ) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    async fn health_protocols(
-        &self,
-        _project_id_str: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        Ok(None)
-    }
 }

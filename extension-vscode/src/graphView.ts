@@ -13,10 +13,11 @@
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
+import { ReconnectingStream } from './projectEvents';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -28,16 +29,21 @@ import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
 /// What a parse answers for a project the dispatcher has never seen.
 const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
 
-/// One node's display poller: the interval, and the route it polls.
-///
-/// The route rides WITH the timer because it is a fact of the poller,
-/// decided when the parse started it. An in-flight tick compares it
-/// against what the map holds to know whether its answer still belongs
-/// to anything on screen.
-interface DisplayPoller {
-  path: string;
-  timer: NodeJS.Timeout;
+/// Where one node's display is served from, and the node as the
+/// display stream names it: its place, spelled the way a person writes
+/// it (`one.door`).
+// SYNC: DisplayRoute.source <-> crates/weft-dispatcher/src/display_feeds.rs (DisplaySource)
+interface DisplayRoute {
+  source: 'infra' | 'signal';
+  node: string;
 }
+
+/// One node's display as the dispatcher pushes it: the node, and what
+/// it shows (`NodeFeedState`, with its items not yet checked).
+type DisplayFeedMessage = DisplayRoute & Unchecked<NodeFeedState>;
+
+/// A feed state whose items crossed a process boundary unread.
+type Unchecked<S> = S extends { items: unknown } ? Omit<S, 'items'> & { items: unknown } : S;
 
 /// The line that stands in for an item no renderer can draw.
 ///
@@ -144,24 +150,28 @@ export class GraphViewController {
   /// race the webview's listener registration and get dropped on
   /// VS Code restart with a .weft already open.
   private readyHandler: (() => void) | undefined;
-  /// One poller per node that shows a display, keyed by node id.
-  /// Reconciled against every parse (a poller whose route is unchanged
-  /// keeps ticking), emptied when the view stops being a place, when
-  /// the document changes, and on dispose. Each tick posts a
-  /// `nodeDisplay` message to the webview.
+  /// Every node on screen that shows a display, keyed by node id, with
+  /// where it is served from. Reconciled against every parse, emptied
+  /// when the view stops being a place, when the document changes, and
+  /// on dispose.
   ///
-  /// Two kinds of node have one and each serves it from its own
-  /// place, but both answer `/live` in the same shape, so one map of
-  /// timers covers them: the URL is the only thing that differs.
-  private displayTimers: Map<string, DisplayPoller> = new Map();
+  /// The dispatcher pushes what these nodes show over one stream
+  /// (`/events/project/{id}/displays`), looking at them only while the
+  /// stream is open; each message becomes a `nodeDisplay` to the
+  /// webview. The stream is open only while the panel is visible: a
+  /// hidden panel keeps its last state (`retainContextWhenHidden`), and
+  /// nobody looks at displays nobody can see.
+  private displayRoutes: Map<string, DisplayRoute> = new Map();
+  /// The project the routes belong to.
+  private displayProject: string | undefined;
+  /// The path the display stream is pointed at now (undefined: closed).
+  private displayPath: string | undefined;
+  private readonly displayStream: ReconnectingStream<DisplayFeedMessage>;
   /// Every infra node of the parsed project: the nodes whose display
   /// carries buttons a press can reach (the container behind `/infra`
   /// serves `/action`). A trigger's display is read-only, so a press
   /// on a node outside this set has nowhere to go.
   private infraNodeIds: Set<string> = new Set();
-  // Interval between display polls. 3s matches v1; `/live` is cheap
-  // (it returns the current state), so this is fine.
-  private readonly liveIntervalMs = 3000;
   // Action bar state, drift, and per-node infra status come from
   // the host's `weft status --json` calls (handled by extension.ts'
   // ActionBarStore). graphView used to run its own infra/trigger
@@ -172,7 +182,10 @@ export class GraphViewController {
     private readonly context: vscode.ExtensionContext,
     private readonly client: DispatcherClient,
     private readonly parseServer: ParseServer,
-  ) {}
+  ) {
+    this.displayStream = new ReconnectingStream<DisplayFeedMessage>(client, 'displays');
+    this.displayStream.onMessage((msg) => this.showDisplay(msg));
+  }
 
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
@@ -349,7 +362,7 @@ export class GraphViewController {
       // next parse starts the new file's. Left running, they would
       // paint the old file's displays onto same-named nodes of the new
       // one until that parse lands, and forever if it fails.
-      if (!sameDoc) this.stopAllLivePollers();
+      if (!sameDoc) this.stopAllDisplays();
       this.watchedDoc = doc;
       this.watchNodesDir(doc);
       this.watchSelfFile(doc);
@@ -398,6 +411,9 @@ export class GraphViewController {
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       this.panel.onDidDispose(() => this.onDispose()),
+      // Hidden: stop asking about displays nobody can see; shown again:
+      // ask again, and the stream starts with what each node shows now.
+      this.panel.onDidChangeViewState(() => this.pointDisplayStream()),
       vscode.workspace.onDidChangeTextDocument((e) => {
         if (this.watchedDoc && e.document === this.watchedDoc) {
           // Skip when the doc already matches what we rendered: our own edit write,
@@ -447,7 +463,7 @@ export class GraphViewController {
           // watched doc, so it is sent once that doc is the new one.
           if (isDifferentDoc) {
             this.navStack = [];
-            this.stopAllLivePollers();
+            this.stopAllDisplays();
           }
           this.watchedDoc = ed.document;
           if (isDifferentDoc) this.sendNavState();
@@ -775,7 +791,7 @@ export class GraphViewController {
       // broken file walked into or opened on its own must not keep the
       // last good file's call path and its action bar, nor its display
       // pollers (nothing is on screen for them to paint).
-      this.stopAllLivePollers();
+      this.stopAllDisplays();
       this.sendNavState();
       this.post({
         kind: 'parseError',
@@ -846,45 +862,44 @@ export class GraphViewController {
       this.post({ kind: 'parseResult', response, source, layoutCode: layout.code, freshMount: this.freshMount });
     }
     this.freshMount = false;
-    this.syncDisplayPollers(response);
+    this.syncDisplays(response);
   }
 
-  /** Compare the latest parse to the nodes we are currently polling a
-   *  display for: start one for each node that now has a display, stop
-   *  the ones whose node is gone.
+  /** Compare the latest parse to the nodes whose display is on screen,
+   *  and point the display stream at the new set when it changed.
    *
    *  Two kinds of node show one. An infra node's container serves it,
    *  and only when the node's metadata names the endpoint; one that
    *  speaks only TCP has nothing to serve it on. A trigger's listener
-   *  kind always serves one. The dispatcher
-   *  answers 404 cleanly while there is nothing behind either yet (the
-   *  infra is not up, the project is not activated), so starting a
-   *  poller early is harmless.
+   *  kind always serves one. The dispatcher answers `absent` while
+   *  there is nothing behind either yet (the infra is not up, the
+   *  project is not activated), so asking early is harmless.
    */
-  private syncDisplayPollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
+  private syncDisplays(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
     const projectId = response.project.id;
     // The nil id is what a parse answers for a project the dispatcher
-    // has never registered. Polling it asks about a project that does
-    // not exist, every 3s, forever, and paints an error on every node
-    // that would have a display.
+    // has never registered. Asking about it asks about a project that
+    // does not exist, and paints an error on every node that would have
+    // a display.
     if (!projectId || projectId === NIL_PROJECT_ID) {
-      this.stopAllLivePollers();
+      this.stopAllDisplays();
       return;
     }
     // Where this view stands (see `viewPlace`). A display belongs to a
     // PLACE: an infra node's container is one per place (a file included
     // twice provisions twice) and a trigger's registration is one per
-    // place, so a file opened on its own (no place) polls nothing:
+    // place, so a file opened on its own (no place) shows nothing:
     // nothing says which call's instance is meant.
     const { callPath, interactive } = this.viewPlace();
     if (!interactive) {
-      this.stopAllLivePollers();
+      this.stopAllDisplays();
       return;
     }
     const nodes = response.project.nodes;
     // The parsed node first, the catalog only when it says nothing: the
     // same precedence the webview's role predicates use, so the host
-    // never polls a node the webview draws no panel for, or the reverse.
+    // never asks about a node the webview draws no panel for, or the
+    // reverse.
     // SYNC: role precedence <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts
     const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
       n.requiresInfra ?? response.catalog[n.nodeType]?.requires_infra ?? false;
@@ -896,105 +911,84 @@ export class GraphViewController {
     this.infraNodeIds = new Set(nodes.filter(isInfraNode).map((n) => n.id));
     // One decision per node, made HERE, from the parse that answers it:
     // where this node's display lives. Re-deriving the route later from
-    // the mutable infra set let a node that changed type keep polling
+    // the mutable infra set let a node that changed type keep asking
     // its old endpoint while its buttons went to the new one, because a
     // node keeps its id when its type changes.
-    const showing = new Map<string, string>();
+    const showing = new Map<string, DisplayRoute>();
     for (const n of nodes) {
-      // An infra node's container serves the display, and only when
-      // the node's metadata names the endpoint. One that speaks only
-      // TCP has nothing to serve it on, and polling it anyway would
-      // answer 502 on every tick.
       // Both doors take the place spelled the way a person writes it
       // (`one.door` for the `door` inside the file the site `one`
       // includes): the node under the calls this view descended through.
       if (isInfraNode(n)) {
-        if (servesLive(n)) {
-          showing.set(n.id, `/projects/${projectId}/infra/nodes/${addressOf(callPath, n.id)}/live`);
-        }
+        if (servesLive(n)) showing.set(n.id, { source: 'infra', node: addressOf(callPath, n.id) });
         continue;
       }
-      if (isTriggerNode(n)) {
-        showing.set(n.id, `/projects/${projectId}/signals/${addressOf(callPath, n.id)}/live`);
-      }
+      if (isTriggerNode(n)) showing.set(n.id, { source: 'signal', node: addressOf(callPath, n.id) });
     }
-
-    for (const [id, poller] of this.displayTimers.entries()) {
-      // Gone, or serving from somewhere else than when it started.
-      if (showing.get(id) === poller.path) continue;
-      clearInterval(poller.timer);
-      this.displayTimers.delete(id);
-    }
-    for (const [id, path] of showing) {
-      if (this.displayTimers.has(id)) continue;
-      this.startDisplayPoller(id, path);
-    }
+    this.displayRoutes = showing;
+    this.displayProject = projectId;
+    this.pointDisplayStream();
   }
 
-  /// Poll one node's display and post each tick to the webview.
-  ///
-  /// The first poll fires immediately, so the user does not wait 3s to
-  /// see the QR code on a first activation, then it repeats.
-  ///
-  /// `path` is decided once, by the parse that put this node in the
-  /// polling set, and a node whose display moves gets a new poller
-  /// rather than a re-derived URL.
-  ///
-  /// Registering the poller is THIS function's job, not its caller's:
-  /// the first tick fires before it returns and has to find itself in
-  /// the map.
-  private startDisplayPoller(nodeId: string, path: string): void {
-    // Compared by identity, never by path: pressing a button replaces
-    // this poller with a fresh one on the SAME path, and a tick that
-    // was already in flight would otherwise pass a path check and
-    // repaint the value the press just changed.
-    let poller: DisplayPoller;
-    const stillMine = () => this.displayTimers.get(nodeId) === poller;
-    const tick = async () => {
-      try {
-        const body = await this.client.get<{ items: unknown[] }>(path);
+  /** Open the display stream on the nodes on screen, or close it when
+   *  there are none or the panel is hidden. Reconnects only when what it
+   *  should ask for changed. */
+  private pointDisplayStream(): void {
+    let path: string | undefined;
+    if (this.panel?.visible && this.displayProject && this.displayRoutes.size > 0) {
+      const of = (source: DisplayRoute['source']) =>
+        [...this.displayRoutes.values()]
+          .filter((r) => r.source === source)
+          .map((r) => encodeURIComponent(r.node))
+          .sort()
+          .join(',');
+      path = `/events/project/${this.displayProject}/displays?infra=${of('infra')}&signals=${of('signal')}`;
+    }
+    if (path === this.displayPath) return;
+    this.displayPath = path;
+    this.displayStream.setPath(path);
+  }
+
+  /** One node's display, as the dispatcher pushed it, to that node's
+   *  panel. A message about a node no longer on screen belongs to
+   *  nothing and is dropped. */
+  private showDisplay(msg: DisplayFeedMessage): void {
+    const nodeId = [...this.displayRoutes.entries()].find(
+      ([, route]) => route.source === msg.source && route.node === msg.node,
+    )?.[0];
+    if (nodeId === undefined) return;
+    switch (msg.state) {
+      case 'ok': {
         // An item the guard rejects is one no renderer can draw. It
         // becomes a visible line saying so: a display quietly missing
         // a line is the one failure nobody can see.
-        const items = (Array.isArray(body.items) ? body.items : []).map((item) =>
+        const items = (Array.isArray(msg.items) ? msg.items : []).map((item) =>
           isLiveDataItem(item) ? item : unrenderableItem(item),
         );
-        if (!stillMine()) return;
         this.post({ kind: 'nodeDisplay', nodeId, state: 'ok', items });
-      } catch (err) {
-        // A poller stopped while this tick was in flight (the node is
-        // gone, the parse broke, another project opened, a press
-        // restarted it): its answer belongs to nothing on screen.
-        if (!stillMine()) return;
-        // 404 = there is nothing serving it yet: the infra is not
-        // provisioned, or the signal is not registered (the project
-        // was never activated, or its trigger setup failed). A
-        // distinct RESTING state, never collapsed into a healthy empty
-        // list: the webview renders it with its own affordance, and
-        // stale items from a previous run clear.
-        // Anything else (BAD_GATEWAY, network) is a real failure;
-        // surface the underlying message.
-        if (err instanceof HttpError && err.status === 404) {
-          this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
-          return;
-        }
-        const error = err instanceof Error ? err.message : String(err);
-        this.post({ kind: 'nodeDisplay', nodeId, state: 'error', error });
+        break;
       }
-    };
-    poller = {
-      path,
-      timer: setInterval(() => void tick(), this.liveIntervalMs),
-    };
-    // Registered before the first tick runs, so that tick's own
-    // still-mine check finds it.
-    this.displayTimers.set(nodeId, poller);
-    void tick();
+      // Nothing serves it yet: the infra is not provisioned, or the
+      // signal is not registered. A distinct RESTING state, never
+      // collapsed into a healthy empty list: the webview renders it with
+      // its own affordance, and stale items from a previous run clear.
+      case 'absent':
+        this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
+        break;
+      case 'error':
+        this.post({ kind: 'nodeDisplay', nodeId, state: 'error', error: msg.error });
+        break;
+      default: {
+        const unhandled: never = msg;
+        throw new Error(`a display state this editor does not know: ${JSON.stringify(unhandled)}`);
+      }
+    }
   }
 
-  private stopAllLivePollers(): void {
-    for (const poller of this.displayTimers.values()) clearInterval(poller.timer);
-    this.displayTimers.clear();
+  private stopAllDisplays(): void {
+    this.displayRoutes = new Map();
+    this.displayProject = undefined;
+    this.pointDisplayStream();
     // The set describes a parse that is no longer on screen, and
     // leaving it behind would route this project's buttons by the last
     // project's answers.
@@ -1015,8 +1009,9 @@ export class GraphViewController {
   /// trigger's display is read-only, and a press on one is dropped
   /// here rather than sent to a door that would refuse it.
   ///
-  /// On success, force an immediate display poll so the panel shows
-  /// what the press changed without waiting for the next tick.
+  /// On success every dispatcher pod watching the node's display looks
+  /// again at once (the press is announced to all of them), so the panel
+  /// shows what the press changed without waiting for the next look.
   ///
   /// When `confirm` is set, asks the user via VS Code's QuickPick
   /// before invoking. Same UX as the deactivate-mode picker so the
@@ -1063,14 +1058,6 @@ export class GraphViewController {
         `/projects/${projectId}/infra/nodes/${place}/action`,
         { kind: actionKind, payload: payload ?? null },
       );
-      // Force-refresh the node's poller so what the press changed (a
-      // new plaintext key, a fresh QR code) shows up immediately.
-      const poller = this.displayTimers.get(nodeId);
-      if (poller) {
-        clearInterval(poller.timer);
-        this.displayTimers.delete(nodeId);
-        this.startDisplayPoller(nodeId, poller.path);
-      }
     } catch (err) {
       // The container's own refusal arrives as a 400 with its text;
       // anything else is the door or the network. Both are shown as
@@ -2331,7 +2318,7 @@ export class GraphViewController {
     // included program outside the editor then stopped updating the
     // graph, in silence, until the panel was opened on something else.
     this.watchedRefPaths = '';
-    this.stopAllLivePollers();
+    this.stopAllDisplays();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
     this.panel = undefined;

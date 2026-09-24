@@ -16,9 +16,10 @@
 # blast-radius control is the namespaced ClusterRole + per-namespace
 # binding, not per-pod tenant identity.
 #
-# The supervisor owns `kubectl apply` for every resource the
+# The supervisor server-side applies, through its in-process API
+# client, every resource the
 # weft-core compiler can emit (Deployment, StatefulSet, Service,
-# PVC, ConfigMap, Secret, Ingress, NetworkPolicy, HPA, Job,
+# PVC, ConfigMap, Secret, HTTPRoute, NetworkPolicy, HPA, Job,
 # DaemonSet, Pod). `create + patch + update` covers both fresh
 # applies (POST) and Replace's re-apply-after-sweep (PUT/PATCH).
 # `delete` covers Stop / Terminate sweeps.
@@ -33,9 +34,8 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, delete]
-  # Services + Configs + PVCs: created by `kubectl apply`, swept on
-  # terminate. Patch is the SSA path kubectl apply uses on existing
-  # objects.
+  # Services + Configs + PVCs: created by server-side apply, swept on
+  # terminate. Patch is the verb server-side apply goes through.
   - apiGroups: [""]
     resources: [services, configmaps, secrets, persistentvolumeclaims]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -51,7 +51,11 @@ rules:
     resources: [jobs]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [networking.k8s.io]
-    resources: [ingresses, networkpolicies]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # A TenantPublic endpoint's route onto the front door.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [autoscaling]
     resources: [horizontalpodautoscalers]

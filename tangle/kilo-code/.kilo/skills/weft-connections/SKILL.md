@@ -174,7 +174,7 @@ thing the tool told them. Steps:
 1. Say what it will do: open a Cloudflare quick tunnel so the provider can
    reach their machine, and expose only the event, signal, file-link and
    OAuth-callback routes. The management API stays unreachable. The
-   book's [public address page](https://weavemindai.github.io/weft/connections/public-address.html)
+   book's [public address page](https://weavemindai.github.io/weft/build/public-address.html)
    lists the exact routes; offer it, do not paste it.
 2. Get their consent before running it, because it makes a surface on
    their machine reachable from the internet. This is one of the

@@ -36,6 +36,7 @@ fn oauth_app() -> AppRegistration {
     }
 }
 
+const PROJECT_1: uuid::Uuid = uuid::Uuid::from_u128(0xc0de);
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 
@@ -219,7 +220,7 @@ async fn full_consent(
             door: Door::Own,
             registration: Some(oauth_app()),
             permissions: scopes.iter().map(|s| s.to_string()).collect(),
-            project_id: Some("proj-1".into()),
+            project_id: Some(PROJECT_1),
             upgrade_grant_id: upgrade,
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -321,7 +322,7 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
             values: [("token".to_string(), "tok-abc".to_string())].into_iter().collect(),
             label: Some("My token".into()),
             permissions: Vec::new(),
-            project_id: Some("proj-1".into()),
+            project_id: Some(PROJECT_1),
         },
     )
     .await
@@ -411,7 +412,7 @@ async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool
     let grant = full_consent(&pool, TENANT_A, &spec, &["read", "write"], None).await.unwrap();
     assert_eq!(grant.scopes, vec!["read", "write"], "no echo = the ticked set, recorded claimed");
     assert!(!grant.permissions_verified, "no provider answer = claimed, never verified");
-    assert_eq!(grant.project_id.as_deref(), Some("proj-1"), "coexisting = per project");
+    assert_eq!(grant.project_id, Some(PROJECT_1), "coexisting = per project");
 
     // With the provider's echo, the recorded set is VERIFIED.
     *fake.scope_echo.lock().unwrap() = Some("read write".into());
@@ -524,7 +525,7 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
             door: Door::Own,
             registration: Some(oauth_app()),
             permissions: vec!["read".into()],
-            project_id: Some("proj-1".into()),
+            project_id: Some(PROJECT_1),
             upgrade_grant_id: Some(first.id),
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -548,7 +549,7 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
             door: Door::Own,
             registration: Some(other_app),
             permissions: vec!["read".into()],
-            project_id: Some("proj-1".into()),
+            project_id: Some(PROJECT_1),
             upgrade_grant_id: Some(first.id),
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -1352,7 +1353,7 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
             door: Door::Shared,
             registration: Some(oauth_app()),
             permissions: vec!["read".into()],
-            project_id: Some("proj-1".into()),
+            project_id: Some(PROJECT_1),
             upgrade_grant_id: None,
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -1604,7 +1605,7 @@ fn published_spec() -> AccessSpec {
 fn publish(values: &[(&str, &str)]) -> weft_access_store::PublishAccess {
     weft_access_store::PublishAccess {
         spec: published_spec(),
-        project_id: "project-1".into(),
+        project_id: PROJECT_1,
         node_id: "db".into(),
         values: values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         label: Some("db".into()),
@@ -1637,13 +1638,13 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
     assert_eq!(second.grant.identity.as_deref(), Some("db.new"));
     assert_eq!(list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap().len(), 1);
 
-    let found = weft_access_store::published_connection(&pool, TENANT_A, "project-1", "db", "selfrun")
+    let found = weft_access_store::published_connection(&pool, TENANT_A, PROJECT_1, "db", "selfrun")
         .await
         .expect("look up")
         .expect("the node finds what it published");
     assert_eq!(found.connection_id, first.grant.id.to_string());
     assert!(
-        weft_access_store::published_connection(&pool, TENANT_A, "project-1", "other", "selfrun")
+        weft_access_store::published_connection(&pool, TENANT_A, PROJECT_1, "other", "selfrun")
             .await
             .unwrap()
             .is_none(),
@@ -1771,14 +1772,14 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
             permissions: vec![],
             registration: None,
             paste: false,
-            project_id: Some("project-1".into()),
+            project_id: Some(PROJECT_1),
         },
     )
     .await
     .expect("a person connects one too");
 
     let dropped =
-        weft_access_store::delete_published_grants(&pool, TENANT_A, "project-1", Some("db"))
+        weft_access_store::delete_published_grants(&pool, TENANT_A, PROJECT_1, Some("db"))
             .await
             .expect("delete for one node");
     assert_eq!(dropped, 1);
@@ -1794,7 +1795,7 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
     )
     .await
     .expect("publish again");
-    let dropped = weft_access_store::delete_published_grants(&pool, TENANT_A, "project-1", None)
+    let dropped = weft_access_store::delete_published_grants(&pool, TENANT_A, PROJECT_1, None)
         .await
         .expect("delete for the project");
     assert_eq!(dropped, 1);

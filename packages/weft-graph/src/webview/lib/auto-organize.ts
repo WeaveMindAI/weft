@@ -46,12 +46,12 @@ export async function autoOrganize(
 	// Only expanded groups are ELK containers; collapsed groups are leaf nodes
 	const groupIds = new Set(
 		projectNodes
-			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded !== false)
+			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded === true)
 			.map(n => n.id)
 	);
 	const collapsedGroupIds = new Set(
 		projectNodes
-			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded === false)
+			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded !== true)
 			.map(n => n.id)
 	);
 

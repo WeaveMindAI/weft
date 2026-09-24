@@ -37,17 +37,27 @@
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        async fn events_for_color(&self, _color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-            Ok(self.events.lock().unwrap().clone())
-        }
-        async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
-            // Typed events, serialized the way the real journal stores
-            // them, so a ferry-shaped consumer sees the same bytes.
+        /// Every captured row (whatever its color), each numbered by its
+        /// place, serialized the way the real journal stores them so a
+        /// ferry-shaped consumer sees the same bytes. Never holds: the
+        /// rig drives no waits.
+        async fn raw_rows_after(
+            &self,
+            _color: Color,
+            after_id: i64,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
             Ok(self
-                .events_for_color(color)
-                .await?
+                .events
+                .lock()
+                .unwrap()
                 .iter()
-                .map(|e| serde_json::to_string(e).expect("serialize ExecEvent"))
+                .enumerate()
+                .map(|(i, e)| weft_journal::RawJournalRow {
+                    id: i as i64 + 1,
+                    payload: serde_json::to_string(e).expect("serialize ExecEvent"),
+                })
+                .filter(|row| row.id > after_id)
                 .collect())
         }
         async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {

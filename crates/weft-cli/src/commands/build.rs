@@ -280,7 +280,7 @@ async fn build_worker_image(
     project_id: &str,
 ) -> Result<()> {
     let label = format!("weft.dev/project={project_id}");
-    images::docker_build(tag, &ctx_dir.join("Dockerfile"), ctx_dir, &[label], None).await
+    images::docker_build_worker(tag, &ctx_dir.join("Dockerfile"), ctx_dir, &[label]).await
 }
 
 /// Drop STALE content-addressed images: every tag of `repo` carrying

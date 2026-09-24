@@ -72,7 +72,7 @@ async fn start_execution(
     journal
         .record_event(&ExecEvent::ExecutionStarted {
             color,
-            project_id: project.to_string(),
+            project_id: project,
             entry_node: "start".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
@@ -167,7 +167,7 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
         .await
         .unwrap();
 
-    let live = live_tagged_executions(&pool, &project.to_string(), "user_7").await.unwrap();
+    let live = live_tagged_executions(&pool, project, "user_7").await.unwrap();
     let colors: Vec<_> = live.iter().map(|t| t.color).collect();
     assert_eq!(
         colors,
@@ -185,7 +185,7 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     assert_eq!(select_stop_targets(&live, a, None, StopSelf::Include), vec![a, b]);
 
     // The dispatcher's Journal trait reads the same rows.
-    let via_trait = journal.live_tagged_executions(&project.to_string(), "user_7").await.unwrap();
+    let via_trait = journal.live_tagged_executions(project, "user_7").await.unwrap();
     assert_eq!(via_trait, live);
 }
 
@@ -251,7 +251,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
         "cancelled"
     );
     // Terminal now: out of the live set.
-    assert!(live_tagged_executions(&pool, &project.to_string(), "user_7").await.unwrap().is_empty());
+    assert!(live_tagged_executions(&pool, project, "user_7").await.unwrap().is_empty());
 
     // A second cancel finds the terminal and writes nothing new.
     let again = journal.cancel_execution(victim, Some(&program), &CancelCause::User).await.unwrap();
@@ -304,7 +304,7 @@ fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> Sign
         program: None,
         token: token.to_string(),
         tenant_id: TENANT.to_string(),
-        project_id: project_id.to_string(),
+        project_id,
         color: Some(color),
         node_id: "wait".to_string(),
         is_resume: true,

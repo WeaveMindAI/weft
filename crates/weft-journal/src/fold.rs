@@ -299,6 +299,16 @@ impl Fold {
         self.snap
     }
 
+    /// The snapshot as it stands, with every awaited sequence in call
+    /// order, leaving the fold to take more rows.
+    pub fn current_snapshot(&self) -> ExecutionSnapshot {
+        let mut snap = self.snap.clone();
+        for entries in snap.awaited_sequences.values_mut() {
+            entries.sort_by_key(|e| e.call_index);
+        }
+        snap
+    }
+
     /// Apply one row, in journal order.
     pub fn apply(&mut self, ev: &ExecEvent) -> FoldEffects {
         let corruptions_before = self.snap.corruptions.len();
@@ -1449,7 +1459,7 @@ mod tests {
     fn started_execution() -> ExecEvent {
         ExecEvent::ExecutionStarted {
             color: color(),
-            project_id: "p".into(),
+            project_id: uuid::Uuid::nil(),
             entry_node: "src".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),

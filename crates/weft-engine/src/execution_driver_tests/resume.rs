@@ -212,7 +212,7 @@
         let rows = vec![
             ExecEvent::ExecutionStarted {
                 color: color(),
-                project_id: uuid::Uuid::nil().to_string(),
+                project_id: uuid::Uuid::nil(),
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("test-hash".into()),

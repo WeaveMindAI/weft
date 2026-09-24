@@ -44,7 +44,7 @@ const NOUN: &str = "routing token";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerTokenClaims {
     pub color: Color,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     pub pod_name: String,
     /// The signal token of the route the handshake matched: the row the
     /// birth reads the trigger, its spec and its armed program from.
@@ -147,7 +147,7 @@ mod tests {
     fn claims(pod_name: &str, exp: i64) -> CallerTokenClaims {
         CallerTokenClaims {
             color: color(),
-            project_id: "proj-1".into(),
+            project_id: uuid::Uuid::nil(),
             pod_name: pod_name.into(),
             signal: "sig-9".into(),
             path: "chat/room7".into(),

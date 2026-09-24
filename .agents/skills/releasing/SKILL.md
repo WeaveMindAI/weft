@@ -170,10 +170,11 @@ packaged and the images stitched. That release is what a fresh
 listing on that store and nothing else. Say so plainly rather than
 reporting a release as broken.
 
-## Never run these yourself
+## Install and e2e before a merge
 
-`./setup.sh` (any flag) and the e2e redeploy the daemon and rebuild the
-extension while the [user] works, and they take a long time. Ask them
-to run those. Packaging the `.vsix`
+`./setup.sh` and the e2e are yours to run, the way `MEMORY.md` lays
+out ("Every fix and feature ends with setup.sh and the e2e that cover
+it"): the branch you merge has passed them on its final code. Packaging
+the `.vsix`
 (`pnpm run vscode:prepublish && pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies`)
-is yours: it touches nothing outside `extension-vscode/`.
+is yours too: it touches nothing outside `extension-vscode/`.

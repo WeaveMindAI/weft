@@ -1,45 +1,115 @@
 //! Background reapers that sweep stale rows and respawn missing
-//! workers. Every dispatcher Pod runs all of these. They don't step
-//! on each other because their writes are idempotent (delete-by-key
-//! is a no-op on the second pod, `mark_dead` is status-guarded, task
-//! reclaim is conditional); the listener and supervisor sweeps add a
-//! per-tenant advisory lock on top. The worker-pod sweeps rely on
-//! idempotency alone (plain SELECT then idempotent delete), not row
-//! locking.
+//! workers. Every dispatcher Pod runs all of these, and each sweep runs
+//! under its own cluster-wide advisory lock (`lease::REAPER_DOMAIN`,
+//! keyed by the reaper's name), so one replica sweeps at a time and a
+//! sibling that finds the lock held skips that turn: N replicas cost one
+//! sweep, not N. The writes stay idempotent underneath (delete-by-key is
+//! a no-op the second time, `mark_dead` is status-guarded, task reclaim
+//! is conditional), so a sweep that overlaps a request doing the same
+//! work is harmless.
+//!
+//! Two kinds of reaper. The ones that react to a write sleep until that
+//! write is announced (`pg_wake`), with a slow safety tick for what no
+//! write announces. The ones that notice SILENCE (a heartbeat that went
+//! stale, a lease that lapsed, a transition whose driver died) cannot be
+//! woken by anything, so they stay on a timer.
 
 use std::time::Duration;
 
+use crate::pg_wake::{self, DrainStep, WakeOn};
 use crate::state::DispatcherState;
+
+/// The channel a signal row notifies on when a fire is parked on it,
+/// with its project id as the payload, from the
+/// `signal_parked_fire_notify_on_grow` trigger in `journal::postgres::GROUP`.
+pub const PARKED_FIRE_CHANNEL: &str = "weft_parked_fire";
+
+/// The channel a queued terminate sweep notifies on, with its color as
+/// the payload, from the `storage_sweep_notify_on_insert` trigger in
+/// `storage::GROUP`.
+pub const STORAGE_SWEEP_CHANNEL: &str = "weft_storage_sweep";
+
+/// The longest the parked-fire sweep sleeps between looks, whatever the
+/// queues say: it also releases the drain claims a dead pod left, which
+/// nothing announces. 30 seconds in real time, at this install's pace
+/// (`weft_core::time_scale`).
+fn parked_fire_longest_sleep() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(30))
+}
+
+const ON_WORKER_POD: &[WakeOn] = &[WakeOn::any(weft_task_store::worker_pod::WORKER_POD_CHANNEL)];
+const ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
+const ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
+
+/// Safety tick of the reapers that are woken by a write: 60 seconds in
+/// real time, at this install's pace (`weft_core::time_scale`).
+fn woken_reaper_safety() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(60))
+}
 
 /// Spawn every reaper. Returns immediately; the reapers run for the
 /// lifetime of the process.
 pub fn spawn_all(state: DispatcherState) {
+    // Silence detectors: nothing announces a heartbeat that stopped.
     spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod", sweep_worker_pods);
     spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod_gc", sweep_terminal_worker_pods);
-    spawn_loop(state.clone(), Duration::from_secs(15), "orphaned_tasks", sweep_orphaned_tasks);
+    spawn_loop(state.clone(), Duration::from_secs(30), "removed_projects", |state| async move {
+        sweep_removed_projects(&state).await
+    });
     spawn_loop(state.clone(), Duration::from_secs(3600), "tasks", sweep_tasks);
-    spawn_loop(state.clone(), Duration::from_secs(10), "listener", sweep_listeners);
+    spawn_loop(state.clone(), Duration::from_secs(30), "listener", sweep_listeners);
     spawn_loop(state.clone(), Duration::from_secs(60), "listener_scaledown", sweep_listener_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "supervisor", sweep_supervisors);
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
     spawn_loop(state.clone(), Duration::from_secs(3600), "retired_rows", sweep_retired_rows);
+    // A pod dying is announced (its row leaves alive); a claim held by a
+    // pod whose row is gone for good is caught by the safety tick.
+    spawn_woken(
+        state.clone(),
+        ON_WORKER_POD,
+        "orphaned_tasks",
+        |s| async move { sweep_orphaned_tasks(s).await.map(|()| DrainStep::Done) },
+    );
     // Re-parked fires (a route that failed) retry with a backoff stamp on
     // the element; this is what drives the retry once the stamp is due.
-    spawn_loop(state.clone(), Duration::from_secs(5), "parked_fires", |s| async move {
-        crate::api::project::drain_due_parked_fires(&s).await
-    });
-    // Storage plane: the durable terminate sweep (un-kept exec files of a
-    // terminated color). Idempotent across pods: the queue deletes a color's
-    // row only after the broker confirms the sweep. The kept-file expiry sweep
-    // is the broker's own loop (it owns the bucket + metadata), not here.
-    spawn_loop(
-        state,
-        Duration::from_secs(15),
-        "storage_sweep",
-        crate::storage::process_sweep_queue,
+    // A newly parked fire wakes it at once; otherwise it sleeps until the
+    // earliest head is due.
+    spawn_woken(
+        state.clone(),
+        ON_PARKED_FIRE,
+        "parked_fires",
+        |s| async move {
+            crate::api::project::drain_due_parked_fires(&s).await?;
+            let now = crate::lease::now_unix();
+            let next = crate::api::project::next_parked_fire_due(&s.pg_pool).await?;
+            Ok(DrainStep::RetryIn(parked_fire_sleep(now, next)))
+        },
     );
+    // Storage plane: the durable terminate sweep (un-kept exec files of a
+    // terminated color). The queue deletes a color's row only after the
+    // broker confirms the sweep; a transient broker failure leaves it for
+    // the safety tick. The kept-file expiry sweep is the broker's own loop
+    // (it owns the bucket + metadata), not here.
+    spawn_woken(
+        state,
+        ON_STORAGE_SWEEP,
+        "storage_sweep",
+        |s| async move { crate::storage::process_sweep_queue(s).await.map(|()| DrainStep::Done) },
+    );
+}
+
+/// How long the parked-fire sweep sleeps: until the earliest queued head
+/// is due, at least a second (a head due now that did not drain was
+/// re-stamped, or is claimed by a live drain) and at most
+/// [`parked_fire_longest_sleep`].
+fn parked_fire_sleep(now_unix: i64, next_due_unix: Option<i64>) -> Duration {
+    let longest = parked_fire_longest_sleep();
+    match next_due_unix {
+        None => longest,
+        Some(due) => Duration::from_secs((due - now_unix).max(1) as u64).min(longest),
+    }
 }
 
 /// Drop what a removed project left behind that no surviving run needs.
@@ -57,21 +127,12 @@ async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
     orphans.extend(state.versions.projects_with_orphan_versions().await?);
     // Executions whose project is gone: the erase at removal is
     // best-effort, so a transient failure there lands here.
-    for project in state.journal.projects_with_orphan_executions().await? {
-        match project.parse::<uuid::Uuid>() {
-            Ok(id) => orphans.push(id),
-            Err(e) => tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                project_id = %project, error = %e,
-                "an execution names a project id that is not an id; leaving it alone"
-            ),
-        }
-    }
+    orphans.extend(state.journal.projects_with_orphan_executions().await?);
     orphans.sort();
     orphans.dedup();
     let mut failed = 0usize;
     for project in orphans {
-        match state.journal.delete_project_executions(&project.to_string()).await {
+        match state.journal.delete_project_executions(project).await {
             Ok(0) => {}
             Ok(erased) => tracing::info!(
                 target: "weft_dispatcher::reaper",
@@ -91,7 +152,7 @@ async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
         // whole reason this loop exists. Propagating the first error
         // abandoned every project after it in id order, every hour, for
         // good.
-        match crate::api::project::retire_what_no_run_needs(&state, &project.to_string()).await {
+        match crate::api::project::retire_what_no_run_needs(&state, project).await {
             Ok(0) => {}
             Ok(dropped) => tracing::info!(
                 target: "weft_dispatcher::reaper",
@@ -120,12 +181,15 @@ async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
 
 /// Grace before a terminal (`done`/`dead`) worker_pod's k8s Pod
 /// object is deleted: keeps a just-finished pod inspectable
-/// (`kubectl logs`) for a window before GC.
+/// (`kubectl logs`) for a window before GC. Never scaled: a window for
+/// a person reading logs.
 const TERMINAL_POD_GRACE_SECS: i64 = 120;
 
 /// Spawn a periodic sweep task. The body is the only thing that
-/// differs across reapers; the loop shape (sleep / call / log on
-/// error) is identical. The sweep takes the state by clone (cheap,
+/// differs across reapers; the loop shape (sleep / sweep alone / log on
+/// error) is identical. `interval` is given in real time and runs at
+/// this install's pace (`weft_core::time_scale`), like the heartbeats
+/// and leases these sweeps judge. The sweep takes the state by clone (cheap,
 /// `DispatcherState` is Arc-fielded), which keeps the trait bound
 /// simple compared to a borrowing closure.
 fn spawn_loop<F, Fut>(
@@ -135,13 +199,14 @@ fn spawn_loop<F, Fut>(
     sweep: F,
 )
 where
-    F: Fn(DispatcherState) -> Fut + Send + 'static,
+    F: Fn(DispatcherState) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
 {
+    let interval = weft_core::time_scale::scaled(interval);
     crate::app::spawn_supervised(name, async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = sweep(state.clone()).await {
+            if let Err(e) = sweep_alone(&state, name, || sweep(state.clone())).await {
                 tracing::warn!(
                     target: "weft_dispatcher::reaper",
                     reaper = name,
@@ -151,6 +216,45 @@ where
             }
         }
     });
+}
+
+/// Spawn a sweep that runs when one of `wake_on` is announced, and on a
+/// slow safety tick. The body's step says whether to look again early.
+fn spawn_woken<F, Fut>(
+    state: DispatcherState,
+    wake_on: &'static [WakeOn],
+    name: &'static str,
+    sweep: F,
+)
+where
+    F: Fn(DispatcherState) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send,
+{
+    crate::app::spawn_supervised(name, async move {
+        let signals = state.signals.subscribe();
+        pg_wake::run(signals, wake_on, woken_reaper_safety(), name, || async {
+            // A sibling holding the lock is sweeping right now; what it
+            // misses of this wake, its own next look or this one's
+            // safety tick covers.
+            Ok(sweep_alone(&state, name, || sweep(state.clone())).await?.unwrap_or(DrainStep::Done))
+        })
+        .await;
+    });
+}
+
+/// Run one sweep while holding the reaper's cluster-wide lock, or skip
+/// it (`None`) while a sibling replica holds it.
+async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    crate::lease::with_advisory_lock(
+        &state.pg_pool,
+        crate::lease::advisory_key(crate::lease::REAPER_DOMAIN, name),
+        sweep,
+    )
+    .await
 }
 
 /// Worker-pod reaper. Once every 30s, mark failed pods `dead` (which
@@ -186,7 +290,7 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
     let now = crate::lease::now_unix();
     let stale = weft_task_store::worker_pod::list_stale(
         &state.pg_pool,
-        now - weft_task_store::worker_pod::HEARTBEAT_STALE_SECS,
+        now - weft_task_store::worker_pod::heartbeat_stale_secs(),
     )
     .await?;
     let stuck_spawning = weft_task_store::worker_pod::list_stale_spawning(
@@ -204,7 +308,7 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
     // the row protected.
     let orphaned_node_tests = weft_task_store::worker_pod::list_orphaned_node_test(
         &state.pg_pool,
-        now - weft_task_store::CLAIM_DURATION_SECS,
+        now - weft_task_store::claim_duration_secs(),
     )
     .await?;
     // All three sets reap through the same path; a dead row is not
@@ -226,6 +330,68 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
         reap_worker_pod(&state, &row, reason).await?;
     }
     Ok(())
+}
+
+/// Clear what removed projects left behind: the work queued for their
+/// workers and the workers themselves. Nothing can serve either once the
+/// project row is gone (the broker refuses a pod whose project it cannot
+/// find, so a worker started for it crashes at boot, and a pending task
+/// would keep asking for one). `weft rm` runs this as soon as the row is
+/// gone; the loop catches work queued in the moment of the removal.
+/// Node-test pods are left alone: their scratch project is never a row,
+/// and the node-test sweep owns them.
+pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::Result<()> {
+    let dropped = drop_work_of_removed_projects(&state.pg_pool).await?;
+    if dropped > 0 {
+        tracing::info!(
+            target: "weft_dispatcher::reaper",
+            dropped,
+            "dropped work queued for removed projects"
+        );
+    }
+    for row in workers_of_removed_projects(&state.pg_pool).await? {
+        reap_worker_pod(state, &row, "its project was removed").await?;
+    }
+    Ok(())
+}
+
+/// Delete the pending worker tasks of projects that no longer exist;
+/// returns how many.
+pub async fn drop_work_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Result<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM task t \
+         WHERE t.status = 'pending' AND t.target = 'worker' AND t.project_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = t.project_id)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// The spawning or alive worker pods of projects that no longer exist.
+pub async fn workers_of_removed_projects(
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<Vec<weft_task_store::worker_pod::WorkerPodRow>> {
+    let rows: Vec<(String, uuid::Uuid, String, i64, i64)> = sqlx::query_as(
+        "SELECT wp.pod_name, wp.project_id, wp.namespace, wp.last_heartbeat_unix, wp.created_at_unix \
+         FROM worker_pod wp \
+         WHERE wp.status IN ('spawning', 'alive') AND wp.role = 'worker' \
+           AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = wp.project_id)",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(pod_name, project_id, namespace, last_heartbeat_unix, created_at_unix)| {
+            weft_task_store::worker_pod::WorkerPodRow {
+                pod_name,
+                project_id,
+                namespace,
+                last_heartbeat_unix,
+                created_at_unix,
+            }
+        })
+        .collect())
 }
 
 /// Mark a worker pod dead + kubectl-delete it. Shared by the stale-alive
@@ -291,13 +457,12 @@ async fn reap_worker_pod(
 /// reset live status for every tenant's projects on any Pod boot.
 async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     use crate::project_store::ProjectStatus;
-    let stale_before = crate::lease::now_unix() - crate::transition::HEARTBEAT_STALE_SECS;
+    let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
     for stuck in state.projects.list_stuck_transitions(stale_before).await? {
-        let project_id = stuck.id.to_string();
         if stuck.transition.is_building() {
             tracing::warn!(
                 target: "weft_dispatcher::reaper",
-                project_id = %project_id,
+                project_id = %stuck.id,
                 transition = stuck.transition.as_str(),
                 "build transition orphaned (driver heartbeat stale); clearing marker"
             );
@@ -308,12 +473,12 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
         if stuck.status == ProjectStatus::Activating {
             tracing::warn!(
                 target: "weft_dispatcher::reaper",
-                project_id = %project_id,
+                project_id = %stuck.id,
                 "activation orphaned (driver heartbeat stale); wiping activating state"
             );
             if let Err((code, msg)) =
                 crate::api::project::wipe_activating_state(
-                    &state, stuck.id, &project_id,
+                    &state, stuck.id,
                     stuck.activating_ts_color.ok_or_else(|| anyhow::anyhow!("activating project {} has no reserved setup identity", stuck.id))?,
                     // The activation's driver died mid-transition and
                     // this sweep is repairing the row; nothing
@@ -328,7 +493,7 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
             {
                 tracing::warn!(
                     target: "weft_dispatcher::reaper",
-                    project_id = %project_id,
+                    project_id = %stuck.id,
                     code = %code,
                     error = %msg,
                     "wipe of orphaned activation failed; retrying next sweep"
@@ -349,19 +514,18 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     //      events were missed across a restart.
     let now = crate::lease::now_unix();
     for id in state.projects.list_deactivating().await? {
-        let project_id = id.to_string();
         if let Some(lifecycle) = state.projects.lifecycle(id).await? {
             if let Some(deadline) = lifecycle.drain_deadline_unix {
                 if now >= deadline {
                     tracing::warn!(
                         target: "weft_dispatcher::reaper",
-                        project_id = %project_id,
+                        project_id = %id,
                         "deactivation drain cap expired; cancelling remaining executions"
                     );
                     if let Err((code, msg)) =
                         crate::api::project::cancel_running_non_suspended(
                             &state,
-                            &project_id,
+                            id,
                             None,
                             weft_core::exec::CancelCause::User,
                         )
@@ -369,7 +533,7 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
                     {
                         tracing::warn!(
                             target: "weft_dispatcher::reaper",
-                            project_id = %project_id,
+                            project_id = %id,
                             code = %code,
                             error = %msg,
                             "drain-cap cancel failed; retrying next sweep"
@@ -379,7 +543,7 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
                 }
             }
         }
-        crate::journal_bridge::try_finish_drain(&state, &project_id, None).await?;
+        crate::journal_bridge::try_finish_drain(&state, id, None).await?;
     }
     Ok(())
 }
@@ -478,7 +642,7 @@ async fn sweep_terminal_worker_pods(state: DispatcherState) -> anyhow::Result<()
             .kube
             .delete_named(
                 &row.namespace,
-                "pod",
+                weft_platform_traits::kube::NamedKind::Pod,
                 &row.pod_name,
                 weft_platform_traits::DeleteOpts::no_wait(),
             )
@@ -512,7 +676,7 @@ async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Listener reaper. Every 10s, reap every pooled listener pod holding
+/// Listener reaper. Every 30s, reap every pooled listener pod holding
 /// ZERO signals (per-pod idle reap). `ListenerPool::reap_idle` scans
 /// the `listener_pod` registry, claims each idle pod (ownership + lease
 /// so two dispatchers do not both reap one), tears it down, and deletes
@@ -632,7 +796,7 @@ async fn sweep_worker_scaledown(state: DispatcherState) -> anyhow::Result<()> {
             weft_task_store::worker_pod::projects_with_multiple_workers(&state.pg_pool).await?;
         for project_id in projects {
             let loads: Vec<weft_platform_traits::PoolPodLoad> =
-                weft_task_store::worker_pod::pod_loads_for_project(&state.pg_pool, &project_id)
+                weft_task_store::worker_pod::pod_loads_for_project(&state.pg_pool, project_id)
                     .await?
                     .into_iter()
                     .map(|(pod_name, mem_pressure)| weft_platform_traits::PoolPodLoad {
@@ -658,4 +822,18 @@ async fn sweep_worker_scaledown(state: DispatcherState) -> anyhow::Result<()> {
     })
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_parked_fire_sweep_sleeps_until_the_next_head_is_due_within_bounds() {
+        assert_eq!(parked_fire_sleep(100, Some(107)), Duration::from_secs(7));
+        assert_eq!(parked_fire_sleep(100, Some(100)), Duration::from_secs(1), "due now: look again shortly");
+        assert_eq!(parked_fire_sleep(100, Some(50)), Duration::from_secs(1));
+        assert_eq!(parked_fire_sleep(100, Some(10_000)), parked_fire_longest_sleep());
+        assert_eq!(parked_fire_sleep(100, None), parked_fire_longest_sleep(), "nothing queued");
+    }
 }

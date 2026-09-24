@@ -24,13 +24,19 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
-/// How long a claim is valid before another Pod can steal it. Pods
-/// heartbeat the claim while they work.
-pub const CLAIM_DURATION_SECS: i64 = 60;
+/// How long a claim is valid before another Pod can steal it, at this
+/// install's pace (`weft_core::time_scale`): 60 seconds in real time.
+/// Pods heartbeat the claim while they work.
+pub fn claim_duration_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(60)
+}
 
-/// How often a working Pod renews its claim. Below `CLAIM_DURATION_SECS`
-/// so a slow op doesn't lose its claim to a transient hiccup.
-pub const CLAIM_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+/// How often a working Pod renews its claim: a quarter of
+/// [`claim_duration_secs`] (15 seconds in real time), so a slow op
+/// doesn't lose its claim to a transient hiccup.
+pub fn claim_heartbeat_interval() -> std::time::Duration {
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(15))
+}
 
 /// How long terminal-state rows linger before the sweeper deletes
 /// them. Long enough that producers polling for results see them.
@@ -90,7 +96,7 @@ pub struct Task {
     pub id: Uuid,
     pub kind: String,
     pub status: TaskStatus,
-    pub project_id: Option<String>,
+    pub project_id: Option<Uuid>,
     pub color: Option<String>,
     pub tenant_id: Option<String>,
     /// Requested executable, retained when claimed and handed to a spawn handler.
@@ -116,7 +122,7 @@ pub struct NewTask {
     /// directly, so an added kind never has to widen the built-in `TaskKind` enum.
     pub kind: String,
     pub target: TaskTarget,
-    pub project_id: Option<String>,
+    pub project_id: Option<Uuid>,
     pub dedup_key: Option<String>,
     pub color: Option<String>,
     pub tenant_id: Option<String>,
@@ -149,7 +155,36 @@ pub struct NewTask {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClaimFilter {
     Dispatcher,
-    Worker { project_id: String },
+    Worker { project_id: Uuid },
+}
+
+impl ClaimFilter {
+    /// The [`TASK_READY_CHANNEL`] payload a task this filter can claim
+    /// is announced with.
+    pub fn ready_payload(&self) -> String {
+        match self {
+            Self::Dispatcher => ready_payload(TaskTarget::Dispatcher, None),
+            Self::Worker { project_id } => ready_payload(TaskTarget::Worker, Some(*project_id)),
+        }
+    }
+}
+
+/// The channel a task that has just become claimable (inserted pending,
+/// or put back to pending by a requeue or a reclaim) notifies on, from
+/// the `task_ready_notify` trigger in [`GROUP`]. A lease that merely
+/// expires announces nothing: a waiter's own deadline is what rescues
+/// it.
+pub const TASK_READY_CHANNEL: &str = "weft_task_ready";
+
+/// A [`TASK_READY_CHANNEL`] payload: `dispatcher` for a dispatcher task,
+/// `worker:<project_id>` for a worker one, since only that project's
+/// pods can claim it.
+/// SYNC: ready_payload <-> the `task_ready_notify` function in `GROUP`.
+pub fn ready_payload(target: TaskTarget, project_id: Option<Uuid>) -> String {
+    match target {
+        TaskTarget::Dispatcher => "dispatcher".to_string(),
+        TaskTarget::Worker => format!("worker:{}", project_id.map(|p| p.to_string()).unwrap_or_default()),
+    }
 }
 
 /// Result of an `enqueue_dedup` call. Both arms carry the live row's
@@ -192,7 +227,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             kind TEXT NOT NULL,
             status TEXT NOT NULL,
             target TEXT NOT NULL,
-            project_id TEXT,
+            project_id UUID,
             dedup_key TEXT,
             color TEXT,
             tenant_id TEXT,
@@ -205,7 +240,12 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             result JSONB,
             error TEXT,
             created_at_unix BIGINT NOT NULL,
-            completed_at_unix BIGINT
+            completed_at_unix BIGINT,
+            -- Asked for again while claimed (`enqueue_or_rearm`): the
+            -- claimant may already be past the point where it would
+            -- have seen why, so finishing puts the row back to pending
+            -- instead of ending it.
+            rerun_requested BOOLEAN NOT NULL DEFAULT FALSE
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_pending_dispatcher
             ON task(created_at_unix)
@@ -236,6 +276,35 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_task_terminal_completed
             ON task(completed_at_unix)
             WHERE status IN ('complete', 'failed')"#,
+        // Announce every task that has just become claimable, so the
+        // pickers sleep until there is work instead of asking on a
+        // timer. From a trigger rather than from each writer, so no
+        // write path (an enqueue, a live admission, a requeue, the
+        // orphan reclaim) can forget it, and the notification goes out
+        // when the write commits.
+        // SYNC: task_ready_notify's payload <-> ready_payload above.
+        r#"CREATE OR REPLACE FUNCTION task_ready_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_task_ready',
+                    CASE WHEN NEW.target = 'dispatcher' THEN 'dispatcher'
+                         ELSE 'worker:' || COALESCE(NEW.project_id::text, '') END);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS task_ready_on_insert ON task"#,
+        r#"CREATE TRIGGER task_ready_on_insert
+            AFTER INSERT ON task
+            FOR EACH ROW
+            WHEN (NEW.status = 'pending')
+            EXECUTE FUNCTION task_ready_notify()"#,
+        // Only the transition INTO pending: claims, heartbeats and
+        // completions are the hot path and must stay silent.
+        r#"DROP TRIGGER IF EXISTS task_ready_on_pending ON task"#,
+        r#"CREATE TRIGGER task_ready_on_pending
+            AFTER UPDATE OF status ON task
+            FOR EACH ROW
+            WHEN (NEW.status = 'pending' AND OLD.status IS DISTINCT FROM 'pending')
+            EXECUTE FUNCTION task_ready_notify()"#,
     ],
     seed: &[],
 };
@@ -254,7 +323,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(id)
     .bind(spec.kind.as_str())
     .bind(spec.target.as_str())
-    .bind(spec.project_id.as_deref())
+    .bind(spec.project_id)
     .bind(spec.dedup_key.as_deref())
     .bind(spec.color.as_deref())
     .bind(spec.tenant_id.as_deref())
@@ -336,7 +405,7 @@ pub async fn enqueue_dedup_in(
     .bind(id)
     .bind(spec.kind.as_str())
     .bind(spec.target.as_str())
-    .bind(spec.project_id.as_deref())
+    .bind(spec.project_id)
     .bind(dedup)
     .bind(spec.color.as_deref())
     .bind(spec.tenant_id.as_deref())
@@ -347,6 +416,49 @@ pub async fn enqueue_dedup_in(
     .execute(&mut *conn)
     .await?;
     Ok(DedupOutcome::Inserted(id))
+}
+
+/// [`enqueue_dedup`] for a task that means "go and look again": a pending
+/// one already will, so the ask collapses onto it, but a CLAIMED one may
+/// already have looked for the last time, so it is asked to run once
+/// more when it finishes (`rerun_requested`) rather than collapsed
+/// onto and forgotten. The next claim clears the ask, however the
+/// current one ends, since that claim is itself the run asked for. A resume is the case: its worker reads the
+/// journal a last time and exits, and a wake landing between that read
+/// and the task's completion used to be collapsed onto the finishing
+/// task and never driven.
+pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
+    let mut tx = pool.begin().await?;
+    let dedup = spec
+        .dedup_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("enqueue_or_rearm requires dedup_key"))?;
+    let lock_input = format!("{}|{}|{}", spec.tenant_id.as_deref().unwrap_or(""), spec.kind.as_str(), dedup);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&lock_input)
+        .execute(&mut *tx)
+        .await?;
+    // The row lock of this UPDATE and the one of `complete`/`fail` order
+    // the two: before the completion, the completion sees the flag and
+    // re-pends; after it, this matches nothing and the insert below
+    // queues a fresh task.
+    let rearmed: Option<(Uuid,)> = sqlx::query_as(
+        r#"UPDATE task SET rerun_requested = TRUE
+           WHERE tenant_id IS NOT DISTINCT FROM $1
+             AND kind = $2 AND dedup_key = $3 AND status = 'claimed'
+           RETURNING id"#,
+    )
+    .bind(spec.tenant_id.as_deref())
+    .bind(spec.kind.as_str())
+    .bind(dedup)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let outcome = match rearmed {
+        Some((id,)) => DedupOutcome::AlreadyLive(id),
+        None => enqueue_dedup_in(&mut tx, spec).await?,
+    };
+    tx.commit().await?;
+    Ok(outcome)
 }
 
 /// The pod a live execution was admitted to (its k8s name + namespace),
@@ -401,7 +513,6 @@ pub async fn admit_live_execution_in(
 ) -> Result<LiveAdmitOutcome> {
     let project_id = spec
         .project_id
-        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
     let color = spec
         .color
@@ -488,128 +599,123 @@ pub async fn admit_live_execution_in(
 
 /// Atomically claim one task for `pod_id`. Picks oldest pending
 /// first; also rescues claims whose lease expired (Pod died mid-work).
+///
+/// One statement: the pick locks its row (`FOR UPDATE SKIP LOCKED`, so
+/// sibling pickers skip it rather than queue behind it) and the claim
+/// updates it, with no round trip between. Each target has its own
+/// query, so the pick reads the target's partial index for pending rows
+/// and the expired-claim index together (a bitmap OR of the two)
+/// instead of scanning the table.
 pub async fn claim_one(
     pool: &PgPool,
     pod_id: &str,
-    filter: ClaimFilter,
+    filter: &ClaimFilter,
 ) -> Result<Option<Task>> {
     let now = unix_now();
-    let claim_until = now + CLAIM_DURATION_SECS;
-
-    // ClaimFilter projects to two SQL parameters:
-    //   - target_str: 'dispatcher' or 'worker'
-    //   - project_filter: NULL for dispatcher (matches any), Some(id)
-    //     for worker (matches that exact project_id).
-    // The single SELECT below works for both via `($2 IS NULL OR
-    // project_id = $2)`. Avoids two near-identical SQL strings that
-    // can drift independently.
-    let (target_str, project_filter): (&str, Option<&str>) = match &filter {
-        ClaimFilter::Dispatcher => (TaskTarget::Dispatcher.as_str(), None),
-        ClaimFilter::Worker { project_id } => (TaskTarget::Worker.as_str(), Some(project_id)),
+    let claim_until = now + claim_duration_secs();
+    let row = match filter {
+        ClaimFilter::Dispatcher => {
+            sqlx::query(&claim_sql(DISPATCHER_PICK))
+                .bind(pod_id)
+                .bind(now)
+                .bind(claim_until)
+                .fetch_optional(pool)
+                .await?
+        }
+        ClaimFilter::Worker { project_id } => {
+            sqlx::query(&claim_sql(WORKER_PICK))
+                .bind(pod_id)
+                .bind(now)
+                .bind(claim_until)
+                .bind(*project_id)
+                .fetch_optional(pool)
+                .await?
+        }
     };
-
-    let mut tx = pool.begin().await?;
-    // `target_pod_name IS NULL OR target_pod_name = $pod` lets cancel /
-    // resume tasks be addressed to one specific pod in a multi-pod pool.
-    // Tasks without an address are claimable by any pod matching the
-    // (target, project) scope.
-    //
-    // Worker-target claims must verify the picking pod is still alive in
-    // `worker_pod`. Without this, a pod that's been marked dead (e.g. by
-    // reconcile_worker during a sync that bumped the
-    // binary_hash) keeps claiming tasks for the up-to-10s window until
-    // its own heartbeat detects the dead row. Those claims then fail
-    // when the fencing trigger rejects the resulting journal writes. The
-    // DB has the source of truth; let it enforce.
-    //
-    // DRAINING pods: a worker being scaled down must stop taking NEW,
-    // unaddressed work (else the drain never empties it), but must still
-    // run work ADDRESSED to it (a resume pinned to it because it still
-    // owns the color, or a cancel). So a draining pod may claim a task
-    // pinned to itself but not an unpinned one. Expressed as: the task
-    // is pinned to THIS pod, OR (it is unpinned AND this pod is not
-    // draining). Aliveness is required either way.
-    //
-    // STALE-IMAGE pods: an unpinned task stamped with a `binary_hash`
-    // is only claimable by a pod baked from THAT image. Without this, a
-    // still-alive worker built for the previous source claims a run for
-    // the new source and fails at runtime with "unknown node type" (its
-    // binary lacks the new node impls). The cold-start sweep applies
-    // the same predicate, so a project whose only pods are stale gets a
-    // fresh spawn; the stale pods stop receiving work and idle-exit.
-    // Pinned tasks bypass (they must reach their addressed pod).
-    //
-    // Dispatcher-target claims aren't affected: dispatcher pods have no
-    // `worker_pod` row at all, so the EXISTS check is gated on target.
-    let row = sqlx::query(
-        r#"SELECT id, kind, status, project_id, color, tenant_id, binary_hash, attempts, payload
-           FROM task
-           WHERE target = $1
-             AND ($2::TEXT IS NULL OR project_id = $2)
-             AND (target_pod_name IS NULL OR target_pod_name = $3)
-             AND (status = 'pending'
-                  OR (status = 'claimed' AND claimed_until_unix < $4))
-             AND (
-                 target = 'dispatcher'
-                 OR EXISTS (
-                     SELECT 1 FROM worker_pod wp
-                     WHERE wp.pod_name = $3
-                       AND wp.status IN ('spawning', 'alive')
-                       AND wp.role = 'worker'
-                       AND (task.target_pod_name = $3
-                            OR (NOT wp.draining
-                                AND (task.binary_hash IS NULL
-                                     OR task.binary_hash = wp.binary_hash)))
-                 )
-             )
-           ORDER BY created_at_unix ASC
-           FOR UPDATE SKIP LOCKED
-           LIMIT 1"#,
-    )
-    .bind(target_str)
-    .bind(project_filter)
-    .bind(pod_id)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(row) = row else {
-        tx.commit().await?;
-        return Ok(None);
-    };
-
-    let id: Uuid = row.try_get("id")?;
-
-    sqlx::query(
-        r#"UPDATE task
-           SET status = 'claimed',
-               claimed_by = $1,
-               claimed_until_unix = $2,
-               attempts = attempts + 1
-           WHERE id = $3"#,
-    )
-    .bind(pod_id)
-    .bind(claim_until)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    let mut task = row_to_task(row)?;
-    // The SELECT ran before the claim UPDATE bumped the counter, so
-    // reflect THIS claim in the returned value: `attempts` counts the
-    // claim the caller is now holding.
-    task.attempts += 1;
-    Ok(Some(task))
+    row.map(row_to_task).transpose()
 }
+
+/// The claim around a pick: `$1` the claiming pod, `$2` now, `$3` the
+/// lease's end. `RETURNING` hands back the row as claimed, so
+/// `attempts` counts the claim the caller now holds. A new claim is the
+/// run that sees everything asked before it, so it clears
+/// `rerun_requested`: an ask left over from a claim that ended without
+/// finishing (a requeue, a reclaim, a lapsed lease) is already served.
+fn claim_sql(pick: &str) -> String {
+    format!(
+        "UPDATE task \
+         SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1, \
+             rerun_requested = FALSE \
+         WHERE id = ({pick}) \
+         RETURNING id, kind, status, project_id, color, tenant_id, binary_hash, attempts, payload"
+    )
+}
+
+/// The oldest dispatcher task that is pending or whose claim lapsed.
+/// Dispatcher pods have no `worker_pod` row, so nothing else gates it.
+const DISPATCHER_PICK: &str = r#"SELECT id FROM task
+    WHERE target = 'dispatcher'
+      AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
+      AND (target_pod_name IS NULL OR target_pod_name = $1)
+    ORDER BY created_at_unix ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1"#;
+
+/// The oldest worker task of project `$4` that is pending or whose
+/// claim lapsed, and that pod `$1` may run.
+///
+/// `target_pod_name IS NULL OR target_pod_name = $pod` lets cancel /
+/// resume tasks be addressed to one specific pod in a multi-pod pool.
+/// Tasks without an address are claimable by any pod of the project.
+///
+/// The picking pod must still be alive in `worker_pod`. Without this, a
+/// pod that's been marked dead (e.g. by reconcile_worker during a sync
+/// that bumped the binary_hash) keeps claiming tasks for the up-to-10s
+/// window until its own heartbeat detects the dead row. Those claims
+/// then fail when the fencing trigger rejects the resulting journal
+/// writes. The DB has the source of truth; let it enforce.
+///
+/// DRAINING pods: a worker being scaled down must stop taking NEW,
+/// unaddressed work (else the drain never empties it), but must still
+/// run work ADDRESSED to it (a resume pinned to it because it still
+/// owns the color, or a cancel). So a draining pod may claim a task
+/// pinned to itself but not an unpinned one. Expressed as: the task is
+/// pinned to THIS pod, OR (it is unpinned AND this pod is not
+/// draining). Aliveness is required either way.
+///
+/// STALE-IMAGE pods: an unpinned task stamped with a `binary_hash` is
+/// only claimable by a pod baked from THAT image. Without this, a
+/// still-alive worker built for the previous source claims a run for
+/// the new source and fails at runtime with "unknown node type" (its
+/// binary lacks the new node impls). The cold-start sweep applies the
+/// same predicate, so a project whose only pods are stale gets a fresh
+/// spawn; the stale pods stop receiving work and idle-exit. Pinned
+/// tasks bypass (they must reach their addressed pod).
+const WORKER_PICK: &str = r#"SELECT id FROM task
+    WHERE target = 'worker'
+      AND project_id = $4
+      AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
+      AND (target_pod_name IS NULL OR target_pod_name = $1)
+      AND EXISTS (
+          SELECT 1 FROM worker_pod wp
+          WHERE wp.pod_name = $1
+            AND wp.status IN ('spawning', 'alive')
+            AND wp.role = 'worker'
+            AND (task.target_pod_name = $1
+                 OR (NOT wp.draining
+                     AND (task.binary_hash IS NULL
+                          OR task.binary_hash = wp.binary_hash)))
+      )
+    ORDER BY created_at_unix ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1"#;
 
 /// Renew the claim's lease. Returns false if the row no longer
 /// belongs to us (lease lost, manually transitioned, deleted).
 /// The caller should abandon work and let the next claim recover.
 pub async fn heartbeat(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<bool> {
     let now = unix_now();
-    let claim_until = now + CLAIM_DURATION_SECS;
+    let claim_until = now + claim_duration_secs();
     let rows = sqlx::query(
         r#"UPDATE task
            SET claimed_until_unix = $1
@@ -693,12 +799,28 @@ pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>
 /// `update` (an `UPDATE task ... ` that makes rows terminal) wrapped so
 /// each row it changes notifies [`crate::terminal::TERMINAL_CHANNEL`]
 /// with its id, in the same statement: the notification goes out when
-/// the write commits. Returns one row per task it changed.
+/// the write commits. Returns one row per task it changed. A row the
+/// update put back to pending (`rerun_requested`) is changed but not
+/// terminal, so it is returned without the notification.
 fn notify_terminal(update: &str) -> String {
     format!(
-        "WITH done AS ({update} RETURNING id) \
-         SELECT pg_notify('{}', id::text) FROM done",
+        "WITH done AS ({update} RETURNING id, status) \
+         SELECT CASE WHEN status = 'pending' THEN NULL \
+                     ELSE pg_notify('{}', id::text) END FROM done",
         crate::terminal::TERMINAL_CHANNEL
+    )
+}
+
+/// The `SET` clause that ends a claim as `status`, unless it was asked
+/// to run again while claimed: then it goes back to pending, unclaimed,
+/// for the next claim to run (see [`enqueue_or_rearm`]).
+fn end_claim_as(status: &str) -> String {
+    format!(
+        "status = CASE WHEN rerun_requested THEN 'pending' ELSE '{status}' END, \
+         completed_at_unix = CASE WHEN rerun_requested THEN NULL ELSE $2 END, \
+         claimed_by = CASE WHEN rerun_requested THEN NULL ELSE claimed_by END, \
+         claimed_until_unix = NULL, \
+         rerun_requested = FALSE"
     )
 }
 
@@ -712,12 +834,11 @@ pub async fn complete(
 ) -> Result<()> {
     let now = unix_now();
     let updated = sqlx::query(&notify_terminal(
-        r#"UPDATE task
-           SET status = 'complete',
-               result = $1,
-               completed_at_unix = $2,
-               claimed_until_unix = NULL
-           WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'"#,
+        &format!(
+            "UPDATE task SET {}, result = $1 \
+             WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
+            end_claim_as("complete")
+        ),
     ))
     .bind(&result)
     .bind(now)
@@ -763,12 +884,11 @@ pub async fn fail(
 ) -> Result<()> {
     let now = unix_now();
     let updated = sqlx::query(&notify_terminal(
-        r#"UPDATE task
-           SET status = 'failed',
-               error = $1,
-               completed_at_unix = $2,
-               claimed_until_unix = NULL
-           WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'"#,
+        &format!(
+            "UPDATE task SET {}, error = $1 \
+             WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
+            end_claim_as("failed")
+        ),
     ))
     .bind(&error)
     .bind(now)
@@ -797,7 +917,7 @@ pub struct TaskOutcome {
 pub async fn peek_for_project(
     pool: &PgPool,
     task_id: Uuid,
-    project_id: &str,
+    project_id: Uuid,
 ) -> Result<Option<TaskOutcome>> {
     // `result` is answered only once the task is terminal: a partial
     // result stored mid-claim (see `store_result_partial`) is an
@@ -879,7 +999,7 @@ pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
 pub struct OrphanedLiveExecution {
     pub task_id: Uuid,
     pub color: String,
-    pub project_id: Option<String>,
+    pub project_id: Option<Uuid>,
 }
 
 /// Recover EVERY task stranded on a worker pod that is no longer routable
@@ -950,7 +1070,7 @@ pub async fn reclaim_orphaned_tasks(pool: &PgPool) -> Result<Vec<OrphanedLiveExe
         // execute always carries a color, so a NULL here is itself corruption.
         let task_id: Uuid = r.try_get("id")?;
         let color: Option<String> = r.try_get("color")?;
-        let project_id: Option<String> = r.try_get("project_id")?;
+        let project_id: Option<Uuid> = r.try_get("project_id")?;
         let Some(color) = color else {
             anyhow::bail!("live execute orphan task {task_id} has NULL color");
         };
@@ -1012,7 +1132,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     let status_str: String = row.try_get("status")?;
     let status = TaskStatus::parse(&status_str)
         .ok_or_else(|| anyhow::anyhow!("unknown task status '{status_str}'"))?;
-    let project_id: Option<String> = row.try_get("project_id")?;
+    let project_id: Option<Uuid> = row.try_get("project_id")?;
     let color: Option<String> = row.try_get("color")?;
     let tenant_id: Option<String> = row.try_get("tenant_id")?;
     let binary_hash: Option<String> = row.try_get("binary_hash")?;
@@ -1052,7 +1172,7 @@ mod wire_tests {
         let original = NewTask {
             kind: "build_image".to_string(),
             target: TaskTarget::Worker,
-            project_id: Some("p1".to_string()),
+            project_id: Some(Uuid::from_u128(1)),
             dedup_key: Some("d1".to_string()),
             color: Some("c1".to_string()),
             tenant_id: Some("t1".to_string()),

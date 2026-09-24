@@ -49,11 +49,23 @@ pub struct SupervisorState {
     pub pod_name: String,
     pub kube: Arc<dyn KubeClient>,
     pub clock: Arc<dyn Clock>,
-    pub poll_interval: Duration,
+    /// How often the ownership loop renews this pod's project leases
+    /// and claims more: a third of `infra_owner_lease_secs`, so one
+    /// slow tick never lets a lease this pod still wants lapse.
+    pub ownership_interval: Duration,
+    /// How often the health loop looks at every owned project.
+    pub health_interval: Duration,
     pub health: Arc<tokio::sync::Mutex<health::HealthRegistry>>,
     /// Reads this pod's real memory pressure, reported to the broker on
     /// each ownership tick. Saturation (the claim gate) and the
     /// dispatcher's placement both key on it, the SAME metric the
     /// listener uses.
     pub mem_pressure: Arc<dyn MemPressure>,
+    /// Raised by the lifecycle loop when the broker says a command waits
+    /// on a project nobody owns: the ownership loop ticks at once rather
+    /// than at the end of its interval.
+    pub ownership_wanted: Arc<tokio::sync::Notify>,
+    /// The install this supervisor serves, read from `WEFT_INSTANCE` at
+    /// startup. Compile refuses what only the default install serves.
+    pub install: weft_core::infra::Instance,
 }

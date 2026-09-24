@@ -18,12 +18,13 @@ async fn schema(pool: &PgPool) {
     weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
 }
 
-async fn project(pool: &PgPool, id: &str, status: ProjectStatus) {
+async fn project(pool: &PgPool, id: uuid::Uuid, status: ProjectStatus) {
     sqlx::query(
         "INSERT INTO project (id, name, status, project_json, updated_at) \
-         VALUES ($1::uuid, $1, $2, '{}', 0)",
+         VALUES ($1, $2, $3, '{}', 0)",
     )
     .bind(id)
+    .bind(id.to_string())
     .bind(status.as_str())
     .execute(pool)
     .await
@@ -32,7 +33,7 @@ async fn project(pool: &PgPool, id: &str, status: ProjectStatus) {
 
 /// One entry signal; the node id is the token, since a project holds
 /// one entry row per node.
-async fn signal(pool: &PgPool, token: &str, project_id: &str, pod: Option<&str>) {
+async fn signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, pod: Option<&str>) {
     sqlx::query(
         "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, listener_pod) \
          VALUES ($1, 'local', $2, $1, FALSE, '{}', 0, $3)",
@@ -45,10 +46,10 @@ async fn signal(pool: &PgPool, token: &str, project_id: &str, pod: Option<&str>)
     .expect("signal row");
 }
 
-const ACTIVE: &str = "00000000-0000-0000-0000-00000000000a";
-const ACTIVATING: &str = "00000000-0000-0000-0000-00000000000b";
-const PARKED: &str = "00000000-0000-0000-0000-00000000000c";
-const DEACTIVATING: &str = "00000000-0000-0000-0000-00000000000d";
+const ACTIVE: uuid::Uuid = uuid::Uuid::from_u128(0xa);
+const ACTIVATING: uuid::Uuid = uuid::Uuid::from_u128(0xb);
+const PARKED: uuid::Uuid = uuid::Uuid::from_u128(0xc);
+const DEACTIVATING: uuid::Uuid = uuid::Uuid::from_u128(0xd);
 
 #[sqlx::test]
 async fn a_pod_rehydrates_live_projects_and_never_a_parked_one(pool: PgPool) {

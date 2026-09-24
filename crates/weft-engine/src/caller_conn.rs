@@ -250,7 +250,9 @@ pub struct LiveCallerConnection {
     inner: Mutex<ConnInner>,
     /// Monotonic offset for journaled caller events (per connection).
     next_offset: AtomicU64,
-    connected: AtomicBool,
+    /// Whether the caller is attached, as a watch so a hold waiting on
+    /// the caller (`disconnected()`) wakes the moment it hangs up.
+    connected: tokio::sync::watch::Sender<bool>,
 }
 
 /// Stored inbound log with a wakeup and a BOUNDED in-RAM window. A
@@ -365,7 +367,7 @@ impl LiveCallerConnection {
     /// The socket owns this connection even after execution cleanup removes
     /// its registry entry. Record the disconnect exactly once on that owner.
     fn mark_disconnected(&self, reason: &str) {
-        if self.connected.swap(false, Ordering::SeqCst) {
+        if self.connected.send_replace(false) {
             let offset = self.next_offset();
             self.journal.disconnected(self.color, offset, reason);
         }
@@ -462,7 +464,14 @@ impl CallerConnection for LiveCallerConnection {
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        *self.connected.borrow()
+    }
+
+    async fn disconnected(&self) {
+        let mut rx = self.connected.subscribe();
+        // `wait_for` reads the current value first, so a hang-up that
+        // already happened resolves at once.
+        let _ = rx.wait_for(|connected| !connected).await;
     }
 
     fn wire_started(&self) -> bool {
@@ -833,7 +842,7 @@ pub(crate) fn new_connection(
         color,
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
         next_offset: AtomicU64::new(0),
-        connected: AtomicBool::new(true),
+        connected: tokio::sync::watch::Sender::new(true),
     });
     // Connect event at offset 0 is stamped by the caller of this fn (the
     // server) once it has registered, so the journal ordering matches the
@@ -958,12 +967,13 @@ async fn ask_for_birth(
     payload: weft_task_store::kinds::LiveArrivalPayload,
 ) -> Result<(), Response> {
     use weft_task_store::tasks::{NewTask, TaskStatus, TaskTarget};
+    let project_id = claims.project_id;
     let enqueued = state
         .tasks
         .enqueue_dedup(NewTask {
             kind: weft_task_store::TaskKind::LiveArrival.into(),
             target: TaskTarget::Dispatcher,
-            project_id: Some(claims.project_id.clone()),
+            project_id: Some(project_id),
             dedup_key: Some(weft_task_store::kinds::live_arrival_dedup_key(claims.color)),
             // No color on the row: the broker scopes a task by every
             // resource it names, and this color names nothing yet. The
@@ -1931,6 +1941,8 @@ mod tests {
     use weft_core::signal::DataType;
     use weft_core::wait::SuspendPolicy;
 
+    const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
+
     /// Recording journal sink: appends every event so tests assert the
     /// observable exchange was journaled in order.
     #[derive(Default)]
@@ -2412,6 +2424,7 @@ mod tests {
             &self,
             _pod_id: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
+            _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
@@ -2446,7 +2459,7 @@ mod tests {
             secret,
             &caller_token::CallerTokenClaims {
                 color,
-                project_id: "proj-1".into(),
+                project_id: PROJECT,
                 pod_name: pod_name.into(),
                 signal: "sig-1".into(),
                 path: "chat/room7".into(),
@@ -2611,7 +2624,7 @@ mod tests {
         let task = &asked[0];
         assert_eq!(task.kind, "live_arrival");
         assert_eq!(task.dedup_key.as_deref(), Some(format!("live-arrival:{color}").as_str()));
-        assert_eq!(task.project_id.as_deref(), Some("proj-1"), "the project is the anchor the broker checks");
+        assert_eq!(task.project_id, Some(PROJECT), "the project is the anchor the broker checks");
         assert_eq!(task.color, None, "the color does not exist yet; this task is what creates it");
         assert_eq!(task.tenant_id.as_deref(), Some("tenant-a"));
         let payload: weft_task_store::kinds::LiveArrivalPayload = serde_json::from_value(task.payload.clone()).unwrap();

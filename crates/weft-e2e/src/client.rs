@@ -50,6 +50,11 @@ pub struct Dispatcher {
     /// Mints the per-request bearer. `None` => unauthenticated; `Some` => a
     /// harness signs a token per call.
     auth: Option<std::sync::Arc<dyn AuthProvider>>,
+    /// Which install on the cluster this dispatcher belongs to: the default
+    /// one, or a test cell ([`crate::cell::Cell`]). What reaches behind the
+    /// API (the platform layer, the `weft` CLI) follows it to the right
+    /// namespaces and database.
+    instance: weft_core::infra::Instance,
 }
 
 impl Dispatcher {
@@ -61,6 +66,12 @@ impl Dispatcher {
     pub fn from_env() -> Result<Self> {
         let base = std::env::var("WEFT_DISPATCHER_URL")
             .unwrap_or_else(|_| DEFAULT_DISPATCHER_URL.to_string());
+        Self::for_install(&base, weft_core::infra::Instance::default_install())
+    }
+
+    /// An UNAUTHENTICATED client for the dispatcher of `instance`, answering
+    /// at `base`.
+    pub fn for_install(base: &str, instance: weft_core::infra::Instance) -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("build reqwest client")?;
@@ -68,7 +79,13 @@ impl Dispatcher {
             base: base.trim_end_matches('/').to_string(),
             http,
             auth: None,
+            instance,
         })
+    }
+
+    /// The install this dispatcher belongs to.
+    pub fn instance(&self) -> &weft_core::infra::Instance {
+        &self.instance
     }
 
     /// A clone of this client that authenticates every request via `auth`. A
@@ -162,9 +179,10 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// DELETE `path`, requiring 2xx. Used by the suite's startup sweep to
-    /// remove leftover projects via the real `DELETE /projects/{id}` path
-    /// (the same forced cleanup `weft rm --force` performs).
+    /// DELETE `path`, requiring 2xx. Used by the cleanup
+    /// (`crate::cleanup`) to remove the projects failed runs kept via the
+    /// real `DELETE /projects/{id}` path (the same forced cleanup
+    /// `weft rm --force` performs).
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.url(path);
         let resp = self
@@ -284,24 +302,33 @@ async fn read_ok(resp: reqwest::Response, verb: &str, url: &str) -> Result<Strin
     }
 }
 
-/// Run the installed `weft` CLI in `dir`, returning the captured output. The
-/// CLI inherits the rig's environment (so `WEFT_DISPATCHER_URL` and friends
-/// flow through). Fails loud if the binary cannot be spawned; the EXIT STATUS
-/// is left to the caller (some verbs are expected to fail in negative tests).
-pub async fn cli(dir: &Path, args: &[&str]) -> Result<CliOutput> {
+/// Run the installed `weft` CLI in `dir` against `disp`'s install, returning
+/// the captured output. The CLI inherits the rig's environment, with the
+/// dispatcher address and the install name set to `disp`'s, so a test on a
+/// cell never reaches the default install by accident. Fails loud if the
+/// binary cannot be spawned; the EXIT STATUS is left to the caller (some
+/// verbs are expected to fail in negative tests).
+pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutput> {
     let mut cmd = tokio::process::Command::new("weft");
     cmd.current_dir(dir);
     cmd.args(args);
+    cmd.env("WEFT_DISPATCHER_URL", disp.base());
+    match disp.instance().name() {
+        Some(name) => cmd.env(weft_core::infra::INSTANCE_ENV, name),
+        None => cmd.env_remove(weft_core::infra::INSTANCE_ENV),
+    };
     // The rig is non-interactive by construction: a verb that wants a
     // prompt must receive its answer via flags. With an inherited stdin
     // (the developer's terminal) a prompt would READ from the terminal
     // while its text went to the captured pipe: an invisible hang. A
     // null stdin makes the CLI's prompt guard bail loudly instead.
     cmd.stdin(std::process::Stdio::null());
+    let start = std::time::Instant::now();
     let out: Output = cmd
         .output()
         .await
         .with_context(|| format!("spawn `weft {}` in {}", args.join(" "), dir.display()))?;
+    eprintln!("[e2e] {:.1}s: weft {}", start.elapsed().as_secs_f64(), args.join(" "));
     Ok(CliOutput {
         status: out.status.code(),
         success: out.status.success(),
@@ -313,8 +340,8 @@ pub async fn cli(dir: &Path, args: &[&str]) -> Result<CliOutput> {
 
 /// Run `weft` in `dir` and require a zero exit, returning stdout. Errors carry
 /// the invocation, exit code, and BOTH streams so a failure is fully legible.
-pub async fn cli_ok(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = cli(dir, args).await?;
+pub async fn cli_ok(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<String> {
+    let out = cli(disp, dir, args).await?;
     if out.success {
         Ok(out.stdout)
     } else {
@@ -393,6 +420,9 @@ where
     let start = std::time::Instant::now();
     loop {
         if let Some(v) = f().await? {
+            // One line per wait in the test's log: where a slow test spends
+            // its time is read off these, and so is how far a failed one got.
+            eprintln!("[e2e] waited {:.1}s for: {what}", start.elapsed().as_secs_f64());
             return Ok(v);
         }
         if start.elapsed() >= deadline {

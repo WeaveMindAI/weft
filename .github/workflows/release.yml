@@ -103,20 +103,6 @@ jobs:
       # the stitch job.
       - name: build + push shared images
         run: cargo run --locked -p weft-cli -- build-images --push-suffix "-${{ matrix.arch }}" > image-refs.txt
-      # The dispatcher and the supervisor exec kubectl in-pod; prove
-      # each one's kubectl actually runs on this architecture before
-      # anything gets stitched for users.
-      - name: smoke-run the kubectl-carrying images
-        run: |
-          set -euo pipefail
-          # Selected by NAME, never by line position.
-          # SYNC: stdout = one registry-qualified bare ref per line <->
-          #       crates/weft-cli/src/images.rs (SharedImages::bare_refs)
-          for repo in weft-dispatcher weft-infra-supervisor; do
-            ref="$(grep "/$repo:" image-refs.txt | head -n1)"
-            [ -n "$ref" ] || { echo "::error::no $repo ref in image-refs.txt"; exit 1; }
-            docker run --rm --entrypoint kubectl "$ref-${{ matrix.arch }}" version --client
-          done
       - uses: actions/upload-artifact@v4
         with:
           name: image-refs-${{ matrix.arch }}

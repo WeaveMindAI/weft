@@ -29,10 +29,9 @@ use weft_e2e::{ensure, project::Project, run::SettledRun};
 #[tokio::test]
 async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nodes() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let first = color_of(&stdout)?;
     let settled = SettledRun::observe(project.dispatcher(), first).await?;
     settled.completed()?;
@@ -65,12 +64,11 @@ async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nod
 #[tokio::test]
 async fn a_scoped_run_takes_a_value_by_hand_and_a_spec_fires_a_trigger_without_activation() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project
         .weft(&["run", "--json", "--from", "mid={\"value\":\"by hand\"}"])
         .await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     let settled = SettledRun::observe(project.dispatcher(), color).await?;
     settled.completed()?;
@@ -97,10 +95,9 @@ async fn a_scoped_run_takes_a_value_by_hand_and_a_spec_fires_a_trigger_without_a
 #[tokio::test]
 async fn a_frozen_example_runs_current_code_and_can_be_compared() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), color).await?.completed()?;
 
@@ -130,10 +127,9 @@ fn version_count(tree: &Value) -> usize {
 #[tokio::test]
 async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let first = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
     let v1 = tree_of(&project).await?["head"]["head_version"].as_str().unwrap().to_string();
@@ -200,10 +196,9 @@ async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
 #[tokio::test]
 async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let first = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
 
@@ -254,7 +249,7 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
 #[tokio::test]
 async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let refused = project.weft_refused(&["run", "--json", "--target", "missing"]).await?;
     anyhow::ensure!(refused.contains("unknown node 'missing'"), "{refused}");
@@ -275,7 +270,6 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
     anyhow::ensure!(refused.contains("is not a trigger"), "{refused}");
     // Saved, then run by name: the value by hand reaches `mid`, `src` never runs.
     let stdout = project.weft(&["run", "--json", "--from", "mid={\"value\":\"by hand\"}", "--save", "mid-only"]).await?;
-    project.mark_registered();
     let saved_run = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), saved_run).await?.completed()?;
     let tree = tree_of(&project).await?;
@@ -306,10 +300,9 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
 #[tokio::test]
 async fn a_frozen_example_drifts_and_is_frozen_again() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let first = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
     project.weft(&["freeze", "chain", &first.to_string(), "--json"]).await?;
@@ -350,14 +343,13 @@ async fn a_frozen_example_drifts_and_is_frozen_again() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_fired_trigger_uses_baked_inputs_and_emit_bypasses_its_body() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     // Refused at the door, naming both ways forward.
     let fire = "wired={\"scheduledTime\":\"2026-02-02T00:00:00Z\",\"actualTime\":\"2026-02-02T00:00:00Z\"}";
     let refused = project
         .weft_refused(&["run", "--fire", fire, "--from", "wired={\"cron\":\"0 0 * * * *\"}"])
         .await?;
-    project.mark_registered();
     anyhow::ensure!(refused.contains("cannot be a from start") && refused.contains("--emit"), "{refused}");
     project.weft(&["bake", "--json"]).await?;
 
@@ -386,7 +378,7 @@ async fn a_fired_trigger_uses_baked_inputs_and_emit_bypasses_its_body() -> anyho
 #[tokio::test]
 async fn trigger_preparation_and_fire_cut_precisely_inside_an_ordinary_group() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
     let graph = r#"
 scope = Group() -> (stamp: String) {
   sched = Text { value: "0 0 * * * *" }
@@ -401,7 +393,6 @@ out.data = scope.stamp
 "#;
     project.write_file("src/main.weft", graph)?;
     let bake = project.weft(&["bake", "--json"]).await?;
-    project.mark_registered();
     SettledRun::observe(project.dispatcher(), color_of(&bake)?).await?.completed()?
         .assert_completed("scope.sched")?.assert_completed("scope.tick")?
         .assert_untouched("scope.after")?.assert_untouched("scope.unrelated")?.assert_untouched("out")?;
@@ -472,11 +463,10 @@ scope.values = [1]
 #[tokio::test]
 async fn never_baked_triggers_refuse_and_baking_allows_fire_without_activation() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("version_tree", disp).await?;
+    let project = Project::prepare("version_tree", disp).await?;
 
     let tick = "tick={\"scheduledTime\":\"2026-04-04T00:00:00Z\",\"actualTime\":\"2026-04-04T00:00:00Z\"}";
     let refused = project.weft_refused(&["run", "--json", "--fire", tick]).await?;
-    project.mark_registered();
     anyhow::ensure!(refused.contains("weft bake"), "{refused}");
     let wired = "wired={\"scheduledTime\":\"2026-04-04T00:00:00Z\",\"actualTime\":\"2026-04-04T00:00:00Z\"}";
     let refused = project.weft_refused(&["run", "--fire", wired]).await?;
@@ -568,7 +558,6 @@ async fn removing_a_project_takes_its_runs_with_it() -> anyhow::Result<()> {
     let mut project = Project::prepare("version_tree", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    project.mark_registered();
     let color = color_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), color).await?.completed()?;
 

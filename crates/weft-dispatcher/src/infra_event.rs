@@ -21,7 +21,7 @@ pub use weft_broker_client::protocol::{InfraEvent, InfraEventKind};
 pub struct InfraEventRow {
     pub id: i64,
     pub tenant_id: String,
-    pub project_id: String,
+    pub project_id: uuid::Uuid,
     /// None for project-wide events (e.g. all infra terminated).
     pub node_id: Option<String>,
     /// Typed payload. Constructed by the supervisor; deserialized
@@ -39,14 +39,33 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TABLE IF NOT EXISTS infra_event (
             id          BIGSERIAL PRIMARY KEY,
             tenant_id   TEXT NOT NULL,
-            project_id  TEXT NOT NULL,
+            project_id  UUID NOT NULL,
             node_id     TEXT,
             kind        TEXT NOT NULL,
             payload     JSONB NOT NULL,
-            at_unix     BIGINT NOT NULL
+            at_unix     BIGINT NOT NULL,
+            -- The transaction that wrote the row, the order the
+            -- bridge's cursor reads in (`crate::settled`).
+            writer_xid  XID8 NOT NULL DEFAULT pg_current_xact_id()
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_event_settled ON infra_event(writer_xid, id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_project ON infra_event(project_id)"#,
+        // Wake the dispatcher's bridge on every event, whoever wrote it
+        // (the broker for a supervisor, or this crate's own `insert`),
+        // when the write commits.
+        // SYNC: 'weft_infra_event' <-> crate::infra_event_bridge::INFRA_EVENT_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION infra_event_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_infra_event', NEW.id::text);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS infra_event_notify_on_insert ON infra_event"#,
+        r#"CREATE TRIGGER infra_event_notify_on_insert
+            AFTER INSERT ON infra_event
+            FOR EACH ROW
+            EXECUTE FUNCTION infra_event_notify()"#,
     ],
     seed: &[],
 };
@@ -54,7 +73,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 pub async fn insert(
     pool: &PgPool,
     tenant_id: &str,
-    project_id: &str,
+    project_id: uuid::Uuid,
     node_id: Option<&str>,
     event: InfraEvent,
 ) -> Result<i64> {
@@ -75,42 +94,17 @@ pub async fn insert(
     Ok(row.0)
 }
 
-const FETCH_SINCE_SQL: &str = "SELECT id, tenant_id, project_id, node_id, kind, payload, at_unix \
-                                FROM infra_event WHERE id > $1 ORDER BY id ASC LIMIT $2";
+/// The columns a settled read of `infra_event` takes next to `id`, the
+/// ones [`parse_rows`] reads (`crate::settled::SettledReader::read`).
+pub const READ_COLUMNS: &str = "tenant_id, project_id, node_id, kind, payload, at_unix";
 
-/// Fetch every row with id > cursor. Used by `infra_event_bridge`
-/// inside its drain transaction.
-pub async fn fetch_since_tx<'c>(
-    tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
-    cursor: i64,
-    limit: i64,
-) -> Result<Vec<InfraEventRow>> {
-    let rows = sqlx::query(FETCH_SINCE_SQL)
-        .bind(cursor)
-        .bind(limit)
-        .fetch_all(&mut **tx)
-        .await?;
-    parse_rows(rows)
-}
-
-/// Pool-scoped variant retained for callers that don't need
-/// transactional isolation (tests, ad-hoc tooling).
-pub async fn fetch_since(pool: &PgPool, cursor: i64, limit: i64) -> Result<Vec<InfraEventRow>> {
-    let rows = sqlx::query(FETCH_SINCE_SQL)
-        .bind(cursor)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-    parse_rows(rows)
-}
-
-fn parse_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<InfraEventRow>> {
+pub fn parse_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<InfraEventRow>> {
     use sqlx::Row;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let id: i64 = r.try_get("id")?;
         let tenant_id: String = r.try_get("tenant_id")?;
-        let project_id: String = r.try_get("project_id")?;
+        let project_id: uuid::Uuid = r.try_get("project_id")?;
         let node_id: Option<String> = r.try_get("node_id")?;
         let kind_str: String = r.try_get("kind")?;
         let payload: Value = r.try_get("payload")?;
@@ -145,10 +139,13 @@ fn parse_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<InfraEventRow>> {
 }
 
 /// Drop every row for a project. Called on `weft rm`.
-pub async fn remove_project(pool: &PgPool, project_id: &str) -> Result<u64> {
+pub async fn remove_project<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    project_id: uuid::Uuid,
+) -> Result<u64> {
     let res = sqlx::query("DELETE FROM infra_event WHERE project_id = $1")
         .bind(project_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected())
 }

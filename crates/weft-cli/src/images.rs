@@ -230,7 +230,7 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
             // `build::stage_builder_base_context`.
             let ctx = weft_compiler::build::stage_builder_base_context(&root)
                 .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
-            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], None).await?;
+            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], None, &[]).await?;
         }
     }
     // Builder-base images are large (~1GB+: debian + rustup +
@@ -415,7 +415,7 @@ pub async fn ensure_system_image(
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(SYSTEM_IMAGES_DOCKERFILE);
-    docker_build(image_ref, &dockerfile, &root, &[], Some(svc.dockerfile_stage())).await
+    docker_build(image_ref, &dockerfile, &root, &[], Some(svc.dockerfile_stage()), &[]).await
 }
 
 /// How `ensure_all_shared_images` treats a builder-base failure. The
@@ -440,8 +440,7 @@ pub struct SharedImages {
 impl SharedImages {
     /// Every bare (unsuffixed) ref, one per shared image.
     /// SYNC: `weft build-images` stdout = one registry-qualified bare
-    ///       ref per line <-> .github/workflows/release.yml (images
-    ///       job: the smoke-run step greps by repo name; the
+    ///       ref per line <-> .github/workflows/release.yml (the
     ///       images-manifest job diffs and stitches every line)
     pub fn bare_refs(&self) -> Vec<&str> {
         let mut refs = vec![
@@ -608,7 +607,7 @@ async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>)
     if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
         let build = stock.stage(&suffixed_ref(base, suffix))?;
         let dockerfile = build.build_context.join("Dockerfile");
-        docker_build(&target, &dockerfile, &build.build_context, &[], None).await?;
+        docker_build_worker(&target, &dockerfile, &build.build_context, &[]).await?;
     }
     Ok(image)
 }
@@ -656,8 +655,17 @@ pub async fn import_published_worker(local_ref: &str, cluster: Option<&str>) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileCacheRecord {
     pub id: String,
-    /// The cache key (`hash::compute_worker_cache_key`) in the mount id.
+    /// The cache key (`hash::compute_worker_cache_key`) in the mount id,
+    /// without the compile lane after it: every lane of a key is that
+    /// key's cache.
     pub key: String,
+    /// The compile lane after the key, `None` for a cache made before
+    /// builds had lanes.
+    pub lane: Option<u32>,
+    /// The text after the key when it is not a lane number: a mount id
+    /// this build does not make, kept so the size report shows its bytes
+    /// instead of hiding them.
+    pub unreadable_lane: Option<String>,
     pub size: String,
     /// Whole days since BuildKit last used it, read off its "Last used"
     /// line (`0` for anything under a day).
@@ -704,10 +712,20 @@ fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
         let field = |key: &str| record.lines().find_map(|line| line.strip_prefix(key)).map(str::trim);
         let description = field("Description:")?;
         let key_start = description.find(&wanted)? + wanted.len();
-        let key = description[key_start..].split('"').next()?.to_string();
+        // `<key>-<lane>`; the key is hex, so the first dash ends it.
+        let id = description[key_start..].split('"').next()?;
+        let (key, lane, unreadable_lane) = match id.split_once('-') {
+            Some((key, suffix)) => match suffix.parse() {
+                Ok(lane) => (key.to_string(), Some(lane), None),
+                Err(_) => (key.to_string(), None, Some(suffix.to_string())),
+            },
+            None => (id.to_string(), None, None),
+        };
         Some(CompileCacheRecord {
             id: field("ID:")?.to_string(),
             key,
+            lane,
+            unreadable_lane,
             size: field("Size:")?.to_string(),
             idle_days: idle_days(field("Last used:").unwrap_or("")),
         })
@@ -741,6 +759,7 @@ pub(crate) async fn docker_build(
     context: &Path,
     labels: &[String],
     target: Option<&str>,
+    build_args: &[String],
 ) -> Result<()> {
     eprintln!(
         "building image {image_ref} (this may take several minutes on first run; \
@@ -760,11 +779,100 @@ pub(crate) async fn docker_build(
     if let Some(stage) = target {
         cmd.args(["--target", stage]);
     }
+    for arg in build_args {
+        cmd.args(["--build-arg", arg]);
+    }
     let status = cmd.arg(context).status().await?;
     if !status.success() {
         anyhow::bail!("docker build {image_ref} failed with {status}");
     }
     Ok(())
+}
+
+/// Build a worker image (a Dockerfile from the worker templates, whose
+/// compile cache is split into lanes): [`docker_build`] holding one of
+/// this host's compile lanes for the whole build, named to the build
+/// through [`weft_compiler::worker_image::COMPILE_LANE_ARG`].
+pub(crate) async fn docker_build_worker(
+    image_ref: &str,
+    dockerfile: &Path,
+    context: &Path,
+    labels: &[String],
+) -> Result<()> {
+    let lane = CompileLane::hold().await?;
+    let arg = format!("{}={}", weft_compiler::worker_image::COMPILE_LANE_ARG, lane.number);
+    docker_build(image_ref, dockerfile, context, labels, None, &[arg]).await
+}
+
+/// How many worker builds compile side by side on this host when nobody
+/// says otherwise. Each lane keeps a compile cache of its own (about
+/// 2GB), so this is also how many of those a host keeps.
+const DEFAULT_COMPILE_LANES: u32 = 4;
+
+/// Overrides [`DEFAULT_COMPILE_LANES`]: more for a machine that builds
+/// many projects at once (and has the disk), 1 to keep a single cache.
+const COMPILE_LANES_ENV: &str = "WEFT_COMPILE_LANES";
+
+/// One of this host's compile lanes, held (an exclusive lock on its file
+/// under the weft data dir) until dropped. Every weft process on the host
+/// picks from the same lock files, so no two builds hold one lane.
+struct CompileLane {
+    number: u32,
+    _lock: std::fs::File,
+}
+
+impl CompileLane {
+    /// The first free lane, waiting for one to free up when all are held.
+    async fn hold() -> Result<Self> {
+        let lanes = compile_lanes()?;
+        let dir = crate::commands::daemon::data_dir().join("compile-lanes");
+        std::fs::create_dir_all(&dir)?;
+        let files = (0..lanes)
+            .map(|n| {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(dir.join(format!("{n}.lock")))?;
+                Ok((n, file))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut said = false;
+        loop {
+            for (number, file) in &files {
+                match file.try_lock() {
+                    Ok(()) => {
+                        let _lock = file.try_clone()?;
+                        return Ok(Self { number: *number, _lock });
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        return Err(anyhow::anyhow!("lock compile lane {number}: {e}"));
+                    }
+                }
+            }
+            if !said {
+                eprintln!(
+                    "all {lanes} compile lanes are busy with other builds; waiting for one \
+                     ({COMPILE_LANES_ENV} sets how many)"
+                );
+                said = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// How many compile lanes this host has: [`COMPILE_LANES_ENV`], or
+/// [`DEFAULT_COMPILE_LANES`].
+fn compile_lanes() -> Result<u32> {
+    match std::env::var(COMPILE_LANES_ENV) {
+        Err(_) => Ok(DEFAULT_COMPILE_LANES),
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => anyhow::bail!("{COMPILE_LANES_ENV}={raw:?}: expected a whole number of at least 1"),
+        },
+    }
 }
 
 /// Directories inside a crate that the image build never compiles, so a change
@@ -1195,19 +1303,22 @@ mod tests {
     use super::*;
 
     /// Records as `docker buildx du --verbose` printed them on a host that
-    /// had built workers under two cache keys (captured verbatim, fields
-    /// this parser ignores trimmed).
+    /// had built workers under two cache keys, one of them in compile
+    /// lane 2 (captured verbatim, fields this parser ignores trimmed).
     #[test]
     fn every_compile_cache_key_is_read_off_the_buildkit_records() {
         let du = "ID:           p490dco22moj9u55682dm3enh\nParents:\n - x\nCreated at:   2026-09-13 17:34:56 +0000 UTC\nMutable:      true\nReclaimable:  true\nShared:       false\nSize:         421.7MB\n\
                   Description:  cached mount /root/.cargo/registry from exec /bin/sh -c cargo build --release with id \"/weft-worker-cargo-registry\"\nUsage count:  6\nLast used:    11 seconds ago\nType:         exec.cachemount\n\n\
                   ID:           z5k0h7hhdmaktflss7bsyjs7u\nMutable:      true\nSize:         1.982GB\n\
-                  Description:  cached mount /cache/target from exec /bin/sh -c ( [ -f /cache/target/.weft-seeded ] || ! [ -d /weft/target ] ) && cargo build --release with id \"/weft-worker-target-9af3f2c5f9da6eaa\"\nUsage count:  6\nLast used:    11 seconds ago\nType:         exec.cachemount\n\n\
+                  Description:  cached mount /cache/target from exec /bin/sh -c ( [ -f /cache/target/.weft-seeded ] || ! [ -d /weft/target ] ) && cargo build --release with id \"/weft-worker-target-9af3f2c5f9da6eaa-2\"\nUsage count:  6\nLast used:    11 seconds ago\nType:         exec.cachemount\n\n\
                   ID:           hve80t8pw8n1ackgqj82wn30e\nSize:         6.1GB\n\
-                  Description:  cached mount /cache/target from exec /bin/sh -c cargo build --release with id \"/weft-worker-target-0123456789abcdef\"\nUsage count:  2\nLast used:    5 weeks ago\nType:         exec.cachemount\n";
+                  Description:  cached mount /cache/target from exec /bin/sh -c cargo build --release with id \"/weft-worker-target-0123456789abcdef\"\nUsage count:  2\nLast used:    5 weeks ago\nType:         exec.cachemount\n\n\
+                  ID:           q1\nSize:         3MB\n\
+                  Description:  cached mount /cache/target with id \"/weft-worker-target-0123456789abcdef-x2\"\nLast used:    2 minutes ago\n";
         assert_eq!(compile_caches_in(du), vec![
-            CompileCacheRecord { id: "z5k0h7hhdmaktflss7bsyjs7u".into(), key: "9af3f2c5f9da6eaa".into(), size: "1.982GB".into(), idle_days: 0 },
-            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), size: "6.1GB".into(), idle_days: 35 },
+            CompileCacheRecord { id: "z5k0h7hhdmaktflss7bsyjs7u".into(), key: "9af3f2c5f9da6eaa".into(), lane: Some(2), unreadable_lane: None, size: "1.982GB".into(), idle_days: 0 },
+            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: None, size: "6.1GB".into(), idle_days: 35 },
+            CompileCacheRecord { id: "q1".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: Some("x2".into()), size: "3MB".into(), idle_days: 0 },
         ]);
         assert!(compile_caches_in("ID: c\nSize: 1MB\nDescription: something else\n").is_empty());
         assert_eq!(idle_days("About an hour ago"), 0);

@@ -60,7 +60,7 @@ another's grant. The existing single-tenant flow is untouched.
 ## Running it for real
 
 **Cloud deployment, and routes that reach the internet.** Everything today runs
-on one machine: a kind cluster, a local Postgres, and a quick tunnel whose proxy
+on one machine: a kind cluster, a local Postgres, and a quick tunnel whose door
 allowlists only the provider-events receiver, the per-signal fire door, the file
 relay and the OAuth callback. A `Route` or `Socket` is reached through
 `/connect/<tenant>/<path>`, and the dispatcher answers with a redirect to the
