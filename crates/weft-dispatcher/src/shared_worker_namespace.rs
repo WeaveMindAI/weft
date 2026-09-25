@@ -47,8 +47,8 @@ pub struct SharedWorkerNamespaceArgs<'a> {
     pub service_cidr: &'a str,
 }
 
-/// Apply the shared-worker-namespace bundle. Idempotent (kubectl
-/// apply). Unlike the tenant / project namespaces, this writes NO
+/// Apply the shared-worker-namespace bundle. Idempotent
+/// (server-side apply). Unlike the tenant / project namespaces, this writes NO
 /// namespace-registry row: the namespace has no single owning tenant,
 /// so worker auth resolves the tenant per-pod (via the `worker_pod`
 /// row) instead of per-namespace.

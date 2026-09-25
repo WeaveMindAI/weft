@@ -305,7 +305,7 @@ mod tests {
         let r = row(
             InfraEvent::Failed(FailedPayload {
                 stage: weft_broker_client::protocol::FailureStage::Apply,
-                message: "kubectl rejected".into(),
+                message: "apply rejected".into(),
             }),
             Some("n1"),
         );

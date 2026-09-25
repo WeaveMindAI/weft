@@ -136,7 +136,7 @@ pub const SIGNAL_PLACEMENT_DOMAIN: &str = "weft_signal_placement";
 /// Serializes the read-state-then-flip entry into a PROJECT lifecycle
 /// transition (activate, deactivate, the build marker, the has-infra
 /// worker relocation), keyed by project id. Held only for the
-/// microseconds of the read-and-CAS (or the short kubectl-bounded
+/// microseconds of the read-and-CAS (or the short cluster-call-bounded
 /// worker relocation): the TRANSITIONAL STATE written into the project
 /// row is the durable mutual exclusion that makes competing verbs
 /// REJECT instantly; this lock only stops two verbs from both winning

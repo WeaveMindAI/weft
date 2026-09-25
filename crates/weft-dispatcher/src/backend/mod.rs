@@ -8,9 +8,9 @@
 //!
 //! Infra provisioning is not a backend here: the dispatcher routes
 //! intent through the `infra_lifecycle_command` table, and the
-//! per-tenant infra supervisor pod claims those rows and runs
-//! kubectl. The dispatcher itself never shells kubectl for user
-//! infra.
+//! pooled infra supervisor that owns the project claims those rows
+//! and applies them. The dispatcher itself never touches a project's
+//! infra objects.
 
 pub mod k8s_worker;
 

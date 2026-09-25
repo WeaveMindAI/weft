@@ -81,8 +81,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             force             BOOLEAN NOT NULL DEFAULT FALSE,
             -- The user requested cancellation of this command while it
             -- was CLAIMED (in flight). The executing supervisor polls
-            -- this between kubectl steps and halts (leaving per-node
-            -- partial state visible; kubectl is not transactional).
+            -- this between cluster calls and halts (leaving per-node
+            -- partial state visible; the Kubernetes API is not
+            -- transactional).
             -- Pending unclaimed rows are cancelled outright (outcome =
             -- 'cancelled') instead of flagged.
             cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -548,8 +549,8 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 /// its start): the shared copies' (`member` `None`, which also reaches
 /// a command for every copy, since that one takes the shared copies
 /// down too) or one member's. Flags CLAIMED rows (`cancel_requested =
-/// TRUE`; the executing supervisor polls the flag between kubectl
-/// steps and halts) and completes still-UNCLAIMED rows outright with
+/// TRUE`; the executing supervisor polls the flag between cluster
+/// calls and halts) and completes still-UNCLAIMED rows outright with
 /// outcome `cancelled` (nothing has touched the cluster for them yet).
 /// Flag first, then complete: a row claimed between the two statements
 /// has its flag already set, so no window exists where a command

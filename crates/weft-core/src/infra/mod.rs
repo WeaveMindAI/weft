@@ -9,7 +9,7 @@
 //!
 //! The dispatcher does NOT call into the compile or apply path. It
 //! routes lifecycle commands and writes their outcomes; supervisor
-//! does the actual kubectl work.
+//! does the actual cluster work.
 
 mod compile;
 mod hash;

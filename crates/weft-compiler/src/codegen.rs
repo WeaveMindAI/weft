@@ -7,25 +7,28 @@
 //!
 //! ```text
 //! .weft/target/build/
-//!   Cargo.toml          # base deps + per-package deps (package.toml)
-//!                       # + per-node deps (deps.toml) for nodes
-//!                       # actually referenced by this project.
+//!   Cargo.toml          # base deps + a path dep on each package crate.
+//!   rust-toolchain.toml # the weft workspace's pinned toolchain.
+//!   weft-cache-gc.sh    # run by the Dockerfile after `cargo build`.
+//!   pkg_<name>-<slot>/  # one cargo crate per referenced package,
+//!     Cargo.toml        # carrying its package.toml + deps.toml deps.
+//!     src/lib.rs        # #[path]-includes the package's shared .rs
+//!                       # files at the top level, then each referenced
+//!                       # node's mod.rs as a submodule. Nodes reach
+//!                       # shared code via `use super::<shared_mod>;`.
 //!   src/
 //!     main.rs           # spawns weft-engine; fetches the
 //!                       # ProjectDefinition per execution from the
 //!                       # broker. NO project.json baked in.
-//!     registry.rs       # NodeCatalog impl: pulls in one shim
-//!                       # `pkg_<name>.rs` per referenced package,
-//!                       # dispatches node_type -> struct.
-//!     pkg_<name>.rs     # one per referenced package. #[path]-includes
-//!                       # the package's shared .rs files at the top
-//!                       # level, then each referenced node's mod.rs
-//!                       # as a submodule. Nodes reach shared code via
-//!                       # `use super::<shared_mod>;`.
+//!     registry.rs       # NodeCatalog impl: dispatches node_type to
+//!                       # the struct in its `pkg_<name>` crate.
 //! ```
 //!
-//! Pruning: each package's shim is emitted only if at least one of
-//! its nodes is referenced. Within a shim, only referenced node
+//! `<slot>` is a hash over the package's files and its generated
+//! manifest and shim, so editing one node recompiles only its package.
+//!
+//! Pruning: each package's crate is emitted only if at least one of
+//! its nodes is referenced. Within a crate, only referenced node
 //! subdirs are `#[path]`-included. Package-level shared .rs files
 //! are always included in an emitted shim (they may be load-bearing
 //! for the referenced nodes; dead-code analysis in the Rust compiler
@@ -50,7 +53,8 @@ use weft_core::ProjectDefinition;
 use crate::error::{CompileError, CompileResult};
 
 /// Emit the full cargo crate. Writes every file listed in the module
-/// docstring. Returns the crate root (`build::build_project` compiles it).
+/// docstring. Returns the crate root (`build::build_project` stages it
+/// into the docker build context, whose `cargo build` compiles it).
 pub fn emit(
     project: &ProjectDefinition,
     project_root: &Path,
@@ -1186,7 +1190,7 @@ struct Args {{
     pod_name: String,
 
     /// k8s namespace this Pod runs in. Recorded on the worker_pod
-    /// row so the dispatcher's reaper can `kubectl delete` against
+    /// row so the dispatcher's reaper can delete it in
     /// the right namespace.
     #[arg(long, env = "WEFT_NAMESPACE")]
     namespace: String,
@@ -1197,9 +1201,7 @@ struct Args {{
     owner_dispatcher: String,
 
     /// Tenant this worker belongs to. Stamped on every task this
-    /// worker enqueues so the dispatcher's listener reaper can tell
-    /// "this tenant has work mid-flight" from "this listener is
-    /// genuinely idle." Without it, the reaper races register flows.
+    /// worker enqueues.
     #[arg(long, env = "WEFT_TENANT_ID")]
     tenant_id: String,
 

@@ -34,7 +34,7 @@ pub mod testing;
 ///
 /// All external dependencies are behind trait objects so tests can
 /// swap them for fakes. Production wires `BrokerSupervisorClient`,
-/// `KubectlClient`, and `SystemClock`.
+/// `KubeApiClient`, and `SystemClock`.
 #[derive(Clone)]
 pub struct SupervisorState {
     pub broker: Arc<dyn broker_ops::BrokerSupervisorOps>,

@@ -3,13 +3,12 @@
 //! Split into three traits so each consumer can ask for the
 //! narrowest contract it needs:
 //!
-//!   - `KubeReader`: read-only operations. Listener uses this to
-//!     resolve cross-namespace service URLs; supervisor uses this in
-//!     its health loop.
-//!   - `KubeWriter`: mutating operations. Supervisor uses this in
-//!     its lifecycle loop.
-//!   - `KubeClient`: union of both. Convenience when a subsystem
-//!     wants the full surface.
+//!   - `KubeReader`: read-only operations. The dispatcher's supervisor
+//!     pool reads the supervisor roster through it.
+//!   - `KubeWriter`: mutating operations.
+//!   - `KubeClient`: union of both. The dispatcher (worker pods,
+//!     namespaces, the pooled tiers) and the supervisor (its lifecycle
+//!     and health loops) hold the full surface.
 //!
 //! The production impl (`KubeApiClient`) talks to the Kubernetes API in
 //! process, one client per process: no `kubectl` is ever started, and

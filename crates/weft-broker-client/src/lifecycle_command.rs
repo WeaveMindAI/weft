@@ -104,8 +104,8 @@ pub fn claimable_predicate() -> String {
 /// supervisor needs no per-command claim lease at all: `infra_owner` is
 /// exclusive (one pod per project) and continuously renewed on each
 /// ownership tick, and the owner runs one project's commands in order,
-/// so two supervisors can never run kubectl for one project. The supervisor's
-/// kubectl ops are declarative (apply manifests, scale-to-N, delete-by-
+/// so two supervisors can never change one project's cluster objects. The
+/// supervisor's cluster calls are declarative (apply manifests, scale-to-N, delete-by-
 /// label), so even the bounded window of one in-flight call from a
 /// just-displaced owner converges rather than corrupts: it is the SAME
 /// command's desired state, re-applied.

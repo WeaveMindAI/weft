@@ -394,7 +394,7 @@ roleRef:
     )
 }
 
-/// Apply the project-namespace bundle. Idempotent (kubectl apply).
+/// Apply the project-namespace bundle. Idempotent (server-side apply).
 /// Called on the first infra apply for a project (`api::infra::sync`,
 /// gated on the project declaring infra) and on cleanup retries.
 /// A no-infra project never reaches here: its worker lives in the

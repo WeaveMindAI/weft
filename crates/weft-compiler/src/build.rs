@@ -1,8 +1,8 @@
 //! Compile pipeline orchestration.
 //!
-//! Given a project root (containing `weft.toml` + `src/main.weft`),
-//! parse + enrich + validate + codegen the generated cargo crate
-//! to `.weft/target/build/`, then emit the multi-stage
+//! Given a project and its ALREADY-COMPILED definition, validate +
+//! codegen the generated cargo crate to `.weft/target/build/`, then
+//! emit the multi-stage
 //! Dockerfile + stage the docker build context. The actual
 //! `cargo build` runs INSIDE that docker build, not on the host.
 //! The host only needs docker.

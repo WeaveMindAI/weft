@@ -734,7 +734,7 @@ async fn execute(
                 // (visible partial state the user acts on per-node).
                 //
                 // The `terminating` transient is flipped HERE, per node, right
-                // before this node's kubectl delete, NOT in an upfront flip-all
+                // before this node's delete, NOT in an upfront flip-all
                 // loop. That way a cancel that lands before a node is reached
                 // leaves it in its prior RESTING status, never stuck in the
                 // transient `terminating` (which blocks re-apply reuse and shows
@@ -961,7 +961,7 @@ async fn execute_apply(
 
     // Full skip: every declared unit is already up, the hash matches,
     // AND the row already carries these addresses. Cluster state is
-    // already what we want; no kubectl. The row keeps its instance_id,
+    // already what we want; no cluster call. The row keeps its instance_id,
     // hash, endpoints. (`reconcile` empty means every unit is up; hash
     // match means the up units are at the current spec; the address
     // check catches a row stamped before a column existed, which would
@@ -1005,11 +1005,11 @@ async fn execute_apply(
     // the prior id lives nowhere durable, so a pod death between the
     // stamp and this delete would strand the old instance forever
     // (the retry reuses the new id). The row is already a visible,
-    // terminable `Terminating` row, so the "row before kubectl" rule
+    // terminable `Terminating` row, so the "row before any cluster call" rule
     // the stamp exists for is already met, and a failure here leaves
     // it exactly as it was for the next apply to finish. What the
     // provisioning stamp ALSO provides is the ownership fence before
-    // the first kubectl call (a pod that lost the project's lease
+    // the first cluster call (a pod that lost the project's lease
     // must not touch its namespace), so the same fence is taken here
     // by re-stamping the row's own `Terminating` through the
     // command-gated write: it changes nothing on the row; Displaced
@@ -1059,7 +1059,7 @@ async fn execute_apply(
     }
 
     // Pre-apply commitment: write the infra_node row before any
-    // kubectl call so a partial-apply failure leaves a visible row the
+    // cluster call so a partial-apply failure leaves a visible row the
     // user can Terminate. Reconciled units go Provisioning; up units
     // keep their (Running/Flaky) status. The units map also carries
     // the (possibly removed) prior units' absence: it's rebuilt from
@@ -1121,8 +1121,8 @@ async fn execute_apply(
         // Interruptible between the phases below (sweep / apply /
         // readiness). A cancel mid-apply bails through the error path,
         // which stamps the node `Failed("cancelled by user (...)")`:
-        // the honest resting state for a half-applied node (kubectl is
-        // not transactional; the user terminates or retries from
+        // the honest resting state for a half-applied node (the Kubernetes
+        // API is not transactional; the user terminates or retries from
         // there), while `tick` records the COMMAND outcome as
         // `cancelled`, not failed.
         check_cancel(state, cmd.id, "before sweeping stale workloads").await?;

@@ -320,7 +320,7 @@ spec:
   # bearing for generation fencing); an in-place restart would
   # call register_alive against an already-alive row and bail.
   # Recovery model: pod dies -> dispatcher reaper marks_dead +
-  # kubectl delete + reclaims tasks -> cold_start spawns a fresh
+  # deletes the pod + reclaims tasks -> cold_start spawns a fresh
   # pod (new pod_name) -> new pod registers cleanly -> picker
   # claims the orphaned tasks -> journal-replay resumes work.
   restartPolicy: Never

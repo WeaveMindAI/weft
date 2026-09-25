@@ -1187,7 +1187,7 @@ async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: P
 // Supervisor pool: pending-command gate + ghost-lease hygiene.
 // =====================================================================
 
-/// Recording fake for the supervisor backend: no processes, no kubectl.
+/// Recording fake for the supervisor backend: no processes, no cluster.
 #[derive(Default)]
 struct FakeSupervisorBackend {
     stopped: std::sync::Mutex<Vec<String>>,
@@ -2155,7 +2155,7 @@ async fn a_supervisor_the_cluster_no_longer_has_is_forgotten_and_its_projects_re
             desired: 1,
             ready: 1,
             // The label the pool's selector reads; the fake honours it
-            // the way kubectl's `-l` does.
+            // the way the apiserver does.
             labels: [("weft.dev/role".to_string(), "infra-supervisor".to_string())]
                 .into_iter()
                 .collect(),
