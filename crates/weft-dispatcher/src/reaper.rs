@@ -259,7 +259,7 @@ where
 
 /// Worker-pod reaper. Once every 30s, mark failed pods `dead` (which
 /// makes the fencing trigger reject any further journal writes) +
-/// `kubectl delete` the Pod:
+/// delete the Pod:
 ///   - `alive` rows whose heartbeat went stale (the worker died),
 ///   - `spawning` rows that never registered `alive` within the generous
 ///     boot deadline. Without sweeping the latter, a ghost `spawning` row
@@ -394,7 +394,7 @@ pub async fn workers_of_removed_projects(
         .collect())
 }
 
-/// Mark a worker pod dead + kubectl-delete it. Shared by the stale-alive
+/// Mark a worker pod dead + delete it. Shared by the stale-alive
 /// and failed-spawning paths. A dead row is no longer re-listed by either
 /// query, so each pod is reaped exactly once. Does NOT recover the pod's
 /// stranded tasks (that is `sweep_orphaned_tasks`' job, a self-healing
@@ -414,7 +414,7 @@ async fn reap_worker_pod(
         "marking failed pod dead"
     );
     weft_task_store::worker_pod::mark_dead(&state.pg_pool, &row.pod_name).await?;
-    // kubectl delete: log loudly on error. A failed kill leaves the pod
+    // Delete the Pod: log loudly on error. A failed kill leaves the pod
     // alive in k8s while our DB says dead, which means a stale pod can
     // keep running. Not fatal to the sweep (the next tick retries), but
     // never silent.
@@ -621,7 +621,7 @@ async fn sweep_orphaned_tasks(state: DispatcherState) -> anyhow::Result<()> {
 /// self-exit, `dead` from the stale-heartbeat reaper above) older
 /// than the grace window, then drop the row. Driven off the
 /// `worker_pod` table (the single source of truth), NOT a
-/// `kubectl get`: the namespace comes from the row itself
+/// cluster listing: the namespace comes from the row itself
 /// (`row.namespace`), so there is no namespace-mapper guessing,
 /// and the whole thing fakes through `state.kube` for tests.
 ///
@@ -633,9 +633,9 @@ async fn sweep_terminal_worker_pods(state: DispatcherState) -> anyhow::Result<()
     let threshold = crate::lease::now_unix() - TERMINAL_POD_GRACE_SECS;
     let terminal = weft_task_store::list_terminal(&state.pg_pool, threshold).await?;
     for row in terminal {
-        // kubectl delete via the shared trait. `--wait=false`
-        // (no_wait): the GC loop shouldn't block on a slow delete.
-        // Idempotent (--ignore-not-found under the hood), so a Pod
+        // Delete via the shared trait, not waiting: the GC loop
+        // shouldn't block on a slow delete. Idempotent (a delete of
+        // a missing object is success), so a Pod
         // already gone (e.g. clean-exit pod k8s never recreated) is
         // fine; we still drop the row.
         if let Err(e) = state

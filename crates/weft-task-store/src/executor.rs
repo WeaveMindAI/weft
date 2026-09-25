@@ -183,7 +183,7 @@ impl<Ctx: Send + Sync> WorkerTaskRegistryBuilder<Ctx> {
 
 /// Maximum concurrent dispatcher tasks per Pod. Tasks like
 /// `register_signal` (HTTP to listener) and `spawn_pod`
-/// (image pull + kubectl apply + boot wait) can take seconds;
+/// (apply + image pull + boot wait) can take seconds;
 /// running them sequentially would head-of-line-block the picker. 8
 /// is enough that one slow op doesn't park everything else, low
 /// enough that we don't open arbitrarily many DB connections at once.

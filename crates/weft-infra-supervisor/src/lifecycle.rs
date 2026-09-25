@@ -1,8 +1,9 @@
 //! Lifecycle loop. Claims the `infra_lifecycle_command` rows of the
-//! projects this pod owns and executes them via kubectl. Three verbs:
+//! projects this pod owns and executes them against the Kubernetes API
+//! (through `KubeClient`). Three verbs:
 //!
 //! - **apply**: compile the InfraSpec (weft-core), resolve local
-//!   image tags, kubectl-apply, wait for readiness, write the
+//!   image tags, apply the manifests, wait for readiness, write the
 //!   `infra_node` row via `set_applied`. Fresh applies mint a new
 //!   instance_id; Replace reuses the prior one (PVCs reattach by
 //!   name) and sweeps workload-shaped resources before applying.
@@ -48,7 +49,7 @@ use crate::SupervisorState;
 ///
 /// Also under `transitioning` only: a unit in `prior` but DROPPED from
 /// the spec is carried forward verbatim. Its workload is reaped later
-/// in the same apply, but a cancel or kubectl failure BEFORE the reap
+/// in the same apply, but a cancel or cluster failure BEFORE the reap
 /// leaves the row `Failed` with those pods still running - carried,
 /// they keep their refs in the keep-set and the honest roster shows a
 /// unit that may still exist in the cluster. The post-readiness stamp
@@ -198,12 +199,12 @@ pub(crate) const INFRA_SELECTOR: &str = "weft.dev/role=infra";
 
 /// How often the executing supervisor polls the command's
 /// `cancel_requested` flag while inside a wait loop (readiness /
-/// drain). Between discrete kubectl steps the check is per-step.
+/// drain). Between discrete cluster calls the check is per-call.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Marker error: the command was HALTED because the user requested
 /// cancellation. `tick` maps it to a `cancelled` outcome (never a
-/// failure). Cancel = halt, not rollback: kubectl is not
+/// failure). Cancel = halt, not rollback: the Kubernetes API is not
 /// transactional, so per-node partial state is left visible (the
 /// apply error path stamps `Failed("cancelled ...")` on the node so
 /// the user terminates/retries per-node from where it stopped).
@@ -353,7 +354,7 @@ const CLAIM_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// change (`changes`). A project this pod took on may have had its
 /// command issued while nobody owned it; a project it lost has a new
 /// owner, which runs its command again from the start, so the command
-/// running here is stopped rather than left issuing kubectl calls for a
+/// running here is stopped rather than left issuing cluster calls for a
 /// project that is no longer this pod's. When the broker answers that a
 /// command waits on a project nobody owns, the ownership loop is asked
 /// to tick now.
@@ -723,7 +724,7 @@ async fn execute(
                 // (visible partial state the user acts on per-node).
                 //
                 // The `terminating` transient is flipped HERE, per node, right
-                // before this node's kubectl delete, NOT in an upfront flip-all
+                // before this node's delete, NOT in an upfront flip-all
                 // loop. That way a cancel that lands before a node is reached
                 // leaves it in its prior RESTING status, never stuck in the
                 // transient `terminating` (which blocks re-apply reuse and shows
@@ -923,7 +924,7 @@ async fn execute_apply(
 
     // Hash the typed spec FIRST (with image_tags mixed in) so the
     // skip-vs-replace decision is stable across compile.rs changes.
-    // Then compile to manifests for kubectl apply.
+    // Then compile to the manifests to apply.
     let applied_spec_hash = infra::hash_spec(&spec, &image_tags)
         .map_err(|e| anyhow!("hash_spec: {e}"))?;
     let manifests = infra::compile(&spec, &compile_ctx)
@@ -943,7 +944,7 @@ async fn execute_apply(
 
     // Full skip: every declared unit is already up, the hash matches,
     // AND the row already carries these addresses. Cluster state is
-    // already what we want; no kubectl. The row keeps its instance_id,
+    // already what we want; no cluster call. The row keeps its instance_id,
     // hash, endpoints. (`reconcile` empty means every unit is up; hash
     // match means the up units are at the current spec; the address
     // check catches a row stamped before a column existed, which would
@@ -986,11 +987,11 @@ async fn execute_apply(
     // the prior id lives nowhere durable, so a pod death between the
     // stamp and this delete would strand the old instance forever
     // (the retry reuses the new id). The row is already a visible,
-    // terminable `Terminating` row, so the "row before kubectl" rule
+    // terminable `Terminating` row, so the "row before any cluster call" rule
     // the stamp exists for is already met, and a failure here leaves
     // it exactly as it was for the next apply to finish. What the
     // provisioning stamp ALSO provides is the ownership fence before
-    // the first kubectl call (a pod that lost the project's lease
+    // the first cluster call (a pod that lost the project's lease
     // must not touch its namespace), so the same fence is taken here
     // by re-stamping the row's own `Terminating` through the
     // command-gated write: it changes nothing on the row; Displaced
@@ -1039,7 +1040,7 @@ async fn execute_apply(
     }
 
     // Pre-apply commitment: write the infra_node row before any
-    // kubectl call so a partial-apply failure leaves a visible row the
+    // cluster call so a partial-apply failure leaves a visible row the
     // user can Terminate. Reconciled units go Provisioning; up units
     // keep their (Running/Flaky) status. The units map also carries
     // the (possibly removed) prior units' absence: it's rebuilt from
@@ -1100,8 +1101,8 @@ async fn execute_apply(
         // Interruptible between the phases below (sweep / apply /
         // readiness). A cancel mid-apply bails through the error path,
         // which stamps the node `Failed("cancelled by user (...)")`:
-        // the honest resting state for a half-applied node (kubectl is
-        // not transactional; the user terminates or retries from
+        // the honest resting state for a half-applied node (the Kubernetes
+        // API is not transactional; the user terminates or retries from
         // there), while `tick` records the COMMAND outcome as
         // `cancelled`, not failed.
         check_cancel(state, cmd.id, "before sweeping stale workloads").await?;

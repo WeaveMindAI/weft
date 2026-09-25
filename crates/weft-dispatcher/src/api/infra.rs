@@ -7,16 +7,16 @@
 //!
 //! `/sync` runs an `InfraSetup` subworkflow exec: the worker walks
 //! every `requires_infra` node + its upstream closure; each infra
-//! node calls `Node::provision_infra`. The engine then makes a local
-//! skip / fresh / replace decision (comparing the compiled spec
-//! hash against the broker's stored `infra_node.applied_spec_hash`)
-//! and, when not Skip, enqueues an `Apply` lifecycle command. The
-//! tenant's supervisor picks the command up, runs kubectl, writes
-//! the updated `infra_node` row. The hash-match Skip path makes
+//! node calls `Node::provision_infra`. The engine enqueues an `Apply`
+//! lifecycle command carrying the spec. The supervisor that owns the
+//! project picks it up, makes the skip / fresh / replace decision
+//! (comparing the spec hash against the stored
+//! `infra_node.applied_spec_hash`), applies, and writes the updated
+//! `infra_node` row. The hash-match Skip path makes
 //! Restart cheap and Upgrade selective.
 //!
 //! `/stop` and `/terminate` enqueue an `infra_lifecycle_command` row
-//! for the tenant's supervisor pod to claim and execute. Per-node
+//! for the supervisor that owns the project to claim and execute. Per-node
 //! variants scope to a single (project, node).
 
 use std::collections::BTreeMap;
@@ -309,8 +309,8 @@ pub(super) async fn sync_inner(
         crate::api::project::execute_trigger_deactivation(&state, id, deactivation).await?;
     }
 
-    // Lazy supervisor spawn. The supervisor is what owns kubectl
-    // for user infra; sync is the first verb that needs it (orphan
+    // Lazy supervisor spawn. The supervisor is what applies user
+    // infra to the cluster; sync is the first verb that needs it (orphan
     // reap and Apply commands both depend on a live supervisor).
     // Idempotent: applies the same Deployment manifest every time;
     // k8s no-ops if already present. MUST land before any code path
@@ -537,10 +537,10 @@ pub async fn terminate(
 
 /// `POST /projects/{id}/infra/cancel`. Cancel the project's in-flight
 /// infra work: flag claimed lifecycle commands (the executing
-/// supervisor halts between kubectl steps), cancel still-unclaimed
+/// supervisor halts between cluster calls), cancel still-unclaimed
 /// commands outright, and cancel any non-terminal InfraSetup
-/// provisioning execution. Cancel = HALT, never rollback: kubectl is
-/// not transactional, so per-node partial state stays visible and the
+/// provisioning execution. Cancel = HALT, never rollback: the Kubernetes
+/// API is not transactional, so per-node partial state stays visible and the
 /// user terminates/retries per-node from where it stopped.
 ///
 /// 412 when nothing infra-transitional is in flight (stale tab; the
@@ -1274,7 +1274,7 @@ async fn ensure_project_namespace_if_infra(
 /// Clears the row BEFORE deleting the namespace: a cleared row pointing
 /// at a not-yet-deleted namespace is benign (the supervisor simply stops
 /// managing it), whereas a set row pointing at a DELETED namespace would
-/// make the supervisor flap kubectl against a gone namespace. So clear
+/// make the supervisor flap its cluster calls against a gone namespace. So clear
 /// first, delete second; a crash between leaves only an empty orphan
 /// namespace (reclaimed on project rm or by a manual delete), never a
 /// live-advertised dead namespace. Nothing else has to be retired in
@@ -1352,7 +1352,7 @@ async fn teardown_project_namespace_if_no_infra(
 ///
 /// Every dispatcher-side enqueue path goes through this helper.
 /// `issue_lifecycle` itself stays a plain DB-write helper (no
-/// kubectl coupling) so the supervisor-side code that ALREADY runs
+/// supervisor coupling) so the supervisor-side code that ALREADY runs
 /// inside a live supervisor can call it directly without recursing
 /// into `ensure_supervisor`.
 async fn issue_lifecycle_ensuring_supervisor(
@@ -1536,7 +1536,7 @@ async fn reap_orphans(
 
 /// `force = true` (i.e. `weft rm --force`) skips the wait: the
 /// dispatcher proceeds immediately. Any in-flight supervisor work
-/// for the project errors on its kubectl calls because the namespace
+/// for the project errors on its cluster calls because the namespace
 /// is gone; the supervisor logs but doesn't retry.
 pub async fn delete_project(
     state: &DispatcherState,
@@ -1652,7 +1652,7 @@ pub async fn delete_project(
     // cleared row pointing at a not-yet-deleted namespace is benign,
     // whereas a set row pointing at a DELETED namespace makes the broker
     // advertise a gone namespace to supervisors. Only logged on error: a
-    // missing namespace is a no-op, and a transient kubectl failure
+    // missing namespace is a no-op, and a transient delete failure
     // leaves a tenant-empty namespace that the next sync will repurpose
     // (or the user can manually `kubectl delete ns`). An empty string
     // means the project never had a per-project namespace (a no-infra

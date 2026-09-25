@@ -1,13 +1,13 @@
-//! Direct journal write API. Used by the engine and the listener
-//! once they hold their own DB connections; also used by the
-//! dispatcher's `PostgresJournal::record_event` so both sides go
-//! through one canonical INSERT.
+//! Direct journal write API. Used by the broker (`PostgresJournalClient`,
+//! writing on behalf of workers, whose engine never holds a DB
+//! connection) and by the dispatcher's `PostgresJournal::record_event`,
+//! so both sides go through one canonical INSERT.
 //!
 //! Schema invariant: the `exec_event` table layout matches the one
 //! created by `weft-dispatcher::journal::postgres::GROUP`. Both
 //! crates write the same row shape; only one side owns the
-//! migration (the dispatcher, on startup), and the engine + listener
-//! piggyback on it.
+//! migration (the dispatcher, on startup), and the broker piggybacks
+//! on it.
 //!
 //! Ordering invariant: a transaction that writes `exec_event` rows for
 //! a color takes that color's lock ([`lock_colors`]) BEFORE its first

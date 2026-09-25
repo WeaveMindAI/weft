@@ -802,7 +802,7 @@ enum InfraAction {
     /// Print the current lifecycle state of each infra node.
     Status,
     /// Cancel in-flight infra work: halt claimed lifecycle commands
-    /// (the supervisor stops between kubectl steps), cancel unclaimed
+    /// (the supervisor stops between cluster calls), cancel unclaimed
     /// ones outright, interrupt the provisioning execution. HALT, not
     /// rollback: per-node partial state stays visible; terminate or
     /// retry per-node from where it stopped. 412 if nothing is in

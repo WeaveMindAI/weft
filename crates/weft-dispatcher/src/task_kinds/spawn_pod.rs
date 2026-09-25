@@ -1,11 +1,11 @@
-//! `spawn_pod` task: dispatcher kubectl-applies a worker Pod for a
+//! `spawn_pod` task: dispatcher applies a worker Pod for a
 //! project pool. Triggered by the cold-start scanner when there's
 //! pending `target=worker` work for project P with no live Pod.
 //!
 //! Idempotency: pod name is derived from the task id, the worker_pod
-//! row is INSERTed (ON CONFLICT DO NOTHING) BEFORE kubectl apply,
+//! row is INSERTed (ON CONFLICT DO NOTHING) BEFORE the apply,
 //! and the apply is itself idempotent on the manifest name. A retry
-//! after a partial success (kubectl applied, dispatcher crashed)
+//! after a partial success (pod applied, dispatcher crashed)
 //! collapses on the same pod name instead of creating a second Pod.
 
 use anyhow::Result;
@@ -73,7 +73,7 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
         // this at enqueue time). Unlike a per-project namespace (created
         // at first infra apply, guaranteed present before any worker),
         // the shared namespace is created HERE the first time any worker
-        // lands in it. Idempotent (kubectl apply); never torn down. An
+        // lands in it. Idempotent (server-side apply); never torn down. An
         // infra project's per-project namespace already exists, so this
         // gate skips it.
         if payload.namespace == state.instance.shared_worker_namespace() {

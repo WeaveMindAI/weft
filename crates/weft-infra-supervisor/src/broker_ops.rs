@@ -99,7 +99,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
     /// Whether the user requested cancellation of a claimed command.
-    /// Polled between kubectl steps and inside readiness/drain waits.
+    /// Polled between cluster calls and inside readiness/drain waits.
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
     async fn running_count(&self, project_id: uuid::Uuid) -> Result<i64>;
     /// True if a user infra action (any uncompleted
@@ -109,7 +109,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     async fn infra_command_in_flight(&self, project_id: uuid::Uuid) -> Result<bool>;
     /// Pre-apply commitment. Writes the infra_node row at
     /// Provisioning status with the locked-in (instance_id,
-    /// namespace, preserve_pvcs) tuple. Subsequent kubectl-apply
+    /// namespace, preserve_pvcs) tuple. A subsequent apply
     /// failure leaves a visible row the user can Terminate;
     /// apply success flips Provisioning -> Running via set_applied.
     async fn set_provisioning(

@@ -119,7 +119,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/projects/{id}/infra/stop", post(infra::stop))
         .route("/projects/{id}/infra/terminate", post(infra::terminate))
         // Cancel in-flight infra work: halt claimed lifecycle commands
-        // between kubectl steps, cancel unclaimed ones outright, and
+        // between cluster calls, cancel unclaimed ones outright, and
         // interrupt the InfraSetup provisioning execution. HALT, not
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))

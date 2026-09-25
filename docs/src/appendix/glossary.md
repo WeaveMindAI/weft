@@ -122,7 +122,7 @@ names the rule; the message names the fix.
 enough to fire them, and nothing is parked on a signal. Nobody can answer, so
 weft ends it and names every step involved.
 
-**Supervisor.** The tier that runs kubectl for your infrastructure. One holds
+**Supervisor.** The tier that creates and removes your infrastructure. One holds
 an exclusive lease per project.
 
 **Tag.** A label a run puts on itself, which another run can use to stop it.

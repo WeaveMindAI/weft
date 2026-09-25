@@ -1,7 +1,7 @@
 //! `infra_lifecycle_command` table.
 //!
 //! The single bidirectional channel between the dispatcher (router)
-//! and a tenant's infra-supervisor (executor). Dispatcher writes
+//! and the pooled infra-supervisor that owns the project (executor). Dispatcher writes
 //! intent rows for the three verbs we expose:
 //!
 //! - **Apply**: provision a new infra node OR roll an existing one
@@ -12,8 +12,9 @@
 //! - **Stop**: scale to zero, preserve PVCs.
 //! - **Terminate**: delete every resource by label, PVCs too.
 //!
-//! Supervisor polls per tenant via the broker's
-//! `supervisor_claim_command`, runs kubectl, writes completion via
+//! The supervisor that owns a project claims its commands via the
+//! broker's `supervisor_claim_command`, applies them to the cluster,
+//! writes completion via
 //! `supervisor_command_complete`. Dispatcher-claimable verbs
 //! (Deactivate, Reactivate) go through `lifecycle_claimer` (this
 //! crate). No HTTP between supervisor and dispatcher; both sides
@@ -72,8 +73,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             force             BOOLEAN NOT NULL DEFAULT FALSE,
             -- The user requested cancellation of this command while it
             -- was CLAIMED (in flight). The executing supervisor polls
-            -- this between kubectl steps and halts (leaving per-node
-            -- partial state visible; kubectl is not transactional).
+            -- this between cluster calls and halts (leaving per-node
+            -- partial state visible; the Kubernetes API is not
+            -- transactional).
             -- Pending unclaimed rows are cancelled outright (outcome =
             -- 'cancelled') instead of flagged.
             cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -190,7 +192,7 @@ pub async fn issue_lifecycle(
 
 /// Enqueue an Apply command. The supervisor reads the row,
 /// deserializes `spec_json`, reads the prior `infra_node` row to
-/// decide skip / fresh / replace, and applies via kubectl.
+/// decide skip / fresh / replace, and applies to the cluster.
 pub async fn issue_apply(
     pool: &PgPool,
     tenant_id: &str,
@@ -444,7 +446,7 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 
 /// Cancel every in-flight lifecycle command for a project: flag
 /// CLAIMED rows (`cancel_requested = TRUE`; the executing supervisor
-/// polls the flag between kubectl steps and halts) and complete
+/// polls the flag between cluster calls and halts) and complete
 /// still-UNCLAIMED rows outright with outcome `cancelled` (nothing has
 /// touched the cluster for them yet). Flag first, then complete: a row
 /// claimed between the two statements has its flag already set, so no

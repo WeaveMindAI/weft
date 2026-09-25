@@ -1,22 +1,39 @@
-//! The weft compiler. Turns a project directory (`main.weft`, `nodes/`,
-//! `weft.toml`) into a compiled rust binary.
+//! The weft compiler. Turns a project directory (`weft.toml`,
+//! `src/main.weft`, `nodes/`) into a flat `ProjectDefinition` and the
+//! docker build contexts of the images that run it.
 //!
-//! Pipeline:
-//! 1. `project::load` reads the project manifest and the graph source.
-//! 2. `weft_compiler::compile` lexes and parses the source into the
-//!    lossless CST, resolves `@file` / `@asset` / `@include`, then
-//!    flattens it: a group becomes two `Passthrough` boundary nodes and a
-//!    loop a `LoopIn` / `LoopOut` pair, so what comes out is one flat
-//!    `ProjectDefinition` of nodes and edges. (`compile_lenient` is the
-//!    same pipeline for the editor, collecting errors instead of
-//!    aborting.)
-//! 3. `enrich::enrich` resolves TypeVars, dynamic ports, and
-//!    config-derived ports.
-//! 4. `validate::validate` checks callback isolation, entry-point
-//!    detection, required-port coverage.
-//! 5. `codegen::emit` produces rust source files that link the graph +
-//!    every referenced node (all from the project's `nodes/`).
-//! 6. `build::build_project` runs cargo to produce the binary.
+//! Pipeline, as `weft run` / `weft build` drive it:
+//! 1. `Project::load` reads `weft.toml` (and refuses a program still at
+//!    the project root instead of `src/`).
+//! 2. `weft_compiler::compile` parses `src/main.weft` into the lossless
+//!    CST and lowers it, resolves `@include` (the build inlines the
+//!    included group's body; the editor's `Interface` mode leaves one
+//!    opaque node), then flattens: a group becomes two `Passthrough`
+//!    boundary nodes and a loop a `LoopIn` / `LoopOut` pair, so what
+//!    comes out is one flat `ProjectDefinition` of nodes and edges.
+//!    `@file` / `@asset` values resolve last, on that flat graph; a
+//!    file-typed `@asset` stays a marker for the build's asset sync.
+//!    (`compile_lenient` is the same pipeline for the editor, collecting
+//!    errors instead of aborting.)
+//! 3. `enrich` fills each node's ports and features from its catalog
+//!    metadata, materializes config-derived and custom ports, and
+//!    resolves TypeVars.
+//! 4. `validate` checks the graph (ids, scopes, port types, required
+//!    ports and `@require_one_of`, loops, trigger and infra placement,
+//!    each node's declarative rules). `Structural` gates the build;
+//!    `Runtime` adds the rules a sketch may leave open (credentials).
+//! 5. The CLI resolves file-typed `@asset` markers into stored files
+//!    (`weft-assets`), then `build_plan::plan_build_from` computes the
+//!    three hashes (`hash`: binary, definition, infra) and stages every
+//!    image: `build::build_project` validates the resolved definition,
+//!    `codegen::emit` writes the worker cargo crate (one crate per
+//!    referenced node package, plus the registry and `main.rs`; the
+//!    definition itself is never baked in, a worker fetches it from the
+//!    broker by `definition_hash`), and `worker_image::emit` writes its
+//!    Dockerfile; `image_set` lists each infra node's own images.
+//! 6. The CLI builds every planned image not already present with
+//!    docker. The worker's `cargo build` runs inside its docker build,
+//!    never on the host.
 
 pub mod project;
 pub mod source_name;

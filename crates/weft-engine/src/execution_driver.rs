@@ -2013,14 +2013,15 @@ async fn drive(
             //   1. `node_impl.provision_infra(infra_ctx, input)` returns
             //      an InfraSpec. Failure here = node fails with stage
             //      "provision"; downstream cascade-skips.
-            //   2. Engine compiles spec locally, asks broker for prior
-            //      applied state, picks skip / fresh / replace, and
-            //      (when not skip) enqueues an Apply lifecycle command
-            //      via the broker. The tenant's supervisor pod claims
-            //      the command and runs kubectl. Failure here = node
+            //   2. The engine enqueues an Apply lifecycle command
+            //      carrying the spec, via the broker, and waits on it.
+            //      The supervisor that owns the project claims it,
+            //      compiles and hashes the spec, picks skip / fresh /
+            //      replace against the prior applied state, and applies
+            //      through the Kubernetes API. Failure here = node
             //      fails with stage "apply".
             //   3. `node_impl.run(ctx)` runs as usual, with
-            //      `ctx.endpoint_url(name)` now resolving against the
+            //      `ctx.endpoint(name)` now resolving against the
             //      freshly-applied infra_node row. Failure here = node
             //      fails with stage "run"; the infra stays up
             //      (provisioned-but-run-failed sub-state).

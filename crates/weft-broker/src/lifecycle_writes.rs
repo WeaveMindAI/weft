@@ -227,7 +227,7 @@ where
 ///
 /// Ownership is the supervisor's one single-actor authority: exclusive
 /// (one pod per project) and renewed on every ownership tick, so two
-/// supervisors never run kubectl for one project. Inside the owner, one
+/// supervisors never change one project's cluster objects. Inside the owner, one
 /// project's commands run in order, because the pod names the projects
 /// it is busy with and gets none of theirs back; different projects'
 /// commands run side by side.
@@ -239,7 +239,7 @@ where
 /// if ownership moves mid-command, every write from the old owner is
 /// refused (`owns_project_predicate` on the fenced writes below) and
 /// the new owner runs it again, which is safe because the supervisor's
-/// kubectl work is declarative.
+/// cluster work is declarative.
 ///
 /// Only the supervisor's verbs: `deactivate` and `reactivate` are the
 /// dispatcher's, claimed by dispatcher pods under their own

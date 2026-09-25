@@ -1,17 +1,15 @@
 //! Infra typed surface + pure helpers shared by every party that
 //! needs to reason about an `InfraSpec`:
 //!
-//! - **engine** compiles + hashes a freshly-provisioned spec so it
-//!   can decide skip / fresh / replace before enqueuing a lifecycle
-//!   command;
-//! - **supervisor** compiles + applies (kubectl) when it claims an
-//!   `Apply` lifecycle command;
+//! - **supervisor** hashes, compiles, decides skip / fresh / replace
+//!   and applies when it claims an `Apply` lifecycle command (the
+//!   engine only ships the spec and waits);
 //! - **tests** round-trip specs through compile to pin manifest
 //!   shapes.
 //!
 //! The dispatcher does NOT call into the compile or apply path. It
 //! routes lifecycle commands and writes their outcomes; supervisor
-//! does the actual kubectl work.
+//! does the actual cluster work.
 
 mod compile;
 mod hash;

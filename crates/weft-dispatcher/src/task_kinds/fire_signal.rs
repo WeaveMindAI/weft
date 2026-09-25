@@ -1,12 +1,14 @@
-//! `fire_signal` task: a held-event signal fired inside a tenant
-//! listener (Timer expiry, SSE event delivery, future browser-session
-//! resolution). The listener enqueues a row through the broker; a
-//! dispatcher Pod claims it and runs the same `dispatch_listener_outcome`
-//! path a stateless fire goes through.
+//! `fire_signal` task: a held-event signal fired inside a pooled
+//! listener pod (Timer expiry, SSE event delivery, future
+//! browser-session resolution). The listener enqueues a row through the
+//! broker; a dispatcher Pod claims it and runs the same
+//! `dispatch_listener_outcome` path a stateless fire goes through.
 //!
-//! Tenant pods never speak HTTP to the dispatcher: listener →
-//! dispatcher coordination goes through the task table, gated by the
-//! broker's per-tenant scope check.
+//! The listener never speaks HTTP to the dispatcher (only the other way
+//! round): listener → dispatcher coordination goes through the task
+//! table. The broker lets a listener enqueue this one kind only, and
+//! stamps the task with the signal's own tenant, resolved from the
+//! signal row, since a pooled listener carries none.
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -1454,7 +1454,7 @@ pub async fn supervisor_set_applied(
 }
 
 /// Supervisor-callable: write the `infra_node` row at `Provisioning`
-/// before kubectl apply begins. Locks in the (instance_id, namespace,
+/// before the apply begins. Locks in the (instance_id, namespace,
 /// preserve_pvcs) tuple so that a partial-apply leaves a visible row
 /// the user can Terminate. On apply success, `set_applied` flips to
 /// `Running` and fills endpoints + applied_spec_hash. Same ownership

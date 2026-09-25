@@ -16,8 +16,8 @@
 //! - `infra_owner(project_id PK, supervisor_pod, namespace, tenant_id,
 //!   leased_until_unix)`: the EXCLUSIVE ownership lease. Exactly one
 //!   supervisor owns a project's infra at a time, so two supervisors
-//!   never run kubectl against the same project (which would corrupt
-//!   it). The grain is the PROJECT (not the namespace) because a
+//!   never change the same project's cluster objects (which would
+//!   corrupt them). The grain is the PROJECT (not the namespace) because a
 //!   project's namespace is a pure function of (tenant, project), so
 //!   the two are 1:1, and the supervisor's whole API is project-scoped.
 //!
@@ -239,18 +239,18 @@ fn render_supervisor_manifest(
     //   1. Broker auth: the projected SA token mounted at
     //      /var/run/weft/sa/token (audience `weft-broker`) authenticates
     //      claim/ownership/state calls to the broker.
-    //   2. kube-apiserver auth: the supervisor reconciles infra by
-    //      shelling out to `kubectl` (apply / scale / delete in tenant
-    //      namespaces), so it NEEDS the DEFAULT kube-API service-account
-    //      token auto-mounted at the standard path. Hence
+    //   2. kube-apiserver auth: the supervisor reconciles infra through
+    //      its in-process Kubernetes client (apply / scale / delete in
+    //      project namespaces), which authenticates with the DEFAULT
+    //      service-account token auto-mounted at the standard path. Hence
     //      `automountServiceAccountToken: true` (the same posture as the
-    //      dispatcher, which also runs kubectl); the listener disables it
-    //      because it has no kubectl path. Without it, kubectl finds no
-    //      in-cluster config and falls back to localhost:8080 (refused).
+    //      dispatcher, which also talks to the apiserver); the listener
+    //      disables it because it never does. Without it, the client
+    //      finds no in-cluster config and cannot start.
     // The pod runs as `weft-infra-supervisor-sa`, which the broker maps
-    // to the InfraSupervisor role AND which holds the per-tenant-namespace
-    // RoleBindings to `weft-infra-supervisor-clusterrole` that kubectl
-    // authenticates against. `WEFT_POD_NAME` (the literal Deployment name)
+    // to the InfraSupervisor role AND which holds the per-project-namespace
+    // RoleBindings to `weft-infra-supervisor-clusterrole` that its
+    // apiserver calls are authorized against. `WEFT_POD_NAME` (the literal Deployment name)
     // is the pod's claim identity in the broker. `weft.dev/role:
     // infra-supervisor` is the selector the reaper + pool replica-state
     // reads key on.
@@ -423,7 +423,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         // The EXCLUSIVE ownership lease. One row per project whose infra is
         // currently owned by a supervisor. Keyed by project (1:1 with its
-        // namespace), carrying the namespace + tenant the kubectl path needs.
+        // namespace), carrying the namespace + tenant the apply path needs.
         r#"CREATE TABLE IF NOT EXISTS infra_owner (
             project_id        UUID PRIMARY KEY,
             supervisor_pod    TEXT NOT NULL,
@@ -845,7 +845,7 @@ impl SupervisorPool {
     /// Releasing a lease (not handing it to a specific pod) is correct
     /// because the supervisor claim path is pull-based: a released
     /// project becomes claimable and the next non-saturated supervisor's
-    /// claim loop adopts it. We do NOT kubectl anything here; we only
+    /// claim loop adopts it. We do NOT touch the cluster here; we only
     /// move ownership rows. The drained pod stops reconciling a project
     /// the instant its lease row is gone (its own claim loop only acts on
     /// projects it owns).
@@ -893,7 +893,7 @@ impl SupervisorPool {
         // loops adopt them. A released project sits unowned until a
         // non-draining supervisor claims it (sub-second on an active
         // claim loop); its infra keeps running untouched in the meantime
-        // (release moves only an ownership row, never kubectl).
+        // (release moves only an ownership row, never a cluster object).
         let released = sqlx::query("DELETE FROM infra_owner WHERE supervisor_pod = $1")
             .bind(&target)
             .execute(pg_pool)

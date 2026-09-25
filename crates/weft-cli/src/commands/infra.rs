@@ -6,7 +6,7 @@
 //! spec hash.
 //!
 //! Stop / Terminate are direct: they enqueue an
-//! `infra_lifecycle_command` row that the tenant's supervisor pod
+//! `infra_lifecycle_command` row that the supervisor owning the project
 //! claims and executes.
 
 use std::collections::BTreeMap;
@@ -32,7 +32,7 @@ pub enum InfraAction {
     /// is nothing here to open or close.
     ListDoors,
     /// Cancel in-flight infra work (claimed lifecycle commands halt
-    /// between kubectl steps; unclaimed ones cancel outright; the
+    /// between cluster calls; unclaimed ones cancel outright; the
     /// provisioning execution is interrupted). HALT, not rollback.
     Cancel,
     /// Per-instance verbs. `node` is the instance's PLACE as a person

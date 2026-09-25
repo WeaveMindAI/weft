@@ -1,6 +1,6 @@
 //! Shared trait surface + production impls for cross-cutting platform
-//! concerns. Multiple subsystems (supervisor, listener, dispatcher,
-//! worker) need k8s access and a clock; this crate is where those
+//! concerns. The dispatcher and the supervisor need k8s access, and
+//! every subsystem needs a clock; this crate is where those
 //! traits live so each subsystem can wire production or fake impls
 //! without depending on a sibling subsystem's internals.
 //!
@@ -11,7 +11,7 @@
 //!   - `mem_pressure`: this pod's memory-usage fraction, the saturation
 //!     signal both pooled pods (listener, supervisor) spill load on.
 //!
-//! Production builds link the real impls (`KubectlClient`,
+//! Production builds link the real impls (`KubeApiClient`,
 //! `SystemClock`, `CgroupMemPressure`). Test builds enable the
 //! `test-helpers` feature to also pull in the fakes. The feature gate
 //! keeps fakes out of release binaries.

@@ -457,7 +457,7 @@ mod listener_drift_tests {
 /// stateless signal fire (webhook, form submission, extension's
 /// resume completion). Architecture-4: dispatcher routes by token,
 /// runs the lifecycle gate (live / park / refuse), relays through
-/// the tenant's listener `/process`, then journals based on the
+/// the `/process` of the listener pod holding the signal, then journals based on the
 /// returned action.
 pub async fn fire_signal(
     State(state): State<DispatcherState>,

@@ -343,7 +343,7 @@ pub async fn remove(
     // error (a headerless 404 must still bubble as version skew).
     authorize_project_marked(&state, &caller.0, id).await?;
     // Deactivate first: cancels any in-flight executions, unregisters
-    // every wake signal (entry + resume) from the tenant's listener,
+    // every wake signal (entry + resume) from the listener pods holding them,
     // drops entry tokens. If deactivate fails on a DB / listener
     // error we must abort: removing the project row while signals
     // remain in the listener leaves dangling registrations that
@@ -3524,7 +3524,7 @@ pub async fn resync(
 /// while holding the per-project advisory lock.
 ///
 /// Kill ordering: `mark_dead` FIRST so the journal-fencing trigger
-/// rejects any late write from the doomed pod, kubectl delete second.
+/// rejects any late write from the doomed pod, the Pod delete second.
 /// Idempotent: a no-op when both axes match, or when no pod is alive.
 pub async fn reconcile_worker(
     state: &DispatcherState,
@@ -3705,7 +3705,7 @@ pub async fn reconcile_worker(
     // that did not by the cap), under Cancel all of them, their
     // executions cancelled just now. mark_dead FIRST so the journal-
     // fencing trigger blocks any late write from a doomed worker;
-    // kubectl delete second. The `spawn_pod` task executor is
+    // the Pod delete second. The `spawn_pod` task executor is
     // intentionally narrow ("spawn a pod when none is alive") and never
     // kills, so the kill lives here with the decision.
     for (pod_name, namespace, _) in &doomed {

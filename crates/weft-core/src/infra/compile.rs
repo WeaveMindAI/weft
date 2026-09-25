@@ -1,6 +1,6 @@
 //! Compile an `InfraSpec` into a list of kubernetes manifest JSON
-//! documents. Pure function: same inputs → same outputs. The apply
-//! executor passes the result to `kubectl apply`.
+//! documents. Pure function: same inputs → same outputs. The
+//! supervisor applies the result server side.
 //!
 //! Every emitted manifest is stamped with the `weft.dev/*` label
 //! set. Node authors do NOT add these labels themselves; if they
@@ -204,7 +204,7 @@ fn is_dns1123_label(name: &str) -> bool {
 }
 
 /// Compile an `InfraSpec` into a list of k8s manifests. Each entry
-/// is a fully-stamped manifest ready for `kubectl apply`.
+/// is a fully-stamped manifest ready to apply.
 ///
 /// Determinism: every map in the spec is a `BTreeMap` and serde_json
 /// (without the `preserve_order` feature) emits object keys sorted,
@@ -215,11 +215,11 @@ fn is_dns1123_label(name: &str) -> bool {
 pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>, CompileError> {
     // Pre-flight: every name we will stamp on a `metadata.name` is
     // enumerated by `emitted_names`. Length-check the lot here so
-    // kubectl never sees an over-long name. The enumerator is the
+    // the apiserver never sees an over-long name. The enumerator is the
     // single source of truth: if compile.rs grows a new resource
     // kind, the contract is "add it to emitted_names" : drift
     // shows up at the call-site of `check_name`, not deep in some
-    // kubectl error message.
+    // apiserver error message.
     // Per-name validation (length + char class) AND pairwise
     // dedup keyed by `(k8s kind, name)`. k8s requires unique
     // `metadata.name` per (kind, namespace): a Deployment "x"
@@ -1747,7 +1747,7 @@ mod tests {
     fn config_literal_names_get_length_checked() {
         // The preflight loop must include user-provided
         // ConfigMap / Secret names; otherwise an over-long name
-        // slips through compile and kubectl rejects far downstream.
+        // slips through compile and the apiserver rejects it far downstream.
         let too_long = "x".repeat(64);
         let spec = InfraSpec {
             config: vec![ConfigSource::ConfigMapLiteral {
@@ -1775,7 +1775,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        // No NameTooLong error: we let kubectl resolve the ref at
+        // No NameTooLong error: we let the apiserver resolve the ref at
         // apply time.
         assert!(compile(&spec, &ctx()).is_ok());
     }
@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     /// Invalid characters (uppercase, underscore) in a unit name
-    /// surface as `NameInvalid`, not as a kubectl apply failure.
+    /// surface as `NameInvalid`, not as an apply failure.
     #[test]
     fn name_invalid_uppercase_underscore() {
         let spec = InfraSpec {

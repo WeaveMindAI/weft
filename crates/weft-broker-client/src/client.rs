@@ -925,7 +925,7 @@ impl BrokerSupervisorClient {
     }
 
     /// Whether the user requested cancellation of a claimed command.
-    /// Polled by the executing supervisor between kubectl steps.
+    /// Polled by the executing supervisor between cluster calls.
     pub async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
         let req = crate::protocol::SupervisorCommandCancelRequestedRequest { command_id };
         let resp: crate::protocol::SupervisorCommandCancelRequestedResponse = self

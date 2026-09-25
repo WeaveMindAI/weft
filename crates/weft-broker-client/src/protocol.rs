@@ -895,8 +895,8 @@ pub struct SupervisorHealthProtocolsResponse {
 pub struct SupervisorClaimCommandRequest {
     /// The pooled supervisor pod claiming work. It claims a lifecycle
     /// command ONLY for a project whose infra it currently owns (the
-    /// `infra_owner` exclusive lease), so two supervisors never run
-    /// kubectl for the same project.
+    /// `infra_owner` exclusive lease), so two supervisors never change
+    /// the same project's cluster objects.
     pub claimer_pod: String,
     /// The projects this pod is running a command for right now. Their
     /// next command waits until that one completes, so one project's
@@ -1039,8 +1039,8 @@ wire_enum! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlakyPayload {
-    /// k8s desired replicas (non-negative; widened to i64 only because
-    /// the `kubectl get` JSON parser produces i64).
+    /// k8s desired replicas (non-negative; k8s counts them in i32,
+    /// widened to i64 because `WorkloadReplicaState` carries them so).
     pub desired: i64,
     pub ready: i64,
     /// Optional human-readable reason; the bridge surfaces it on
@@ -1221,7 +1221,7 @@ pub struct AppliedEndpoints {
 }
 
 /// Supervisor-callable: write or update the `infra_node` row at
-/// `Provisioning` status BEFORE the kubectl apply begins. Locks
+/// `Provisioning` status BEFORE the apply begins. Locks
 /// in the (instance_id, namespace, preserve_pvcs) tuple so that a
 /// partial-apply failure leaves a visible row pointing at the
 /// labelled-but-incomplete resources. The user's Terminate then
@@ -1244,7 +1244,7 @@ pub struct SupervisorSetProvisioningRequest {
     pub preserve_pvcs: Vec<String>,
     /// Per-unit runtime resolved from the spec's units. Status is
     /// `Provisioning` for every unit at this point. Locked in before
-    /// kubectl so a partial-apply failure leaves the roster visible.
+    /// any cluster call so a partial-apply failure leaves the roster visible.
     pub units: std::collections::BTreeMap<String, UnitRuntime>,
 }
 
@@ -1350,7 +1350,7 @@ pub struct SupervisorEnqueueLifecycleResponse {
 }
 
 /// Worker-callable: enqueue an Apply lifecycle command for the
-/// tenant's supervisor. The engine uses this after `node.provision_infra()`
+/// supervisor that owns the project. The engine uses this after `node.provision_infra()`
 /// returns a fresh InfraSpec. The supervisor reads the prior
 /// `infra_node` row, compiles the new spec, hashes, and decides
 /// skip / fresh / replace internally.
@@ -1536,7 +1536,7 @@ pub struct SupervisorCommandCompleteRequest {
 pub struct SupervisorCommandCompleteResponse {}
 
 /// Poll target for an executing supervisor: has the user requested
-/// cancellation of this claimed command? Checked between kubectl steps
+/// cancellation of this claimed command? Checked between cluster calls
 /// and inside readiness/drain waits so a cancel interrupts promptly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCancelRequestedRequest {
@@ -2361,7 +2361,7 @@ mod supervisor_protocol_tests {
             InfraEvent::Recovered,
             InfraEvent::Failed(FailedPayload {
                 stage: FailureStage::Apply,
-                message: "kubectl rejected".into(),
+                message: "apply rejected".into(),
             }),
             InfraEvent::Stopped,
             InfraEvent::Terminated,

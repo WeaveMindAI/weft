@@ -8,8 +8,8 @@
 //! shared memory saturation threshold (a saturated pod keeps what it
 //! owns but takes on no more, so the dispatcher spawns another
 //! supervisor). Both work loops (lifecycle, health) then act ONLY on the
-//! owned set (read via `owned_projects`), so two supervisors never run
-//! kubectl against the same project. A crashed supervisor stops
+//! owned set (read via `owned_projects`), so two supervisors never change
+//! the same project's cluster objects. A crashed supervisor stops
 //! renewing; its leases expire after `infra_owner_lease_secs` and a live
 //! supervisor adopts the projects on a later tick.
 //! What a tick changed for this pod (projects taken on, projects lost)

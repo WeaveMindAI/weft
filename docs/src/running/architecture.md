@@ -7,7 +7,7 @@ Four kinds of process, one job each.
 | **Worker** | Runs your compiled program | Nothing else. It is your program |
 | **Dispatcher** | Decides what runs where, and answers every request about a project or a run | Run your step code |
 | **Listener** | Holds the timers, the open sockets and the subscriptions | Run your step code, or know which project it serves |
-| **Supervisor** | Runs kubectl for the containers your program asked for | Run your step code, or share a project with another supervisor |
+| **Supervisor** | Creates, scales and removes the containers your program asked for | Run your step code, or share a project with another supervisor |
 
 Anything that has to survive a crash goes into Postgres, and all four read it
 back from there.
@@ -93,8 +93,8 @@ limit, and weft puts the next event source on the one with room.
 It applies your infrastructure and watches whether what it created is healthy.
 
 Before it issues any cluster command it takes an exclusive lease on the
-project, because two processes running kubectl against the same namespace
-corrupt each other. It keeps renewing that lease while the work runs, and if it
+project, because two processes changing the same namespace at once corrupt
+each other. It keeps renewing that lease while the work runs, and if it
 expires another supervisor picks the project up.
 
 A supervisor can still die between changing the cluster and recording that it

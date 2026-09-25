@@ -1,6 +1,9 @@
 //! Append-only journal of execution events. Shared by the
-//! dispatcher (folds + reads), the engine (writes lifecycle), and
-//! the listener (writes on fire).
+//! dispatcher (folds, reads, and writes what it decides itself), the
+//! engine (writes lifecycle and folds on resume, both through the
+//! broker), and the broker (writes on the engine's behalf). The
+//! listener never touches it: a fire it holds reaches the journal
+//! through a `fire_signal` task the dispatcher runs.
 //!
 //! The engine cannot depend on the dispatcher, but both need the
 //! same `ExecEvent` schema and the same INSERT, so the type +

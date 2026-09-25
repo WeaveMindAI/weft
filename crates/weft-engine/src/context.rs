@@ -10,11 +10,10 @@
 //! Infra-provision (the engine-side counterpart to user code's
 //! `Node::provision_infra` returning an `InfraSpec`) is driven by the loop
 //! driver, NOT by methods on `RunnerHandle`. The loop driver calls
-//! `node.provision`, compiles + hashes the returned spec locally,
-//! reads prior applied state via the broker, makes a local
-//! skip/fresh/replace decision, and (when not Skip) enqueues an
-//! `Apply` lifecycle command via `apply_via_supervisor`. The tenant's
-//! supervisor pod handles the kubectl work. Once apply completes,
+//! `node.provision_infra` and hands the returned spec to
+//! `apply_via_supervisor`, which enqueues an `Apply` lifecycle command
+//! and waits on it. The supervisor that owns the project compiles,
+//! hashes, decides skip / fresh / replace and applies. Once apply completes,
 //! the loop driver runs the node's body with `Phase::InfraSetup`.
 
 use std::collections::{HashMap, HashSet};
@@ -258,7 +257,7 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 /// to the supervisor) and `wait_apply` (wait on the resulting command
 /// row until it is terminal). The supervisor owns every other concern
 /// end-to-end: read prior `infra_node`, compile + hash, decide
-/// skip / fresh / replace, run kubectl, update the row. The worker
+/// skip / fresh / replace, apply to the cluster, update the row. The worker
 /// just hands off the spec and waits.
 #[async_trait]
 pub trait InfraStateClient: Send + Sync {
@@ -1305,10 +1304,7 @@ pub struct RunnerHandle {
     /// trigger can reject writes from a Pod that has been drained or
     /// reaped.
     pod_name: String,
-    /// Tenant id stamped on every task this handle enqueues. The
-    /// dispatcher's listener reaper queries the task table by tenant
-    /// to tell "in-flight register" from "genuinely idle" before
-    /// killing the per-tenant listener pod.
+    /// Tenant id stamped on every task this handle enqueues.
     tenant_id: String,
     cancellation: Arc<CancellationFlag>,
     /// Pre-loaded sequence of past `await_signal` calls for this

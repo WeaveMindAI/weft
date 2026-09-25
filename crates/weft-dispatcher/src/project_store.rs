@@ -713,8 +713,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- The project's OWN k8s namespace
                 -- (wft-project-<tenant>--<project>), where its INFRA pods
                 -- and its worker live. Distinct concept from has_infra:
-                -- this is the namespace string the supervisor runs
-                -- kubectl against, EMPTY until the namespace is actually
+                -- this is the namespace string the supervisor applies
+                -- into, EMPTY until the namespace is actually
                 -- provisioned (first infra apply) and re-emptied when
                 -- infra is torn down. The broker's supervisor-claim
                 -- filters `project_namespace <> ''` to manage only

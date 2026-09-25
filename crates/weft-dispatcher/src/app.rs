@@ -606,7 +606,7 @@ async fn lease_renewer(state: DispatcherState) {
     }
 }
 
-/// Wait for SIGTERM / Ctrl+C and let axum drain. Tenant listener rows stay so
+/// Wait for SIGTERM / Ctrl+C and let axum drain. Listener pod rows stay so
 /// the next dispatcher Pod re-attaches with the same URL + tokens; the listener
 /// Pod itself doesn't care which dispatcher Pod owns its lease.
 async fn graceful_shutdown() {

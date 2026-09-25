@@ -35,7 +35,7 @@ pub fn heartbeat_stale_secs() -> i64 {
     weft_core::time_scale::scaled_secs(30)
 }
 
-/// How long a row may sit in `spawning` (reserved, kubectl-applied, but
+/// How long a row may sit in `spawning` (reserved, applied, but
 /// the worker never registered itself `alive`) before the reaper marks
 /// it dead. Without this, a failed boot (OOM during start, a panic
 /// before the first heartbeat, a pod deleted out-of-band, a node that
@@ -58,7 +58,7 @@ pub const SPAWN_BOOT_DEADLINE_SECS: i64 = 1800;
 /// Lifecycle states for a `worker_pod` row.
 ///
 /// `spawning` → `alive` → `done | dead`.
-///   - `spawning`: dispatcher reserved the row before `kubectl apply`.
+///   - `spawning`: dispatcher reserved the row before applying the pod.
 ///   - `alive`: worker registered itself, heartbeat is fresh.
 ///   - `done`: worker exited cleanly (heartbeat loop saw the row go
 ///     away, mark_done called).
@@ -390,7 +390,7 @@ pub enum AliveTransition {
 /// Flip a pre-inserted row to `alive` and stamp the heartbeat.
 /// `transition` picks the acceptable prior statuses (see
 /// [`AliveTransition`]). The dispatcher's `insert_spawning` always
-/// runs before the kubectl apply that creates the pod, so the row is
+/// runs before the apply that creates the pod, so the row is
 /// guaranteed to exist by the time this is called. If it doesn't
 /// (e.g. a forged pod_name from a compromised caller), the UPDATE
 /// affects zero rows and we surface that as an error: there is no
@@ -433,7 +433,7 @@ pub async fn register_alive(
     Ok(())
 }
 
-/// Reserve a row before `kubectl apply`. Idempotent on retry via
+/// Reserve a row before the pod is applied. Idempotent on retry via
 /// `ON CONFLICT DO NOTHING`. The dispatcher's spawn_pod task calls
 /// this so a partial-success retry collides on the same pod_name.
 pub async fn insert_spawning(
@@ -965,7 +965,7 @@ pub async fn list_stale(pool: &PgPool, threshold_unix: i64) -> Result<Vec<Worker
 }
 
 /// Rows stuck in `spawning` past `threshold_unix` (pass `now -
-/// SPAWN_BOOT_DEADLINE_SECS`): reserved + kubectl-applied, but the worker
+/// SPAWN_BOOT_DEADLINE_SECS`): reserved + applied, but the worker
 /// never registered itself `alive` within the generous boot deadline.
 /// The reaper marks these dead so a failed boot stops being counted as
 /// capacity by the scale-up check (which treats `spawning` as
@@ -1021,10 +1021,10 @@ pub async fn list_orphaned_node_test(
 }
 
 /// Terminal rows (`done` | `dead`) whose `terminal_at_unix` is
-/// older than the threshold. The pod-GC sweep `kubectl delete`s
+/// older than the threshold. The pod-GC sweep deletes
 /// the finished k8s Pod object (using the row's own namespace, so
 /// no namespace-mapper guessing) and removes the row. Driven off
-/// the table, not `kubectl get`, so it's the single source of
+/// the table, not a cluster listing, so it's the single source of
 /// truth and is fakeable in tests.
 pub async fn list_terminal(pool: &PgPool, threshold_unix: i64) -> Result<Vec<WorkerPodRow>> {
     let rows = sqlx::query(

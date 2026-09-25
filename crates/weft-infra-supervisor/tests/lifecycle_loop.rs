@@ -150,7 +150,7 @@ async fn cancel_requested_halts_stop_and_records_cancelled_outcome() {
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
 
-    assert!(rig.kube.scale_calls().is_empty(), "halted before any kubectl scale");
+    assert!(rig.kube.scale_calls().is_empty(), "halted before any scale");
     assert_eq!(rig.broker.cancelled_commands(), vec![1]);
     assert!(rig.broker.failed_commands().is_empty(), "a cancel is not a failure");
 }
@@ -801,7 +801,7 @@ async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
 }
 
 #[tokio::test]
-async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
+async fn terminate_aborts_before_touching_the_cluster_when_ownership_moves_mid_command() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     rig.kube
@@ -812,7 +812,7 @@ async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
     rig.tick_lifecycle().await.unwrap();
 
     // The Terminating stamp (the first ownership-gated write) was
-    // displaced, so no kubectl ran, the node row survives for the new
+    // displaced, so nothing touched the cluster, the node row survives for the new
     // owner to terminate, and the command is left uncompleted.
     assert!(
         rig.kube.delete_calls().is_empty(),

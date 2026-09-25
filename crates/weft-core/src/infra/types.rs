@@ -1,9 +1,9 @@
 //! Typed declarations for infrastructure nodes.
 //!
 //! An infra node implements `Node::provision_infra`, which returns an
-//! [`InfraSpec`]. The dispatcher's apply executor compiles the spec
-//! to a list of kubernetes manifests, resolves image digests, hashes
-//! the resolved spec, and applies via `kubectl`. The same spec is
+//! [`InfraSpec`]. The supervisor that owns the project resolves its
+//! image tags, hashes the resolved spec, compiles it to a list of
+//! kubernetes manifests, and applies them. The same spec is
 //! re-derived on every restart / upgrade so drift detection collapses
 //! to "does the resolved hash match what's currently applied".
 //!
@@ -824,7 +824,7 @@ pub enum StopBehavior {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpgradeBehavior {
-    /// kubectl apply lets k8s rolling-update the Deployment.
+    /// The apply lets k8s rolling-update the Deployment.
     Rolling {
         #[serde(default, rename = "maxUnavailable", alias = "max_unavailable", skip_serializing_if = "Option::is_none")]
         max_unavailable: Option<String>,

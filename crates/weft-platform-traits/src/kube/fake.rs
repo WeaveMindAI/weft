@@ -77,8 +77,8 @@ pub enum KubeCall {
 #[derive(Default)]
 struct Inner {
     /// Keyed by namespace. Each entry is the full list of weft-managed
-    /// workloads in that namespace (analogous to what `kubectl get`
-    /// would return).
+    /// workloads in that namespace (what a list on the apiserver would
+    /// return).
     workloads: HashMap<String, Vec<WorkloadReplicaState>>,
     /// Per-(namespace, pod_name) container waiting reason. Empty =
     /// no reason (running / not waiting). Seeded by tests via
@@ -297,7 +297,7 @@ impl KubeReader for FakeKube {
             namespace: namespace.to_string(),
             selector: selector.to_string(),
         });
-        // Honor the label selector the way kubectl's `-l` does for our
+        // Honor the label selector the way the apiserver does for our
         // calls. Route through the SAME `parse_selector` the writer side
         // (`delete_by_label`) uses, so both paths reject unsupported grammar
         // identically: a selector/label MISMATCH (e.g. asking for `role=infra`
@@ -540,11 +540,11 @@ impl KubeWriter for FakeKube {
 /// Parse the subset of the k8s label-selector grammar that the
 /// fake supports: comma-separated `key=value` AND-of-equals.
 ///
-/// Production kubectl supports `!=`, `in (...)`, `notin (...)`,
+/// The apiserver supports `!=`, `in (...)`, `notin (...)`,
 /// bare-key existence, and `!key` non-existence. The fake panics
 /// on those rather than silently mismatching: tests should fail
 /// loudly if they use grammar the fake can't honor, otherwise
-/// they'd pass against the fake and break against real kubectl.
+/// they'd pass against the fake and break against the real apiserver.
 ///
 /// If you hit this panic, either (a) limit your selector to
 /// `key=value,key=value` shape, or (b) extend the fake AND
@@ -611,7 +611,7 @@ mod tests {
 
     /// The whole point of routing `list_replica_state` through the selector
     /// filter: a selector whose value does not match the workload's label must
-    /// return nothing, exactly as real kubectl `-l` does. This pins the bug
+    /// return nothing, exactly as the real apiserver does. This pins the bug
     /// class where the reaper asked for `role=infra` while the supervisor is
     /// labeled `role=infra-supervisor`, which silently matched nothing in prod;
     /// the fake must reproduce that miss so a contract test can catch the drift.
