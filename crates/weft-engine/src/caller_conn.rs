@@ -244,15 +244,16 @@ pub struct LiveCallerConnection {
     handshake: Arc<LiveRequest>,
     /// HTTP request parts captured at attach (HTTP only). `None` for WS.
     http_request: Option<Arc<HttpRequestParts>>,
-    /// Journal sink for `Caller*` observability events.
-    journal: Arc<dyn CallerJournalSink>,
-    color: Color,
+    /// Where the `Caller*` observability rows go, each at its offset.
+    record: CallerRecord,
     inner: Mutex<ConnInner>,
-    /// Monotonic offset for journaled caller events (per connection).
-    next_offset: AtomicU64,
     /// Whether the caller is attached, as a watch so a hold waiting on
     /// the caller (`disconnected()`) wakes the moment it hangs up.
     connected: tokio::sync::watch::Sender<bool>,
+    /// Whether the disconnect row was handed to the journal: the
+    /// exactly-once guard, apart from `connected` so the row is written
+    /// BEFORE anyone waiting on `connected` wakes (see `mark_disconnected`).
+    disconnect_recorded: AtomicBool,
 }
 
 /// Stored inbound log with a wakeup and a BOUNDED in-RAM window. A
@@ -364,17 +365,51 @@ struct ConnInner {
 }
 
 impl LiveCallerConnection {
-    /// The socket owns this connection even after execution cleanup removes
-    /// its registry entry. Record the disconnect exactly once on that owner.
-    fn mark_disconnected(&self, reason: &str) {
-        if self.connected.send_replace(false) {
-            let offset = self.next_offset();
-            self.journal.disconnected(self.color, offset, reason);
+    /// The sink the exchange is recorded through, for the run to close
+    /// once it is over.
+    pub fn journal(&self) -> Arc<dyn CallerJournalSink> {
+        self.record.sink()
+    }
+
+    /// The run is over and has said its last word: let the socket task
+    /// send what is still queued, end the exchange, and record its
+    /// `CallerDisconnected`, then return. The run's journal is closed
+    /// only after this, so the disconnect row is part of the run's
+    /// record. No deadline of its own: the tail waits on the caller
+    /// reading it, the same as every other write to the caller, until the
+    /// caller leaves or the session cap (when one is set) ends the
+    /// exchange; every write is raced against both (`write_or_end`).
+    pub async fn hang_up(&self) {
+        self.outbound.close();
+        CallerConnection::disconnected(self).await;
+    }
+
+    /// Journal the caller's arrival: the connect row at offset zero and,
+    /// for HTTP, the request body as the first inbound message (it arrives
+    /// with the connection rather than after it). Only
+    /// [`CallerRegistry::attach`] calls this, once the connection is the
+    /// exchange's one caller and before anyone else can reach it, so a
+    /// refused caller writes nothing into the run it was refused from and
+    /// no other row can take these offsets.
+    fn record_arrival(&self) {
+        self.record.connected(self.config.protocol);
+        if let Some(http) = &self.http_request {
+            self.record.inbound(&http.body);
         }
     }
 
-    fn next_offset(&self) -> u64 {
-        self.next_offset.fetch_add(1, Ordering::SeqCst)
+    /// The socket owns this connection even after execution cleanup removes
+    /// its registry entry. Record the disconnect exactly once on that owner.
+    /// The row goes to the journal first and `connected` flips after:
+    /// `hang_up` wakes on the flip and the run then closes the sink, so a
+    /// flip first could close it before the row was handed over. Only the
+    /// caller that wrote the row flips: a second one returning at once
+    /// leaves the flip to the first, so it never lands ahead of the row.
+    fn mark_disconnected(&self, reason: &str) {
+        if !self.disconnect_recorded.swap(true, Ordering::SeqCst) {
+            self.record.disconnected(reason);
+            self.connected.send_replace(false);
+        }
     }
 
     /// Surface a node/run error to the caller per the error mode. Best
@@ -388,12 +423,10 @@ impl LiveCallerConnection {
         if self.config.error_mode == weft_core::signal::ErrorMode::DropChunk {
             // Tolerant streams: the chosen mode says swallow it. Still
             // journal it (observability), just don't push to the wire.
-            let offset = self.next_offset();
-            self.journal.errored(self.color, offset, message);
+            self.record.errored(message);
             return;
         }
-        let offset = self.next_offset();
-        self.journal.errored(self.color, offset, message);
+        self.record.errored(message);
         self.outbound.push_terminal(Outbound::Error(message.to_string()));
     }
 
@@ -419,8 +452,7 @@ impl LiveCallerConnection {
         };
         if silent_http {
             let message = "the run ended without answering";
-            let offset = self.next_offset();
-            self.journal.errored(self.color, offset, message);
+            self.record.errored(message);
             self.outbound.push_terminal(Outbound::Error(message.to_string()));
         } else {
             self.outbound.push_terminal(Outbound::Terminate(None, None));
@@ -514,11 +546,10 @@ impl CallerConnection for LiveCallerConnection {
         // longer being written down: the record is what anyone later
         // has to go on, and a run that keeps going while it is missing
         // is a run that says it went well and cannot show it.
-        if let Some(why) = self.journal.degraded() {
+        if let Some(why) = self.record.sink.degraded() {
             return Err(CallerError::JournalLost(why));
         }
-        let offset = self.next_offset();
-        self.journal.outbound(self.color, offset, &chunk, false);
+        self.record.outbound(&chunk, false);
         let chunk = Outbound::Chunk(chunk);
         match self.config.backpressure {
             // Await a free slot; only errors if the socket is gone.
@@ -555,8 +586,7 @@ impl CallerConnection for LiveCallerConnection {
             }
         }
         if let Some(c) = &final_chunk {
-            let offset = self.next_offset();
-            self.journal.outbound(self.color, offset, c, true);
+            self.record.outbound(c, true);
         }
         // The terminal always lands (subject to no capacity policy); if the
         // socket task already ended (caller gone), it is silently dropped
@@ -672,11 +702,72 @@ async fn recv_from_log(
 /// per-message waits are unbounded, but the author can bound the TOTAL
 /// session via `max_session_secs` to cap a multiplexing pod's RAM/abuse.
 /// Uses the injected clock so the rig can advance it deterministically.
+/// One write to the caller, raced against the exchange ending under it:
+/// `gone` (the caller's side going away, where the transport says so
+/// without a write) and the `session` cap. A caller that stops reading
+/// would otherwise hold the write, and the drainer and `hang_up` with it,
+/// past both. `Ok` carries whether the write went through.
+async fn write_or_end<S: std::future::Future<Output = ()>>(
+    write: impl std::future::Future<Output = bool>,
+    gone: impl std::future::Future<Output = ()>,
+    session: std::pin::Pin<&mut S>,
+) -> Result<bool, ExchangeEnd> {
+    tokio::select! {
+        ok = write => Ok(ok),
+        () = gone => Err(ExchangeEnd::CallerHungUp),
+        () = session => Err(ExchangeEnd::SessionCapExceeded),
+    }
+}
+
 async fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs: u64) {
     if cap_secs == 0 {
         std::future::pending::<()>().await;
     } else {
         clock.sleep(std::time::Duration::from_secs(cap_secs)).await;
+    }
+}
+
+/// One exchange's record: the sink its `Caller*` rows go to and the
+/// counter that hands each row the next offset, starting at zero. Every
+/// caller (a live connection, a fired run's stand-in) writes through
+/// one, so their rows number the same way.
+pub(crate) struct CallerRecord {
+    color: Color,
+    sink: Arc<dyn CallerJournalSink>,
+    next_offset: AtomicU64,
+}
+
+impl CallerRecord {
+    pub(crate) fn new(color: Color, sink: Arc<dyn CallerJournalSink>) -> Self {
+        Self { color, sink, next_offset: AtomicU64::new(0) }
+    }
+
+    pub(crate) fn sink(&self) -> Arc<dyn CallerJournalSink> {
+        self.sink.clone()
+    }
+
+    fn take_offset(&self) -> u64 {
+        self.next_offset.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn connected(&self, protocol: Protocol) {
+        self.sink.connected(self.color, self.take_offset(), protocol);
+    }
+
+    pub(crate) fn inbound(&self, msg: &InboundMessage) {
+        self.sink.inbound(self.color, self.take_offset(), msg);
+    }
+
+    pub(crate) fn outbound(&self, chunk: &OutboundChunk, terminal: bool) {
+        self.sink.outbound(self.color, self.take_offset(), chunk, terminal);
+    }
+
+    pub(crate) fn errored(&self, message: &str) {
+        self.sink.errored(self.color, self.take_offset(), message);
+    }
+
+    pub(crate) fn disconnected(&self, reason: &str) {
+        self.sink.disconnected(self.color, self.take_offset(), reason);
     }
 }
 
@@ -690,6 +781,13 @@ pub trait CallerJournalSink: Send + Sync {
     fn outbound(&self, color: Color, offset: u64, chunk: &OutboundChunk, terminal: bool);
     fn errored(&self, color: Color, offset: u64, message: &str);
     fn disconnected(&self, color: Color, offset: u64, reason: &str);
+
+    /// Stop taking rows: write what is held, and resolve once every row
+    /// handed over is in the journal. A run closes its caller's sink
+    /// before its own journal is settled (an unrecorded run's is read
+    /// once, then written or forgotten), so no row of the exchange is
+    /// still in flight when that happens.
+    fn close(&self) -> futures::future::BoxFuture<'static, ()>;
 
     /// Why this conversation has stopped being recorded, once it has.
     ///
@@ -739,13 +837,18 @@ impl CallerRegistry {
     /// they give up, a route that cannot suspend reads their departure
     /// as its own caller leaving and kills the run that was still
     /// serving the first one. Both would also journal from offset zero,
-    /// so one exchange's rows would interleave with the other's.
+    /// so one exchange's rows would interleave with the other's: that is
+    /// why a connection journals its arrival here, on admission, and a
+    /// refused one never journals at all.
     #[must_use]
     pub fn attach(&self, color: Color, conn: Arc<LiveCallerConnection>) -> bool {
         let mut inner = self.inner.lock().expect("registry poisoned");
         if inner.contains_key(&color) {
             return false;
         }
+        // Journaled under the lock: nothing reaches this connection before
+        // its arrival rows are written.
+        conn.record_arrival();
         inner.insert(color, conn);
         drop(inner);
         // `notify_waiters` (not `notify_one`): several execute paths may be
@@ -838,18 +941,14 @@ pub(crate) fn new_connection(
         inbound: inbound.clone(),
         handshake,
         http_request,
-        journal: journal.clone(),
-        color,
+        record: CallerRecord::new(color, journal.clone()),
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
-        next_offset: AtomicU64::new(0),
         connected: tokio::sync::watch::Sender::new(true),
+        disconnect_recorded: AtomicBool::new(false),
     });
-    // Connect event at offset 0 is stamped by the caller of this fn (the
-    // server) once it has registered, so the journal ordering matches the
-    // attach ordering; expose the protocol for that.
-    let proto = conn.config.protocol;
-    let off = conn.next_offset();
-    journal.connected(color, off, proto);
+    // The connect row is written on admission (`CallerRegistry::attach`),
+    // never here: a connection refused as a second caller must leave no
+    // row in the run it was refused from.
     (conn, outbound, inbound)
 }
 
@@ -984,7 +1083,7 @@ async fn ask_for_birth(
             // off the signed token, which is the only trustworthy
             // source for it anyway.
             color: None,
-            tenant_id: Some(state.tenant_id.clone()),
+            tenant_id: state.tenant_id.clone(),
             target_pod_name: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload).expect("the arrival payload serializes"),
@@ -1008,7 +1107,21 @@ async fn ask_for_birth(
         }
     };
     match outcome.status {
-        TaskStatus::Complete => Ok(()),
+        TaskStatus::Complete => match outcome.result.map(serde_json::from_value::<weft_task_store::kinds::LiveArrivalResult>) {
+            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { .. })) => Ok(()),
+            // Refused before the run was born: the caller gets that
+            // answer, with its status.
+            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Refused { status, message })) => Err((
+                StatusCode::from_u16(status).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY),
+                message,
+            )
+                .into_response()),
+            other => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("the arrival answered something unreadable: {other:?}"),
+            )
+                .into_response()),
+        },
         TaskStatus::Failed => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             format!("the run could not start: {}", outcome.error.unwrap_or_else(|| "no reason given".into())),
@@ -1564,25 +1677,12 @@ async fn drive_http(
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
-    let sink = journal.clone();
-    let seed = decoded.clone();
+    // What the caller sent is journaled on admission, right after the
+    // connect row (`record_arrival`).
     let (conn, outbound, _inb) =
         new_connection(config.clone(), color, request, Some(decoded), journal);
-    // What the caller sent is written down the same way a socket's
-    // first frame is. It used to be the one thing a caller said that
-    // the journal never held, for no reason anybody chose: an HTTP
-    // request is one inbound message that happens to arrive with the
-    // connection rather than after it. Journaled AFTER the connection
-    // exists so it takes the connection's own next offset and cannot
-    // collide with the connect row at offset zero.
-    sink.inbound(color, conn.next_offset(), &seed);
     if !state.registry.attach(color, conn.clone()) {
-        return (
-            StatusCode::CONFLICT,
-            "this exchange already has a caller: a routing token opens one connection, and \
-             following the same redirect twice is not a second one. Ask for a new one.",
-        )
-            .into_response();
+        return (StatusCode::CONFLICT, EXCHANGE_TAKEN).into_response();
     }
 
     // Stream the worker's outbound chunks as a chunked HTTP body. The
@@ -1622,8 +1722,11 @@ async fn drive_http(
                         if !head.commit_for(Some(&c)) {
                             break ExchangeEnd::CallerHungUp;
                         }
-                        if tx.send(Ok(chunk_to_bytes(&c))).await.is_err() {
-                            break ExchangeEnd::CallerHungUp;
+                        let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
+                        match write_or_end(sent, tx.closed(), session.as_mut()).await {
+                            Ok(true) => {}
+                            Ok(false) => break ExchangeEnd::CallerHungUp,
+                            Err(end) => break end,
                         }
                     }
                     Some(Outbound::Terminate(final_chunk, _close)) => {
@@ -1631,21 +1734,36 @@ async fn drive_http(
                             break ExchangeEnd::CallerHungUp;
                         }
                         if let Some(c) = final_chunk {
-                            let _ = tx.send(Ok(chunk_to_bytes(&c))).await;
+                            let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
+                            // The program answered: a last write the caller no
+                            // longer reads still ends the exchange on the
+                            // program's side, never as a hang-up (which would
+                            // cancel a run that already answered).
+                            if let Err(end) = write_or_end(sent, tx.closed(), session.as_mut()).await {
+                                break end;
+                            }
                         }
                         break ExchangeEnd::ResponseComplete;
                     }
                     Some(Outbound::Error(msg)) => {
                         // Before the first byte the status line is still
                         // ours to set: a real error status with the
-                        // message as the body. After streaming started
-                        // the status is committed, so the error goes
-                        // in-band, then the stream closes.
+                        // message as the body (nothing is queued ahead of
+                        // it yet, so it never waits). After streaming
+                        // started the status is committed, so the error
+                        // goes in-band, then the stream closes.
                         if head.is_pending() {
                             head.commit_error();
-                            let _ = tx.send(Ok(msg.into_bytes())).await;
+                            let _ = tx.try_send(Ok(msg.into_bytes()));
                         } else {
-                            let _ = tx.send(Ok(format!("\n[error] {msg}").into_bytes())).await;
+                            let sent = async { tx.send(Ok(format!("\n[error] {msg}").into_bytes())).await.is_ok() };
+                            // The program answered: a last write the caller no
+                            // longer reads still ends the exchange on the
+                            // program's side, never as a hang-up (which would
+                            // cancel a run that already answered).
+                            if let Err(end) = write_or_end(sent, tx.closed(), session.as_mut()).await {
+                                break end;
+                            }
                         }
                         break ExchangeEnd::ResponseErrored;
                     }
@@ -1658,8 +1776,11 @@ async fn drive_http(
                 // write is the caller gone.
                 _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
                     if let Some(filler) = head.keepalive() {
-                        if tx.send(Ok(filler.as_bytes().to_vec())).await.is_err() {
-                            break ExchangeEnd::CallerHungUp;
+                        let sent = async { tx.send(Ok(filler.as_bytes().to_vec())).await.is_ok() };
+                        match write_or_end(sent, tx.closed(), session.as_mut()).await {
+                            Ok(true) => {}
+                            Ok(false) => break ExchangeEnd::CallerHungUp,
+                            Err(end) => break end,
                         }
                     }
                 }
@@ -1672,10 +1793,11 @@ async fn drive_http(
         };
         // Ended with the head still held (the run finished, was cut, or
         // the queue closed without a word to the caller): say so with a
-        // real status instead of hanging up mid-handshake.
+        // real status instead of hanging up mid-handshake. Nothing is
+        // queued ahead of it while the head is held, so it never waits.
         if head.is_pending() {
             head.commit_error();
-            let _ = tx.send(Ok(format!("no response from the program: {}", reason.as_str()).into_bytes())).await;
+            let _ = tx.try_send(Ok(format!("no response from the program: {}", reason.as_str()).into_bytes()));
         }
         // The exchange ended: stop producers (a blocked send now errors) and
         // mark the caller gone for this run. A tied run is cancelled only
@@ -1794,6 +1916,10 @@ fn build_response(head: &ResponseHead, body: axum::body::Body) -> Response {
     }
 }
 
+/// What a second HTTP caller on one exchange is told.
+const EXCHANGE_TAKEN: &str = "this exchange already has a caller: a routing token opens one connection, and \
+     following the same redirect twice is not a second one. Ask for a new one.";
+
 /// WebSocket path: bridge the socket to the connection. Spawns the read
 /// pump (decode caller frames -> broadcast inbound), the write pump (drain
 /// outbound -> frames), and the heartbeat (ping on a timer).
@@ -1814,8 +1940,15 @@ async fn drive_ws(
         // The socket is already upgraded here, so the only way to say
         // no is to close it. One exchange, one connection: the run is
         // already talking to the first socket and would never answer
-        // this one.
-        conn.mark_disconnected("this exchange already has a caller");
+        // this one. Nothing is journaled: this socket was never part of
+        // the run, and a disconnect row would read as its caller leaving.
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1008, // policy violation
+                // A close reason carries at most 123 bytes: the short form.
+                reason: "this exchange already has a caller".into(),
+            })))
+            .await;
         return;
     }
 
@@ -1845,8 +1978,7 @@ async fn drive_ws(
                     }
                     match decode_inbound(data_type, t.as_bytes()) {
                         Ok(msg) => {
-                            let off = conn.next_offset();
-                            journal.inbound(color, off, &msg);
+                            conn.record.inbound(&msg);
                             inbound.push(msg);
                         }
                         Err(_) => break ExchangeEnd::InboundDecodeFailed,
@@ -1858,8 +1990,7 @@ async fn drive_ws(
                     }
                     match decode_inbound(data_type, &b) {
                         Ok(msg) => {
-                            let off = conn.next_offset();
-                            journal.inbound(color, off, &msg);
+                            conn.record.inbound(&msg);
                             inbound.push(msg);
                         }
                         Err(_) => break ExchangeEnd::InboundDecodeFailed,
@@ -1879,27 +2010,51 @@ async fn drive_ws(
                     target: "weft_engine::caller_conn",
                     color = %color, "a response head reached a websocket drainer"
                 ),
+                // A socket reports a caller gone only through a failed
+                // write, so each write races the session cap alone. A
+                // caller that stops taking bytes still fails it: the
+                // socket carries the route's caller-silence bound
+                // (`bound_silence`, set before the protocol branch), so
+                // the machine aborts a connection whose data sits
+                // unacknowledged, or behind a closed window, that long.
                 Some(Outbound::Chunk(c)) => {
-                    if socket.send(chunk_to_ws(&c)).await.is_err() {
-                        break ExchangeEnd::CallerHungUpOnSend;
+                    let sent = async { socket.send(chunk_to_ws(&c)).await.is_ok() };
+                    match write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                        Ok(true) => {}
+                        Ok(false) => break ExchangeEnd::CallerHungUpOnSend,
+                        Err(end) => break end,
                     }
                 }
                 Some(Outbound::Terminate(final_chunk, close)) => {
-                    if let Some(c) = final_chunk {
-                        let _ = socket.send(chunk_to_ws(&c)).await;
-                    }
                     let close = close.unwrap_or_default();
-                    let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: close.code,
-                        reason: close.reason.into(),
-                    }))).await;
+                    let sent = async {
+                        if let Some(c) = final_chunk {
+                            let _ = socket.send(chunk_to_ws(&c)).await;
+                        }
+                        socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: close.code,
+                            reason: close.reason.into(),
+                        }))).await.is_ok()
+                    };
+                    // The program ended it: a close the caller no longer
+                    // reads is still the program's end, never a hang-up.
+                    if let Err(end) = write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                        break end;
+                    }
                     break ExchangeEnd::SessionClosedByProgram;
                 }
                 Some(Outbound::Error(msg)) => {
-                    let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: 1011, // internal error
-                        reason: msg.into(),
-                    }))).await;
+                    let sent = async {
+                        socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1011, // internal error
+                            reason: msg.into(),
+                        }))).await.is_ok()
+                    };
+                    // The program ended it: a close the caller no longer
+                    // reads is still the program's end, never a hang-up.
+                    if let Err(end) = write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                        break end;
+                    }
                     break ExchangeEnd::SessionErroredByProgram;
                 }
                 None => break ExchangeEnd::OutboundQueueClosed,
@@ -1908,8 +2063,11 @@ async fn drive_ws(
             // only exists when a heartbeat is configured (`heartbeat` is
             // `Some`); otherwise it is permanently disabled.
             _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
-                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    break ExchangeEnd::CallerMissedHeartbeat;
+                let sent = async { socket.send(Message::Ping(Vec::new().into())).await.is_ok() };
+                match write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                    Ok(true) => {}
+                    Ok(false) => break ExchangeEnd::CallerMissedHeartbeat,
+                    Err(end) => break end,
                 }
             }
             // Session cap: the one deadline on a live exchange (per-message
@@ -1970,6 +2128,11 @@ mod tests {
         fn disconnected(&self, _c: Color, off: u64, _r: &str) {
             self.events.lock().unwrap().push(format!("disconnected@{off}"));
         }
+
+        fn close(&self) -> futures::future::BoxFuture<'static, ()> {
+            // Every row above is written as it is handed over.
+            Box::pin(std::future::ready(()))
+        }
     }
 
     fn ws_cfg() -> CallerRuntimeConfig {
@@ -2006,6 +2169,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out_rx, _inb) =
             new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
+        assert!(CallerRegistry::new().attach(Color::nil(), conn.clone()), "admitted");
         let handle = CallerHandle::from_connection(conn.clone());
         let CallerHandle::Websocket(ws) = handle else { unreachable!() };
         ws.send(OutboundChunk::Json(serde_json::json!("hi"))).await.unwrap();
@@ -2466,6 +2630,7 @@ mod tests {
                 params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
                 caller: None,
                 approved,
+                member: None,
                 exp,
             },
         );
@@ -2583,7 +2748,7 @@ mod tests {
         let (first, _, _) =
             new_connection(ws_cfg(), color, Arc::new(LiveRequest::default()), None, sink.clone());
         let (second, _, _) =
-            new_connection(ws_cfg(), color, Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), color, Arc::new(LiveRequest::default()), None, sink.clone());
         let registry = CallerRegistry::new();
         assert!(registry.attach(color, first.clone()), "the first caller is admitted");
         assert!(!registry.attach(color, second), "the second is refused");
@@ -2591,6 +2756,10 @@ mod tests {
             Arc::ptr_eq(&registry.get(color).expect("the exchange still has its caller"), &first),
             "the run keeps the caller it already had"
         );
+        // The refused caller left nothing in the run: only the first
+        // caller's arrival is journaled, and no disconnect reads as the
+        // live caller leaving.
+        assert_eq!(sink.events(), vec!["connected@0".to_string()]);
     }
 
     /// A caller with a valid token has the execution asked for before
@@ -2626,7 +2795,7 @@ mod tests {
         assert_eq!(task.dedup_key.as_deref(), Some(format!("live-arrival:{color}").as_str()));
         assert_eq!(task.project_id, Some(PROJECT), "the project is the anchor the broker checks");
         assert_eq!(task.color, None, "the color does not exist yet; this task is what creates it");
-        assert_eq!(task.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(task.tenant_id, "tenant-a");
         let payload: weft_task_store::kinds::LiveArrivalPayload = serde_json::from_value(task.payload.clone()).unwrap();
         assert_eq!(payload.token, token);
         assert_eq!(payload.method, "POST");

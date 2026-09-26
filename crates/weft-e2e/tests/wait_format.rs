@@ -42,13 +42,16 @@ async fn a_formatted_line_survives_a_timer_park() -> anyhow::Result<()> {
 
     // The listener the first run placed its timer on is kept for a while
     // after its last signal, so this run registers without starting one.
+    // Well under a second on a quiet machine; the room is for the whole
+    // suite running at once, where a warm registration still takes a few
+    // seconds and a cold one (a listener pod starting) takes far longer.
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     let (started, suspended, _) = hold_stamps(&settled)?;
     let parking = suspended - started;
     anyhow::ensure!(
-        parking <= 1,
-        "the Wait took {parking}s to park on a warm listener; registering its timer should take well under a second"
+        parking <= 5,
+        "the Wait took {parking}s to park on a warm listener; registering its timer should not start a listener"
     );
 
     project.finish().await

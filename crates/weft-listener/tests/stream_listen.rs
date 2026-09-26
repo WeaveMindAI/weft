@@ -228,6 +228,7 @@ async fn run_scenario() {
         SignalIdentity {
             token: sig_token.clone(),
             tenant_id: "tenant-a".into(),
+            for_member: None,
             node_id: "node-1".into(),
             is_resume: false,
             color: None,
@@ -271,7 +272,7 @@ async fn run_scenario() {
         let fires = tasks.enqueued.lock().unwrap();
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].payload["payload"], Value::String("* 4 EXISTS".into()));
-        assert_eq!(fires[0].tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(fires[0].tenant_id, "tenant-a");
         assert_eq!(fires[0].payload["token"], Value::String(sig_token.clone()));
         assert_eq!(fires[0].payload["placement_generation"], 7);
     }

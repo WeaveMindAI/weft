@@ -18,8 +18,10 @@ use crate::journal::{
 
 #[derive(Default)]
 struct FakeState {
-    trigger_setups: HashMap<uuid::Uuid, Color>,
-    trigger_bakes: HashMap<(uuid::Uuid, String), super::TriggerBake>,
+    /// Setup run color -> its project: several setups of one project may
+    /// run at once, each over its own triggers.
+    trigger_setups: HashMap<Color, uuid::Uuid>,
+    trigger_bakes: HashMap<(uuid::Uuid, Option<weft_core::member::MemberId>, String), super::TriggerBake>,
     events: Vec<ExecEvent>,
     signal_tokens: HashMap<String, SignalToken>,
     /// One entry per `signal` row: the row (its holder on
@@ -113,11 +115,11 @@ impl FakeJournal {
     /// `summary_from_payloads` helper.
     fn summary_for_color(&self, color: Color) -> Option<ExecutionSummary> {
         let g = self.inner.lock().unwrap();
-        let (project_id, entry_node, phase, started_at) = g.events.iter().find_map(|e| match e {
-            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, phase, at_unix, .. }
+        let (project_id, entry_node, phase, started_at, member) = g.events.iter().find_map(|e| match e {
+            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, phase, at_unix, member, .. }
                 if *c == color =>
             {
-                Some((*project_id, entry_node.clone(), *phase, *at_unix))
+                Some((*project_id, entry_node.clone(), *phase, *at_unix, member.clone()))
             }
             _ => None,
         })?;
@@ -152,7 +154,7 @@ impl FakeJournal {
             .collect();
         tagged.sort();
         let tags = tagged.into_iter().map(|(_, tag)| tag).collect();
-        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, skipped_nodes })
+        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, skipped_nodes, member })
     }
 
     /// Every execution summary owned by `tenant` (unordered). Tenant ownership
@@ -225,22 +227,24 @@ impl FakeJournal {
 struct ExecutionColorRow {
     project_id: uuid::Uuid,
     tenant_id: String,
-    /// 'execution' | 'node_test', mirroring the Postgres `kind`
+    /// `RunKind::as_str`, mirroring the Postgres `kind`
     /// column: the lifecycle sweeps read only 'execution'.
     kind: &'static str,
     /// The run's phase (`fire`, `trigger_setup`, `infra_setup`),
     /// mirroring the Postgres `phase` column the activation sweep
     /// narrows on.
     phase: &'static str,
+    /// Who the run is for, and the trigger that fired it (the Postgres
+    /// `member_id` / `fired_by` columns).
+    member: Option<weft_core::member::MemberId>,
+    fired_by: Option<String>,
 }
 
-fn seed_execution_color(
-    state: &mut FakeState,
-    color: Color,
-    project_id: uuid::Uuid,
-    node_test: bool,
-    phase: weft_core::context::Phase,
-) -> anyhow::Result<()> {
+fn seed_execution_color(state: &mut FakeState, start: &ExecEvent) -> anyhow::Result<()> {
+    let ExecEvent::ExecutionStarted { color, project_id, run_kind, phase, member, fired_trigger, .. } = start else {
+        anyhow::bail!("an execution_color seed is written from an ExecutionStarted");
+    };
+    let (color, project_id, run_kind, phase) = (*color, *project_id, *run_kind, *phase);
     // Already-seeded first, EXACTLY like Postgres: an idempotent
     // re-ExecutionStarted for a seeded color succeeds even if the project row
     // has since vanished (the real seed's not-already-seeded guard
@@ -260,8 +264,10 @@ fn seed_execution_color(
         ExecutionColorRow {
             project_id,
             tenant_id: tenant,
-            kind: if node_test { "node_test" } else { "execution" },
+            kind: run_kind.as_str(),
             phase: phase.as_str(),
+            member: member.clone(),
+            fired_by: fired_trigger.clone(),
         },
     );
     Ok(())
@@ -270,30 +276,35 @@ fn seed_execution_color(
 #[async_trait]
 impl Journal for FakeJournal {
     async fn is_trigger_setup_pending(&self, color: Color) -> anyhow::Result<bool> {
-        Ok(self.inner.lock().unwrap().trigger_setups.values().any(|setup| *setup == color))
+        Ok(self.inner.lock().unwrap().trigger_setups.contains_key(&color))
     }
 
     async fn finish_trigger_setup(&self, color: Color, bake: Option<&super::TriggerBake>) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let project = g.trigger_setups.iter().find(|(_, setup)| **setup == color).map(|(project, _)| *project);
+        let project = g.trigger_setups.get(&color).copied();
         if let Some(project) = project {
             if let Some(bake) = bake {
                 anyhow::ensure!(bake.project_id == project && bake.color == color, "bake does not belong to its setup");
-                g.trigger_bakes.insert((project, bake.program.digest()), bake.clone());
+                let key = (project, bake.member.clone(), bake.program.digest());
+                let merged = match g.trigger_bakes.remove(&key) {
+                    Some(prior) => prior.refreshed_by(bake),
+                    None => bake.clone(),
+                };
+                g.trigger_bakes.insert(key, merged);
             }
-            g.trigger_setups.remove(&project);
+            g.trigger_setups.remove(&color);
         }
         Ok(())
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<super::TriggerBake>> {
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, member: Option<&weft_core::member::MemberId>) -> anyhow::Result<Vec<super::TriggerBake>> {
         Ok(self.inner.lock().unwrap().trigger_bakes.values()
-            .filter(|bake| bake.project_id == project_id).cloned().collect())
+            .filter(|bake| bake.project_id == project_id && bake.member.as_ref() == member).cloned().collect())
     }
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        if let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = event {
-            seed_execution_color(&mut g, *color, *project_id, *node_test, *phase)?;
+        if let ExecEvent::ExecutionStarted { .. } = event {
+            seed_execution_color(&mut g, event)?;
         }
         g.events.push(event.clone());
         Ok(())
@@ -306,8 +317,8 @@ impl Journal for FakeJournal {
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         if g.dedup_keys.insert(dedup_key.to_string()) {
-            if let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = event {
-                seed_execution_color(&mut g, *color, *project_id, *node_test, *phase)?;
+            if let ExecEvent::ExecutionStarted { .. } = event {
+                seed_execution_color(&mut g, event)?;
             }
             g.events.push(event.clone());
         }
@@ -322,15 +333,14 @@ impl Journal for FakeJournal {
         _expected_activation: Option<Color>,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, project_id, phase, .. } = start else {
             anyhow::bail!("start_execution requires an ExecutionStarted event");
         };
         if g.execution_colors.contains_key(color) { return Ok(()); }
         if *phase == weft_core::context::Phase::TriggerSetup {
-            anyhow::ensure!(!g.trigger_setups.contains_key(project_id), "project already has a trigger setup running");
-            g.trigger_setups.insert(*project_id, *color);
+            g.trigger_setups.insert(*color, *project_id);
         }
-        seed_execution_color(&mut g, *color, *project_id, *node_test, *phase)?;
+        seed_execution_color(&mut g, start)?;
         g.events.push(start.clone());
         g.events.extend(kicks.iter().cloned());
         g.tasks.push(task);
@@ -351,7 +361,7 @@ impl Journal for FakeJournal {
             namespace: "fake-ns".into(),
         };
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, .. } = start else {
             anyhow::bail!("start_live_execution requires an ExecutionStarted event");
         };
         if g.execution_colors.contains_key(color) {
@@ -359,9 +369,13 @@ impl Journal for FakeJournal {
                 "live execution {color} already started and no longer has an active admission; open a new connection");
             return Ok(weft_task_store::tasks::LiveAdmitOutcome::AlreadyAdmitted(pod));
         }
-        seed_execution_color(&mut g, *color, *project_id, *node_test, *phase)?;
-        g.events.push(start.clone());
-        g.events.extend(kicks.iter().cloned());
+        seed_execution_color(&mut g, start)?;
+        // An unrecorded run is born with its color row alone, like the
+        // real birth: its rows ride the execute task.
+        if matches!(start, ExecEvent::ExecutionStarted { run_kind, .. } if run_kind.journaled()) {
+            g.events.push(start.clone());
+            g.events.extend(kicks.iter().cloned());
+        }
         task.target_pod_name = Some(pod.pod_name.clone());
         g.tasks.push(task);
         Ok(weft_task_store::tasks::LiveAdmitOutcome::Admitted(pod))
@@ -385,7 +399,15 @@ impl Journal for FakeJournal {
         let removed: Vec<SignalRegistration> =
             keys.into_iter().filter_map(|k| g.signals.remove(&k).map(|s| s.row)).collect();
         let mut write = crate::journal::CancelWrite { removed, ..Default::default() };
-        if g.execution_colors.contains_key(&color) {
+        let unrecorded = g.execution_colors.get(&color).is_some_and(|row| row.kind == "unrecorded");
+        if unrecorded {
+            // No journal to close, and no pod in the fake to cancel it in
+            // memory: the run is forgotten, as the real cancel does when
+            // no pod owns it.
+            if !g.events.iter().any(|e| e.color() == color) {
+                g.execution_colors.remove(&color);
+            }
+        } else if g.execution_colors.contains_key(&color) {
             let has_terminal = g.events.iter().any(|e| {
                 e.color() == color && e.is_execution_terminal()
             });
@@ -484,6 +506,8 @@ impl Journal for FakeJournal {
         Ok(self.inner.lock().unwrap().execution_colors.get(&color).map(|r| ExecutionOwner {
             project_id: r.project_id,
             tenant: r.tenant_id.clone(),
+            member: r.member.clone(),
+            fired_by: r.fired_by.clone(),
         }))
     }
 
@@ -561,11 +585,14 @@ impl Journal for FakeJournal {
             .filter(|s| query.phase.is_none_or(|p| s.phase == p))
             .filter(|s| query.entry_node.as_deref().is_none_or(|n| s.entry_node == n))
             .filter(|s| query.status.as_deref().is_none_or(|st| s.status == st))
+            .filter(|s| query.member.as_ref().is_none_or(|m| s.member.as_ref() == Some(m)))
+            .filter(|s| query.tag.as_deref().is_none_or(|t| s.tags.iter().any(|x| x == t)))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.color.cmp(&a.color)));
         let total = all.len() as u64;
         let executions = all
             .into_iter()
+            .filter(|s| query.below.is_none_or(|below| (s.started_at, s.color) < below))
             .skip(query.offset as usize)
             .take(query.limit as usize)
             .collect();
@@ -681,7 +708,7 @@ impl Journal for FakeJournal {
 
     async fn delete_execution(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut g = self.inner.lock().unwrap();
-        g.trigger_setups.retain(|_, setup| *setup != color);
+        g.trigger_setups.remove(&color);
         g.events.retain(|e| e.color() != color);
         // Resume tokens only, exactly as `PostgresJournal` does
         // (`DELETE FROM signal WHERE color = $1 AND is_resume = TRUE`).
@@ -813,6 +840,7 @@ impl Journal for FakeJournal {
         &self,
         project_id: uuid::Uuid,
         node: &str,
+        member: Option<&weft_core::member::MemberId>,
     ) -> anyhow::Result<Option<SignalRegistration>> {
         Ok(self
             .inner
@@ -821,7 +849,9 @@ impl Journal for FakeJournal {
             .signals
             .values()
             .map(|s| &s.row)
-            .find(|s| !s.is_resume && s.project_id == project_id && s.node_id == node)
+            .find(|s| {
+                !s.is_resume && s.project_id == project_id && s.node_id == node && s.member.as_ref() == member
+            })
             .cloned())
     }
 
@@ -938,6 +968,8 @@ mod tests {
 
     fn registration(token: &str) -> SignalRegistration {
         SignalRegistration {
+            member: None,
+            activation_trigger: None,
             source_version: None,
             setup_color: None,
             program: None,
@@ -1094,15 +1126,42 @@ mod tests {
             entry_node: "node-test:MyNode::t".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: None,
-            program: None, source_version: None, node_test: true,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
             subgraph: None,
             seed: None,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         })
         .await
         .unwrap();
         let live = j.list_non_terminal_colors_for_project(PROJECT).await.unwrap().into_iter().map(|(color, _)| color).collect::<Vec<_>>();
         assert_eq!(live, vec![run], "the node-test color never counts as a project run");
+    }
+
+    /// An unrecorded live birth seeds the color mirror and pins the task
+    /// but journals nothing, stays out of the lifecycle reads, and a
+    /// cancel with no pod driving it forgets the run without a terminal.
+    #[tokio::test]
+    async fn an_unrecorded_live_birth_journals_nothing_and_a_cancel_forgets_it() {
+        let j = FakeJournal::new();
+        j.set_project_tenant(PROJECT, "t");
+        let color = weft_core::Color::new_v4();
+        let start = match started(color, PROJECT) {
+            ExecEvent::ExecutionStarted { color, project_id, entry_node, phase, definition_hash, program, source_version, subgraph, seed, member, member_values, fired_trigger, at_unix, .. } =>
+                ExecEvent::ExecutionStarted { color, project_id, entry_node, phase, definition_hash, program, source_version, run_kind: weft_core::exec::RunKind::Unrecorded, subgraph, seed, member, member_values, fired_trigger, at_unix },
+            _ => unreachable!(),
+        };
+        let kick = ExecEvent::NodeKicked { color, node_id: "entry".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 };
+        let task = crate::task_kinds::execute::execution_task_spec(
+            weft_task_store::TaskKind::Execute, PROJECT, color, "h", "bin", "t", None, None, Some(&[start.clone(), kick.clone()]),
+        )
+        .unwrap();
+        j.start_live_execution(&start, &[kick], task, 1.0).await.unwrap();
+        assert!(j.events_log(color).await.unwrap().is_empty(), "no journal row for an unrecorded birth");
+        assert!(j.execution_owner(color).await.unwrap().is_some(), "but the color exists");
+        assert!(j.list_non_terminal_colors_for_project(PROJECT).await.unwrap().is_empty());
+        j.cancel_execution(color, None, &weft_core::exec::CancelCause::User).await.unwrap();
+        assert!(j.events_log(color).await.unwrap().is_empty(), "no cancel terminal");
+        assert!(j.execution_owner(color).await.unwrap().is_none(), "forgotten");
     }
 
     fn started(color: weft_core::Color, project_id: uuid::Uuid) -> ExecEvent {
@@ -1112,10 +1171,10 @@ mod tests {
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }
     }
 
@@ -1174,10 +1233,10 @@ mod tests {
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            at_unix,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix,
         }
     }
 
@@ -1219,23 +1278,24 @@ mod tests {
         let journal = FakeJournal::new();
         let first = Color::new_v4();
         let bake = super::super::TriggerBake::from_events(&setup_events(first, serde_json::json!({"x":1}))).unwrap().unwrap();
-        journal.inner.lock().unwrap().trigger_setups.insert(PROJECT, first);
+        journal.inner.lock().unwrap().trigger_setups.insert(first, PROJECT);
         journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
         assert!(!journal.is_trigger_setup_pending(first).await.unwrap());
         assert!(journal.signal_list_for_project(PROJECT).await.unwrap().is_empty());
         let second = Color::new_v4();
-        journal.inner.lock().unwrap().trigger_setups.insert(PROJECT, second);
+        journal.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
         journal.finish_trigger_setup(second, None).await.unwrap();
-        assert_eq!(journal.trigger_bakes(PROJECT).await.unwrap()[0].color, first);
-        assert!(journal.trigger_bakes(OTHER_PROJECT).await.unwrap().is_empty());
+        assert_eq!(journal.trigger_bakes(PROJECT, None).await.unwrap()[0].color, first);
+        assert!(journal.trigger_bakes(OTHER_PROJECT, None).await.unwrap().is_empty());
         let mut refresh = bake.clone();
         refresh.color = second;
+        refresh.targets = refresh.captured.keys().cloned().collect();
         refresh.captured.clear();
-        journal.inner.lock().unwrap().trigger_setups.insert(PROJECT, second);
+        journal.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
         journal.finish_trigger_setup(second, Some(&refresh)).await.unwrap();
         journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
         journal.delete_execution(second).await.unwrap();
-        let saved = journal.trigger_bakes(PROJECT).await.unwrap();
+        let saved = journal.trigger_bakes(PROJECT, None).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].color, second);
         assert!(saved[0].captured.is_empty(), "a skipped target cannot keep its old registration");
@@ -1393,6 +1453,36 @@ mod tests {
         assert_eq!(running.executions[0].color, going);
     }
 
+    /// A walk that hands each page's last run back as `below` reaches
+    /// every run exactly once, even when the runs it passed leave the
+    /// filter behind it (cancelled under `status = running`) and they all
+    /// started in the same second.
+    #[tokio::test]
+    async fn a_keyset_walk_reaches_every_run_once_while_the_walked_ones_leave_the_filter() {
+        let j = FakeJournal::new();
+        j.set_project_tenant(PROJECT, "t");
+        let runs: Vec<weft_core::Color> = (0..5).map(|_| weft_core::Color::new_v4()).collect();
+        for color in &runs {
+            j.record_event(&started_at(*color, PROJECT, 10)).await.unwrap();
+        }
+        let mut reached = Vec::new();
+        let mut below = None;
+        loop {
+            let q = ExecutionQuery { limit: 2, status: Some("running".into()), below, ..Default::default() };
+            let page = j.list_executions("t", &q).await.unwrap();
+            let Some(last) = page.executions.last() else { break };
+            below = Some((last.started_at, last.color));
+            for run in page.executions {
+                j.record_event(&ExecEvent::ExecutionCancelled { color: run.color, reason: "cleaned".into(), cause: None, at_unix: 11 }).await.unwrap();
+                reached.push(run.color);
+            }
+        }
+        reached.sort();
+        let mut expected = runs;
+        expected.sort();
+        assert_eq!(reached, expected);
+    }
+
     /// The phase filter separates a trigger's real fires from the
     /// setup runs an activate makes, and the summary carries the phase
     /// so a listing can say which is which.
@@ -1403,7 +1493,7 @@ mod tests {
         let fire = weft_core::Color::new_v4();
         let setup = weft_core::Color::new_v4();
         j.record_event(&started_at(fire, PROJECT, 10)).await.unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, entry_node, definition_hash, node_test, subgraph, seed, at_unix, .. } =
+        let ExecEvent::ExecutionStarted { color, project_id, entry_node, definition_hash, run_kind, subgraph, seed, at_unix, .. } =
             started_at(setup, PROJECT, 20)
         else {
             unreachable!()
@@ -1415,11 +1505,11 @@ mod tests {
             phase: weft_core::context::Phase::TriggerSetup,
             definition_hash,
             program: None,
-            node_test,
+            run_kind,
             source_version: None,
             subgraph,
             seed,
-            at_unix,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix,
         })
         .await
         .unwrap();

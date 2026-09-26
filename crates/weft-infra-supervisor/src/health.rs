@@ -30,10 +30,10 @@ use anyhow::Result;
 use weft_core::truncate_user_string;
 
 use crate::health_engine::{
-    evaluate_node_health, evaluate_protocols, all_units_healthy, NodeHealthState,
-    NodeDecision, NodeEdgeEvent, NodeObservation, ProtocolEvalInputs,
+    all_units_healthy, evaluate_protocols, observe_unit, rearm, record_fire, NodeDecision, NodeEdgeEvent, NodeHealthState,
+    NodeObservation, ProtocolEvalInputs,
 };
-use crate::protocol::{self, HealthProtocol, ProtocolAction};
+use crate::protocol::{self, HealthProtocol, ProtocolAction, UnitView};
 use crate::SupervisorState;
 
 /// Exponential-backoff state for a (project, protocol) whose action
@@ -63,19 +63,22 @@ fn backoff_delay(consecutive_failures: u32) -> Duration {
 
 #[derive(Default)]
 pub struct HealthRegistry {
-    /// Per-(project, node, unit) state tracking. Records when the
+    /// Per-(project, instance, unit) state tracking. Records when the
     /// unit was last seen Ready vs Not-Ready so we can apply windowed
-    /// transitions (flaky_after, recovery_after). Health is per-unit.
+    /// transitions (flaky_after, recovery_after). Health is per-unit of
+    /// one deployed copy: a node that exists once per member has one
+    /// instance per member, each with its own health.
     state: HashMap<(uuid::Uuid, String, String), NodeHealthState>,
     /// Per-project "currently in flight" protocol names. While a
     /// protocol is in flight, the supervisor doesn't re-fire any
     /// protocol for that project (avoids action storms when health
     /// flaps mid-action).
     in_flight: HashSet<uuid::Uuid>,
-    /// Per-project "already fired" protocol names since the most
-    /// recent recovery. Re-armed when every condition in the project
-    /// becomes false (i.e. the project is fully healthy).
-    fired: HashMap<uuid::Uuid, HashSet<String>>,
+    /// Per-project protocols already fired, each with the copies its
+    /// action aimed at (empty for a notification, which aims at no
+    /// copy). A protocol fires again only for a copy it has not acted
+    /// on. Re-armed copy by copy (`health_engine::rearm`).
+    fired: HashMap<uuid::Uuid, HashMap<String, std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>>>,
     /// Per-(project, protocol) exponential backoff after a failed
     /// action. A matched protocol whose entry's `next_retry_at` is in
     /// the future is skipped this tick. Cleared on success.
@@ -107,7 +110,7 @@ impl HealthRegistry {
     pub fn is_fired(&self, project_id: uuid::Uuid, protocol_name: &str) -> bool {
         self.fired
             .get(&project_id)
-            .is_some_and(|names| names.contains(protocol_name))
+            .is_some_and(|fired| fired.contains_key(protocol_name))
     }
 
     /// Consecutive-failure count for a (project, protocol)'s backoff,
@@ -397,81 +400,46 @@ async fn tick_project(
     project: &weft_broker_client::protocol::SupervisorProject,
     workloads: &[weft_platform_traits::kube::WorkloadReplicaState],
 ) -> Result<()> {
-    // Stand down while a user infra action is running: any uncompleted
-    // infra_lifecycle_command (apply / stop / terminate) for this
-    // project means the lifecycle handler owns its nodes' status
-    // right now. Health observes (replicas dropping to 0 during a stop,
-    // etc.) but must NOT write, or its autonomous reconcile would race
-    // and clobber the user action's transition. Re-arms automatically
-    // on the next tick once the command completes (status has settled).
-    if state.broker.infra_command_in_flight(project.project_id).await? {
-        // Clear in-memory health state so the post-action tick starts
-        // clean (no stale flaky-window arithmetic from before the
-        // action), matching the per-node skip below.
-        state.health.lock().await.state.retain(|(p, _, _), _| *p != project.project_id);
-        return Ok(());
-    }
-
+    // Stand down, copy by copy, while a user infra action runs on it:
+    // an uncompleted supervisor command (apply / stop / terminate) that
+    // reaches a copy means the lifecycle handler owns that copy's status
+    // right now. Health must NOT look at it (replicas dropping to 0
+    // during a stop are the action, not a fault), or its autonomous
+    // reconcile would race and clobber the action's transition. Every
+    // other copy keeps its health. A stood-down copy's latches are
+    // cleared, so the look after the command starts from the row it
+    // left (`NodeHealthState::seeded_from`).
+    let commands = state.broker.infra_commands_in_flight(project.project_id).await?;
     let nodes = state.broker.infra_nodes(project.project_id).await?;
 
-    // Group workloads by `(weft.dev/node, weft.dev/unit)`. Health is
+    // Group workloads by `(weft.dev/instance, weft.dev/unit)`. Health is
     // PER-UNIT: one infra node deploys N units (workloads), each with
     // independent health, so a flaky sidecar doesn't drag a healthy
-    // primary into "node flaky" (and can be remediated on its own).
-    // The node label carries the value that stands for the node id
-    // (`node_label_value`), never the id itself, so the key is that
-    // value on both sides.
+    // primary into "node flaky" (and can be remediated on its own). The
+    // instance, not the node, is the key: a node that exists once per
+    // member deploys one instance per member under the same node label,
+    // and one member's broken copy says nothing about another's.
     let mut by_unit: HashMap<(String, String), (i64, i64)> = HashMap::new();
     for w in workloads {
-        let (Some(node_label), Some(unit)) =
-            (w.labels.get(weft_core::infra::NODE_LABEL), w.labels.get("weft.dev/unit"))
+        let (Some(instance), Some(unit)) =
+            (w.labels.get("weft.dev/instance"), w.labels.get("weft.dev/unit"))
         else {
             continue;
         };
         let entry = by_unit
-            .entry((node_label.clone(), unit.clone()))
+            .entry((instance.clone(), unit.clone()))
             .or_insert((0, 0));
         entry.0 += w.desired;
         entry.1 += w.ready;
     }
 
-    // Per-(node, unit) ready ratio + ready replicas. Used by
-    // HealthCondition evaluation below. ONLY populated for nodes the
-    // user expects to be up right now ({running, flaky}). A
-    // provisioning / stopped / stopping / terminating / failed node
-    // contributes NOTHING (the AutoRecover default protocol would
-    // otherwise fire on every mid-first-provision project). The unit
-    // roster comes from the node's persisted `units` map (a 0-replica
-    // or Service-only unit shows no workload but is still expected).
-    let mut ready_ratio: HashMap<(String, String), f32> = HashMap::new();
-    let mut ready_replicas: HashMap<(String, String), u32> = HashMap::new();
-    for n in &nodes {
-        if !n.status.expects_running_replicas() {
-            continue;
-        }
-        for unit in n.units.keys() {
-            let key = (n.node_id.clone(), unit.clone());
-            let on_label = (weft_core::infra::node_label_value(&n.node_id), unit.clone());
-            let (desired, ready) = by_unit.get(&on_label).copied().unwrap_or((0, 0));
-            let ratio = if desired > 0 {
-                (ready as f32 / desired as f32).clamp(0.0, 1.0)
-            } else {
-                // desired=0: scaling toward 0, apply hasn't produced
-                // replicas yet. Treat as ready (no "almost zero is
-                // broken" math).
-                1.0
-            };
-            ready_ratio.insert(key.clone(), ratio);
-            ready_replicas.insert(key, ready.max(0) as u32);
-        }
-    }
-
-    // Windowed flaky/recovered transitions per node. These drive
-    // the dispatcher-visible status badge regardless of whether any
-    // HealthProtocol fires.
+    // Per unit of each copy: its windowed health (flaky/recovered
+    // transitions, which drive the dispatcher-visible status badge
+    // whether or not any HealthProtocol fires) and the view the
+    // protocols read.
     //
-    // ONLY evaluate health for nodes whose status implies "should be
-    // running right now". Skip the rest:
+    // ONLY units whose status implies "should be running right now"
+    // ({running, flaky}). Skip the rest:
     //   - `stopped` / `stopping`: user intentionally scaled to 0;
     //     0/0 ready is the desired state, not flaky.
     //   - `terminating`: resources being deleted; transient.
@@ -479,75 +447,98 @@ async fn tick_project(
     //     is the source of truth until it writes Running.
     //   - `failed`: apply errored; the failure stage carries the
     //     diagnosis, health-flaky would just clobber it.
-    // Also clear the in-memory health state for skipped nodes so a
-    // post-restart cycle starts clean (no stale last_ready_at /
-    // last_not_ready_at from before the Stop biasing the next
-    // flaky-window arithmetic).
+    // Also skipped: a copy a command in flight reaches (above). Clear
+    // the in-memory health state for skipped units so a post-restart
+    // cycle starts clean (no stale last_ready_at / last_not_ready_at
+    // from before the Stop biasing the next flaky-window arithmetic).
     //
-    // The actual state-machine math lives in `health_engine`; this
-    // loop is just the I/O harness around it.
-    // Per-tick decisions. Each carries:
-    //   - the node_id,
-    //   - the latched decision (desired_status + edge event),
-    //   - the row's observed status (so the I/O layer below can
-    //     reconcile any drift in EITHER direction in one place).
-    // Per-tick per-unit decisions. Each carries node_id + unit + the
-    // latched decision + the unit's observed status (so the I/O layer
-    // reconciles drift in either direction in one place).
+    // A unit whose workload the watch has not handed over yet is
+    // UNKNOWN: no decision, no view, so no protocol reads it as broken
+    // (a copy just applied can reach this look before its workload
+    // reaches the watch). The unit roster comes from the row's `units`
+    // map, so a unit the watch never lists (a Job, a DaemonSet) shows no
+    // workload and stays unknown too: the row's `watched` flag keeps it
+    // from being seeded as seen after a restart. A workload at zero
+    // replicas is unknown only when weft asked for that zero
+    // (`UnitRuntime::zero_replicas_intended`); any other zero is broken.
+    //
+    // The state-machine math lives in `health_engine`; this loop is
+    // just the I/O harness around it. Each decision carries the unit's
+    // observed row status, so the I/O layer below reconciles drift in
+    // either direction in one place.
     let mut decisions: Vec<(
         String,
+        Option<weft_core::member::MemberId>,
         String,
         NodeDecision,
         weft_broker_client::protocol::InfraNodeStatus,
     )> = Vec::new();
+    let mut units: Vec<UnitView> = Vec::new();
     {
         let mut registry = state.health.lock().await;
         for n in &nodes {
+            let stood_down = commands.iter().any(|c| c.reaches(&n.node_id, n.member.as_ref()));
             for (unit, unit_rt) in &n.units {
-                let key = (project.project_id, n.node_id.clone(), unit.clone());
-                // A unit's status implies whether it should be running.
-                // Skip non-running ones (clearing window state) just
-                // like the node-level skip did, but per-unit.
-                if !unit_rt.status.expects_running_replicas() {
+                let key = (project.project_id, n.instance_id.clone(), unit.clone());
+                if stood_down || !unit_rt.status.expects_running_replicas() {
                     registry.state.remove(&key);
                     continue;
                 }
-                let (desired, ready) = by_unit
-                    .get(&(weft_core::infra::node_label_value(&n.node_id), unit.clone()))
-                    .copied()
-                    .unwrap_or((0, 0));
-                let observation = NodeObservation {
-                    desired: desired.max(0) as u32,
-                    ready: ready.max(0) as u32,
-                };
-                // No latch yet (first tick, or every latch of the
-                // project was cleared by a lifecycle command): start
+                let workload = by_unit.get(&(n.instance_id.clone(), unit.clone())).map(|(desired, ready)| {
+                    NodeObservation { desired: (*desired).max(0) as u32, ready: (*ready).max(0) as u32 }
+                });
+                // No latch yet (first look by this pod, or the copy's
+                // latches were cleared by a lifecycle command): start
                 // from what the row says, see `seeded_from`.
                 let now = state.clock.now();
-                let prior = registry
-                    .state
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| NodeHealthState::seeded_from(unit_rt.status, now));
-                let decision = evaluate_node_health(
+                let flaky_after = Duration::from_secs(unit_rt.flaky_after_seconds as u64);
+                let prior = registry.state.get(&key).cloned().unwrap_or_else(|| {
+                    NodeHealthState::seeded_from(
+                        unit_rt.status,
+                        unit_rt.watched,
+                        n.applied_at_unix,
+                        flaky_after,
+                        now,
+                        state.clock.now_unix(),
+                    )
+                });
+                let Some(decision) = observe_unit(
                     prior,
-                    observation,
+                    workload,
+                    unit_rt.zero_replicas_intended(),
                     now,
-                    Duration::from_secs(unit_rt.flaky_after_seconds as u64),
+                    flaky_after,
                     Duration::from_secs(unit_rt.recovery_after_seconds as u64),
-                );
+                ) else {
+                    continue;
+                };
+                let seen = workload.unwrap_or(NodeObservation { desired: 0, ready: 0 });
+                units.push(UnitView {
+                    node_id: n.node_id.clone(),
+                    member: n.member.clone(),
+                    unit: unit.clone(),
+                    // A zero weft asked for never gets here (`observe_unit`
+                    // reads it as unknown), so zero desired means gone, or
+                    // scaled down outside weft: nothing serves.
+                    ready_ratio: if seen.desired > 0 {
+                        (seen.ready as f32 / seen.desired as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                    ready: seen.ready,
+                    flaky: decision.next.declared_flaky,
+                });
                 registry.state.insert(key, decision.next.clone());
-                decisions.push((n.node_id.clone(), unit.clone(), decision, unit_rt.status));
+                decisions.push((n.node_id.clone(), n.member.clone(), unit.clone(), decision, unit_rt.status));
             }
         }
 
-        // If every unit is healthy again, re-arm the per-project fired
-        // set (protocols can fire again on the next degradation) AND
-        // drop the project's backoff entries (a recovered project
-        // starts fresh; otherwise stale backoff would delay the first
-        // action of the next degradation episode).
-        if all_units_healthy(&ready_ratio) {
-            registry.fired.remove(&project.project_id);
+        // If every unit is healthy again, drop the project's backoff
+        // entries (a recovered project starts fresh; otherwise stale
+        // backoff would delay the first action of the next degradation
+        // episode). What the protocols fired re-arms copy by copy once
+        // the protocols are read, below.
+        if all_units_healthy(&units) {
             registry.backoff.retain(|(proj, _), _| *proj != project.project_id);
         }
     }
@@ -569,7 +560,7 @@ async fn tick_project(
     //      The latch is the single source of truth for the row's
     //      status; the broker write is a reconcile, not a
     //      consequence of the edge.
-    for (node_id, unit, decision, observed_status) in decisions {
+    for (node_id, member, unit, decision, observed_status) in decisions {
         if let Some(edge) = decision.event {
             let infra_event = match edge {
                 NodeEdgeEvent::BecameFlaky { desired, ready } => {
@@ -587,7 +578,7 @@ async fn tick_project(
             };
             state
                 .broker
-                .event_record(project.project_id, Some(&node_id), infra_event)
+                .event_record(project.project_id, Some(&node_id), member.as_ref(), infra_event)
                 .await?;
         }
         if observed_status != decision.desired_status {
@@ -607,6 +598,7 @@ async fn tick_project(
                     None,
                     project.project_id,
                     &node_id,
+                    member.as_ref(),
                     Some(&unit),
                     decision.desired_status,
                     None,
@@ -631,10 +623,10 @@ async fn tick_project(
     // dispatches the matched action.
     let protocols_value = state.broker.health_protocols(project.project_id).await?;
     let protocols: protocol::HealthProtocols = match protocols_value {
-        Some(v) => match serde_json::from_value(v.clone()) {
+        Some(v) => match serde_json::from_value::<protocol::HealthProtocols>(v.clone()) {
             Ok(p) => p,
             Err(e) => {
-                // The user's protocol config is broken. Emit a
+                // The user's protocol config is broken (unreadable). Emit a
                 // `protocol_config_error` event so the action bar
                 // shows it, then SKIP this tick's evaluation. The
                 // previous shape fell back to default_protocols,
@@ -652,6 +644,7 @@ async fn tick_project(
                     .broker
                     .event_record(
                         project.project_id,
+                        None,
                         None,
                         weft_broker_client::protocol::InfraEvent::ProtocolConfigError(
                             weft_broker_client::protocol::ProtocolConfigErrorPayload {
@@ -671,18 +664,24 @@ async fn tick_project(
         None => protocol::default_protocols(),
     };
     let inputs = ProtocolEvalInputs {
-        ready_ratio,
-        ready_replicas,
+        units,
         project_status: project.status,
-        deactivated_by_health: project.deactivated_by_health,
+        health_parked: project.health_parked,
     };
 
-    // Snapshot the per-project in_flight + fired sets under the
-    // lock, evaluate purely, then re-take the lock to mutate. This
-    // is safe because tick_project is the only writer for its own
-    // project_id; concurrent ticks are scoped to other projects.
+    // Re-arm what the protocols fired, copy by copy, then snapshot the
+    // per-project in_flight + fired sets under the lock, evaluate
+    // purely, then re-take the lock to mutate. This is safe because
+    // tick_project is the only writer for its own project_id;
+    // concurrent ticks are scoped to other projects.
     let (in_flight_snap, fired_snap) = {
-        let registry = state.health.lock().await;
+        let mut registry = state.health.lock().await;
+        if let Some(fired) = registry.fired.get_mut(&project.project_id) {
+            rearm(fired, &protocols, &inputs);
+            if fired.is_empty() {
+                registry.fired.remove(&project.project_id);
+            }
+        }
         (
             registry.in_flight.contains(&project.project_id),
             registry
@@ -698,6 +697,7 @@ async fn tick_project(
     };
     let matched_name = matched.protocol.name.clone();
     let matched_proto = matched.protocol.clone();
+    let scope = matched.scope;
 
     // Backoff gate + claim, in ONE critical section so the check and
     // the in_flight/fired insert can't interleave with another tick
@@ -706,7 +706,7 @@ async fn tick_project(
     // the protocol stays un-latched from `fired` (so it WILL retry),
     // just not on every poll tick.
     let backoff_key = (project.project_id, matched_name.clone());
-    {
+    let acted_before = {
         let mut registry = state.health.lock().await;
         if let Some(b) = registry.backoff.get(&backoff_key) {
             if state.clock.now() < b.next_retry_at {
@@ -714,12 +714,11 @@ async fn tick_project(
             }
         }
         registry.in_flight.insert(project.project_id);
-        registry
-            .fired
-            .entry(project.project_id)
-            .or_default()
-            .insert(matched_name.clone());
-    }
+        let fired = registry.fired.entry(project.project_id).or_default();
+        let acted_before = fired.get(&matched_name).cloned();
+        record_fire(fired, &matched_proto, &scope);
+        acted_before
+    };
     tracing::info!(
         project_id = %project.project_id,
         protocol = %matched_name,
@@ -735,7 +734,7 @@ async fn tick_project(
     let secs = matched_proto.timeout_seconds;
     let dur = std::time::Duration::from_secs(secs as u64);
     let result =
-        match tokio::time::timeout(dur, run_action(state, project, &matched_proto)).await {
+        match tokio::time::timeout(dur, run_action(state, project, &matched_proto, &scope)).await {
             Ok(r) => r,
             Err(_elapsed) => Err(anyhow::anyhow!(
                 "HealthProtocol action timed out after {secs}s (broker/kube call hung)"
@@ -755,9 +754,17 @@ async fn tick_project(
             // can never become true because recovery is what makes it
             // true). The in_flight guard already prevents storms
             // DURING the run, so only success latches.
-            if let Some(names) = registry.fired.get_mut(&project.project_id) {
-                names.remove(&matched_name);
-                if names.is_empty() {
+            // Back to what it had acted on before this attempt.
+            if let Some(fired) = registry.fired.get_mut(&project.project_id) {
+                match acted_before {
+                    Some(acted) => {
+                        fired.insert(matched_name.clone(), acted);
+                    }
+                    None => {
+                        fired.remove(&matched_name);
+                    }
+                }
+                if fired.is_empty() {
                     registry.fired.remove(&project.project_id);
                 }
             }
@@ -808,31 +815,66 @@ pub(crate) enum ActionPlan {
     EnqueueLifecycle {
         spec: weft_broker_client::protocol::LifecycleSpec,
     },
-    /// Scale a specific (instance, unit) workload to `replicas`.
-    /// `instance_id` is resolved from the broker's `infra_nodes`
-    /// list ahead of dispatch.
+    /// Scale a (instance, unit) workload to `replicas`, in the copies
+    /// of the node owned by whoever owns a broken copy (the protocol's
+    /// scope). Each copy's instance is resolved from the broker's
+    /// `infra_nodes` list ahead of dispatch; the copy itself is where
+    /// the scale is recorded (`UnitRuntime::scaled_to`).
     Scale {
-        instance_id: String,
+        copies: Vec<CopyInstance>,
         unit: String,
         replicas: u32,
     },
     /// Delete every Pod matching this (instance, unit). Kubernetes
     /// restarts them via the Deployment/StatefulSet controller. The
     /// Deployment / Service / ConfigMap / PVCs are NOT touched :
-    /// this is the "kick the process" hammer, not a teardown.
-    BouncePods { instance_id: String, unit: String },
-    /// The action references a node id that doesn't exist in the
+    /// this is the "kick the process" hammer, not a teardown. The same
+    /// copies as `Scale`.
+    BouncePods { instance_ids: Vec<String>, unit: String },
+    /// The action references a node with no copy at all in the
     /// project's `infra_nodes`. Logged via tracing; otherwise no-op.
     NodeMissing { node_id: String },
+    /// The node has copies, but none belongs to the owners of the broken
+    /// copies (`owners`: `None` for the shared copy): the action names a
+    /// node on the other side (a shared node for a broken member's copy,
+    /// or the reverse). Logged via tracing; otherwise no-op.
+    NoCopyForOwners {
+        node_id: String,
+        owners: Vec<Option<weft_core::member::MemberId>>,
+    },
 }
 
-/// Pure: given the matched protocol + the broker's current
-/// `infra_nodes` snapshot, decide what side effect to perform. No
-/// I/O.
+/// One copy of a node and the instance its workloads are labelled with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyInstance {
+    pub copy: weft_broker_client::protocol::InfraCopy,
+    pub instance_id: String,
+}
+
+/// Pure: given the matched protocol, the broken copies it aims at (its
+/// match's scope), and the broker's current `infra_nodes` snapshot,
+/// decide what side effect to perform. No I/O.
 pub(crate) fn plan_action(
     proto: &HealthProtocol,
+    scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
     infra_nodes: &[weft_broker_client::protocol::SupervisorInfraNode],
 ) -> ActionPlan {
+    use weft_broker_client::protocol::{
+        DeactivateSpec, DeactivationMode, LifecycleSpec, RestoreReaders, RunningPolicy, TakeDownReach, TakeDownReaders,
+    };
+    // A take-down of the triggers reading the broken copies. The
+    // dispatcher's claim loop runs it; lifecycle commands are the
+    // channel (the supervisor has no signal-table access).
+    // A condition naming no infra says nothing about which copies are
+    // broken: the take-down reaches the whole project.
+    let reach = if crate::protocol::names_infra(&proto.when) {
+        TakeDownReach::ReadersOf { broken: scope.iter().cloned().collect() }
+    } else {
+        TakeDownReach::Project
+    };
+    let take_down = |spec: DeactivateSpec| ActionPlan::EnqueueLifecycle {
+        spec: LifecycleSpec::Deactivate(TakeDownReaders { spec, reach: reach.clone() }),
+    };
     match &proto.action {
         ProtocolAction::Notify { channel } => ActionPlan::Notify {
             payload: weft_broker_client::protocol::NotifyPayload {
@@ -840,90 +882,133 @@ pub(crate) fn plan_action(
                 channel: channel.clone(),
             },
         },
-        // Trigger-state actions: the supervisor enqueues a
-        // dispatcher-targeted lifecycle command. The dispatcher's
-        // claim loop runs `deactivate_project_with_mode` /
-        // `activate_inner`. Side-channel `event_record(notify,
-        // action=...)` is gone; lifecycle commands are the channel.
-        ProtocolAction::ParkTriggers => ActionPlan::EnqueueLifecycle {
-            spec: weft_broker_client::protocol::LifecycleSpec::Deactivate(
-                weft_broker_client::protocol::DeactivateSpec {
-                    mode: weft_broker_client::protocol::DeactivationMode::Park,
-                    grace_minutes: 15,
-                    running_policy: weft_broker_client::protocol::RunningPolicy::Wait,
-                    // Autonomous park: the server default cap.
-                    drain_timeout_secs: None,
-                },
-            ),
-        },
-        ProtocolAction::HibernateTriggers { grace_minutes } => ActionPlan::EnqueueLifecycle {
-            spec: weft_broker_client::protocol::LifecycleSpec::Deactivate(
-                weft_broker_client::protocol::DeactivateSpec {
-                    mode: weft_broker_client::protocol::DeactivationMode::Hibernate,
-                    grace_minutes: *grace_minutes,
-                    running_policy: weft_broker_client::protocol::RunningPolicy::Wait,
-                    drain_timeout_secs: None,
-                },
-            ),
-        },
-        ProtocolAction::WipeTriggers => ActionPlan::EnqueueLifecycle {
-            spec: weft_broker_client::protocol::LifecycleSpec::Deactivate(
-                weft_broker_client::protocol::DeactivateSpec {
-                    mode: weft_broker_client::protocol::DeactivationMode::Wipe,
-                    grace_minutes: 0,
-                    running_policy: weft_broker_client::protocol::RunningPolicy::Cancel,
-                    drain_timeout_secs: None,
-                },
-            ),
-        },
+        ProtocolAction::ParkTriggers => take_down(DeactivateSpec {
+            mode: DeactivationMode::Park,
+            grace_minutes: 15,
+            running_policy: RunningPolicy::Wait,
+            // Autonomous park: the server default cap.
+            drain_timeout_secs: None,
+        }),
+        ProtocolAction::HibernateTriggers { grace_minutes } => take_down(DeactivateSpec {
+            mode: DeactivationMode::Hibernate,
+            grace_minutes: *grace_minutes,
+            running_policy: RunningPolicy::Wait,
+            drain_timeout_secs: None,
+        }),
+        ProtocolAction::WipeTriggers => take_down(DeactivateSpec {
+            mode: DeactivationMode::Wipe,
+            grace_minutes: 0,
+            running_policy: RunningPolicy::Cancel,
+            drain_timeout_secs: None,
+        }),
         ProtocolAction::AutoRecover => ActionPlan::EnqueueLifecycle {
-            spec: weft_broker_client::protocol::LifecycleSpec::Reactivate,
+            spec: LifecycleSpec::Reactivate(RestoreReaders { still_broken: scope.iter().cloned().collect() }),
         },
         ProtocolAction::Scale {
             node_id,
             unit,
             replicas,
-        } => match infra_nodes.iter().find(|n| &n.node_id == node_id) {
-            Some(n) => ActionPlan::Scale {
-                instance_id: n.instance_id.clone(),
-                unit: unit.clone(),
-                replicas: *replicas,
-            },
-            None => ActionPlan::NodeMissing {
-                node_id: node_id.clone(),
-            },
-        },
+        } => copies_of(infra_nodes, node_id, scope, |copies| ActionPlan::Scale {
+            copies,
+            unit: unit.clone(),
+            replicas: *replicas,
+        }),
         ProtocolAction::BouncePods { node_id, unit } => {
-            match infra_nodes.iter().find(|n| &n.node_id == node_id) {
-                Some(n) => ActionPlan::BouncePods {
-                    instance_id: n.instance_id.clone(),
-                    unit: unit.clone(),
-                },
-                None => ActionPlan::NodeMissing {
-                    node_id: node_id.clone(),
-                },
-            }
+            copies_of(infra_nodes, node_id, scope, |copies| ActionPlan::BouncePods {
+                instance_ids: copies.into_iter().map(|c| c.instance_id).collect(),
+                unit: unit.clone(),
+            })
         }
     }
+}
+
+/// The plan `act` makes over each copy of `node_id`
+/// owned by the owner of one of the broken copies in `scope` (the shared
+/// copy for a broken shared one, ada's for a broken copy of ada's); when
+/// there is none, why: no copy of the node at all, or none of those
+/// owners'.
+fn copies_of(
+    infra_nodes: &[weft_broker_client::protocol::SupervisorInfraNode],
+    node_id: &str,
+    scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
+    act: impl FnOnce(Vec<CopyInstance>) -> ActionPlan,
+) -> ActionPlan {
+    let copies: Vec<_> = infra_nodes.iter().filter(|n| n.node_id == node_id).collect();
+    if copies.is_empty() {
+        return ActionPlan::NodeMissing { node_id: node_id.to_string() };
+    }
+    let instances: Vec<CopyInstance> = copies
+        .iter()
+        .filter(|n| scope.iter().any(|broken| broken.member == n.member))
+        .map(|n| CopyInstance {
+            copy: weft_broker_client::protocol::InfraCopy { node_id: n.node_id.clone(), member: n.member.clone() },
+            instance_id: n.instance_id.clone(),
+        })
+        .collect();
+    if instances.is_empty() {
+        let owners: std::collections::BTreeSet<_> = scope.iter().map(|broken| broken.member.clone()).collect();
+        return ActionPlan::NoCopyForOwners { node_id: node_id.to_string(), owners: owners.into_iter().collect() };
+    }
+    act(instances)
+}
+
+/// Scale one copy's `unit` workloads to `replicas`, then record it in
+/// the copy's `UnitRuntime::scaled_to`. Errs on a kube failure (nothing
+/// recorded) and on a refused record.
+async fn scale_copy(
+    state: &SupervisorState,
+    project: &weft_broker_client::protocol::SupervisorProject,
+    copy: &weft_broker_client::protocol::InfraCopy,
+    instance_id: &str,
+    unit: &str,
+    replicas: u32,
+) -> Result<()> {
+    // Filter at the apiserver: instance + unit. No in-Rust filter pass.
+    let selector = format!(
+        "{},weft.dev/instance={instance_id},weft.dev/unit={unit}",
+        crate::lifecycle::INFRA_SELECTOR
+    );
+    let workloads = state
+        .kube
+        .list_replica_state(&project.project_namespace, &selector)
+        .await?;
+    for w in workloads.iter() {
+        state
+            .kube
+            .scale_workload(&project.project_namespace, w.kind, &w.name, replicas)
+            .await?;
+    }
+    let outcome = state
+        .broker
+        .set_scaled(&state.pod_name, project.project_id, &copy.node_id, copy.member.as_ref(), unit, replicas)
+        .await?;
+    if !outcome.is_applied() {
+        anyhow::bail!(
+            "scaled to {replicas} but the record was refused ({outcome:?}): the copy or unit is gone, a command is in flight, or ownership moved"
+        );
+    }
+    Ok(())
 }
 
 async fn run_action(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
     proto: &HealthProtocol,
+    scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
 ) -> Result<()> {
     // For Scale / BouncePods we need the current infra_nodes list to
     // resolve node_id → instance_id. EnqueueLifecycle / Notify don't
     // need it; pay the broker round-trip up front to keep the
     // planner pure regardless.
     let nodes = state.broker.infra_nodes(project.project_id).await?;
-    let plan = plan_action(proto, &nodes);
+    let plan = plan_action(proto, scope, &nodes);
     match plan {
         ActionPlan::Notify { payload } => {
             state
                 .broker
                 .event_record(
                     project.project_id,
+                    None,
                     None,
                     weft_broker_client::protocol::InfraEvent::Notify(payload),
                 )
@@ -933,37 +1018,43 @@ async fn run_action(
             state.broker.enqueue_lifecycle(project.project_id, spec).await?;
         }
         ActionPlan::Scale {
-            instance_id,
+            copies,
             unit,
             replicas,
         } => {
-            // Filter at the apiserver: instance + unit. No in-Rust
-            // filter pass.
-            let selector = format!(
-                "{},weft.dev/instance={instance_id},weft.dev/unit={unit}",
-                crate::lifecycle::INFRA_SELECTOR
-            );
-            let workloads = state
-                .kube
-                .list_replica_state(&project.project_namespace, &selector)
-                .await?;
-            for w in workloads.iter() {
-                state
-                    .kube
-                    .scale_workload(&project.project_namespace, w.kind, &w.name, replicas)
-                    .await?;
+            // Each copy is scaled first and recorded after, so the row
+            // never claims a zero the cluster does not have: a failed
+            // scale records nothing. Any copy left unscaled or
+            // unrecorded (a kube error, or a fenced write refused
+            // because the copy or unit is gone, a command is in flight,
+            // or this pod lost the project) fails the action, which
+            // releases the protocol's latch so it retries next tick;
+            // the retry scales again (idempotent) and records.
+            let mut failed = Vec::new();
+            for CopyInstance { copy, instance_id } in copies {
+                if let Err(e) = scale_copy(state, project, &copy, &instance_id, &unit, replicas).await {
+                    failed.push(format!("{}: {e:#}", copy.node_id));
+                }
+            }
+            if !failed.is_empty() {
+                anyhow::bail!(
+                    "protocol '{}' scaled unit '{unit}' in only some copies; not done: {}",
+                    proto.name,
+                    failed.join("; ")
+                );
             }
         }
-        ActionPlan::BouncePods { instance_id, unit } => {
+        ActionPlan::BouncePods { instance_ids, unit } => {
             // Pods-only delete: the Deployment / Service /
             // ConfigMap / PVC / Secret all survive. The Deployment
             // controller respawns Pods with the same spec.
-            let selector =
-                format!("weft.dev/instance={instance_id},weft.dev/unit={unit}");
-            state
-                .kube
-                .delete_pods(&project.project_namespace, &selector)
-                .await?;
+            for instance_id in instance_ids {
+                let selector = format!("weft.dev/instance={instance_id},weft.dev/unit={unit}");
+                state
+                    .kube
+                    .delete_pods(&project.project_namespace, &selector)
+                    .await?;
+            }
         }
         ActionPlan::NodeMissing { node_id } => {
             tracing::warn!(
@@ -971,6 +1062,17 @@ async fn run_action(
                 protocol = %proto.name,
                 missing_node = %node_id,
                 "HealthProtocol action references node that's not in infra_nodes; skipping",
+            );
+        }
+        ActionPlan::NoCopyForOwners { node_id, owners } => {
+            let owners: Vec<String> =
+                owners.iter().map(|o| o.as_ref().map_or_else(|| "shared".to_string(), |m| m.to_string())).collect();
+            tracing::warn!(
+                project_id = %project.project_id,
+                protocol = %proto.name,
+                node = %node_id,
+                owners = %owners.join(", "),
+                "HealthProtocol action: no copy of {node_id} belongs to the broken owners; skipping",
             );
         }
     }
@@ -981,7 +1083,7 @@ async fn run_action(
 mod tests {
     use super::*;
     use crate::protocol::{HealthCondition, HealthProtocol, ProtocolAction};
-    use weft_broker_client::protocol::SupervisorInfraNode;
+    use weft_broker_client::protocol::{InfraCopy, SupervisorInfraNode};
 
     fn proto(action: ProtocolAction) -> HealthProtocol {
         HealthProtocol {
@@ -1002,9 +1104,11 @@ mod tests {
             instance_id: instance_id.to_string(),
             status: weft_broker_client::protocol::InfraNodeStatus::Running,
             applied_spec_hash: None,
+            applied_at_unix: None,
             addresses: Default::default(),
             preserve_pvcs: Vec::new(),
             units: Default::default(),
+            member: None,
         }
     }
 
@@ -1013,7 +1117,7 @@ mod tests {
         let p = proto(ProtocolAction::Notify {
             channel: "ops".into(),
         });
-        match plan_action(&p, &[]) {
+        match plan_action(&p, &no_scope(), &[]) {
             ActionPlan::Notify { payload } => {
                 assert_eq!(payload.channel, "ops");
                 assert_eq!(payload.protocol, "p");
@@ -1022,18 +1126,43 @@ mod tests {
         }
     }
 
+    fn no_scope() -> std::collections::BTreeSet<InfraCopy> {
+        Default::default()
+    }
+
+    /// The park carries what is broken, so the dispatcher parks only
+    /// the triggers that read it: here ada's copy of `svc`.
     #[test]
-    fn plan_park_triggers_enqueues_deactivate_park() {
+    fn plan_park_triggers_enqueues_deactivate_park_aimed_at_the_broken_copies() {
         use weft_broker_client::protocol::{
             DeactivationMode, LifecycleSpec, RunningPolicy,
         };
         let p = proto(ProtocolAction::ParkTriggers);
-        match plan_action(&p, &[]) {
+        let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
+        match plan_action(&p, &std::collections::BTreeSet::from([ada_svc.clone()]), &[]) {
             ActionPlan::EnqueueLifecycle {
                 spec: LifecycleSpec::Deactivate(d),
             } => {
-                assert_eq!(d.mode, DeactivationMode::Park);
-                assert_eq!(d.running_policy, RunningPolicy::Wait);
+                assert_eq!(d.spec.mode, DeactivationMode::Park);
+                assert_eq!(d.spec.running_policy, RunningPolicy::Wait);
+                assert_eq!(d.reach, weft_broker_client::protocol::TakeDownReach::ReadersOf { broken: vec![ada_svc] });
+            }
+            other => panic!("wrong plan: {other:?}"),
+        }
+    }
+
+    /// A take-down whose condition names no infra reaches the whole
+    /// project, as it did before copies had owners.
+    #[test]
+    fn plan_park_on_a_condition_naming_no_infra_reaches_the_project() {
+        use weft_broker_client::protocol::{LifecycleSpec, ProjectStatus, TakeDownReach};
+        let p = HealthProtocol {
+            when: HealthCondition::ProjectStatusEq { status: ProjectStatus::Active },
+            ..proto(ProtocolAction::ParkTriggers)
+        };
+        match plan_action(&p, &no_scope(), &[]) {
+            ActionPlan::EnqueueLifecycle { spec: LifecycleSpec::Deactivate(d) } => {
+                assert_eq!(d.reach, TakeDownReach::Project)
             }
             other => panic!("wrong plan: {other:?}"),
         }
@@ -1045,13 +1174,13 @@ mod tests {
             DeactivationMode, LifecycleSpec, RunningPolicy,
         };
         let p = proto(ProtocolAction::HibernateTriggers { grace_minutes: 42 });
-        match plan_action(&p, &[]) {
+        match plan_action(&p, &no_scope(), &[]) {
             ActionPlan::EnqueueLifecycle {
                 spec: LifecycleSpec::Deactivate(d),
             } => {
-                assert_eq!(d.mode, DeactivationMode::Hibernate);
-                assert_eq!(d.grace_minutes, 42);
-                assert_eq!(d.running_policy, RunningPolicy::Wait);
+                assert_eq!(d.spec.mode, DeactivationMode::Hibernate);
+                assert_eq!(d.spec.grace_minutes, 42);
+                assert_eq!(d.spec.running_policy, RunningPolicy::Wait);
             }
             other => panic!("wrong plan: {other:?}"),
         }
@@ -1063,12 +1192,12 @@ mod tests {
             DeactivationMode, LifecycleSpec, RunningPolicy,
         };
         let p = proto(ProtocolAction::WipeTriggers);
-        match plan_action(&p, &[]) {
+        match plan_action(&p, &no_scope(), &[]) {
             ActionPlan::EnqueueLifecycle {
                 spec: LifecycleSpec::Deactivate(d),
             } => {
-                assert_eq!(d.mode, DeactivationMode::Wipe);
-                assert_eq!(d.running_policy, RunningPolicy::Cancel);
+                assert_eq!(d.spec.mode, DeactivationMode::Wipe);
+                assert_eq!(d.spec.running_policy, RunningPolicy::Cancel);
             }
             other => panic!("wrong plan: {other:?}"),
         }
@@ -1078,12 +1207,21 @@ mod tests {
     fn plan_auto_recover_enqueues_reactivate() {
         use weft_broker_client::protocol::LifecycleSpec;
         let p = proto(ProtocolAction::AutoRecover);
-        match plan_action(&p, &[]) {
+        let shared = InfraCopy { node_id: "svc".into(), member: None };
+        match plan_action(&p, &std::collections::BTreeSet::from([shared.clone()]), &[]) {
             ActionPlan::EnqueueLifecycle {
-                spec: LifecycleSpec::Reactivate,
-            } => {}
+                spec: LifecycleSpec::Reactivate(restore),
+            } => assert_eq!(restore.still_broken, vec![shared]),
             other => panic!("wrong plan: {other:?}"),
         }
+    }
+
+    fn shared_instance(node_id: &str, instance_id: &str) -> CopyInstance {
+        CopyInstance { copy: InfraCopy { node_id: node_id.into(), member: None }, instance_id: instance_id.into() }
+    }
+
+    fn shared_broken(node_id: &str) -> std::collections::BTreeSet<InfraCopy> {
+        std::collections::BTreeSet::from([InfraCopy { node_id: node_id.into(), member: None }])
     }
 
     #[test]
@@ -1094,13 +1232,51 @@ mod tests {
             replicas: 3,
         });
         let nodes = vec![node("n1", "inst-abc")];
-        let result = plan_action(&p, &nodes);
+        let result = plan_action(&p, &shared_broken("n1"), &nodes);
         assert_eq!(
             result,
             ActionPlan::Scale {
-                instance_id: "inst-abc".into(),
+                copies: vec![shared_instance("n1", "inst-abc")],
                 unit: "main".into(),
                 replicas: 3,
+            }
+        );
+    }
+
+    /// Scaling reaches the copies owned by whoever owns a broken copy:
+    /// ada's broken `n1` scales ada's `n1` only, never the shared one or
+    /// bob's; a broken shared `db` scales the shared `n1`.
+    #[test]
+    fn plan_scale_reaches_only_the_broken_owners_copy() {
+        let p = proto(ProtocolAction::Scale {
+            node_id: "n1".into(),
+            unit: "main".into(),
+            replicas: 0,
+        });
+        let ada_id = weft_core::member::MemberId::new("ada").unwrap();
+        let mut ada = node("n1", "inst-ada");
+        ada.member = Some(ada_id.clone());
+        let mut bob = node("n1", "inst-bob");
+        bob.member = Some(weft_core::member::MemberId::new("bob").unwrap());
+        let nodes = vec![node("n1", "inst-shared"), ada, bob, node("n2", "inst-other")];
+        let ada_broken = std::collections::BTreeSet::from([InfraCopy { node_id: "n1".into(), member: Some(ada_id.clone()) }]);
+        assert_eq!(
+            plan_action(&p, &ada_broken, &nodes),
+            ActionPlan::Scale {
+                copies: vec![CopyInstance {
+                    copy: InfraCopy { node_id: "n1".into(), member: Some(ada_id.clone()) },
+                    instance_id: "inst-ada".into(),
+                }],
+                unit: "main".into(),
+                replicas: 0,
+            }
+        );
+        assert_eq!(
+            plan_action(&p, &shared_broken("db"), &nodes),
+            ActionPlan::Scale {
+                copies: vec![shared_instance("n1", "inst-shared")],
+                unit: "main".into(),
+                replicas: 0,
             }
         );
     }
@@ -1113,7 +1289,7 @@ mod tests {
             replicas: 3,
         });
         let nodes = vec![node("n1", "inst-abc")];
-        let result = plan_action(&p, &nodes);
+        let result = plan_action(&p, &shared_broken("n1"), &nodes);
         assert_eq!(
             result,
             ActionPlan::NodeMissing {
@@ -1128,13 +1304,33 @@ mod tests {
             node_id: "n1".into(),
             unit: "main".into(),
         });
-        let nodes = vec![node("n1", "inst-abc")];
-        let result = plan_action(&p, &nodes);
+        let mut ada = node("n1", "inst-ada");
+        ada.member = Some(weft_core::member::MemberId::new("ada").unwrap());
+        let nodes = vec![node("n1", "inst-abc"), ada];
+        let result = plan_action(&p, &shared_broken("n1"), &nodes);
         assert_eq!(
             result,
             ActionPlan::BouncePods {
-                instance_id: "inst-abc".into(),
+                instance_ids: vec!["inst-abc".into()],
                 unit: "main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_names_the_owners_when_the_node_is_on_the_other_side() {
+        let p = proto(ProtocolAction::BouncePods {
+            node_id: "n1".into(),
+            unit: "main".into(),
+        });
+        let ada = weft_core::member::MemberId::new("ada").unwrap();
+        let broken = std::collections::BTreeSet::from([InfraCopy { node_id: "db".into(), member: Some(ada.clone()) }]);
+        let result = plan_action(&p, &broken, &[node("n1", "inst-shared")]);
+        assert_eq!(
+            result,
+            ActionPlan::NoCopyForOwners {
+                node_id: "n1".into(),
+                owners: vec![Some(ada)],
             }
         );
     }
@@ -1145,7 +1341,7 @@ mod tests {
             node_id: "ghost".into(),
             unit: "main".into(),
         });
-        let result = plan_action(&p, &[]);
+        let result = plan_action(&p, &shared_broken("ghost"), &[]);
         assert_eq!(
             result,
             ActionPlan::NodeMissing {

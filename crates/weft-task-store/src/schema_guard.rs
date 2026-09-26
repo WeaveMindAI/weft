@@ -1142,11 +1142,30 @@ fn removed(thing: &Thing) -> String {
     }
 }
 
+/// Whether `group`'s released history (its frozen origin, or a released
+/// migration) creates `table`: how a table the canonical DDL dropped is
+/// still known to be that group's.
+#[cfg(feature = "db-tests")]
+fn history_created(group: &str, table: &str) -> bool {
+    let creates = |sql: &str| {
+        let lower = sql.to_ascii_lowercase();
+        [format!("create table if not exists {table} "), format!("create table {table} "),
+         format!("create table if not exists {table}("), format!("create table {table}(")]
+            .iter()
+            .any(|head| lower.contains(head.as_str()))
+    };
+    embedded_origin(group).is_some_and(creates)
+        || MIGRATIONS.iter().any(|m| m.group == group && !m.draft && creates(m.sql))
+}
+
 /// Split a plan into one file per group, and say where each file goes.
 ///
 /// A statement is filed under the group that owns it: for a table, the
-/// group listing it in `tables`; for a named table-less object (a
-/// function, a type), the group whose DDL text declares its name.
+/// group listing it in `tables`, or, for a table the canonical DDL no
+/// longer has (the plan drops it), the group whose history created it
+/// (its `origin.sql` or a released migration); for a named table-less
+/// object (a function, a type), the group whose DDL text declares its
+/// name.
 /// Anything that matches no group is refused rather than filed somewhere
 /// plausible, since a migration in the wrong group runs against
 /// databases that never had the table.
@@ -1171,6 +1190,10 @@ pub fn file_per_group(
             .find(|g| match &planned.owner {
                 Owner::Table(table) => g.tables.contains(&table.as_str()),
                 Owner::Named(name) => declared_names(g).iter().any(|n| n == name),
+            })
+            .or_else(|| match &planned.owner {
+                Owner::Table(table) => groups.iter().find(|g| history_created(g.name, table)),
+                Owner::Named(_) => None,
             })
             .ok_or_else(|| {
                 let what = match &planned.owner {
@@ -1777,5 +1800,18 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(recorded_without_file(&[&A], &applied), vec!["20990101T000000_lost".to_string()]);
+    }
+
+    /// A table files under the group whose history created it, whether
+    /// its `origin.sql` or a released migration did (which is what lets a
+    /// table the canonical DDL later drops still find its group), and a
+    /// table no history created is nobody's.
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_table_is_owned_by_the_group_whose_history_created_it() {
+        assert!(super::history_created("access_grant", "access_grant"));
+        assert!(super::history_created("access_grant", "member_value"));
+        assert!(!super::history_created("project", "member_value"));
+        assert!(!super::history_created("access_grant", "member"));
     }
 }

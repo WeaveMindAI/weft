@@ -15,7 +15,7 @@ use super::CredentialOwner;
 /// One registered app the editor offers as its own shared-door option:
 /// its label and its FIXED permission set. The user picks an option;
 /// they never tick permissions on the shared door.
-// SYNC: SharedAppChoice <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte SharedAppChoice
+// SYNC: SharedAppChoice <-> packages/weft-connect/src/core/wire.ts SharedAppChoice
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedAppChoice {
     pub label: String,
@@ -25,7 +25,7 @@ pub struct SharedAppChoice {
 /// The doors probe's answer core: which shared-door options exist right
 /// now. The ONE definition every service answering or forwarding the
 /// probe uses (the editor hides what is not offered; it never greys).
-// SYNC: DoorsAnswer <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus (flattens it in)
+// SYNC: DoorsAnswer <-> packages/weft-connect/src/core/wire.ts DoorsStatus (flattens it in)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorsAnswer {
     /// The registered apps, one shared-door option each (oauth
@@ -52,7 +52,7 @@ pub struct PublishedConnection {
 /// The doors probe's request: the service recipe to probe. The client
 /// (editor or CLI) posts it to the dispatcher, which forwards it to
 /// the broker verbatim.
-// SYNC: DoorsRequest <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte the doors accessCall body
+// SYNC: DoorsRequest <-> packages/weft-connect/src/core/transport.ts ConnectTransport.doors (its body)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoorsRequest {
     pub spec: AccessSpec,
@@ -61,7 +61,7 @@ pub struct DoorsRequest {
 /// The full doors-probe answer as it reaches a client: the broker's
 /// [`DoorsAnswer`] plus the consent-surface facts the dispatcher adds
 /// (only it knows the public host).
-// SYNC: DoorsStatus <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus
+// SYNC: DoorsStatus <-> packages/weft-connect/src/core/wire.ts DoorsStatus
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoorsStatus {
     /// The broker's probe answer (shared-door options + the
@@ -84,7 +84,7 @@ pub struct DoorsStatus {
 /// renders (identity / app label / what it can do, plus the
 /// spends-credits and verified marks) rides here, so the list needs no
 /// second call.
-// SYNC: GrantSummary <-> packages/weft-graph/src/protocol.ts GrantSummary
+// SYNC: GrantSummary <-> packages/weft-connect/src/core/wire.ts GrantSummary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantSummary {
     pub id: uuid::Uuid,
@@ -93,6 +93,10 @@ pub struct GrantSummary {
     /// `exclusive`-class shared grant (every project referencing it
     /// follows its rotations).
     pub project_id: Option<uuid::Uuid>,
+    /// The member of `project_id` whose connection this is; `None` for
+    /// the author's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<crate::member::MemberId>,
     pub identity: Option<String>,
     /// The connection list's middle column: the app's label, or the
     /// name the user typed for a pasted credential. `None` only for
@@ -110,16 +114,17 @@ pub struct GrantSummary {
     /// sending server can send and cannot receive).
     #[serde(default)]
     pub value_names: Vec<String>,
-    /// Whose credential the row resolves to. `Ours` rows are the
-    /// spends-credits connections.
+    /// Whose credential the row resolves to: `Platform` rows are the
+    /// spends-credits connections, `Author` and `Member` rows spend
+    /// their owner's money.
     pub owner: CredentialOwner,
     /// Which door created it; drives the shared-door displacement
     /// warning (shown once per connection created through it).
     pub door: Door,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether a credential stands behind the row right now. A
-    /// `TheirOwn` row stores its own material, so always. An `Ours`
-    /// row resolves to the runtime's own key at run time, which lives
+    /// Whether a credential stands behind the row right now. An
+    /// `Author` or `Member` row stores its own material, so always. A
+    /// `Platform` row resolves to the runtime's own key at run time, which lives
     /// in the broker's shared-credentials file and can be gone (the
     /// file changed, the secret was emptied) while the row stays: the
     /// dispatcher asks the broker when it lists, and a picked row with
@@ -129,7 +134,7 @@ pub struct GrantSummary {
 }
 
 /// Which services the runtime holds its own credential for, asked by
-/// the dispatcher when it lists connections (an `Ours` row is only a
+/// the dispatcher when it lists connections (a `Platform` row is only a
 /// connection while the key behind it exists).
 // SYNC: SharedCredentialsQuery <-> crates/weft-broker/src/access_admin.rs shared_credentials
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +152,7 @@ pub struct SharedCredentialsAnswer {
 /// paste, `mint_jwt`, server-to-server `oauth2`/`client_credentials`,
 /// or the SHARED door of a key service). A browser-consent acquisition
 /// is refused here; that is [`BeginOAuth`].
+// SYNC: ConnectDirect <-> packages/weft-connect/src/core/transport.ts DirectConnect
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectDirect {
     pub spec: AccessSpec,
@@ -188,6 +194,12 @@ pub struct ConnectDirect {
     /// exclusive-class OAuth grant ignores it, but direct connects are
     /// per-paste anyway).
     pub project_id: Option<uuid::Uuid>,
+    /// The member of `project_id` this connection is for. Stamped by the
+    /// dispatcher from WHO is connecting (a member token, or a trusted
+    /// backend's `Weft-Member` header), never taken from a client body:
+    /// nobody connects in somebody else's name.
+    #[serde(default)]
+    pub member: Option<crate::member::MemberId>,
 }
 
 fn own_door() -> Door {
@@ -214,6 +226,7 @@ pub struct MintAppResponse {
 
 /// The connect flow's answer: the summary the editor stores on the
 /// node (`{id, identity}`) and shows.
+// SYNC: CompletedConnect <-> packages/weft-connect/src/core/wire.ts CompletedConnect
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompletedConnect {
     pub grant: GrantSummary,
@@ -225,6 +238,7 @@ pub struct CompletedConnect {
 /// and its fixed `covers` before the store flow runs; the flows
 /// themselves never read it. Defined here so the dispatcher's
 /// forwarding and the broker's handling share one wire shape.
+// SYNC: SharedDoorPick <-> packages/weft-connect/src/core/transport.ts DirectConnect.shared_app, packages/weft-connect/src/core/transport.ts ConsentStart.shared_app
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SharedDoorPick<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +249,7 @@ pub struct SharedDoorPick<T> {
 
 /// Start a browser consent (OAuth2 authorization_code): park the
 /// pending state, answer the consent URL to open.
+// SYNC: BeginOAuth <-> packages/weft-connect/src/core/transport.ts ConsentStart
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BeginOAuth {
     pub spec: AccessSpec,
@@ -254,6 +269,11 @@ pub struct BeginOAuth {
     /// by the broker; nothing the client sent survives there).
     pub permissions: Vec<String>,
     pub project_id: Option<uuid::Uuid>,
+    /// The member of `project_id` this consent is for; stamped by the
+    /// dispatcher from who is connecting, exactly like
+    /// [`ConnectDirect::member`].
+    #[serde(default)]
+    pub member: Option<crate::member::MemberId>,
     /// Upgrade/rotate this existing exclusive-class grant in place
     /// instead of minting a new row.
     pub upgrade_grant_id: Option<uuid::Uuid>,
@@ -264,6 +284,7 @@ pub struct BeginOAuth {
     pub redirect_uri: String,
 }
 
+// SYNC: StartedOAuth <-> packages/weft-connect/src/core/wire.ts StartedConsent
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StartedOAuth {
     /// Open this in the user's browser.
@@ -308,12 +329,13 @@ mod wire_tests {
             id: uuid::Uuid::nil(),
             service: "openrouter".into(),
             project_id: None,
+            member: None,
             identity: Some("Q".into()),
             label: None,
             scopes: vec!["s".into()],
             permissions_verified: true,
             value_names: vec!["key".into()],
-            owner: CredentialOwner::Ours,
+            owner: CredentialOwner::Platform,
             door: Door::Shared,
             expires_at: None,
             has_credential: true,
@@ -321,7 +343,7 @@ mod wire_tests {
         let back: GrantSummary =
             serde_json::from_value(serde_json::to_value(&grant).unwrap()).unwrap();
         assert_eq!(back.id, grant.id);
-        assert_eq!(back.owner, CredentialOwner::Ours);
+        assert_eq!(back.owner, CredentialOwner::Platform);
         assert_eq!(back.door, Door::Shared);
 
         let done = CompletedConnect { grant };
@@ -349,6 +371,7 @@ mod wire_tests {
             registration: None,
             permissions: vec![],
             project_id: Some(uuid::Uuid::nil()),
+            member: None,
             upgrade_grant_id: None,
             redirect_uri: String::new(),
         };
@@ -373,6 +396,7 @@ mod wire_tests {
                 registration: None,
                 paste: false,
                 project_id: None,
+                member: None,
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
@@ -412,6 +436,7 @@ mod wire_tests {
                 registration: Some(reg.clone()),
                 paste: true,
                 project_id: Some(uuid::Uuid::nil()),
+                member: None,
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
@@ -436,6 +461,7 @@ mod wire_tests {
                 registration: Some(reg),
                 permissions: vec!["write".into()],
                 project_id: None,
+                member: None,
                 upgrade_grant_id: Some(uuid::Uuid::nil()),
                 redirect_uri: "http://h/cb".into(),
             },

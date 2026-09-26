@@ -36,13 +36,13 @@ error rather than a trigger that quietly never fires.
 
 | Field | Type | What it is |
 |---|---|---|
-| `execution_id` | `String` | This run, as a string |
-| `color` | `Color` (a UUID) | The same run, as its id |
-| `project_id` | `String` | The project it belongs to |
+| `color` | `Color` (a UUID) | This run's id |
+| `project_id` | `Uuid` | The project it belongs to |
 | `node_id` | `String` | This node's id in the graph |
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
 | `node_label` | `Option<String>` | The title shown on the box, if it has one |
 | `frames` | `LoopFrames` | Which loop iterations this firing sits inside |
+| `member()` | `Option<&MemberId>` | Who this run is for, when it is for one member of the program (see [programs with members](../running/members.md)) |
 
 ## Reading inputs
 
@@ -210,6 +210,36 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 `StopSelf::Keep` only reaches runs that took the tag before this one did, so
 two runs racing to stop each other leave the later one alive. `StopSelf::Include`
 ends this run too.
+
+## Your project beyond this run
+
+The runtime answers each of these calls on behalf of this run and writes the
+answer into the run's journal, so a replay reads the answer back instead of
+asking again. Most of them take an optional `.member(id)`, which picks that
+member's copy instead of the shared one; `values()`, `connections()` and
+`tokens().member(..)` always name a member.
+
+| Call | What it does |
+|---|---|
+| `infra("bridge").start().await` | Brings the shared copy up. Returns once it runs, parking the run between looks; fails with the reason if it does not come up, or if somebody stops it while this waits |
+| `infra("bridge").stop(spec, stop_self).await` | Scales the copy down, keeping its disk |
+| `infra("bridge").terminate(spec, stop_self).await` | Deletes the copy and its disk |
+| `infra("bridge").status().await` | The copy's state, `None` when there is none. A start or stop on its way reads `provisioning` or `stopping` at once, the same answer `weft status` gives |
+| `infra("bridge").copies().await` | Every copy: the shared one and each member's |
+| `trigger("receive").activate().await` | Turns one trigger on |
+| `triggers().deactivate(spec, stop_self).await` | Turns off every trigger of the program (or of one member, with `.member(id)`); if you want only some, name them with `.only([..])` |
+| `values().member(id).get().await` | What the member gave for the program's `@member_filled` fields, by step and field |
+| `values().member(id).set(step, field, value).clear(step, field).apply().await` | Gives and clears values in one change, each checked against its node's rules; the member's live triggers reading one are set up again, and their names come back |
+| `values().member(id).forget().await` | Forgets everything the member gave |
+| `connections().member(id).list() / forget()` | Lists a member's connections, or forgets all of them (the values naming them go too) |
+| `members().list().await` | Every member weft holds anything for, one entry each: how many values, connections and live tokens, their infra copies, and their triggers, each with the events waiting on a field they have not filled and why |
+| `costs().member(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by member, node, service, run, `paid_by` or `since` (unix seconds) |
+| `runs().member(id).status(s).older_than(d).clean(running, stop_self).await` | Deletes runs; runs still going follow `running` |
+| `tokens().mint_for_member(id, expires_in).await` | A member token, value shown once |
+| `tokens().member(id).revoke().await` | Revokes a member's tokens |
+
+For what `spec` and `stop_self` decide, go and read
+[taking something down from a run](../running/members.md#taking-something-down-from-a-run).
 
 ## What is not here
 

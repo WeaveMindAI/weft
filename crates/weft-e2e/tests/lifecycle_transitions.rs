@@ -321,12 +321,12 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
 }
 
 /// All three concerns at once: an ACTIVE project with RUNNING infra offers
-/// the full verb set; `infra stop` on it auto-deactivates first (one click,
-/// the user's deactivation spec) and lands on the stopped row where nothing
-/// that needs infra is offered; a fresh start + activate brings the full
-/// cycle back; terminate returns to resting.
+/// the full verb set; `infra stop` takes down only the triggers that read
+/// the infra, so a trigger on another branch keeps listening while
+/// nothing that needs the stopped infra is offered; a fresh start brings
+/// the full cycle back; terminate returns to resting.
 #[tokio::test]
-async fn active_infra_stop_auto_deactivates_and_recovers() -> anyhow::Result<()> {
+async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
@@ -343,34 +343,24 @@ async fn active_infra_stop_auto_deactivates_and_recovers() -> anyhow::Result<()>
         .await?
         .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
 
-    // Stop while ACTIVE: auto-deactivates with the caller's spec, then stops.
+    // Stop while ACTIVE: the stop takes down the triggers reading this
+    // service with the caller's spec, and this service sits on its own
+    // branch (`svc -> svc_out`, nothing to do with the trigger), so the
+    // trigger keeps listening while the service stops.
     project
         .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
         .await?;
-    let s = status::wait_until(&disp, &pid, "stopped row", STATUS_DEADLINE, |s| {
-        s.status() == "inactive" && s.infra_rollup() == "stopped"
+    let s = status::wait_until(&disp, &pid, "stopped infra under a live trigger", STATUS_DEADLINE, |s| {
+        s.status() == "active" && s.infra_rollup() == "stopped"
     })
     .await?;
-    // Activate is STILL offered with the infra stopped, and that is the
-    // rule, not an oversight: the three lifetimes stack, so a trigger
-    // waits on the infra it DEPENDS ON and on nothing else. This
-    // service sits on its own branch (`svc -> svc_out`, nothing to do
-    // with the trigger), so arming the trigger is sound with it down.
     // `run` is the other half: a run waits on the infra IT touches, and
     // a whole-graph run touches this service, so it is refused by the
     // run's own pre-flight (a run aimed away from it would go).
     // What the TABLE reports; the doors re-check the same rules after
     // their build, in `require_trigger_infra` and `versions::run`.
-    // SYNC: the gate <-> crates/weft-dispatcher/src/api/project.rs
-    //       compute_available_actions, weft_core::project::infra_triggers_depend_on
-    s.assert_actions_exactly(&["activate", "infra_start", "infra_terminate"])?;
-    assert_run_rejected(&project, "infra stopped", INFRA_GATE).await?;
-
-    // This service is outside trigger preparation, so activation leaves it stopped.
-    project.activate().await?;
-    let s = status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
-    anyhow::ensure!(s.infra_rollup() == "stopped", "activation must leave unrelated infra stopped");
     s.assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+    assert_run_rejected(&project, "infra stopped", INFRA_GATE).await?;
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?
         .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;

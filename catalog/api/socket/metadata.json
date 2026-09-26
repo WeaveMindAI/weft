@@ -84,6 +84,18 @@
       "description": "How long the caller's machine may leave what the worker sent it unacknowledged before the connection is called dead, in seconds. This is NOT a ceiling on the session: a machine that is still there acknowledges every packet by itself, whatever the person is doing, so a caller who stays resets this constantly and a socket held open for hours is never touched. It bounds SILENCE, which is the only way to tell a caller who vanished (a closed laptop, a dropped network) from one who is simply quiet. Raise it for a client on a link that genuinely goes silent for longer, like a device that sleeps its radio between messages; lower it to notice a departure sooner. `0` leaves the machine's own default, which is about fifteen minutes."
     },
     {
+      "name": "maxInboundMb",
+      "type": "Number",
+      "default": 16,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Largest message, in MB",
+      "description": "The biggest single message a caller may send, in whole megabytes; a bigger one ends the session with an error. 16 by default. Raise it for a socket that carries large payloads, lower it to refuse oversized messages early."
+    },
+    {
       "name": "journalEphemeral",
       "type": "Boolean",
       "label": "Keep the conversation out of the journal",

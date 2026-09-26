@@ -101,7 +101,7 @@ fn render_version<'a>(
     if tree.head.head_version.as_deref() == Some(v.id.as_str()) {
         marks.push("HEAD");
     }
-    if tree.head.activation_version.as_deref() == Some(v.id.as_str()) {
+    if tree.head.activated_versions.contains(&v.id) {
         marks.push("activated");
     }
     let mark = if marks.is_empty() { String::new() } else { format!(" <- {}", marks.join(", ")) };
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn the_tree_indents_children_lists_runs_under_their_version_and_marks_head() {
         let tree = Tree {
-            head: Head { head_version: Some("v200000000".into()), head_run: Some("c200000000".into()), activation_version: None },
+            head: Head { head_version: Some("v200000000".into()), head_run: Some("c200000000".into()), activated_versions: vec![] },
             versions: vec![version("v1", None, Some("base"), &[]), version("v2", Some("v1"), None, &["main.weft"]), version("v3", Some("v1"), None, &["prompts/p.txt"])],
             runs: vec![run("c1", "v1", None, "completed"), run("c2", "v2", Some("c1"), "running")],
         };

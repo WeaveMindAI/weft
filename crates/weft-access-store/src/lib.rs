@@ -23,10 +23,12 @@ mod subscriptions;
 pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
-    begin_oauth, begin_picker, complete_oauth, connect_direct, delete_grant,
-    delete_published_grants, finish_picker, list_grants, load_picker, publish_grant,
-    published_connection, sweep_expired_connects, take_connect_result, BeginPicker, OAuthComplete,
-    PickerSession, PublishAccess,
+    begin_oauth, begin_picker, own_connection_gate, change_member_values, complete_oauth, connection_handle, connect_direct, delete_grant,
+    delete_published_grants, finish_picker, forget_member_grants, forget_project_members, list_grants, load_picker,
+    member_connection_counts, member_value_counts, member_values, publish_grant, published_connection, sweep_expired_connects,
+    ConnectionValue, MemberValueWrite,
+    take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
+    PublishAccess,
 };
 pub use subscriptions::{
     drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
@@ -35,7 +37,7 @@ pub use subscriptions::{
 pub use resolve::{
     caller_verifier, connections_for_event, events_recipe_hash, events_recipes_of, granted_items,
     lookup, lookup_url, recipe_value_names, record_events_recipes, resolve_event_source,
-    resolve_for_worker, CallerVerifier, EventTarget, GrantedQuery, LookupItem, LookupPage,
+    resolve_for_worker, CallerVerifier, EventTarget, GrantUser, GrantedQuery, LookupItem, LookupPage,
     LookupRequest, RecordedEventsRecipe, ResolvedAccess, ResolvedEventSource,
 };
 
@@ -57,11 +59,16 @@ pub enum AccessError {
     /// drift, malformed spec).
     #[error("{0}")]
     Invalid(String),
+    /// A browser flow's state that is unknown or past its time: nothing
+    /// will ever land under it, so a poll must stop.
+    #[error("{0}")]
+    Gone(String),
 }
 
 /// Map a store error to an HTTP status at an API edge: missing/foreign
 /// rows are 404 (one answer, no existence leak), caller-fixable input
-/// is 400, a dead grant is 409 (the fix is a reconnect, not a retry).
+/// is 400, a dead grant is 409 (the fix is a reconnect, not a retry),
+/// a browser flow that is gone is 410 (the fix is starting it again).
 /// `None` = internal: the edge logs the chain itself and answers 500
 /// without echoing detail. ONE mapping so every surface fronting the
 /// store (dispatcher and broker) answers identically.
@@ -70,6 +77,7 @@ fn client_status(e: &anyhow::Error) -> Option<(u16, String)> {
         Some(AccessError::NotFound) => Some((404, format!("{e}"))),
         Some(AccessError::Invalid(_)) => Some((400, format!("{e}"))),
         Some(AccessError::NeedsReconnect { .. }) => Some((409, format!("{e}"))),
+        Some(AccessError::Gone(_)) => Some((410, format!("{e}"))),
         None => None,
     }
 }
@@ -98,6 +106,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "access_grant",
     tables: &[
         "access_grant",
+        "member_value",
         "access_connect",
         "access_picker",
         "access_connect_result",
@@ -172,9 +181,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- making a second one, and terminating the node deletes
             -- it, so it lives exactly as long as the thing it opens.
             published_by_node TEXT,
+            -- Whose connection, inside a project: NULL for one the
+            -- author made (the project's, or a tenant-wide shared one),
+            -- else the member of `project_id` who connected it (or whose
+            -- copy of a node published it). A member is always a
+            -- project's, so a member's connection always names one.
+            member_id TEXT,
             expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT access_grant_member_has_project
+                CHECK (member_id IS NULL OR project_id IS NOT NULL)
         );
         CREATE INDEX IF NOT EXISTS access_grant_tenant_service
             ON access_grant (tenant_id, service);
@@ -182,8 +199,31 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         -- republishing is a lookup on this key, and two racing runs
         -- cannot leave two rows behind.
         CREATE UNIQUE INDEX IF NOT EXISTS access_grant_published
-            ON access_grant (tenant_id, project_id, published_by_node, service)
+            ON access_grant (tenant_id, project_id, published_by_node, service, member_id) NULLS NOT DISTINCT
             WHERE published_by_node IS NOT NULL;
+        -- A member's connections, for their picker and their forget.
+        CREATE INDEX IF NOT EXISTS access_grant_member
+            ON access_grant (project_id, member_id) WHERE member_id IS NOT NULL;
+        -- What a member provides for the fields their program writes
+        -- `@member_filled`: the value a run for them puts where the
+        -- source would hold one. The step is its place, spelled the
+        -- way the program reads it (`read`, `one.read`), and the field
+        -- one of its inputs. A value that is a connection (the
+        -- `{id, identity}` handle an access field holds) names its
+        -- grant, so removing the connection removes every value using
+        -- it, and its identity is read fresh from the grant.
+        CREATE TABLE IF NOT EXISTS member_value (
+            tenant_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            member_id TEXT NOT NULL,
+            step TEXT NOT NULL,
+            field TEXT NOT NULL,
+            value JSONB NOT NULL,
+            grant_id UUID REFERENCES access_grant(id) ON DELETE CASCADE,
+            set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (project_id, member_id, step, field)
+        );
+        CREATE INDEX IF NOT EXISTS member_value_grant ON member_value (grant_id) WHERE grant_id IS NOT NULL;
         -- The inbound-event lookup: an incoming push names a service
         -- and an account, and must find every connection to it
         -- without knowing a tenant (which is the point: the push
@@ -212,6 +252,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Set when this connect upgrades/rotates an existing
             -- exclusive-class grant in place.
             upgrade_grant_id UUID,
+            -- The member this connect is for (their browser went
+            -- through a member token, or their backend named them):
+            -- recorded onto the grant at completion. NULL for the
+            -- author's own connect.
+            member_id TEXT,
             redirect_uri TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -235,6 +280,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- declared `grants`), parked with the session; a finished
             -- pick unions them into the grant row's granted_scopes.
             grants JSONB NOT NULL DEFAULT '[]',
+            -- The member the pick is for, when it opened at their own
+            -- door: the chooser then signs in with a connection only
+            -- that member may use.
+            project_id UUID,
+            member_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS access_picker_created
@@ -278,6 +328,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- (resource id, anything the unsubscribe call needs).
             captures_json JSONB NOT NULL DEFAULT '{}',
             expires_at TIMESTAMPTZ,
+            -- The member whose signal this is, when the connection is
+            -- theirs: stopping the channel signs in as them.
+            project_id UUID,
+            member_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -330,18 +384,24 @@ pub(crate) fn values_of(
         .unwrap_or_default()
 }
 
-/// The DB string of an owner / door and back: exactly serde's
-/// kebab/snake tag, so the column and the wire can never disagree.
-pub(crate) fn owner_str(owner: weft_core::CredentialOwner) -> &'static str {
-    match owner {
-        weft_core::CredentialOwner::TheirOwn => "their-own",
-        weft_core::CredentialOwner::Ours => "ours",
-    }
+/// The DB string of an owner, and back. The column says where the
+/// credential comes from: `ours` (the runtime's own key) or `their-own`
+/// (material the row stores). WHOSE own it is, the author's or a
+/// member's, is the row's `member_id`, so reading an owner takes both.
+pub(crate) fn owner_str(owner: &weft_core::CredentialOwner) -> &'static str {
+    if owner.is_platform() { "ours" } else { "their-own" }
 }
 
-pub(crate) fn owner_of(s: &str) -> anyhow::Result<weft_core::CredentialOwner> {
-    serde_json::from_value(serde_json::Value::String(s.to_string()))
-        .map_err(|_| anyhow::anyhow!("connection row has an unknown owner '{s}'"))
+pub(crate) fn owner_of(s: &str, member: Option<&str>) -> anyhow::Result<weft_core::CredentialOwner> {
+    match s {
+        "ours" => Ok(weft_core::CredentialOwner::Platform),
+        "their-own" => Ok(weft_core::CredentialOwner::own(
+            member
+                .map(|m| weft_core::member::MemberId::new(m).map_err(anyhow::Error::msg))
+                .transpose()?,
+        )),
+        other => anyhow::bail!("connection row has an unknown owner '{other}'"),
+    }
 }
 
 pub(crate) fn door_str(door: weft_core::access::spec::Door) -> &'static str {

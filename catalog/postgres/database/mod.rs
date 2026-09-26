@@ -103,9 +103,11 @@ fn secret_mount() -> Mount {
 
 /// Where the credential container reads its settings from, so the
 /// paths and the port are declared once, here, and the container
-/// cannot drift from them.
-fn credential_env() -> Vec<EnvEntry> {
+/// cannot drift from them. The database and user names are what its
+/// card shows beside the password: the three a client signs in with.
+fn credential_env(database: &str) -> Vec<EnvEntry> {
     vec![
+        EnvEntry::Literal { name: "WEFT_DATABASE".into(), value: database.into() },
         EnvEntry::Literal { name: "WEFT_SECRET_DIR".into(), value: SECRET_PATH.into() },
         EnvEntry::Literal { name: "WEFT_PASSWORD_FILE".into(), value: password_file() },
         EnvEntry::Literal {
@@ -169,7 +171,7 @@ impl Node for PostgresDatabaseNode {
                 on_upgrade: UpgradeBehavior::Recreate,
                 init_containers: vec![Container::new("mint", credential.clone())
                     .with_args(vec!["mint".into()])
-                    .with_env(credential_env())
+                    .with_env(credential_env(&database))
                     .with_mounts(vec![store_mount()])],
                 containers: vec![
                     Container::new("postgres", Image::Upstream {
@@ -182,7 +184,7 @@ impl Node for PostgresDatabaseNode {
                         },
                         EnvEntry::Literal {
                             name: "POSTGRES_DB".into(),
-                            value: database,
+                            value: database.clone(),
                         },
                         // The file, never the value: the password is
                         // not in this spec and never will be.
@@ -231,7 +233,7 @@ impl Node for PostgresDatabaseNode {
                     ),
                     Container::new("credential", credential)
                         .with_args(vec!["serve".into()])
-                        .with_env(credential_env())
+                        .with_env(credential_env(&database))
                         .with_ports(vec![ContainerPort {
                             name: "http".into(),
                             port: CREDENTIAL_PORT,
@@ -421,7 +423,7 @@ async fn password_from_database(
         "this database handed its password over once already, and no connection holds it \
          now, so nothing can sign in to it. The data is still on its disk. Press \
          `Reset password` on this node in the graph (the database mints a new one), then \
-         `weft infra start`: this run reads the new password and publishes a fresh \
+         run again: the next run reads the new password and publishes a fresh \
          connection."
     )
 }

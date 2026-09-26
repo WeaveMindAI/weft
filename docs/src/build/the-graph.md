@@ -70,6 +70,25 @@ puts a catalog port back the way it was.
 Double-click a box's name to rename it. Right-click a box for **Duplicate**,
 **Delete**, **Tags…**, **Set as target** and **Run from here…**.
 
+On an infra node, the same menu has **One per member**: each member of your
+program then gets their own copy of it, and it shows a **per member** badge.
+**Share across members** takes the mark off.
+
+If you want each member to give their own value for a field (their account,
+their spreadsheet, their schedule), click the 👤 button beside the field's
+name, or right-click the field and pick **Let each member fill this** (the same
+entry is on the right-click menu of the field's input port). The field then
+shows **Filled by each member** instead of a control, and the node a **filled
+per member** badge. If you had already written a value, a member who gives none
+gets that one. Click 👤 again, or pick **Stop letting each member fill this**,
+and that value becomes the one value for everyone again, or the field goes back
+to empty if there was none. A field with a wire into it offers neither, because
+its value comes from the wire.
+
+A box that reads from a per-member node or a member-filled field runs once for
+each member too, and shows a dashed **per member (follows)** badge. For what all
+of this means, go and read [programs with members](../running/members.md).
+
 ## Run one branch instead of everything
 
 Right-click the box whose answer you want and choose **Set as target**. It gets

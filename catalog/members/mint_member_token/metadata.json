@@ -1,0 +1,39 @@
+{
+  "type": "MintMemberToken",
+  "label": "Mint member token",
+  "description": "Hand a member's browser or extension a token that acts as them in this program, and nothing else: it starts their runs (in the `Weft-Member-Token` header on a live route), answers their waits, shows their own copies' displays and lets them connect their own accounts. It always expires. The value comes out once; keep it only where the member can use it.",
+  "tags": [
+    "members",
+    "token",
+    "auth"
+  ],
+  "icon": "KeyRound",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "member",
+      "type": "String",
+      "required": true,
+      "description": "The member, by the id your program uses for them (`user-42`)."
+    },
+    {
+      "name": "expiresInHours",
+      "type": "Number",
+      "required": true,
+      "description": "How long the token works, in hours (a year at most)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "token",
+      "type": "String",
+      "description": "The token itself."
+    },
+    {
+      "name": "expiresAt",
+      "type": "Number",
+      "description": "When it stops working, in unix seconds."
+    }
+  ],
+  "requires_infra": false
+}

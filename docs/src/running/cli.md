@@ -58,16 +58,35 @@ Flags on `weft run`:
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
-| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire` |
+| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `member` |
+| `--member <id>` | Run for this member of the program. Needed when the run reaches a step that exists once per member (see [programs with members](members.md)) |
+
+If you want to hand a run a file its real source cannot give you here (a
+WhatsApp voice note needs a paired phone), write it in any `--from`,
+`--emit`, `--group` or `--fire` value, or in a saved example, the way you
+would write it in source. `"@asset(\"samples/hello.ogg\", Audio)"` uploads
+the file into the project's storage and hands the port the file value its
+type names (`Image`, `Video`, `Audio` or `Blob`); `"@file(\"prompts/x.md\")"`
+hands it the file's text. Both mean exactly what they mean in a `.weft` (see
+[files and reuse](../language/files-and-reuse.md)), and a path is relative to
+the project root:
+
+```bash
+weft run --emit receive='{"messageType":"audio","file":"@asset(\"samples/hello.ogg\", Audio)","seconds":3}' --target transcribe
+```
+
+A missing file stops the run before it starts, and so does a file on a port
+whose type does not take one. A saved example keeps the marker, so each run
+reads the file again.
 
 ## Look at a run
 
 | Command | What it does |
 |---|---|
-| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status` |
+| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status`, `--member`, `--tag`. A run of a `Route` with `recorded: false` shows only if it failed |
 | `weft events <color>` | One run's events in order. `--node`, `--kind`, `--full` for whole values |
 | `weft logs [<color>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
-| `weft status` | The cwd project: registration, listener, infra per node, recent runs, what drifted, and what you can do next |
+| `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_member` one how many members have a copy), each trigger (with the events a member's trigger holds until they fill a field), recent runs, what drifted, and what you can do next |
 | `weft ps` | Every project the dispatcher knows |
 | `weft listener inspect` | Every listener pod and the signals on it. An operator's view |
 
@@ -91,8 +110,8 @@ answers "has my trigger fired since I changed it".
 | Command | What it does |
 |---|---|
 | `weft activate` | Sets up every trigger and starts the listeners. Builds and registers first if it has to. A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout` |
-| `weft deactivate` | Stops the listening |
-| `weft resync` | Deactivate and re-activate in one shot against your current program. Only on a project that is already active; an inactive one is `weft activate` |
+| `weft deactivate` | Stops the program's own triggers listening, and tells you how many members still have theirs on. `--member <id>` stops one member's, `--all-members` stops every member's and leaves the program's own alone |
+| `weft resync` | Deactivate and re-activate in one shot against your current program. With no flag it does every trigger that is on, the program's own and every member's, and prints whose it did. It only touches triggers that are on; for ones that are off, use `weft activate` |
 | `weft cancel-activate` | Cancels an activate in flight |
 | `weft cancel-build` | Cancels a build in flight. Only for a build running in the cluster; Ctrl+C handles a local one |
 | `weft cancel-running` | Ends a drain early while a deactivate is waiting |
@@ -107,6 +126,15 @@ answers "has my trigger fired since I changed it".
 | `--running-policy cancel\|wait` | Cancel the running executions, or wait for them. `cancel` unless you say otherwise; `wipe` refuses `wait`. On `weft infra stop` and `terminate` it works on an inactive project too: no triggers to take down, but a run may still be using the infra |
 | `--drain-timeout <seconds>` | Cap on a wait, so only beside `--running-policy wait`; passed with cancel it is refused. 60 by default. What is still running at the cap is cancelled |
 
+Every trigger verb (`activate`, `deactivate`, `resync`, `bake`,
+`cancel-activate`, `cancel-running`) also takes which triggers it acts on:
+
+| Flag | What it does |
+|---|---|
+| `--trigger <name>` | Only this trigger. Repeat it for several. Without it, every shared trigger (a plain `resync` does every member's too) |
+| `--member <id>` | That member's copies of the triggers that exist once per member (see [programs with members](members.md)) |
+| `--all-members` | On `weft deactivate` only: every member whose triggers are on, each with the same `--mode`. The program's own triggers stay as they are |
+
 ## Infrastructure
 
 | Command | What it does |
@@ -115,12 +143,20 @@ answers "has my trigger fired since I changed it".
 | `weft infra stop` | Scales to nothing, keeping the disk. The project's running executions are cancelled first unless you pass `--running-policy wait`, because they may be using this infra |
 | `weft infra terminate` | Deletes it, disk included, unless the node asked for the disk to be kept. The same running-policy rule as stop |
 | `weft infra upgrade` | Rebuilds against your current source. Leaves the project deactivated |
-| `weft infra status` | Where each piece stands, with its address |
+| `weft infra status` | Where each copy that exists stands, with its address. A start or stop on its way shows as `provisioning` or `stopping` at once |
 | `weft infra list-doors` | Which pieces you can reach from this machine, and at what address |
 | `weft infra logs [<node>]` | What the containers printed. `--tail` (200), `-f` |
 | `weft infra cancel` | Stops waiting on work in flight. Halts between steps rather than undoing |
 | `weft infra node-stop <node> [--force]` | One piece. `--force` takes down units that would normally stay up. Cancels every running execution of the project unless you pass `--running-policy wait`, since nothing records which of them use this piece |
 | `weft infra node-terminate <node>` | One piece, deleted. The same running-policy rule |
+| `weft infra show <node>` | The node's card: every item (label, kind, value) and every button, with the action to hand `press` and what it asks before pressing. A `secret` item's value is never printed, `--json` included |
+| `weft infra press <node> <action>` | Presses the card's button with that action, without asking: naming the action is the choice. Prints what the node answered, and the button's warning if it has one |
+| `weft infra env <node> --into <file> --set NAME=Label ...` | Writes what the node's card shows into an env file, every name in one go: `--set DATABASE_USER=User --set DATABASE_PASSWORD=Password` takes each item by its label as `show` prints it, and `--as <NAME>` is the short form for the card's only secret. A secret's value is never printed; the other values are, in the line confirming what it wrote. A new file is yours only; an existing one gets those lines set and keeps the rest. If a secret was handed over already, it refuses, quoting what the card says there: press the card's button with `weft infra press`, then run it again |
+
+If you want to act on one member's copies of the nodes marked `@per_member`
+instead of the shared infra, `start`, `stop`, `terminate`, `upgrade`,
+`node-stop`, `node-terminate`, `cancel`, `show`, `press` and `env` all take
+`--member <id>`.
 
 ## Connections and tokens
 
@@ -132,11 +168,16 @@ answers "has my trigger fired since I changed it".
 | `weft connect --grant <id>` | Pick a stored connection for the node |
 | `weft connect --disconnect` | Clear the node's pick, leaving the connection stored |
 | `weft connect --forget <id>` | Delete a stored connection for good |
+| `weft connect --member <id>` | Act as that member of the program on an access node whose connection is `@member_filled`: `--list`, `--grant`, `--disconnect` and connecting a new account all work on their connections and their value, exactly as their settings page would |
+| `weft member-values --member <id>` | Lists what the program asks that member to fill and what they gave; `--set node.field=value` and `--clear node.field` (both repeatable) change it in one go, re-arming their live triggers that read a changed value |
 | `weft connect --door shared\|own` | Which door to connect through, without being asked |
 | `weft connect --set NAME=VALUE` | Fill a credential field. The value is visible to other processes, so prefer the prompt or `--set-env NAME=ENV_VAR` |
-| `weft token mint` | Mint a signal token. `--name`, `--projects`, `--tags`, `--display <node>`, `--displays`. Printed once and never again |
+| `weft token mint` | Mint a signal token. `--name`, `--projects`, `--tags`, `--display <node>`, `--displays`, and `--expires <duration>` (`30m`, `12h`, `7d`; without it the token works until revoked). Printed once and never again |
+| `weft token mint --member <id> --expires <duration>` | A member token for the project you are in: it acts as that member and nothing else. `--expires` (`30m`, `12h`, `7d`) is required |
 | `weft token ls` | The tokens you have, by their recognizer prefix |
 | `weft token revoke <id>` | Revoke one |
+| `weft options <step> <field> [--search <text>]` | Lists the choices a field with a searchable list offers (a model, a spreadsheet, a channel), the same list the editor shows when you search that field, read through the connection picked for it. One `id  label` line each; the id is what you write in the field |
+| `weft connect-lib` | Copies weft's connect library into the project's frontend (`front/src/lib/weft-connect`, or the folder `--into` names), so its pages show the editor's connection pickers and list fields, and a member gets their own settings page. The folder is the library's: each run replaces it, so run it again after updating weft and keep your own code outside it |
 
 ## Stored files
 
@@ -193,6 +234,7 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 | `weft clean <color>` | Deletes one run |
 | `weft clean --all` | Deletes every run |
 | `weft clean --project <id>` | Deletes that project's whole history, which outlives the project |
+| `weft clean --member <id>`, `--tag <tag>`, `--status <how>`, `--node <node>` | Deletes only the runs these name, across the projects you name (or every one). Naming a member or a tag takes all their runs; add `--keep-days` to spare recent ones. A run still going is left to finish unless you pass `--cancel-running` |
 | `weft clean --images` | Reclaims worker images nothing references. `--all` spans every project |
 | `weft clean --build-cache` | Drops the docker build cache and the node-test cache. The next build compiles cold |
 | `weft rm` | Unregisters a project: signals wiped, runs cancelled, infra terminated, stored data reclaimed |
@@ -218,9 +260,13 @@ hanging on an answer that will never come.
 | `weft deactivate`, `weft resync`, the infra verbs | Which preservation mode, and the hibernate grace | `--mode`, `--grace` |
 | `weft test-node --tier live` | Confirm that this spends money | `--yes` |
 
-One asymmetry worth knowing: `deactivate`, `resync` and the infra verbs are the
-only ones that pick a default off a terminal rather than refusing. They pick
-`wipe`, with running executions cancelled.
+One asymmetry worth knowing: `deactivate` and `resync` are the only ones that
+pick a default off a terminal rather than refusing. They pick `wipe`, with
+running executions cancelled. The infra verbs ask only when a trigger reading
+that infra is on (the program's or a member's), and off a terminal, or with
+`--json`, they stop and name the flags to pass, for example `--mode park
+--running-policy wait`. If you pass `--mode` or `--grace` up front, it is used
+when needed and ignored otherwise.
 
 ## Everything destructive, and what it takes
 

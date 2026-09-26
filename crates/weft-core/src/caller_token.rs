@@ -72,6 +72,10 @@ pub struct CallerTokenClaims {
     /// that claim away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<RequestFingerprint>,
+    /// Who the run is for, when the gate honoured a
+    /// [`crate::member::MEMBER_HEADER`] (only a gated route does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<crate::member::MemberId>,
     pub exp: i64,
 }
 
@@ -154,6 +158,7 @@ mod tests {
             params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
             caller: Some(serde_json::json!({ "sub": "ada" })),
             approved: Some(RequestFingerprint::of("post", "/chat/room7", "a=1", b"{}")),
+            member: Some(crate::member::MemberId::new("ada").unwrap()),
             exp,
         }
     }
@@ -186,8 +191,9 @@ mod tests {
         let tok = mint(SECRET, &claims("pod-7", 1_000));
         let back = validate(SECRET, &tok, 999).unwrap();
         assert_eq!(back, claims("pod-7", 1_000));
-        // An open route on a bare path carries neither captures nor a caller.
-        let bare = CallerTokenClaims { params: BTreeMap::new(), caller: None, ..claims("pod-7", 1_000) };
+        // An open route on a bare path carries no captures, no caller, no
+        // member and no approved request.
+        let bare = CallerTokenClaims { params: BTreeMap::new(), caller: None, member: None, approved: None, ..claims("pod-7", 1_000) };
         assert_eq!(validate(SECRET, &mint(SECRET, &bare), 0).unwrap(), bare);
     }
 

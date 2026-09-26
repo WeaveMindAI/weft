@@ -20,10 +20,20 @@ pub struct SseSubscribe {
     /// Only fire on events with this `event:` name. Empty = every event.
     #[serde(default)]
     pub event_name: String,
+    /// The pre-fire filter, over the event's parsed `data:` object.
+    /// Lifted onto the spec by [`super::to_spec`] (hence `skip`); the
+    /// shared fire plumbing evaluates it, so a filtered-out event
+    /// costs no execution. Empty = fire on every matching event.
+    #[serde(skip)]
+    pub filters: Vec<crate::signal::predicate::Predicate>,
 }
 
 impl Signal for SseSubscribe {
     const TAG: &'static str = "sse_subscribe";
+
+    fn match_predicates(&self) -> &[crate::signal::predicate::Predicate] {
+        &self.filters
+    }
 
     fn validate(&self) -> Result<(), String> {
         validate_http_url(&self.url, "sse_subscribe.url")
@@ -49,20 +59,27 @@ mod tests {
 
     #[test]
     fn empty_url_rejected() {
-        let s = SseSubscribe { url: "".into(), event_name: "".into() };
+        let s = SseSubscribe { url: "".into(), event_name: "".into(), filters: Vec::new() };
         assert!(s.validate().is_err());
     }
 
     #[test]
     fn non_http_url_rejected() {
-        let s = SseSubscribe { url: "ftp://x".into(), event_name: "".into() };
+        let s = SseSubscribe { url: "ftp://x".into(), event_name: "".into(), filters: Vec::new() };
         assert!(s.validate().unwrap_err().contains("http(s)"));
     }
 
     #[test]
     fn valid_round_trips() {
-        let s = SseSubscribe { url: "https://x/stream".into(), event_name: "tick".into() };
+        let filters = vec![crate::signal::Predicate::neq("isGroup", "true")];
+        let s = SseSubscribe {
+            url: "https://x/stream".into(),
+            event_name: "tick".into(),
+            filters: filters.clone(),
+        };
         let spec = crate::signal::to_spec(s);
         assert_eq!(spec.kind, "sse_subscribe");
+        assert_eq!(spec.match_predicates, filters, "the filter rides the spec");
+        assert!(spec.config.get("filters").is_none(), "one home: the spec, not the config");
     }
 }

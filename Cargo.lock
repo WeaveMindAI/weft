@@ -5505,6 +5505,7 @@ dependencies = [
  "url",
  "uuid",
  "weft-access-store",
+ "weft-broker",
  "weft-broker-client",
  "weft-compiler",
  "weft-core",

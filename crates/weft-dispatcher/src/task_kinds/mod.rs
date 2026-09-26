@@ -9,6 +9,7 @@
 pub mod execute;
 pub mod fire_signal;
 pub mod live_arrival;
+pub mod program_call;
 pub mod record_cost;
 pub mod record_log;
 pub mod register_signal;
@@ -24,6 +25,7 @@ pub mod update_kind_state;
 // `cold_start.rs` imports `SpawnPodPayload` from the submodule).
 pub use fire_signal::FireSignalExecutor;
 pub use live_arrival::LiveArrivalExecutor;
+pub use program_call::ProgramCallExecutor;
 pub use record_cost::RecordCostExecutor;
 pub use record_log::RecordLogExecutor;
 pub use register_signal::RegisterSignalExecutor;

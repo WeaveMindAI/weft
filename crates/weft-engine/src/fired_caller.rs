@@ -31,18 +31,16 @@ use weft_core::caller::{
 use weft_core::signal::Protocol;
 use weft_core::Color;
 
-use crate::caller_conn::CallerJournalSink;
+use crate::caller_conn::{CallerJournalSink, CallerRecord};
 
 /// A caller that was never there: the request came from `--fire` and
 /// the answer goes to the journal.
 pub struct FiredCaller {
-    color: Color,
     config: CallerRuntimeConfig,
     parts: Arc<HttpRequestParts>,
-    journal: Arc<dyn CallerJournalSink>,
-    /// The journal offsets this exchange has used. The same counter a
-    /// real connection keeps, so the rows read in the same order.
-    offset: AtomicU64,
+    /// The same record a real connection keeps, so the rows read in the
+    /// same order.
+    record: CallerRecord,
     started: AtomicBool,
     /// The terminate latch, as a watch so `disconnected()` wakes when
     /// the program ends the exchange.
@@ -50,6 +48,12 @@ pub struct FiredCaller {
 }
 
 impl FiredCaller {
+    /// The sink the exchange is recorded through, for the run to close
+    /// once it is over.
+    pub fn journal(&self) -> Arc<dyn CallerJournalSink> {
+        self.record.sink()
+    }
+
     /// Build one for a fired run and record that the exchange opened.
     ///
     /// The request is the one the fire payload described. There is no
@@ -65,24 +69,17 @@ impl FiredCaller {
         journal: Arc<dyn CallerJournalSink>,
     ) -> Arc<Self> {
         let caller = Arc::new(Self {
-            color,
             config,
             parts: Arc::new(HttpRequestParts {
                 request,
                 body: InboundMessage::Json(serde_json::Value::Null),
             }),
-            journal,
-            offset: AtomicU64::new(0),
+            record: CallerRecord::new(color, journal),
             started: AtomicBool::new(false),
             terminated: tokio::sync::watch::Sender::new(false),
         });
-        let at = caller.next_offset();
-        caller.journal.connected(color, at, Protocol::Http);
+        caller.record.connected(Protocol::Http);
         caller
-    }
-
-    fn next_offset(&self) -> u64 {
-        self.offset.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Record what the program sent. `head` rides the first item only,
@@ -114,12 +111,10 @@ impl FiredCaller {
         // wrong against real HTTP. The exchange still reads as closed,
         // through the disconnect below.
         if let Some(chunk) = chunk {
-            let at = self.next_offset();
-            self.journal.outbound(self.color, at, &chunk, terminal);
+            self.record.outbound(&chunk, terminal);
         }
         if terminal {
-            let at = self.next_offset();
-            self.journal.disconnected(self.color, at, "the fired run answered");
+            self.record.disconnected("the fired run answered");
         }
         Ok(())
     }
@@ -231,6 +226,11 @@ mod tests {
         }
         fn disconnected(&self, _: Color, at: u64, reason: &str) {
             self.0.lock().unwrap().push(format!("{at} disconnected {reason}"));
+        }
+
+        fn close(&self) -> futures::future::BoxFuture<'static, ()> {
+            // Every row above is written as it is handed over.
+            Box::pin(std::future::ready(()))
         }
     }
 

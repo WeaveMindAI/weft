@@ -169,6 +169,22 @@ fn daemon_unreachable(e: &anyhow::Error) -> bool {
 }
 
 pub fn report_plain_error(json: bool, e: &anyhow::Error) {
+    let detail = error_detail(e);
+    if json {
+        let ev = Event { ts_unix: now_unix(), verb: None, phase: Phase::Error, detail: Some(&detail) };
+        println!("{}", serde_json::to_string(&ev).expect("Event serializes"));
+    } else {
+        eprintln!("error: {}", detail["message"].as_str().expect("error_detail carries a message"));
+    }
+}
+
+/// The `detail` of the `error` event a failure becomes, on every path
+/// that reports one: the message (with the cause chain, `{e:#}`, since
+/// that is where the "why" lives), plus the facts a host acts on
+/// without matching the wording.
+// SYNC: daemonUnreachable <-> extension-vscode/src/cli.ts CliFailure
+// SYNC: needsTriggerChoice <-> extension-vscode/src/triggerChoice.ts isTriggerChoiceRefusal
+pub fn error_detail(e: &anyhow::Error) -> Value {
     let unreachable = daemon_unreachable(e);
     let message = if unreachable {
         format!(
@@ -178,17 +194,14 @@ pub fn report_plain_error(json: bool, e: &anyhow::Error) {
     } else {
         format!("{e:#}")
     };
-    if json {
-        // SYNC: daemonUnreachable <-> extension-vscode/src/cli.ts CliFailure
-        let detail = serde_json::json!({
-            "message": message,
-            "daemonUnreachable": unreachable,
-        });
-        let ev = Event { ts_unix: now_unix(), verb: None, phase: Phase::Error, detail: Some(&detail) };
-        println!("{}", serde_json::to_string(&ev).expect("Event serializes"));
-    } else {
-        eprintln!("error: {message}");
-    }
+    serde_json::json!({
+        "message": message,
+        "daemonUnreachable": unreachable,
+        // The dispatcher needs to know how triggers come down and
+        // nobody could be asked: a host that can ask opens its picker
+        // and sends the verb again with the choice.
+        "needsTriggerChoice": e.chain().any(|cause| cause.is::<crate::commands::deactivate::NeedsTriggerChoice>()),
+    })
 }
 
 /// One emitter per CLI invocation. Cheap to clone; commands thread
@@ -409,12 +422,11 @@ impl Progress {
         );
     }
 
-    pub fn error(&self, message: &str) {
+    /// The verb failed with `e`: one `error` event carrying
+    /// [`error_detail`].
+    pub fn error(&self, e: &anyhow::Error) {
         self.error_emitted.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.emit(
-            Phase::Error,
-            Some(serde_json::json!({ "message": message })),
-        );
+        self.emit(Phase::Error, Some(error_detail(e)));
     }
 
     /// Structured error variant: lets the verb describe WHAT failed,
@@ -516,4 +528,27 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         // Done counterparts and the catch-alls are silent in human mode.
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_detail;
+    use crate::commands::deactivate::NeedsTriggerChoice;
+
+    /// The dispatcher's needs-a-choice refusal reaches the error event
+    /// as a flag, even under a context, and keeps its message; any
+    /// other failure says it does not need one.
+    #[test]
+    fn a_needed_trigger_choice_is_a_flag_on_the_error_event() {
+        let refusal = anyhow::Error::new(NeedsTriggerChoice("triggers are on: pass --mode".into()))
+            .context("infra stop");
+        let detail = error_detail(&refusal);
+        assert_eq!(detail["needsTriggerChoice"], true);
+        assert_eq!(detail["daemonUnreachable"], false);
+        assert_eq!(detail["message"], "infra stop: triggers are on: pass --mode");
+
+        let other = error_detail(&anyhow::anyhow!("project not registered"));
+        assert_eq!(other["needsTriggerChoice"], false);
+        assert_eq!(other["message"], "project not registered");
+    }
 }

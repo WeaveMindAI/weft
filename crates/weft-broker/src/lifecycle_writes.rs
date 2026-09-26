@@ -12,12 +12,13 @@ use anyhow::Context as _;
 use sqlx::PgPool;
 
 use weft_broker_client::lifecycle_command::{
-    claimable_project, live_lease_exists, owns_project_predicate, pending_supervisor_command,
+    claimable_project, command_reaches_copy, live_lease_exists, owns_project_predicate,
+    pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
     InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, RunningPolicy,
     SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
-    SupervisorSetStatusRequest, SupervisorSyncOwnershipResponse,
+    SupervisorSetScaledRequest, SupervisorSetStatusRequest, SupervisorSyncOwnershipResponse,
 };
 
 /// One supervisor ownership tick, atomically, so two supervisors never
@@ -192,33 +193,66 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     use sqlx::Row;
+    // Every activation of the owned projects rides along (a project with
+    // none has one row of NULLs from the LEFT JOIN): the health loop reads
+    // the project's listening as ONE lifecycle, the aggregate over all its
+    // activations, every owner's, and whether any activation it took down
+    // itself is still down.
     let sql = format!(
-        "SELECT p.id AS project_id, p.tenant_id, p.project_namespace, p.status, \
-                p.deactivated_by_health \
+        "SELECT p.id AS project_id, p.tenant_id, p.project_namespace, \
+                a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
+                a.drain_deadline_unix, a.deactivated_by_health, a.activating_color \
          FROM infra_owner io \
          JOIN project p ON p.id = io.project_id \
-         WHERE io.supervisor_pod = $1 AND {claimable}",
+         LEFT JOIN trigger_activation a ON a.project_id = p.id \
+         WHERE io.supervisor_pod = $1 AND {claimable} \
+         ORDER BY p.id",
         claimable = claimable_project("p"),
     );
     let rows = sqlx::query(&sql)
         .bind(pod_name)
         .fetch_all(executor)
         .await?;
-    rows.iter()
-        .map(|r| {
-            let status: String = r.try_get("status").context("decode status")?;
-            Ok(SupervisorProject {
-                project_id: r.try_get("project_id").context("decode project_id")?,
-                tenant_id: r.try_get("tenant_id").context("decode tenant_id")?,
-                project_namespace: r.try_get("project_namespace").context("decode project_namespace")?,
-                status: ProjectStatus::parse(&status)
-                    .with_context(|| format!("project.status='{status}' is not a known ProjectStatus"))?,
-                deactivated_by_health: r
-                    .try_get("deactivated_by_health")
-                    .context("decode deactivated_by_health")?,
-            })
+    let mut projects: Vec<(uuid::Uuid, String, String, Vec<weft_broker_client::activation::ActivationLifecycle>)> = Vec::new();
+    for r in &rows {
+        let project_id: uuid::Uuid = r.try_get("project_id").context("decode project_id")?;
+        if projects.last().map(|p| p.0) != Some(project_id) {
+            projects.push((
+                project_id,
+                r.try_get("tenant_id").context("decode tenant_id")?,
+                r.try_get("project_namespace").context("decode project_namespace")?,
+                Vec::new(),
+            ));
+        }
+        let status: Option<String> = r.try_get("status").context("decode status")?;
+        let Some(status) = status else { continue };
+        let lifecycle = weft_broker_client::activation::ActivationLifecycle {
+            status: ProjectStatus::parse(&status)
+                .with_context(|| format!("trigger_activation.status='{status}' is not a known status"))?,
+            accepting_fires: r.try_get("accepting_fires").context("decode accepting_fires")?,
+            fires_visible_to_consumers: r.try_get("fires_visible_to_consumers").context("decode visibility")?,
+            fires_deadline_unix: r.try_get("fires_deadline_unix").context("decode deadline")?,
+            drain_deadline_unix: r.try_get("drain_deadline_unix").context("decode drain deadline")?,
+            deactivated_by_health: r.try_get("deactivated_by_health").context("decode deactivated_by_health")?,
+            activating_color: r.try_get("activating_color").context("decode activating_color")?,
+        };
+        projects.last_mut().expect("pushed above").3.push(lifecycle);
+    }
+    Ok(projects
+        .into_iter()
+        .map(|(project_id, tenant_id, project_namespace, lifecycles)| {
+            let aggregate = weft_broker_client::activation::aggregate(&lifecycles);
+            SupervisorProject {
+                project_id,
+                tenant_id,
+                project_namespace,
+                status: aggregate.status,
+                health_parked: lifecycles
+                    .iter()
+                    .any(|l| l.deactivated_by_health && l.status == ProjectStatus::Inactive),
+            }
         })
-        .collect()
+        .collect())
 }
 
 /// The command `claimer_pod` runs next: the oldest uncompleted one of a
@@ -251,7 +285,7 @@ pub async fn next_command(
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
     let sql = format!(
         "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
-                c.drain_timeout_secs \
+                c.drain_timeout_secs, c.member_id, c.every_copy \
          FROM infra_lifecycle_command c \
          WHERE {pending} \
            AND NOT (c.project_id = ANY($2)) \
@@ -289,6 +323,8 @@ pub struct IssuedCommand<'a> {
     pub tenant_id: &'a str,
     pub project_id: uuid::Uuid,
     pub node_id: Option<&'a str>,
+    /// Which copies of the node it acts on.
+    pub copies: &'a weft_core::member::Copies,
     pub verb: InfraLifecycleVerb,
     pub running_policy: Option<RunningPolicy>,
     pub spec_json: Option<&'a serde_json::Value>,
@@ -305,22 +341,23 @@ pub struct IssuedCommand<'a> {
 /// transaction deletes the project's commands (`ProjectStore::remove`).
 ///
 /// An apply is deduplicated against an in-flight apply for the same
-/// (project, node), so a worker restart retrying the call never issues
-/// it twice: the partial unique index `uq_lifecycle_cmd_pending_apply`
-/// allows one pending apply per (project_id, node_id), and on a clash
+/// copy, so a worker restart retrying the call never issues it twice:
+/// the partial unique index `uq_lifecycle_cmd_pending_apply` allows one
+/// pending apply per (project_id, node_id, member_id), and on a clash
 /// the no-op `DO UPDATE` hands back the existing row's id in the same
 /// statement (a `DO NOTHING` would return no row and need a second read
 /// that races the row's completion). Other verbs never match that
 /// index's predicate.
 pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Result<Option<i64>> {
+    let (member_id, every_copy) = cmd.copies.columns();
     sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, running_policy, \
-          spec_json, issued_by_pod, issued_at_unix) \
-         SELECT $1, p.id, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW())::BIGINT \
+          spec_json, issued_by_pod, issued_at_unix, member_id, every_copy) \
+         SELECT $1, p.id, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW())::BIGINT, $8, $9 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
-         ON CONFLICT (project_id, node_id) \
+         ON CONFLICT (project_id, node_id, member_id) \
            WHERE completed_at_unix IS NULL AND verb = 'apply' \
            DO UPDATE SET issued_at_unix = infra_lifecycle_command.issued_at_unix \
          RETURNING id",
@@ -332,6 +369,8 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     .bind(cmd.running_policy.map(|p| p.as_str()))
     .bind(cmd.spec_json)
     .bind(cmd.issued_by_pod)
+    .bind(member_id)
+    .bind(every_copy)
     .fetch_optional(pool)
     .await
     .context("issue infra_lifecycle_command")
@@ -344,13 +383,14 @@ pub async fn record_event(
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
+    member: Option<&weft_core::member::MemberId>,
     kind: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<Option<i64>> {
     sqlx::query_scalar(
         "INSERT INTO infra_event \
-         (tenant_id, project_id, node_id, kind, payload, at_unix) \
-         SELECT $1, p.id, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT \
+         (tenant_id, project_id, node_id, kind, payload, at_unix, member_id) \
+         SELECT $1, p.id, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
          RETURNING id",
@@ -360,6 +400,7 @@ pub async fn record_event(
     .bind(node_id)
     .bind(kind)
     .bind(payload)
+    .bind(member.map(|m| m.as_str()))
     .fetch_optional(pool)
     .await
     .context("record infra_event")
@@ -390,11 +431,16 @@ fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommand
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
     let force: bool = r.try_get("force")?;
+    let member_id: Option<String> = r.try_get("member_id")?;
+    let every_copy: bool = r.try_get("every_copy")?;
+    let copies = weft_core::member::Copies::from_columns(member_id, every_copy)
+        .map_err(|e| anyhow::anyhow!("infra_lifecycle_command.id={id}: {e}"))?;
     let drain_timeout_secs: i64 = r.try_get("drain_timeout_secs")?;
     Ok(SupervisorCommandRow {
         id,
         project_id,
         node_id,
+        copies,
         verb,
         running_policy,
         spec_json,
@@ -526,13 +572,15 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
     let res = if let Some(cid) = req.command_id {
         sqlx::query(&format!(
             "UPDATE infra_node SET {set_clause} \
-             WHERE project_id = $5 AND node_id = $6{unit_fence} AND EXISTS ( \
-               SELECT 1 FROM infra_lifecycle_command \
-               WHERE id = $7 \
-                 AND project_id = $5 \
-                 AND (node_id = $6 OR node_id IS NULL) \
-                 AND completed_at_unix IS NULL \
+             WHERE project_id = $5 AND node_id = $6 \
+               AND member_id IS NOT DISTINCT FROM $9{unit_fence} AND EXISTS ( \
+               SELECT 1 FROM infra_lifecycle_command c \
+               WHERE c.id = $7 \
+                 AND c.project_id = $5 \
+                 AND {reaches} \
+                 AND c.completed_at_unix IS NULL \
              ) AND {owns}",
+            reaches = command_reaches_copy("c", "$6", "$9"),
             owns = owns_project_predicate("$8", "$5"),
         ))
         .bind(&unit_key)
@@ -543,17 +591,20 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         .bind(&req.node_id)
         .bind(cid)
         .bind(&req.pod_name)
+        .bind(req.member.as_ref().map(|m| m.as_str()))
         .execute(pool)
         .await?
     } else {
         sqlx::query(&format!(
             "UPDATE infra_node SET {set_clause} \
-             WHERE project_id = $5 AND node_id = $6{unit_fence} AND NOT EXISTS ( \
-               SELECT 1 FROM infra_lifecycle_command \
-               WHERE project_id = $5 \
-                 AND (node_id = $6 OR node_id IS NULL) \
-                 AND completed_at_unix IS NULL \
+             WHERE project_id = $5 AND node_id = $6 \
+               AND member_id IS NOT DISTINCT FROM $8{unit_fence} AND NOT EXISTS ( \
+               SELECT 1 FROM infra_lifecycle_command c \
+               WHERE c.project_id = $5 \
+                 AND {reaches} \
+                 AND c.completed_at_unix IS NULL \
              ) AND {owns}",
+            reaches = command_reaches_copy("c", "$6", "$8"),
             owns = owns_project_predicate("$7", "$5"),
         ))
         .bind(&unit_key)
@@ -563,9 +614,46 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         .bind(req.project_id)
         .bind(&req.node_id)
         .bind(&req.pod_name)
+        .bind(req.member.as_ref().map(|m| m.as_str()))
         .execute(pool)
         .await?
     };
+    if res.rows_affected() > 0 {
+        return Ok(FencedWrite::Applied);
+    }
+    stale_answer(pool, &req.pod_name, req.project_id).await
+}
+
+/// Record the replicas a health protocol's `Scale` just set, in
+/// the unit's `scaled_to` inside `units_json`. Fenced exactly like the
+/// autonomous branch of [`set_status`]: the unit must be in the roster
+/// (`units_json ? $1`, so no stub entry is ever written), no uncompleted
+/// command may reach the copy, and `pod_name` must still own the
+/// project, all in the UPDATE's WHERE so check and write share one
+/// snapshot.
+pub async fn set_scaled(pool: &PgPool, req: &SupervisorSetScaledRequest) -> anyhow::Result<FencedWrite> {
+    let res = sqlx::query(&format!(
+        "UPDATE infra_node \
+         SET units_json = jsonb_set(units_json, ARRAY[$1], \
+             (units_json->$1) || jsonb_build_object('scaled_to', $2::bigint)) \
+         WHERE project_id = $3 AND node_id = $4 \
+           AND member_id IS NOT DISTINCT FROM $6 AND units_json ? $1 AND NOT EXISTS ( \
+           SELECT 1 FROM infra_lifecycle_command c \
+           WHERE c.project_id = $3 \
+             AND {reaches} \
+             AND c.completed_at_unix IS NULL \
+         ) AND {owns}",
+        reaches = command_reaches_copy("c", "$4", "$6"),
+        owns = owns_project_predicate("$5", "$3"),
+    ))
+    .bind(&req.unit)
+    .bind(i64::from(req.replicas))
+    .bind(req.project_id)
+    .bind(&req.node_id)
+    .bind(&req.pod_name)
+    .bind(req.member.as_ref().map(|m| m.as_str()))
+    .execute(pool)
+    .await?;
     if res.rows_affected() > 0 {
         return Ok(FencedWrite::Applied);
     }

@@ -72,6 +72,18 @@ The address is known before you activate:
 `<dispatcher>/connect/<tenant>/<path>`, where the tenant is `local` on your own
 machine.
 
+If a page asks a route for something every few seconds (a status, a count), set
+`recorded: false` on the `Route`, or those calls fill `weft executions` with
+hundreds of runs. A run that succeeds or is cancelled then leaves nothing behind
+except what it cost. A run that fails is written down whole after the fact, so
+it lists and inspects exactly like a recorded one. The steps of an unrecorded
+run live in the worker's memory while it runs, which has two consequences: it
+cannot wait (a timer, a form, anything that parks the run fails at the call
+naming `recorded`), and it is lost without a trace if the worker dies mid-call,
+since running it again could repeat what it had already done. With
+`outlivesCaller` on as well, it keeps running after the caller leaves, still
+in memory and still unable to wait.
+
 ## Answering on a socket
 
 `Socket` is the same idea for a WebSocket: the caller connects, your program

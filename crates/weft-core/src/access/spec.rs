@@ -29,7 +29,7 @@ use serde_json::Value;
 /// The recipe for one service's personal accesses: how a grant is
 /// acquired, how a request through it is authenticated, and how grants
 /// coexist across projects.
-// SYNC: AccessSpec <-> packages/weft-graph/src/protocol.ts AccessSpecWire
+// SYNC: AccessSpec <-> packages/weft-connect/src/core/wire.ts AccessSpecWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessSpec {
@@ -160,7 +160,7 @@ pub struct AccessSpec {
 
 /// One all-or-nothing group of optional fields; see
 /// [`AccessSpec::capabilities`] for the two rules a group carries.
-// SYNC: Capability <-> packages/weft-graph/src/protocol.ts Capability
+// SYNC: Capability <-> packages/weft-connect/src/core/wire.ts Capability
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capability {
@@ -176,7 +176,7 @@ pub struct Capability {
 }
 
 /// One connect door; see [`AccessSpec::doors`].
-// SYNC: Door <-> packages/weft-graph/src/protocol.ts Door
+// SYNC: Door <-> packages/weft-connect/src/core/wire.ts Door
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Door {
@@ -200,7 +200,7 @@ fn is_default_doors(doors: &[Door]) -> bool {
 /// The optional parts of the "Your own" page beyond its paste fields.
 /// There is deliberately no mode switch: a page renders whichever of
 /// these exist, plus the fields, as ONE form.
-// SYNC: OwnPage <-> packages/weft-graph/src/protocol.ts OwnPage
+// SYNC: OwnPage <-> packages/weft-connect/src/core/wire.ts OwnPage
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnPage {
@@ -223,7 +223,7 @@ pub struct OwnPage {
 }
 
 /// The paste-a-credential section of the "Your own" page.
-// SYNC: Paste <-> packages/weft-graph/src/protocol.ts OwnPageWire.paste
+// SYNC: Paste <-> packages/weft-connect/src/core/wire.ts OwnPageWire.paste
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Paste {
@@ -261,7 +261,7 @@ pub struct Guide {
 }
 
 /// One entry of a service's permission catalogue.
-// SYNC: Permission <-> packages/weft-graph/src/protocol.ts Permission
+// SYNC: Permission <-> packages/weft-connect/src/core/wire.ts Permission
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permission {
@@ -312,7 +312,7 @@ impl Verification {
 /// authoritative (the provider states what the credential holds), the
 /// middle proves only liveness, `probe` infers from a real call's
 /// refusal, and `silent` learns nothing (the permissions stay claimed).
-// SYNC: VerificationRung <-> packages/weft-graph/src/protocol.ts VerificationRung
+// SYNC: VerificationRung <-> packages/weft-connect/src/core/wire.ts VerificationRung
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationRung {
@@ -342,7 +342,7 @@ impl VerificationRung {
 /// What running the verification costs. `paid` means the check is
 /// NEVER run automatically: the credential is recorded as claimed and
 /// the first real call surfaces the truth.
-// SYNC: VerificationCost <-> packages/weft-graph/src/protocol.ts VerificationCost
+// SYNC: VerificationCost <-> packages/weft-connect/src/core/wire.ts VerificationCost
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationCost {
@@ -380,7 +380,7 @@ pub const APPS_FILE_ENV: &str = "WEFT_ACCESS_APPS_FILE";
 /// shared door, the user's pasted app or the project's public app for
 /// the own door) and snapshotted onto the grant so runtime refresh
 /// reads it without a separate lookup.
-// SYNC: AppRegistration <-> packages/weft-graph/src/protocol.ts AppRegistration
+// SYNC: AppRegistration <-> packages/weft-connect/src/core/wire.ts AppRegistration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRegistration {
     /// The app's display name, shown as the connection list's middle
@@ -435,7 +435,7 @@ impl AppRegistration {
 
 /// How grants of a service coexist across projects; see
 /// [`AccessSpec::grants`].
-// SYNC: GrantCoexistence <-> packages/weft-graph/src/protocol.ts GrantCoexistence
+// SYNC: GrantCoexistence <-> packages/weft-connect/src/core/wire.ts GrantCoexistence
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GrantCoexistence {
@@ -447,7 +447,7 @@ pub enum GrantCoexistence {
 /// One pasted credential field on the connect form. Values go
 /// editor -> store directly and NEVER into node config (node config
 /// rides the journal in plaintext).
-// SYNC: CredentialField <-> packages/weft-graph/src/protocol.ts CredentialFieldWire
+// SYNC: CredentialField <-> packages/weft-connect/src/core/wire.ts CredentialFieldWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialField {
@@ -475,7 +475,7 @@ fn default_true() -> bool {
 }
 
 /// How a grant's stored values are acquired.
-// SYNC: Acquisition <-> packages/weft-graph/src/protocol.ts AccessSpecWire.acquisition
+// SYNC: Acquisition <-> packages/weft-connect/src/core/wire.ts AccessSpecWire.acquisition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Acquisition {
@@ -932,6 +932,11 @@ impl MintedSocket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Template(pub String);
+
+
+/// The values a consent stores that are secrets by nature, whatever the
+/// recipe declares: the tokens and the app's own secret.
+const SECRET_TOKEN_NAMES: &[&str] = &["access_token", "refresh_token", "client_secret"];
 
 impl Template {
     pub fn new(s: impl Into<String>) -> Self {
@@ -1412,6 +1417,12 @@ impl AccessSpec {
                 }
             }
         }
+        let secret_fields: std::collections::HashSet<String> = field_lists
+            .iter()
+            .flat_map(|fs| fs.iter())
+            .filter(|f| f.secret)
+            .map(|f| f.name.clone())
+            .collect();
         for fields in field_lists {
             let mut seen = std::collections::HashSet::new();
             for f in fields {
@@ -1433,7 +1444,17 @@ impl AccessSpec {
             validate_captures(&test.captures)?;
         }
         if let Some(identity) = &self.identity {
-            identity.placeholders()?;
+            // The identity is shown wherever a connection is listed (the
+            // editor, `weft connect --list`, a member's settings page), so
+            // it may never be assembled from a secret.
+            for name in identity.placeholders()? {
+                if SECRET_TOKEN_NAMES.contains(&name.as_str()) || secret_fields.contains(&name) {
+                    return Err(format!(
+                        "identity names '{name}', a secret: it is shown wherever the connection \
+                         is listed, so build it from a non-secret value (an account name, a host)"
+                    ));
+                }
+            }
         }
         if self.doors.is_empty() {
             return Err("a service must declare at least one door".into());
@@ -1588,7 +1609,7 @@ impl AccessSpec {
     /// Narrower than [`is_oauth`]: a `client_credentials` grant uses an
     /// app registration but exchanges it server-to-server in one
     /// request, so it connects through the direct path.
-    // SYNC: needs_browser_consent <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte isConsent
+    // SYNC: needs_browser_consent <-> packages/weft-connect/src/core/recipe.ts needsConsent
     pub fn needs_browser_consent(&self) -> bool {
         matches!(
             self.acquisition,
@@ -1598,13 +1619,13 @@ impl AccessSpec {
 
     /// The service's display name: the declared label, else the service
     /// name itself.
-    // SYNC: display_label <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte label
+    // SYNC: display_label <-> packages/weft-connect/src/core/recipe.ts displayLabel
     pub fn display_label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.service)
     }
 
     /// The catalogue entries that start ticked.
-    // SYNC: AccessSpec::default_permissions <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts defaultPermissions
+    // SYNC: AccessSpec::default_permissions <-> packages/weft-connect/src/core/recipe.ts defaultPermissions
     // Own-account-only entries are capability declarations, never
     // consent asks, so they are never ticked (and never ride a
     // consent URL).
@@ -1627,7 +1648,7 @@ impl AccessSpec {
     /// credentials (client id, secret, declared extras). A name field
     /// for the connection list is always prepended by the editor,
     /// whatever this returns.
-    // SYNC: AccessSpec::own_fields <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts ownFields
+    // SYNC: AccessSpec::own_fields <-> packages/weft-connect/src/core/recipe.ts ownFields
     pub fn own_fields(&self) -> Vec<CredentialField> {
         let field = |name: &str, label: &str, secret: bool| CredentialField {
             name: name.into(),
@@ -1655,7 +1676,7 @@ impl AccessSpec {
     /// The guide's steps with `{permissions}` replaced by the ticked
     /// permissions' labels (comma-joined), generated per pick rather
     /// than written as a static blob. Empty when no guide is declared.
-    // SYNC: guide_steps <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts guideSteps
+    // SYNC: guide_steps <-> packages/weft-connect/src/core/recipe.ts guideSteps
     pub fn guide_steps(&self, ticked: &[String]) -> Vec<String> {
         let Some(guide) = self.own_page.as_ref().and_then(|p| p.guide.as_ref()) else {
             return Vec::new();
@@ -1676,7 +1697,7 @@ impl AccessSpec {
     /// prose wants labels. The ONE substitution, so no surface renders
     /// the same link differently. None when no guide or no link is
     /// declared.
-    // SYNC: guide_link <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts guideLink
+    // SYNC: guide_link <-> packages/weft-connect/src/core/recipe.ts guideLink
     pub fn guide_link(&self, ticked: &[String]) -> Option<String> {
         let link = self.own_page.as_ref()?.guide.as_ref()?.link.as_ref()?;
         Some(link.replace("{permissions}", &percent_encode(&ticked.join(","))))
@@ -2005,6 +2026,28 @@ mod tests {
         .unwrap();
         let names: Vec<String> = telegram.own_fields().into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["token"]);
+    }
+
+    /// A connection's identity is listed everywhere, so a recipe may
+    /// never build it from a secret field or a stored token.
+    #[test]
+    fn an_identity_built_from_a_secret_is_refused() {
+        let spec = |identity: &str| -> AccessSpec {
+            serde_json::from_value(json!({
+                "service": "svc",
+                "acquisition": { "kind": "static", "fields": [
+                    { "name": "api_key", "label": "Key" },
+                    { "name": "user", "label": "User", "secret": false }
+                ] },
+                "doors": ["own"],
+                "identity": identity
+            }))
+            .unwrap()
+        };
+        assert!(spec("{user}").validate().is_ok());
+        let err = spec("{api_key}").validate().unwrap_err();
+        assert!(err.contains("'api_key', a secret"), "{err}");
+        assert!(spec("{access_token}").validate().is_err());
     }
 
     /// Guide steps are generated from the ticked permissions, never a

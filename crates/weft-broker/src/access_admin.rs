@@ -358,17 +358,23 @@ async fn lookup(
             "this list source signs with a connection, but none was given; pick one on the node"
         )));
     };
+    let Some(service) = inner.service.as_deref() else {
+        return Err(shared_app_err(anyhow::anyhow!(
+            "the lookup names connection {access_id} but not its service"
+        )));
+    };
     let mut resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &req.tenant,
+        weft_access_store::GrantUser::of(inner.for_member.as_ref()),
         access_id,
-        &inner.service,
+        service,
         &[],
         &[],
     )
     .await
     .map_err(crate::handlers::store_err)?;
-    if resolved.owner == weft_core::CredentialOwner::Ours {
+    if resolved.owner.is_platform() {
         // A REFUSAL is policy text the editor shows verbatim; an
         // internal failure answers opaquely (its message may quote
         // configuration internals that must never travel).
@@ -421,6 +427,7 @@ async fn granted(
     weft_access_store::granted_items(
         &state.pool,
         &req.tenant,
+        weft_access_store::GrantUser::of(req.inner.for_member.as_ref()),
         req.inner.access_id,
         &req.inner.service,
         &req.inner.from,
@@ -439,6 +446,10 @@ async fn granted(
 struct PickerTokenQuery {
     access_id: uuid::Uuid,
     service: String,
+    /// The member the pick is for (the session opened at their door);
+    /// `None`: the author.
+    #[serde(default)]
+    for_member: Option<weft_core::member::MemberScope>,
 }
 
 #[derive(Serialize)]
@@ -465,6 +476,7 @@ async fn picker_token(
     let resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &req.tenant,
+        weft_access_store::GrantUser::of(req.inner.for_member.as_ref()),
         req.inner.access_id,
         &req.inner.service,
         &[],
@@ -472,12 +484,9 @@ async fn picker_token(
     )
     .await
     .map_err(crate::handlers::store_err)?;
-    if resolved.owner != weft_core::CredentialOwner::TheirOwn {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "a provider chooser only runs on your own connection".into(),
-        ));
-    }
+    // The resolve above already went through the member's own project.
+    weft_access_store::own_connection_gate(&resolved.owner, None, req.inner.for_member.as_ref())
+        .map_err(|why| (StatusCode::FORBIDDEN, why.to_string()))?;
     // The same one-string derivation as `OpenedConnection::credential`:
     // exactly one auth step interpolating exactly one stored value.
     let token = weft_core::access::spec::single_credential(&resolved.auth, &resolved.values)

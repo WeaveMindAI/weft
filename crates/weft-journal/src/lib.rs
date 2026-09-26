@@ -11,6 +11,7 @@ pub mod fold;
 pub mod seed;
 pub mod tags;
 pub mod traits;
+pub mod unrecorded;
 pub mod write;
 
 pub use events::{ExecEvent, Seed};
@@ -35,6 +36,7 @@ pub fn decode_event(color: weft_core::Color, payload: &str) -> Result<ExecEvent,
     })
 }
 pub use traits::{JournalClient, JournalRow, NoopJournal, PostgresJournalClient, RawJournalRow};
+pub use unrecorded::UnrecordedJournal;
 pub use write::{
     lock_colors, record_event, record_event_dedup, record_event_from_pod, record_event_in, RecordError,
 };

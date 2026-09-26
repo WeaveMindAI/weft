@@ -144,6 +144,9 @@ pub async fn run(
     // them to the project's catalog (or to an error, outside a project).
     if let Some(wanted) = &node {
         let Some(metadata) = catalog.get(wanted) else {
+            if let Some(answer) = language_construct(wanted) {
+                anyhow::bail!("{answer}");
+            }
             let listing = if stdlib {
                 "weft describe-nodes --stdlib"
             } else {
@@ -176,9 +179,44 @@ pub async fn run(
     Ok(())
 }
 
+/// What `--node <name>` answers for a name the language owns rather
+/// than the catalog: what it is, and where it is explained. Every
+/// reserved type keyword has an answer (a test holds that), plus
+/// `Include`, which is written `@include(...)` but is what someone
+/// looking for "the include node" asks for.
+fn language_construct(name: &str) -> Option<String> {
+    let (what, page) = match name {
+        "Group" => ("a group, written `name = Group(...) { ... }`", "docs/src/language/groups.md"),
+        "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
+        "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
+        "Passthrough" | "LoopIn" | "LoopOut" => (
+            "a step the compiler makes out of a group or a loop; you never write it",
+            "docs/src/language/how-a-program-runs.md",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "`{name}` is not a catalog node, it is part of the weft language: {what}. \
+         The weft-language skill explains it, and so does {page}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::first_sentence;
+    use super::{first_sentence, language_construct};
+
+    /// Every type name the language reserves answers with what it is,
+    /// never "unknown node type".
+    #[test]
+    fn a_language_construct_is_named_as_one() {
+        for name in weft_compiler::weft_compiler::RESERVED_TYPE_KEYWORDS.iter().chain(&["Include"]) {
+            let answer = language_construct(name).unwrap_or_else(|| panic!("{name} has no answer"));
+            assert!(answer.contains("part of the weft language"), "{answer}");
+            assert!(answer.contains("docs/src/language/"), "{answer}");
+        }
+        assert!(language_construct("Loop").unwrap().contains("loops.md"));
+        assert_eq!(language_construct("HttpRequest"), None);
+    }
 
     /// The listing shows one sentence per node, and a dot inside a
     /// name (`weft.dev`, `ctx.inputs`) is not the end of one.

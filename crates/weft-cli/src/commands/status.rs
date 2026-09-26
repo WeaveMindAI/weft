@@ -140,6 +140,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         );
     }
 
+    // One entry per infra node the program declares, started or not, so
+    // an empty list really means no node declares `requires_infra`.
     if let Some(infra) = data.get("infra").and_then(|v| v.as_array()) {
         if infra.is_empty() {
             println!("  infra: (no nodes declare requires_infra)");
@@ -150,11 +152,55 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 // source reads it (`one.db`): the key and the label are one.
                 let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
                 let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                let url = entry
-                    .get("endpoint_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-");
-                println!("    {node}: {st} ({url})");
+                // SYNC: the two statuses a place with no shared copy reads <-> crates/weft-dispatcher/src/api/project.rs INFRA_NOT_STARTED, INFRA_PER_MEMBER
+                match st {
+                    "not_started" => println!("    {node}: not started (`weft infra start` brings it up)"),
+                    "per_member" => {
+                        let copies = entry.get("member_copies").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let counted = if copies == 1 { "1 member has a copy".to_string() } else { format!("{copies} members have a copy") };
+                        println!("    {node}: one copy per member ({counted}, listed under member copies)");
+                    }
+                    _ => {
+                        let url = entry.get("endpoint_url").and_then(|v| v.as_str()).unwrap_or("-");
+                        println!("    {node}: {st} ({url})");
+                    }
+                }
+            }
+        }
+    }
+
+    // Each trigger's own activation: the shared ones make up the
+    // registration line above, and a member's appear only here.
+    if let Some(activations) = data.get("activations").and_then(|v| v.as_array()) {
+        if !activations.is_empty() {
+            println!("  triggers:");
+            for entry in activations {
+                let trigger = entry.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+                let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+                match entry.get("member").and_then(|v| v.as_str()) {
+                    Some(member) => println!("    {trigger} (member {member}): {mode}"),
+                    None => println!("    {trigger}: {mode}"),
+                }
+                // Fires parked until the member gives a value they need:
+                // the member's next change of values routes them again.
+                if let Some(waiting) = entry.get("waiting") {
+                    let fires = waiting.get("fires").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let reason = waiting.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                    let counted = if fires == 1 { "1 fire waits".to_string() } else { format!("{fires} fires wait") };
+                    println!("      {counted} until the member changes their values: {reason}");
+                }
+            }
+        }
+    }
+    // Members' own copies of the `@per_member` infra nodes.
+    if let Some(copies) = data.get("member_copies").and_then(|v| v.as_array()) {
+        if !copies.is_empty() {
+            println!("  member copies:");
+            for entry in copies {
+                let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+                let member = entry.get("member").and_then(|v| v.as_str()).unwrap_or("?");
+                let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("    {node} (member {member}): {st}");
             }
         }
     }

@@ -56,8 +56,22 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         project_id: uuid::Uuid,
         node_id: Option<&str>,
+        member: Option<&weft_core::member::MemberId>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64>;
+    /// Record, in the unit's `UnitRuntime::scaled_to`, the replicas a
+    /// health protocol's `Scale` just set on one copy. Fenced
+    /// like the autonomous `set_status`: a stale answer means the copy
+    /// or the unit is gone, a command is in flight, or ownership moved.
+    async fn set_scaled(
+        &self,
+        pod_name: &str,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        unit: &str,
+        replicas: u32,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetScaledResponse>>;
     /// Set the `infra_node.status` row.
     /// `command_id = Some(id)` for lifecycle-driven writes. The broker
     /// refuses the UPDATE when the caller's pod no longer owns the
@@ -74,6 +88,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         command_id: Option<i64>,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
@@ -88,6 +103,8 @@ pub trait BrokerSupervisorOps: Send + Sync {
         pod_name: &str,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        command_id: i64,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>>;
     /// `cancelled = true` records outcome `cancelled` (a user-honored
     /// cancel), never a failure; `error` then carries the halt point.
@@ -99,17 +116,19 @@ pub trait BrokerSupervisorOps: Send + Sync {
         cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
     /// Whether the user requested cancellation of a claimed command.
-    /// Polled between kubectl steps and inside readiness/drain waits.
+    /// Polled between cluster steps and inside readiness/drain waits.
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
-    async fn running_count(&self, project_id: uuid::Uuid) -> Result<i64>;
-    /// True if a user infra action (any uncompleted
-    /// infra_lifecycle_command: apply / stop / terminate) is in flight
-    /// for the project. The health loop stands down while it holds so
-    /// it never races a user action.
-    async fn infra_command_in_flight(&self, project_id: uuid::Uuid) -> Result<bool>;
+    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::member::Copies) -> Result<i64>;
+    /// The project's uncompleted supervisor commands (apply / stop /
+    /// terminate), each as the copies it acts on. The health loop stands
+    /// down for those copies so it never races a user action.
+    async fn infra_commands_in_flight(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> Result<Vec<weft_broker_client::protocol::InFlightCommand>>;
     /// Pre-apply commitment. Writes the infra_node row at
     /// Provisioning status with the locked-in (instance_id,
-    /// namespace, preserve_pvcs) tuple. Subsequent kubectl-apply
+    /// namespace, preserve_pvcs) tuple. Subsequent apply
     /// failure leaves a visible row the user can Terminate;
     /// apply success flips Provisioning -> Running via set_applied.
     async fn set_provisioning(
@@ -118,6 +137,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         namespace: &str,
         preserve_pvcs: Vec<String>,
@@ -133,6 +153,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
@@ -190,9 +211,10 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         &self,
         project_id: uuid::Uuid,
         node_id: Option<&str>,
+        member: Option<&weft_core::member::MemberId>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64> {
-        BrokerSupervisorClient::event_record(self, project_id, node_id, event).await
+        BrokerSupervisorClient::event_record(self, project_id, node_id, member, event).await
     }
     async fn set_status(
         &self,
@@ -200,6 +222,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         command_id: Option<i64>,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
@@ -211,6 +234,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             command_id,
             project_id,
             node_id,
+            member,
             unit,
             status,
             failure_stage,
@@ -218,13 +242,26 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         )
         .await
     }
+    async fn set_scaled(
+        &self,
+        pod_name: &str,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        unit: &str,
+        replicas: u32,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetScaledResponse>> {
+        BrokerSupervisorClient::set_scaled(self, pod_name, project_id, node_id, member, unit, replicas).await
+    }
     async fn remove_node(
         &self,
         pod_name: &str,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        command_id: i64,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>> {
-        BrokerSupervisorClient::remove_node(self, pod_name, project_id, node_id).await
+        BrokerSupervisorClient::remove_node(self, pod_name, project_id, node_id, member, command_id).await
     }
     async fn command_complete(
         &self,
@@ -240,11 +277,14 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
         BrokerSupervisorClient::command_cancel_requested(self, command_id).await
     }
-    async fn running_count(&self, project_id: uuid::Uuid) -> Result<i64> {
-        BrokerSupervisorClient::running_count(self, project_id).await
+    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::member::Copies) -> Result<i64> {
+        BrokerSupervisorClient::running_count(self, project_id, copies).await
     }
-    async fn infra_command_in_flight(&self, project_id: uuid::Uuid) -> Result<bool> {
-        BrokerSupervisorClient::infra_command_in_flight(self, project_id).await
+    async fn infra_commands_in_flight(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> Result<Vec<weft_broker_client::protocol::InFlightCommand>> {
+        BrokerSupervisorClient::infra_commands_in_flight(self, project_id).await
     }
     async fn set_provisioning(
         &self,
@@ -252,6 +292,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         namespace: &str,
         preserve_pvcs: Vec<String>,
@@ -263,6 +304,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             command_id,
             project_id,
             node_id,
+            member,
             instance_id,
             namespace,
             preserve_pvcs,
@@ -276,6 +318,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
@@ -289,6 +332,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             command_id,
             project_id,
             node_id,
+            member,
             instance_id,
             applied_spec_hash,
             addresses,

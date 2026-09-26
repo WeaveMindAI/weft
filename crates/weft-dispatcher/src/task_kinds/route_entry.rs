@@ -113,7 +113,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             Ok(crate::journal::ColorLookup::Corrupt) => anyhow::bail!(
                 "journal row for color {color} is corrupt; see dispatcher logs"
             ),
-            Err(e) => return park_fire(state, task, &payload, &format!("journal read: {e}")).await,
+            Err(e) => return park_fire(state, task, &payload, &Unrouted::Retry(format!("journal read: {e}"))).await,
         };
         if born.is_some() {
             forget_parked_twin(state, &payload).await;
@@ -126,9 +126,9 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         {
             let routed = match pre_journal_route(state, &payload).await {
                 Ok(v) => v,
-                Err(e) => return park_fire(state, task, &payload, &e.to_string()).await,
+                Err(e) => return park_fire(state, task, &payload, &Unrouted::of(e)).await,
             };
-            let RoutedFire { signal, program, fire } = routed;
+            let RoutedFire { signal, program, fire, member_values } = routed;
             let candidate_hash = program.definition_hash.clone();
             // A trigger that reaches no output has nothing to run: not a
             // failure, not a park (a park would drain it back into this
@@ -143,7 +143,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             // pulses into that program's consumers, which park forever and
             // end the run Stuck.
             let Some(source_version) = signal.source_version.as_deref() else {
-                return park_fire(state, task, &payload, &format!("trigger '{}' has no original source version; activate it again", signal.node_id)).await;
+                return park_fire(state, task, &payload, &Unrouted::Retry(format!("trigger '{}' has no original source version; activate it again", signal.node_id))).await;
             };
             let (start, kick_events) = crate::api::project::execution_birth_events(
                 color,
@@ -156,6 +156,9 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                 Some(&fire.subgraph),
                 None,
                 Some(source_version),
+                signal.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
+                Some(&signal.node_id),
+                weft_core::exec::RunKind::Execution,
                 now,
             );
             // The start write is the LAST fire-loss point: until it commits
@@ -165,14 +168,14 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             // finds the color born (above) and finishes it.
             let execution_task = crate::task_kinds::execute::execution_task_spec(
                 weft_task_store::TaskKind::Execute, signal.project_id, color,
-                &candidate_hash, &program.binary_hash, Some(&payload.tenant_id), None, None,
+                &candidate_hash, &program.binary_hash, &payload.tenant_id, None, None, None,
             )?;
             if let Err(e) = state
                 .journal
                 .start_execution(&start, &kick_events, execution_task, None)
                 .await
             {
-                return park_fire(state, task, &payload, &format!("ExecutionStarted write: {e}")).await;
+                return park_fire(state, task, &payload, &Unrouted::Retry(format!("ExecutionStarted write: {e}"))).await;
             }
         };
 
@@ -200,7 +203,23 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
 /// already settled); log it loud.
 async fn refinish_drain(state: &DispatcherState, task: &Task) {
     let Some(project_id) = task.project_id else { return };
-    if let Err(e) = crate::journal_bridge::try_finish_drain(state, project_id, Some(task.id)).await {
+    // The fire belonged to its signal's activation: that is the one a
+    // waiting deactivation may be counting it against.
+    let Ok(payload) = serde_json::from_value::<RouteEntryPayload>(task.payload.clone()) else { return };
+    let signal = match state.journal.signal_get(&payload.token).await {
+        Ok(Some(signal)) => signal,
+        // The row is gone (wiped under the fire): nothing to land.
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(target: "weft_dispatcher::route_entry", %project_id, error = %e,
+                "route_entry ended without a journal event, and its signal could not be read for the \
+                 drain re-check; the reaper's next sweep re-drives it");
+            return;
+        }
+    };
+    let Some(trigger) = signal.activation_trigger else { return };
+    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(signal.member));
+    if let Err(e) = crate::journal_bridge::try_finish_drain(state, project_id, &key, Some(task.id)).await {
         tracing::error!(
             target: "weft_dispatcher::route_entry",
             project_id = %project_id,
@@ -263,16 +282,15 @@ async fn pre_journal_route(
         .signal_get(&payload.token)
         .await?
         .ok_or_else(|| anyhow::anyhow!("signal {} not found", payload.token))?;
-    let lifecycle = state
-        .projects
-        .lifecycle(signal.project_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("project {} not found; cannot route fire", signal.project_id))?;
-    if lifecycle.status != crate::project_store::ProjectStatus::Active {
+    // The authoritative re-check of the gate the fire passed: the
+    // activation governing the signal must still be Active (a sibling
+    // Pod may have taken it down since).
+    let gate = crate::api::signal::signal_gate(state, &signal).await?;
+    if gate.status != crate::activation_store::ProjectStatus::Active {
         anyhow::bail!(
-            "project {} is {} (not Active) at route time",
-            signal.project_id,
-            lifecycle.status
+            "trigger '{}' is {} (not Active) at route time",
+            signal.node_id,
+            gate.status
         );
     }
 
@@ -285,7 +303,64 @@ async fn pre_journal_route(
         &payload.payload,
         signal.port_snapshot.as_ref(),
     ).map_err(anyhow::Error::msg)?;
-    Ok(RoutedFire { signal, program, fire })
+    // A per-member trigger copy fires for its member. What the fire
+    // reaches must be ready for that member (their values filled and
+    // valid, infra up); when it is not, the fire parks. One waiting on
+    // the member's values routes again when they change them; one
+    // waiting on anything else (their copy coming up) retries on the
+    // backoff. The values read here are the run's.
+    let member_values = crate::api::project::refuse_member_gaps(
+        state,
+        signal.project_id,
+        &project_def,
+        &fire.subgraph,
+        signal.member.as_ref(),
+    )
+    .await
+    .map_err(|gap| match gap {
+        crate::api::project::RunGap::MemberValues(refusal) => anyhow::Error::new(MemberValuesGap(refusal.to_string())),
+        crate::api::project::RunGap::Other((_, why)) => anyhow::anyhow!("{why}"),
+    })?;
+    Ok(RoutedFire { signal, program, fire, member_values })
+}
+
+/// A fire refused because its member has not given (or gave an invalid)
+/// value it needs: the refusal, naming each field.
+#[derive(Debug)]
+struct MemberValuesGap(String);
+
+impl std::fmt::Display for MemberValuesGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MemberValuesGap {}
+
+/// Why a fire could not be routed, which decides when it is tried again.
+enum Unrouted {
+    /// Waiting on the member's values: routed again when they change
+    /// (`member_values::change`) or the trigger is activated, never on a
+    /// timer, since nothing else can close the gap.
+    MemberValues(String),
+    /// Anything else (a transient read, the trigger not Active at route
+    /// time, the member's copy still down): retried on the backoff.
+    Retry(String),
+}
+
+impl Unrouted {
+    fn of(error: anyhow::Error) -> Self {
+        match error.downcast::<MemberValuesGap>() {
+            Ok(MemberValuesGap(reason)) => Unrouted::MemberValues(reason),
+            Err(other) => Unrouted::Retry(other.to_string()),
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Unrouted::MemberValues(reason) | Unrouted::Retry(reason) => reason,
+        }
+    }
 }
 
 /// The routing decision for one fire, everything the journal write and
@@ -295,6 +370,8 @@ struct RoutedFire {
     signal: crate::journal::SignalRegistration,
     program: weft_core::project::hash::ProgramIdentity,
     fire: crate::api::project::TriggerFire,
+    /// What the fire's member provides, as the gate read and checked it.
+    member_values: weft_core::member::MemberValues,
 }
 
 /// The execution color for a fire: `v5(fire_id)`, derived from the FIRE
@@ -335,7 +412,8 @@ async fn definition_for(
 /// Re-park a fire whose pre-journal routing failed (or which arrived at
 /// a non-Active project), so it survives instead of being lost when the
 /// task goes terminal: the reaper's parked-fire sweep retries it after
-/// its backoff, or the next activate drains it. Idempotent on retry (task id
+/// its backoff, or, for one waiting on its member's values, their next
+/// change of values routes it; the next activate drains either. Idempotent on retry (task id
 /// is the fire identity). Then re-drive the drain CAS, since this task
 /// may have been the last in-flight item keeping `running_count` above
 /// zero and nothing was journaled to re-trigger the watcher. A drain-
@@ -345,8 +423,9 @@ async fn park_fire(
     state: &DispatcherState,
     task: &Task,
     payload: &RouteEntryPayload,
-    reason: &str,
+    unrouted: &Unrouted,
 ) -> Result<Value> {
+    let reason = unrouted.reason();
     // ParkedFire.id is the stable FIRE id (not the task id): a re-parked
     // fire is later drained under a NEW task but keeps this id, so the
     // re-dispatch dedups against any in-flight task carrying the same
@@ -359,7 +438,17 @@ async fn park_fire(
         payload: payload.payload.clone(),
         received_at_unix: now,
         attempts,
-        not_before_unix: now + crate::api::signal::park_backoff_secs(attempts),
+        // A fire waiting on its member's values carries no backoff: only
+        // their next change (or the trigger's activation) routes it, and
+        // that drain must find it due.
+        not_before_unix: match unrouted {
+            Unrouted::MemberValues(_) => 0,
+            Unrouted::Retry(_) => now + crate::api::signal::park_backoff_secs(attempts),
+        },
+        member_gap: match unrouted {
+            Unrouted::MemberValues(reason) => Some(reason.clone()),
+            Unrouted::Retry(_) => None,
+        },
     };
     use crate::api::signal::{ParkAppend, ParkRefusal};
     match crate::api::signal::append_parked_fire(&state.pg_pool, &payload.token, &entry).await? {
@@ -426,7 +515,8 @@ async fn park_fire(
     refinish_drain(state, task).await;
     // No immediate re-drain: the element carries its backoff stamp, and
     // the reaper's parked-fire sweep (`drain_due_parked_fires`) re-drives
-    // the token once it is due. A persistent failure therefore retries
+    // the token once it is due (one waiting on its member's values waits
+    // for their next change instead). A persistent failure therefore retries
     // every few minutes at most, instead of park / drain / enqueue / fail
     // spinning against Postgres and the logs. This task's dedup slot
     // frees when it returns, so the sweep's enqueue lands on a fresh task.

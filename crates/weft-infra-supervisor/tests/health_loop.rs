@@ -32,6 +32,8 @@ fn unit_map(
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
             image_refs: Default::default(),
+            watched: true,
+            scaled_to: None,
         },
     );
     m
@@ -47,6 +49,11 @@ const ACTIVE_HEALTHY: uuid::Uuid = uuid::Uuid::from_u128(0xe78b1a9b48520b1);
 const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
 
+/// A stop of every node's shared copies, in flight.
+fn whole_project_command() -> weft_broker_client::protocol::InFlightCommand {
+    weft_broker_client::protocol::InFlightCommand { node_id: None, copies: weft_core::member::Copies::Shared }
+}
+
 fn rig() -> SupervisorTestRig {
     let rig = SupervisorTestRig::with_tenant(TENANT);
     rig.broker.add_project(PROJECT, NAMESPACE);
@@ -55,6 +62,13 @@ fn rig() -> SupervisorTestRig {
 
 fn workload(name: &str, node_id: &str, desired: i64, ready: i64) -> WorkloadReplicaState {
     workload_with_unit(name, node_id, "bridge", desired, ready)
+}
+
+/// The one-unit workload of the copy deployed as `instance`.
+fn workload_for_instance(instance: &str, node_id: &str, desired: i64, ready: i64) -> WorkloadReplicaState {
+    let mut w = workload(&format!("{instance}-{node_id}"), node_id, desired, ready);
+    w.labels.insert("weft.dev/instance".into(), instance.into());
+    w
 }
 
 fn workload_with_unit(
@@ -98,7 +112,7 @@ async fn provisioning_node_not_yet_ready_does_not_flap_flaky() {
     }
 
     let events = rig.broker.events();
-    let kinds: Vec<&str> = events.iter().map(|(_, _, k, _)| k.as_str()).collect();
+    let kinds: Vec<&str> = events.iter().map(|(_, _, _, k, _)| k.as_str()).collect();
     assert!(
         !kinds.contains(&"flaky"),
         "should not emit flaky for provisioning node"
@@ -121,7 +135,7 @@ async fn health_skips_project_while_infra_command_in_flight() {
     rig.kube
         .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
     // A user infra action is running.
-    rig.broker.set_infra_command_in_flight(PROJECT, true);
+    rig.broker.set_infra_commands_in_flight(PROJECT, vec![whole_project_command()]);
 
     // Run well past the flaky window: with no gate, this would emit
     // flaky + reconcile status. With the gate, nothing happens.
@@ -136,12 +150,52 @@ async fn health_skips_project_while_infra_command_in_flight() {
     // The loop checked the gate and did NOT proceed to set_status.
     let calls = rig.broker.calls();
     assert!(
-        calls.iter().any(|c| matches!(c, BrokerCall::InfraCommandInFlight { .. })),
+        calls.iter().any(|c| matches!(c, BrokerCall::InfraCommandsInFlight { .. })),
         "the gate was consulted"
     );
     assert!(
         !calls.iter().any(|c| matches!(c, BrokerCall::SetStatus { .. })),
         "no autonomous status write while standing down"
+    );
+}
+
+/// A command in flight on one member's copy stands health down for that
+/// copy only: the shared copy of the same node, degraded, still turns
+/// flaky, while ada's copy (as degraded) is left to the command.
+#[tokio::test]
+async fn health_stands_down_only_for_the_copy_a_command_reaches() {
+    let rig = rig();
+    let ada = weft_core::member::MemberId::new("ada").unwrap();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada, "inst-ada", Status::Running);
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_for_instance("inst1", NODE, 1, 1), workload_for_instance("inst-ada", NODE, 1, 1)],
+    );
+    rig.tick_health().await.unwrap();
+    rig.broker.set_infra_commands_in_flight(
+        PROJECT,
+        vec![weft_broker_client::protocol::InFlightCommand {
+            node_id: Some(NODE.to_string()),
+            copies: weft_core::member::Copies::Member(ada.clone()),
+        }],
+    );
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_for_instance("inst1", NODE, 1, 0), workload_for_instance("inst-ada", NODE, 1, 0)],
+    );
+    rig.tick_health().await.unwrap();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+
+    let flaky: Vec<_> = rig.broker.events().into_iter().filter(|(_, _, _, k, _)| k == "flaky").collect();
+    assert_eq!(flaky.len(), 1, "{flaky:?}");
+    assert_eq!(flaky[0].2, None, "the shared copy, never ada's");
+    assert_eq!(rig.broker.infra_copy(PROJECT, NODE, None).unwrap().status, Status::Flaky);
+    assert_eq!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada)).unwrap().status, Status::Running);
+    assert!(
+        !rig.broker.status_writes().iter().any(|(_, _, member, _)| member.is_some()),
+        "no status write for the copy the command owns"
     );
 }
 
@@ -157,14 +211,14 @@ async fn health_rearms_after_infra_command_completes() {
 
     // A user action runs (e.g. an upgrade): health stands down. The
     // gate also clears any in-memory window, so health resumes clean.
-    rig.broker.set_infra_command_in_flight(PROJECT, true);
+    rig.broker.set_infra_commands_in_flight(PROJECT, vec![whole_project_command()]);
     rig.advance(Duration::from_secs(60));
     rig.tick_health().await.unwrap();
     assert!(rig.broker.events().is_empty(), "gated: no events");
 
     // Action completes; node is back up and healthy. Health re-arms
     // and establishes a fresh ready baseline.
-    rig.broker.set_infra_command_in_flight(PROJECT, false);
+    rig.broker.set_infra_commands_in_flight(PROJECT, Vec::new());
     rig.tick_health().await.unwrap();
 
     // Now the node genuinely degrades, post-action. Flaky must fire
@@ -175,7 +229,7 @@ async fn health_rearms_after_infra_command_completes() {
     rig.advance(Duration::from_secs(35)); // past the 30s flaky window
     rig.tick_health().await.unwrap();
 
-    let kinds: Vec<String> = rig.broker.events().iter().map(|(_, _, k, _)| k.clone()).collect();
+    let kinds: Vec<String> = rig.broker.events().iter().map(|(_, _, _, k, _)| k.clone()).collect();
     assert!(kinds.contains(&"flaky".to_string()), "health re-armed after the command completed");
 }
 
@@ -199,21 +253,21 @@ async fn full_lifecycle_emits_flaky_then_recovered() {
     // Tick 2 (immediately): still inside flaky window, no flaky yet.
     rig.tick_health().await.unwrap();
     let event_kinds: Vec<String> =
-        rig.broker.events().iter().map(|(_, _, k, _)| k.clone()).collect();
+        rig.broker.events().iter().map(|(_, _, _, k, _)| k.clone()).collect();
     assert!(!event_kinds.contains(&"flaky".to_string()));
 
     // Advance past flaky window. Tick 3: emits flaky + sets status.
-    // The default `auto-recover-on-zero-ready` protocol ALSO fires
-    // here, enqueueing a `reactivate` lifecycle command via
-    // `enqueue_lifecycle`. We filter for `flaky` event_record
-    // entries specifically; protocol firing is observed via
+    // The default `park-while-infra-broken` protocol ALSO fires here,
+    // enqueueing a `deactivate` lifecycle command via
+    // `enqueue_lifecycle`. We filter for `flaky` event_record entries
+    // specifically; protocol firing is observed via
     // `BrokerCall::EnqueueLifecycle` counts (see the
-    // `fired_set_rearms_when_all_nodes_healthy` test).
+    // `fired_set_rearms_when_the_copy_heals` test).
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
 
     let events = rig.broker.events();
-    let flaky_events: Vec<_> = events.iter().filter(|(_, _, k, _)| k == "flaky").collect();
+    let flaky_events: Vec<_> = events.iter().filter(|(_, _, _, k, _)| k == "flaky").collect();
     assert_eq!(flaky_events.len(), 1);
     assert_eq!(flaky_events[0].1.as_deref(), Some(NODE));
     let status = rig.broker.infra_node(PROJECT, NODE).unwrap().status;
@@ -227,7 +281,7 @@ async fn full_lifecycle_emits_flaky_then_recovered() {
     // no recovered yet.
     rig.tick_health().await.unwrap();
     let event_kinds: Vec<String> =
-        rig.broker.events().iter().map(|(_, _, k, _)| k.clone()).collect();
+        rig.broker.events().iter().map(|(_, _, _, k, _)| k.clone()).collect();
     assert!(!event_kinds.contains(&"recovered".to_string()));
 
     // Advance past recovery window. Tick 5: emits recovered.
@@ -235,7 +289,7 @@ async fn full_lifecycle_emits_flaky_then_recovered() {
     rig.tick_health().await.unwrap();
 
     let events = rig.broker.events();
-    let kinds: Vec<String> = events.iter().map(|(_, _, k, _)| k.clone()).collect();
+    let kinds: Vec<String> = events.iter().map(|(_, _, _, k, _)| k.clone()).collect();
     assert!(kinds.contains(&"recovered".to_string()));
     let status = rig.broker.infra_node(PROJECT, NODE).unwrap().status;
     assert_eq!(status, Status::Running);
@@ -286,7 +340,7 @@ async fn one_flaky_unit_does_not_drag_down_a_healthy_sibling() {
         .broker
         .events()
         .into_iter()
-        .filter(|(_, _, k, _)| k == "flaky")
+        .filter(|(_, _, _, k, _)| k == "flaky")
         .collect();
     assert_eq!(flaky.len(), 1, "exactly one flaky edge (the sidecar)");
 
@@ -322,7 +376,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     // Stop: status flips to stopped. (Simulating what lifecycle's
     // stop verb would do; we just write directly here.)
     rig.broker
-        .set_status("test-pod", None, PROJECT, NODE, Some(NODE), Status::Stopped, None, None)
+        .set_status("test-pod", None, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
         .await
         .unwrap();
     rig.kube
@@ -335,7 +389,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
 
     // Start: status flips back to running, replicas come back.
     rig.broker
-        .set_status("test-pod", None, PROJECT, NODE, Some(NODE), Status::Running, None, None)
+        .set_status("test-pod", None, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
         .await
         .unwrap();
     rig.kube
@@ -348,26 +402,30 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     }
 
     let events = rig.broker.events();
-    let flaky_count = events.iter().filter(|(_, _, k, _)| k == "flaky").count();
+    let flaky_count = events.iter().filter(|(_, _, _, k, _)| k == "flaky").count();
     assert_eq!(flaky_count, 0, "no flaky event should fire on clean start");
 }
 
 // ---------- fired-set re-arm ----------
 
 #[tokio::test]
-async fn fired_set_rearms_when_all_nodes_healthy() {
-    // After a protocol fires (the default `AutoRecover` enqueues a
-    // `reactivate` lifecycle command), the supervisor remembers it
-    // in `fired_set` so it doesn't fire again on the same
-    // degradation. When the project becomes fully healthy again
-    // (all ratios >= 1.0), the set must re-arm so the next
-    // degradation triggers the protocol.
+async fn fired_set_rearms_when_the_copy_heals() {
+    // After a protocol fires (the default park enqueues a `deactivate`
+    // lifecycle command aimed at the broken copy), the supervisor
+    // remembers the copy in `fired` so it doesn't fire again on the
+    // same degradation. Once that copy is no longer broken, it must
+    // re-arm (`health_engine::rearm`) so its next degradation triggers
+    // the protocol again.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
 
-    // Degrade first: trigger fires (one EnqueueLifecycle).
+    // Degrade past the flaky window: the park fires (one EnqueueLifecycle).
     rig.kube
         .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap();
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
     let enqueue_count_1 = rig
@@ -378,15 +436,17 @@ async fn fired_set_rearms_when_all_nodes_healthy() {
         .count();
     assert_eq!(enqueue_count_1, 1, "default protocol should fire once");
 
-    // Recover.
+    // Recover: ready for the whole recovery window.
     rig.kube
         .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
 
-    // Degrade again.
+    // Degrade again, past the flaky window.
     rig.kube
         .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap();
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
 
@@ -631,8 +691,8 @@ async fn completed_action_frees_in_flight() {
     // The success side, through the FULL tick: the action does NOT
     // hang, the timeout wrapper is transparent, the action runs
     // (delete_pods called) and the in_flight slot frees. Together
-    // with `action_timeout_fires_over_hung_kube_call` this covers
-    // both arms of the timeout match in `tick_project`.
+    // with `hung_action_times_out_frees_inflight_and_unlatches_fired`
+    // this covers both arms of the timeout match in `tick_project`.
     let rig = rig_with_bounce_protocol();
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
@@ -658,7 +718,8 @@ async fn set_applied_landing_mid_flaky_is_re_observed_next_tick() {
     // lands while the supervisor's in-RAM flaky tracker still sees
     // degraded replicas, the row briefly flips `flaky` → `running`.
     // The next health tick must re-observe and re-write `flaky`
-    // because the tracker's `last_not_ready_since` persists.
+    // because the in-RAM latch (`declared_flaky`, with its
+    // `last_not_ready_at`) persists across the row's rewrite.
     //
     // Without that property, the row sticks at `running` while the
     // cluster is broken.
@@ -694,9 +755,9 @@ async fn set_applied_landing_mid_flaky_is_re_observed_next_tick() {
         );
     assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Running);
 
-    // Tick 3: replicas still degraded, tracker's
-    // `last_not_ready_since` still set from before. Tick must
-    // re-emit `flaky` and write Flaky status.
+    // Tick 3: replicas still degraded, the latch still declared flaky
+    // from before. The tick derives Flaky from the latch (no new edge,
+    // so no second `flaky` event) and writes Flaky status back.
     rig.advance(Duration::from_secs(1));
     rig.tick_health().await.unwrap();
     assert_eq!(
@@ -707,8 +768,8 @@ async fn set_applied_landing_mid_flaky_is_re_observed_next_tick() {
 }
 
 /// A frozen unit the row calls `Flaky`, still at 0 ready, must stay
-/// `Flaky` on the first tick after the project's latches were cleared
-/// (every lifecycle command clears them): the fresh latch is seeded
+/// `Flaky` on the first tick after its latch was cleared (a command in
+/// flight on the copy clears it): the fresh latch is seeded
 /// from the row, so the reconcile has nothing to rewrite. Before the
 /// seeding, the empty latch derived `Running` and rewrote the unit,
 /// and the node with it, while nothing was ready.
@@ -726,11 +787,11 @@ async fn frozen_flaky_unit_is_not_rewritten_running_after_latch_reset() {
     );
     rig.kube
         .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
-    // A command in flight clears the project's latches and stands
-    // the tick down.
-    rig.broker.set_infra_command_in_flight(PROJECT, true);
+    // A command in flight on the copy clears its latch and stands the
+    // tick down for it.
+    rig.broker.set_infra_commands_in_flight(PROJECT, vec![whole_project_command()]);
     rig.tick_health().await.unwrap();
-    rig.broker.set_infra_command_in_flight(PROJECT, false);
+    rig.broker.set_infra_commands_in_flight(PROJECT, Vec::new());
 
     rig.advance(Duration::from_secs(1));
     rig.tick_health().await.unwrap();
@@ -755,46 +816,96 @@ async fn frozen_flaky_unit_is_not_rewritten_running_after_latch_reset() {
 
 // ---------- regression: two-stage default protocols ----------
 
+/// The take-downs the rig's broker was asked to enqueue for `project`.
+fn take_downs(rig: &SupervisorTestRig, project: uuid::Uuid) -> Vec<weft_broker_client::protocol::TakeDownReaders> {
+    rig.broker
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            BrokerCall::EnqueueLifecycle { project_id, spec: weft_broker_client::protocol::LifecycleSpec::Deactivate(d) }
+                if project_id == project =>
+            {
+                Some(d)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn default_protocol_parks_active_project_on_infra_broken() {
-    // Round-6 reshape: default protocol pair is
-    //   - park-while-infra-broken    (Active + zero ready → Park)
-    //   - auto-recover-when-healthy  (Inactive + ready    → Reactivate)
-    // Confirm stage 1: an Active project with broken infra enqueues
-    // a dispatcher-targeted deactivate(park) command.
+async fn default_protocol_parks_what_reads_the_broken_copy() {
+    // Stage 1 of the default pair: an Active project whose unit stays
+    // not ready for the whole flaky window (after having been ready)
+    // enqueues a park aimed at that copy, and only at it: the
+    // dispatcher then parks only the triggers reading it.
     let rig = rig();
-    // Project starts Active.
     rig.broker.add_project_with_status(
         PROJ_ACTIVE,
         "wft-project-test-active",
         weft_broker_client::protocol::ProjectStatus::Active,
     );
     rig.broker.add_infra_node(PROJ_ACTIVE, NODE, "inst1", Status::Running);
-    rig.kube.set_workloads(
-        "wft-project-test-active",
-        vec![workload("inst1-bridge", NODE, 1, 0)],
-    );
+    rig.kube.set_workloads("wft-project-test-active", vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
+    rig.kube.set_workloads("wft-project-test-active", vec![workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap();
+    assert!(take_downs(&rig, PROJ_ACTIVE).is_empty(), "one bad reading parks nothing");
+
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
+    let parks = take_downs(&rig, PROJ_ACTIVE);
+    assert_eq!(parks.len(), 1, "the latched breakage parks once");
+    assert_eq!(parks[0].spec.mode, weft_broker_client::protocol::DeactivationMode::Park);
+    assert_eq!(
+        parks[0].reach,
+        weft_broker_client::protocol::TakeDownReach::ReadersOf {
+            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), member: None }]
+        }
+    );
+}
 
-    let calls = rig.broker.calls();
-    let enqueued = calls.iter().any(|c| matches!(
-        c,
-        BrokerCall::EnqueueLifecycle { project_id, spec }
-            if *project_id == PROJ_ACTIVE
-            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Deactivate(_))
-    ));
-    assert!(
-        enqueued,
-        "default protocol park-while-infra-broken must enqueue a deactivate when infra degrades on an Active project"
+/// The incident: a member's copy was just applied (its row says
+/// Running) and its workload has not reached the watch yet. Unknown is
+/// not broken: however long that lasts, nothing parks and nothing is
+/// called flaky. A member's copy that does break parks only that copy.
+#[tokio::test]
+async fn a_copy_the_watch_has_not_seen_never_parks_and_a_broken_one_parks_alone() {
+    let rig = rig();
+    let ada = weft_core::member::MemberId::new("ada").unwrap();
+    rig.broker.add_infra_node(PROJECT, "shared", "inst-shared", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada, "inst1", Status::Running);
+    let mut shared = workload_with_unit("inst-shared-shared", "shared", "shared", 1, 1);
+    shared.labels.insert("weft.dev/instance".into(), "inst-shared".into());
+    rig.kube.set_workloads(NAMESPACE, vec![shared.clone()]);
+    for _ in 0..4 {
+        rig.advance(Duration::from_secs(60));
+        rig.tick_health().await.unwrap();
+    }
+    assert!(take_downs(&rig, PROJECT).is_empty(), "an unseen copy is unknown, never broken");
+    assert!(!rig.broker.events().iter().any(|(_, _, _, k, _)| k == "flaky"));
+
+    // Ada's copy shows up ready, then breaks for the whole window.
+    rig.kube.set_workloads(NAMESPACE, vec![shared.clone(), workload("inst1-bridge", NODE, 1, 1)]);
+    rig.tick_health().await.unwrap();
+    rig.kube.set_workloads(NAMESPACE, vec![shared, workload("inst1-bridge", NODE, 1, 0)]);
+    rig.tick_health().await.unwrap();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    let parks = take_downs(&rig, PROJECT);
+    assert_eq!(parks.len(), 1);
+    assert_eq!(
+        parks[0].reach,
+        weft_broker_client::protocol::TakeDownReach::ReadersOf {
+            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), member: Some(ada) }]
+        },
+        "only ada's copy is broken; the shared one is healthy"
     );
 }
 
 #[tokio::test]
-async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
-    // Stage 2 of the two-stage protocol: an Inactive project with
-    // every infra node ready triggers a reactivate, BUT ONLY if the
-    // health loop is the one that deactivated it (`deactivated_by_health`).
+async fn default_protocol_auto_recovers_what_it_parked_on_infra_healthy() {
+    // Stage 2 of the two-stage protocol: with every seen unit healthy
+    // and something the health loop parked still down, reactivate.
     let rig = rig();
     rig.broker.add_project_with_status(
         PROJ_INACTIVE,
@@ -802,14 +913,13 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The health loop parked it: auto-recover is allowed to undo it.
-    rig.broker.set_deactivated_by_health(PROJ_INACTIVE, true);
+    rig.broker.set_health_parked(PROJ_INACTIVE, true);
     rig.broker.add_infra_node(PROJ_INACTIVE, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-project-test-inactive",
         vec![workload("inst1-bridge", NODE, 1, 1)],
     );
 
-    // Tick: infra is healthy, project is inactive, health parked it → reactivate.
     rig.tick_health().await.unwrap();
 
     let calls = rig.broker.calls();
@@ -817,31 +927,30 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
         c,
         BrokerCall::EnqueueLifecycle { project_id, spec }
             if *project_id == PROJ_INACTIVE
-            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate)
+            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate(_))
     ));
     assert!(
         reactivated,
-        "default protocol auto-recover-when-infra-healthy must enqueue a reactivate when infra is up on an Inactive project"
+        "default protocol auto-recover-when-infra-healthy must enqueue a reactivate when infra is up and it parked something"
     );
 }
 
 #[tokio::test]
 async fn default_protocol_does_not_reactivate_user_deactivated_project() {
     // Regression: the user clicked Stop infra (or Deactivate / Upgrade)
-    // on a running+active project. The deactivation flips the project
-    // Inactive, but the infra pods are still up for a moment (or being
-    // brought back up by a later Start). A health tick that lands while
-    // (infra healthy + Inactive) must NOT auto-reactivate, because the
-    // USER deactivated (`deactivated_by_health == false`), not the
-    // health loop. Before the gate, this raced into a reactivate and
-    // left the user with active triggers but no/just-stopped infra.
+    // on a running+active project. The infra pods are still up for a
+    // moment (or being brought back up by a later Start). A health tick
+    // that lands then must NOT auto-reactivate, because the USER
+    // deactivated (nothing is `health_parked`), not the health loop.
+    // Before the gate, this raced into a reactivate and left the user
+    // with active triggers but no/just-stopped infra.
     let rig = rig();
     rig.broker.add_project_with_status(
         PROJ_USER_OFF,
         "wft-project-test-user-off",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
-    // The USER deactivated: the flag stays false (default).
+    // The USER deactivated: nothing is health-parked (default).
     rig.broker.add_infra_node(PROJ_USER_OFF, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-project-test-user-off",
@@ -854,23 +963,21 @@ async fn default_protocol_does_not_reactivate_user_deactivated_project() {
         c,
         BrokerCall::EnqueueLifecycle { project_id, spec }
             if *project_id == PROJ_USER_OFF
-            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate)
+            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate(_))
     ));
     assert!(
         !any_reactivate,
-        "a USER-deactivated project (deactivated_by_health=false) must NOT be auto-reactivated, \
-         even when infra is healthy + Inactive"
+        "a USER-deactivated project (nothing health-parked) must NOT be auto-reactivated, \
+         even when infra is healthy"
     );
 }
 
 #[tokio::test]
 async fn default_protocol_does_not_fire_when_status_mismatches() {
-    // Cross-check: an Active project with HEALTHY infra must NOT
-    // enqueue a reactivate (the second-stage condition requires
-    // Inactive). And an Inactive project with BROKEN infra must
-    // NOT enqueue a park (the first-stage condition requires
-    // Active). Confirms the ProjectStatusEq clause actually
-    // gates each stage.
+    // Cross-check: an Active project with HEALTHY infra and nothing
+    // health-parked must NOT enqueue a reactivate. And an Inactive
+    // project with BROKEN infra must NOT enqueue a park (the
+    // first-stage condition requires Active: nothing listens to park).
     let rig = rig();
     rig.broker.add_project_with_status(
         ACTIVE_HEALTHY,
@@ -892,10 +999,21 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
     rig.broker.add_infra_node(INACTIVE_BROKEN, NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wft-inactive-broken",
+        vec![workload("inst1-bridge", NODE, 1, 1)],
+    );
+    rig.tick_health().await.unwrap();
+    rig.kube.set_workloads(
+        "wft-inactive-broken",
         vec![workload("inst1-bridge", NODE, 1, 0)],
     );
+    rig.tick_health().await.unwrap();
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
+    assert_eq!(
+        rig.broker.infra_node(INACTIVE_BROKEN, NODE).unwrap().status,
+        Status::Flaky,
+        "the unit did break"
+    );
 
     let calls = rig.broker.calls();
     let any_lifecycle = calls.iter().any(|c| matches!(c, BrokerCall::EnqueueLifecycle { .. }));
@@ -1000,7 +1118,7 @@ async fn three_stage_recovery_deactivate_bounce_reactivate() {
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
     assert!(
-        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Reactivate)),
+        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Reactivate(_))),
         "stage 3 must enqueue a Reactivate (auto-recover)"
     );
 
@@ -1012,7 +1130,7 @@ async fn three_stage_recovery_deactivate_bounce_reactivate() {
         matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Deactivate(_), .. })
     }).count();
     let reactivates = calls.iter().filter(|c| {
-        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Reactivate, .. })
+        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Reactivate(_), .. })
     }).count();
     assert_eq!(deactivates, 1, "exactly one deactivate across the cycle");
     assert_eq!(reactivates, 1, "exactly one reactivate across the cycle");
@@ -1040,7 +1158,7 @@ async fn a_change_the_watch_hands_over_is_evaluated_without_a_tick() {
     rig.advance(Duration::from_secs(35));
     rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 2, 0)]);
     rig.health_change().await;
-    let flaky: Vec<_> = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").collect();
+    let flaky: Vec<_> = rig.broker.events().into_iter().filter(|(_, _, _, k, _)| k == "flaky").collect();
     assert_eq!(flaky.len(), 1);
     assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Flaky);
     // No list: the watch is the only read of the cluster.
@@ -1163,7 +1281,7 @@ async fn a_watch_that_never_answers_does_not_block_other_projects() {
         .expect("the tick waited on the silent watch")
         .unwrap();
 
-    let flaky = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").count();
+    let flaky = rig.broker.events().into_iter().filter(|(_, _, _, k, _)| k == "flaky").count();
     assert_eq!(flaky, 1, "the answering project was evaluated");
     assert_eq!(rig.kube.live_watches(), 2, "the silent watch is kept, not restarted");
 }
@@ -1187,6 +1305,68 @@ async fn a_failing_watch_is_not_evaluated() {
 
     rig.kube.set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
     rig.tick_health().await.unwrap();
-    let flaky = rig.broker.events().into_iter().filter(|(_, _, k, _)| k == "flaky").count();
+    let flaky = rig.broker.events().into_iter().filter(|(_, _, _, k, _)| k == "flaky").count();
     assert_eq!(flaky, 1, "the watch answered again and is evaluated");
+}
+
+// ---------- protocol Scale: scale first, then record ----------
+
+/// A copy whose `bridge` workload has no ready replica, with a protocol
+/// that scales `unit` of it to zero.
+fn rig_with_scale_protocol(unit: &str) -> SupervisorTestRig {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.broker.set_health_protocols(
+        PROJECT,
+        serde_json::json!({
+            "protocols": [{
+                "name": "scale-down",
+                "when": { "kind": "node_ready_replicas", "node_id": NODE, "op": "eq", "value": 0 },
+                "action": { "kind": "scale", "node_id": NODE, "unit": unit, "replicas": 0 },
+                "timeout_seconds": 5
+            }]
+        }),
+    );
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![
+            workload_with_unit("inst1-bridge", NODE, "bridge", 1, 0),
+            workload_with_unit("inst1-other", NODE, "other", 1, 1),
+        ],
+    );
+    rig.advance(Duration::from_secs(35));
+    rig
+}
+
+/// A scale whose record the broker refuses (here: the unit is not in the
+/// copy's roster) fails the action, so the protocol is not latched as
+/// acted and retries once its backoff passes.
+#[tokio::test]
+async fn a_refused_scale_record_releases_the_latch() {
+    let rig = rig_with_scale_protocol("other");
+    rig.tick_health().await.unwrap();
+    assert!(!rig.kube.scale_calls().is_empty(), "the scale reached the cluster");
+    let reg = rig.state.health.lock().await;
+    assert!(!reg.is_fired(PROJECT, "scale-down"), "an unrecorded scale must not latch");
+    assert_eq!(reg.backoff_failures(PROJECT, "scale-down"), 1);
+}
+
+/// A scale the cluster refuses records nothing: the row never claims a
+/// zero the workload does not have, and the protocol retries.
+#[tokio::test]
+async fn a_failed_scale_records_nothing() {
+    let rig = rig_with_scale_protocol("bridge");
+    rig.kube.fail_next_scale();
+    rig.tick_health().await.unwrap();
+    assert!(!rig.broker.calls().iter().any(|c| matches!(c, BrokerCall::SetScaled { .. })));
+    let node = rig.broker.infra_node(PROJECT, NODE).unwrap();
+    assert_eq!(node.units["bridge"].scaled_to, None);
+    assert!(!rig.state.health.lock().await.is_fired(PROJECT, "scale-down"));
+
+    // Past the backoff the retry scales and records.
+    rig.advance(Duration::from_secs(6));
+    rig.tick_health().await.unwrap();
+    let node = rig.broker.infra_node(PROJECT, NODE).unwrap();
+    assert_eq!(node.units["bridge"].scaled_to, Some(0));
+    assert!(rig.state.health.lock().await.is_fired(PROJECT, "scale-down"));
 }

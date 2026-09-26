@@ -87,3 +87,16 @@ you assert on that:
 assert_eq!(rig.execution_tags(), vec!["chat_7"]);
 assert_eq!(rig.stops().len(), 1);
 ```
+
+## Taking down what your own run uses
+
+`StopSelf` is also the last argument of every call that takes part of the
+project down (`ctx.infra("bridge").stop(..)`, `terminate(..)`,
+`ctx.trigger("receive").deactivate(..)`, `ctx.runs().clean(..)`). For what
+`Keep` and `Include` do there, go and read
+[taking something down from a run](../running/members.md#taking-something-down-from-a-run).
+
+In a test, `rig.program_calls()` lists every such call with the `StopSelf` it
+passed. If your node reads something back, such as an infra copy's status,
+`rig.answer_program_call("weft.infra.status", ..)` sets what that call returns
+in the test.

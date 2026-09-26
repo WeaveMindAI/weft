@@ -2,14 +2,16 @@
 //! No build required; deactivate just drops trigger URLs (or
 //! preserves them, per --mode).
 //!
-//! Also home to [`prompt_trigger_deactivation`]: the shared helper
-//! used by every CLI verb that takes triggers down as a side effect
-//! (`weft infra stop / terminate / upgrade`). One UX surface for
-//! trigger deactivation means improvements propagate everywhere.
+//! Also home to [`prompt_trigger_deactivation`] and
+//! [`post_with_trigger_choice`]: the shared helpers used by every CLI
+//! verb that takes triggers down as a side effect (`weft resync`, `weft
+//! infra stop / terminate / upgrade`). One UX surface for trigger
+//! deactivation means improvements propagate everywhere.
 
 use super::Ctx;
 use crate::commands::ensure::parse_running_choice;
 use crate::progress::ActionVerb;
+use weft_core::deactivation::{whose_triggers, DeactivateResponse};
 use weft_core::{DeactivateSpec, DeactivationMode, RunningPolicy, DEFAULT_GRACE_MINUTES};
 
 /// Resolve the trigger-deactivation choice (mode + grace + running
@@ -74,38 +76,116 @@ pub fn prompt_trigger_deactivation(
     Ok(spec)
 }
 
-/// Read the project's current lifecycle.status from the dispatcher.
-/// Returns `Ok(true)` when status == "active". Propagates errors
-/// so callers don't silently skip trigger-deactivation prompts on
-/// a network blip and then eat a 412 from the dispatcher.
-pub async fn project_is_active(
+/// The trigger-deactivation flags as a verb receives them from the
+/// command line, before they are read into a [`DeactivateSpec`]: the
+/// mode and grace, and the running-work pair that rides inside the
+/// choice (and answers the verb's own running work when no trigger
+/// comes down).
+#[derive(Debug, Default, Clone)]
+pub struct TriggerChoiceFlags {
+    pub mode: Option<String>,
+    pub grace: Option<u32>,
+    pub running_policy: Option<String>,
+    pub drain_timeout: Option<u64>,
+}
+
+/// The trigger-deactivation choice the person gave on the command line,
+/// `None` when they gave neither `--mode` nor `--grace`. A verb that
+/// takes triggers down only when some are on (the infra verbs) sends a
+/// given choice every time and lets the dispatcher use it or not; it is
+/// the dispatcher that knows whose triggers read what. `--running-policy`
+/// and `--drain-timeout` alone do not make a choice: they are the verb's
+/// own running-work answer, and they ride inside the choice when it is
+/// made.
+pub fn given_trigger_deactivation(
+    json: bool,
+    mode: Option<&str>,
+    grace: Option<u32>,
+    running_policy: RunningPolicy,
+    drain_timeout_secs: Option<u64>,
+) -> anyhow::Result<Option<DeactivateSpec>> {
+    if mode.is_none() && grace.is_none() {
+        return Ok(None);
+    }
+    prompt_trigger_deactivation(json, mode, grace, running_policy, drain_timeout_secs).map(Some)
+}
+
+/// POST `body` to `path`, carrying the trigger-deactivation choice under
+/// `triggerDeactivation` when there is one to carry. `given` (see
+/// [`given_trigger_deactivation`]) always goes along. Without it the body
+/// goes as it is, and when the dispatcher answers that triggers are on
+/// and it needs the choice, a person at a terminal (not `--json`) is
+/// asked and the request is sent once more with the answer; anyone else
+/// gets the dispatcher's refusal, which names the flags to pass.
+pub async fn post_with_trigger_choice(
     client: &crate::client::DispatcherClient,
-    project_id: &str,
-) -> anyhow::Result<bool> {
-    // Surfaces real errors (network blip, dispatcher down) so the
-    // caller doesn't silently skip the trigger-deactivation prompt
-    // and then eat a 412 from the dispatcher with no context.
-    let status: serde_json::Value = client
-        .get_json(&format!("/projects/{project_id}/status"))
-        .await?;
-    Ok(status
-        .get("status")
-        .and_then(|s| s.as_str())
-        .is_some_and(|s| s == "active"))
+    path: &str,
+    mut body: serde_json::Map<String, serde_json::Value>,
+    json: bool,
+    given: Option<DeactivateSpec>,
+    running_policy: RunningPolicy,
+    drain_timeout_secs: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(spec) = given {
+        body.insert("triggerDeactivation".into(), serde_json::to_value(spec)?);
+        return client.post_json(path, &serde_json::Value::Object(body)).await;
+    }
+    let refusal = match client.post_json_or_choice_needed(path, &serde_json::Value::Object(body.clone())).await? {
+        Ok(answer) => return Ok(answer),
+        Err(refusal) => refusal,
+    };
+    if json || !crate::prompt::is_interactive() {
+        return Err(NeedsTriggerChoice(refusal).into());
+    }
+    println!("Triggers are on and come down first.");
+    let spec = prompt_trigger_deactivation(false, None, None, running_policy, drain_timeout_secs)?;
+    body.insert("triggerDeactivation".into(), serde_json::to_value(spec)?);
+    client.post_json(path, &serde_json::Value::Object(body)).await
+}
+
+/// The dispatcher's refusal when triggers are on and nobody here could
+/// be asked how they come down: its message names the flags. A type of
+/// its own so the `--json` error event can say so as a fact
+/// (`needsTriggerChoice`, see `progress::error_detail`), which is what
+/// lets the editor open its picker instead of showing the refusal.
+#[derive(Debug)]
+pub struct NeedsTriggerChoice(pub String);
+
+impl std::fmt::Display for NeedsTriggerChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsTriggerChoice {}
+
+/// The line a plain deactivate adds when members still have triggers
+/// on: how many, who, and the flag that takes theirs down too. `None`
+/// when no member's are on.
+fn members_still_on_line(members: &[weft_core::member::MemberId]) -> Option<String> {
+    if members.is_empty() {
+        return None;
+    }
+    let names = members.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ");
+    let (count, have) = match members.len() {
+        1 => ("1 member".to_string(), "has"),
+        n => (format!("{n} members"), "have"),
+    };
+    Some(format!(
+        "{count} still {have} triggers on ({names}); `weft deactivate --all-members` takes theirs down too"
+    ))
 }
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
-    mode: Option<String>,
-    grace: Option<u32>,
-    running_policy: Option<String>,
-    drain_timeout: Option<u64>,
+    flags: TriggerChoiceFlags,
+    scope: weft_core::activation::ActivationScope,
+    all_members: bool,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Deactivate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, mode, grace, running_policy, drain_timeout)
-            .await
+        run_inner(&ctx_inner, &progress, project, flags, scope, all_members).await
     })
     .await
 }
@@ -114,16 +194,16 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     project: Option<String>,
-    mode: Option<String>,
-    grace: Option<u32>,
-    running_policy: Option<String>,
-    drain_timeout: Option<u64>,
+    flags: TriggerChoiceFlags,
+    scope: weft_core::activation::ActivationScope,
+    all_members: bool,
 ) -> anyhow::Result<()> {
     // No `--mode` off a terminal (or under `--json`) is `wipe` with the
     // running executions cancelled, the standing answer while building;
     // on a terminal `prompt_trigger_deactivation` asks.
-    let (running_policy, drain_timeout) = parse_running_choice(running_policy.as_deref(), drain_timeout)?;
-    let deactivation = prompt_trigger_deactivation(ctx.json(), mode.as_deref(), grace, running_policy, drain_timeout)?;
+    let (running_policy, drain_timeout) = parse_running_choice(flags.running_policy.as_deref(), flags.drain_timeout)?;
+    let deactivation =
+        prompt_trigger_deactivation(ctx.json(), flags.mode.as_deref(), flags.grace, running_policy, drain_timeout)?;
 
     let (client, id, name) = match project {
         Some(id) => (ctx.client(), id.clone(), id),
@@ -132,29 +212,44 @@ async fn run_inner(
 
     let path = format!("/projects/{id}/deactivate");
     // The dispatcher's `/deactivate` endpoint takes the `DeactivateSpec`
-    // itself, the same shape the infra verbs embed under
-    // `triggerDeactivation`.
-    let body = serde_json::to_value(&deactivation)?;
+    // itself (the same shape the infra verbs embed under
+    // `triggerDeactivation`), plus which activations it takes down.
+    let mut body = serde_json::to_value(&deactivation)?;
+    body["scope"] = serde_json::to_value(&scope)?;
+    if all_members {
+        body["allMembers"] = serde_json::json!(true);
+    }
     let mode_str = deactivation.mode.as_str();
     let running_policy_str = deactivation.running_policy.as_str();
     let grace_minutes =
         (deactivation.mode == DeactivationMode::Hibernate).then_some(deactivation.grace_minutes);
     progress.drain_wait(&body, deactivation.drain_timeout_secs);
     progress.dispatcher_call_start(&path);
-    client.post_with_body(&path, &body).await?;
+    let answer: DeactivateResponse = serde_json::from_value(client.post_json(&path, &body).await?)
+        .map_err(|e| anyhow::anyhow!("deactivate: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match"))?;
     let mut done = serde_json::Map::new();
     done.insert("mode".into(), serde_json::json!(mode_str));
     done.insert("runningPolicy".into(), serde_json::json!(running_policy_str));
     if let Some(g) = grace_minutes {
         done.insert("graceMinutes".into(), serde_json::json!(g));
     }
+    done.insert("deactivated".into(), serde_json::to_value(&answer.deactivated)?);
+    done.insert("membersStillOn".into(), serde_json::to_value(&answer.members_still_on)?);
     progress.dispatcher_call_done(serde_json::Value::Object(done));
     if !ctx.json() {
         let suffix = match grace_minutes {
             Some(g) => format!("[mode: {mode_str}, running: {running_policy_str}, grace: {g}min]"),
             None => format!("[mode: {mode_str}, running: {running_policy_str}]"),
         };
-        println!("deactivated {name} ({id}) {suffix}");
+        if answer.deactivated.is_empty() {
+            println!("no trigger in {name} ({id}) was on; nothing to deactivate {suffix}");
+        } else {
+            let whom = answer.deactivated.iter().map(whose_triggers).collect::<Vec<_>>().join(", ");
+            println!("deactivated {whom} in {name} ({id}) {suffix}");
+        }
+        if let Some(line) = members_still_on_line(&answer.members_still_on) {
+            println!("{line}");
+        }
     }
     progress.complete(&format!("deactivated {name} ({mode_str}/{running_policy_str})"));
     Ok(())
@@ -199,6 +294,32 @@ mod tests {
     fn prompt(mode: Option<&str>, policy: Option<&str>, cap: Option<u64>) -> anyhow::Result<DeactivateSpec> {
         let (running_policy, drain_timeout) = parse_running_choice(policy, cap)?;
         prompt_trigger_deactivation(true, mode, None, running_policy, drain_timeout)
+    }
+
+    /// Only `--mode` or `--grace` make a choice to send up front; the
+    /// running-work flags alone stay the verb's own answer, so a verb
+    /// with no trigger on is never refused over a choice it did not need.
+    #[test]
+    fn a_choice_is_given_by_mode_or_grace_only() {
+        let (cancel, none) = parse_running_choice(None, None).unwrap();
+        assert_eq!(super::given_trigger_deactivation(true, None, None, cancel, none).unwrap(), None);
+        let (wait, cap) = parse_running_choice(Some("wait"), Some(30)).unwrap();
+        assert_eq!(super::given_trigger_deactivation(true, None, None, wait, cap).unwrap(), None);
+        let park = super::given_trigger_deactivation(true, Some("park"), None, wait, cap).unwrap().expect("given");
+        assert_eq!((park.mode, park.running_policy, park.drain_timeout_secs), (DeactivationMode::Park, RunningPolicy::Wait, Some(30)));
+    }
+
+    #[test]
+    fn a_plain_deactivate_names_the_members_still_on() {
+        assert_eq!(super::members_still_on_line(&[]), None);
+        let one = super::members_still_on_line(&[weft_core::member::MemberId::new("ada").unwrap()]).unwrap();
+        assert!(one.starts_with("1 member still has triggers on (ada)") && one.contains("--all-members"), "{one}");
+        let two = super::members_still_on_line(&[
+            weft_core::member::MemberId::new("ada").unwrap(),
+            weft_core::member::MemberId::new("bob").unwrap(),
+        ])
+        .unwrap();
+        assert!(two.starts_with("2 members still have triggers on (ada, bob)"), "{two}");
     }
 
     /// A script (and every agent) gets `wipe` with no flag: the

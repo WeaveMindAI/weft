@@ -159,10 +159,10 @@
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, node_test: false,
+                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    at_unix: 0,
+                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
                 },
                 None,
             )
@@ -304,7 +304,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -556,7 +556,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1044,7 +1044,7 @@
             journal.record_event(&ExecEvent::ExecutionStarted {
                 color, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1057,7 +1057,7 @@
             fake_access_broker.set_owned_bearer_connection(
                 "conn-1",
                 "sk-platform",
-                weft_core::CredentialOwner::Ours,
+                weft_core::CredentialOwner::Platform,
             );
             let clients = EngineClients { access_broker: fake_access_broker.clone(), ..clients(journal.clone()) };
             let cancel = CancellationFlag::new_arc();
@@ -1290,10 +1290,10 @@
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, node_test: false,
+                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    at_unix: 0,
+                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
                 },
                 None,
             )
@@ -2059,10 +2059,10 @@
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, node_test: false,
+                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    at_unix: 0,
+                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
                 },
                 None,
             )
@@ -2391,7 +2391,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {

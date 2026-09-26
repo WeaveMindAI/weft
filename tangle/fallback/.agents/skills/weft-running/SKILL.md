@@ -147,15 +147,18 @@ status` and the graph print back.
 | `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
 | `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project needs `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes). Both take `--running-policy <cancel\|wait>`, default `cancel`: on `activate` it says what happens to a worker still up from an older build (cancel what it runs and replace it now, or `wait` for its executions to land, up to `--drain-timeout` seconds); on `deactivate` the same for the project's running executions |
-| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only for an ACTIVE project (a parked or hibernated one refuses: `weft activate` first), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
-| `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` / `logs` | the project's [infra] (see The infra verbs) |
+| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only while some trigger is on, the program's or a member's (with none on it refuses: `weft activate` first), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
+| `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` / `logs` / `show` / `press` / `env` | the project's [infra] (see The infra verbs) |
+| `weft connect-lib` | copy weft's connect library into the frontend (`front/src/lib/weft-connect`, `--into <dir>` for another folder) so its pages show the editor's connection pickers; the `weft-frontend` skill has when and how. Replaces that folder each run |
 | `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension. `mint` prints the connect URL, then the bare token on its own line for a script |
 | `weft daemon start` / `status` / `logs` | [the daemon]; only `status` and `logs` are yours |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's stdlib |
+| `weft options <step> <field> --search <text>` | the choices a field with a searchable list offers (a model id, a spreadsheet), the same list the editor shows, through the step's picked connection; write the id it prints. Before you write such a value as a default (`@member_filled("...")` included), check it here: nothing else checks it before a run fails |
 | `weft describe-nodes --list` | one line per node type; how you find one |
 | `weft describe-nodes --node <Type> --compact` | one node's wiring view; read it before wiring. With no flags you get the whole catalog as JSON, which is large |
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
-| `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
+| `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect`; `--member <id>` does the same as one member of the program on a node whose connection is `@member_filled`, the way their settings page would |
+| `weft member-values --member <id> [--set node.field=value]... [--clear node.field]...` | what the program asks that member to fill and what they gave; with `--set` / `--clear`, changes it in one go (their live triggers reading a changed value are set up again). Through a member token it mints and revokes |
 | `weft rm [--journal] [--local] [--all] --yes` | unregister the project, terminate [infra], reclaim data. `--journal` also drops its run history, `--local` its build artifacts, `--all` implies every flag. Asks first; pass `--yes`, and only after the user confirmed |
 | `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: a [color] takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. `--images` and `--build-cache` touch no journal rows. Deleting runs asks first; pass `--yes`, and only after the user confirmed |
 
@@ -185,8 +188,20 @@ validate --file src/main.weft < src/main.weft`, which reports the
 connect --node <id> --grant <id>`, or the user on the node's Connect button),
 never a source edit.
 
-A program with triggers listens only after `weft activate`. An edit to a
-trigger's subgraph takes effect only after `weft resync`.
+A program with triggers listens only after `weft activate`. Each trigger is
+turned on and off on its own: `--trigger <name>` on `activate`, `deactivate`,
+`resync`, `bake` and the cancel verbs acts on that trigger alone, and without
+it they act on every shared trigger. A deactivate drains or cancels only the
+runs its triggers fired; a run started by hand is left alone. A program with
+members (the `weft-members` skill) adds `--member <id>`. An edit to a
+trigger's subgraph takes effect only after `weft resync`, and a plain `weft
+resync` brings every trigger that is on up to the new code, each member's
+included. A plain `weft deactivate` leaves members' triggers on and says whose
+are still on; `weft deactivate --all-members --mode <mode>` takes theirs down.
+`weft status --json` lists every trigger with its member under `activations`;
+a trigger being turned on reads `activating` from the moment the activate is
+taken, and a member's trigger holding events until they fill a field carries
+`waiting` (`fires` and the `reason` naming the field).
 
 `project files changed while building; run the command again` means a file of
 the project was written while the build was reading it, which is almost always
@@ -265,12 +280,38 @@ restarts. You pick the verb by what you want to keep:
   again.
 - **If a verb is stuck mid-way**: `weft infra cancel` stops it between
   steps; whatever it already did stays done.
+- **If you want to see what an infra node shows**: `weft infra show <node>`.
+  A node's card can hold items (a status, an address, a secret) and buttons.
+  It prints every item and every button, with the action you hand to `weft
+  infra press`, and never prints a secret's value.
+- **If something outside the program needs values the [infra] shows** (a
+  frontend's database user and password): `weft infra env <node> --into
+  <file> --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes
+  them all into that env file in one go, each `NAME=Label` taking the card
+  item under that label as `weft infra show` prints it. `--as <NAME>` is the
+  short form for the card's only secret. A new file is readable by the user
+  only; an existing one has only those lines changed. A secret's value is
+  never printed, the other values are. Nobody edits the file by hand for a
+  value the card shows. If the secret is still on the card, that is all you
+  need.
+- **If the secret was already handed over**, `env` refuses and says what
+  the card shows instead. The card usually has a button that issues a new one:
+  `weft infra press <node> <action>` presses it (any card button, in fact),
+  then run `env` again. A button's warning (`weft infra show` prints it) says what the press breaks
+  (a new password cuts off everything holding the old one), so read it, and
+  ask the user before pressing a button that breaks something in use, unless
+  they already told you to.
 
-`stop`, `terminate` and `upgrade` take the project's triggers down first
-(nothing can fire at [infra] that is going away) and leave it deactivated, so
-each ends with `weft activate` when you want it listening again.
+`stop`, `terminate` and `upgrade` take down first the triggers that read
+the [infra] going away (nothing can fire at it) and leave them deactivated,
+so each ends with `weft activate` when you want them listening again. A
+trigger that reads none of it keeps listening throughout.
 
-`weft infra status` says per node whether it is running and its endpoint.
+`weft infra status` says per copy that exists whether it is running and its
+endpoint; `weft status` lists under `infra:` every infra node the program
+declares, one never started as `not started`, so an empty list there means no
+node needs [infra]. A start or stop on its way reads `provisioning` or
+`stopping` in every reader at once, before the containers move.
 `weft infra logs <node>` (or no node, for all) prints what the containers
 wrote, `--tail N` and `-f` as for a run: a failure inside a service is read
 there, with no kubectl.

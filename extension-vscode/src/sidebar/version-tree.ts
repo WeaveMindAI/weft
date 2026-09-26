@@ -9,7 +9,7 @@ import { describeOutcome } from './outcome';
 
 // SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-cli/src/commands/versions.rs Tree, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs), crates/weft-dispatcher/src/api/versions.rs TreeResponse, VersionSummary, RunSummary
 export interface TreeJson {
-  head: { head_version: string | null; head_run: string | null; activation_version: string | null };
+  head: { head_version: string | null; head_run: string | null; activated_versions: string[] };
   versions: VersionSummary[];
   runs: RunSummary[];
   /** The version the files on disk are, when it is one the tree holds. */
@@ -95,7 +95,7 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
       children: [],
       isHead: tree.head.head_version === v.id,
       isDisk: tree.disk_version === v.id,
-      isActivated: tree.head.activation_version === v.id,
+      isActivated: tree.head.activated_versions.includes(v.id),
     };
     const pending: VersionTreeNode[] = [root];
     while (pending.length > 0) {
@@ -109,7 +109,7 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
           children: [],
           isHead: tree.head.head_version === c.id,
           isDisk: tree.disk_version === c.id,
-          isActivated: tree.head.activation_version === c.id,
+          isActivated: tree.head.activated_versions.includes(c.id),
         };
         parent.children.push(child);
         pending.push(child);

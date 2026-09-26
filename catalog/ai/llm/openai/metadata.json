@@ -90,14 +90,14 @@
   "validate": [
     {
       "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "model"
-        }
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+        ]
       },
       "then": {
-        "message": "OpenAIProvider '{id}' has no model; name one on the node.",
+        "message": "OpenAIProvider '{id}' has no model; name one on the node or wire one in.",
         "level": "runtime",
         "field": "model"
       }

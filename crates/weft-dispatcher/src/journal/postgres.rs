@@ -118,6 +118,7 @@ fn corrupt_summary(
         tags: Vec::new(),
         cancel_cause: None,
         skipped_nodes: 0,
+        member: None,
     }
 }
 
@@ -137,7 +138,7 @@ fn summary_from_payloads(
 ) -> anyhow::Result<ExecutionSummary> {
     let started = decode_event(color, started_payload).map_err(anyhow::Error::msg)?;
     let ExecEvent::ExecutionStarted {
-        color, project_id, entry_node, phase, at_unix, ..
+        color, project_id, entry_node, phase, at_unix, member, ..
     } = started
     else {
         // The row was selected by kind = 'execution_started', so a
@@ -175,6 +176,7 @@ fn summary_from_payloads(
         tags,
         cancel_cause,
         skipped_nodes: skipped_nodes.max(0) as u64,
+        member,
     })
 }
 
@@ -367,11 +369,17 @@ impl PostgresJournal {
     /// execute task. The caller holds the color's lock
     /// (`weft_journal::lock_colors`), which is what serializes admission.
     async fn execution_already_started(tx: &mut sqlx::PgConnection, start: &ExecEvent) -> anyhow::Result<bool> {
-        let ExecEvent::ExecutionStarted { color, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, run_kind, .. } = start else {
             anyhow::bail!("execution admission requires a birth event");
         };
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM exec_event WHERE color = $1 AND kind = 'execution_started')")
-            .bind(color.to_string()).fetch_one(&mut *tx).await?)
+        // An unrecorded run journals no `ExecutionStarted`: its birth is
+        // its `execution_color` row alone.
+        let query = if run_kind.journaled() {
+            "SELECT EXISTS (SELECT 1 FROM exec_event WHERE color = $1 AND kind = 'execution_started')"
+        } else {
+            "SELECT EXISTS (SELECT 1 FROM execution_color WHERE color = $1)"
+        };
+        Ok(sqlx::query_scalar(query).bind(color.to_string()).fetch_one(&mut *tx).await?)
     }
 
     /// Write an `ExecutionStarted` event AND its `execution_color` seed on the
@@ -385,7 +393,7 @@ impl PostgresJournal {
         event: &ExecEvent,
         dedup_key: Option<&str>,
     ) -> anyhow::Result<()> {
-        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, node_test, source_version, .. } =
+        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, run_kind, source_version, member, fired_trigger, .. } =
             event
         else {
             anyhow::bail!("write_started_in requires an ExecutionStarted event");
@@ -393,19 +401,25 @@ impl PostgresJournal {
         if let Some(version) = source_version {
             crate::versions::retain_source_version(tx, *project_id, version).await?;
         }
-        weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // An unrecorded run is born with its color row alone: its
+        // `ExecutionStarted` rides the execute task instead.
+        if run_kind.journaled() {
+            weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         let rows = sqlx::query(
-            "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase, kind) \
-             SELECT $1, $2, p.tenant_id, $3, $4, $5 FROM project p WHERE p.id = $2 \
+            "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase, kind, member_id, fired_by) \
+             SELECT $1, $2, p.tenant_id, $3, $4, $5, $6, $7 FROM project p WHERE p.id = $2 \
              ON CONFLICT (color) DO NOTHING",
         )
         .bind(color.to_string())
         .bind(project_id)
         .bind(*at_unix as i64)
         .bind(phase.as_str())
-        .bind(if *node_test { "node_test" } else { "execution" })
+        .bind(run_kind.as_str())
+        .bind(member.as_ref().map(|m| m.as_str()))
+        .bind(fired_trigger.as_deref())
         .execute(&mut *tx)
         .await?;
         if rows.rows_affected() == 0 {
@@ -440,24 +454,24 @@ impl PostgresJournal {
     ) -> anyhow::Result<()> {
         Self::write_started_in(tx, start, None).await?;
         if let ExecEvent::ExecutionStarted { color, project_id, phase: weft_core::context::Phase::TriggerSetup, .. } = start {
-            // Serialize with activation's lifecycle claim. Ownership is born
-            // with the task, so a dead requester cannot leave an owner without work.
-            let lifecycle: (String, Option<uuid::Uuid>) = sqlx::query_as(
-                "SELECT status, activating_ts_color FROM project WHERE id = $1 FOR UPDATE",
-            ).bind(project_id).fetch_one(&mut *tx).await?;
+            // Serialize with the activation's claim: an activation's setup
+            // is born only while that activation still owns its rows (a
+            // cancel between the claim and here wins). Ownership is born
+            // with the task, so a dead requester cannot leave an owner
+            // without work. A bake (no activation) claims nothing.
             if let Some(expected) = expected_activation {
-                anyhow::ensure!(expected == *color && lifecycle.0 == "activating" && lifecycle.1 == Some(expected),
-                    "activation {expected} ended before trigger setup could start");
+                anyhow::ensure!(expected == *color, "activation {expected} starts setup {color}");
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM trigger_activation \
+                     WHERE project_id = $1 AND activating_color = $2 AND status = 'activating' FOR UPDATE)",
+                ).bind(project_id).bind(expected).fetch_one(&mut *tx).await?;
+                anyhow::ensure!(owned, "activation {expected} ended before trigger setup could start");
             }
-            anyhow::ensure!(lifecycle.0 != "activating" || lifecycle.1 == Some(*color),
-                "project is already activating; wait for it to finish or cancel activation");
-            let claimed = sqlx::query(
-                "INSERT INTO trigger_setup (project_id, color) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            ).bind(project_id).bind(color.to_string()).execute(&mut *tx).await?;
-            anyhow::ensure!(claimed.rows_affected() == 1,
-                "project already has a trigger setup running; wait for it or stop that execution");
+            sqlx::query("INSERT INTO trigger_setup (project_id, color) VALUES ($1, $2)")
+                .bind(project_id).bind(color.to_string()).execute(&mut *tx).await?;
         }
-        for kick in kicks {
+        let journaled = matches!(start, ExecEvent::ExecutionStarted { run_kind, .. } if run_kind.journaled());
+        for kick in kicks.iter().filter(|_| journaled) {
             weft_journal::record_event_in(&mut *tx, kick, None, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -473,21 +487,30 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "exec_event",
     tables: &["exec_event", "signal_token", "signal", "execution_color", "execution_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
+        // One row per trigger setup in flight. Several may run at once for
+        // one project (each activation claims its own triggers, one member's
+        // at a time), so the setup's own color is the key.
         r#"CREATE TABLE IF NOT EXISTS trigger_setup (
-            project_id UUID PRIMARY KEY,
-            color TEXT NOT NULL UNIQUE
+            project_id UUID NOT NULL,
+            color TEXT PRIMARY KEY
         )"#,
-        // One bake per (project, program identity). The key is the
-        // identity's digest (`ProgramIdentity::digest`): the identity
-        // itself lists one hash per compiled node type and does not fit
-        // a btree entry once a worker carries the whole catalog. The
-        // full identity travels inside `bake_json`.
+        r#"CREATE INDEX IF NOT EXISTS idx_trigger_setup_project ON trigger_setup(project_id)"#,
+        // One bake per (project, owner, program identity): a member's
+        // triggers capture that member's own values (their copy's
+        // address), so they are baked apart from the shared ones. The key
+        // is the identity's digest (`ProgramIdentity::digest`): the
+        // identity itself lists one hash per compiled node type and does
+        // not fit a btree entry once a worker carries the whole catalog.
+        // The full identity travels inside `bake_json`. A setup of some
+        // triggers merges its captures into the bake it shares a key with.
         r#"CREATE TABLE IF NOT EXISTS trigger_bake (
             project_id UUID NOT NULL,
+            member_id TEXT,
             program_hash TEXT NOT NULL,
-            bake_json TEXT NOT NULL,
-            PRIMARY KEY (project_id, program_hash)
+            bake_json TEXT NOT NULL
         )"#,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_bake_key
+             ON trigger_bake(project_id, member_id, program_hash) NULLS NOT DISTINCT"#,
         // exec_event: append-only journal. `dedup_key` is the
         // idempotency knob writers that may retry (dispatcher tasks
         // that crash mid-execution) populate; the partial UNIQUE
@@ -551,7 +574,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- `weft token mint --displays`.
             allowed_displays TEXT[] NOT NULL DEFAULT '{}',
             all_displays BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL
+            created_at BIGINT NOT NULL,
+            -- A member token: the member it acts as, in its one project
+            -- (`allowed_projects` holds exactly that one). NULL for a
+            -- token that acts as nobody in particular.
+            member_id TEXT,
+            -- When it stops working (unix seconds); NULL never. A
+            -- member token always has one: it lives in a browser.
+            expires_at BIGINT,
+            CONSTRAINT signal_token_member_has_one_project
+                CHECK (member_id IS NULL OR cardinality(allowed_projects) = 1),
+            CONSTRAINT signal_token_member_expires
+                CHECK (member_id IS NULL OR expires_at IS NOT NULL)
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_token_tenant ON signal_token(tenant_id)"#,
         // signal: one row per registered wake target (entry trigger
@@ -635,6 +669,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- = any. Two entries of one tenant may not overlap in both
             -- pattern and method (checked at register time).
             mount_methods TEXT[] NOT NULL DEFAULT '{}',
+            -- Whose signal: NULL for the program's shared ones, else the
+            -- member whose copy of a per-member trigger this is, or whose
+            -- run is waiting on it.
+            member_id TEXT,
+            -- The trigger whose activation gates this signal (with
+            -- `member_id`, the `trigger_activation` row the fire gate
+            -- reads): an entry signal's own trigger, or the trigger that
+            -- fired the run a wait belongs to. NULL for a wait of a run
+            -- started by hand, which no activation governs.
+            activation_trigger TEXT,
             auth_kind TEXT NOT NULL DEFAULT 'none',
             auth_config JSONB,
             -- Placement: which pooled listener pod currently holds this
@@ -679,7 +723,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // skip the constraint because each suspension mints its own
         // row.
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_entry_node
-             ON signal(project_id, node_id) WHERE is_resume = FALSE"#,
+             ON signal(project_id, node_id, member_id) NULLS NOT DISTINCT WHERE is_resume = FALSE"#,
+        // The fire gate's join, and what taking an activation down selects.
+        r#"CREATE INDEX IF NOT EXISTS idx_signal_activation
+             ON signal(project_id, activation_trigger, member_id) WHERE activation_trigger IS NOT NULL"#,
         // Wake the parked-fires sweep when a fire is parked, so a
         // project that is already Active again replays it at once
         // instead of on the sweep's next look. Only a growing queue
@@ -729,16 +776,41 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- `task_kinds::execute::enqueue_resume`.
             -- NULL also covers dispatcher-orchestrated writes (no pod).
             owner_pod_name TEXT,
-            -- What this color IS: 'execution' (a project run; the
-            -- project-lifecycle sweeps, cancel, wipe, and drain
-            -- counting operate on these) or 'node_test' (a node
-            -- self-test's identity: real cost attribution and broker
-            -- scoping, but its lifecycle is owned by its task, so the
-            -- project sweeps must never cancel it or wait on it).
-            kind TEXT NOT NULL DEFAULT 'execution'
+            -- What this color IS (`weft_core::exec::RunKind`):
+            -- 'execution' (a project run; the project-lifecycle sweeps,
+            -- cancel, wipe, drain counting and the listings operate on
+            -- these), 'node_test' (a node self-test's identity: real
+            -- cost attribution and broker scoping, but its lifecycle is
+            -- owned by its task, so the project sweeps must never cancel
+            -- it or wait on it), or 'unrecorded' (a run whose journal
+            -- lives in its worker's memory: never listed, dropped when
+            -- it ends unless its costs keep it, and turned into an
+            -- 'execution' with its whole record written if it fails).
+            kind TEXT NOT NULL DEFAULT 'execution',
+            -- Who the run is for: the member its `ExecutionStarted`
+            -- names, copied here in the same transaction so every
+            -- member filter (clean, costs, a member token's reads) is
+            -- a column read. NULL for a run for nobody in particular.
+            member_id TEXT,
+            -- The trigger whose firing started the run (its
+            -- `ExecutionStarted.fired_trigger`), NULL for a run started
+            -- by hand and every setup run. With `member_id` it names the
+            -- activation the run belongs to: a wait the run registers is
+            -- gated by that activation, and taking it down reaches it.
+            fired_by TEXT,
+            -- When an unrecorded run ended, for the one whose row its
+            -- costs keep after it is over (`weft_journal::unrecorded`):
+            -- NULL while it runs, so the live rule stops counting it the
+            -- moment it ends, before its execute task is closed. NULL
+            -- for every other kind, whose ending is its journal row.
+            ended_at_unix BIGINT
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_project ON execution_color(project_id)"#,
+        // A member's runs of one project: what `ctx.runs().member(id)`,
+        // `weft clean --member` and a member token's reads select.
+        r#"CREATE INDEX IF NOT EXISTS idx_execution_color_member
+             ON execution_color(project_id, member_id) WHERE member_id IS NOT NULL"#,
         // The execution LISTING reads exactly this shape: one tenant's
         // project runs, newest first, a page at a time, with the
         // optional project / time / phase filters applied on top. The
@@ -789,18 +861,32 @@ impl Journal for PostgresJournal {
         ).bind(color.to_string()).fetch_optional(&mut *tx).await?;
         if let (Some((project_id,)), Some(bake)) = (owner, bake) {
             anyhow::ensure!(bake.project_id == project_id && bake.color == color, "bake does not belong to its setup");
-            sqlx::query("INSERT INTO trigger_bake (project_id, program_hash, bake_json) VALUES ($1, $2, $3) \
-                ON CONFLICT (project_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json")
-                .bind(project_id).bind(bake.program.digest())
-                .bind(serde_json::to_string(bake)?).execute(&mut *tx).await?;
+            let member = bake.member.as_ref().map(|m| m.as_str());
+            let digest = bake.program.digest();
+            // A setup of some triggers refreshes those and keeps what an
+            // earlier setup captured for the others, under the row lock.
+            let prior: Option<(String,)> = sqlx::query_as(
+                "SELECT bake_json FROM trigger_bake \
+                 WHERE project_id = $1 AND member_id IS NOT DISTINCT FROM $2 AND program_hash = $3 FOR UPDATE",
+            ).bind(project_id).bind(member).bind(&digest).fetch_optional(&mut *tx).await?;
+            let merged = match prior {
+                Some((json,)) => serde_json::from_str::<super::TriggerBake>(&json)?.refreshed_by(bake),
+                None => bake.clone(),
+            };
+            sqlx::query("INSERT INTO trigger_bake (project_id, member_id, program_hash, bake_json) VALUES ($1, $2, $3, $4) \
+                ON CONFLICT (project_id, member_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json")
+                .bind(project_id).bind(member).bind(&digest)
+                .bind(serde_json::to_string(&merged)?).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<super::TriggerBake>> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT bake_json FROM trigger_bake WHERE project_id = $1")
-            .bind(project_id).fetch_all(&self.pool).await?;
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, member: Option<&weft_core::member::MemberId>) -> anyhow::Result<Vec<super::TriggerBake>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT bake_json FROM trigger_bake WHERE project_id = $1 AND member_id IS NOT DISTINCT FROM $2",
+        )
+            .bind(project_id).bind(member.map(|m| m.as_str())).fetch_all(&self.pool).await?;
         rows.into_iter().map(|(value,)| serde_json::from_str(&value).map_err(Into::into)).collect()
     }
 
@@ -917,22 +1003,33 @@ impl Journal for PostgresJournal {
         // 2 + 3. Only a started color has a journal to close and a pod to
         //    flag; its project and tenant were stamped on this row in the
         //    birth transaction, so no other lookup is needed.
-        let owner: Option<(uuid::Uuid, String)> =
-            sqlx::query_as("SELECT project_id, tenant_id FROM execution_color WHERE color = $1")
+        let owner: Option<(uuid::Uuid, String, String)> =
+            sqlx::query_as("SELECT project_id, tenant_id, kind FROM execution_color WHERE color = $1")
                 .bind(color.to_string())
                 .fetch_optional(&mut *tx)
                 .await?;
         let mut write = CancelWrite { removed, ..CancelWrite::default() };
-        if let Some((project_id, tenant_id)) = owner {
-            write.node_cancellations = cancel_terminals_in(&mut tx, color, program, cause).await?;
+        if let Some((project_id, tenant_id, kind)) = owner {
+            let kind = weft_core::exec::RunKind::parse(&kind)
+                .map_err(|e| anyhow::anyhow!("execution_color.kind of {color}: {e}"))?;
+            // An unrecorded run has no journal to close: the pod driving it
+            // cancels it in memory and forgets it. With no pod left to do
+            // that, the run died with its pod, so it is forgotten here.
+            if kind.journaled() {
+                write.node_cancellations = cancel_terminals_in(&mut tx, color, program, cause).await?;
+            }
             write.task_enqueued = crate::task_kinds::execute::enqueue_cancel_in(
                 &mut tx,
                 project_id,
                 color,
-                Some(tenant_id.as_str()),
+                tenant_id.as_str(),
                 cause,
             )
             .await?;
+            if !kind.journaled() && !write.task_enqueued {
+                weft_journal::unrecorded::forget_in(&mut tx, color).await?;
+                crate::storage::enqueue_sweep_in(&mut tx, tenant_id.as_str(), &color.to_string()).await?;
+            }
         }
         tx.commit().await?;
         Ok(write)
@@ -954,8 +1051,8 @@ impl Journal for PostgresJournal {
         sqlx::query(
             "INSERT INTO signal_token \
              (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-              allowed_displays, all_displays, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              allowed_displays, all_displays, created_at, member_id, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(tok.id)
         .bind(&tok.token_hash)
@@ -969,6 +1066,8 @@ impl Journal for PostgresJournal {
         // Store the caller-stamped mint time verbatim (the handler set it from
         // the canonical clock), so postgres and the fake agree.
         .bind(tok.created_at as i64)
+        .bind(tok.member.as_ref().map(|m| m.as_str()))
+        .bind(tok.expires_at.map(|at| at as i64))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -978,7 +1077,7 @@ impl Journal for PostgresJournal {
     async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
         let row: Option<SignalTokenRow> = sqlx::query_as(
             "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at \
+                    allowed_displays, all_displays, created_at, member_id, expires_at \
              FROM signal_token WHERE token_hash = $1",
         )
         .bind(token_hash)
@@ -990,7 +1089,7 @@ impl Journal for PostgresJournal {
     async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
         let rows: Vec<SignalTokenRow> = sqlx::query_as(
             "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at \
+                    allowed_displays, all_displays, created_at, member_id, expires_at \
              FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
         )
         .bind(tenant)
@@ -1018,12 +1117,23 @@ impl Journal for PostgresJournal {
         // `weft clean` is the way out), and not from the project store
         // (deletable, and an execution deliberately outlives its
         // project).
-        let row: Option<(uuid::Uuid, String)> =
-            sqlx::query_as("SELECT project_id, tenant_id FROM execution_color WHERE color = $1")
-                .bind(color.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(project_id, tenant)| ExecutionOwner { project_id, tenant }))
+        let row: Option<(uuid::Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT project_id, tenant_id, member_id, fired_by FROM execution_color WHERE color = $1",
+        )
+        .bind(color.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(project_id, tenant, member, fired_by)| {
+            Ok(ExecutionOwner {
+                project_id,
+                tenant,
+                member: member.map(weft_core::member::MemberId::new).transpose().map_err(|e| {
+                    anyhow::anyhow!("corrupt execution_color.member_id for {color}: {e}")
+                })?,
+                fired_by,
+            })
+        })
+        .transpose()
     }
 
     async fn execution_definition_hash(
@@ -1114,7 +1224,7 @@ impl Journal for PostgresJournal {
         // SQL so a tenant with a huge history never truncates blindly.
         //
         // Bind order is fixed ($1 tenant, $2 project filter, $3 after, $4 before,
-        // $5 phase, $6 entry node, $7 status) and every optional filter is a
+        // $5 phase, $6 entry node, $7 status, $8 member, $9 tag) and every optional filter is a
         // `($n IS NULL OR ...)` clause so one prepared statement serves every
         // filter combination.
         // The `execution_color` row (seeded at start) carries the real, indexed
@@ -1156,7 +1266,11 @@ impl Journal for PostgresJournal {
                  ) ELSE EXISTS ( \
                      SELECT 1 FROM exec_event WHERE color = ec.color \
                        AND kind = 'execution_' || $7 \
-                 ) END)";
+                 ) END) \
+             AND ($8::text IS NULL OR ec.member_id = $8) \
+             AND ($9::text IS NULL OR EXISTS ( \
+                     SELECT 1 FROM execution_tag et WHERE et.color = ec.color AND et.tag = $9 \
+                 ))";
 
         // The count carries the SAME started-event predicate as the row
         // query's inner lateral join: a seeded `execution_color` row
@@ -1178,6 +1292,8 @@ impl Journal for PostgresJournal {
         .bind(phase)
         .bind(entry_node)
         .bind(status)
+        .bind(query.member.as_ref().map(|m| m.as_str()))
+        .bind(query.tag.as_deref())
         .fetch_one(&self.pool)
         .await?;
 
@@ -1198,7 +1314,8 @@ impl Journal for PostgresJournal {
                  ORDER BY id DESC LIMIT 1 \
              ) t ON TRUE \
              WHERE {where_clause} \
-             ORDER BY ec.started_at_unix DESC, ec.color DESC LIMIT $8 OFFSET $9"
+               AND ($12::bigint IS NULL OR (ec.started_at_unix, ec.color) < ($12, $13::text)) \
+             ORDER BY ec.started_at_unix DESC, ec.color DESC LIMIT $10 OFFSET $11"
         ))
         .bind(tenant)
         .bind(project)
@@ -1207,8 +1324,12 @@ impl Journal for PostgresJournal {
         .bind(phase)
         .bind(entry_node)
         .bind(status)
+        .bind(query.member.as_ref().map(|m| m.as_str()))
+        .bind(query.tag.as_deref())
         .bind(query.limit as i64)
         .bind(query.offset as i64)
+        .bind(query.below.map(|(started, _)| started as i64))
+        .bind(query.below.map(|(_, color)| color.to_string()))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1372,28 +1493,22 @@ impl Journal for PostgresJournal {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>> {
         // A color is "non-terminal" iff it belongs to this project
-        // AND has no terminal event in the journal. `execution_color`
-        // is the denormalized (color, project_id) index seeded at
-        // ExecutionStarted time, so we get the project filter as an
-        // indexed equality lookup rather than parsing JSON. NOT
-        // EXISTS lets Postgres short-circuit per row. PROJECT
-        // EXECUTIONS only (`kind = 'execution'`): this is the one
-        // read behind the cancel/wipe sweeps and the drain count, and
-        // a node-test color's lifecycle is owned by its task, never by
-        // the project's.
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        // AND is a live project run. `execution_color` is the
+        // denormalized (color, project_id) index seeded at birth, so
+        // the project filter is an indexed equality lookup. This is the
+        // one read behind the cancel/wipe sweeps and the drain count; a
+        // node-test color's lifecycle is owned by its task, never by
+        // the project's, so the rule never matches one.
+        // Liveness is the one rule every sweep shares
+        // (`weft_journal::unrecorded::LIVE_RUN_SQL`): an unrecorded run
+        // counts while a live pod can still be driving it.
+        let query = format!(
             "SELECT ec.color, ec.phase FROM execution_color ec \
-             WHERE ec.project_id = $1 \
-               AND ec.kind = 'execution' \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM exec_event t \
-                   WHERE t.color = ec.color \
-                     AND t.kind IN ('execution_completed', \
-                                    'execution_failed', \
-                                    'execution_cancelled') \
-               ) \
+             WHERE ec.project_id = $1 AND {} \
              ORDER BY ec.started_at_unix ASC, ec.color ASC",
-        )
+            weft_journal::unrecorded::LIVE_RUN_SQL
+        );
+        let rows: Vec<(String, String)> = sqlx::query_as(&query)
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1536,10 +1651,21 @@ impl Journal for PostgresJournal {
             .execute(&mut *tx)
             .await?;
         if let Some(setup) = sig.setup_color {
-            let lifecycle: (String, Option<uuid::Uuid>) = sqlx::query_as(
-                "SELECT status, activating_ts_color FROM project WHERE id = $1 FOR UPDATE",
-            ).bind(sig.project_id).fetch_one(&mut *tx).await?;
-            anyhow::ensure!(!sig.is_resume && lifecycle.0 == "activating" && lifecycle.1 == Some(setup),
+            // Arm only while THIS activation still owns the trigger's row:
+            // a cancelled or superseded activation must not arm over the
+            // one that replaced it.
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM trigger_activation \
+                 WHERE project_id = $1 AND trigger = $2 AND member_id IS NOT DISTINCT FROM $3 \
+                   AND status = 'activating' AND activating_color = $4 FOR UPDATE)",
+            )
+            .bind(sig.project_id)
+            .bind(&sig.node_id)
+            .bind(sig.member.as_ref().map(|m| m.as_str()))
+            .bind(setup)
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(!sig.is_resume && owned,
                 "activation ended before trigger '{}' could be armed", sig.node_id);
         }
         if let Some(version) = &sig.source_version {
@@ -1552,9 +1678,9 @@ impl Journal for PostgresJournal {
               consumer_payload, \
               surface_kind, mount_path, auth_kind, auth_config, kind_state, \
               kind_state_seq, listener_pod, placement_generation, program_json, setup_color, source_version, \
-              mount_methods) \
+              mount_methods, member_id, activation_trigger) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                    $17, $18, $19, $20, $21, $22, $23, $24, $25 \
+                    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27 \
              WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $20) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
@@ -1604,6 +1730,8 @@ impl Journal for PostgresJournal {
         .bind(sig.setup_color)
         .bind(&sig.source_version)
         .bind(&sig.mount_methods)
+        .bind(sig.member.as_ref().map(|m| m.as_str()))
+        .bind(sig.activation_trigger.as_deref())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1631,10 +1759,12 @@ impl Journal for PostgresJournal {
         &self,
         project_id: uuid::Uuid,
         node: &str,
+        member: Option<&weft_core::member::MemberId>,
     ) -> anyhow::Result<Option<SignalRegistration>> {
         let row: Option<SignalRow> = sqlx::query_as(SIGNAL_SELECT_ENTRY_AT_PLACE)
             .bind(project_id)
             .bind(node)
+            .bind(member.map(|m| m.as_str()))
             .fetch_optional(&self.pool)
             .await
             .context("signal_entry_at: read a signal row")?;
@@ -1786,6 +1916,77 @@ pub(crate) async fn remove_project_signals<'e>(
     rows.into_iter().map(row_to_signal).collect()
 }
 
+/// Every signal of the project but the waits of `except` (the run that
+/// asked for a whole-project take-down keeps its own), deleted and handed
+/// back for the listener cleanup.
+pub async fn remove_project_signals_except<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: uuid::Uuid,
+    except: Option<Color>,
+) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING)
+        .bind(project_id)
+        .bind(except.map(|c| c.to_string()))
+        .fetch_all(executor)
+        .await
+        .context("remove project signals: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
+}
+
+/// Delete the signals of projects that no longer exist, handing them
+/// back for the listener unregister.
+pub async fn remove_signals_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_OF_REMOVED_PROJECTS_RETURNING)
+        .fetch_all(pool)
+        .await
+        .context("remove the signals of removed projects: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
+}
+
+/// The keys as two parallel arrays for an `unnest` join, `''` standing
+/// for the shared owner (a member id is never empty).
+fn activation_key_arrays(keys: &[weft_core::activation::ActivationKey]) -> (Vec<String>, Vec<String>) {
+    keys.iter()
+        .map(|k| (k.trigger.clone(), k.member().map(|m| m.as_str().to_string()).unwrap_or_default()))
+        .unzip()
+}
+
+/// Every signal the activations `keys` govern: their entry signals and
+/// the waits of the runs their triggers fired.
+pub(crate) async fn activation_signals<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: uuid::Uuid,
+    keys: &[weft_core::activation::ActivationKey],
+) -> anyhow::Result<Vec<SignalRegistration>> {
+    let (triggers, members) = activation_key_arrays(keys);
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_BY_ACTIVATIONS)
+        .bind(project_id)
+        .bind(&triggers)
+        .bind(&members)
+        .fetch_all(executor)
+        .await
+        .context("activation signals: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
+}
+
+/// Delete every signal the activations `keys` govern, handed back for
+/// the listener cleanup.
+pub(crate) async fn remove_activation_signals<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: uuid::Uuid,
+    keys: &[weft_core::activation::ActivationKey],
+) -> anyhow::Result<Vec<SignalRegistration>> {
+    let (triggers, members) = activation_key_arrays(keys);
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING)
+        .bind(project_id)
+        .bind(&triggers)
+        .bind(&members)
+        .fetch_all(executor)
+        .await
+        .context("remove activation signals: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
+}
+
 pub(crate) async fn remove_signals<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     tokens: &[String],
@@ -1810,7 +2011,7 @@ macro_rules! signal_columns {
             $p, "consumer_payload, ", $p, "surface_kind, ", $p, "mount_path, ",
             $p, "auth_kind, ", $p, "auth_config, ", $p, "kind_state, ",
             $p, "kind_state_seq, ", $p, "listener_pod, ", $p, "program_json, ", $p, "setup_color, ", $p, "source_version, ",
-            $p, "mount_methods"
+            $p, "mount_methods, ", $p, "member_id, ", $p, "activation_trigger"
         )
     };
 }
@@ -1833,7 +2034,8 @@ const SIGNAL_SELECT_WHERE_PROJECT: &str =
 const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
     "SELECT ",
     signal_columns!(""),
-    " FROM signal WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE"
+    " FROM signal WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3 \
+     AND is_resume = FALSE"
 );
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
@@ -1841,6 +2043,32 @@ const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
 
 const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
     concat!("DELETE FROM signal WHERE project_id = $1 RETURNING ", signal_columns!(""));
+
+const SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING: &str = concat!(
+    // `$2` NULL keeps nothing back: `color IS DISTINCT FROM NULL` would
+    // spare every entry signal (their color is NULL too).
+    "DELETE FROM signal WHERE project_id = $1 AND ($2::text IS NULL OR color IS DISTINCT FROM $2) RETURNING ",
+    signal_columns!("")
+);
+
+const SIGNAL_DELETE_OF_REMOVED_PROJECTS_RETURNING: &str = concat!(
+    "DELETE FROM signal s WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = s.project_id) RETURNING ",
+    signal_columns!("")
+);
+
+const SIGNAL_SELECT_BY_ACTIVATIONS: &str = concat!(
+    "SELECT ",
+    signal_columns!(""),
+    " FROM signal WHERE project_id = $1 \
+      AND (activation_trigger, COALESCE(member_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[]))"
+);
+
+const SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING: &str = concat!(
+    "DELETE FROM signal WHERE project_id = $1 \
+      AND (activation_trigger, COALESCE(member_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[])) \
+      RETURNING ",
+    signal_columns!("")
+);
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));
@@ -1877,6 +2105,8 @@ pub(crate) struct SignalRow {
     pub(crate) surface_kind: String,
     pub(crate) mount_path: Option<String>,
     pub(crate) mount_methods: Vec<String>,
+    pub(crate) member_id: Option<String>,
+    pub(crate) activation_trigger: Option<String>,
     pub(crate) auth_kind: String,
     pub(crate) auth_config: Option<serde_json::Value>,
     pub(crate) kind_state: serde_json::Value,
@@ -1924,6 +2154,12 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
     };
     Ok(SignalRegistration {
         setup_color: row.setup_color,
+        member: row
+            .member_id
+            .map(weft_core::member::MemberId::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("corrupt signal.member_id for token {}: {e}", row.token))?,
+        activation_trigger: row.activation_trigger,
         source_version: row.source_version,
         program: row.program_json.map(serde_json::from_value).transpose()?,
         token: row.token,
@@ -1949,9 +2185,75 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
     })
 }
 
+/// Revoke member tokens of `member` in `project_id`: the one `id`, or
+/// every one of them. What a program's `ctx.tokens().member(..).revoke()`
+/// does; answers how many went.
+// SYNC: signal_token member rows <-> crates/weft-broker/src/program_tokens.rs (the program's mint)
+pub async fn revoke_member_tokens(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    project_id: uuid::Uuid,
+    member: &weft_core::member::MemberId,
+    id: Option<uuid::Uuid>,
+) -> anyhow::Result<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM signal_token \
+         WHERE tenant_id = $1 AND member_id = $2 AND allowed_projects = ARRAY[$3]::uuid[] \
+           AND ($4::uuid IS NULL OR id = $4)",
+    )
+    .bind(tenant)
+    .bind(member.as_str())
+    .bind(project_id)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// How many member tokens of `project_id` still work (not expired at
+/// `now_unix`), per member, one entry per member with at least one.
+pub async fn member_token_counts(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    project_id: uuid::Uuid,
+    now_unix: i64,
+) -> anyhow::Result<Vec<(weft_core::member::MemberId, u32)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT member_id, count(*)::bigint FROM signal_token \
+         WHERE tenant_id = $1 AND member_id IS NOT NULL AND allowed_projects = ARRAY[$2]::uuid[] \
+           AND expires_at > $3 \
+         GROUP BY member_id ORDER BY member_id",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(now_unix)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(member, n)| {
+            let member = weft_core::member::MemberId::new(member).map_err(|e| anyhow::anyhow!("signal_token.member_id: {e}"))?;
+            Ok((member, u32::try_from(n)?))
+        })
+        .collect()
+}
+
+/// Revoke every member token of `project_id`: a member token acts in
+/// its one project, so it outlives a removed project as nothing anybody
+/// could use.
+pub(crate) async fn revoke_project_member_tokens<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    project_id: uuid::Uuid,
+) -> anyhow::Result<u64> {
+    Ok(sqlx::query("DELETE FROM signal_token WHERE member_id IS NOT NULL AND allowed_projects = ARRAY[$1]::uuid[]")
+        .bind(project_id)
+        .execute(executor)
+        .await?
+        .rows_affected())
+}
+
 /// The `signal_token` SELECT row shape (id, token_hash, recognizer, tenant_id,
 /// name, allowed_projects, allowed_tags, allowed_displays, all_displays,
-/// created_at). One tuple type so both readers decode it through the single
+/// created_at, member_id, expires_at). One tuple type so both readers decode it through the single
 /// fallible `row_to_signal_token`.
 type SignalTokenRow = (
     uuid::Uuid,
@@ -1964,11 +2266,25 @@ type SignalTokenRow = (
     Vec<String>,
     bool,
     i64,
+    Option<String>,
+    Option<i64>,
 );
 
 fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
-    let (id, token_hash, recognizer, tenant_id, name, projects, tags, displays, all_displays, created_at) =
-        row;
+    let (
+        id,
+        token_hash,
+        recognizer,
+        tenant_id,
+        name,
+        projects,
+        tags,
+        displays,
+        all_displays,
+        created_at,
+        member,
+        expires_at,
+    ) = row;
     Ok(SignalToken {
         id,
         token_hash,
@@ -1980,6 +2296,11 @@ fn row_to_signal_token(row: SignalTokenRow) -> anyhow::Result<SignalToken> {
         allowed_displays: displays,
         all_displays,
         created_at: created_at as u64,
+        member: member
+            .map(weft_core::member::MemberId::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("signal_token {id}: corrupt member_id: {e}"))?,
+        expires_at: expires_at.map(|at| at as u64),
     })
 }
 

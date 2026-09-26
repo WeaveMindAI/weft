@@ -126,7 +126,7 @@ impl SocketDial for ConnectionSocketDial {
         // Apply the credential's route policy before either direct or relay
         // routing, just as the HTTP client does.
         let https = https_form(&parsed);
-        if self.sink.origin == weft_core::CredentialOwner::Ours {
+        if self.sink.origin.is_platform() {
             let meter = meter.ok_or_else(|| dial_err(service, "the runtime credential requires a meter; none was attached"))?;
             weft_providers::ours_route_on(meter, service, "GET", https.as_str())
                 .map_err(|error| dial_err(service, error))?;
@@ -601,7 +601,7 @@ mod tests {
             node_id: "node-x".into(),
             frames: weft_core::frames::LoopFrames::default(),
             service: "bytesvc".into(),
-            origin: weft_core::CredentialOwner::TheirOwn,
+            origin: weft_core::CredentialOwner::Author,
         })
     }
 
@@ -617,7 +617,7 @@ mod tests {
         let tasks = Arc::new(RecordingTaskStore::default());
         let pending = crate::metering::PendingCostRecords::new();
         let mut sink_ours = sink(tasks.clone(), pending.clone());
-        Arc::get_mut(&mut sink_ours).expect("sole owner").origin = weft_core::CredentialOwner::Ours;
+        Arc::get_mut(&mut sink_ours).expect("sole owner").origin = weft_core::CredentialOwner::Platform;
         let dial = ConnectionSocketDial {
             steps: vec![],
             relay_url: None,
@@ -678,13 +678,13 @@ mod tests {
         assert!(seen.iter().any(|s| s.contains("/live?mode=fast")), "{seen:?}");
 
         // The figure: 10 bytes sent ("hello" + "more!"), measured,
-        // never billed, their-own.
+        // never billed, the author's own.
         let enqueued = tasks.enqueued.lock().unwrap();
         assert_eq!(enqueued.len(), 1, "one session, one record");
         let payload = &enqueued[0].payload;
         assert_eq!(payload["amount_usd"], serde_json::json!(10.0));
         assert_eq!(payload["billed"], serde_json::json!(false));
-        assert_eq!(payload["origin"], serde_json::json!("their-own"));
+        assert_eq!(payload["origin"], serde_json::json!("author"));
         assert_eq!(payload["model"], serde_json::json!("byte-model"));
         assert_eq!(payload["metadata"]["interrupted"], serde_json::json!(false));
     }

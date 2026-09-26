@@ -34,7 +34,8 @@ import { runWeftJson, WeftCliError } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
-import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation } from '../../packages/weft-graph/src/protocol';
+import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerChoiceIntent } from '../../packages/weft-graph/src/protocol';
+import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
 import { emptyActionAvailability, parseRunning, parseStatusPayload } from '../../packages/weft-graph/src/status';
 import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
@@ -336,10 +337,13 @@ export function activate(context: vscode.ExtensionContext) {
   ///
   /// On success we fire a status refetch to reconcile the bar with
   /// backend ground truth (run started → execution_running).
-  async function runCliVerb(verb: string, args: string[]): Promise<void> {
+  /// Resolves to the picker intent when the dispatcher refused the verb
+  /// for want of a trigger-deactivation choice (the bar is cleared, the
+  /// caller opens the picker), and to `undefined` otherwise.
+  async function runCliVerb(verb: string, args: string[]): Promise<TriggerChoiceIntent | undefined> {
     if (!pinnedProject) {
       void vscode.window.showInformationMessage('Pin a Weft project first.');
-      return;
+      return undefined;
     }
     // Bind the WHOLE verb to the project pinned at click time. Every
     // await below (pending save, pre-flight, the reactivate modal) is a
@@ -354,11 +358,11 @@ export function activate(context: vscode.ExtensionContext) {
     // tracking slot).
     if (verbsInFlight.has(projectId)) {
       void vscode.window.showInformationMessage('Weft: an action is already running for this project.');
-      return;
+      return undefined;
     }
     verbsInFlight.add(projectId);
     try {
-      await runCliVerbForProject(project, verb, args);
+      return await runCliVerbForProject(project, verb, args);
     } finally {
       verbsInFlight.delete(projectId);
     }
@@ -366,7 +370,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   /// The verb, with its project already bound at click time (it will
   /// not be re-read across the awaits below).
-  async function runCliVerbForProject(project: WeftProject, verb: string, args: string[]): Promise<void> {
+  async function runCliVerbForProject(
+    project: WeftProject,
+    verb: string,
+    args: string[],
+  ): Promise<TriggerChoiceIntent | undefined> {
     const projectId = project.id;
     const projectRoot = project.rootPath;
     const verbTag = verbTagFor(verb, args);
@@ -459,8 +467,15 @@ export function activate(context: vscode.ExtensionContext) {
       autoFollow.followStartedByUser(undefined);
     }
     actionBar.cliStart(projectId, verbTag);
+    // Set when the CLI's error is the dispatcher asking how triggers come
+    // down: that is a question for the picker, never an error banner.
+    let needsTriggerChoice = false;
     try {
       await runWeftCliJson(projectId, [verb, ...args], projectRoot, (ev) => {
+        if (isTriggerChoiceRefusal(ev)) {
+          needsTriggerChoice = true;
+          return;
+        }
         // Stamp the verb this child was spawned for onto an event that
         // carries none (a failure that reached the CLI's main
         // unreported). This closure is the only place that knows which
@@ -486,7 +501,7 @@ export function activate(context: vscode.ExtensionContext) {
       }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
       const tracking = cliTracking.get(projectId);
-      if (tracking?.userKilled) {
+      if (tracking?.userKilled || needsTriggerChoice) {
         actionBar.cliKilled(projectId, verbTag);
       } else {
         const message = err instanceof Error ? err.message : String(err);
@@ -504,6 +519,7 @@ export function activate(context: vscode.ExtensionContext) {
         void executionsProvider.refresh();
       }
     }
+    return needsTriggerChoice ? triggerChoiceIntent(verbTag) : undefined;
   }
 
   /// Map (verb, args) onto the CLI's ActionVerb tag. Compound

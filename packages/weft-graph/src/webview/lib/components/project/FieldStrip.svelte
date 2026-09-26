@@ -227,7 +227,8 @@
 		     states); a port-driven row is never file-backed, so it never
 		     inherits a same-named config sibling's lock. -->
 		{@const ro = readonlyKeys?.has(field.key) ?? false}
-		<div class="space-y-1">
+		<!-- data-field-key: a parent's right-click menu finds the field by it. -->
+		<div class="space-y-1" data-field-key={field.key}>
 			<div class="flex items-center justify-between">
 				<label for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
 					{field.label}

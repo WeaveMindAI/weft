@@ -33,7 +33,8 @@
 #   - after the daemon refresh, `weft clean --images --all` reclaims
 #     every weft image nothing runs any more (unreferenced worker
 #     images, stale weft-infra-* tags, old builder bases, on host
-#     docker and the kind node). KEEP set = the dispatcher's
+#     docker and the kind node, and the worker compile cache this
+#     checkout used before the update, every lane of it). KEEP set = the dispatcher's
 #     referenced set (running projects' worker hashes, live pods',
 #     live tasks', every project's infra image tags, every live infra
 #     unit's recorded refs), so a running project's current worker
@@ -2070,9 +2071,10 @@ if [[ $build_vscode -eq 1 ]]; then
   # A real directory there (a `pnpm install` run inside the package) is
   # replaced: `ln -sfn` onto a directory would nest the link INSIDE it
   # and leave the package resolving against the wrong install.
-  # Same borrow for the grammars package: its only dependency is the
-  # highlight.js the extension already installs, for its own tests.
-  for borrower in ../packages/weft-graph ../packages/weft-syntax; do
+  # Same borrow for the grammars package (its only dependency is the
+  # highlight.js the extension already installs, for its own tests) and
+  # the connect library the graph's connection picker is built on.
+  for borrower in ../packages/weft-graph ../packages/weft-syntax ../packages/weft-connect; do
     if [[ -d "${borrower}/node_modules" && ! -L "${borrower}/node_modules" ]]; then
       rm -rf "${borrower}/node_modules"
     fi
@@ -2086,8 +2088,9 @@ if [[ $build_vscode -eq 1 ]]; then
   hash_dir="${HOME}/.local/share/weft/vscode-hashes"
   hash_file="${hash_dir}/extension.hash"
   # The fingerprint is EVERYTHING the package can ship: every tracked
-  # file of the extension and its two source-consumed sibling packages
-  # (weft-graph's webview, weft-syntax's grammars), plus untracked
+  # file of the extension and its source-consumed sibling packages
+  # (weft-graph's webview, weft-syntax's grammars, weft-connect's
+  # picker), plus untracked
   # not-ignored ones (a just-created source file must not be invisible
   # to the stamp), hashed by content. A hand-kept file list here
   # repeatedly went stale (.vscodeignore, media/, the README all ship
@@ -2100,9 +2103,9 @@ if [[ $build_vscode -eq 1 ]]; then
   if git -C "${here}" rev-parse HEAD >/dev/null 2>&1; then
     current_hash="$(
       {
-        git -C "${here}" ls-files -z extension-vscode packages/weft-graph packages/weft-syntax
+        git -C "${here}" ls-files -z extension-vscode packages/weft-graph packages/weft-syntax packages/weft-connect
         git -C "${here}" ls-files -z --others --exclude-standard \
-          extension-vscode packages/weft-graph packages/weft-syntax
+          extension-vscode packages/weft-graph packages/weft-syntax packages/weft-connect
       } | {
         cd "${here}" && sort -z | while IFS= read -r -d '' f; do
           if [[ -e "$f" ]]; then ${sha256_bin} "$f"; else printf 'absent  %s\n' "$f"; fi

@@ -30,6 +30,12 @@ address with `ws://`. You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` prints the same URLs afterwards and only turns them on.
 
+`127.0.0.1:9999` answers only on this machine. When the install has a public
+address (a tunnel), `weft activate` and `weft token mint` print URLs on that
+address instead, and both reach the same dispatcher. A frontend that runs
+anywhere else (a hosted site, a phone, a browser on another machine) uses the
+public one; a server on this same machine may use either.
+
 ## The shape
 
 The run ends when it has sent its [answer]. You declare the body keys you
@@ -145,6 +151,15 @@ part after, wire the `Reply` early in the graph, then the rest, and set
 If you want a long job polled later, one route answers `202` with an id and
 writes the job's state to the project's Postgres, and a second route reads
 it back. Two routes and a table, no new node.
+
+If a page asks a route for a status every few seconds, set `recorded: false`
+on the `Route` so each call does not leave a run behind. A run that succeeds or
+is cancelled then leaves nothing but what it cost, and one that fails is written
+down whole afterwards, so you still find it in `weft executions` and inspect it
+like any other. An unrecorded run keeps its steps in the worker's memory, which
+means it cannot wait (a timer or a form fails at the call) and is lost if the
+worker dies mid-call. With `outlivesCaller` on too, it keeps running after the
+caller leaves, still unable to wait.
 
 ## Pictures in and out
 

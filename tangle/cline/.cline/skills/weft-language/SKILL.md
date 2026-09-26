@@ -415,6 +415,16 @@ custom ports, a name is a port once the header declares it, a wire lands on
 it, or a config key names it); at run time the node skips when every port in
 the group arrives [closed].
 
+`@per_member` on its own line in an infra node (no arguments; anything else is
+`per-member-ineligible`) gives each member of the program their own copy of
+that node. `@member_filled` (or `@member_filled(<fallback>)`) where a field's
+value goes makes that value each member's own, a connection included
+(`account: @member_filled`); the fallback may be a value, `@file(...)` or
+`@asset(...)`; never on a wired field (`member-filled-wired`) or
+a group's own port (`member-filled-boundary`). Every node reading either
+follows, per member. The `weft-members` skill has what that means and the shape
+a program with members takes.
+
 ## Types
 
 | Kind | Written |
@@ -445,7 +455,11 @@ typing = ExecPython(p: Profile) -> (ms: Number) { code: "..." }
 Any type, multi-line allowed, other declared names allowed on the right.
 Declared at file level it is visible to the whole file; directly inside a
 group or loop body, to that body and its nested bodies only (the group's own
-signature sits outside and cannot use it). Never inside a node's braces. A visible name cannot be declared again (no
+signature sits outside and cannot use it). It also reaches down through
+`@include`: a type declared above an include is visible inside the included
+file and whatever that file includes, so a record several files share is
+declared once, at the highest scope that includes them all. An included file's
+own types never reach back up. Never inside a node's braces. A visible name cannot be declared again (no
 shadowing). Named types are nominal: the name is the contract, nothing
 unnamed wires into a named target, and the door between the two is `Cast`.
 
@@ -505,7 +519,7 @@ input is the recovery path.
 Branching is only this: a branch in weft is a node that ran or a port that
 closed, and nothing else. Any Boolean reaches a `_should_flow`, so a node of
 any kind decides a branch by emitting one (a moderation check's `flagged`, a
-request's `ok`, a lookup's `found`). Three nodes exist to shape the decision
+request's `ok`, a lookup's `found`). Four nodes exist to shape the decision
 itself, and you reach for them rather than deriving them: `Switch` tests a
 value against its `cases` config and emits `true` on the winning case's
 port, closing the rest; wire a case port into the branch's `_should_flow`.
@@ -514,7 +528,8 @@ its inputs that carried a value, in written order, so alternative paths
 rejoin into one wire. `All` says
 yes only when every input wired onto it arrived and none of them is `false`,
 and closes its output otherwise; it is where the second answer goes when a
-gate takes one wire and the permission has two parts.
+gate takes one wire and the permission has two parts. `Not` flips one Boolean, for
+the step that should run when the answer was `false`.
 
 Three shapes come up constantly, so reach for them rather than deriving them
 again:

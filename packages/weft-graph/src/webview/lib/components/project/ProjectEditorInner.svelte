@@ -23,7 +23,7 @@
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
-	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
+	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit } from "../../../../protocol";
 	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -41,7 +41,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { canBePerMember, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -588,8 +588,8 @@
 	 *  execution row: one distinct origin passes through, disagreeing
 	 *  members read 'mixed', no cost records means no origin. */
 	function groupCredentialOwner(
-		members: { credentialOwner?: 'their-own' | 'ours' | 'mixed' }[],
-	): 'their-own' | 'ours' | 'mixed' | undefined {
+		members: { credentialOwner?: CredentialOwnerKind | 'mixed' }[],
+	): CredentialOwnerKind | 'mixed' | undefined {
 		const origins = new Set(
 			members.map((e) => e.credentialOwner).filter((o) => o !== undefined),
 		);
@@ -1485,6 +1485,9 @@
 					// predicates read the instance before the catalog, the
 					// way the host does before it starts a poller.
 					requiresInfra: n.requiresInfra,
+					// Whether the node exists once per member (marked in the
+					// source, or reached from a marked one): drawn on the node.
+					perMember: n.perMember,
 					// The unconnected-access pin (view state, never config):
 					// ProjectNode draws the body open and disables collapse.
 					pinnedOpen: pinnedIds.has(n.id),
@@ -1525,7 +1528,11 @@
 	let organizeRecheck = false;
 	function organizeUnplaced(verb: LayoutVerb, fallback: Array<[string, { x: number; y: number }]>): void {
 		if (organizeInFlight) { organizeRecheck = true; return; }
-		organizeInFlight = runAutoOrganize(true, false);
+		// The camera is fitted only when this organize is what first
+		// reveals the canvas. Later ones (an agent or the source tab adding
+		// nodes) keep the zoom and position the person left: fitting each
+		// time yanked the view back out on every edit.
+		organizeInFlight = runAutoOrganize(!canvasReady, false);
 		void organizeInFlight.then((outcome) => {
 			if (outcome === 'failed') {
 				persistLayoutEdit((layout) => fallback.reduce(
@@ -2080,6 +2087,7 @@
 							fileContents: ctx.fileContents,
 							bodyFeed,
 							infraNodeStatus: backendNode?.status,
+							infraMemberCopies: backendNode?.memberCopies,
 							infraFailureStage: backendNode?.failureStage,
 							infraFailureMessage: backendNode?.failureMessage,
 						},
@@ -3763,8 +3771,11 @@
 	 *  whether to open the menu in simplified view and to render the infra section. */
 	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
 		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
-		const stop = !!infra && (infra.status === 'running' || infra.status === 'flaky');
-		const terminate = !!infra && infra.status !== 'terminating';
+		// A place with no shared copy (never started, or one per member)
+		// has nothing to stop or terminate here.
+		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_member';
+		const stop = hasCopy && (infra.status === 'running' || infra.status === 'flaky');
+		const terminate = hasCopy && infra.status !== 'terminating';
 		return { stop, terminate, has: stop || terminate };
 	}
 
@@ -4394,6 +4405,23 @@
 								<span class="text-muted-foreground text-xs">#</span>
 								<span>Tags…</span>
 							</button>
+							<!-- `@per_member`: only on a node that owns something per
+							     account (an infra container, a connection). A node the
+							     compiler reached from a marked one follows it and has
+							     nothing of its own to toggle. -->
+							{#if canBePerMember({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
+								{@const marked = nodeToEdit.data.perMember === 'marked'}
+								<button
+									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+									title={marked
+										? 'Make this node one shared node again: every member uses the same one.'
+										: 'Give every member of the program their own copy of this node (its container, or the connection it uses).'}
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerMember', node: id, perMember: !marked }]); }}
+								>
+									<span class="text-muted-foreground text-xs">@</span>
+									<span>{marked ? 'Share across members' : 'One per member'}</span>
+								</button>
+							{/if}
 						{/if}
 						<!-- Aiming a run names a PLACE (`addressOf` spells the node
 						     under this view's calls), so a view that is no place

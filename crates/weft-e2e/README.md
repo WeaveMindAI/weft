@@ -47,8 +47,9 @@ made, marked as e2e), then runs `weft clean --images --all`. That last step is
 machine-wide and reaches past the suite: it removes every worker image no
 project on the default install references (yours too, once nothing runs them),
 infra images no project references, the kind node's cached copies of both,
-every builder base but the current one, and worker compile caches of a retired
-key that sat unused. `--clean` does only this, without bringing the cluster to
+every builder base but the current one, the worker compile cache this checkout
+moved off (every lane, at once), and compile caches of another retired key that
+sat unused. `--clean` does only this, without bringing the cluster to
 current code first, so a failure's dispatcher is still the one that failed.
 `--failed` re-runs just the tests that did not pass: the ones that failed, the
 ones the stop kept from starting, and, if you pressed Ctrl-C, the ones it cut
@@ -59,9 +60,10 @@ The runner needs bash 5.1 or newer, and only one run (or `--clean`) at a time
 on a machine, from any checkout: a second one is refused while the first is
 alive.
 
-When a whole run passes, nothing is left behind: every test removed its own
-projects, cells and connections, and the runner runs the same
-`weft clean --images --all`, with the same machine-wide reach.
+Every run ends with the same `weft clean --images --all`, pass or fail. When a
+whole run passes, nothing is left behind: every test removed its own projects,
+cells and connections. When some failed, what they kept stays (the reclaim
+keeps every image a project still points at) and the rest goes.
 
 ## Credentials, and what the runner provides for you
 

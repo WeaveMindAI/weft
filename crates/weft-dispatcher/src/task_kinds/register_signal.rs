@@ -251,6 +251,14 @@ impl RegisterSignalExecutor {
         // the project store: same answer while the project lives, and
         // still an answer once it does not.
         let tenant = owner.tenant;
+        // Whose signal: the run's member (a member's trigger setup arms
+        // that member's copy; a member's run waits as that member).
+        let member = owner.member;
+        let fired_by = owner.fired_by;
+        let member_call = member.clone();
+        let for_member = member
+            .clone()
+            .map(|member| weft_core::member::MemberScope { project_id, member });
 
         // The place this registration is for, spelled: the row's key.
         // Read off the original program, the one this registration's
@@ -293,10 +301,12 @@ impl RegisterSignalExecutor {
         } else {
             let existing: Option<(String, Value, i64)> = sqlx::query_as(
                 "SELECT token, kind_state, kind_state_seq FROM signal \
-                 WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE",
+                 WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3 \
+                   AND is_resume = FALSE",
             )
             .bind(project_id)
             .bind(&place)
+            .bind(member.as_ref().map(|m| m.as_str()))
             .fetch_optional(&state.pg_pool)
             .await?;
             match existing {
@@ -365,6 +375,7 @@ impl RegisterSignalExecutor {
                             &handle,
                             &token_call,
                             &tenant_for_register,
+                            for_member.as_ref(),
                             &spec_call,
                             &node_id_call,
                             payload.is_resume,
@@ -386,6 +397,23 @@ impl RegisterSignalExecutor {
                         // `register_signal` would re-run and mint a
                         // fresh secret, flipping the user's API key.
                         let post_register: Result<_> = async {
+                            // A public address is one per trigger: the member of a call to
+                            // it is named per call (the `Weft-Member` header on a gated
+                            // route, or a member token), never by giving each member a
+                            // copy of the route. A per-member route is refused where it
+                            // is armed, naming that way.
+                            if let (Some(member), weft_core::primitive::SignalSurface::PublicEntry { path, .. }) =
+                                (member_call.as_ref(), &routing.surface)
+                            {
+                                anyhow::bail!(
+                                    "trigger '{node_id_call}' serves the public address '{path}', and an address is shared by \
+                                     every member, so it cannot be armed for member '{member}'. Keep the route shared \
+                                     and name the member per call: the {} header on a route gated by a connection, or \
+                                     a member token",
+                                    weft_core::member::MEMBER_HEADER,
+                                );
+                            }
+
                             // Route overlap check: another (project, node) of
                             // THIS tenant already serves a call this route
                             // would claim (`chat/{room}` against `chat/{x}`,
@@ -496,6 +524,11 @@ impl RegisterSignalExecutor {
             let insert_result = state
                 .journal
                 .signal_insert(&crate::journal::SignalRegistration {
+                    member: member.clone(),
+                    // An entry signal is its own trigger's; a wait is the
+                    // activation's of the trigger that fired its run (none
+                    // for a run started by hand).
+                    activation_trigger: if payload.is_resume { fired_by.clone() } else { Some(place.clone()) },
                     setup_color: (!payload.is_resume).then_some(color),
                     source_version,
                     program,

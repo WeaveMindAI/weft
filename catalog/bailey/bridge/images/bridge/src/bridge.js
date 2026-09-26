@@ -317,12 +317,10 @@ export async function createBridge(authDir, webhookManager, messageStore) {
 
       const { content, messageType } = extractTextContent(msg);
 
-      // Skip non-actionable noise (reactions, receipts, protocol msgs).
-      // Media without caption still goes through; the receive node
-      // resolves the bytes via /media/:id and stores them.
-      const hasText = content != null && content !== '';
-      const isMedia = ['image', 'video', 'document', 'audio', 'sticker'].includes(messageType);
-      if (!hasText && !isMedia) continue;
+      // Every message with content is emitted, typed. A kind the store
+      // does not know (a reaction, a poll, a protocol message) goes out
+      // as `unknown`, and the receive node's filter drops it unless its
+      // author asked for `unknown` by name.
 
       const from = msg.key.remoteJid;
       const isGroup = from?.endsWith('@g.us') || false;

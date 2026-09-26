@@ -38,7 +38,7 @@ const run = (color: string, version: string, at: number, extra: Partial<RunSumma
 
 const id = (n: string) => `${n}00000000`;
 const tree: TreeJson = {
-  head: { head_version: id('v2'), head_run: id('c2'), activation_version: id('v1') },
+  head: { head_version: id('v2'), head_run: id('c2'), activated_versions: [id('v1')] },
   disk_version: id('v3'),
   // In the dispatcher's order: the order they were recorded.
   versions: [version('v1', null, 1, [], 'base'), version('v2', 'v1', 2, ['main.weft']), version('v3', 'v1', 3, ['prompts/p.txt'])],

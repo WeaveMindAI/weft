@@ -47,6 +47,10 @@ struct Minted {
     allowed_displays: Vec<String>,
     #[serde(rename = "allDisplays")]
     all_displays: bool,
+    #[serde(default)]
+    member: Option<weft_core::member::MemberId>,
+    #[serde(default, rename = "expiresAtUnix")]
+    expires_at_unix: Option<u64>,
 }
 
 /// One listed token (`GET /signal-tokens`): metadata and the
@@ -64,6 +68,10 @@ struct Listed {
     allowed_displays: Vec<String>,
     #[serde(rename = "allDisplays")]
     all_displays: bool,
+    #[serde(default)]
+    member: Option<weft_core::member::MemberId>,
+    #[serde(default, rename = "expiresAtUnix")]
+    expires_at_unix: Option<u64>,
 }
 
 pub enum TokenAction {
@@ -75,6 +83,9 @@ pub enum TokenAction {
         displays: Vec<String>,
         /// Every display in the token's projects (`--displays`).
         all_displays: bool,
+        /// A member token for this member of the project in the folder.
+        member: Option<weft_core::member::MemberId>,
+        expires_in_secs: Option<u64>,
     },
     Ls,
     Revoke {
@@ -85,14 +96,17 @@ pub enum TokenAction {
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     let client = ctx.client();
     match action {
-        TokenAction::Mint { name, projects, tags, displays, all_displays } => {
+        TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires_in_secs } => {
             let displays = grants_for(&ctx, &displays)?;
+            let projects = member_projects(&ctx, member.as_ref(), projects)?;
             let body = serde_json::json!({
                 "name": name,
                 "allowedProjects": projects,
                 "allowedTags": tags,
                 "allowedDisplays": displays,
                 "allDisplays": all_displays,
+                "member": member,
+                "expiresInSecs": expires_in_secs,
             });
             let resp: serde_json::Value = client.post_json("/signal-tokens", &body).await?;
             let minted: Minted = serde_json::from_value(resp.clone())
@@ -117,6 +131,7 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 &minted.allowed_displays,
                 minted.all_displays,
             );
+            print_member_summary(minted.member.as_ref(), minted.expires_at_unix);
             Ok(())
         }
         TokenAction::Ls => {
@@ -143,6 +158,7 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                     &t.allowed_displays,
                     t.all_displays,
                 );
+                print_member_summary(t.member.as_ref(), t.expires_at_unix);
             }
             Ok(())
         }
@@ -154,6 +170,41 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
             println!("revoked: {id}");
             Ok(())
         }
+    }
+}
+
+/// The projects a token is scoped to. A member token acts in exactly
+/// one project, the one the person is standing in, so `--member` fills
+/// it from the folder (and a `--projects` naming anything else is
+/// refused rather than quietly replaced).
+fn member_projects(ctx: &Ctx, member: Option<&weft_core::member::MemberId>, projects: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let Some(member) = member else { return Ok(projects) };
+    let here = ctx
+        .project()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "--member makes a token for a member of the project you are in, and there is none \
+                 here: {e}. Run this from the project's folder."
+            )
+        })?
+        .id()
+        .to_string();
+    if projects.iter().any(|p| p != &here) {
+        anyhow::bail!(
+            "a member token acts in exactly one project, the one you are in ({here}); drop --projects \
+             for member '{member}'"
+        );
+    }
+    Ok(vec![here])
+}
+
+/// The member line of a token's summary, when it is a member token.
+fn print_member_summary(member: Option<&weft_core::member::MemberId>, expires_at_unix: Option<u64>) {
+    if let Some(member) = member {
+        eprintln!("    member:   {member}");
+    }
+    if let Some(at) = expires_at_unix {
+        eprintln!("    expires:  unix {at}");
     }
 }
 

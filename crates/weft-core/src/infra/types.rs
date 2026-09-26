@@ -118,6 +118,28 @@ pub struct Unit {
     pub health: UnitHealth,
 }
 
+impl Unit {
+    /// Whether the health loop can ever see this unit ready: its workload
+    /// is a kind the loop's watch lists (a Deployment or a StatefulSet)
+    /// and it asks for at least one replica (an autoscaled one, its
+    /// floor). A DaemonSet, a Job or a unit at zero replicas never reads
+    /// as ready there, so nothing may count it as seen from its row.
+    // SYNC: watched kinds <-> crates/weft-platform-traits/src/kube/api.rs KubeApiClient::watch_replica_state
+    pub fn health_watched(&self) -> bool {
+        matches!(self.kind, UnitKind::Deployment | UnitKind::StatefulSet) && !self.zero_by_spec()
+    }
+
+    /// Whether the spec asks for zero replicas: a fixed count of 0, or
+    /// an autoscale floor of 0.
+    pub fn zero_by_spec(&self) -> bool {
+        let wanted = match &self.scaling.autoscale {
+            Some(autoscale) => autoscale.min_replicas,
+            None => self.scaling.replicas,
+        };
+        wanted == 0
+    }
+}
+
 /// Per-unit health window overrides. `None` means "use the
 /// supervisor's global default" (`FLAKY_AFTER` / `RECOVERY_AFTER`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

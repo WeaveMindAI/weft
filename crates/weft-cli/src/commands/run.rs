@@ -76,6 +76,14 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
         }
     }
     let compiled = super::ensure::compile_project(ctx, progress)?;
+    // A `@file(...)` / `@asset(...)` in a handed value becomes the value
+    // it stands for before anything checks it, so the port-type check
+    // below judges the file, never the marker text. What was saved above
+    // keeps the markers, so an example reads its file afresh every run.
+    if let Some(spec) = &mut spec {
+        let (client, project_id, _) = super::resolve_project(ctx)?;
+        super::assets::resolve_run_values(&client, &ctx.project()?.root, &project_id, spec).await?;
+    }
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
     let node_set = args.node_set.unwrap_or(weft_compiler::codegen::NodeSet::Full);
     let definition = compiled.definition.clone();

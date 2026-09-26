@@ -639,8 +639,61 @@ fn render_query(params: &[(Vec<u8>, Vec<u8>)]) -> String {
 
 /// One stored file in the fake's in-memory storage.
 struct StoredEntry {
+    /// The wall it was stored inside, resolved (a `Member { of: None }`
+    /// names the run's member): what `storage_list` filters on.
+    scope: crate::storage::StorageScope,
     meta: crate::storage::StoredFileMeta,
     bytes: bytes::Bytes,
+}
+
+impl FakeState {
+    /// `scope` with the run's own member named: a `Member { of: None }`
+    /// in a run for nobody fails as it does in a real run.
+    fn resolve_scope(&self, scope: &crate::storage::StorageScope) -> WeftResult<crate::storage::StorageScope> {
+        match scope {
+            crate::storage::StorageScope::Member { of: None } => {
+                let member = self.member.lock().unwrap().clone().ok_or_else(|| {
+                    WeftError::NodeExecution(
+                        "member storage in a run for nobody: name the member, or give the run one with rig.member(..)".into(),
+                    )
+                })?;
+                Ok(crate::storage::StorageScope::member_of(member))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// The stored-file value an identified put in `scope` (resolved)
+    /// already minted, if any.
+    fn identified(&self, scope: &crate::storage::StorageScope, identity: &str) -> Option<Value> {
+        let identities = self.identities.lock().unwrap();
+        let (_, key) = identities.iter().find(|((s, i), _)| s == scope && i == identity)?;
+        let storage = self.storage.lock().unwrap();
+        let entry = storage.get(key).expect("an identified key is stored");
+        Some(
+            crate::storage::StoredFile {
+                key: entry.meta.key.clone(),
+                mime_type: entry.meta.mime_type.clone(),
+                size_bytes: entry.meta.size_bytes,
+                filename: entry.meta.filename.clone(),
+            }
+            .to_value(),
+        )
+    }
+
+    /// A fresh key inside `scope` (already resolved).
+    fn mint_storage_key(&self, scope: &crate::storage::StorageScope, filename: &str) -> String {
+        let wall = match scope {
+            crate::storage::StorageScope::Execution => "exec".to_string(),
+            crate::storage::StorageScope::Project => "project".to_string(),
+            crate::storage::StorageScope::Shared { name } => format!("shared/{name}"),
+            crate::storage::StorageScope::Asset => "asset".to_string(),
+            crate::storage::StorageScope::Member { of } => {
+                format!("member/{}", of.as_ref().expect("a resolved member scope names its member"))
+            }
+        };
+        format!("node-test/{wall}/{}-{filename}", self.next_storage_key.fetch_add(1, Ordering::SeqCst))
+    }
 }
 
 /// Shared state behind the fake rig and its handle. Dumb by rule:
@@ -658,6 +711,9 @@ struct FakeState {
     /// The wake payload for the NEXT `run` (a firing trigger's
     /// `ctx.wake`). Taken (consumed) when a run starts.
     wake: Mutex<Option<Value>>,
+    /// Who every run on this rig is for (`ctx.member()`), set with
+    /// `rig.member(..)`. `None`: a run for nobody in particular.
+    member: Mutex<Option<crate::member::MemberId>>,
     /// The live caller the run is attached to (`attach_caller`), what
     /// `ctx.caller()` and its protocol-typed forms answer. `None` = a
     /// run with nobody on the line, which is what every node not behind
@@ -691,12 +747,14 @@ struct FakeState {
     /// marker, so the marker resolves back (in the node and in the
     /// test's post-run read).
     buses: Mutex<HashMap<String, crate::bus::BusHandle>>,
-    /// In-memory storage, keyed by minted key.
+    /// In-memory storage, keyed by minted key. A key carries its scope
+    /// (`node-test/<scope>/..`) and the entry its resolved scope, so a
+    /// list sees only its own wall.
     storage: Mutex<HashMap<String, StoredEntry>>,
-    /// `(scope, identity)` of every identified put, to the key it
-    /// minted: a second put of the same identity answers that key
-    /// and stores nothing, like the real service.
-    identities: Mutex<HashMap<(String, String), String>>,
+    /// `(resolved scope, identity)` of every identified put, to the key
+    /// it minted: a second put of the same identity in the same scope
+    /// answers that key and stores nothing, like the real service.
+    identities: Mutex<Vec<((crate::storage::StorageScope, String), String)>>,
     /// Mint for storage keys.
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
@@ -709,6 +767,14 @@ struct FakeState {
     /// ask so a test can assert the node steered the right tag the
     /// right way.
     stops: Mutex<Vec<(String, crate::tag::StopSelf)>>,
+    /// Every program call the node made (`ctx.infra(..)`,
+    /// `ctx.trigger(..)`, `ctx.connections()`, ...), in order.
+    program_calls: Mutex<Vec<(crate::program::ProgramCall, crate::tag::StopSelf)>>,
+    /// Answers declared for program calls, by the call's journal name
+    /// (`weft.infra.status`), each used once, in order.
+    program_answers: Mutex<HashMap<String, VecDeque<Value>>>,
+    /// Every member token the node minted: the member and its life.
+    minted_tokens: Mutex<Vec<MintedToken>>,
     /// The infra endpoints this node's own infrastructure answers on,
     /// by endpoint name. Declared by `endpoint`; an undeclared name
     /// fails the way an unprovisioned one does in a real run.
@@ -786,6 +852,7 @@ impl FakeState {
             requests: Mutex::new(Vec::new()),
             signals: Mutex::new(VecDeque::new()),
             wake: Mutex::new(None),
+            member: Mutex::new(None),
             caller: Mutex::new(None),
             registered_signals: Mutex::new(Vec::new()),
             awaited_signals: Mutex::new(Vec::new()),
@@ -796,11 +863,14 @@ impl FakeState {
             input_types: Mutex::new(HashMap::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
-            identities: Mutex::new(HashMap::new()),
+            identities: Mutex::new(Vec::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
             execution_tags: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
+            program_calls: Mutex::new(Vec::new()),
+            program_answers: Mutex::new(HashMap::new()),
+            minted_tokens: Mutex::new(Vec::new()),
             endpoints: Mutex::new(BTreeMap::new()),
             public_urls: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
@@ -809,6 +879,17 @@ impl FakeState {
             cancellation: Arc::new(CancellationFlag::new()),
         })
     }
+}
+
+/// One member token a node minted through the rig
+/// ([`FakeRig::minted_tokens`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedToken {
+    pub member: crate::member::MemberId,
+    /// How many seconds it was made to live.
+    pub expires_in_secs: u64,
+    /// The id the run chose for it.
+    pub id: uuid::Uuid,
 }
 
 /// The fake-tier harness handle. A test declares canned responses and
@@ -943,6 +1024,15 @@ impl FakeRig {
     /// queue fails loud ("the test declared no signal").
     pub fn signal(&self, payload: Value) {
         self.state.signals.lock().unwrap().push_back(payload);
+    }
+
+    /// Make every run on this rig a run for this member, what
+    /// `ctx.member()` answers, the way a member's firing, member token or
+    /// `Weft-Member` header would in production. A blank or malformed id
+    /// panics: it is a mistake in the test.
+    pub fn member(&self, id: &str) {
+        let id = crate::member::MemberId::new(id).unwrap_or_else(|why| panic!("rig.member({id:?}): {why}"));
+        *self.state.member.lock().unwrap() = Some(id);
     }
 
     /// Set the wake payload (`ctx.wake`) for the NEXT run: what a
@@ -1271,7 +1361,8 @@ impl FakeRig {
             awaited_sequence: Mutex::new(awaited_sequence.into()),
             next_call_index: AtomicU32::new(0),
         });
-        let ctx = test_context(manifest, bag, handle.clone());
+        let member = self.state.member.lock().unwrap().clone();
+        let ctx = test_context(manifest, bag, member, handle.clone());
         Ok((CaptureBox::Fake(handle), ctx, feeds))
     }
 
@@ -1280,11 +1371,24 @@ impl FakeRig {
     /// "application/pdf", bytes)})`. The same shape `ctx.storage`
     /// verbs mint during a run.
     pub fn store_file(&self, filename: &str, mime_type: &str, bytes: impl Into<Vec<u8>>) -> Value {
+        self.store_file_in(&crate::storage::StorageScope::Execution, filename, mime_type, bytes)
+    }
+
+    /// [`Self::store_file`] inside `scope`: a member's files
+    /// (`StorageScope::member_of(..)`), the project's, a shared space's.
+    /// Only that scope's `storage_list` sees it. The run's own member
+    /// (`StorageScope::member()`) needs `rig.member(..)` first, and
+    /// panics without one.
+    pub fn store_file_in(
+        &self,
+        scope: &crate::storage::StorageScope,
+        filename: &str,
+        mime_type: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Value {
         let bytes: Vec<u8> = bytes.into();
-        let key = format!(
-            "node-test/{}-{filename}",
-            self.state.next_storage_key.fetch_add(1, Ordering::SeqCst)
-        );
+        let scope = self.state.resolve_scope(scope).expect("store_file_in: the scope names no member");
+        let key = self.state.mint_storage_key(&scope, filename);
         let meta = crate::storage::StoredFileMeta {
             key: key.clone(),
             mime_type: mime_type.to_string(),
@@ -1305,7 +1409,7 @@ impl FakeRig {
             .storage
             .lock()
             .unwrap()
-            .insert(key, StoredEntry { meta, bytes: bytes::Bytes::from(bytes) });
+            .insert(key, StoredEntry { scope, meta, bytes: bytes::Bytes::from(bytes) });
         stored.to_value()
     }
 
@@ -1407,6 +1511,29 @@ impl FakeRig {
     /// fake run has no siblings); this is the record of the ask.
     pub fn stops(&self) -> Vec<(String, crate::tag::StopSelf)> {
         self.state.stops.lock().unwrap().clone()
+    }
+
+    /// Declare what the next program call named `name` answers (its
+    /// journal name: `weft.infra.status`, `weft.infra.copies`,
+    /// `weft.connections.list`, `weft.costs.list`, `weft.runs.clean`, ...).
+    /// Answers are used once each, in order. A call that reads something
+    /// with no answer declared fails naming this; a call that only acts
+    /// (start, stop, activate, pick) answers without one.
+    pub fn answer_program_call(&self, name: &str, value: Value) {
+        self.state.program_answers.lock().unwrap().entry(name.to_string()).or_default().push_back(value);
+    }
+
+    /// Every program call the node made, in order, with the `StopSelf`
+    /// it passed. Nothing was actually started, stopped or cleaned (a
+    /// fake run has no project); this is the record of the asks.
+    pub fn program_calls(&self) -> Vec<(crate::program::ProgramCall, crate::tag::StopSelf)> {
+        self.state.program_calls.lock().unwrap().clone()
+    }
+
+    /// Every member token the node minted, in order, one entry per
+    /// `mint_member_token` call.
+    pub fn minted_tokens(&self) -> Vec<MintedToken> {
+        self.state.minted_tokens.lock().unwrap().clone()
     }
 }
 
@@ -1557,16 +1684,17 @@ fn declared_output_map(manifest: &NodeMetadata, config: &Value) -> HashMap<Strin
 fn test_context(
     manifest: &NodeMetadata,
     inputs: ValueBag,
+    member: Option<crate::member::MemberId>,
     handle: Arc<dyn ContextHandle>,
 ) -> ExecutionContext {
     ExecutionContext::new(
-        format!("node-test-{}", uuid::Uuid::new_v4().simple()),
         uuid::Uuid::new_v4(),
         NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
         crate::Color::new_v4(),
         LoopFrames::default(),
+        member,
         inputs,
         handle,
     )
@@ -2051,7 +2179,7 @@ impl ContextHandle for TestHandle {
             values,
             Vec::new(),
             None,
-            CredentialOwner::TheirOwn,
+            CredentialOwner::Author,
             client,
             Arc::new(NoFakeSocket),
         ))
@@ -2070,6 +2198,59 @@ impl ContextHandle for TestHandle {
     async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
         self.state.stops.lock().unwrap().push((tag, stop_self));
         Ok(())
+    }
+
+    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: crate::tag::StopSelf, _call_index: u32) -> WeftResult<Value> {
+        let name = call.journal_name();
+        // A call that only acts, left unanswered by the test, answers the
+        // way the runtime answers one it carried out: a start is queued,
+        // a change of values set nothing up again.
+        let unanswered = match call {
+            crate::program::ProgramCall::InfraStart { .. } => serde_json::to_value(crate::program::InfraStartAnswer::Started),
+            crate::program::ProgramCall::ValuesChange { .. } | crate::program::ProgramCall::ValuesForget { .. } => {
+                serde_json::to_value(crate::member_door::ValuesChanged::default())
+            }
+            _ => Ok(serde_json::json!({})),
+        }
+        .expect("a program call answer serializes");
+        let acts_only = matches!(
+            call,
+            crate::program::ProgramCall::InfraStart { .. }
+                | crate::program::ProgramCall::InfraStop { .. }
+                | crate::program::ProgramCall::InfraTerminate { .. }
+                | crate::program::ProgramCall::TriggerActivate { .. }
+                | crate::program::ProgramCall::TriggerDeactivate { .. }
+                | crate::program::ProgramCall::ValuesChange { .. }
+                | crate::program::ProgramCall::ValuesForget { .. }
+        );
+        self.state.program_calls.lock().unwrap().push((call, stop_self));
+        if let Some(answer) = self.state.program_answers.lock().unwrap().get_mut(name).and_then(VecDeque::pop_front) {
+            return Ok(answer);
+        }
+        if acts_only {
+            return Ok(unanswered);
+        }
+        Err(WeftError::Config(format!(
+            "the node called {name}, and the test declared no answer for it: \
+             rig.answer_program_call(\"{name}\", ..) before the run"
+        )))
+    }
+
+    async fn mint_member_token(
+        &self,
+        member: &crate::member::MemberId,
+        expires_in_secs: u64,
+        _displays: bool,
+        id: uuid::Uuid,
+    ) -> WeftResult<crate::program::MintedMemberToken> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs();
+        let expires_at_unix = crate::signal_token::expiry_at(now, expires_in_secs).map_err(WeftError::Config)?;
+        let mut minted = self.state.minted_tokens.lock().unwrap();
+        minted.push(MintedToken { member: member.clone(), expires_in_secs, id });
+        Ok(crate::program::MintedMemberToken { id, token: format!("wft-test-token-{}", minted.len()), expires_at_unix })
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -2145,24 +2326,12 @@ impl ContextHandle for TestHandle {
         let bytes = crate::storage::collect_stream(data)
             .await
             .map_err(|e| WeftError::NodeExecution(format!("fake storage put: {e}")))?;
-        let identity_key = identity.map(|i| (format!("{scope:?}"), i.to_string()));
-        if let Some(identity_key) = &identity_key {
-            if let Some(existing) = self.state.identities.lock().unwrap().get(identity_key) {
-                let storage = self.state.storage.lock().unwrap();
-                let entry = storage.get(existing).expect("an identified key is stored");
-                return Ok(crate::storage::StoredFile {
-                    key: entry.meta.key.clone(),
-                    mime_type: entry.meta.mime_type.clone(),
-                    size_bytes: entry.meta.size_bytes,
-                    filename: entry.meta.filename.clone(),
-                }
-                .to_value());
-            }
+        let scope = self.state.resolve_scope(scope)?;
+        if let Some(stored) = identity.and_then(|identity| self.state.identified(&scope, identity)) {
+            return Ok(stored);
         }
-        let key = format!(
-            "node-test/{}-{filename}",
-            self.state.next_storage_key.fetch_add(1, Ordering::SeqCst)
-        );
+        let identity_key = identity.map(|i| (scope.clone(), i.to_string()));
+        let key = self.state.mint_storage_key(&scope, filename);
         let meta = crate::storage::StoredFileMeta {
             key: key.clone(),
             mime_type: mime_type.to_string(),
@@ -2180,13 +2349,13 @@ impl ContextHandle for TestHandle {
             filename: filename.to_string(),
         };
         if let Some(identity_key) = identity_key {
-            self.state.identities.lock().unwrap().insert(identity_key, meta.key.clone());
+            self.state.identities.lock().unwrap().push((identity_key, meta.key.clone()));
         }
         self.state
             .storage
             .lock()
             .unwrap()
-            .insert(meta.key.clone(), StoredEntry { meta, bytes });
+            .insert(meta.key.clone(), StoredEntry { scope, meta, bytes });
         Ok(stored.to_value())
     }
 
@@ -2201,19 +2370,9 @@ impl ContextHandle for TestHandle {
         // An identified fetch the fake already holds costs no request,
         // like production: the canned route is not even consulted, so
         // a test can count requests to prove a second ask pulled nothing.
-        if let Some(identity) = identity {
-            let key = (format!("{scope:?}"), identity.to_string());
-            if let Some(existing) = self.state.identities.lock().unwrap().get(&key) {
-                let storage = self.state.storage.lock().unwrap();
-                let entry = storage.get(existing).expect("an identified key is stored");
-                return Ok(crate::storage::StoredFile {
-                    key: entry.meta.key.clone(),
-                    mime_type: entry.meta.mime_type.clone(),
-                    size_bytes: entry.meta.size_bytes,
-                    filename: entry.meta.filename.clone(),
-                }
-                .to_value());
-            }
+        let resolved = self.state.resolve_scope(scope)?;
+        if let Some(stored) = identity.and_then(|identity| self.state.identified(&resolved, identity)) {
+            return Ok(stored);
         }
         // Answered from the SAME canned routes every other fake call
         // uses, so a fetch stays offline: declare the URL's route with
@@ -2286,7 +2445,10 @@ impl ContextHandle for TestHandle {
 
     async fn storage_delete(&self, key: &str) -> WeftResult<()> {
         match self.state.storage.lock().unwrap().remove(key) {
-            Some(_) => Ok(()),
+            Some(_) => {
+                self.state.identities.lock().unwrap().retain(|(_, minted)| minted != key);
+                Ok(())
+            }
             None => Err(WeftError::NodeExecution(format!(
                 "fake storage holds no file at key '{key}'"
             ))),
@@ -2295,14 +2457,16 @@ impl ContextHandle for TestHandle {
 
     async fn storage_list(
         &self,
-        _scope: &crate::storage::StorageScope,
+        scope: &crate::storage::StorageScope,
     ) -> WeftResult<Vec<crate::storage::StoredFileMeta>> {
+        let scope = self.state.resolve_scope(scope)?;
         let mut metas: Vec<_> = self
             .state
             .storage
             .lock()
             .unwrap()
             .values()
+            .filter(|e| e.scope == scope)
             .map(|e| e.meta.clone())
             .collect();
         metas.sort_by(|a, b| a.key.cmp(&b.key));
@@ -2667,7 +2831,7 @@ impl LiveRig {
             capture: Capture::new(outputs_by_name),
             declared_inputs: declared_input_map(manifest, &HashMap::new()),
         });
-        let ctx = test_context(manifest, bag, handle.clone());
+        let ctx = test_context(manifest, bag, None, handle.clone());
         let result = node.run(ctx).await;
         CaptureBox::Live(handle).into_outcome(result)
     }
@@ -2758,6 +2922,20 @@ impl ContextHandle for CapturingHandle {
 
     async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
         self.inner.stop_tagged(tag, stop_self).await
+    }
+
+    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: crate::tag::StopSelf, call_index: u32) -> WeftResult<Value> {
+        self.inner.program_call(call, stop_self, call_index).await
+    }
+
+    async fn mint_member_token(
+        &self,
+        member: &crate::member::MemberId,
+        expires_in_secs: u64,
+        displays: bool,
+        id: uuid::Uuid,
+    ) -> WeftResult<crate::program::MintedMemberToken> {
+        self.inner.mint_member_token(member, expires_in_secs, displays, id).await
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {

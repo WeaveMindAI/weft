@@ -92,4 +92,16 @@ describe('buildPortMenuItems', () => {
 		}
 		expect(notes(items).length).toBeGreaterThan(0);
 	});
+
+	it('an input a member could fill offers the toggle, named for what it will do', () => {
+		let flipped = 0;
+		const off = build({ memberFilled: { filled: false, onToggle: () => { flipped++; } } });
+		const row = off.find((item) => item.label.includes('each member'));
+		expect(row?.label).toBe('👤 Let each member fill this');
+		if (row && row.note !== true) row.onClick();
+		expect(flipped).toBe(1);
+		const on = build({ memberFilled: { filled: true, onToggle: () => {} } });
+		expect(on.some((item) => item.label === '👤 Stop letting each member fill this')).toBe(true);
+		expect(build({}).some((item) => item.label.includes('each member'))).toBe(false);
+	});
 });

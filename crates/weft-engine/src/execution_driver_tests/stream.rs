@@ -201,8 +201,8 @@
                 let rows = vec![
                     ExecEvent::ExecutionStarted {
                         color, project_id: project.id, entry_node: root.into(),
-                        phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, node_test: false,
-                        subgraph: Some(selection), seed: None, at_unix: 0,
+                        phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                        subgraph: Some(selection), seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
                     },
                     ExecEvent::NodeKicked { color, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 ];

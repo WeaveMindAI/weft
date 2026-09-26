@@ -598,6 +598,7 @@ fn editor_caller(tenant: &str, project: &str) -> CallerAuth {
         tenant: tenant.to_string(),
         project_id: project.to_string(),
         color: None,
+        member: None,
     }
 }
 

@@ -130,6 +130,10 @@ spec:
     spec:
       serviceAccountName: weft-dispatcher
       terminationGracePeriodSeconds: 60
+      # ndots:1: a fully qualified internal name resolves as written,
+      # never walking the search list out to the host resolver first
+      # (weft_core::pod_dns, whose test holds this line in sync).
+      dnsConfig: {"options":[{"name":"ndots","value":"1"}]}
       containers:
         - name: dispatcher
           # Content-addressed ref substituted by the apply path; a new

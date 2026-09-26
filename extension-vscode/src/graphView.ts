@@ -17,7 +17,7 @@ import { ReconnectingStream } from './projectEvents';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -127,8 +127,10 @@ export class GraphViewController {
   /// resync, infra start/stop/terminate/upgrade) shells out to the
   /// CLI. Extension.ts installs this; graphView calls it with the
   /// verb name + arg list.
+  /// Resolves to a picker intent when the dispatcher asked how the
+  /// triggers come down (see `triggerChoice.ts`).
   private cliVerbHandler:
-    | ((verb: string, args: string[]) => Promise<void>)
+    | ((verb: string, args: string[]) => Promise<TriggerChoiceIntent | undefined>)
     | undefined;
   /// Runs `weft status --json` and pushes drift bits + available
   /// actions into the action-bar state machine. Used on graph
@@ -284,7 +286,7 @@ export class GraphViewController {
   /// The CLI handles build, hash-skip, registry push, dispatcher
   /// call, and any user prompts.
   setCliVerbHandler(
-    fn: (verb: string, args: string[]) => Promise<void>,
+    fn: (verb: string, args: string[]) => Promise<TriggerChoiceIntent | undefined>,
   ): void {
     this.cliVerbHandler = fn;
   }
@@ -916,6 +918,10 @@ export class GraphViewController {
     // node keeps its id when its type changes.
     const showing = new Map<string, DisplayRoute>();
     for (const n of nodes) {
+      // A node that exists once per member has no one display to show
+      // here: each member's copy shows its own, to that member, through
+      // the member door. The editor shows the shared program alone.
+      if (n.perMember) continue;
       // Both doors take the place spelled the way a person writes it
       // (`one.door` for the `door` inside the file the site `one`
       // includes): the node under the calls this view descended through.
@@ -1153,7 +1159,12 @@ export class GraphViewController {
     // graphView no longer needs its own try/catch -> reportActionFailure
     // shim because the bar reads error state directly from
     // actionBarState.
-    await this.cliVerbHandler?.(verb, args);
+    //
+    // A verb sent without a trigger-deactivation choice that the
+    // dispatcher needed comes back as a picker intent: the webview opens
+    // its picker and sends the verb again with the choice.
+    const intent = await this.cliVerbHandler?.(verb, args);
+    if (intent) this.post({ kind: 'needsTriggerChoice', intent });
     void this.refreshActionAvailability();
   }
 
@@ -1314,9 +1325,7 @@ export class GraphViewController {
         this.dismissErrorHandler?.();
         break;
       case 'resyncProject':
-        // The picker's spec rides along when the project was Active
-        // (the CLI passes it as trigger-deactivation flags; the
-        // dispatcher 412s without them on an Active project).
+        // The picker's spec rides along as trigger-deactivation flags.
         void this.dispatchVerb(
           'resync',
           msg.spec ? this.deactivationFlags(msg.spec) : [],
@@ -2300,6 +2309,13 @@ export class GraphViewController {
   }
 
   private onDispose(): void {
+    // Forget the panel FIRST. Every getter on a disposed panel throws
+    // "Webview is disposed" (`visible` included, which the display
+    // teardown below reads), and a throw that stopped this cleanup
+    // before the panel was forgotten left it recorded as the open one:
+    // every later open then revealed the dead panel and threw the same
+    // error until the window was reloaded.
+    this.panel = undefined;
     if (this.parseTimer) clearTimeout(this.parseTimer);
     // The controller object is reused across panel sessions: a parse owed to
     // the torn-down session must not carry into the next one.
@@ -2321,7 +2337,6 @@ export class GraphViewController {
     this.stopAllDisplays();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
-    this.panel = undefined;
     this.watchedDoc = undefined;
     this.lastExecVersion = undefined;
     this.execVersionFor = undefined;

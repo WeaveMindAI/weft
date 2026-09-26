@@ -283,6 +283,7 @@ spec:
     spec:
       serviceAccountName: weft-infra-supervisor-sa
       automountServiceAccountToken: true
+      {dns_config}
       containers:
         - name: supervisor
           image: {image}
@@ -325,6 +326,7 @@ spec:
                   path: token
 "#,
         time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        dns_config = weft_core::pod_dns::pod_dns_config_yaml(),
         time_scale = weft_core::time_scale::factor(),
         instance_env = weft_core::infra::INSTANCE_ENV,
         instance_name = instance.name().unwrap_or(""),
@@ -971,6 +973,10 @@ mod tests {
             &weft_core::infra::Instance::default_install(),
         );
         assert!(yaml.contains("name: WEFT_POD_NAME"));
+        assert!(
+            yaml.contains(&format!("\n      {}\n      containers:", weft_core::pod_dns::pod_dns_config_yaml())),
+            "ndots:1 at the pod spec level"
+        );
         assert!(yaml.contains("value: \"weft-infra-supervisor-abc\""));
         assert!(!yaml.contains("fieldPath: metadata.name"));
         assert!(yaml.contains("weft.dev/role: infra-supervisor"));

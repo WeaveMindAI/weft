@@ -333,10 +333,11 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
 }
 
 /// Clear what removed projects left behind: the work queued for their
-/// workers and the workers themselves. Nothing can serve either once the
-/// project row is gone (the broker refuses a pod whose project it cannot
-/// find, so a worker started for it crashes at boot, and a pending task
-/// would keep asking for one). `weft rm` runs this as soon as the row is
+/// workers, the workers themselves, and the signals a listener still
+/// holds for them (a registration no project can fire or take down).
+/// None of it can do anything once the project row is gone: the broker
+/// refuses a pod whose project it cannot find, so a worker started for
+/// it crashes at boot, and a pending task would keep asking for one. `weft rm` runs this as soon as the row is
 /// gone; the loop catches work queued in the moment of the removal.
 /// Node-test pods are left alone: their scratch project is never a row,
 /// and the node-test sweep owns them.
@@ -351,6 +352,15 @@ pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::R
     }
     for row in workers_of_removed_projects(&state.pg_pool).await? {
         reap_worker_pod(state, &row, "its project was removed").await?;
+    }
+    let signals = crate::journal::postgres::remove_signals_of_removed_projects(&state.pg_pool).await?;
+    if !signals.is_empty() {
+        tracing::warn!(
+            target: "weft_dispatcher::reaper",
+            removed = signals.len(),
+            "removed the signals of projects that no longer exist"
+        );
+        state.listeners.unregister_many(&state.pg_pool, &signals).await;
     }
     Ok(())
 }
@@ -441,8 +451,8 @@ async fn reap_worker_pod(
 /// status-guarded (safe under N Pods; a live driver's row is never
 /// touched because its heartbeat is fresh):
 ///
-///   - stuck `activating` -> the same wipe the activate rollback /
-///     cancel-activate performs (unstick the status + cancel the
+///   - an activation stuck `activating` -> the same wipe the activate
+///     rollback / cancel-activate performs (end the claim + cancel the
 ///     leaked TriggerSetup color + drop half-registered signals).
 ///   - stuck `building` / `cancelling_build` -> clear the marker; the
 ///     builder job died with its pod (or keeps running harmlessly to
@@ -456,94 +466,93 @@ async fn reap_worker_pod(
 /// This replaces the old constructor-time blind bulk downgrade, which
 /// reset live status for every tenant's projects on any Pod boot.
 async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
-    use crate::project_store::ProjectStatus;
     let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
     for stuck in state.projects.list_stuck_transitions(stale_before).await? {
-        if stuck.transition.is_building() {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                project_id = %stuck.id,
-                transition = stuck.transition.as_str(),
-                "build transition orphaned (driver heartbeat stale); clearing marker"
-            );
-            if state.projects.finish_building(stuck.id).await? {
-                crate::transition::publish_transition_changed(&state, stuck.id).await;
-            }
-        }
-        if stuck.status == ProjectStatus::Activating {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                project_id = %stuck.id,
-                "activation orphaned (driver heartbeat stale); wiping activating state"
-            );
-            if let Err((code, msg)) =
-                crate::api::project::wipe_activating_state(
-                    &state, stuck.id,
-                    stuck.activating_ts_color.ok_or_else(|| anyhow::anyhow!("activating project {} has no reserved setup identity", stuck.id))?,
-                    // The activation's driver died mid-transition and
-                    // this sweep is repairing the row; nothing
-                    // superseded the run and no person stopped it.
-                    &weft_core::exec::CancelCause::Runtime {
-                        detail: "the activation's driver died mid-transition; the reaper \
-                                 wiped its state"
-                            .into(),
-                    },
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: "weft_dispatcher::reaper",
-                    project_id = %stuck.id,
-                    code = %code,
-                    error = %msg,
-                    "wipe of orphaned activation failed; retrying next sweep"
-                );
-                continue;
-            }
+        tracing::warn!(
+            target: "weft_dispatcher::reaper",
+            project_id = %stuck.id,
+            transition = stuck.transition.as_str(),
+            "build transition orphaned (driver heartbeat stale); clearing marker"
+        );
+        if state.projects.finish_building(stuck.id).await? {
             crate::transition::publish_transition_changed(&state, stuck.id).await;
         }
+    }
+    for stuck in state.activations.list_stuck(stale_before).await? {
+        tracing::warn!(
+            target: "weft_dispatcher::reaper",
+            project_id = %stuck.project_id,
+            activation = %stuck.color,
+            "activation orphaned (driver heartbeat stale); wiping activating state"
+        );
+        if let Err((code, msg)) = crate::api::project::wipe_activating_state(
+            &state,
+            stuck.project_id,
+            stuck.color,
+            // The activation's driver died mid-transition and this sweep
+            // is repairing the row; nothing superseded the run and no
+            // person stopped it.
+            &weft_core::exec::CancelCause::Runtime {
+                detail: "the activation's driver died mid-transition; the reaper wiped its state".into(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                project_id = %stuck.project_id,
+                code = %code,
+                error = %msg,
+                "wipe of orphaned activation failed; retrying next sweep"
+            );
+            continue;
+        }
+        crate::transition::publish_transition_changed(&state, stuck.project_id).await;
     }
     // Deactivating landings. Two steps, both idempotent, both the
     // SAME building blocks every other drain path uses:
     //   1. If the user's drain cap expired ("wait at most N, then
-    //      proceed"), cancel the remaining executions via the ONE
-    //      cancel helper (`cancel_running_non_suspended`).
-    //   2. Re-drive the ONE landing CAS (`try_finish_drain`); it
-    //      flips Deactivating -> Inactive iff the running set is
-    //      empty. This also covers deactivations whose terminal
-    //      events were missed across a restart.
+    //      proceed"), cancel what the activation still waits on via the
+    //      ONE cancel helper (`cancel_running_for`).
+    //   2. Re-drive the ONE landing CAS (`try_finish_drain`); it flips
+    //      Deactivating -> Inactive iff nothing it waits on runs. This
+    //      also covers deactivations whose terminal events were missed
+    //      across a restart.
     let now = crate::lease::now_unix();
-    for id in state.projects.list_deactivating().await? {
-        if let Some(lifecycle) = state.projects.lifecycle(id).await? {
-            if let Some(deadline) = lifecycle.drain_deadline_unix {
-                if now >= deadline {
-                    tracing::warn!(
-                        target: "weft_dispatcher::reaper",
-                        project_id = %id,
-                        "deactivation drain cap expired; cancelling remaining executions"
-                    );
-                    if let Err((code, msg)) =
-                        crate::api::project::cancel_running_non_suspended(
-                            &state,
-                            id,
-                            None,
-                            weft_core::exec::CancelCause::User,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            target: "weft_dispatcher::reaper",
-                            project_id = %id,
-                            code = %code,
-                            error = %msg,
-                            "drain-cap cancel failed; retrying next sweep"
-                        );
-                        continue;
-                    }
-                }
+    for (project_id, key) in state.activations.list_deactivating().await? {
+        let deadline = state
+            .activations
+            .list(project_id)
+            .await?
+            .into_iter()
+            .find(|a| a.key == key)
+            .and_then(|a| a.lifecycle.drain_deadline_unix);
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                %project_id,
+                trigger = %key,
+                "deactivation drain cap expired; cancelling remaining executions"
+            );
+            if let Err((code, msg)) = crate::api::project::cancel_running_for(
+                &state,
+                project_id,
+                std::slice::from_ref(&key),
+                weft_core::exec::CancelCause::User,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "weft_dispatcher::reaper",
+                    %project_id,
+                    code = %code,
+                    error = %msg,
+                    "drain-cap cancel failed; retrying next sweep"
+                );
+                continue;
             }
         }
-        crate::journal_bridge::try_finish_drain(&state, id, None).await?;
+        crate::journal_bridge::try_finish_drain(&state, project_id, &key, None).await?;
     }
     Ok(())
 }

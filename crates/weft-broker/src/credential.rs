@@ -316,7 +316,7 @@ mod tests {
             auth: bearer("key"),
             identity: None,
             service: "openrouter".into(),
-            owner: weft_core::CredentialOwner::Ours,
+            owner: weft_core::CredentialOwner::Platform,
             app_client_id: None,
         }
     }

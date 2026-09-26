@@ -7,6 +7,10 @@
 //!     by the broker (after its scope check).
 //!   - `Broker*` (in `weft-broker-client`): HTTP through the broker.
 //!     Used by workers and listeners.
+//! `InfraReader` is the exception: its only implementation is the
+//! broker client, because the worker names a run and the broker
+//! decides whose copy that run may reach. The broker reads the row
+//! through `PostgresInfraReader::endpoint_address` after that check.
 //!
 //! The engine takes `TaskStoreClient`, `WorkerPodClient` and
 //! `InfraReader`; the listener takes only `TaskStoreClient`.
@@ -187,13 +191,17 @@ impl WorkerPodClient for PostgresWorkerPodClient {
 /// provisions infrastructure.
 #[async_trait]
 pub trait InfraReader: Send + Sync {
-    /// Where one declared endpoint of an infra node answers. `None` when
-    /// the node is not Running or declares no endpoint by that name.
-    /// Backs `ctx.endpoint(name)` in node code.
+    /// Where one declared endpoint of an infra node answers, for the
+    /// run `color`. `None` when the node is not Running or declares no
+    /// endpoint by that name. Backs `ctx.endpoint(name)` in node code.
+    /// The run names only itself: its project, and its member when the
+    /// node exists once per member (`per_member`), are the broker's to
+    /// resolve, so a run can never reach another member's copy.
     async fn endpoint_address(
         &self,
-        project_id: Uuid,
+        color: weft_core::Color,
         node_id: &str,
+        per_member: bool,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 }
@@ -212,20 +220,24 @@ impl PostgresInfraReader {
     }
 }
 
-#[async_trait]
-impl InfraReader for PostgresInfraReader {
-    async fn endpoint_address(
+impl PostgresInfraReader {
+    /// [`InfraReader::endpoint_address`] once the broker has resolved
+    /// the run: `member` is whose copy (`None` for a shared node).
+    pub async fn endpoint_address(
         &self,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let row = sqlx::query(
             "SELECT endpoints_json, public_paths_json FROM infra_node \
-             WHERE project_id = $1 AND node_id = $2 AND status = 'running'",
+             WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3 \
+               AND status = 'running'",
         )
         .bind(project_id)
         .bind(node_id)
+        .bind(member.map(|m| m.as_str()))
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {

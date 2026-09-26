@@ -67,6 +67,9 @@ db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
 weft-dispatcher = { path = ".", features = ["test-helpers"] }
+# The broker's own apply insert, so a test issues an apply the way a
+# worker does in production.
+weft-broker = { path = "../weft-broker" }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "macros", "migrate"] }

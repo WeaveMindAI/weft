@@ -278,6 +278,17 @@ pub struct LiveConnectionConfig {
     /// `weft_core::caller::DEFAULT_INBOUND_WINDOW`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<usize>,
+
+    /// Whether the runs this trigger starts are recorded. Off, a run's
+    /// journal lives in the worker's memory
+    /// ([`crate::exec::RunKind::Unrecorded`]): nothing lists it unless
+    /// it fails, and it can neither wait nor outlive its caller.
+    #[serde(default = "default_recorded")]
+    pub recorded: bool,
+}
+
+fn default_recorded() -> bool {
+    true
 }
 
 impl LiveConnectionConfig {
@@ -299,7 +310,7 @@ impl LiveConnectionConfig {
     /// Build the shared body from a catalog node's config field map (the
     /// common authoring fields both live-caller nodes expose: `path`,
     /// `method`, `dataType`, `auth`, `outlivesCaller`, `defaultHoldSecs`,
-    /// `maxSessionSecs`, `callerSilenceSecs`).
+    /// `maxSessionSecs`, `callerSilenceSecs`, `maxInboundMb`).
     /// Centralized here so the two nodes (`Route`, `Socket`) do NOT each
     /// re-implement field parsing; every non-exposed knob keeps its
     /// default. `fields` is the node's `ctx.inputs.object()` map.
@@ -373,6 +384,18 @@ impl LiveConnectionConfig {
         // trigger is what opens the call path, and it is the one place
         // that knows what kind of client is on the other end.
         let caller_silence_secs = seconds("callerSilenceSecs", DEFAULT_CALLER_SILENCE_SECS)?;
+        // The largest request body (route) or message (socket) a caller
+        // may send, in whole megabytes; absent, the default. Zero would
+        // refuse every call, so the smallest is one.
+        let max_inbound_bytes = match fields.get("maxInboundMb") {
+            None | Some(serde_json::Value::Null) => DEFAULT_MAX_INBOUND_BYTES,
+            Some(v) => match v.as_f64() {
+                Some(n) if n >= 1.0 && n.fract() == 0.0 && n <= (u64::MAX / 1_048_576) as f64 => {
+                    n as u64 * 1_048_576
+                }
+                _ => return Err(format!("maxInboundMb must be a whole number of megabytes, 1 or more, got {v}")),
+            },
+        };
         // What the journal keeps of the exchange. A node that wants to
         // hand that choice to its author surfaces a `journalEphemeral`
         // boolean; one that does not never sets it and gets the same
@@ -388,6 +411,14 @@ impl LiveConnectionConfig {
                 return Err(format!("journalEphemeral must be true or false, got {v}"));
             }
         };
+        // Whether the runs are recorded: absent is yes, the default every
+        // run starts from; anything but a boolean is refused, for the
+        // same reason as `journalEphemeral` just above.
+        let recorded = match fields.get("recorded") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(v) => return Err(format!("recorded must be true or false, got {v}")),
+        };
         Ok(Self {
             path,
             methods,
@@ -396,7 +427,7 @@ impl LiveConnectionConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
             caller_silence_secs,
-            max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
+            max_inbound_bytes,
             max_session_secs,
             data_type,
             backpressure: Backpressure::default(),
@@ -404,7 +435,17 @@ impl LiveConnectionConfig {
             journal_mode,
             journal_window_secs: None,
             window: None,
+            recorded,
         })
+    }
+
+    /// The kind of run this trigger's firing starts.
+    pub fn run_kind(&self) -> crate::exec::RunKind {
+        if self.recorded {
+            crate::exec::RunKind::Execution
+        } else {
+            crate::exec::RunKind::Unrecorded
+        }
     }
 
     /// Shared validation for both kinds. `kind_tag` only flavors the error
@@ -537,6 +578,30 @@ mod tests {
         assert_eq!(c.error_mode, ErrorMode::Surface);
         assert_eq!(c.journal_mode, JournalMode::Journaled);
         assert_eq!(c.window, None);
+        assert!(c.recorded, "runs are recorded unless the author says otherwise");
+    }
+
+    /// `recorded` reads off the node's field (absent is on) and decides the
+    /// run kind. It sits fine with `outlivesCaller`: a caller leaving does
+    /// not park the run, it keeps going in memory, and the waits that
+    /// would park it are refused in an unrecorded run anyway.
+    #[test]
+    fn recorded_decides_the_run_kind_and_may_outlive_the_caller() {
+        let fields = |extra: serde_json::Value| {
+            let mut all = serde_json::json!({ "path": "status" });
+            all.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            all.as_object().unwrap().clone()
+        };
+        let on = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({}))).unwrap();
+        assert_eq!(on.run_kind(), crate::exec::RunKind::Execution);
+        let off = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": false }))).unwrap();
+        assert_eq!(off.run_kind(), crate::exec::RunKind::Unrecorded);
+        assert!(off.validate("Route").is_ok());
+        let err = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": "no" }))).unwrap_err();
+        assert!(err.contains("recorded"), "{err}");
+        let both = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": false, "outlivesCaller": true }))).unwrap();
+        assert!(both.validate("Route").is_ok());
+        assert_eq!(both.run_kind(), crate::exec::RunKind::Unrecorded);
     }
 
     /// Both kinds share the body, so a config valid for one parses for the
@@ -593,6 +658,7 @@ mod tests {
                 journal_mode: JournalMode::Ephemeral,
                 journal_window_secs: Some(5),
                 window: Some(128),
+                recorded: true,
             },
         };
         let spec = crate::signal::to_spec(sock.clone());
@@ -696,6 +762,7 @@ mod tests {
             "defaultHoldSecs": 120,
             "maxSessionSecs": 900,
             "callerSilenceSecs": 90,
+            "maxInboundMb": 64,
         });
         let cfg = LiveConnectionConfig::from_node_fields(fields.as_object().unwrap()).expect("builds");
         assert_eq!(cfg.path, "users/{id}");
@@ -709,6 +776,7 @@ mod tests {
         assert!(cfg.suspend.can_suspend);
         assert_eq!(cfg.suspend.default_hold_secs, 120);
         assert_eq!(cfg.max_session_secs, 900, "the ceiling the author asked for");
+        assert_eq!(cfg.max_inbound_bytes, 64 * 1_048_576, "the body cap the author asked for");
         assert_eq!(
             cfg.caller_silence_secs, 90,
             "the node that opens the call path says how long a caller may go silent"
@@ -720,6 +788,7 @@ mod tests {
         assert_eq!(cfg.data_type, DataType::Json);
         assert!(matches!(cfg.auth, PublicEntryAuth::None));
         assert_eq!(cfg.max_session_secs, 0, "no ceiling unless one was asked for");
+        assert_eq!(cfg.max_inbound_bytes, DEFAULT_MAX_INBOUND_BYTES, "a route that says nothing gets 16 MB");
         assert_eq!(
             cfg.caller_silence_secs, DEFAULT_CALLER_SILENCE_SECS,
             "a route that says nothing gets the default, never the machine's 15 minutes"
@@ -734,6 +803,9 @@ mod tests {
             ("defaultHoldSecs", serde_json::json!(1.5)),
             ("maxSessionSecs", serde_json::json!(1.5)),
             ("maxSessionSecs", serde_json::json!("forever")),
+            ("maxInboundMb", serde_json::json!(0)),
+            ("maxInboundMb", serde_json::json!(1.5)),
+            ("maxInboundMb", serde_json::json!("big")),
         ] {
             let bad = serde_json::json!({ "path": "x", field: value });
             assert!(
@@ -803,6 +875,7 @@ mod tests {
             journal_mode: JournalMode::Journaled,
             journal_window_secs: None,
             window: None,
+            recorded: true,
         }
     }
 }

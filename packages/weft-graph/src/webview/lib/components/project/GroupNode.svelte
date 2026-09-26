@@ -9,7 +9,7 @@
 	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
-	import { innerMarkerStyle, portMarkerStyle } from '../../utils/port-marker';
+	import { filledMarkerStyle, portMarkerStyle } from '../../utils/port-marker';
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
@@ -28,7 +28,7 @@
 	/// same dot, and placed in the flow of the port row rather than on
 	/// the box edge.
 	const innerMarker = (color: string) =>
-		innerMarkerStyle(color, '!relative !inset-auto !transform-none');
+		filledMarkerStyle(color, 'inner', '!relative !inset-auto !transform-none');
 
 	let { data, id, selected }: {
 		id: string;

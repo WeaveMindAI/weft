@@ -47,7 +47,14 @@ export interface RunSpec {
   caller?: JsonValue[];
   frozen_from?: FrozenFrom;
   expected?: Expected;
+  /// Who the run is for: one member of the program. Needed only when the
+  /// run reaches something that exists once per member.
+  member?: string;
 }
+
+/// A member id: the grammar of one storage key segment.
+// SYNC: MEMBER_ID_PATTERN <-> crates/weft-core/src/storage/key.rs valid_segment
+export const MEMBER_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 
 /// Validate files before they enter menus or dialogs. A type assertion alone
 /// cannot reject obsolete fields or malformed nested port maps.
@@ -79,8 +86,12 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'member'], 'spec');
   string(spec.name, 'name');
+  if (spec.member != null) {
+    string(spec.member, 'member');
+    if (!MEMBER_ID_PATTERN.test(spec.member as string)) throw new Error(`member: '${spec.member}' is not a valid member id`);
+  }
   for (const key of ['target', 'before', 'feed']) if (spec[key] !== undefined) {
     for (const id of array(spec[key], key)) string(id, key);
   }
@@ -129,7 +140,7 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   }
   const normalized = { ...spec };
-  for (const key of ['group', 'fire', 'frozen_from', 'expected']) if (normalized[key] === null) delete normalized[key];
+  for (const key of ['group', 'fire', 'frozen_from', 'expected', 'member']) if (normalized[key] === null) delete normalized[key];
   return normalized as unknown as RunSpec;
 }
 

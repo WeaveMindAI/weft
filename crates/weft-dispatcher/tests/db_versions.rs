@@ -13,8 +13,11 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use weft_core::activation::ActivationKey;
+use weft_core::member::Owner;
 use weft_core::run_spec::RunSpec;
 use weft_core::ProjectDefinition;
+use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, PostgresActivationStore, SignalsGoing};
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::Journal;
 use weft_dispatcher::versions::{version_id, Head, PostgresVersionStore, RunRow, VersionRow, VersionStoreOps};
@@ -101,7 +104,7 @@ async fn retention_keeps_program_references_when_execution_selection_has_changed
     let birth = ExecEvent::ExecutionStarted {
         color, project_id: project, entry_node: "mid".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
+        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
     };
     journal.record_event(&birth).await.unwrap();
     let mut row = serde_json::to_value(&birth).unwrap();
@@ -147,10 +150,11 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
     );
 }
 
-/// Head lives on the project row: moved by checkpoint, run and branch,
-/// cleared with the activation on deactivate.
+/// Head lives on the project row, moved by checkpoint, run and branch.
+/// The activated versions are read off the trigger activations: a build
+/// leaves them alone, and a deactivation clears them.
 #[sqlx::test]
-async fn head_and_activation_live_on_the_project_row(pool: PgPool) {
+async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool: PgPool) {
     let (_, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
@@ -160,29 +164,34 @@ async fn head_and_activation_live_on_the_project_row(pool: PgPool) {
     let activated = weft_core::project::hash::ProgramIdentity {
         binary_hash: "bin-A".into(), definition_hash: "def-1".into(), implementations: Default::default(),
     };
-    sqlx::query("UPDATE project SET activation_version = 'v1', activation_program = $2 WHERE id = $1")
-        .bind(project).bind(sqlx::types::Json(&activated)).execute(&pool).await.unwrap();
+    let activations = PostgresActivationStore::new(pool.clone());
+    let keys = [ActivationKey::new("door", Owner::Shared)];
+    let setup_color = Uuid::new_v4();
+    assert!(activations.try_begin_activating(project, &keys, setup_color, None).await.unwrap().is_ok());
+    assert!(activations.record_activation_source(project, setup_color, &activated, "v1").await.unwrap());
+    activations.end_activating(project, setup_color, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None).await.unwrap();
-    assert_eq!(projects.activation_program(project).await.unwrap(), Some(activated), "a build preserves the code activation used");
+    let listed = activations.list(project).await.unwrap();
+    assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some("v1"));
     assert_eq!(head.head_run, Some(color));
-    assert_eq!(head.activation_version.as_deref(), Some("v1"));
+    assert_eq!(head.activated_versions, vec!["v1".to_string()]);
     versions
-        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(color), activation_version: None }, Some("v2"), None)
+        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(color), activated_versions: vec![] }, Some("v2"), None)
         .await
         .unwrap();
-    projects.set_lifecycle_guarded(project, &weft_dispatcher::project_store::ProjectLifecycle::wiped()).await.unwrap();
-    assert_eq!(projects.activation_program(project).await.unwrap(), None);
+    activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept).await.unwrap();
+    assert_eq!(activations.list(project).await.unwrap()[0].program, None);
     let head = versions.head(project).await.unwrap();
-    assert_eq!((head.head_version.as_deref(), head.head_run, head.activation_version), (Some("v2"), None, None));
+    assert_eq!((head.head_version.as_deref(), head.head_run, head.activated_versions), (Some("v2"), None, vec![]));
     assert!(
         versions.move_head(Uuid::new_v4(), &Head::default(), Some("v"), None).await.is_err(),
         "no such project"
     );
     // A lost race is Ok(false), never an error: the handler turns it
     // into a 409, and a decode failure here used to make it a 500.
-    let stale = Head { head_version: Some("nowhere".into()), head_run: None, activation_version: None };
+    let stale = Head { head_version: Some("nowhere".into()), head_run: None, activated_versions: vec![] };
     assert!(
         !versions.move_head(project, &stale, Some("v2"), None).await.unwrap(),
         "head is not where the caller thought, so nothing moves"
@@ -209,10 +218,10 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         })
         .await
         .unwrap();

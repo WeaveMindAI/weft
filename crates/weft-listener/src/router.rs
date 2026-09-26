@@ -106,6 +106,7 @@ async fn register(
         kinds::SignalIdentity {
             token: req.token,
             tenant_id: req.tenant_id,
+            for_member: req.for_member,
             node_id: req.node_id,
             is_resume: req.is_resume,
             color: req.color,

@@ -22,9 +22,9 @@
 
 mod common;
 
-use common::{color_of, graph_hold, spawn_weft, tree_of, HOLD, RELEASE};
+use common::{color_of, fire_until_execution, graph_trigger_hold, spawn_weft, tree_of, HOLD};
 use serde_json::Value;
-use weft_e2e::fakes::PollFake;
+use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
 use weft_e2e::{ensure, project::Project, run, SettledRun};
 
@@ -170,10 +170,10 @@ async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result
 ///
 /// Head is read to decide a parent and written afterwards, so a lost
 /// update would drop one session's version out of the lineage the next
-/// seeded run walks, silently. Both may land (the tree write holds the
+/// seeded run walks, silently. Both land (the tree write holds the
 /// project's lock, so the second reads the head the first just moved),
-/// and the property that matters either way is that the tree is a CHAIN:
-/// nothing parents on a head that has moved on, and nothing dangles.
+/// and the tree must be a CHAIN: nothing parents on a head that has
+/// moved on, and nothing dangles.
 /// Running both from one directory would not test this: they would agree
 /// on the same content and so on the same version.
 #[tokio::test]
@@ -197,20 +197,13 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
     let (a, b) = (a?, b?);
 
     anyhow::ensure!(
-        a.success || b.success,
-        "at least one checkpoint must land:\nfirst: {} {}\nsecond: {} {}",
+        a.success && b.success,
+        "both checkpoints must land:\nfirst: {} {}\nsecond: {} {}",
         a.stdout, a.stderr, b.stdout, b.stderr
     );
-    for lost in [&a, &b].iter().filter(|o| !o.success) {
-        anyhow::ensure!(
-            lost.stderr.contains("head moved"),
-            "a checkpoint that lost the race is told why, not handed a server error: {}",
-            lost.stderr
-        );
-    }
 
-    // Whatever happened, head names a version the tree holds, and every
-    // version parents on one the tree holds too: no lineage dangles.
+    // Head names a version the tree holds, and every version parents on
+    // one the tree holds too: no lineage dangles.
     let tree = tree_of(&project).await?;
     let head = tree["head"]["head_version"].as_str().unwrap_or_default().to_string();
     let versions: &[Value] = tree["versions"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -225,45 +218,44 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
             );
         }
     }
-    // And the winner's version is actually recorded, not just answered.
-    let landed = [&a, &b]
-        .iter()
-        .filter(|o| o.success)
-        .filter_map(|o| serde_json::from_str::<Value>(o.stdout.trim()).ok())
-        .filter_map(|v| v["version"].as_str().map(str::to_string))
-        .collect::<Vec<_>>();
+    // And each version is actually recorded, not just answered.
+    let mut landed = Vec::new();
+    for out in [&a, &b] {
+        let answer: Value = serde_json::from_str(out.stdout.trim())
+            .map_err(|e| anyhow::anyhow!("a checkpoint answers JSON ({e}): {}", out.stdout))?;
+        let version = answer["version"].as_str().ok_or_else(|| anyhow::anyhow!("a checkpoint names its version: {answer}"))?;
+        landed.push(version.to_string());
+    }
     for version in &landed {
         anyhow::ensure!(ids.contains(version), "a checkpoint that answered {version} recorded it: {ids:?}");
     }
 
-    // The lineage, which is the whole point. Two versions that both
-    // landed must be parent and child, in the order they were written,
-    // and head must be the child: the lost update this test exists for
+    // The lineage, which is the whole point. The two versions must be
+    // parent and child, in the order they were written, and head must be
+    // the child: the lost update this test exists for
     // looks exactly like two siblings, both parented on the head from
     // before either landed, with one of them cut out of the line the next
     // seeded run walks.
-    if landed.len() == 2 {
-        let parent_of = |id: &str| -> Option<String> {
-            versions
-                .iter()
-                .find(|v| v["id"].as_str() == Some(id))
-                .and_then(|v| v["parent_id"].as_str().map(str::to_string))
-        };
-        let (first, second) = (&landed[0], &landed[1]);
-        let chained = parent_of(first).as_deref() == Some(second.as_str())
-            || parent_of(second).as_deref() == Some(first.as_str());
-        anyhow::ensure!(
-            chained,
-            "both checkpoints landed, so one is the other's parent; they are siblings, which is \
-             the lost update: {first} parents on {:?}, {second} on {:?}",
-            parent_of(first),
-            parent_of(second)
-        );
-        anyhow::ensure!(
-            landed.contains(&head),
-            "head is one of the two versions that landed: head {head}, landed {landed:?}"
-        );
-    }
+    let parent_of = |id: &str| -> Option<String> {
+        versions
+            .iter()
+            .find(|v| v["id"].as_str() == Some(id))
+            .and_then(|v| v["parent_id"].as_str().map(str::to_string))
+    };
+    let (first, second) = (&landed[0], &landed[1]);
+    let chained = parent_of(first).as_deref() == Some(second.as_str())
+        || parent_of(second).as_deref() == Some(first.as_str());
+    anyhow::ensure!(
+        chained,
+        "one checkpoint is the other's parent; they are siblings, which is \
+         the lost update: {first} parents on {:?}, {second} on {:?}",
+        parent_of(first),
+        parent_of(second)
+    );
+    anyhow::ensure!(
+        landed.contains(&head),
+        "head is one of the two versions: head {head}, landed {landed:?}"
+    );
 
     project.finish().await
 }
@@ -274,23 +266,27 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
 /// and answered success, so a cancel reported that it had cancelled and
 /// nothing had been cancelled.
 ///
-/// `cancel-running` only acts while a deactivate is draining (the drain
-/// watcher fires from that state), so the test drives the project into
-/// that window exactly as `lifecycle_transitions` does, and then cancels
-/// with the id spelled the way a hand-written script or an id copied out
-/// of a UI often is.
+/// `cancel-running` only acts while a deactivate is draining the runs
+/// a trigger fired (the drain watcher fires from that state), so the
+/// test fires the trigger and drives the project into that window
+/// exactly as `lifecycle_transitions` does, and then cancels with the id
+/// spelled the way a hand-written script or an id copied out of a UI
+/// often is.
 #[tokio::test]
 async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let gate = PollFake::start(HOLD).await?;
-    project.set_main(&graph_hold(&gate.url()))?;
-
-    let color = run::start(&mut project).await?;
+    let feed = SseFake::start().await?;
+    project.add_node_from_fixture("human_form", "test_sse_trigger")?;
+    project.set_main(&graph_trigger_hold(&feed.url(), "go", &gate.url()))?;
+    project.activate().await?;
+    let pid = project.id();
+    let before = run::execution_colors(&disp, &pid).await?;
+    let color = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
     run::wait_for_status(&disp, color, "running").await?;
 
     // Deactivate with a Wait drain: it holds open while the run holds.
-    let pid = project.id();
     let deact = spawn_weft(
         &project,
         vec![
@@ -327,6 +323,5 @@ async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<
     let deact_out = deact.await??;
     anyhow::ensure!(deact_out.success, "the drain finishes once the cancel lands: {}", deact_out.stderr);
 
-    gate.set_body(RELEASE).await;
     project.finish().await
 }

@@ -6,6 +6,7 @@
 //! for each rule documented at the helper function that implements
 //! it.
 
+use weft_core::rules::{has_incoming_edge, literal_fills};
 use weft_core::node::{
     Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
 };
@@ -71,14 +72,86 @@ fn validate_scoped(
     check_double_driven_ports(project, &mut d);
     check_two_gates(project, &mut d);
     check_warnings(project, &mut d);
-    check_level_sizes(project, &mut d);
+    check_level_sizes(project, catalog, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
     check_graph_shape(project, &mut d);
     check_generator_wiring(project, &mut d);
     check_named_type_conflicts(project, &mut d);
     check_route_claims(project, catalog, &mut d);
+    check_per_member(project, catalog, &mut d);
+    check_member_filled(project, &mut d);
     d
+}
+
+/// per-member-ineligible: `@per_member` marks a node that RUNS something
+/// of its own, which the node's metadata says, never its name: an infra
+/// node (`requiresInfra`), one container per member. What a member
+/// provides (their connection, their sheet) is a field written
+/// `@member_filled`, and a step that reads a per-member value runs per
+/// member without a mark, which the compiler already follows.
+fn check_per_member(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
+    for node in project.nodes.iter().filter(|n| n.per_member == Some(weft_core::member::PerMember::Marked)) {
+        let Some(meta) = catalog.lookup(&node.node_type) else { continue };
+        if meta.per_member_eligible() {
+            continue;
+        }
+        let name = author_name(node);
+        let instead = match meta.access_input() {
+            Some(input) => format!(
+                "To have each member connect their own account, write `{}: @member_filled` instead",
+                input.name
+            ),
+            None => "Remove the mark: it already runs in a member's runs whenever it reads a per-member \
+                     value, and a field each member provides is written `@member_filled`"
+                .to_string(),
+        };
+        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, "per-member-ineligible",
+            format!(
+                "'{name}' is marked `@per_member`, but only an infra node exists once per member (one \
+                 container each); a {} runs nothing of its own to copy. {instead}",
+                node.node_type,
+            ));
+    }
+}
+
+/// The places a `@member_filled` cannot stand, each refused where it is
+/// written:
+/// - member-filled-wired: the field also has a wire into it, so two things
+///   would drive one value;
+/// - member-filled-boundary: a group's, loop's or included file's own port
+///   (write it on the node inside that reads the value);
+/// - member-filled-not-an-input: a key that is not one of the node's
+///   inputs, which no value from outside can reach.
+fn check_member_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    for node in &project.nodes {
+        let name = author_name(node);
+        if let Some(config) = node.config.as_object() {
+            for (key, value) in config {
+                if weft_core::member::as_member_filled(value).is_some() {
+                    let (file, span) = cfg_anchor(node, key);
+                    push(d, file, span, Severity::Error, "member-filled-not-an-input",
+                        format!("'{name}.{key}' is not an input of '{name}', so no member's value can reach it; \
+                                 only an input can be `@member_filled`"));
+                }
+            }
+        }
+        for (field, _) in weft_core::member::member_filled_fields(node) {
+            let (file, span) = cfg_anchor(node, field);
+            if node.group_boundary.is_some() {
+                push(d, file, span, Severity::Error, "member-filled-boundary",
+                    format!("'{name}.{field}' is the port of a group, a loop or an included file, so it passes a value \
+                             on rather than using one; write `@member_filled` on the input of the node inside \
+                             that reads it"));
+                continue;
+            }
+            if has_incoming_edge(node, project, field) {
+                push(d, file, span, Severity::Error, "member-filled-wired",
+                    format!("'{name}.{field}' is `@member_filled` and also wired: each member provides this \
+                             value, so nothing else can drive it. Remove the wire, or the marker"));
+            }
+        }
+    }
 }
 
 /// route-overlap: two nodes of this program claim public addresses a
@@ -129,6 +202,14 @@ fn check_route_claims(
             continue;
         };
         let written = node.written_value(&spec.path_field);
+        // A path or method each member provides is, like a wired one,
+        // known only when that member's trigger sets up; activation
+        // compares it.
+        let member_filled =
+            |field: &str| node.written_value(field).is_some_and(|value| weft_core::member::as_member_filled(value).is_some());
+        if member_filled(&spec.path_field) || spec.method_field.as_deref().is_some_and(member_filled) {
+            continue;
+        }
         let raw = match written.map(|value| value.as_str()) {
             Some(Some(raw)) => raw,
             // Written, but not text. The config type rules name that.
@@ -843,9 +924,15 @@ fn check_declarative_rules(
     mode: ValidationMode,
     out: &mut Vec<Diagnostic>,
 ) {
+    // A field written `@member_filled` needs no special case here: the
+    // evaluator reads it as present with a value nobody knows yet, so a
+    // "no connection picked" or "has no model" rule holds off, and a rule
+    // about the value's content waits for the member's value, when it is
+    // asked again with that value in (`weft_core::rules`).
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-        for rule in &meta.validate {
+        let custom = node_custom_outputs(node, meta);
+        for rule in &node_rules(meta, node) {
             // Skip runtime-only rules in structural mode (the build and
             // the Problems panel). Runtime mode runs them: the editor's
             // pre-flight gate before Run/Activate/Resync, and the
@@ -855,24 +942,26 @@ fn check_declarative_rules(
             {
                 continue;
             }
-            if eval_condition(&rule.when, node, meta, project) {
+            if weft_core::rules::fires(rule, node, project, &custom) {
                 emit_rule_diagnostic(node, meta, rule, out);
             }
         }
-        // Every access node requires a connection BY DEFAULT: declaring a
-        // `service` recipe is what makes a node an access node, and running
-        // one without a connection picked always fails, so the LANGUAGE
-        // synthesizes the runtime rule instead of every node's metadata
-        // restating it. Opt-out for the genuine can-run-unauthenticated
-        // case: `connection_optional: true` on the recipe.
-        if mode == ValidationMode::Runtime {
-            if let Some(rule) = implicit_connection_rule(meta, node) {
-                if eval_condition(&rule.when, node, meta, project) {
-                    emit_rule_diagnostic(node, meta, &rule, out);
-                }
-            }
-        }
     }
+}
+
+/// Every rule a node of this type answers to: the ones its metadata
+/// declares, and the one the language adds. Every access node requires a
+/// connection BY DEFAULT: declaring a `service` recipe is what makes a
+/// node an access node, and running one without a connection picked
+/// always fails, so the LANGUAGE synthesizes that runtime rule instead of
+/// every node's metadata restating it. Opt-out for the genuine
+/// can-run-unauthenticated case: `connection_optional: true` on the
+/// recipe. The ONE list both the compiler's check and a member's value
+/// check (`MemberRules`, filled at enrich) read.
+pub(crate) fn node_rules(meta: &weft_core::node::NodeMetadata, node: &NodeDefinition) -> Vec<ValidationRule> {
+    let mut rules = meta.validate.clone();
+    rules.extend(implicit_connection_rule(meta, node));
+    rules
 }
 
 /// The synthesized "no connection picked" rule for an access node, None
@@ -890,18 +979,8 @@ fn implicit_connection_rule(
     let input = meta.access_input()?;
     // A metadata that declares the EXACT rule being synthesized keeps
     // its own copy alone (a project's copied catalog predating the
-    // synthesis would otherwise report one mistake twice). Narrow to
-    // that exact shape: an UNRELATED declared rule on the picker field
-    // (a scope check, say) must not swallow the connection requirement.
-    let is_the_connection_rule = |r: &ValidationRule| {
-        r.then.field.as_deref() == Some(input.name.as_str())
-            && matches!(
-                &r.when,
-                Condition::Not { of }
-                    if matches!(of.as_ref(), Condition::ConfigNonempty { field } if field == &input.name)
-            )
-    };
-    if meta.validate.iter().any(is_the_connection_rule) {
+    // synthesis would otherwise report one mistake twice).
+    if meta.validate.iter().any(|rule| is_the_connection_rule(meta, rule)) {
         return None;
     }
     Some(ValidationRule {
@@ -922,155 +1001,22 @@ fn implicit_connection_rule(
     })
 }
 
-fn eval_condition(
-    cond: &Condition,
-    node: &NodeDefinition,
-    meta: &weft_core::node::NodeMetadata,
-    project: &ProjectDefinition,
-) -> bool {
-    match cond {
-        Condition::InputSatisfied { port } => input_satisfied(node, project, port),
-        Condition::InputWired { port } => has_incoming_edge(node, project, port),
-        Condition::OutputWired { port } => has_outgoing_edge(node, project, port),
-        Condition::InputSourceType { port, equals } => {
-            // Vacuously true if the port has no wired edges (use
-            // `all(input_wired, input_source_type)` to require both).
-            let sources: Vec<&NodeDefinition> = project
-                .edges
-                .iter()
-                .filter(|e| e.target == node.id && e.target_handle.as_deref() == Some(port))
-                .filter_map(|e| project.nodes.iter().find(|n| n.id == e.source))
-                .collect();
-            sources.iter().all(|n| &n.node_type == equals)
-        }
-        Condition::ConfigPresent { field } => node
-            .written_value(field)
-            .map(|v| !v.is_null())
-            .unwrap_or(false),
-        Condition::ConfigNonempty { field } => is_nonempty(node.written_value(field)),
-        Condition::ConfigEquals { field, equals } => {
-            node.written_value(field).map(|v| v == equals).unwrap_or(false)
-        }
-        Condition::ConfigInSet { field, values } => node
-            .written_value(field)
-            .and_then(|v| v.as_str())
-            .map(|s| values.iter().any(|v| v == s))
-            .unwrap_or(false),
-        Condition::ConfigMatches { field, regex } => node
-            .written_value(field)
-            .and_then(|v| v.as_str())
-            // Absent/non-string field -> false (not satisfied), like every sibling
-            // ConfigX condition. A malformed regex (a metadata-authoring bug) also
-            // yields false: it can't match, so the condition fails CLOSED rather
-            // than silently evaluating true and suppressing/forcing a diagnostic.
-            .and_then(|s| regex::Regex::new(regex).ok().map(|r| r.is_match(s)))
-            .unwrap_or(false),
-        Condition::RunReaches { direction, types } => {
-            run_reaches(node, project, *direction, types)
-        }
-        Condition::CustomOutputsDeclared {} => !custom_outputs(node, meta).is_empty(),
-        Condition::All { of } => of.iter().all(|c| eval_condition(c, node, meta, project)),
-        Condition::Any { of } => of.iter().any(|c| eval_condition(c, node, meta, project)),
-        Condition::Not { of } => !eval_condition(of, node, meta, project),
-    }
+/// Whether `rule` is exactly the "no connection picked" rule on the
+/// node's picker. Narrow to that exact shape: an UNRELATED declared rule
+/// on the picker field (a scope check, say) is not it.
+fn is_the_connection_rule(meta: &weft_core::node::NodeMetadata, rule: &ValidationRule) -> bool {
+    let Some(input) = meta.access_input() else { return false };
+    rule.then.field.as_deref() == Some(input.name.as_str())
+        && matches!(
+            &rule.when,
+            Condition::Not { of }
+                if matches!(of.as_ref(), Condition::ConfigNonempty { field } if field == &input.name)
+        )
 }
 
-/// Whether `node` sits in a run with a node of one of `types`, looking
-/// `direction` from it. The run is the same selection a fire computes
-/// (`RunSelection::carve`: forward from the seed, then back for what
-/// that needs), taken at every place the node runs (once per call
-/// site for a node inside an included file). Downstream: every run
-/// seeded at the node holds one of the types. Upstream: every place
-/// of the node is in the run of some node of one of the types. A seed
-/// that cannot be carved (a cut inside a loop) counts as not reaching,
-/// so a malformed program never silences the rule.
-fn run_reaches(
-    node: &NodeDefinition,
-    project: &ProjectDefinition,
-    direction: weft_core::node::RunDirection,
-    types: &[String],
-) -> bool {
-    use weft_core::node::RunDirection;
-    use weft_core::frames::Located;
-    use weft_core::project::selection::{every_place, RunSelection, SelectionBounds};
-    let of_type = |place: &Located| {
-        project.nodes.iter().any(|n| n.id == place.id && types.contains(&n.node_type))
-    };
-    let program_of = |seed: &Located| -> Option<RunSelection> {
-        let is_trigger = project.nodes.iter().any(|n| n.id == seed.id && n.features.is_trigger);
-        let spelled = weft_core::project::address_of(project, &seed.id, &seed.path);
-        let bounds = if is_trigger {
-            SelectionBounds { fire: Some(spelled), ..Default::default() }
-        } else {
-            SelectionBounds { from: vec![spelled], ..Default::default() }
-        };
-        RunSelection::carve(project, &bounds).ok()
-    };
-    let places: Vec<Located> = every_place(project).into_iter().filter(|place| place.id == node.id).collect();
-    match direction {
-        RunDirection::Downstream => places.iter().all(|place| {
-            program_of(place).is_some_and(|run| run.nodes.iter().any(of_type))
-        }),
-        RunDirection::Upstream => {
-            let seeds: Vec<Located> = every_place(project).into_iter().filter(of_type).collect();
-            places.iter().all(|place| {
-                seeds.iter().any(|seed| program_of(seed).is_some_and(|run| run.nodes.contains(place)))
-            })
-        }
-    }
-}
-
-/// The output ports the source added beyond the metadata's own: after
-/// enrich a node's ports are the catalog's merged with the written
-/// ones, so a name the metadata does not declare is a custom port.
-fn custom_outputs<'a>(node: &'a NodeDefinition, meta: &weft_core::node::NodeMetadata) -> Vec<&'a str> {
-    node.outputs
-        .iter()
-        .map(|p| p.name.as_str())
-        .filter(|name| !meta.outputs.iter().any(|o| o.name == *name))
-        .collect()
-}
-
-/// Port is "satisfied" if either (a) it has a wired incoming edge, or
-/// (b) a non-null body literal drives it (`port_literals`, where the
-/// enrich normalization homes every port-driving value). This covers
-/// `Llm { prompt: "hi" }` where prompt is provided by a literal rather
-/// than a wire.
-fn input_satisfied(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
-    has_incoming_edge(node, project, port) || literal_fills(node, port)
-}
-
-/// Does a written constant fill the port: the runtime's own line on a
-/// `null` (data on a nullable port, nothing anywhere else), so a port
-/// this rule calls filled is one the firing sees filled.
-fn literal_fills(node: &NodeDefinition, port: &str) -> bool {
-    node.port_literals
-        .get(port)
-        .is_some_and(|v| weft_core::exec::ready::literal_is_data(node, port, v))
-}
-
-fn has_incoming_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
-    project
-        .edges
-        .iter()
-        .any(|e| e.target == node.id && e.target_handle.as_deref() == Some(port))
-}
-
-fn has_outgoing_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
-    project
-        .edges
-        .iter()
-        .any(|e| e.source == node.id && e.source_handle.as_deref() == Some(port))
-}
-
-fn is_nonempty(v: Option<&serde_json::Value>) -> bool {
-    match v {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::Object(o)) => !o.is_empty(),
-        Some(_) => true,
-    }
+/// The output ports the source added beyond the node type's own.
+pub(crate) fn node_custom_outputs(node: &NodeDefinition, meta: &weft_core::node::NodeMetadata) -> Vec<String> {
+    weft_core::rules::custom_outputs(node, meta.outputs.iter().map(|o| o.name.as_str()))
 }
 
 fn emit_rule_diagnostic(
@@ -1086,35 +1032,12 @@ fn emit_rule_diagnostic(
         RuleSeverity::Info => Severity::Info,
         RuleSeverity::Hint => Severity::Hint,
     };
-    let message = interpolate(&rule.then.message, node, meta, &rule.then);
+    let message = weft_core::rules::message(rule, node, &node_custom_outputs(node, meta));
     let code = match rule.then.level {
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
     };
     out.push(Diagnostic::at(span, severity, code, message).in_file(node.source_file.as_deref()));
-}
-
-/// Replace `{id}`, `{port}`, `{field}` and `{custom_outputs}`
-/// placeholders in the rule message with concrete values from the
-/// context (the last one: the output ports the source added, comma
-/// separated).
-fn interpolate(
-    template: &str,
-    node: &NodeDefinition,
-    meta: &weft_core::node::NodeMetadata,
-    diag: &RuleDiagnostic,
-) -> String {
-    let mut s = template.replace("{id}", &node.id);
-    if let Some(p) = &diag.port {
-        s = s.replace("{port}", p);
-    }
-    if let Some(f) = &diag.field {
-        s = s.replace("{field}", f);
-    }
-    if s.contains("{custom_outputs}") {
-        s = s.replace("{custom_outputs}", &custom_outputs(node, meta).join(", "));
-    }
-    s
 }
 
 fn push(
@@ -1757,6 +1680,16 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // (`literal_type`), so `@asset("a.png", Image)` on an Image port
         // is a match and on a Video port a mismatch.
         for (key, value) in &node.port_literals {
+            // A `@member_filled` field is checked through its fallback,
+            // the one value of it known now; the member's own value is
+            // checked when they give it (`weft_core::member`).
+            let value = match weft_core::member::as_member_filled(value) {
+                Some(filled) => match filled.fallback {
+                    Some(fallback) => fallback,
+                    None => continue,
+                },
+                None => value,
+            };
             let span_entry = node.port_literal_spans.get(key);
             let Some(input) = node.inputs.iter().find(|p| p.name == *key) else { continue };
             // A port whose type is still open (`MustOverride`, an
@@ -2069,7 +2002,12 @@ fn check_port_coverage(
             }
 
             // The widget-level literal checks read the one home.
-            let literal_value = node.port_literals.get(&input.name);
+            let literal_value = node.port_literals.get(&input.name).and_then(|value| {
+                match weft_core::member::as_member_filled(value) {
+                    Some(filled) => filled.fallback,
+                    None => Some(value),
+                }
+            });
             let literal_span = literal_anchor;
             // literal-out-of-range: the number widget's domain (min,
             // max, step) bounds the literal at compile time. The rule
@@ -2977,23 +2915,16 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
     }
 
-    let root = component_root(project);
     for node in &project.nodes {
-        // A group's two boundary nodes are the two halves of its
-        // header, and their ids (`my__in`, `my__out`) appear nowhere
-        // in the source: a warning about either names the GROUP and
-        // points at its header. Which warnings apply follows the
-        // half, and today no warning applies to either: a boundary's
-        // input ports are optional by construction (a gather port is
-        // `List[T | Null]` because a missed iteration leaves null), so
-        // "no required input" would be one the author cannot act on.
-        if node.group_boundary.as_ref().is_some_and(|b| Some(b.group_id.as_str()) == root) {
-            continue;
-        }
-        // A boundary holds every group port as optional by construction
-        // (a closed one reaches the inside as a closure, and the node
-        // that needs it skips there), so the warning below would fire on
-        // every group; it is about nodes.
+        // A group's two boundary nodes are the two halves of its header,
+        // and neither warning below applies to them. Every group port is
+        // optional on a boundary by construction (a gather port is
+        // `List[T | Null]` because a missed iteration leaves null, and a
+        // closed port reaches the inside as a closure), so
+        // no-required-skip would fire on every group. And a boundary's
+        // config is the compiler's own (`parentId`) plus a loop header's
+        // keys, which `check_loop_config` validates one by one and
+        // refuses a null in, so config-null-literal has nothing to add.
         if node.group_boundary.is_some() {
             continue;
         }
@@ -3049,7 +2980,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 Severity::Warning,
                 "no-required-skip",
                 format!(
-                    "node '{name}' has no required inputs; it will run even when all upstream values are null. Consider marking one input required or adding @require_one_of."
+                    "node '{name}' runs even when nothing arrives on its wires: none of its wired inputs is required, so if the steps feeding it do not run, it still runs, with those inputs empty. If it should wait for one of them, mark that input required or add `@require_one_of(<inputs>)`."
                 ),
             );
         }
@@ -3085,13 +3016,14 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// on one job; let nesting absorb size).
 ///
 /// The file's top level is measured per BRANCH: the items one wire walk
-/// reaches, where a plain infra node at that level ends the walk (a
-/// database both branches talk to joins nothing; a group holding one is
-/// an item like any other). A branch counts its own items plus the
-/// infra nodes it touches, so two unrelated pipelines sharing one file
+/// reaches, where a plain infra or connection node at that level ends
+/// the walk (a database both branches talk to, or the one key set gating
+/// every route, joins nothing; a group holding one is an item like any
+/// other). A branch counts its own items plus the shared nodes it
+/// touches, so two unrelated pipelines sharing one file
 /// each answer for their own width. The inside of a group or loop is
 /// one job by construction, so it is measured whole.
-fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     /// A level holds more than this many items and the warning fires.
@@ -3128,7 +3060,7 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // reaching into a group from outside names the inner node, and the
     // branch walk has to see that as the group joining.
     let mut top_item_of: HashMap<&str, &str> = HashMap::new();
-    let mut infra: HashSet<&str> = HashSet::new();
+    let mut shared: HashSet<&str> = HashSet::new();
 
     // An included file's body is its own level (the file's page), not an
     // item on the page of the program that includes it: there the item
@@ -3151,10 +3083,14 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 b.group_id.as_str()
             }
             None => {
-                // Only a plain infra node AT the top level ends the walk;
-                // a group holding one is an item like any other.
-                if node.requires_infra && node.scope == top {
-                    infra.insert(node.id.as_str());
+                // Only a plain shared supply AT the top level ends the
+                // walk: an infra node, or a connection node (one whose
+                // type declares a service: a key set gating several
+                // routes, one provider serving several model calls). A
+                // group holding one is an item like any other.
+                let connection = catalog.lookup(&node.node_type).is_some_and(|m| m.service.is_some());
+                if (node.requires_infra || connection) && node.scope == top {
+                    shared.insert(node.id.as_str());
                 }
                 node.id.as_str()
             }
@@ -3204,7 +3140,7 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // Every sub level is one unit; the top level splits by branch.
         let is_top = *scope == top.as_slice();
         let units: Vec<Vec<&str>> = if is_top {
-            branches(level_items, &infra, &top_item_of, project)
+            branches(level_items, &shared, &top_item_of, project)
         } else {
             vec![level_items.clone()]
         };
@@ -3240,18 +3176,19 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     }
 
     /// The top level's items split into branches: the items one wire
-    /// walk reaches without passing through an infra node, each branch
-    /// listed in source order with the infra nodes it touches appended.
-    /// An infra node wired to nothing counts nowhere. `top_item_of`
+    /// walk reaches without passing through a shared node (infra or a
+    /// connection), each branch listed in source order with the shared
+    /// nodes it touches appended. A shared node wired to nothing counts
+    /// nowhere. `top_item_of`
     /// maps every node id an edge may name to its item at this level,
     /// so a wire into a group's inside joins the group.
     fn branches<'a>(
         level_items: &[&'a str],
-        infra: &HashSet<&'a str>,
+        shared: &HashSet<&'a str>,
         top_item_of: &HashMap<&'a str, &'a str>,
         project: &'a ProjectDefinition,
     ) -> Vec<Vec<&'a str>> {
-        // Union-find over the level's non-infra items, by position in
+        // Union-find over the level's non-shared items, by position in
         // `level_items` so branches come out in source order.
         let index: HashMap<&str, usize> =
             level_items.iter().enumerate().map(|(i, id)| (*id, i)).collect();
@@ -3265,7 +3202,7 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             i
         }
         // An edge joins its ends when both are items of this level and
-        // neither is infra; an edge onto an infra node only marks the
+        // neither is shared; an edge onto a shared node only marks the
         // touch, resolved to the branch once every join is in.
         let mut touches: Vec<(usize, &str)> = Vec::new();
         for edge in &project.edges {
@@ -3273,7 +3210,7 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 (top_item_of.get(edge.source.as_str()), top_item_of.get(edge.target.as_str()));
             let (Some(&a), Some(&b)) = ends else { continue };
             let (Some(&ia), Some(&ib)) = (index.get(a), index.get(b)) else { continue };
-            match (infra.contains(a), infra.contains(b)) {
+            match (shared.contains(a), shared.contains(b)) {
                 (false, false) => {
                     let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
                     parent[ra.max(rb)] = ra.min(rb);
@@ -3285,13 +3222,13 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
         let mut members: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
         for (i, id) in level_items.iter().enumerate() {
-            if !infra.contains(id) {
+            if !shared.contains(id) {
                 members.entry(find(&mut parent, i)).or_default().push(id);
             }
         }
         let mut touched: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
-        for (i, infra_id) in touches {
-            touched.entry(find(&mut parent, i)).or_default().insert(infra_id);
+        for (i, shared_id) in touches {
+            touched.entry(find(&mut parent, i)).or_default().insert(shared_id);
         }
         members
             .into_iter()

@@ -25,7 +25,6 @@ use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, DoorsStatus,
     GrantSummary, MintAppRequest, MintAppResponse, SharedAppChoice, SharedDoorPick, StartedOAuth,
 };
-use weft_core::CredentialOwner;
 
 use crate::client::DispatcherClient;
 use crate::commands::Ctx;
@@ -95,6 +94,11 @@ pub struct ConnectOpts {
     /// its permissions (services with one grant per account).
     #[arg(long, group = "action")]
     pub upgrade: Option<Uuid>,
+    /// Act as this member of the program, on a node marked `@per_member`:
+    /// list, connect and pick THEIR connections, exactly as their connect
+    /// page would. For trying a program's member path from the terminal.
+    #[arg(long, conflicts_with_all = ["forget", "upgrade", "mint"])]
+    pub member: Option<weft_core::member::MemberId>,
 }
 
 impl ConnectOpts {
@@ -118,7 +122,7 @@ impl ConnectOpts {
 /// Discovery walks main.weft AND every `@include`d file (recursively),
 /// each file visited ONCE: a subgraph included in two places is still
 /// one source file, so one pick serves every inclusion.
-struct AccessTarget {
+pub(crate) struct AccessTarget {
     /// The project root the file sits under.
     root: std::path::PathBuf,
     /// The file the node is written in; the pick is written HERE (the
@@ -131,15 +135,15 @@ struct AccessTarget {
     /// included file that carries the file's path (`@src:sweep.key`).
     /// It is the id the structural edit needs to write the pick, and
     /// nothing else: what a person reads and types is `spellings`.
-    node: String,
+    pub(crate) node: String,
     node_type: String,
     input: String,
-    spec: AccessSpec,
+    pub(crate) spec: AccessSpec,
     /// The project's declared public app for this service, the own
     /// door's fallback when the user pastes no app.
     project_app: Option<AppRegistration>,
     /// What the node's picker field currently holds.
-    picked: Pick,
+    pub(crate) picked: Pick,
     /// Every way a person names this node: one per place it is at in
     /// the program (see [`spellings_of`]). A node of the entry file has
     /// one; a node inside a file included twice has two, and both work.
@@ -147,8 +151,8 @@ struct AccessTarget {
 }
 
 /// The `{id, identity}` handle a node's picker config holds.
-struct PickedHandle {
-    id: Uuid,
+pub(crate) struct PickedHandle {
+    pub(crate) id: Uuid,
     identity: Option<String>,
 }
 
@@ -164,9 +168,12 @@ impl PickedHandle {
 /// not die on it, because the write paths (pick, disconnect) overwrite
 /// the value, and bailing would brick the very commands that fix it
 /// (a `--disconnect` on another node would die on this one's value).
-enum Pick {
+pub(crate) enum Pick {
     None,
     Handle(PickedHandle),
+    /// `@member_filled`: each member of the program picks their own
+    /// (`--member`), and the source holds no pick.
+    MemberFilled,
     Malformed(String),
 }
 
@@ -246,7 +253,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     let catalog = weft_compiler::build::build_project_catalog(&root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
     let mut others: Vec<OtherNode> = Vec::new();
-    let targets = access_targets(project, &catalog, &mut others)?;
+    let (targets, program) = discover(project, &catalog, &mut others)?;
     if targets.is_empty() {
         if opts.list {
             // Nothing to scope the listing to; list the whole store.
@@ -262,7 +269,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     if opts.list && opts.node.is_none() && targets.len() > 1 {
         let mut all: Vec<serde_json::Value> = Vec::new();
         for (i, target) in targets.iter().enumerate() {
-            let grants = list_grants(&client, Some(&target.spec.service)).await?;
+            let grants = list_grants(&client, Doorway::Owner, Some(&target.spec.service)).await?;
             if json {
                 all.push(serde_json::json!({ "node": target.spelling(), "spellings": target.spellings(), "file": target.rel_file, "connections": grants }));
             } else {
@@ -278,10 +285,23 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         }
         return Ok(());
     }
-    let target = choose_target(targets, &others, opts.node.as_deref(), json)?;
+    let target = choose_target(project, &program, targets, &others, opts.node.as_deref(), json)?;
     let service = target.spec.service.clone();
     let label = target.spec.display_label().to_string();
     let registry = catalog.type_registry();
+    if let Some(member) = &opts.member {
+        return as_member(&ctx, &client, member, &opts, &target, &label, &registry).await;
+    }
+    // A pick here would overwrite the marker that hands the connection to
+    // each member: say what the field is instead.
+    if matches!(target.picked, Pick::MemberFilled) && !opts.list {
+        bail!(
+            "'{}' is connected by each member of the program (`{}: @member_filled`); manage one \
+             member's with --member <id>, or remove the marker to pick one connection for everyone",
+            target.spelling(),
+            target.input
+        );
+    }
     let cx = Connecting {
         client: &client,
         target: &target,
@@ -289,6 +309,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         registry: &registry,
         interactive,
         json,
+        doorway: Doorway::Owner,
     };
 
     if opts.disconnect {
@@ -302,7 +323,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         return Ok(());
     }
 
-    let grants = list_grants(&client, Some(&service)).await?;
+    let grants = list_grants(&client, Doorway::Owner, Some(&service)).await?;
 
     if opts.list {
         if json {
@@ -460,6 +481,110 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     Ok(())
 }
 
+/// `weft connect --member <id>`: the member's side of one member-filled
+/// connection field, through the member door (see
+/// `member_values::as_member`).
+async fn as_member(
+    ctx: &Ctx,
+    client: &DispatcherClient,
+    member: &weft_core::member::MemberId,
+    opts: &ConnectOpts,
+    target: &AccessTarget,
+    label: &str,
+    registry: &std::sync::Arc<weft_core::weft_type::TypeRegistry>,
+) -> Result<()> {
+    let json = ctx.json();
+    super::member_values::as_member(ctx, client, member, |door| async move {
+        member_connect(&door, member, opts, target, label, registry, json).await
+    })
+    .await
+}
+
+async fn member_connect(
+    door: &DispatcherClient,
+    member: &weft_core::member::MemberId,
+    opts: &ConnectOpts,
+    target: &AccessTarget,
+    label: &str,
+    registry: &std::sync::Arc<weft_core::weft_type::TypeRegistry>,
+    json: bool,
+) -> Result<()> {
+    let step = target.spelling();
+    let cx = Connecting {
+        client: door,
+        target,
+        service_label: label,
+        registry,
+        interactive: is_interactive(),
+        json,
+        doorway: Doorway::Member,
+    };
+    if !matches!(target.picked, Pick::MemberFilled) {
+        bail!(
+            "'{step}' takes the author's connection, not each member's; write `{}: @member_filled` on it \
+             to have each member connect their own",
+            target.input
+        );
+    }
+    if opts.disconnect {
+        door.put_json("/member/values", &serde_json::json!({ "clear": [{ "step": step, "field": target.input }] }))
+            .await?;
+        if json {
+            println!("{}", serde_json::json!({ "node": step, "member": member, "picked": Value::Null }));
+        } else {
+            println!("'{step}' now has no connection picked for member '{member}'.");
+        }
+        return Ok(());
+    }
+    let grants = list_grants(door, Doorway::Member, Some(&target.spec.service)).await?;
+    if opts.list {
+        if json {
+            println!("{}", serde_json::json!({ "node": step, "member": member, "connections": grants }));
+        } else if grants.is_empty() {
+            println!("member '{member}' has no {label} connection yet; connect one with --door own (or shared).");
+        } else {
+            for g in &grants {
+                println!("  {}  {}", g.id, g.identity.clone().unwrap_or_default());
+            }
+        }
+        return Ok(());
+    }
+    let grant = match &opts.grant {
+        Some(id) => grants
+            .into_iter()
+            .find(|g| g.id == *id)
+            .with_context(|| format!("member '{member}' has no {label} connection with id {id} (see --list)"))?,
+        None => cx.connect_new(opts).await?,
+    };
+    let changed = door
+        .put_json(
+            "/member/values",
+            &serde_json::json!({ "set": [{ "step": step, "field": target.input, "value": { "id": grant.id } }] }),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "the connection is stored as {}; pick it with `weft connect --member {member} --node {step} --grant {}`",
+                grant.id, grant.id
+            )
+        })?;
+    let rearmed = serde_json::from_value::<weft_core::member_door::ValuesChanged>(changed)
+        .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
+        .rearmed;
+    if json {
+        println!("{}", serde_json::json!({ "node": step, "member": member, "picked": grant.id, "rearmed": rearmed }));
+    } else {
+        println!(
+            "'{step}' now uses {} for member '{member}'.",
+            grant.identity.clone().unwrap_or_else(|| grant.id.to_string())
+        );
+        if !rearmed.is_empty() {
+            println!("Their trigger(s) reading it were set up again: {}.", rearmed.join(", "));
+        }
+    }
+    Ok(())
+}
+
 /// The ambient state of one `weft connect` invocation, threaded once
 /// instead of five parameters through every flow.
 struct Connecting<'a> {
@@ -471,6 +596,47 @@ struct Connecting<'a> {
     interactive: bool,
     /// Under --json prose stays off stdout (one JSON object per line).
     json: bool,
+    /// Whose connection this is: the author's (picked in the source)
+    /// or one member's (`--member`, picked at the member door).
+    doorway: Doorway,
+}
+
+/// Whose connections `weft connect` manages. The author's go through
+/// the store's own routes and the pick is written into the source; a
+/// member's go through the member door, exactly as the member's connect
+/// page would, with a member token the command mints for the purpose,
+/// and the pick is the member's own, stored beside their connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Doorway {
+    Owner,
+    Member,
+}
+
+/// The connect routes both doorways offer, one name each.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Route {
+    Grants,
+    Doors,
+    Direct,
+    Begin,
+    Status,
+}
+
+impl Doorway {
+    pub(crate) fn route(self, route: Route) -> &'static str {
+        match (self, route) {
+            (Doorway::Owner, Route::Grants) => "/access/grants",
+            (Doorway::Owner, Route::Doors) => "/access/doors",
+            (Doorway::Owner, Route::Direct) => "/access/connect/direct",
+            (Doorway::Owner, Route::Begin) => "/access/connect/begin",
+            (Doorway::Owner, Route::Status) => "/access/connect/status",
+            (Doorway::Member, Route::Grants) => "/member/connections",
+            (Doorway::Member, Route::Doors) => "/member/doors",
+            (Doorway::Member, Route::Direct) => "/member/connections/direct",
+            (Doorway::Member, Route::Begin) => "/member/connections/begin",
+            (Doorway::Member, Route::Status) => "/member/connections/status",
+        }
+    }
 }
 
 /// Delete a stored connection for good. The ONE path to the delete
@@ -538,6 +704,7 @@ fn sweep_picks(
                     // prompts, so interactivity is moot here.
                     interactive: false,
                     json,
+                    doorway: Doorway::Owner,
                 }
                 .clear_pick()?;
                 cleared.push(target.spelling());
@@ -562,10 +729,9 @@ fn sweep_failed(e: &anyhow::Error) {
 
 /// A node that is NOT connectable, kept only so a refusal can tell
 /// "you typed a name that is not here" apart from "that node needs no
-/// connection". Nothing else reads it, which is why it carries the two
-/// fields a sentence needs and none of `AccessTarget`'s.
+/// connection".
 struct OtherNode {
-    spellings: Vec<String>,
+    node: String,
     node_type: String,
 }
 
@@ -590,6 +756,17 @@ fn access_targets(
     catalog: &weft_catalog::FsCatalog,
     others: &mut Vec<OtherNode>,
 ) -> Result<Vec<AccessTarget>> {
+    Ok(discover(project, catalog, others)?.0)
+}
+
+/// [`access_targets`], plus the leniently flattened program the names
+/// came from (the one view that holds every node, edge and written
+/// value across includes).
+fn discover(
+    project: &weft_compiler::project::Project,
+    catalog: &weft_catalog::FsCatalog,
+    others: &mut Vec<OtherNode>,
+) -> Result<(Vec<AccessTarget>, weft_core::ProjectDefinition)> {
     let main = project.read_main_weft().map_err(|e| anyhow::anyhow!("read {}: {e}", project.main_weft().display()))?;
     // ONE spelling of the root for both halves. The compiler keys an
     // included file by its path under the root it is given, taken from
@@ -620,7 +797,7 @@ fn access_targets(
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
     collect_targets(&project.main_weft(), &root, &program, catalog, &mut out, others, &mut visited)?;
-    Ok(out)
+    Ok((out, program))
 }
 
 /// One file's pass: parse it standalone (the same per-file view the
@@ -681,6 +858,10 @@ fn collect_targets(
             first.message
         );
     }
+    let rel_file = canonical
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| canonical.to_string_lossy().into_owned());
     let mut includes: Vec<String> = Vec::new();
     for node in &definition.nodes {
         if let Some(path) = &node.include_path {
@@ -689,7 +870,7 @@ fn collect_targets(
         }
         let spellings = spellings_of(program, &node.id)?;
         let mut note_other = || {
-            others.push(OtherNode { spellings: spellings.clone(), node_type: node.node_type.clone() })
+            others.push(OtherNode { node: node.id.clone(), node_type: node.node_type.clone() })
         };
         let Some(meta) = weft_core::node::MetadataCatalog::lookup(catalog, &node.node_type) else {
             note_other();
@@ -721,6 +902,7 @@ fn collect_targets(
         // holds, and every node reads as unconnected.
         let picked = match node.written_value(&input) {
             None | Some(Value::Null) => Pick::None,
+            Some(v) if weft_core::member::as_member_filled(v).is_some() => Pick::MemberFilled,
             Some(v) => match parse_picked(v) {
                 Ok(h) => Pick::Handle(h),
                 Err(e) => Pick::Malformed(format!("{e:#}")),
@@ -729,10 +911,7 @@ fn collect_targets(
         out.push(AccessTarget {
             root: root.to_path_buf(),
             file: canonical.clone(),
-            rel_file: canonical
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| canonical.to_string_lossy().into_owned()),
+            rel_file: rel_file.clone(),
             node: node.id.clone(),
             node_type: node.node_type.clone(),
             input,
@@ -794,7 +973,7 @@ impl AccessTarget {
 
     /// The one spelling to print when only one fits: the first, which
     /// [`Self::answer_as`] makes the one the person asked by.
-    fn spelling(&self) -> String {
+    pub(crate) fn spelling(&self) -> String {
         self.spellings[0].clone()
     }
 
@@ -802,8 +981,7 @@ impl AccessTarget {
     /// line printed about it answers in their words: asked for
     /// `two.key`, a node a file included twice is `two.key` in the
     /// answer, never the other call's name.
-    fn answer_as(&mut self, named: &str) {
-        let asked = named.split_once(':').map_or(named, |(_, n)| n);
+    fn answer_as(&mut self, asked: &str) {
         if let Some(at) = self.spellings.iter().position(|s| s == asked) {
             self.spellings.swap(0, at);
         }
@@ -824,43 +1002,56 @@ fn describe_target(t: &AccessTarget) -> String {
     s
 }
 
+/// Any node of the project, found by the name a person types, the same
+/// way `weft connect --node` finds an access node.
+pub(crate) struct Step {
+    /// The compiled id, the key into `program`.
+    pub(crate) node: String,
+    /// The name the person asked by (the file qualifier dropped).
+    pub(crate) spelling: String,
+    pub(crate) node_type: String,
+    /// Every access node of the project, to read a traced pick off.
+    pub(crate) targets: Vec<AccessTarget>,
+    pub(crate) program: weft_core::ProjectDefinition,
+}
+
+pub(crate) fn resolve_step(
+    project: &weft_compiler::project::Project,
+    catalog: &weft_catalog::FsCatalog,
+    name: &str,
+) -> Result<Step> {
+    let (targets, program) = discover(project, catalog, &mut Vec::new())?;
+    let (node, _) = super::resolve_node(project, &program, name)?;
+    let node_type = program
+        .nodes
+        .iter()
+        .find(|n| n.id == node)
+        .map(|n| n.node_type.clone())
+        .context("the resolved step is missing from the program")?;
+    Ok(Step { node, spelling: super::unqualified(name).to_string(), node_type, targets, program })
+}
+
 fn choose_target(
+    project: &weft_compiler::project::Project,
+    program: &weft_core::ProjectDefinition,
     mut targets: Vec<AccessTarget>,
     others: &[OtherNode],
     node: Option<&str>,
     json: bool,
 ) -> Result<AccessTarget> {
     if let Some(name) = node {
-        // Bare id, or root-relative-file-qualified `nodes/a/sub.weft:node`
-        // when the same id exists in two files.
-        // Only a name a person writes (a place spelling) matches; the
-        // compiled id resolves nowhere on purpose, here as everywhere.
-        let matches_name = |t: &AccessTarget| {
-            t.spellings().iter().any(|s| s == name)
-                || name.split_once(':').is_some_and(|(f, n)| {
-                    t.rel_file == f && t.spellings().iter().any(|s| s == n)
-                })
-        };
-        let count = targets.iter().filter(|t| matches_name(t)).count();
-        if count > 1 {
-            let qualified: Vec<String> = targets
-                .iter()
-                .filter(|t| matches_name(t))
-                .map(|t| format!("{}:{}", t.rel_file, t.spelling()))
-                .collect();
-            bail!(
-                "'{name}' names an access node in more than one file; qualify it: {}",
-                qualified.join(", ")
-            );
-        }
+        let known = targets
+            .iter()
+            .map(describe_target)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (id, _) = super::resolve_node(project, program, name)
+            .map_err(|e| anyhow::anyhow!("{e:#}; the access nodes are: {known}"))?;
         // A node that IS in the program but takes no connection: say
         // that, rather than listing the connectable ones, which reads
         // as "you typed it wrong" when the real answer is "that one
         // needs nothing from you".
-        if let Some(other) = others.iter().find(|o| {
-            o.spellings.iter().any(|s| s == name)
-                || name.split_once(':').is_some_and(|(_, n)| o.spellings.iter().any(|s| s == n))
-        }) {
+        if let Some(other) = others.iter().find(|o| o.node == id) {
             bail!(
                 "'{name}' is a {} and takes no connection: nothing about it is yours to \
                  pick, so there is nothing to connect here. `weft connect --list` shows the \
@@ -868,18 +1059,10 @@ fn choose_target(
                 other.node_type
             );
         }
-        let known = targets
-            .iter()
-            .map(describe_target)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut found = targets
-            .into_iter()
-            .find(|t| matches_name(t))
-            .with_context(|| {
-                format!("no access node '{name}' in this project (the access nodes are: {known})")
-            })?;
-        found.answer_as(name);
+        let mut found = targets.into_iter().find(|t| t.node == id).with_context(|| {
+            format!("'{name}' takes no connection (the access nodes are: {known})")
+        })?;
+        found.answer_as(super::unqualified(name));
         return Ok(found);
     }
     if targets.len() == 1 {
@@ -897,6 +1080,7 @@ fn choose_target(
         let status = match &t.picked {
             Pick::Handle(p) => format!("connected as {}", p.who()),
             Pick::None => "NOT connected".to_string(),
+            Pick::MemberFilled => "each member connects their own (see --member)".to_string(),
             Pick::Malformed(_) => "holds an unreadable value (pick or --disconnect to replace it)".to_string(),
         };
         eprintln!("  [{}] {} - {}", i + 1, describe_target(t), status);
@@ -918,16 +1102,17 @@ fn choose_target(
 /// API.
 pub(crate) async fn list_grants(
     client: &DispatcherClient,
+    doorway: Doorway,
     service: Option<&str>,
 ) -> Result<Vec<GrantSummary>> {
     let path = match service {
-        Some(s) => format!("/access/grants?service={}", percent_encode(s)),
+        Some(s) => format!("{}?service={}", doorway.route(Route::Grants), percent_encode(s)),
         // No service: every stored connection, every service (the
         // store models the filter as optional the same way). The
         // store-wide listing `--list` falls back to when no project
         // scopes it, and what the recovery hints other commands print
         // (`weft connect --list`) rely on, so it works from anywhere.
-        None => "/access/grants".to_string(),
+        None => doorway.route(Route::Grants).to_string(),
     };
     let rows = client.get_json(&path).await?;
     serde_json::from_value(rows).context("parse the connection list")
@@ -937,7 +1122,7 @@ pub(crate) async fn list_grants(
 /// it): one line per connection with its service, since no node
 /// context exists to mark a pick against.
 async fn print_all_grants(client: &DispatcherClient, json: bool) -> Result<()> {
-    let grants = list_grants(client, None).await?;
+    let grants = list_grants(client, Doorway::Owner, None).await?;
     if json {
         println!("{}", serde_json::json!({ "connections": grants }));
         return Ok(());
@@ -983,6 +1168,10 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
     match &target.picked {
         Pick::Handle(p) => println!("'{}' is connected as {}.", target.spelling(), p.who()),
         Pick::None => println!("'{}' has no connection picked.", target.spelling()),
+        Pick::MemberFilled => println!(
+            "'{}' is connected by each member of the program; see theirs with --member <id>.",
+            target.spelling()
+        ),
         Pick::Malformed(why) => println!(
             "'{}' holds a value `weft connect` cannot read ({why}); pick a connection \
              or --disconnect to replace it.",
@@ -1000,9 +1189,9 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
             .clone()
             .or_else(|| g.label.clone())
             .unwrap_or_else(|| g.id.to_string());
-        let can = if g.owner == CredentialOwner::Ours && !g.has_credential {
+        let can = if g.owner.is_platform() && !g.has_credential {
             "runs on the runtime's own key, which is NOT configured".to_string()
-        } else if g.owner == CredentialOwner::Ours {
+        } else if g.owner.is_platform() {
             "uses your credits".to_string()
         } else if g.scopes.is_empty() {
             "full access of its credential".to_string()
@@ -1170,14 +1359,17 @@ impl Connecting<'_> {
         let doors: DoorsStatus = serde_json::from_value(
             client
                 .post_json(
-                    "/access/doors",
+                    self.doorway.route(Route::Doors),
                     &serde_json::to_value(DoorsRequest { spec: spec.clone() })?,
                 )
                 .await?,
         )
         .context("parse the doors probe")?;
         let is_consent = spec.needs_browser_consent();
-        let shared_backed = (!doors.doors.shared_apps.is_empty() || doors.doors.shared_credential)
+        // A member always connects an account of their own: the shared
+        // key is the author's and spends the author's credits.
+        let shared_backed = self.doorway == Doorway::Owner
+            && (!doors.doors.shared_apps.is_empty() || doors.doors.shared_credential)
             && spec.doors.contains(&Door::Shared)
             && !(is_consent && doors.consent_blocked.is_some());
         let own_offered = spec.doors.contains(&Door::Own);
@@ -1283,6 +1475,7 @@ impl Connecting<'_> {
             }
             return connect_direct(
                 client,
+                self.doorway,
                 ConnectDirect {
                     spec: spec.clone(),
                     door: Door::Shared,
@@ -1292,6 +1485,7 @@ impl Connecting<'_> {
                     registration: None,
                     paste: false,
                     project_id: None,
+                    member: None,
                 },
                 app.map(|a| a.label.clone()),
             )
@@ -1454,6 +1648,7 @@ impl Connecting<'_> {
             refuse_strays(&set, &paste_fields)?;
             return connect_direct(
                 client,
+                self.doorway,
                 ConnectDirect {
                     spec: spec.clone(),
                     door: Door::Own,
@@ -1463,6 +1658,7 @@ impl Connecting<'_> {
                     registration: None,
                     paste: true,
                     project_id: None,
+                    member: None,
                 },
                 None,
             )
@@ -1620,6 +1816,7 @@ impl Connecting<'_> {
             // in one request, no browser.
             return connect_direct(
                 client,
+                self.doorway,
                 ConnectDirect {
                     spec: spec.clone(),
                     door: Door::Own,
@@ -1629,6 +1826,7 @@ impl Connecting<'_> {
                     registration,
                     paste: false,
                     project_id: None,
+                    member: None,
                 },
                 None,
             )
@@ -1642,6 +1840,7 @@ impl Connecting<'_> {
         refuse_strays(&set, &fields)?;
         connect_direct(
             client,
+            self.doorway,
             ConnectDirect {
                 spec: spec.clone(),
                 door: Door::Own,
@@ -1651,6 +1850,7 @@ impl Connecting<'_> {
                 registration: None,
                 paste: false,
                 project_id: None,
+                member: None,
             },
             None,
         )
@@ -1686,6 +1886,7 @@ fn connection_name(
 /// with `weft test-node`'s live tier.
 pub(crate) async fn connect_direct(
     client: &DispatcherClient,
+    doorway: Doorway,
     req: ConnectDirect,
     shared_app: Option<String>,
 ) -> Result<GrantSummary> {
@@ -1693,7 +1894,7 @@ pub(crate) async fn connect_direct(
         shared_app,
         inner: req,
     })?;
-    let done = client.post_json("/access/connect/direct", &body).await?;
+    let done = client.post_json(doorway.route(Route::Direct), &body).await?;
     grant_of(done)
 }
 
@@ -1736,6 +1937,7 @@ impl Connecting<'_> {
             // The editor sends no project id on a user connect either; the
             // column means "published by a node in this project".
             project_id: None,
+            member: None,
             upgrade_grant_id,
             // Filled by the dispatcher (it knows its public host).
             redirect_uri: String::new(),
@@ -1745,7 +1947,7 @@ impl Connecting<'_> {
             inner: req,
         })?;
         let started: StartedOAuth =
-            serde_json::from_value(client.post_json("/access/connect/begin", &body).await?)
+            serde_json::from_value(client.post_json(self.doorway.route(Route::Begin), &body).await?)
                 .context("parse the sign-in start")?;
         println!(
             "Finish the sign-in in your browser:\n  {}",
@@ -1765,7 +1967,8 @@ impl Connecting<'_> {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let outcome = client
                 .get_json(&format!(
-                    "/access/connect/status?state={}",
+                    "{}?state={}",
+                    self.doorway.route(Route::Status),
                     percent_encode(&started.state)
                 ))
                 .await
@@ -1970,12 +2173,13 @@ mod tests {
             id: uuid::Uuid::nil(),
             service: "s".into(),
             project_id: None,
+            member: None,
             identity: None,
             label: None,
             scopes: vec![],
             permissions_verified: false,
             value_names: vec![],
-            owner: CredentialOwner::TheirOwn,
+            owner: weft_core::CredentialOwner::Author,
             door: Door::Own,
             expires_at: None,
             has_credential: true,

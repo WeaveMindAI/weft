@@ -88,6 +88,10 @@ pub enum DispatcherEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<weft_journal::Seed>,
         project_id: uuid::Uuid,
+        /// Who the run is for, when it is one member's run: the editor
+        /// labels the run with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<weft_core::member::MemberId>,
         at_unix: u64,
     },
     ExecutionCompleted { color: Color, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },

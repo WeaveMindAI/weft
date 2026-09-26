@@ -40,6 +40,11 @@ pub enum EditOp {
     RemoveConfig { node: String, key: String, #[serde(default, skip_serializing_if = "Option::is_none")] form: Option<ValueForm> },
     /// Set or clear a node's label.
     SetLabel { node: String, label: Option<String> },
+    /// Add (`per_member: true`) or remove the node's `@per_member` line:
+    /// the node then exists once per member of the program. The editor
+    /// offers it only on a node that may carry it (an infra node); the
+    /// compiler refuses it anywhere else.
+    SetPerMember { node: String, per_member: bool },
     /// Add a bare node `id = Type {}` at the end of the scope (top level when
     /// `parent_group` is None).
     AddNode { id: String, node_type: String, parent_group: Option<String> },

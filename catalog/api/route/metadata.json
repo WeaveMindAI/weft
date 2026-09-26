@@ -1,7 +1,7 @@
 {
   "type": "Route",
   "label": "Route",
-  "description": "Turn this program into an HTTP route. A call to the route's path (and method) starts a fresh execution: the request's method, path, parameters, query and headers come out on the fixed ports, and the body's top-level keys come out on the output ports you declare in the source (`-> (user_id: String, text: String)`), exactly like an LLM call with Parse JSON on. Declare every field you read; there is no port for the whole body (a field that is itself an object is `-> (meta: JsonDict)`). A declared port named like a path capture reads the capture (`-> (id: String)` on `cards/{id}`). A port declared as a file kind (`photo: Image`) takes a picture the body carries as a `data:` URL or base64: it is stored on the way in and the stored-file value flows, never the bytes (a value on a wire is at most 100 KB). The whole request body is capped at 256 KB, and a `data:` URL inflates what it carries by about a third, so roughly 190 KB of picture: a caller sending more gets 413 before the run starts, and a page that takes photos resizes them before posting. Answer with a Reply, Stream or Close node downstream, or read the caller through the ctx in a custom node.",
+  "description": "Turn this program into an HTTP route. A call to the route's path (and method) starts a fresh execution: the request's method, path, parameters, query and headers come out on the fixed ports, and the body's top-level keys come out on the output ports you declare in the source (`-> (user_id: String, text: String)`), exactly like an LLM call with Parse JSON on. Declare every field you read; there is no port for the whole body (a field that is itself an object is `-> (meta: JsonDict)`). A declared port named like a path capture reads the capture (`-> (id: String)` on `cards/{id}`). A port declared as a file kind (`photo: Image`) takes a picture the body carries as a `data:` URL or base64: it is stored on the way in and the stored-file value flows, never the bytes (a value on a wire is at most 100 KB). The whole request body is capped at 16 MB unless `Largest request body` says otherwise, and a `data:` URL inflates what it carries by about a third, so roughly 12 MB of picture at the default: a caller sending more is answered 413. Answer with a Reply, Stream or Close node downstream, or read the caller through the ctx in a custom node.",
   "tags": [
     "api",
     "http",
@@ -104,10 +104,29 @@
       "description": "How long the caller's machine may leave what the worker sent it unacknowledged before the connection is called dead, in seconds. This is NOT a ceiling on the call: a machine that is still there acknowledges every packet by itself, whatever the person is doing, so a caller who stays resets this constantly and a run that legitimately lasts hours is never touched. It bounds SILENCE, which is the only way to tell a caller who vanished (a closed laptop, a dropped network) from one who is simply quiet. Raise it for a client on a link that genuinely goes silent for longer, like a device that sleeps its radio between messages; lower it to notice a departure sooner. `0` leaves the machine's own default, which is about fifteen minutes."
     },
     {
+      "name": "maxInboundMb",
+      "type": "Number",
+      "default": 16,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Largest request body, in MB",
+      "description": "The biggest body a caller may send, in whole megabytes; a bigger one is answered 413. 16 by default, which fits a few photos sent as `data:` URLs. Raise it for a route that takes larger uploads, lower it to refuse oversized calls early."
+    },
+    {
       "name": "journalEphemeral",
       "type": "Boolean",
       "label": "Keep the exchange out of the journal",
       "description": "What the journal keeps of what was said. Off (default): the request and the answer are recorded, so the inspector replays the exchange and you can see what a caller actually sent. Anything over 100 KB is recorded trimmed, and raw bytes are never recorded whatever this says, so the journal holds what a person would read rather than a copy of the traffic. On: only the sizes and the count are kept, never the content. Turn it on for a route carrying something you would rather not have written down for every run, remembering that you are also giving up seeing it when you debug."
+    },
+    {
+      "name": "recorded",
+      "type": "Boolean",
+      "default": true,
+      "label": "Record each run",
+      "description": "Whether each call leaves a run in `weft executions`. On (default): every call is a recorded run you can list and inspect. Off: a run that succeeds or is cancelled leaves nothing behind but what it cost, and a run that fails is written down whole after the fact, so you can still inspect it like any other. Turn it off for a route called often for cheap reads, like a page asking for a status every few seconds, which would otherwise pile up hundreds of runs. An unrecorded run keeps its steps in the worker's memory, so it cannot wait (a timer, a form, anything that parks the run fails at the call), cannot outlive its caller, and is lost if the worker dies mid-call."
     }
   ],
   "outputs": [

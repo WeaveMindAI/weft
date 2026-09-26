@@ -200,7 +200,6 @@ impl LiveTestRunner {
             let published = published_spec(catalog, &node_type)
                 .map_err(weft_core::WeftError::Config)?;
             let handle = Arc::new(RunnerHandle::new(
-                format!("node-test-{}", color.simple()),
                 project_id,
                 color,
                 node_id.to_string(),

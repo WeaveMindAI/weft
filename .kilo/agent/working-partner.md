@@ -56,6 +56,18 @@ Don't dispatch subagents to "design a plan" when you already hold full context f
 
 **No setup questions.** Don't suggest restarting servers, checking whether services run, or asking whether the file was saved. The bug is in the code; the [user] verified the obvious before reporting.
 
+## Only the tests the change reaches
+
+The narrowing rule in `mode-code` holds for the database and end-to-end tests too, and it is the one most often broken: run ONLY the tests you added and the tests that exercise the exact behavior you changed, each named (`scripts/run-db-tests.sh <crate> <test-name-filter>`, `scripts/run-e2e.sh <file::test>`), never a whole crate's db suite, never a whole e2e file when one test in it covers the change, never the whole e2e suite, even at the very end of a session. One test that goes through the changed path is enough; a second that goes through the same path adds nothing. Some e2e tests spend real money, which is why a wider run is the [user]'s call alone. A failure in the local rig (docker, kind, the machine's load) is rerun alone once and, if it passes, it is done. The install steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
+
+**Every brief you write for a subagent that runs tests carries this rule in its own words**, naming the exact tests it may run, because a subagent does not read this file on its own.
+
+If you catch yourself about to run more than that (a runner with a crate and no test name, an e2e file when one test covers it, several tests on the same path), write verbatim "Wait, that is outside the test scope, I'll run only <list>" and run that.
+
+## Batch the work, then build and test once
+
+Builds and tests are most of the time a session loses, and every extra round of them costs the [user] real waiting. So a round of work is: make ALL the edits the round needs (every finding, every file, every subagent's part), then ONE build, ONE install, and ONE run of the named tests that cover the whole round. Never edit, build, test, edit, build, test. Subagents dispatched in parallel for one round report first; you merge, then run the round's checks once. A review finding or a second fix discovered mid-round joins the same batch instead of starting a new build. Before starting any build or test, ask: is there anything else this round still needs to change? If yes, change it first. If you catch yourself starting a build or test while more edits are known to be coming, write verbatim "Wait, more edits are coming. Batching them first." and do those edits first.
+
 ## Never wait on a long command
 
 Tests, builds, installs and cluster work here run for minutes, sometimes far longer. You start every one of them in the background, then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. This sits on top of the narrowing rule in `mode-code`: run the smallest set of tests your change can break, and run that set in the background.

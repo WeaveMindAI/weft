@@ -4,27 +4,27 @@
 
 use sqlx::{PgPool, Row};
 use weft_broker_client::protocol::{
-    SignalAuthKind, SignalRowWire, SignalSurfaceKind, LISTENER_HELD_PROJECT_STATUSES,
+    SignalAuthKind, SignalRowWire, SignalSurfaceKind, LISTENER_HELD_STATUSES, SIGNAL_ACTIVATION_JOIN,
 };
 
 /// The signal rows a booting or rehydrating pod must hold: every row
-/// placed on `pod_name` whose project is in
-/// [`LISTENER_HELD_PROJECT_STATUSES`]. A hibernated or parked project
-/// keeps its rows placed on the pod (reactivate restores them from
-/// here) while deactivate told the pod to forget them; handing them
-/// back to a restarting pod would revive a parked project's timers
-/// behind the user's back, so those rows never come out of this query.
-/// Mixed tenants: each row carries its own.
+/// placed on `pod_name` whose governing activation is in
+/// [`LISTENER_HELD_STATUSES`] (or that none governs). A hibernated or
+/// parked activation keeps its rows placed on the pod (reactivate
+/// restores them from here) while deactivate told the pod to forget
+/// them; handing them back to a restarting pod would revive a parked
+/// trigger's timers behind the user's back, so those rows never come
+/// out of this query. Mixed tenants: each row carries its own.
 pub async fn signals_held_by_pod(pool: &PgPool, pod_name: &str) -> anyhow::Result<Vec<SignalRowWire>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.color, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
-                s.kind_state, s.kind_state_seq, s.placement_generation \
-         FROM signal s JOIN project p ON p.id = s.project_id \
-         WHERE s.listener_pod = $1 AND p.status = ANY($2)",
-    )
+                s.kind_state, s.kind_state_seq, s.placement_generation, s.project_id, s.member_id \
+         FROM signal s {SIGNAL_ACTIVATION_JOIN} \
+         WHERE s.listener_pod = $1 AND COALESCE(a.status, 'active') = ANY($2)"
+    ))
     .bind(pod_name)
-    .bind(&LISTENER_HELD_PROJECT_STATUSES[..])
+    .bind(&LISTENER_HELD_STATUSES[..])
     .fetch_all(pool)
     .await?;
     // try_get on a NOT NULL column should never fail; if it does the
@@ -38,9 +38,13 @@ pub async fn signals_held_by_pod(pool: &PgPool, pod_name: &str) -> anyhow::Resul
             let auth_str: String = r.try_get("auth_kind")?;
             let auth_kind = SignalAuthKind::parse(&auth_str)
                 .ok_or_else(|| anyhow::anyhow!("unknown auth_kind '{auth_str}'"))?;
+            let for_member =
+                weft_core::member::MemberScope::from_columns(r.try_get("project_id")?, r.try_get("member_id")?)
+                    .map_err(|e| anyhow::anyhow!("corrupt member_id: {e}"))?;
             Ok(SignalRowWire {
                 token: r.try_get("token")?,
                 tenant_id: r.try_get("tenant_id")?,
+                for_member,
                 node_id: r.try_get("node_id")?,
                 spec_json: r.try_get("spec_json")?,
                 is_resume: r.try_get("is_resume")?,

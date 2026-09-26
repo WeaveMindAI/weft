@@ -231,7 +231,7 @@ async fn process_one_row(
     // first pod observing the terminal row removes the signal
     // entries; sibling pods see an empty result and skip.
     match &event {
-        ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::Fire, node_test: false, .. } => {
+        ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::Fire, run_kind: weft_core::exec::RunKind::Execution, .. } => {
             crate::api::versions::record_trigger_run(state, color).await?;
         }
         e if e.is_execution_terminal() => {
@@ -284,7 +284,15 @@ async fn process_one_row(
         // `try_finish_drain` is idempotent, so the extra trigger is
         // free when nothing is draining.
         ExecEvent::SuspensionRegistered { .. } => {
-            try_finish_drain(state, project_id, None).await?;
+            if let Some(owner) = state.journal.execution_owner(color).await? {
+                if let Some(trigger) = owner.fired_by {
+                    let key = weft_core::activation::ActivationKey::new(
+                        trigger,
+                        weft_core::member::Owner::from_member(owner.member),
+                    );
+                    try_finish_drain(state, project_id, &key, None).await?;
+                }
+            }
         }
         _ => {}
     }
@@ -472,33 +480,72 @@ async fn rows_before(
     Ok(CatchUp::Rows(out))
 }
 
+/// Hear every unrecorded run's ending
+/// (`weft_journal::unrecorded::UNRECORDED_ENDED_CHANNEL`, sent at the
+/// commit that forgot it) and re-check the drain of the activation it
+/// belonged to, as `terminal_cleanup` does for a recorded run's terminal
+/// row. A missed signal (the listener reconnecting) is covered by the
+/// reaper's periodic drain pass.
+pub async fn run_unrecorded_endings(state: DispatcherState) {
+    let mut heard = state.signals.subscribe();
+    loop {
+        match heard.next().await {
+            Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload })
+                if channel == weft_journal::unrecorded::UNRECORDED_ENDED_CHANNEL =>
+            {
+                if let Err(e) = on_unrecorded_ended(&state, &payload).await {
+                    tracing::warn!(
+                        target: "weft_dispatcher::journal_bridge",
+                        error = %format!("{e:#}"),
+                        "could not re-check the drain after an unrecorded run ended"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(target: "weft_dispatcher::journal_bridge", error = %e, "unrecorded endings stopped");
+                return;
+            }
+        }
+    }
+}
+
+/// One ending: the drain its run's activation may be waiting on.
+pub(crate) async fn on_unrecorded_ended(state: &DispatcherState, payload: &str) -> anyhow::Result<()> {
+    let ended: weft_journal::unrecorded::UnrecordedEnded = serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("unrecorded ending '{payload}' does not decode: {e}"))?;
+    let Some(trigger) = ended.fired_by else {
+        return Ok(());
+    };
+    let member = ended.member.map(weft_core::member::MemberId::new).transpose()
+        .map_err(|e| anyhow::anyhow!("unrecorded ending names a bad member: {e}"))?;
+    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(member));
+    try_finish_drain(state, ended.project_id, &key, None).await
+}
+
 async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> anyhow::Result<()> {
     let removed = state.journal.signal_remove_for_color(color).await?;
-    let project_id = removed.first().map(|m| m.project_id);
     state
         .listeners
         .unregister_many(&state.pg_pool, &removed)
         .await;
-
-    // If signal_remove_for_color found nothing (entry trigger or
-    // already-cleaned execution), still try to find the project
-    // via the execution's own row so the drain-watcher fires.
-    let project_id = match project_id {
-        Some(p) => Some(p),
-        None => state.journal.execution_owner(color).await?.map(|o| o.project_id),
-    };
-    if let Some(project_id) = project_id {
-        try_finish_drain(state, project_id, None).await?;
+    // The run's own row says which activation it belonged to (the
+    // trigger that fired it, for its member); a waiting deactivation of
+    // that activation may have been waiting on exactly this run.
+    if let Some(owner) = state.journal.execution_owner(color).await? {
+        if let Some(trigger) = owner.fired_by {
+            let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(owner.member));
+            try_finish_drain(state, owner.project_id, &key, None).await?;
+        }
     }
     Ok(())
 }
 
-/// Drain-watcher CAS. If the project is `Deactivating` AND no
-/// running non-suspended executions remain, flip status to
-/// `Inactive`. Idempotent: a stale view loses the CAS and the
-/// next terminal event re-checks. Activate concurrently flipping
-/// status back to `Active` also wins the CAS, so the deactivate
-/// rolls back cleanly.
+/// Drain-watcher CAS. If the activation `key` is `Deactivating` AND
+/// nothing it waits on runs any more, flip it to `Inactive`.
+/// Idempotent: a stale view loses the CAS and the next terminal event
+/// re-checks. An activate concurrently flipping it back to `Active` also
+/// wins the CAS, so the deactivate rolls back cleanly.
 ///
 /// `exclude_task`: a still-claimed task row to discount from the
 /// running count. The route_entry executor's re-park branch passes
@@ -508,27 +555,32 @@ async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> a
 pub(crate) async fn try_finish_drain(
     state: &DispatcherState,
     project_id: uuid::Uuid,
+    key: &weft_core::activation::ActivationKey,
     exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<()> {
-    use crate::project_store::ProjectStatus;
-    let Some(lifecycle) = state.projects.lifecycle(project_id).await? else {
-        return Ok(());
-    };
-    if lifecycle.status != ProjectStatus::Deactivating {
+    use crate::activation_store::ProjectStatus;
+    let draining = state
+        .activations
+        .list(project_id)
+        .await?
+        .iter()
+        .any(|a| &a.key == key && a.lifecycle.status == ProjectStatus::Deactivating);
+    if !draining {
         return Ok(());
     }
-    let running = crate::api::project::running_count(state, project_id, exclude_task).await?;
+    let running = crate::api::project::running_count_for(state, project_id, std::slice::from_ref(key), exclude_task).await?;
     if running > 0 {
         return Ok(());
     }
     let flipped = state
-        .projects
-        .cas_status(project_id, ProjectStatus::Deactivating, ProjectStatus::Inactive)
+        .activations
+        .cas_status(project_id, key, ProjectStatus::Deactivating, ProjectStatus::Inactive)
         .await?;
     if flipped {
         tracing::info!(
             target: "weft_dispatcher::journal_bridge",
             %project_id,
+            trigger = %key,
             "drain finished: deactivating -> inactive"
         );
         // Broadcast the landing so both frontends reconcile without a

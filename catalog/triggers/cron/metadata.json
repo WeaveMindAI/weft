@@ -20,7 +20,7 @@
       },
       "default": "0 */5 * * * *",
       "label": "Cron",
-      "description": "Six fields, seconds first: `sec min hour day month weekday`. The default fires every five minutes. A five-field (minute-first) expression is refused at activation.",
+      "description": "Six fields, seconds first: `sec min hour day month weekday`. The default fires every five minutes. A five-field (minute-first) expression is refused as you type it.",
       "placeholder": "0 */5 * * * *"
     },
     {
@@ -643,6 +643,21 @@
       "name": "actualTime",
       "type": "String",
       "description": "ISO-8601 timestamp of when the firing actually happened"
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_nonempty", "field": "cron" },
+          { "kind": "not", "of": { "kind": "config_matches", "field": "cron", "regex": "^\\s*\\S+(\\s+\\S+){5,6}\\s*$" } }
+        ]
+      },
+      "then": {
+        "message": "Cron '{id}' needs six fields, seconds first (`sec min hour day month weekday`), so every five minutes is `0 */5 * * * *` and three every morning is `0 0 3 * * *`. A five-field expression is minute-first cron, one field short.",
+        "field": "cron"
+      }
     }
   ],
   "requires_infra": false,

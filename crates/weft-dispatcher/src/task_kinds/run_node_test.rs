@@ -248,10 +248,10 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
                         // definition; `None` makes a resume against
                         // this color fail loudly as an unknown hash.
                         definition_hash: None,
-                        program: None, source_version: None, node_test: true,
+                        program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                         subgraph: None,
                         seed: None,
-                        at_unix: crate::lease::now_unix() as u64,
+                        member: None, fired_trigger: None, member_values: Default::default(), at_unix: crate::lease::now_unix() as u64,
                     },
                     &format!("node_test_started:{color}"),
                 )
@@ -732,6 +732,7 @@ spec:
 {runtime_class_line}{image_pull_secrets_line}  serviceAccountName: weft-worker-sa
   automountServiceAccountToken: false
   restartPolicy: Never
+  {dns_config}
   containers:
     - name: node-test
       image: {image}
@@ -764,6 +765,7 @@ spec:
               path: token
 "#,
         image = payload.image_ref,
+        dns_config = weft_core::pod_dns::pod_dns_config_yaml(),
     )
 }
 
@@ -875,6 +877,10 @@ mod tests {
         assert!(pod.contains("weft.dev/kind: node-test"), "identifiable as a test pod");
         assert!(pod.contains("serviceAccountToken"), "broker token projection");
         assert!(pod.contains("restartPolicy: Never"), "run to completion");
+        assert!(
+            pod.contains(&format!("\n  {}\n  containers:", weft_core::pod_dns::pod_dns_config_yaml())),
+            "ndots:1 at the pod spec level"
+        );
         assert!(pod.contains("- \"--node\"") && pod.contains("- \"SlackSendMessage\""));
         assert!(pod.contains("- \"--live-connection\""));
         assert!(pod.contains("- \"--color\"") && pod.contains("- \"c0ffee\""));

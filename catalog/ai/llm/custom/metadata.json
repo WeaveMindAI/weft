@@ -98,28 +98,28 @@
   "validate": [
     {
       "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "baseUrl"
-        }
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "baseUrl" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "baseUrl" } }
+        ]
       },
       "then": {
-        "message": "CustomProvider '{id}' has no base URL; set the endpoint's address on the node.",
+        "message": "CustomProvider '{id}' has no base URL; set the endpoint's address on the node or wire one in.",
         "level": "runtime",
         "field": "baseUrl"
       }
     },
     {
       "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "model"
-        }
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+        ]
       },
       "then": {
-        "message": "CustomProvider '{id}' has no model; name one on the node.",
+        "message": "CustomProvider '{id}' has no model; name one on the node or wire one in.",
         "level": "runtime",
         "field": "model"
       }

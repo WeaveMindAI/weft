@@ -2,7 +2,7 @@
   "name": "weft-extension",
   "description": "Human-in-the-loop task manager for weft projects",
   "private": true,
-  "version": "1.0.71",
+  "version": "1.0.72",
   "packageManager": "pnpm@10.32.1",
   "type": "module",
   "scripts": {
@@ -35,6 +35,9 @@
       "tmp": ">=0.2.6",
       "uuid": ">=11.1.1"
     }
+  },
+  "dependencies": {
+    "@weft/connect": "link:../packages/weft-connect"
   },
   "devDependencies": {
     "@tsconfig/svelte": "^5.0.8",

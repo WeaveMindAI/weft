@@ -427,11 +427,11 @@ async fn drive_color(
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
     // ExecutionStarted, the journal is malformed and we fail loud.
-    let (phase, run_subgraph) = events
+    let (phase, run_subgraph, member, member_values, run_kind) = events
         .iter()
         .find_map(|e| match e {
-            weft_journal::ExecEvent::ExecutionStarted { phase, subgraph, .. } => {
-                Some((*phase, subgraph.clone()))
+            weft_journal::ExecEvent::ExecutionStarted { phase, subgraph, member, member_values, run_kind, .. } => {
+                Some((*phase, subgraph.clone(), member.clone(), member_values.clone(), *run_kind))
             }
             _ => None,
         })
@@ -495,7 +495,6 @@ async fn drive_color(
     )
     .await;
 
-    let exec_id = uuid::Uuid::new_v4().to_string();
     // Drive in a re-fetch loop. drive() works off the snapshot folded
     // so far; SuspensionResolved rows that arrive while drive() is
     // running are invisible to it. When drive() returns Stalled/Stuck,
@@ -527,7 +526,6 @@ async fn drive_color(
             &project_arc,
             &edge_idx,
             catalog.as_ref(),
-            &exec_id,
             color,
             &clients,
             &journal_poisoned,
@@ -544,6 +542,9 @@ async fn drive_color(
             std::mem::take(&mut awaited_sequences),
             &mut loop_runtime,
             phase,
+            member.as_ref(),
+            &member_values,
+            run_kind,
             dispatchable.as_ref(),
             &mut live,
         )
@@ -1094,7 +1095,6 @@ async fn drive(
     project_arc: &Arc<ProjectDefinition>,
     edge_idx: &EdgeIndex,
     catalog: &dyn NodeCatalog,
-    exec_id: &str,
     color: Color,
     clients: &EngineClients,
     journal_poisoned: &std::sync::atomic::AtomicBool,
@@ -1113,6 +1113,15 @@ async fn drive(
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut LoopRuntime,
     phase: weft_core::context::Phase,
+    // Who the run is for, from its `ExecutionStarted`; every firing's
+    // ctx carries it.
+    member: Option<&weft_core::member::MemberId>,
+    // What that member provides, as the run was born with it (its
+    // `ExecutionStarted`): every `@member_filled` field reads these.
+    member_values: &weft_core::member::MemberValues,
+    // What the run is, from its `ExecutionStarted`: an unrecorded run's
+    // firings refuse to wait.
+    run_kind: weft_core::exec::RunKind,
     // The nodes this run may dispatch (see `run_one_execution_observed`
     // where it is derived); None = the whole graph.
     dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
@@ -1846,11 +1855,23 @@ async fn drive(
             // delivered (wired pulses + body literals), the remaining
             // braces config values, and declared defaults for whatever
             // is still absent (a closed wire is never defaulted).
-            let inputs = match weft_core::context::node_input_bag(
-                node_def,
-                owned_bag(&group.received.input),
-                &group.received.closed_ports,
-            ) {
+            // Where this firing runs, spelled: the node under the call
+            // sites on its frames (`one.db` inside the file the site
+            // `one` includes). What a person is told, and what an infra
+            // node's row is keyed by.
+            let place = {
+                let call_path: Vec<String> =
+                    weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
+                weft_core::project::address_of(project, &node_id, &call_path)
+            };
+            //
+            // A `@member_filled` field takes what the run's member
+            // provides at this place, as the run was born with it, in the
+            // place a value written in the source would sit.
+            let delivered = with_member_values(node_def, &place, member, member_values, owned_bag(&group.received.input));
+            let inputs = match delivered.and_then(|delivered| {
+                weft_core::context::node_input_bag(node_def, delivered, &group.received.closed_ports)
+            }) {
                 Ok(bag) => bag,
                 // A broken spec or malformed widget handle: the node
                 // fails loud instead of running on a bag it can never
@@ -1898,17 +1919,7 @@ async fn drive(
                     .map(|p| (p.name.clone(), p.port_type.clone()))
                     .collect();
             let wake_payload = kick_payloads.remove(&FiringLocation::new(node_id.clone(), group.frames.clone()));
-            // Where this firing runs, spelled: the node under the call
-            // sites on its frames (`one.db` inside the file the site
-            // `one` includes). What a person is told, and what an infra
-            // node's row is keyed by.
-            let place = {
-                let call_path: Vec<String> =
-                    weft_core::frames::call_path(&group.frames).into_iter().map(str::to_string).collect();
-                weft_core::project::address_of(project, &node_id, &call_path)
-            };
             let mut runner = RunnerHandle::new(
-                exec_id.to_string(),
                 project.id,
                 group.color,
                 node_id.clone(),
@@ -1928,7 +1939,9 @@ async fn drive(
             )
             .with_awaited_sequence(sequence)
             .with_emit_channel(task_tx.clone())
-            .with_caller_connection(caller.cloned());
+            .with_caller_connection(caller.cloned())
+            .with_member(member.cloned(), node_def.per_member)
+            .with_run_kind(run_kind);
             // What a trigger wakes with is a declared contract
             // (`firesWith` in its metadata), so a payload that does not
             // match fails the firing HERE, naming the field, instead of
@@ -1961,13 +1974,13 @@ async fn drive(
             // the same view a `run` body would.
             let provision_input = inputs.clone();
             let mut ctx = ExecutionContext::new(
-                exec_id.to_string(),
                 project.id,
                 node_id.clone(),
                 node_def.node_type.clone(),
                 node_def.label.clone(),
                 group.color,
                 group.frames.clone(),
+                member.cloned(),
                 inputs,
                 handle,
             );
@@ -2049,6 +2062,8 @@ async fn drive(
             let provision_tenant_id = tenant_id.to_string();
             let provision_namespace = namespace.to_string();
             let provision_clients = clients.clone();
+            let provision_copy =
+                weft_core::member::copy_owner(node_def.per_member, member).cloned();
             let abort_handle = in_flight.spawn(async move {
                 if is_infra_setup_provision {
                     // 1. Call the node's provision body.
@@ -2097,6 +2112,7 @@ async fn drive(
                         provision_clients.clock.as_ref(),
                         provision_project,
                         &provision_place,
+                        provision_copy.as_ref(),
                         &spec,
                     )
                     .await
@@ -2524,6 +2540,31 @@ async fn drive(
 /// so the drive panics here naming the location, which
 /// `run_one_execution` catches and journals as the run's Failed
 /// terminal.
+/// `delivered` with the run member's values in `node`'s `@member_filled`
+/// fields at `place` (see `weft_core::member::fill_literals`), or why the
+/// step cannot run: it takes values a member provides, and the run is for
+/// no member. The dispatcher refuses such a run before it is born; this is
+/// the floor under that.
+fn with_member_values(
+    node: &weft_core::project::NodeDefinition,
+    place: &str,
+    member: Option<&weft_core::member::MemberId>,
+    values: &weft_core::member::MemberValues,
+    mut delivered: serde_json::Map<String, Value>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    if weft_core::member::member_filled_fields(node).next().is_none() {
+        return Ok(delivered);
+    }
+    if member.is_none() {
+        return Err(format!(
+            "step '{place}' takes values its member provides, and this run is for no member; \
+             start it for one (`--member <id>`)"
+        ));
+    }
+    weft_core::member::fill_literals(node, &mut delivered, values.get(place));
+    Ok(delivered)
+}
+
 fn ended_firing_ordinal(
     executions: &NodeExecutionTable,
     node_id: &str,
@@ -4850,6 +4891,12 @@ mod branching_tests;
 #[cfg(test)]
 #[path = "execution_driver_tests/wire_values.rs"]
 mod wire_values_tests;
+
+// Layer 3: an unrecorded run keeps its journal in memory, writes it
+// whole only when it fails, and refuses to wait.
+#[cfg(test)]
+#[path = "execution_driver_tests/unrecorded.rs"]
+mod unrecorded_tests;
 
 // Layer 1: a run's failure reason spells the failed node's address.
 #[cfg(test)]

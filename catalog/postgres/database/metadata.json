@@ -1,7 +1,7 @@
 {
   "type": "PostgresDatabase",
   "label": "Postgres: Database",
-  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and hands it out exactly ONCE, to whoever asks first: until that happens the node's card shows it, masked, with a button to copy it, which is how something outside the program (a frontend keeping its own tables here) gets in. After a run takes it, the card shows only that it was handed over, and the way back is the card's Reset password button, which mints a new one and shows it again. Terminating this node's infra deletes the disk and everything on it.",
+  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and hands it out exactly ONCE, to whoever asks first: until that happens the node's card shows it, masked, with a button to copy it, which is how something outside the program (a frontend keeping its own tables here) gets in. After a run takes it, the card shows only that it was handed over, and the way back is the card's Reset password button, which mints a new one and shows it again. `weft infra env <node> --into .env --set DATABASE_USER=User --set DATABASE_PASSWORD=Password` writes the user and the password into an env file in one go, the password without anyone reading it. Once it was handed over, `weft infra show <node>` lists the card's button, `weft infra press <node> reset_password` presses it, and `weft infra env` then writes the new one. Terminating this node's infra deletes the disk and everything on it.",
   "tags": [
     "postgres",
     "database",
@@ -45,7 +45,7 @@
       "type": "Boolean",
       "default": false,
       "label": "Reachable from this machine",
-      "description": "Let something that is not part of this program connect to this database directly: a frontend you are building, a `psql` session, a tool that reads the tables. Off by default, and off means the database answers only inside the project. On, weft gives it an address on the machine the runtime runs on, and `weft infra list-doors` prints it. Never the internet, and on a local install never anything but this machine: the address is bound to loopback. Getting there still costs the password, which is why only the database's own port can be opened this way and the part that hands out credentials never can."
+      "description": "Let something that is not part of this program connect to this database directly: a frontend you are building, a `psql` session, a tool that reads the tables. Off by default, and off means the database answers only inside the project. On, weft gives it an address on the machine the runtime runs on, and `weft infra list-doors` prints it. Never the internet, and on a local install never anything but this machine: the address is bound to loopback. Getting there still costs the password (the node's card shows it with the database and user to sign in as), which is why only the database's own port can be opened this way and the part that hands out credentials never can."
     }
   ],
   "outputs": [

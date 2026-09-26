@@ -1,17 +1,20 @@
 //! `weft resync`. Deactivate-then-activate against a fresh worker
 //! image, with the USER'S trigger-deactivation choice (mode + running
 //! policy + drain cap; same picker as `weft deactivate`). Used after
-//! editing the trigger or fire subgraph. Refuses on the dispatcher
-//! side if the project has infra nodes that aren't running.
+//! editing the trigger or fire subgraph. Plain, it brings every trigger
+//! that is on up to date, the program's and each member's; the
+//! dispatcher picks whose from its activation rows and answers with the
+//! list. Refuses on the dispatcher side if the infra those triggers read
+//! isn't running.
 
 use super::Ctx;
-use crate::commands::infra::InfraOpts;
+use crate::commands::deactivate::TriggerChoiceFlags;
 use crate::progress::ActionVerb;
 
-pub async fn run(ctx: Ctx, opts: InfraOpts) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, scope: weft_core::activation::ActivationScope, opts: TriggerChoiceFlags) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Resync, |progress| async move {
-        run_inner(&ctx_inner, &progress, opts).await
+        run_inner(&ctx_inner, &progress, scope, opts).await
     })
     .await
 }
@@ -19,47 +22,73 @@ pub async fn run(ctx: Ctx, opts: InfraOpts) -> anyhow::Result<()> {
 async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
-    opts: InfraOpts,
+    scope: weft_core::activation::ActivationScope,
+    opts: TriggerChoiceFlags,
 ) -> anyhow::Result<()> {
-    // Resync only re-registers an ACTIVE project (the dispatcher
-    // refuses anything else with a 409: a parked project is brought
-    // back with `weft activate`, by choice, never as a side effect),
-    // and it needs the trigger-deactivation choice the shared prompt
-    // asks for (`weft deactivate` / the infra verbs use the same one).
-    // Both are settled BEFORE the build: registering loads the new
-    // image and drops the one the project is active on, so a refusal
-    // has to come before anything is touched.
-    let project_id = ctx.project()?.id().to_string();
-    if !super::deactivate::project_is_active(&ctx.client(), &project_id).await? {
-        anyhow::bail!(
-            "resync: this project is not active, and resync only re-registers an active \
-             project; `weft activate` brings it up on the current source"
-        );
-    }
+    // Resync only re-registers triggers that are on (the dispatcher
+    // refuses anything else with a 409: a parked trigger is brought back
+    // with `weft activate`, by choice, never as a side effect), and the
+    // dispatcher is the one that knows whose are on. So nothing is
+    // checked here: the choice of how they come down goes along when
+    // it was given, or off a terminal (where no `--mode` is `wipe`, see
+    // `prompt_trigger_deactivation`); a person at a terminal who gave
+    // none is asked once the dispatcher says triggers are on. The
+    // dispatcher refuses before it builds or takes anything down.
     let (running_policy, drain_timeout) =
         super::ensure::parse_running_choice(opts.running_policy.as_deref(), opts.drain_timeout)?;
-    let trigger_deactivation = serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
-        ctx.json(),
-        opts.mode.as_deref(),
-        opts.grace,
-        running_policy,
-        drain_timeout,
-    )?)?;
+    let scripted = ctx.json() || !crate::prompt::is_interactive();
+    let given = if scripted {
+        Some(super::deactivate::prompt_trigger_deactivation(
+            ctx.json(),
+            opts.mode.as_deref(),
+            opts.grace,
+            running_policy,
+            drain_timeout,
+        )?)
+    } else {
+        super::deactivate::given_trigger_deactivation(
+            false,
+            opts.mode.as_deref(),
+            opts.grace,
+            running_policy,
+            drain_timeout,
+        )?
+    };
     let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
     let path = format!("/projects/{}/resync", handle.id);
-    let mut body_map = serde_json::Map::new();
-    handle.inject_hash_fields(&mut body_map);
-    progress.drain_wait(&trigger_deactivation, drain_timeout);
-    body_map.insert("triggerDeactivation".into(), trigger_deactivation);
-    let body = serde_json::Value::Object(body_map);
+    let mut body = serde_json::Map::new();
+    handle.inject_hash_fields(&mut body);
+    body.insert("scope".into(), serde_json::to_value(&scope)?);
+    progress.drain_wait(&serde_json::json!({ "runningPolicy": running_policy.as_str() }), drain_timeout);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let _: serde_json::Value = handle.client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+    let answer = super::deactivate::post_with_trigger_choice(
+        &handle.client,
+        &path,
+        body,
+        ctx.json(),
+        given,
+        running_policy,
+        drain_timeout,
+    )
+    .await?;
+    let resynced: Vec<weft_core::member::Owner> = answer
+        .get("resynced")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "resync: the dispatcher's answer does not say whose triggers it resynced; \
+                 upgrade the dispatcher or this CLI so the versions match"
+            )
+        })?;
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id, "resynced": resynced }));
     progress.trigger_register_done();
+    let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
     if !ctx.json() {
-        println!("resynced {} ({})", handle.name, handle.id);
+        println!("resynced {whom} in {} ({})", handle.name, handle.id);
     }
-    progress.complete(&format!("resynced {}", handle.name));
+    progress.complete(&format!("resynced {whom} in {}", handle.name));
     Ok(())
 }

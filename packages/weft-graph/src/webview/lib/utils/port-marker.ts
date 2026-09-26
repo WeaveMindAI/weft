@@ -56,48 +56,48 @@ export function portMarkerStyle(
 		? inputMarkerState(port.required, oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
 		: 'full';
 
-	if (state === 'full') return fullMarkerStyle(color, extraClass);
+	if (state === 'full') return filledMarkerStyle(color, 'port', extraClass);
 
 	let style: string;
 	if (state === 'half') {
-		style = `background: linear-gradient(to right, ${color} 50%, white 50%); ${ring('solid', color)}`;
+		style = `background: linear-gradient(to right, ${color} 50%, white 50%); ${ring(color)}`;
 	} else if (state === 'empty-dotted') {
-		style = `background-color: white; ${ring('dotted', color)}`;
+		style = dottedRing(color);
 	} else {
-		style = `background-color: white; ${ring('solid', color)}`;
+		style = `background-color: white; ${ring(color)}`;
 	}
 
-	return { style, class: markerClass(PORT_SIZE_CLASS, extraClass) };
+	return { style, class: markerClass(SIZE_CLASS.port, extraClass) };
 }
 
-/** A filled marker in the port's own colour: what an output draws and
- *  what a required input draws, at the full port size.
+/** A filled marker in the port's own colour, at one of two sizes.
+ *  - 'port' (12px): what an output draws and what a required input draws.
+ *  - 'inner' (10px): what a container's INNER boundary handle draws (the
+ *    dot a child wires to, and a loop's implicit `index` / `done`). Being
+ *    smaller is what says "this is the inside of the port", so the two
+ *    sizes have to stay apart.
  *
  *  The ring is the colour too. A white ring reads as a smaller port,
  *  because the marker is border-box and the ring eats 2px in from each
  *  edge: that is what made an output draw 8px beside a 12px input. Which
  *  side a port is on is already said by where it sits. */
-export function fullMarkerStyle(color: string, extraClass: string = ''): { style: string; class: string } {
+export function filledMarkerStyle(
+	color: string,
+	size: MarkerSize,
+	extraClass: string = '',
+): { style: string; class: string } {
 	return {
-		style: `background-color: ${color}; ${ring('solid', color)}`,
-		class: markerClass(PORT_SIZE_CLASS, extraClass),
+		style: `background-color: ${color}; ${ring(color)}`,
+		class: markerClass(SIZE_CLASS[size], extraClass),
 	};
 }
 
-/** The same filled marker, one step smaller: what a container's INNER
- *  boundary handle draws (the dot a child wires to, and a loop's implicit
- *  `index` / `done`). Being smaller is what says "this is the inside of
- *  the port", so this size and the full one have to stay apart. */
-export function innerMarkerStyle(color: string, extraClass: string = ''): { style: string; class: string } {
-	return {
-		style: `background-color: ${color}; ${ring('solid', color)}`,
-		class: markerClass(INNER_SIZE_CLASS, extraClass),
-	};
-}
+export type MarkerSize = 'port' | 'inner';
 
-/// 12px for a port, 10px for the inside of one.
-const PORT_SIZE_CLASS = '!w-3 !h-3';
-const INNER_SIZE_CLASS = '!w-2.5 !h-2.5';
+const SIZE_CLASS: Record<MarkerSize, string> = {
+	port: '!w-3 !h-3',
+	inner: '!w-2.5 !h-2.5',
+};
 
 /** The whole ring, WIDTH INCLUDED, as one inline `border` shorthand.
  *
@@ -112,8 +112,18 @@ const INNER_SIZE_CLASS = '!w-2.5 !h-2.5';
  *  2px, because at 12px a 1px dotted ring is indistinguishable from a
  *  solid hollow one; the weight is the same on every marker so the one
  *  dotted port does not look like a bug. */
-function ring(style: 'solid' | 'dotted', color: string): string {
-	return `border: 2px ${style} ${color}`;
+function ring(color: string): string {
+	return `border: 2px solid ${color}`;
+}
+
+/** The ring of an input filled from code: eight even dashes. A CSS
+ *  `dotted` border cannot do it on a 12px circle (the browser spaces the
+ *  dots unevenly round the curve), so the ring is a transparent border
+ *  painted by a conic gradient, with a white disc over the middle. Same
+ *  2px width and box as every other marker. */
+function dottedRing(color: string): string {
+	return `border: 2px solid transparent; background: linear-gradient(white, white) padding-box, `
+		+ `repeating-conic-gradient(${color} 0deg 22.5deg, transparent 22.5deg 45deg) border-box`;
 }
 
 function markerClass(sizeClass: string, extraClass: string): string {

@@ -70,6 +70,14 @@ option buttons, approve and reject pairs, images and files.
 Approve and reject are labelled by whoever wrote the step, so they can read
 **Send it** and **Hold it** rather than the defaults.
 
+If you are a member of a program, **Your connections** (the link icon in the
+popup) is where you connect your own accounts. With a member token added, it
+lists the steps that run on your own account, and what you connect and pick
+there is yours alone. If the page says you have no member token, add the one
+the program's author gave you; other tokens you have added are ignored there.
+For member tokens and what they reach, go and read
+[programs with members](members.md).
+
 After you submit, the card says `Submitted` for a moment and moves to the next.
 Back in the editor, the cyan ring on that box goes green and the rest of the
 program runs.
@@ -81,8 +89,9 @@ for the poller behind them. No access to any site until you add a runtime, and
 the Firefox build declares that it collects nothing.
 
 It talks to two addresses on your runtime: one that lists what is waiting, and
-one that answers. The token rides in the `Authorization` header rather than in
-the URL, so it does not land in anybody's logs.
+one that answers. With a member token it also talks to the member's connect
+page on the runtime. The token rides in the `Authorization` header rather than
+in the URL, so it does not land in anybody's logs.
 
 ## Writing your own instead
 

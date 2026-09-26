@@ -14,6 +14,7 @@
 //! binary; node trait impls live inside that binary. Does NOT do
 //! runtime health probing of infra; that's the supervisor's job.
 
+pub mod activation_store;
 pub mod api;
 pub mod app;
 pub mod authenticator;
@@ -30,6 +31,7 @@ pub mod journal_bridge;
 pub mod lease;
 pub mod lifecycle_claimer;
 pub mod listener;
+pub mod member_values;
 pub mod pg_wake;
 pub mod placement;
 pub mod project_namespace;
@@ -43,6 +45,7 @@ pub mod state;
 pub mod broker_admin;
 pub mod storage;
 pub mod supervisor_pool;
+pub mod take_down;
 pub mod task_kinds;
 pub mod tenant;
 pub mod transition;

@@ -305,9 +305,7 @@ Weft is early, and breaking changes are still possible. This is what we are work
   slower because existing coding ai spent too much time on fluff that are worthless for weft.
 - running outside Kubernetes (a local LLM, or an AWS, GCP or Azure service) and
   connecting it to the rest of the runtime;
-- a guide to deploying weft on your cloud provider;
-- letting the program hoster handle multiple user logins for the same program
-  natively;
+- a guide to deploying weft on your cloud provider.
 
 For more detail, read [the roadmap](https://weavemindai.github.io/weft/appendix/roadmap.html).
 

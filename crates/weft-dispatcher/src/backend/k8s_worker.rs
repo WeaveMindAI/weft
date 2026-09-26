@@ -324,6 +324,7 @@ spec:
   # pod (new pod_name) -> new pod registers cleanly -> picker
   # claims the orphaned tasks -> journal-replay resumes work.
   restartPolicy: Never
+  {dns_config}
   containers:
     - name: worker
       image: {image}
@@ -370,6 +371,7 @@ spec:
               path: token
 "#,
         time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        dns_config = weft_core::pod_dns::pod_dns_config_yaml(),
         time_scale = weft_core::time_scale::factor(),
     )
 }
@@ -415,6 +417,10 @@ mod tests {
         assert!(!pod.contains("imagePullSecrets"), "no pull secret by default");
         assert!(pod.contains("containerPort: 9091"), "port exposed");
         assert!(pod.contains("subdomain: weft-workers"), "pod DNS subdomain");
+        assert!(
+            pod.contains(&format!("\n  {}\n  containers:", weft_core::pod_dns::pod_dns_config_yaml())),
+            "ndots:1 at the pod spec level"
+        );
         assert!(pod.contains("WEFT_CONNECTION_PORT"), "port env");
         assert!(
             pod.contains("WEFT_CALLER_TOKEN_SECRET") && pod.contains("deadbeef"),

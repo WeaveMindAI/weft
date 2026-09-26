@@ -295,10 +295,10 @@ fn started(color: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),
-        program: None, source_version: None, node_test: false,
+        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
         subgraph: None,
         seed: None,
-        at_unix: 0,
+        member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
     }
 }
 
@@ -314,5 +314,7 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
         allowed_displays: vec![],
         all_displays: false,
         created_at: 0,
+        member: None,
+        expires_at: None,
     }
 }

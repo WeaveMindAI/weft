@@ -66,18 +66,27 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
             headers: payload.headers,
             caller: claims.caller,
         };
-        let pod = crate::api::signal::birth_on_arrival(
+        let pod = match crate::api::signal::birth_on_arrival(
             state, &route, &request, tenant.as_str(), claims.color, &claims.pod_name,
+            claims.member.as_ref(),
         )
         .await
-        .map_err(|(status, msg)| anyhow::anyhow!("{msg} ({status})"))?;
+        {
+            Ok(pod) => pod,
+            // A run refused before it was born (a member gap, a bad
+            // payload) is the caller's answer, not this task failing.
+            Err((status, message)) if status.is_client_error() => {
+                return Ok(serde_json::to_value(LiveArrivalResult::Refused { status: status.as_u16(), message })?);
+            }
+            Err((status, msg)) => anyhow::bail!("{msg} ({status})"),
+        };
         tracing::info!(
             target: "weft_dispatcher::live_arrival",
             color = %claims.color, pod = %pod.pod_name,
             node = %route.node_id,
             "live caller arrived; execution born on its pod"
         );
-        Ok(serde_json::to_value(LiveArrivalResult {
+        Ok(serde_json::to_value(LiveArrivalResult::Born {
             color: claims.color.to_string(),
             pod_name: pod.pod_name,
         })?)

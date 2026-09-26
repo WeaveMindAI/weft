@@ -202,6 +202,25 @@ pub struct DeactivateSpec {
     pub drain_timeout_secs: Option<u64>,
 }
 
+/// The header a 428 carries when it asks for the person's
+/// trigger-deactivation choice (`triggerDeactivation`), so a client can
+/// tell it apart from the other 428 a verb can answer ("the infra these
+/// triggers read is not running"), and ask the person or name the flags.
+pub const TRIGGER_CHOICE_REQUIRED_HEADER: &str = "x-weft-needs-trigger-choice";
+
+/// The refusal a verb answers when triggers are on and the request did
+/// not say how they come down. `why` says which triggers and what the
+/// verb was about to do; the rest names the field and the CLI flags
+/// that carry it, so a person or an agent reads what to pass.
+pub fn trigger_choice_required(why: &str) -> String {
+    format!(
+        "{why}, so say how they come down: on the command line pass --mode wipe|hibernate|park \
+         and --running-policy cancel|wait (plus --grace <minutes> with hibernate, \
+         --drain-timeout <seconds> with wait), for example `--mode park --running-policy wait`; \
+         over HTTP send triggerDeactivation {{ mode, runningPolicy, graceMinutes?, drainTimeoutSecs? }}"
+    )
+}
+
 /// The hibernate window a spec gets when the request leaves it out.
 pub const DEFAULT_GRACE_MINUTES: u32 = 15;
 

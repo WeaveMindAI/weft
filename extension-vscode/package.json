@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
-  "version": "0.2.252",
+  "version": "0.2.253",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -406,6 +406,7 @@
     "@codemirror/view": "^6.43.13",
     "@lucide/svelte": "^1.47.0",
     "@uiw/codemirror-theme-github": "^4.25.11",
+    "@weft/connect": "link:../packages/weft-connect",
     "codemirror": "^6.0.2",
     "marked": "^18.0.14",
     "svelte-sonner": "^1.2.1"

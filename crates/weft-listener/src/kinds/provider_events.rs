@@ -620,6 +620,7 @@ async fn ensure_via_broker(
             topic: cfg.topic.clone(),
             access_id: access.id.clone(),
             signal_token: ctx.fire.token().to_string(),
+            for_member: ctx.fire.for_member().cloned(),
             params: cfg.params.clone(),
         })
         .await

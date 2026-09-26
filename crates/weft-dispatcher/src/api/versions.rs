@@ -9,7 +9,7 @@
 //! every other start does, and records the run under its version. A
 //! plain `weft run` is this endpoint with no seed and no scope.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -422,10 +422,7 @@ pub struct VersionRunResponse {
 /// What the resolver refused, as the 422 body: JSON, so the CLI prints
 /// every line and the editor makes a field per missing input.
 fn refused(refusal: &Refusal) -> ApiError {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        serde_json::to_string(refusal).expect("a Refusal serializes"),
-    )
+    crate::api::project::refusal_error(refusal)
 }
 
 /// The runs of a project that are genuinely still going.
@@ -546,7 +543,7 @@ pub async fn run(
     Json(body): Json<VersionRunRequest>,
 ) -> Result<Json<VersionRunResponse>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    require_action(&state, id, &["run"]).await?;
+    require_action(&state, id, None, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed {
         return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
     }
@@ -614,7 +611,9 @@ pub async fn run(
     let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
     let mut resolved = resolve_spec(&spec, &project).map_err(|r| refused(&r))?;
     let bakes = if spec.fire.is_some() {
-        state.journal.trigger_bakes(id).await.map_err(|error| internal("read trigger bakes", error))?
+        // A member's trigger was baked with that member's values: the
+        // fire replays the member's bake.
+        state.journal.trigger_bakes(id, spec.member.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
     // A fired CALLER trigger (a Route) gets a stand-in caller: there is
     // no socket coming, so the run serves the body the author typed and
@@ -628,11 +627,14 @@ pub async fn run(
     // caller at all is `protocol_for_tag` on the signal kind, which is
     // the language's own vocabulary.
     let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
+    // The trigger `--fire` names, spelled: the run is that trigger's.
+    let mut fired_trigger: Option<String> = None;
     for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
         // A bake captures a trigger under its place (`one.door` for the
         // `door` an include site `one` reaches), so the kick is spelled
         // through its call frames before the lookup.
         let address = crate::api::project::kick_place(&project, kick);
+        fired_trigger = Some(address.clone());
         weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
             .map_err(|refusal| refused(&refusal))?;
         let capture = bakes.iter().find(|bake| bake.program == program)
@@ -652,25 +654,13 @@ pub async fn run(
         }
     }
 
-    // THE infra gate on a run: against the definition this run was just
-    // built from, scoped to the places it executes (spelled the way
-    // their infra rows are keyed). A run aimed at part of the graph
-    // waits on that part's infra alone; a whole-graph run waits on all
-    // of it. `require_action` above deliberately does not enforce the
-    // whole-graph fact (it reports it, for the bar's unaimed button),
+    // The infra gate (`require_run_infra`), against the definition this
+    // run was just built from and the places it executes before any seed
+    // narrows them: a node a seed stands in for still calls the infra it
+    // was wired to. `require_action` above deliberately does not enforce
+    // the whole-graph fact (it reports it, for the bar's unaimed button),
     // the way it leaves the trigger facts to `require_trigger_infra`.
-    let bound: Option<HashSet<String>> = Some(
-        resolved.selection.nodes.iter()
-            .map(|place| weft_core::project::address_of(&project, &place.id, &place.path))
-            .collect(),
-    );
-    let missing = crate::api::project::missing_infra_nodes(&state, id, &project, bound.as_ref()).await?;
-    if !missing.is_empty() {
-        return Err((
-            StatusCode::PRECONDITION_REQUIRED,
-            format!("infra not running for: {}. Run `weft infra start` first.", missing.join(", ")),
-        ));
-    }
+    crate::api::project::require_run_infra(&state, id, &project, &resolved.selection, spec.member.as_ref()).await?;
 
     // What the run inherits and what it kicks.
     let mut starting_parameters = spec.clone();
@@ -706,6 +696,16 @@ pub async fn run(
         }
         refused(&refusal)
     })?;
+    // A member's run reaching a `@member_filled` field runs on what that
+    // member provides there: read and checked now, refused naming every
+    // field left unfilled or filled wrong, rather than failing at the
+    // step mid-run. The run carries what was read.
+    let member_values = match &spec.member {
+        Some(member) => {
+            crate::api::project::member_values_for_run(&state, id, &project, &resolved.selection, member, None).await?
+        }
+        None => Default::default(),
+    };
     // A stale node with no kick still runs: its inputs are inherited
     // pulses the worker folds in, and it fires the moment they settle
     // after the selected reuse boundary. Only a run with
@@ -799,6 +799,8 @@ pub async fn run(
             None,
             Some(&version.version),
             fired_caller.clone(),
+            spec.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
+            fired_trigger.as_deref(),
         )
         .await?;
         // Head moves LAST, and a lost race is reported, never refused.
@@ -957,14 +959,22 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
     events
 }
 
+/// Whose bakes a preview asks about: the shared triggers' by default.
+#[derive(Debug, Default, Deserialize)]
+pub struct BakesQuery {
+    #[serde(default)]
+    pub member: Option<weft_core::member::MemberId>,
+}
+
 /// Code identities and captured trigger names for preview validation.
 pub async fn trigger_bakes(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
+    axum::extract::Query(query): axum::extract::Query<BakesQuery>,
 ) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    let bakes = state.journal.trigger_bakes(id).await.map_err(|error| internal("read trigger bakes", error))?;
+    let bakes = state.journal.trigger_bakes(id, query.member.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
 }
 
@@ -1253,15 +1263,11 @@ pub async fn prune(
             Ok(plan) => plan,
             Err(r) => return Err((StatusCode::CONFLICT, r.reasons.join("\n"))),
         };
-        let protected = crate::versions::source_versions_in_use(&mut *state.pg_pool.acquire().await.map_err(|e| internal("source references", e))?, id, false)
-            .await.map_err(|e| internal("source references", e))?;
+        let protected = state.versions.versions_in_use(id, false).await.map_err(|e| internal("source references", e))?;
         if plan.versions.iter().any(|id| protected.contains(id)) {
-            return Err((StatusCode::CONFLICT, "these versions still supply trigger settings or running executions; stop the runs and replace or wipe those trigger settings before pruning".into()));
+            return Err((StatusCode::CONFLICT, crate::versions::VERSIONS_IN_USE_REFUSAL.into()));
         }
-        let source: Option<Option<Value>> = sqlx::query_scalar("SELECT running_source FROM project WHERE id = $1")
-            .bind(id).fetch_optional(&state.pg_pool).await.map_err(|e| internal("registered source", e))?;
-        if let Some(source) = source.flatten() {
-            let source: Manifest = serde_json::from_value(source).map_err(|e| internal("registered source", e))?;
+        if let Some(source) = state.versions.registered_source(id).await.map_err(|e| internal("registered source", e))? {
             let retained: BTreeSet<_> = source.values().collect();
             plan.blobs.retain(|hash| !retained.contains(hash));
         }
@@ -1366,8 +1372,7 @@ pub(crate) async fn sweep_bare_versions(
             let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
             let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
             let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-            let protected = crate::versions::source_versions_in_use(&mut *state.pg_pool.acquire().await.map_err(|e| internal("source references", e))?, id, true)
-                .await.map_err(|e| internal("source references", e))?;
+            let protected = state.versions.versions_in_use(id, true).await.map_err(|e| internal("source references", e))?;
             let bare: Vec<_> = crate::versions::sweepable_versions(&versions, &runs, &head)
                 .into_iter().filter(|id| !protected.contains(id)).collect();
             if bare.is_empty() {
@@ -1386,9 +1391,7 @@ pub(crate) async fn sweep_bare_versions(
 /// alive alongside the build's own assets.
 pub async fn version_blob_keys(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Result<Vec<String>> {
     let versions = state.versions.versions(project).await?;
-    let source: Option<Option<Value>> = sqlx::query_scalar("SELECT running_source FROM project WHERE id = $1")
-        .bind(project).fetch_optional(&state.pg_pool).await?;
-    let source: Option<Manifest> = source.flatten().map(serde_json::from_value).transpose()?;
+    let source = state.versions.registered_source(project).await?;
     blob_keys(project, versions.iter().map(|v| (v.id.as_str(), &v.manifest))
         .chain(source.as_ref().map(|source| ("registered sources", source))))
 }
@@ -1417,7 +1420,7 @@ pub fn blob_keys<'a>(
                     "version {version} lists '{path}' as '{hash}', which is not a storable \
                      address ({e}), so this project's asset references cannot be published. \
                      `weft tree` shows where that version sits; getting rid of it is `weft \
-                     prune {version}`, which first needs head (and the activated version) off \
+                     prune {version}`, which first needs head (and every activated version) off \
                      it, every run under it settled, and any frozen example that came from it \
                      re-frozen."
                 )
@@ -1509,7 +1512,8 @@ mod fire_snapshot_tests {
         let (birth, mut kicks) = crate::api::project::execution_birth_events(
             color, project, weft_core::context::Phase::Fire, "trigger",
             &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
-            "original-graph", None, None, None, Some("original-source"), 42,
+            "original-graph", None, None, None, Some("original-source"), None, Some("trigger"),
+            weft_core::exec::RunKind::Execution, 42,
         );
         let mut rows = vec![birth];
         rows.append(&mut kicks);

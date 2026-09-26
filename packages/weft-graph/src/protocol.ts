@@ -1,6 +1,13 @@
 // Types shared between extension host and webview. Both import from
 // this file so any change propagates.
 
+// The connect library by its path, never as `@weft/connect`: the VS Code
+// extension host compiles this file with tsc into CommonJS and runs it in
+// node, where the package's TypeScript source cannot be required. The path
+// makes tsc emit the library beside it. The webview and the browser
+// extension, which vite bundles, import the package by name.
+import type { AccessSpecWire, AppRegistration, CredentialOwner } from '../../weft-connect/src/core/wire';
+
 export interface Span {
   startLine: number;
   startColumn: number;
@@ -8,78 +15,11 @@ export interface Span {
   endColumn: number;
 }
 
-/// One of the two things that can drive an input: a constant written in
-/// the source (any spelling: braces, statement, `@file`, `@asset`), or a
-/// value another node produces at run time (an edge, a dotted value in
-/// the braces, an inline node).
-// SYNC: AcceptedForm <-> crates/weft-core/src/node.rs AcceptedForm
-export type AcceptedForm = 'literal' | 'wire';
-
-/// Which drivers an input takes, as the list of accepted forms. Absent
-/// on an input means both. A port never adds a form; it only removes
-/// one, and the compiler resolves the list onto every instance input.
-// SYNC: Accepts <-> crates/weft-core/src/node.rs Accepts
-export type Accepts = AcceptedForm[];
-
-/// A pure WIRE port on a node instance's output side or a group/loop
-/// interface. Inputs are the richer `InputDefinition`.
-// SYNC: PortDefinition <-> crates/weft-core/src/project.rs PortDefinition
-export interface PortDefinition {
-  name: string;
-  portType: string;
-  /// Whether the node waits for a value here. Inputs only: an output
-  /// carries no optionality and is always `true` here.
-  required: boolean;
-  description?: string;
-  /// True iff this port was auto-synthesized by the loop-lowering pass
-  /// (the input side of a carry port). The editor renders it as a ghost
-  /// mirror of the matching carry output. Never user-editable; the user
-  /// changes the output's role to remove the synthesized input.
-  synthesizedFromCarry?: boolean;
-  /// The type the SOURCE header declares for this port; absent when the
-  /// header does not declare it (a catalog port, a config-derived one,
-  /// a synthesized one). The editor rewrites the header from THIS,
-  /// never from `portType`: the rendered type may be an
-  /// inference-resolved instantiation of a generic, which must not get
-  /// frozen into source as if the author wrote it.
-  // Declared once here and inherited by InputDefinition (Rust flattens
-  // its PortDefinition into InputDefinition the same way).
-  // SYNC: PortDefinition.declaredType <-> crates/weft-core/src/project.rs PortDefinition.declared_type
-  declaredType?: string;
-}
-
-/// One INPUT on a node instance, enriched: accepted drivers resolved and
-/// the editor surface (widget/default/label/placeholder) stamped by the
-/// compiler, so the editor never re-derives any of it. The optional
-/// members are only absent on a locally-added port that has not
-/// round-tripped through a parse yet.
-// SYNC: InputDefinition <-> crates/weft-core/src/project.rs InputDefinition
-export interface InputDefinition extends PortDefinition {
-  // SYNC: InputDefinition.accepts <-> crates/weft-core/src/project.rs InputDefinition.accepts
-  accepts?: Accepts;
-  // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
-  widget?: Widget;
-  default?: unknown;
-  label?: string;
-  placeholder?: string;
-  /// True when the input comes from the node type's own spec (a
-  /// setting), absent for instance-added ports (custom header ports,
-  /// form-derived ports).
-  // SYNC: InputDefinition.fromSpec <-> crates/weft-core/src/project.rs InputDefinition.from_spec
-  fromSpec?: boolean;
-  /// The permissions THIS consumer needs on the wired connection
-  /// (Access-typed inputs only). The editor's live check compares them
-  /// against the picked connection's granted set; the runtime stamps
-  /// them onto the marker for the resolve-time backstop.
-  // SYNC: InputDefinition.requiresScopes <-> crates/weft-core/src/project.rs InputDefinition.requires_scopes
-  requiresScopes?: string[];
-  /// The stored VALUES this input needs on the wired connection
-  /// (Access-typed inputs only), for a service whose optional fields
-  /// decide what a connection can do. Same three check points; unlike
-  /// permissions a shortfall is never "unknown", so it always marks.
-  // SYNC: InputDefinition.requiresValues <-> crates/weft-core/src/project.rs InputDefinition.requires_values
-  requiresValues?: string[];
-}
+// The input vocabulary (ports, their drivers, the control an input draws)
+// lives in the connect library, whose member page draws a program's inputs
+// too; the graph protocol names it from there.
+export type { AcceptedForm, Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
+import type { Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
 
 /// Source span of one config field plus how it was written. `origin` tells
 /// the editor how to rewrite the field in place: an inline field
@@ -544,6 +484,9 @@ export interface NodeDefinition {
   outputs: PortDefinition[];
   features: NodeFeaturesWire;
   requiresInfra?: boolean;
+  /// Set on a node that exists once per member of the program.
+  // SYNC: perMember <-> crates/weft-core/src/project.rs NodeDefinition.per_member
+  perMember?: PerMember;
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
@@ -693,105 +636,13 @@ export interface Diagnostic {
   file?: string;
 }
 
-/// Derived from the Widget union below (never a second hand-kept list).
+/// Derived from the Widget union (never a second hand-kept list).
 export type WidgetKind = Widget['kind'];
 
-// One way a `remote_select` field can be filled, in preference order;
-// the editor uses the richest source the chosen connection supports
-// and silently drops each source whose requirement is not met.
-// SYNC: ResourceSource <-> crates/weft-core/src/node.rs ResourceSource
-export type ResourceSource =
-  /// Options recorded on the connection during sign-in; free.
-  | { kind: 'granted'; from: string; label: string; value: string }
-  /// Call the service and enumerate; needs `requires` on the
-  /// connection, unless the lookup is `public` (credential-free,
-  /// stands with no connection; `public` + `requires` is refused at
-  /// metadata load).
-  | ({ kind: 'list'; requires?: string[] } & Lookup)
-  /// The provider's own chooser, declared entirely by the NODE: the
-  /// chooser script's address and the author's glue, run on a
-  /// weft-served page (embedded, or a browser tab), never in the
-  /// editor. Choosing GRANTS the picked resource.
-  | { kind: 'picker'; script: string; code: string; grants?: string[]; mime_types?: string[] }
-  /// Paste a link; the pattern's first capture group is the id.
-  | { kind: 'from_url'; pattern: string };
-
-// The declarative list request behind a `remote_select` list source.
-// SYNC: Lookup <-> crates/weft-core/src/node.rs Lookup
-export interface Lookup {
-  /// GET URL; `{query}` interpolates the search text, `{<parent>}` a
-  /// depends_on parent's picked id.
-  get: string;
-  /// Dotted path to the items array in the response.
-  items: string;
-  /// Dotted path (per item) for the display label.
-  label: string;
-  /// Dotted path (per item) for the stored id.
-  value: string;
-  page?: PageSpec;
-  /// The endpoint is public: called with no credential, so the source
-  /// works with no connection picked (and never signs even with one).
-  public?: boolean;
-}
-
-// SYNC: PageSpec <-> crates/weft-core/src/node.rs PageSpec
-export interface PageSpec {
-  cursor_param: string;
-  cursor_path: string;
-}
-
-// The editor control an input renders. Every key a widget object may
-// carry, one per Rust variant payload. No index signature: the Rust
-// side rejects unknown keys, so a key that is not listed here cannot
-// survive a metadata load and must not typecheck.
-// A DISCRIMINATED union mirroring the Rust tagged enum, one member per
-// variant with only its own payload: an options-less select or a
-// sources-less remote_select cannot typecheck (Rust already refuses
-// them at metadata load), and adding a Rust variant without a member
-// here breaks every exhaustive switch instead of shipping unhandled.
-// SYNC: Widget <-> crates/weft-core/src/node.rs Widget
-export type Widget =
-  | { kind: 'text' }
-  | { kind: 'textarea' }
-  /// Syntax highlighting language ("python", "javascript", ...).
-  | { kind: 'code'; language: string }
-  /// `step` is the input's granularity (arrow/slider increment).
-  | { kind: 'number'; min?: number | null; max?: number | null; step?: number | null }
-  | { kind: 'checkbox' }
-  /// A calendar-and-clock picker; the stored String is ISO-8601 with
-  /// the picker's own zone offset.
-  | { kind: 'datetime' }
-  | { kind: 'select'; options: string[] }
-  | { kind: 'multiselect'; options: string[] }
-  | { kind: 'password' }
-  /// The connection picker; `service` and `optional` are
-  /// compiler-stamped from the node metadata's recipe
-  /// (`service.service` / `service.connection_optional`). `optional` =
-  /// the node runs without a connection, so the editor neither pins
-  /// the unconnected node open nor gates the run on it.
-  | { kind: 'access'; service?: string | null; optional?: boolean }
-  /// Pick a resource on the connected service. `access` names this
-  /// node's Access input; `sources` are the fill ways in preference
-  /// order; `depends_on` are parent inputs for drill-down.
-  | {
-      kind: 'remote_select';
-      access: string;
-      sources: ResourceSource[];
-      depends_on?: string[];
-      /// The user may type a value the sources never listed (the
-      /// fetched list is suggestions, not a closed set).
-      free_text?: boolean;
-    }
-  /// Build the list of config entries a node's ports come from.
-  | { kind: 'entry_list' }
-  /// A list of short text values, added and removed one at a time.
-  | { kind: 'text_list' }
-  /// Editor file picker. `type` is the declared weft file type
-  /// (Image/Audio/Video/Blob/File); `accept` optionally narrows the
-  /// derived filter; `multiple` means the port holds several files, so
-  /// the control keeps a list and writes one marker per file.
-  // SYNC: Widget.type <-> crates/weft-core/src/node.rs Widget::FileDrop file_type
-  | { kind: 'file_drop'; accept?: string | null; type: string; multiple?: boolean };
+// The ways a `remote_select` field can be filled, and the list request
+// behind a `list` source: the connect library's, since the one control
+// that fills such a field lives there.
+export type { ResourceSource, Lookup, PageSpec } from '../../weft-connect/src/core/wire';
 
 // One declared INPUT of a node type, as authored in metadata.json and
 // RESOLVED by the CLI before it ships (accepts + widget always filled
@@ -862,156 +713,24 @@ export interface CatalogEntry {
   accessApps?: Record<string, AppRegistration>;
 }
 
-/** The credentials of a service's OAuth app: a mandatory display
- *  label (the connection list's middle column), client id, secret
- *  (absent for a public PKCE client, and FORBIDDEN on project-declared
- *  apps: metadata is source), and any registration_fields extras. */
-// SYNC: AppRegistration <-> crates/weft-core/src/access/spec.rs AppRegistration
-export interface AppRegistration {
-  label: string;
-  client_id: string;
-  client_secret?: string;
-  /** registration_fields extras, flattened alongside id + secret. */
-  [key: string]: string | undefined;
-}
-
-/** How grants coexist across projects (a provider property). */
-// SYNC: GrantCoexistence <-> crates/weft-core/src/access/spec.rs GrantCoexistence
-export type GrantCoexistence = 'coexisting' | 'exclusive';
-
-/** One pasted credential field on the connect form. */
-// SYNC: CredentialFieldWire <-> crates/weft-core/src/access/spec.rs CredentialField
-export interface CredentialFieldWire {
-  name: string;
-  label?: string;
-  /** The connect accepts this field empty (an app-level token only
-   *  some uses of the service need); default false. */
-  optional?: boolean;
-  /** Render as a password field; default true. */
-  secret?: boolean;
-  placeholder?: string;
-}
-
-/** One connect door. */
-// SYNC: Door <-> crates/weft-core/src/access/spec.rs Door
-export type Door = 'shared' | 'own';
-
-/** One entry of a service's permission catalogue. */
-// SYNC: Permission <-> crates/weft-core/src/access/spec.rs Permission
-export interface Permission {
-  id: string;
-  label: string;
-  description: string;
-  default?: boolean;
-  /** This capability creates or reads things INSIDE the credential's
-   *  own account, so a runtime-supplied (shared) credential can never
-   *  serve it; the editor greys the shared option and resolution
-   *  refuses it. */
-  own_only?: boolean;
-  /** The set-up tutorial for this capability, shown as its own
-   *  foldable section on the "Your own" page. */
-  guide?: { link?: string; steps: string[] };
-}
-
-// SYNC: VerificationRung <-> crates/weft-core/src/access/spec.rs VerificationRung
-export type VerificationRung =
-  | 'reports_permissions'
-  | 'self_introspect'
-  | 'reports_validity'
-  | 'probe'
-  | 'silent';
-
-// SYNC: VerificationCost <-> crates/weft-core/src/access/spec.rs VerificationCost
-export type VerificationCost = 'free' | 'ambiguous' | 'paid';
-
-/** The optional parts of the "Your own" page beyond its paste fields
- *  (which derive from the acquisition; see `ownFields`). */
-// SYNC: OwnPage <-> crates/weft-core/src/access/spec.rs OwnPage
-export interface OwnPageWire {
-  mint?: { url: string; payload: unknown; captures: unknown[] };
-  guide?: { link?: string; steps: string[] };
-  /** "I already have a credential": paste it, no app; the server
-   *  stores a static-acquisition connection over these fields. */
-  paste?: { fields: CredentialFieldWire[] };
-}
-
-/** The wire shape of an `AccessSpec` (the parts the editor reads;
- *  auth steps/test calls pass through opaquely to the store). */
-// SYNC: AccessSpecWire <-> crates/weft-core/src/access/spec.rs AccessSpec
-export interface AccessSpecWire {
-  service: string;
-  label?: string;
-  /** The node runs without a connection picked (a possibly
-   *  unauthenticated custom endpoint): no synthesized "no connection
-   *  picked" rule, no pinned-open node. Default false: every access
-   *  node requires a connection unless it says otherwise. */
-  connection_optional?: boolean;
-  grants?: GrantCoexistence;
-  /** The connect doors this service offers; default ['own']. */
-  doors?: Door[];
-  own_page?: OwnPageWire;
-  permissions?: Permission[];
-  /** Where the provider's COMPLETE permission list lives, when
-   *  `permissions` is a curated subset (Google class); drives the
-   *  picker's "missing one? add it to this node's metadata" hint.
-   *  Absent = the catalogue is the complete set, no hint. */
-  all_permissions_url?: string;
-  verification?: { rung?: VerificationRung; cost?: VerificationCost };
-  acquisition: {
-    // SYNC: kind <-> crates/weft-core/src/access/spec.rs Acquisition
-    kind: 'static' | 'oauth2' | 'runtime' | 'mint_jwt';
-    fields?: CredentialFieldWire[];
-    registration_fields?: CredentialFieldWire[];
-    grant?: { kind: 'authorization_code' | 'client_credentials'; [key: string]: unknown };
-    [key: string]: unknown;
-  };
-  auth?: unknown[];
-  test?: unknown;
-  identity?: string;
-  /** How the service REPORTS events, by named topic. The editor never
-   *  reads inside; the blob rides to the server verbatim (the door
-   *  probe records it so the events receiver can verify pushes). */
-  events?: Record<string, unknown>;
-  /** How a CALLER presenting a connection of this service is checked
-   *  when a live route is gated by it (an auth access node's recipe).
-   *  The editor never reads inside; the blob rides to the server
-   *  verbatim and the broker runs it. */
-  verify?: Record<string, unknown>;
-  /** All-or-nothing groups of optional fields, at least one of which a
-   *  connect must fill (a mailbox's receiving vs sending servers). The
-   *  connect refuses a half-filled or empty choice, naming the fix. */
-  // SYNC: Capability <-> crates/weft-core/src/access/spec.rs Capability
-  capabilities?: { label: string; fields: string[] }[];
-}
-
-/** A connection row as the store lists it: everything the connection
- *  list renders, never a stored value. */
-// SYNC: GrantSummary <-> crates/weft-core/src/access/wire.rs GrantSummary
-export interface GrantSummary {
-  id: string;
-  service: string;
-  project_id?: string | null;
-  identity?: string | null;
-  /** The list's middle column: the app's label, or the user's name for
-   *  a pasted credential. */
-  label?: string | null;
-  scopes: string[];
-  /** Whether `scopes` came from the provider (verified) or the user's
-   *  ticks (claimed); only a verified shortfall marks a node. */
-  permissions_verified: boolean;
-  /** Whose credential the row resolves to; 'ours' rows spend credits. */
-  owner: CredentialOwner;
-  /** Which door created it; drives the shared-door one-time warning. */
-  door: Door;
-  expires_at?: string | null;
-  /** The NAMES of the values this connection stores (never the values).
-   *  What the live `requiresValues` check compares against. */
-  value_names?: string[];
-  /** Whether a credential stands behind the row right now: always for
-   *  a stored credential; for an 'ours' row, whether the runtime holds
-   *  the key it resolves to. False = picked, nothing behind it. */
-  has_credential: boolean;
-}
+// The connection vocabulary (recipes, connections, doors) lives in the
+// connect library, which the editor's picker and a member's connect page
+// both build on; the graph protocol names it from there.
+export type {
+  AppRegistration,
+  GrantCoexistence,
+  CredentialFieldWire,
+  Door,
+  Permission,
+  VerificationRung,
+  VerificationCost,
+  OwnPageWire,
+  AccessSpecWire,
+  GrantSummary,
+  CredentialOwner,
+  CredentialOwnerKind,
+} from '../../weft-connect/src/core/wire';
+export { credentialOwnerKind } from '../../weft-connect/src/core/wire';
 
 /** The on-wire sentinel key tagging an Access value. */
 // SYNC: ACCESS_MARKER_KEY <-> crates/weft-core/src/access/value.rs ACCESS_MARKER_KEY
@@ -1201,9 +920,80 @@ export function locatedKey(id: string, callPath: readonly string[]): string {
   return callPath.length === 0 ? id : `${callPath.join('/')}/${id}`;
 }
 
-/// Whose credential a measured call spent.
-// SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
-export type CredentialOwner = 'their-own' | 'ours';
+
+/// Why a node exists once per member: `marked` for an infra node the
+/// source marks `@per_member` (a container each), `filled` for a node with
+/// a field written `@member_filled` (each member provides it), `derived`
+/// for a node reached from either.
+// SYNC: PerMember <-> crates/weft-core/src/member.rs PerMember
+export type PerMember = 'marked' | 'filled' | 'derived';
+
+/// The shape a `@member_filled` field's value takes in the compiled
+/// literals: `{ "__weft_member_filled__": {} }`, with `fallback` inside
+/// when the source gives one (`@member_filled(<value>)`).
+// SYNC: MEMBER_FILLED_KEY <-> crates/weft-core/src/member.rs MEMBER_FILLED_KEY
+export const MEMBER_FILLED_KEY = '__weft_member_filled__';
+
+export interface MemberFilledValue {
+  [MEMBER_FILLED_KEY]: { fallback?: unknown };
+}
+
+/// `value` read as a `@member_filled` literal (its fallback, when any),
+/// `null` for any other value.
+// SYNC: memberFilled <-> crates/weft-core/src/member.rs as_member_filled
+export function memberFilled(value: unknown): { fallback?: unknown } | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== MEMBER_FILLED_KEY) return null;
+  const inner = (value as Record<string, unknown>)[MEMBER_FILLED_KEY];
+  if (typeof inner !== 'object' || inner === null || Array.isArray(inner)) return null;
+  return inner as { fallback?: unknown };
+}
+
+/// The literal `@member_filled` (or `@member_filled(<fallback>)`) lowers to.
+export function memberFilledValue(fallback?: unknown): MemberFilledValue {
+  return { [MEMBER_FILLED_KEY]: fallback === undefined ? {} : { fallback } };
+}
+
+/// Which activations a lifecycle verb names: the triggers (every one of
+/// the owner's when empty), for a member (the shared ones when absent).
+// SYNC: ActivationScope <-> crates/weft-core/src/activation.rs ActivationScope
+export interface ActivationScope {
+  triggers?: string[];
+  member?: string;
+}
+
+/// One trigger activation, as the project status lists it.
+/// Where a project or one activation stands in its lifecycle.
+// SYNC: LifecycleStatus <-> crates/weft-broker-client/src/protocol.rs ProjectStatus
+export type LifecycleStatus = 'registered' | 'activating' | 'active' | 'deactivating' | 'inactive';
+
+/// Where one activation stands, as a person reads it: its status, or
+/// for one taken down, the way it went.
+// SYNC: ActivationMode <-> crates/weft-core/src/activation.rs ActivationMode
+export type ActivationMode = 'registered' | 'activating' | 'active' | 'deactivating' | DeactivationSpec['mode'];
+
+// SYNC: ActivationEntry <-> crates/weft-dispatcher/src/api/project.rs ActivationEntry
+export interface ActivationEntry {
+  trigger: string;
+  member?: string;
+  // SYNC: status <-> crates/weft-broker-client/src/protocol.rs ProjectStatus
+  status: LifecycleStatus;
+  // SYNC: mode <-> crates/weft-core/src/activation.rs ActivationMode
+  mode: ActivationMode;
+  /// A member's fires parked until the member gives a value they need:
+  /// how many, and why (the refusal naming the field).
+  // SYNC: waiting <-> crates/weft-core/src/program.rs WaitingFires
+  waiting?: { fires: number; reason: string };
+}
+
+/// One member's copy of an infra node, as the project status lists it.
+// SYNC: MemberCopyEntry <-> crates/weft-dispatcher/src/api/project.rs MemberCopyEntry
+export interface MemberCopyEntry {
+  node: string;
+  member: string;
+  status: string;
+}
 
 /// The parent run and the original run supplying each reused result,
 /// per place (a `locatedKey`).
@@ -1561,13 +1351,7 @@ export interface ActionAvailability {
   /// ("Activate" vs "Activating + Cancel" vs "Deactivate" vs
   /// "Cancel running / Resume" while deactivating).
   // SYNC: projectStatus <-> crates/weft-broker-client/src/protocol.rs ProjectStatus, crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.status
-  projectStatus:
-    | 'registered'
-    | 'activating'
-    | 'active'
-    | 'deactivating'
-    | 'inactive'
-    | 'unknown';
+  projectStatus: LifecycleStatus | 'unknown';
   /// The build-transition axis. 'building'/'cancelling_build' render
   /// the unified transitional pattern (the launching button shows
   /// "Building... (cancel)") and gate every other verb.
@@ -1855,7 +1639,15 @@ export interface InfraInstanceStatus {
   /// Possible values:
   ///   "provisioning" | "running" | "stopped" | "flaky" | "failed"
   ///   | "stopping"   | "terminating"
+  /// for a copy (a start or stop under way reads as provisioning or
+  /// stopping before the supervisor reaches the copy), and for a place
+  /// with no shared copy:
+  ///   "not_started" (nothing started it yet)
+  ///   | "per_member" (a `@per_member` node: only members have copies)
+  // SYNC: "not_started" / "per_member" <-> crates/weft-dispatcher/src/api/project.rs INFRA_NOT_STARTED, INFRA_PER_MEMBER
   status: string;
+  /// For a `per_member` place: how many members have a copy.
+  memberCopies?: number;
   /// Set when status=failed: which stage of the apply pipeline
   /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
   failureStage?: string;
@@ -1883,7 +1675,18 @@ export type ActionBarOverlay =
   | { kind: 'execution_running'; color: string }
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
+/// A verb whose trigger-deactivation choice the dispatcher may ask for.
+/// Only the dispatcher knows whether any trigger is on (the program's or
+/// a member's), so the webview sends these without a choice and opens
+/// its picker when the host answers `needsTriggerChoice`.
+export type TriggerChoiceIntent = 'resync' | 'infraStop' | 'infraTerminate' | 'infraUpgrade';
+
 export type HostMessage =
+  /// The verb the webview sent without a trigger-deactivation choice was
+  /// refused because triggers are on: open the picker for `intent` and
+  /// send the verb again with the chosen spec.
+  // SYNC: needsTriggerChoice <-> crates/weft-cli/src/progress.rs error_detail
+  | { kind: 'needsTriggerChoice'; intent: TriggerChoiceIntent }
   | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string; freshMount?: boolean }
   | { kind: 'parseError'; error: string }
   /// Reply to `applyEdits` / `applyTextEdit`. Success carries the inverse text
@@ -2162,10 +1965,10 @@ export type WebviewMessage =
   /// Restore the version of a run or a version id (`weft branch <ref>`).
   | { kind: 'branchTo'; reference: string }
   | { kind: 'infraStart' }
-  /// Project-level infra Stop / Terminate. `deactivation` is set iff
-  /// the project is Active: the shared picker (in the webview) chose
-  /// how triggers come down; the host forwards it verbatim. Absent
-  /// when the project is not Active (nothing to deactivate).
+  /// Project-level infra Stop / Terminate. `deactivation` is set once
+  /// the shared picker (in the webview) chose how triggers come down,
+  /// which it opens only after the host answered `needsTriggerChoice`
+  /// to a send without it; the host forwards it verbatim.
   | { kind: 'infraStop'; deactivation?: DeactivationSpec }
   | { kind: 'infraTerminate'; deactivation?: DeactivationSpec }
   /// Cancel in-flight infra work (provisioning / stopping /
@@ -2210,12 +2013,12 @@ export type WebviewMessage =
   /// anything that parked during the transient.
   | { kind: 'resumeActive' }
   /// User clicked Resync. Deactivate + reactivate against the current
-  /// source. `spec` is set iff the project is Active (the shared
-  /// picker chose how triggers come down, exactly like Deactivate).
+  /// source. `spec` is the shared picker's choice of how triggers come
+  /// down, exactly like Deactivate.
   | { kind: 'resyncProject'; spec?: DeactivationSpec }
   /// User clicked Upgrade Infra. atomic infra stop + image
-  /// rebuild + start. `deactivation` set iff the project is Active
-  /// (same shared-picker contract as infraStop).
+  /// rebuild + start. `deactivation` follows the same shared-picker
+  /// contract as infraStop.
   | { kind: 'infraUpgrade'; deactivation?: DeactivationSpec }
   /// User clicked the Refresh Status button on the graph header.
   /// Forces a `weft status --json` recheck without waiting for
@@ -2377,6 +2180,10 @@ export type EditOp =
   | { op: 'setConfig'; node: string; key: string; value: string; form?: 'inline' | 'connection' }
   | { op: 'removeConfig'; node: string; key: string; form?: 'inline' | 'connection' }
   | { op: 'setLabel'; node: string; label: string | null }
+  // Add or remove the node's `@per_member` line: the node then exists
+  // once per member of the program. Offered only on a node that may
+  // carry it (`canBePerMember`).
+  | { op: 'setPerMember'; node: string; perMember: boolean }
   | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
   | { op: 'removeNode'; node: string }
   | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }

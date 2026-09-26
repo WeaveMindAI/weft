@@ -278,12 +278,7 @@ pub fn find_ready_among<'a>(
                 .filter(|p| p.required && edge_idx.includes_port(node, &frames, &p.name))
                 .map(|p| p.name.as_str())
                 .collect();
-            let mut literal_filled: HashSet<&str> = HashSet::new();
-            for (name, value) in &node.port_literals {
-                if edge_idx.includes_port(node, &frames, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value) {
-                    literal_filled.insert(name.as_str());
-                }
-            }
+            let literal_filled = literal_filled_ports(node, &wired, &frames, edge_idx);
             if let Some(group) = ready_group_at(
                 node, &group_pulses, color, &frames, &required, &wired, &literal_filled, out_of_scope, project, edge_idx,
             ) {
@@ -403,7 +398,7 @@ pub fn kicked_group(
         None if kick.firing => check_flow_permission(node, &[]),
         None => check_should_skip(node, &effective_refs,
             &node.inputs.iter().filter(|p| p.required && edge_idx.includes_port(node, frames, &p.name)).map(|p| p.name.as_str()).collect(),
-            &wired, &received.input.keys().map(String::as_str).collect()),
+            &wired, &literal_filled_ports(node, &wired, frames, edge_idx)),
     };
     ReadyGroup {
         frames: frames.clone(),
@@ -588,17 +583,51 @@ enum InputCheck {
 /// between the pulse-driven dispatch path (`firing_input`) and the
 /// kick-driven dispatch path (`build_kicked_input` below) so the two
 /// paths can't disagree on what counts as "body-supplied".
+///
+/// A `@member_filled` literal is left out: it names no value until the
+/// engine swaps in what the run's member provides (checked against the
+/// port when the run was born), so judging the marker itself against
+/// the port's type here would refuse every such field. It still counts
+/// as filled for readiness, since a run is only born once every such
+/// field it needs has a value or a fallback.
 pub fn fill_input_from_literals(
     node: &NodeDefinition,
     wired: &HashSet<&str>,
     obj: &mut InputBag,
 ) {
     for (name, value) in &node.port_literals {
-        if wired.contains(name.as_str()) || obj.contains_key(name) || !literal_is_data(node, name, value) {
+        if wired.contains(name.as_str())
+            || obj.contains_key(name)
+            || !literal_is_data(node, name, value)
+            || crate::member::as_member_filled(value).is_some()
+        {
             continue;
         }
         obj.insert(name.clone(), Arc::new(value.clone()));
     }
+}
+
+/// The unwired ports a written constant fills at `frames`: what keeps a
+/// node with no live wire alive in the skip rules. A `@member_filled`
+/// literal counts, since a run is only born once each such field it
+/// needs has the member's value or a fallback; it is left out of the
+/// bag itself ([`fill_input_from_literals`]) only until the engine puts
+/// that value in. The ONE reading both the pulse path and a kicked
+/// scope root use: reading it off the bag instead made a step whose
+/// every setting is `@member_filled` look like it had nothing, and skip.
+pub fn literal_filled_ports<'a>(
+    node: &'a NodeDefinition,
+    wired: &HashSet<&str>,
+    frames: &LoopFrames,
+    edge_idx: &EdgeIndex,
+) -> HashSet<&'a str> {
+    node.port_literals
+        .iter()
+        .filter(|(name, value)| {
+            edge_idx.includes_port(node, frames, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
 }
 
 /// Does a written constant carry a value for the port? A `null` is data
@@ -997,6 +1026,18 @@ mod tests {
         assert_eq!(input.get("account").map(|v| &**v), Some(&handle), "the handle reaches the bag intact");
     }
 
+    /// A `@member_filled` field reaches the bag only once the engine swaps
+    /// in the member's value: the marker itself is never judged against
+    /// the port (a String port would refuse the marker's object).
+    #[test]
+    fn a_member_filled_literal_waits_for_the_members_value() {
+        let marker = crate::member::member_filled_literal(Some(json!("0 0 3 * * *")));
+        let node = kicked_node("Cron", vec![port("String", true)], json!({ "p": marker }));
+        let (input, refusals) = build_kicked_input(&node, None);
+        assert!(refusals.is_empty(), "{refusals:?}");
+        assert!(!input.contains_key("p"));
+    }
+
     /// A trigger's own ports are held to the same line as a pulsed
     /// node's. This is the path a poll interval actually arrives on, so
     /// leaving it unchecked meant the interval's rules bound nothing.
@@ -1028,10 +1069,12 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false,
+            requires_infra: false, per_member: None,
             images: Vec::new(),
             fires_with: Default::default(),
             published_service: None,
+            member_service: None,
+            member_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1071,6 +1114,28 @@ mod tests {
         let received = firing_input(&node, &[], &HashSet::new(), &vec![], &index);
         assert_eq!(super::owned_bag(&received.input), json!({"selected":"kept"}).as_object().unwrap().clone());
         assert!(received.type_errors.is_empty(), "the excluded invalid literal cannot fail this boundary");
+    }
+
+    /// A scope root whose only setting is `@member_filled` runs when its
+    /// scope starts, like one with a written value: the marker stays out
+    /// of the bag until the engine puts the member's value in, and must
+    /// not read as "nothing will ever come" (it used to skip with every
+    /// input closed, silently, in a completed run).
+    #[test]
+    fn a_kicked_root_whose_setting_each_member_fills_runs() {
+        let marker = crate::member::member_filled_literal(None);
+        let node = kicked_node("X", vec![port("String", true)], json!({ "p": marker }));
+        let project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
+        let index = EdgeIndex::selected(&project, crate::project::selection::RunSelection::whole(&project));
+        let kick = crate::primitive::KickedNode {
+            firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
+        };
+        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
+        assert!(group.skip.is_none(), "{:?}", group.skip);
+        assert!(!group.received.input.contains_key("p"), "the marker waits for the member's value");
     }
 
     #[test]

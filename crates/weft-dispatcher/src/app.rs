@@ -80,6 +80,8 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // anywhere surfaces in ONE error naming every stale group
     // together.
     &crate::project_store::GROUP,
+    // Hangs off `project` (its rows cascade with the project).
+    &crate::activation_store::GROUP,
     // The version tree hangs off `project` (its foreign keys and the
     // head columns), so it comes after.
     &crate::versions::GROUP,
@@ -131,6 +133,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     weft_task_store::terminal::TERMINAL_CHANNEL,
     weft_task_store::worker_pod::WORKER_POD_CHANNEL,
     weft_journal::EXEC_EVENT_CHANNEL,
+    weft_journal::unrecorded::UNRECORDED_ENDED_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
     crate::events::NOTIFY_CHANNEL,
@@ -163,6 +166,8 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: crate::ProjectStore =
         std::sync::Arc::new(crate::PostgresProjectStore::new(pool.clone()));
+    let activations: crate::activation_store::ActivationStore =
+        std::sync::Arc::new(crate::activation_store::PostgresActivationStore::new(pool.clone()));
     let versions: crate::versions::VersionStore =
         std::sync::Arc::new(crate::versions::PostgresVersionStore::new(pool));
 
@@ -387,6 +392,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         workers: worker_backend,
         ensure_built,
         projects,
+        activations,
         versions,
         events: event_bus,
         listener_backend,
@@ -441,6 +447,7 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
             Arc::new(crate::task_kinds::UpdateSignalKindStateExecutor),
         )
         .register(TaskKind::StopTagged, Arc::new(crate::task_kinds::StopTaggedExecutor))
+        .register(TaskKind::ProgramCall, Arc::new(crate::task_kinds::ProgramCallExecutor))
         .register_str(
             crate::task_kinds::run_node_test::RUN_NODE_TEST_KIND,
             Arc::new(crate::task_kinds::RunNodeTestExecutor),
@@ -502,6 +509,14 @@ pub fn spawn_core_loops(state: DispatcherState, registry: crate::task_executor::
     let bridge_state = state.clone();
     spawn_supervised("journal_bridge", async move {
         crate::journal_bridge::run(bridge_state).await;
+    });
+
+    // An unrecorded run's ending writes no journal row for the bridge to
+    // see, so it is heard on its own channel and re-checks the drain the
+    // same way a terminal row does.
+    let endings_state = state.clone();
+    spawn_supervised("unrecorded_endings", async move {
+        crate::journal_bridge::run_unrecorded_endings(endings_state).await;
     });
 
     // Infra-event bridge: same pattern for `infra_event` rows written by pooled

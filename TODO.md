@@ -124,61 +124,6 @@ that would otherwise have died and refolded) and on the lifecycle/leasing
 implications of a pinned worker. Surfaced from the node-authoring docs,
 which promised this primitive before it existed.
 
-## Delegated end-customer connections (embed weft in someone else's product)
-
-**Problem.** An operator builds a product on top of weft (say a
-sheet-analysis workflow) and serves it to THEIR end customers from
-their own website. Each end customer needs to connect their own
-third-party account (their Google, their Slack) and run the workflow
-against it: pick their sheet, run on their data, on their behalf. The
-access system today has no seam for this: connections belong to the
-tenant who owns the project (the operator), created through the
-editor's connect flow by that tenant. There is no way for the
-operator's website to mint a connection FOR one of its end customers,
-no way to keep two end customers' grants apart inside one project, and
-no way to point a run at "customer X's connection" at fire time.
-
-**Direction (rough, needs a real design pass).**
-- The operator registers their own OAuth app once (that part exists:
-  it is an app entry, the operator's client id/secret).
-- Their website drives a connect flow for a LOGGED-IN end customer:
-  the operator's backend asks weft (server-to-server, operator
-  credential) to mint a consent link scoped to an operator-chosen
-  subject id ("customer-123"); the end customer approves at the
-  provider; the resulting grant lands in weft tagged with that
-  subject, not as an operator-wide connection.
-- Credential custody stays in weft the whole way: the end customer's
-  tokens are held and resolved by weft like any grant, never returned
-  to the operator's backend and never exposed to the end customer's
-  browser, so neither side can exfiltrate the other's credentials.
-  The operator can list/revoke by subject, never read.
-- A run then names its subject (fire-time input or signal payload) and
-  the access resolution picks that subject's grant for the service,
-  instead of "the project's connection". Remote-select pickers (pick a
-  sheet) need the same subject-scoped resolution to work in the
-  operator's embedded UI.
-
-**Requirements.**
-- The subject is an OPAQUE operator-chosen string; weft does not know
-  or care about the operator's user model.
-- Per-subject isolation is enforced by weft, not by operator
-  discipline: a run bound to subject A can never resolve subject B's
-  grant.
-- The existing single-tenant flow stays untouched: a project with no
-  subjects behaves exactly as today (the substitution test says extend
-  the grant concept with an optional subject, not fork a sibling
-  concept).
-
-**Why deferred.** Real design pass across the access store (grant
-shape), the consent flow (embeddable, operator-driven), fire-time
-binding, and the picker path. Surfaced by a real ask from a potential
-operator; recorded so the access system's next design round takes it
-as a first-class use case.
-
-[Update Notice Warning] If we touch the access grant schema, the
-connect/consent flow, or fire-time access resolution, revisit this
-entry.
-
 ## Parallel loops: a `max_parallel` concurrency bound
 
 **Problem.** A parallel loop launches a lane per item with NO bound on

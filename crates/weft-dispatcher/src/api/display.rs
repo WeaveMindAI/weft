@@ -82,6 +82,13 @@ pub struct NodeDisplayEntry {
     /// panel without knowing the project.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// For an `infra` display, where the copy behind it stands:
+    /// `provisioning` while it starts, `running`, `stopping`, `stopped`,
+    /// `failed`, `flaky`, `terminating`, or `absent` when it was never
+    /// started. A client shows "starting" from this instead of reading
+    /// the feed's 404 as "not started". Absent on a `trigger` display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 /// `GET /signal-token/displays` (signal token in `Authorization:
@@ -133,7 +140,22 @@ pub async fn list_displays(
             if !token_reaches_display(&token, &summary.id, address) {
                 continue;
             }
+            // A member token lists its member's own copies alone.
+            if token.member.is_some() && node.per_member.is_none() {
+                continue;
+            }
+            let status = match kind {
+                DisplayKind::Infra => {
+                    let copy = weft_core::member::copy_owner(node.per_member, token.member.as_ref());
+                    let row = crate::infra_node::get(&state.pg_pool, summary.id, address, copy)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?;
+                    Some(row.map_or("absent", |row| row.status.as_str()))
+                }
+                DisplayKind::Trigger => None,
+            };
             out.push(NodeDisplayEntry {
+                status,
                 project_id: summary.id,
                 project_name: summary.name.clone(),
                 node: address.clone(),
@@ -158,14 +180,14 @@ pub async fn read_display(
     headers: HeaderMap,
     Path((project_id, address)): Path<(String, String)>,
 ) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
-    let (id, kind) = resolve(&state, &headers, &project_id, &address).await?;
+    let (id, kind, copy) = resolve(&state, &headers, &project_id, &address).await?;
     // Both resolvers take the PLACE as the caller spelled it: a trigger's
     // registration and an infra node's instance are each one per place,
     // keyed by that spelling, so a file included twice is two displays
     // and a grant for one opens that one alone.
     Ok(Json(match kind {
-        DisplayKind::Infra => crate::api::infra::read_live(&state, id, &address).await?,
-        DisplayKind::Trigger => crate::api::signal::read_signal_live(&state, id, &address).await?,
+        DisplayKind::Infra => crate::api::infra::read_live(&state, id, &address, copy.as_ref()).await?,
+        DisplayKind::Trigger => crate::api::signal::read_signal_live(&state, id, &address, copy.as_ref()).await?,
     }))
 }
 
@@ -187,7 +209,7 @@ pub async fn press_display(
     // exists and what it takes. Authorize first, read the body after.
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let (id, kind) = resolve(&state, &headers, &project_id, &address).await?;
+    let (id, kind, copy) = resolve(&state, &headers, &project_id, &address).await?;
     let body: crate::api::infra::InfraActionBody = serde_json::from_slice(&body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -196,7 +218,7 @@ pub async fn press_display(
     })?;
     match kind {
         DisplayKind::Infra => Ok(Json(
-            crate::api::infra::press_live(&state, id, &address, &body.kind, &body.payload).await?,
+            crate::api::infra::press_live(&state, id, &address, copy.as_ref(), &body.kind, &body.payload).await?,
         )),
         // Named the way the CALLER named it: they asked for
         // `bridge.whatsapp`, so hearing about some other spelling of
@@ -497,7 +519,7 @@ async fn resolve(
     headers: &HeaderMap,
     project_id: &str,
     address: &str,
-) -> Result<(uuid::Uuid, DisplayKind), (StatusCode, String)> {
+) -> Result<(uuid::Uuid, DisplayKind, Option<weft_core::member::MemberId>), (StatusCode, String)> {
     let token = display_token(state, headers).await?;
     let id = project_id
         .parse::<uuid::Uuid>()
@@ -523,7 +545,18 @@ async fn resolve(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(not_found)?;
     let kind = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
-    Ok((id, kind))
+    // Whose copy the token reads: a member token reads its member's copy
+    // of a node that exists once per member, and the shared one of any
+    // other node; any other token reads the shared copies.
+    let (node_id, _) = weft_core::project::resolve_address(&project, address);
+    let per_member = project.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.per_member);
+    // A member token reaches its member's own copies alone: a shared
+    // node's display (the shared bridge's pairing code) is the author's.
+    if token.member.is_some() && per_member.is_none() {
+        return Err(not_found());
+    }
+    let copy = weft_core::member::copy_owner(per_member, token.member.as_ref()).cloned();
+    Ok((id, kind, copy))
 }
 
 #[cfg(test)]
@@ -620,6 +653,8 @@ mod scope_tests {
             allowed_displays: displays.to_vec(),
             all_displays: all,
             created_at: 0,
+            member: None,
+            expires_at: None,
         }
     }
 

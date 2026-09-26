@@ -230,6 +230,33 @@ It goes in a step's body or its inline signature. A step's author can bake the
 same requirement into its metadata as `oneOfRequired`. Groups and loops reject
 it: put it on the child that needs the value.
 
+## One copy per member, one value per member
+
+`@per_member` on its own line in an infra node's body gives each member of the
+program their own copy of that node (their own container):
+
+```weft
+bridge = BaileyBridge {
+  @per_member
+}
+```
+
+It takes no arguments.
+
+`@member_filled` goes where a field's value would, and makes the value each
+member's own: `@member_filled` alone, or `@member_filled(<value>)` with the
+value a member who gave none gets. A connection is a value too:
+
+```weft
+google = GoogleAccess { account: @member_filled }
+digest = Cron { cron: @member_filled("0 0 8 * * *") }
+```
+
+The fallback can also be a file, read the way a written one is:
+`personality: @member_filled(@file("prompts/default.md"))`.
+
+For what both do, go and read [programs with members](../running/members.md).
+
 ## Comments
 
 `#` starts a comment. A plain comment as the first thing inside a group or loop

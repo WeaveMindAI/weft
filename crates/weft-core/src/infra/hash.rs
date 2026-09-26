@@ -1,44 +1,58 @@
 //! Compute the `applied_spec_hash` that drives the supervisor's
 //! skip-vs-replace decision on the next apply for the same node.
 //!
-//! We hash the TYPED `InfraSpec` (post-validation), not the compiled
-//! manifest bytes. Hashing the typed spec means:
-//!   - changes to `compile.rs` output (annotations, labels, k8s field
-//!     ordering) don't invalidate every existing hash;
-//!   - the hash is stable as long as the user-authored spec is stable;
-//!   - HashMap-iteration order can't leak in because every map field
-//!     on `InfraSpec` is a `BTreeMap` (or a typed Vec).
+//! We hash the COMPILED manifests, exactly what gets applied. Anything
+//! that changes what a unit runs changes the hash: the author's spec,
+//! a rebuilt local image (its resolved tag is in the manifest), and a
+//! change to how weft compiles a unit (a new pod field such as the DNS
+//! settings, a label, a probe default). Hashing the typed spec instead
+//! missed that last one, so a compile change never reached a unit
+//! whose spec was untouched.
 //!
-//! Determinism: `serde_json::to_string` walks structs in
-//! struct-field declaration order and BTreeMaps in key order. With
-//! the workspace's default `serde_json` features (no
-//! `preserve_order`), object keys also serialize in BTreeMap order.
-//! Any new HashMap added to `InfraSpec` MUST switch to `BTreeMap` or
-//! this guarantee breaks.
+//! The same spec for the same instance compiles to the same manifests:
+//! the compile context (tenant, project, node, instance id, namespace,
+//! install) is stable across applies of one row, since the supervisor
+//! reuses the prior instance id.
+//!
+//! Determinism: object keys are sorted here, recursively, before
+//! hashing. `serde_json` cannot be trusted to do it: a dependency
+//! (`minillmlib`) turns on its `preserve_order` feature, which makes
+//! every `Map` keep insertion order in any binary that links it.
+//! Arrays keep the compiler's order, which follows the spec.
 
-use anyhow::Result;
 use sha2::{Digest, Sha256};
+use serde_json::Value;
 
-use super::types::InfraSpec;
-
-/// Stable hash of an `InfraSpec` for skip-vs-replace decisions.
-///
-/// `image_tags` is mixed in so a tag rebuild (same spec, fresh
-/// `weft-infra-foo:abc` → `weft-infra-foo:xyz`) produces a different
-/// hash and triggers a re-apply.
-pub fn hash_spec(
-    spec: &InfraSpec,
-    image_tags: &std::collections::BTreeMap<String, String>,
-) -> Result<String> {
-    let spec_json = serde_json::to_string(spec)?;
-    let tags_json = serde_json::to_string(image_tags)?;
+/// Stable hash of a node's compiled manifests (the output of
+/// [`super::compile`]) for skip-vs-replace decisions.
+pub fn hash_manifests(manifests: &[Value]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"weft-infra-typed-v1\n");
-    hasher.update((spec_json.len() as u64).to_le_bytes());
-    hasher.update(spec_json.as_bytes());
-    hasher.update((tags_json.len() as u64).to_le_bytes());
-    hasher.update(tags_json.as_bytes());
-    Ok(hex(&hasher.finalize()))
+    hasher.update(b"weft-infra-compiled-v1\n");
+    for manifest in manifests {
+        let bytes = canonical(manifest).to_string();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes.as_bytes());
+    }
+    hex(&hasher.finalize())
+}
+
+/// `value` with every object's keys in sorted order, whatever order
+/// they were inserted in. Inserting sorted keys into a fresh `Map`
+/// serializes sorted under both `Map` backings.
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), canonical(&map[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -54,8 +68,10 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::compile::tests::ctx;
     use crate::infra::types::*;
-    use std::collections::BTreeMap;
+    use crate::infra::compile;
+    use serde_json::json;
 
     fn spec() -> InfraSpec {
         InfraSpec {
@@ -74,93 +90,63 @@ mod tests {
         }
     }
 
+    fn hash(spec: &InfraSpec) -> String {
+        hash_manifests(&compile(spec, &ctx()).unwrap())
+    }
+
     #[test]
     fn hash_stable_across_calls() {
-        let s = spec();
-        let tags = BTreeMap::new();
-        let h1 = hash_spec(&s, &tags).unwrap();
-        let h2 = hash_spec(&s, &tags).unwrap();
-        assert_eq!(h1, h2);
+        let h1 = hash(&spec());
+        assert_eq!(h1, hash(&spec()));
         assert_eq!(h1.len(), 64);
     }
 
     #[test]
     fn hash_changes_with_spec() {
-        let s1 = spec();
         let mut s2 = spec();
         s2.units[0].containers[0].image = Image::Upstream {
             reference: "nginx:1.28".into(),
         };
-        let tags = BTreeMap::new();
-        assert_ne!(
-            hash_spec(&s1, &tags).unwrap(),
-            hash_spec(&s2, &tags).unwrap()
-        );
+        assert_ne!(hash(&spec()), hash(&s2));
     }
 
-    #[test]
-    fn hash_changes_with_image_tags() {
-        let s = spec();
-        let mut t1 = BTreeMap::new();
-        t1.insert("bridge".to_string(), "weft-infra-bridge:abc".to_string());
-        let mut t2 = BTreeMap::new();
-        t2.insert("bridge".to_string(), "weft-infra-bridge:xyz".to_string());
-        assert_ne!(
-            hash_spec(&s, &t1).unwrap(),
-            hash_spec(&s, &t2).unwrap()
-        );
-    }
-
-    /// `on_upgrade` lives per-Unit and MUST contribute to the hash:
-    /// changing the upgrade strategy is a spec change the supervisor
-    /// has to re-apply. A `#[serde(skip)]` or field reorder that
-    /// dropped it would silently break drift detection on upgrade.
+    /// `on_upgrade` lives per-Unit and MUST reach the hash: changing
+    /// the upgrade strategy is a change the supervisor has to re-apply.
     #[test]
     fn hash_changes_with_on_upgrade() {
-        let s1 = spec(); // default Rolling
         let mut s2 = spec();
         s2.units[0].on_upgrade = UpgradeBehavior::Recreate;
-        let tags = BTreeMap::new();
-        assert_ne!(
-            hash_spec(&s1, &tags).unwrap(),
-            hash_spec(&s2, &tags).unwrap()
-        );
+        assert_ne!(hash(&spec()), hash(&s2));
     }
 
-    /// The hash's determinism rests on the spec serializing with map
-    /// keys in a STABLE (sorted) order. That holds because every
-    /// spec-reachable map is a `BTreeMap` and serde_json (without the
-    /// `preserve_order` feature) emits object keys sorted. This pins
-    /// it at the serialization layer the hash actually uses: build a
-    /// spec with an out-of-order multi-key map and assert the emitted
-    /// JSON has those keys in sorted order. A regression to `HashMap`
-    /// on the field, or serde_json gaining `preserve_order`, would
-    /// flip the order and fail this, surfacing the nondeterminism
-    /// instead of letting it cause silent rebuild loops.
-    ///
-    /// (The prior version inserted into a BTreeMap in two orders and
-    /// asserted equal hashes: tautological, since BTreeMap sorts on
-    /// insert regardless. This checks the real failure mode.)
+    /// A change only to how weft compiles a unit (the spec untouched)
+    /// changes the hash, so it rolls out on the next apply.
     #[test]
-    fn spec_serializes_map_keys_in_sorted_order() {
-        let mut s = spec();
-        let mut sel = BTreeMap::new();
-        // Insert deliberately out of lexicographic order.
-        sel.insert("zone".to_string(), "eu".to_string());
-        sel.insert("arch".to_string(), "amd64".to_string());
-        sel.insert("tier".to_string(), "infra".to_string());
-        s.units[0].pod_options.node_selector = Some(sel);
+    fn hash_changes_with_compile_output_alone() {
+        let manifests = compile(&spec(), &ctx()).unwrap();
+        let mut recompiled = manifests.clone();
+        let deployment = recompiled
+            .iter_mut()
+            .find(|m| m["kind"] == "Deployment")
+            .unwrap();
+        deployment["spec"]["template"]["spec"]["dnsConfig"] =
+            json!({ "options": [{ "name": "ndots", "value": "2" }] });
+        assert_ne!(hash_manifests(&manifests), hash_manifests(&recompiled));
+    }
 
-        // Serialize via the same path `hash_spec` uses.
-        let json = serde_json::to_string(&s).unwrap();
-        let a = json.find("\"arch\"").expect("arch key present");
-        let t = json.find("\"tier\"").expect("tier key present");
-        let z = json.find("\"zone\"").expect("zone key present");
-        assert!(
-            a < t && t < z,
-            "node_selector keys must serialize sorted (arch<tier<zone); \
-             got arch@{a}, tier@{t}, zone@{z}. A HashMap field or serde_json \
-             preserve_order would break hash determinism."
+    /// Key order inside a manifest cannot leak into the hash: objects
+    /// hash sorted whatever order they were built in.
+    #[test]
+    fn object_key_order_does_not_matter() {
+        let mut a = serde_json::Map::new();
+        a.insert("zone".into(), json!(1));
+        a.insert("arch".into(), json!(2));
+        let mut b = serde_json::Map::new();
+        b.insert("arch".into(), json!(2));
+        b.insert("zone".into(), json!(1));
+        assert_eq!(
+            hash_manifests(&[Value::Object(a)]),
+            hash_manifests(&[Value::Object(b)])
         );
     }
 }

@@ -881,7 +881,7 @@ fn env_component(name: &str) -> String {
 /// pod otherwise. Uses the service-scoped list (the API's read
 /// surface for grants), so a wrong-service id fails naming both.
 async fn require_grant_for_service(ctx: &Ctx, service: &str, grant_id: uuid::Uuid) -> Result<()> {
-    let grants = super::connect::list_grants(&ctx.client(), Some(service)).await?;
+    let grants = super::connect::list_grants(&ctx.client(), super::connect::Doorway::Owner, Some(service)).await?;
     if !grants.iter().any(|g| g.id == grant_id) {
         bail!(
             "--connection {grant_id} is not a grant for service '{service}'; list the \
@@ -929,7 +929,7 @@ fn ensure_live_consent(args: &TestNodeArgs) -> Result<()> {
 /// unambiguous; zero is `None` (the caller knows the other ways in);
 /// several name the fix.
 async fn sole_grant_for_service(ctx: &Ctx, service: &str) -> Result<Option<uuid::Uuid>> {
-    let grants = super::connect::list_grants(&ctx.client(), Some(service)).await?;
+    let grants = super::connect::list_grants(&ctx.client(), super::connect::Doorway::Owner, Some(service)).await?;
     match grants.as_slice() {
         [] => Ok(None),
         [only] => Ok(Some(only.id)),
@@ -1041,6 +1041,7 @@ fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedK
 async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uuid> {
     let grant = super::connect::connect_direct(
         &ctx.client(),
+        super::connect::Doorway::Owner,
         ConnectDirect {
             spec: key.spec,
             door: Door::Own,
@@ -1050,6 +1051,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
             registration: None,
             paste: key.paste,
             project_id: None,
+            member: None,
         },
         None,
     )

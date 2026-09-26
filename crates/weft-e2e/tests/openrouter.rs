@@ -12,10 +12,10 @@
 //! connection picker, exactly as a user picks a connection in the editor
 //! (the pick lives on the PROVIDER node; the inference node just consumes
 //! the wired provider value):
-//!   - `ours`: a shared-door connection, so the call is made on the
+//!   - `platform`: a shared-door connection, so the call is made on the
 //!     runtime's configured key (the shared-credentials `api_key` entry),
 //!     which the worker never holds directly.
-//!   - `their-own`: a connection holding the user's own pasted key.
+//!   - `author`: a connection holding the user's own pasted key.
 //! Both land a resolved cost, measured worker-side; the difference is only
 //! whose credential spent, which the node never sees.
 //!
@@ -33,7 +33,7 @@ use weft_e2e::{ensure, project::Project, run};
 
 /// Drive the openrouter fixture and assert a real blue-sky completion came
 /// back with a resolved cost, spent on the expected credential (`origin`
-/// is `"ours"` or `"their-own"`; the cost record says whose credential
+/// is `"platform"` or `"author"`; the cost record says whose credential
 /// spent, so a silent fall-through to the other one fails here).
 async fn assert_metered(project: &mut Project, origin: &str) -> anyhow::Result<()> {
     let mut settled = run::run_and_settle(project).await?;
@@ -71,7 +71,7 @@ async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
     set_account(&project, "prov", "connection", conn.handle())?;
-    assert_metered(&mut project, "ours").await?;
+    assert_metered(&mut project, "platform").await?;
     project.finish().await?;
     conn.finish().await
 }
@@ -103,7 +103,7 @@ async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Resul
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
     set_account(&project, "prov", "connection", conn.handle())?;
-    assert_metered(&mut project, "their-own").await?;
+    assert_metered(&mut project, "author").await?;
     project.finish().await?;
     conn.finish().await
 }

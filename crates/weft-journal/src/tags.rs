@@ -109,8 +109,8 @@ pub async fn max_tag_seq<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> Result<i64
 }
 
 /// Every LIVE execution of `project_id` carrying `tag`, with its tag
-/// row's `seq`. Live means a project execution (not a node test) whose
-/// journal holds no terminal event. The ordering and self rules are
+/// row's `seq`. Live is [`crate::unrecorded::LIVE_RUN_SQL`]: a project
+/// run still going, recorded or not (never a node test). The ordering and self rules are
 /// applied afterwards by [`select_stop_targets`], which is pure, so the
 /// SQL stays a plain read and the rule has a layer-1 test.
 pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
@@ -118,28 +118,19 @@ pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
     project_id: uuid::Uuid,
     tag: &str,
 ) -> Result<Vec<TaggedExecution>, sqlx::Error> {
-    // The NOT EXISTS kind list below is the SQL copy of the terminal set;
-    // a fourth terminal kind must land here too or a run that ended in it
-    // keeps matching this read as live forever.
-    // SYNC: terminal kind list <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal,
-    // crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list),
-    // crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    // Live is the one rule every sweep shares
+    // (`crate::unrecorded::LIVE_RUN_SQL`, which holds the terminal list).
+    let query = format!(
         "SELECT et.color, et.seq \
          FROM execution_tag et \
          JOIN execution_color ec ON ec.color = et.color \
          WHERE ec.project_id = $1 \
            AND et.tag = $2 \
-           AND ec.kind = 'execution' \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM exec_event t \
-               WHERE t.color = ec.color \
-                 AND t.kind IN ('execution_completed', \
-                                'execution_failed', \
-                                'execution_cancelled') \
-           ) \
+           AND {} \
          ORDER BY et.seq ASC",
-    )
+        crate::unrecorded::LIVE_RUN_SQL
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(&query)
     .bind(project_id)
     .bind(tag)
     .fetch_all(executor)

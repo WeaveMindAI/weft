@@ -473,7 +473,7 @@ async fn never_baked_triggers_refuse_and_baking_allows_fire_without_activation()
     anyhow::ensure!(refused.contains("weft bake"), "{refused}");
     project.weft(&["bake", "--json"]).await?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["activation_version"].is_null(), "bake does not activate: {tree}");
+    anyhow::ensure!(tree["head"]["activated_versions"] == json!([]), "bake does not activate: {tree}");
     let stdout = project.weft(&["run", "--json", "--fire", tick]).await?;
     let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
     settled.completed()?.assert_completed("tick")?;
@@ -529,14 +529,17 @@ async fn activation_pins_a_version_in_the_tree() -> anyhow::Result<()> {
 
     project.activate().await?;
     let tree = tree_of(&project).await?;
-    let active = tree["head"]["activation_version"].as_str().map(str::to_string);
+    let active = match tree["head"]["activated_versions"].as_array().map(Vec::as_slice) {
+        Some([one]) => one.as_str().map(str::to_string),
+        _ => None,
+    };
     anyhow::ensure!(active.is_some() && tree["head"]["head_version"].is_null(), "activation pins the version, head stays: {tree}");
     anyhow::ensure!(tree["versions"].as_array().unwrap().iter().any(|v| v["id"] == json!(active)), "the version is in the tree: {tree}");
     let refused = project.weft_refused(&["prune", active.as_deref().unwrap(), "--yes"]).await?;
-    anyhow::ensure!(refused.contains("activated version is inside the subtree"), "{refused}");
+    anyhow::ensure!(refused.contains("is activated and inside the subtree"), "{refused}");
     project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["activation_version"].is_null(), "deactivate clears it: {tree}");
+    anyhow::ensure!(tree["head"]["activated_versions"] == json!([]), "deactivate clears it: {tree}");
 
     project.finish().await
 }

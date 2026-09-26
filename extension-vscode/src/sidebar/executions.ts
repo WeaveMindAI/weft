@@ -340,7 +340,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       runs,
       head,
       this.tree?.disk_version ?? '',
-      this.tree?.head.activation_version ?? '',
+      (this.tree?.head.activated_versions ?? []).join(','),
     ].join('|');
   }
 

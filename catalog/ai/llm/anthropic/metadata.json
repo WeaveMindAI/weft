@@ -1,7 +1,7 @@
 {
   "type": "AnthropicProvider",
   "label": "Anthropic",
-  "description": "Serve LLM calls directly on Anthropic's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node. Model names are Anthropic's own (claude-sonnet-4-5, ...).",
+  "description": "Serve LLM calls directly on Anthropic's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node. Model names are Anthropic's own (claude-sonnet-5, ...).",
   "tags": [
     "ai",
     "provider",
@@ -95,14 +95,14 @@
   "validate": [
     {
       "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "model"
-        }
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+        ]
       },
       "then": {
-        "message": "AnthropicProvider '{id}' has no model; name one on the node.",
+        "message": "AnthropicProvider '{id}' has no model; name one on the node or wire one in.",
         "level": "runtime",
         "field": "model"
       }

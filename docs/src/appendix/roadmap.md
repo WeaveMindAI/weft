@@ -43,20 +43,6 @@ vetted sets of nodes, signed off by whoever is doing the regulating, with
 safety-critical programs required to build out of those. Read
 [How I think about AI safety](../thinking/safety.md) for why this matters.
 
-## Connections
-
-**Delegated end-customer connections.** An operator builds a product on weft and
-serves it from their own site. Each end customer needs to connect their own
-Google or Slack and run the workflow on their own data. Today connections belong
-to the tenant who owns the project, so there is no way to mint a connection for
-one end customer, keep two customers' grants apart, or point a run at "customer
-X's connection". The plan: the operator registers their OAuth app once, their
-backend asks weft to mint a consent link scoped to an opaque subject id, the
-customer approves at the provider, and the grant lands in weft tagged with that
-subject. Credentials stay in weft the whole way. The operator can list and revoke
-by subject but never read, and a run bound to one subject can never resolve
-another's grant. The existing single-tenant flow is untouched.
-
 ## Running it for real
 
 **Cloud deployment, and routes that reach the internet.** Everything today runs
@@ -83,9 +69,6 @@ assistants spend time on fluff weft does not need, and our own CLI fixes that.
 
 **Coordinated assistants in parallel.** Several agents building branches of the
 weft codebase under one plan, the same shape weft gives a program.
-
-**Multiple logins for one hosted program.** Letting whoever hosts a program
-handle several users of it natively, instead of each install serving one tenant.
 
 ## The editor
 

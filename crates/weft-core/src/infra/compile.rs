@@ -30,8 +30,8 @@ pub struct CompileContext<'a> {
     /// Resolution map for `Image::Local { name }` references. Maps
     /// the local name (`"bridge"`) to the concrete docker tag
     /// (`"weft-infra-bridge:abc123"`). Provided by the CLI. Must be
-    /// a `BTreeMap` so iteration is deterministic (the downstream
-    /// hash mixes it in and HashMap order would randomize).
+    /// a `BTreeMap` so iteration is deterministic (the resolved tags
+    /// land in the manifests the apply hash is taken over).
     /// `Image::Upstream(...)` references bypass this map.
     pub local_image_tags: &'a std::collections::BTreeMap<String, String>,
     /// The install this apply runs for. Only the default install owns a
@@ -55,8 +55,9 @@ pub enum CompileError {
     /// node's metadata declares; the message says so, since the first
     /// reading of it ("the metadata is wrong") sends a person to a
     /// file that is fine.
-    #[error("infra node '{node}' has no image built yet for '{name}': run `weft infra start`, \
-             which builds the node's images and registers them, before activating or running")]
+    #[error("infra node '{node}' has no image built yet for '{name}': run `weft infra start` \
+             (or, for a node marked `@per_member`, `weft activate`), which builds the node's \
+             images and registers them")]
     MissingLocalImage { node: String, name: String },
     #[error("infra spec for node '{node}': endpoint '{endpoint}' references unit '{unit}' \
              but no such Unit was declared")]
@@ -292,7 +293,7 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
         if let Expose::TenantPublic { path } = &ep.expose {
             if let Some(install) = ctx.install.name() {
                 return Err(CompileError::TenantPublicOnNamedInstall {
-                    node: ctx.node_id.to_string(),
+                    node: crate::project::plain_id(ctx.node_id),
                     endpoint: ep.name.clone(),
                     install: install.to_string(),
                 });
@@ -443,11 +444,11 @@ fn compile_pod_template(
 ) -> Result<Value, CompileError> {
     let mut containers = Vec::new();
     for c in &unit.containers {
-        containers.push(compile_container(c, unit, ctx)?);
+        containers.push(compile_container(c, spec, ctx)?);
     }
     let mut init = Vec::new();
     for c in &unit.init_containers {
-        init.push(compile_container(c, unit, ctx)?);
+        init.push(compile_container(c, spec, ctx)?);
     }
 
     let volumes = compile_pod_volumes(unit, spec, ctx);
@@ -483,6 +484,7 @@ fn compile_pod_template(
     if let Some(tg) = unit.pod_options.termination_grace_period_seconds {
         pod_spec.insert("terminationGracePeriodSeconds".into(), json!(tg));
     }
+    pod_spec.insert("dnsConfig".into(), crate::pod_dns::pod_dns_config());
 
     Ok(json!({
         "metadata": {
@@ -504,7 +506,7 @@ fn compile_pod_template(
 
 fn compile_container(
     c: &Container,
-    _unit: &Unit,
+    spec: &InfraSpec,
     ctx: &CompileContext<'_>,
 ) -> Result<Value, CompileError> {
     let image = resolve_image(&c.image, ctx.node_id, ctx.local_image_tags)?;
@@ -518,7 +520,7 @@ fn compile_container(
         obj.insert("args".into(), json!(c.args));
     }
     if !c.env.is_empty() {
-        obj.insert("env".into(), json!(compile_env(&c.env)));
+        obj.insert("env".into(), json!(compile_env(&c.env, spec, ctx)));
     }
     if !c.ports.is_empty() {
         obj.insert("ports".into(), json!(compile_ports(&c.ports)));
@@ -596,7 +598,7 @@ pub fn unit_image_refs(
     Ok(refs)
 }
 
-fn compile_env(env: &[EnvEntry]) -> Vec<Value> {
+fn compile_env(env: &[EnvEntry], spec: &InfraSpec, ctx: &CompileContext<'_>) -> Vec<Value> {
     env.iter()
         .map(|e| match e {
             EnvEntry::Literal { name, value } => json!({ "name": name, "value": value }),
@@ -607,13 +609,13 @@ fn compile_env(env: &[EnvEntry]) -> Vec<Value> {
             } => json!({
                 "name": name,
                 "valueFrom": {
-                    "configMapKeyRef": { "name": config_map, "key": key }
+                    "configMapKeyRef": { "name": config_map_ref(config_map, spec, ctx), "key": key }
                 }
             }),
             EnvEntry::FromSecret { name, secret, key } => json!({
                 "name": name,
                 "valueFrom": {
-                    "secretKeyRef": { "name": secret, "key": key }
+                    "secretKeyRef": { "name": secret_ref(secret, spec, ctx), "key": key }
                 }
             }),
             EnvEntry::Downward { name, field_path } => json!({
@@ -759,7 +761,7 @@ fn compile_pod_volumes(
                 }
                 VolumeKind::ConfigMap { name, items } => {
                     let mut cm = Map::new();
-                    cm.insert("name".into(), json!(name));
+                    cm.insert("name".into(), json!(config_map_ref(name, spec, ctx)));
                     if let Some(items) = items {
                         let entries: Vec<Value> = items
                             .iter()
@@ -771,7 +773,7 @@ fn compile_pod_volumes(
                 }
                 VolumeKind::Secret { name, items } => {
                     let mut s = Map::new();
-                    s.insert("secretName".into(), json!(name));
+                    s.insert("secretName".into(), json!(secret_ref(name, spec, ctx)));
                     if let Some(items) = items {
                         let entries: Vec<Value> = items
                             .iter()
@@ -846,18 +848,40 @@ fn pvc_name(v: &Volume, ctx: &CompileContext<'_>) -> String {
 // ConfigMap / Secret literals
 // -----------------------------------------------------------------
 
+/// The object a literal the spec names `name` is created as: one per
+/// instance, like every other resource, so two copies of a node (one
+/// per member) in the same namespace never write the same Secret, and
+/// taking one copy down (by its instance label) leaves the others'.
+fn config_literal_name(name: &str, ctx: &CompileContext<'_>) -> String {
+    format!("{}-{}", ctx.instance_id, name)
+}
+
+/// What a reference to the Secret `name` points at: this instance's own
+/// object when the spec creates it as a literal, the name as written
+/// when it is a pre-existing one.
+fn secret_ref(name: &str, spec: &InfraSpec, ctx: &CompileContext<'_>) -> String {
+    let literal = spec.config.iter().any(|c| matches!(c, ConfigSource::SecretLiteral { name: n, .. } if n == name));
+    if literal { config_literal_name(name, ctx) } else { name.to_string() }
+}
+
+/// [`secret_ref`] for a ConfigMap.
+fn config_map_ref(name: &str, spec: &InfraSpec, ctx: &CompileContext<'_>) -> String {
+    let literal = spec.config.iter().any(|c| matches!(c, ConfigSource::ConfigMapLiteral { name: n, .. } if n == name));
+    if literal { config_literal_name(name, ctx) } else { name.to_string() }
+}
+
 fn compile_config(cfg: &ConfigSource, ctx: &CompileContext<'_>) -> Option<Value> {
     match cfg {
         ConfigSource::SecretLiteral { name, data } => Some(json!({
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": { "name": name, "namespace": ctx.namespace },
+            "metadata": { "name": config_literal_name(name, ctx), "namespace": ctx.namespace },
             "stringData": data,
         })),
         ConfigSource::ConfigMapLiteral { name, data } => Some(json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": { "name": name, "namespace": ctx.namespace },
+            "metadata": { "name": config_literal_name(name, ctx), "namespace": ctx.namespace },
             "data": data,
         })),
         // Refs don't emit anything; they assume the named object
@@ -1459,10 +1483,10 @@ fn emitted_names<'a>(spec: &'a InfraSpec, ctx: &'a CompileContext<'a>) -> Vec<Em
             ConfigSource::SecretRef { .. } | ConfigSource::ConfigMapRef { .. } => continue,
         };
         out.push(EmittedName {
-            name: name.clone(),
+            name: config_literal_name(name, ctx),
             kind,
             source_kind: "config",
-            details: format!("{display} '{name}'"),
+            details: format!("instance_id '{}' + {display} '{name}'", ctx.instance_id),
         });
     }
 
@@ -1513,11 +1537,11 @@ fn stamp_labels_into(md: &mut serde_json::Map<String, Value>, ctx: &CompileConte
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use super::super::types::*;
 
-    pub(super) fn ctx() -> CompileContext<'static> {
+    pub(in crate::infra) fn ctx() -> CompileContext<'static> {
         ctx_with(std::collections::BTreeMap::new())
     }
 
@@ -1589,6 +1613,12 @@ mod tests {
         assert!(kinds.contains(&"Deployment"));
         assert!(kinds.contains(&"Service"));
         assert!(kinds.contains(&"NetworkPolicy"));
+        let deployment = out.iter().find(|m| m["kind"] == "Deployment").unwrap();
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["dnsConfig"],
+            crate::pod_dns::pod_dns_config(),
+            "ndots:1 on every infra pod"
+        );
     }
 
     #[test]
@@ -1761,6 +1791,55 @@ mod tests {
             matches!(err, CompileError::NameTooLong { .. }),
             "expected NameTooLong, got {err:?}",
         );
+    }
+
+    /// Two copies of one node (a member's each) live in the same
+    /// namespace: each creates its own Secret and ConfigMap, named after
+    /// its instance, and each copy's references point at its own. A
+    /// reference to a pre-existing object keeps the name as written.
+    #[test]
+    fn config_literals_are_per_instance_and_references_follow() {
+        let data: std::collections::BTreeMap<String, String> = [("k".to_string(), "v".to_string())].into_iter().collect();
+        let mut container = Container::new("c", Image::Upstream { reference: "nginx:1".into() });
+        container.env = vec![
+            EnvEntry::FromSecret { name: "A".into(), secret: "creds".into(), key: "k".into() },
+            EnvEntry::FromConfigMap { name: "B".into(), config_map: "settings".into(), key: "k".into() },
+            EnvEntry::FromSecret { name: "C".into(), secret: "outside".into(), key: "k".into() },
+        ];
+        container.mounts = vec![
+            Mount { volume: "creds-vol".into(), path: "/creds".into(), sub_path: None, read_only: false },
+            Mount { volume: "settings-vol".into(), path: "/settings".into(), sub_path: None, read_only: false },
+        ];
+        let spec = InfraSpec {
+            units: vec![Unit { name: "app".into(), kind: UnitKind::Deployment, containers: vec![container], ..Default::default() }],
+            volumes: vec![
+                Volume { name: "creds-vol".into(), kind: VolumeKind::Secret { name: "creds".into(), items: None } },
+                Volume { name: "settings-vol".into(), kind: VolumeKind::ConfigMap { name: "settings".into(), items: None } },
+            ],
+            config: vec![
+                ConfigSource::SecretLiteral { name: "creds".into(), data: data.clone() },
+                ConfigSource::ConfigMapLiteral { name: "settings".into(), data },
+                ConfigSource::SecretRef { name: "outside".into() },
+            ],
+            ..Default::default()
+        };
+        let ada = CompileContext { instance_id: "inst-ada", ..ctx() };
+        let bob = CompileContext { instance_id: "inst-bob", ..ctx() };
+        for (context, instance) in [(&ada, "inst-ada"), (&bob, "inst-bob")] {
+            let out = compile(&spec, context).expect("compiles");
+            let named = |kind: &str| out.iter().find(|m| m["kind"] == kind).map(|m| m["metadata"]["name"].clone());
+            assert_eq!(named("Secret"), Some(json!(format!("{instance}-creds"))));
+            assert_eq!(named("ConfigMap"), Some(json!(format!("{instance}-settings"))));
+            let deployment = out.iter().find(|m| m["kind"] == "Deployment").expect("the workload");
+            let pod = &deployment["spec"]["template"]["spec"];
+            let env = &pod["containers"][0]["env"];
+            assert_eq!(env[0]["valueFrom"]["secretKeyRef"]["name"], json!(format!("{instance}-creds")));
+            assert_eq!(env[1]["valueFrom"]["configMapKeyRef"]["name"], json!(format!("{instance}-settings")));
+            assert_eq!(env[2]["valueFrom"]["secretKeyRef"]["name"], "outside", "a pre-existing Secret keeps its name");
+            let volume = |name: &str| pod["volumes"].as_array().unwrap().iter().find(|v| v["name"] == name).cloned().unwrap();
+            assert_eq!(volume("creds-vol")["secret"]["secretName"], json!(format!("{instance}-creds")));
+            assert_eq!(volume("settings-vol")["configMap"]["name"], json!(format!("{instance}-settings")));
+        }
     }
 
     #[test]

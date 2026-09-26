@@ -180,20 +180,17 @@ async fn drop_journal_rows(
             );
         }
         if dropped.is_empty() {
-            // Deactivate before the first delete: a still-running
-            // execution would keep appending events to a color
-            // mid-erase. The wipe spec drops every signal and cancels
-            // running executions (wipe is only legal with cancel);
-            // same canonical body `weft deactivate` posts. Only
-            // reached when rows exist, so a rerun after a completed rm
-            // (project already gone, nothing to drop) skips it instead
-            // of failing on the missing project.
-            progress.dispatcher_call_start(&format!("/projects/{project_id}/deactivate"));
+            // Quiesce before the first delete: a run still going would
+            // keep appending events to a color mid-erase. The dispatcher
+            // wipes every trigger and cancels EVERY live run of the
+            // project (started by a trigger, by hand, or unrecorded),
+            // and answers only once none is live. Only reached when
+            // rows exist, so a rerun after a completed rm (project
+            // already gone, nothing to drop) skips it instead of failing
+            // on the missing project.
+            progress.dispatcher_call_start(&format!("/projects/{project_id}/quiesce"));
             client
-                .post_with_body(
-                    &format!("/projects/{project_id}/deactivate"),
-                    &serde_json::json!({ "mode": "wipe", "runningPolicy": "cancel" }),
-                )
+                .post_with_body(&format!("/projects/{project_id}/quiesce"), &serde_json::json!({}))
                 .await
                 .with_context(|| format!(
                     "could not quiesce project {project_id} before dropping its \
@@ -202,7 +199,7 @@ async fn drop_journal_rows(
                      re-registers: run `weft run` in the project folder, then \
                      rerun `weft rm --journal`"
                 ))?;
-            progress.dispatcher_call_done(serde_json::json!({ "step": "deactivate" }));
+            progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));
         }
         for color in fresh {
             client

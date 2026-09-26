@@ -123,21 +123,37 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 /// address instead: the requester's host says nothing about what a
 /// third party can reach.
 ///
-/// Trust: `Host` is attacker-controlled on a direct request, so the
-/// links this builds are only ever capability URLs whose token is the
-/// credential. A forged host redirects the forger to their own server
-/// with a token they already had, which grants them nothing new.
+/// A proxy in front (a website passing a browser's request through,
+/// mounted under a path of its own) says where the caller really was:
+/// `X-Forwarded-Host` wins over `Host`, `X-Forwarded-Proto` names the
+/// scheme, and `X-Forwarded-Prefix` is the path the proxy is mounted
+/// under (`/weft`), which the base then ends with. Each takes its first
+/// hop when a chain of proxies lists several. A prefix that is not a
+/// plain path gives no base at all, rather than a link to somewhere
+/// the caller never was.
+///
+/// Trust: these headers are attacker-controlled on a direct request, so
+/// the links this builds are only ever capability URLs whose token is
+/// the credential. A forged host redirects the forger to their own
+/// server with a token they already had, which grants them nothing new.
+// SYNC: the forwarded headers <-> packages/weft-connect/src/server/passthrough.ts FORWARDED_HOST, FORWARDED_PROTO, FORWARDED_PREFIX
 pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
-    let host = headers.get(http::header::HOST)?.to_str().ok()?.trim();
+    let host = match headers.get("x-forwarded-host") {
+        Some(forwarded) => first_hop(forwarded)?,
+        None => headers.get(http::header::HOST)?.to_str().ok()?.trim(),
+    };
     if host.is_empty() {
         return None;
     }
+    let prefix = match headers.get("x-forwarded-prefix") {
+        Some(forwarded) => forwarded_prefix(first_hop(forwarded)?)?,
+        None => String::new(),
+    };
     // A proxy that terminated TLS says so; otherwise the scheme is
     // whatever this listener speaks, which is plain http.
     let scheme = headers
         .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or(v).trim().to_string())
+        .and_then(first_hop)
         .map(|v| v.to_ascii_lowercase())
         .filter(|v| v == "http" || v == "https")
         .unwrap_or_else(|| "http".to_string());
@@ -172,7 +188,31 @@ pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     if !bare_authority {
         return None;
     }
-    Some(parsed.origin().ascii_serialization())
+    Some(format!("{}{prefix}", parsed.origin().ascii_serialization()))
+}
+
+/// The first value of a header a chain of proxies may list comma-separated.
+fn first_hop(value: &http::HeaderValue) -> Option<&str> {
+    let text = value.to_str().ok()?;
+    Some(text.split(',').next().unwrap_or(text).trim())
+}
+
+/// A forwarded mount path as a base's tail: `/weft` (a trailing slash
+/// dropped), empty for the root. `None` for anything that is not a plain
+/// path of ordinary segments, so no query, host or `..` rides into a link.
+fn forwarded_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let segments = trimmed.strip_prefix('/')?;
+    let plain = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+    };
+    segments.split('/').all(plain).then(|| trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -275,6 +315,37 @@ mod request_base_url_tests {
         assert_eq!(
             request_base_url(&headers(&[("host", "a.example.com"), ("x-forwarded-proto", "HTTPS")])),
             Some("https://a.example.com".to_string())
+        );
+    }
+
+    /// Behind a proxy that passes the request through under a path of
+    /// its own, the base is where the caller really was.
+    #[test]
+    fn a_forwarding_proxy_names_the_host_scheme_and_mount() {
+        assert_eq!(
+            request_base_url(&headers(&[
+                ("host", "10.0.0.7:9999"),
+                ("x-forwarded-host", "app.example.com, 10.0.0.2"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-prefix", "/weft/"),
+            ]))
+            .as_deref(),
+            Some("https://app.example.com/weft")
+        );
+        assert_eq!(
+            request_base_url(&headers(&[("host", "a.example.com"), ("x-forwarded-prefix", "/")])).as_deref(),
+            Some("http://a.example.com")
+        );
+        for bad in ["weft", "/a/../b", "/a//b", "/a?b", "//evil.example", "/a b"] {
+            assert_eq!(
+                request_base_url(&headers(&[("host", "a.example.com"), ("x-forwarded-prefix", bad)])),
+                None,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            request_base_url(&headers(&[("host", "a.example.com"), ("x-forwarded-host", "evil@x.example")])),
+            None
         );
     }
 
