@@ -1694,7 +1694,7 @@ fn published_spec() -> AccessSpec {
     serde_json::from_value(json!({
         "service": "selfrun",
         "acquisition": { "kind": "static", "fields": [
-            { "name": "host" },
+            { "name": "host", "secret": false },
             { "name": "password" },
             { "name": "port", "optional": true },
         ]},
