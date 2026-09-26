@@ -4,6 +4,7 @@
 // through its host bridge, a member's page answers with a member token
 // against the dispatcher's member door.
 
+import { trimTrailingSlashes } from './url';
 import type {
 	AccessSpecWire,
 	AppRegistration,
@@ -154,7 +155,7 @@ export class MemberDoor implements ConnectTransport {
 		private readonly token: string,
 		options: { base?: string; fetcher?: typeof fetch; opener?: (url: string) => void } = {},
 	) {
-		this.base = (options.base ?? WEFT_PASS_THROUGH_PATH).replace(/\/+$/, '');
+		this.base = trimTrailingSlashes(options.base ?? WEFT_PASS_THROUGH_PATH);
 		this.fetcher = options.fetcher ?? ((...args) => fetch(...args));
 		this.opener =
 			options.opener ??

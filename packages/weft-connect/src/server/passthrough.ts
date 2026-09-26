@@ -11,6 +11,8 @@
 // cookies stay behind, and so does `Weft-Member`, the header only the
 // site's server may send on the member's behalf.
 
+import { trimTrailingSlashes } from '../core/url';
+
 /** The first path segment of each door a page may reach through here: the
  *  member door, a signal's fire / skip / cancel door, the member or api
  *  token's listings (signals, displays, files), the program's own live
@@ -73,7 +75,7 @@ export function weftPassThrough(options: PassThroughOptions): (request: Request,
 		if (refused) return new Response(`weft pass-through: ${refused}`, { status: 404 });
 
 		const url = new URL(request.url);
-		const target = `${base.replace(/\/+$/, '')}/${segments.map(encodeURIComponent).join('/')}${url.search}`;
+		const target = `${trimTrailingSlashes(base)}/${segments.map(encodeURIComponent).join('/')}${url.search}`;
 		const headers = new Headers();
 		for (const name of PASSED_REQUEST_HEADERS) {
 			const value = request.headers.get(name);
