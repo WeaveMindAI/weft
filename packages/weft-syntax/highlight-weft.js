@@ -56,7 +56,7 @@
           contains: [{ begin: '\\\\.' }],
         },
 
-        // @file(...), @include(...), @require_one_of(...). The lexer's
+        // @file(...), @include(...), @require_one_of(...), @per_member. The lexer's
         // marker charset has no `-`, unlike IDENT.
         { className: 'meta', begin: '@[A-Za-z_][A-Za-z0-9_]*' },
 

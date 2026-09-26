@@ -94,6 +94,9 @@ struct Inner {
     /// error (still recorded in the log). Lets tests exercise the
     /// apply-failure branch. Decremented per failed call.
     fail_applies: u32,
+    /// When > 0, the next N `scale_workload` calls return an error
+    /// (still recorded, the workload untouched). Decremented per call.
+    fail_scales: u32,
     /// When true, `delete_pods` records the call then never returns
     /// (awaits `pending()`). Lets tests exercise a hung-action path
     /// (e.g. the HealthProtocol action timeout). Sticky.
@@ -212,6 +215,12 @@ impl FakeKube {
     /// logged). Exercises apply-failure handling in callers.
     pub fn fail_next_apply(&self) {
         self.inner.lock().fail_applies += 1;
+    }
+
+    /// Make the next `scale_workload` return an error (still logged,
+    /// the workload left as it was).
+    pub fn fail_next_scale(&self) {
+        self.inner.lock().fail_scales += 1;
     }
 
     /// Make `delete_pods` hang forever after recording the call.
@@ -403,6 +412,10 @@ impl KubeWriter for FakeKube {
             name: name.to_string(),
             replicas,
         });
+        if inner.fail_scales > 0 {
+            inner.fail_scales -= 1;
+            anyhow::bail!("FakeKube: injected scale failure");
+        }
         // Mirror the effect onto the in-memory workloads so a
         // subsequent list_replica_state reflects the scale.
         //

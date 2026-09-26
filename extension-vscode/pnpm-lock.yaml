@@ -35,6 +35,9 @@ importers:
       '@uiw/codemirror-theme-github':
         specifier: ^4.25.11
         version: 4.25.11(@codemirror/language@6.12.4)(@codemirror/state@6.7.6)(@codemirror/view@6.43.13)
+      '@weft/connect':
+        specifier: link:../packages/weft-connect
+        version: link:../packages/weft-connect
       codemirror:
         specifier: ^6.0.2
         version: 6.0.2

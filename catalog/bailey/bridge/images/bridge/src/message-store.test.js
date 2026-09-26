@@ -5,11 +5,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MessageStore, contentDisposition, mediaFacts } from './message-store.js';
+import { MessageStore, contentDisposition, extractTextContent, mediaFacts } from './message-store.js';
 
 const CHAT = '33600000000@s.whatsapp.net';
 
@@ -59,6 +59,40 @@ test('what was stored before a restart never fires again', () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('a seen-ids file that does not read stops the store, naming the file and the way out', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-store-'));
+  const path = join(dir, 'messages.json');
+  writeFileSync(`${path}.seen`, '["A", "B"');
+  assert.throws(
+    () => new MessageStore(500, path),
+    (err) => err.message.includes(`${path}.seen`) && err.message.includes('weft infra node-terminate'),
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a message history that does not read stops the store instead of starting empty and overwriting it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-store-'));
+  const path = join(dir, 'messages.json');
+  writeFileSync(path, '{"chat": [');
+  assert.throws(
+    () => new MessageStore(500, path),
+    (err) => err.message.includes(path) && err.message.includes('weft infra node-terminate'),
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a flush replaces both files whole, leaving no temporary behind', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-store-'));
+  const path = join(dir, 'messages.json');
+  const store = new MessageStore(500, path);
+  store.add(message('A', voiceNote));
+  store.flushSync();
+  assert.equal(existsSync(`${path}.tmp`), false);
+  assert.equal(existsSync(`${path}.seen.tmp`), false);
+  assert.equal(new MessageStore(500, path).add(message('A', voiceNote)), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('a media message says its size and length; a text one says neither', () => {
   assert.deepEqual(mediaFacts(message('A', voiceNote)), { fileSize: 48213, seconds: 12 });
   // A protobuf Long, as Baileys hands it over on the live path.
@@ -84,4 +118,43 @@ test('a late message older than a full chat is kept, and fires', () => {
   assert.equal(store.add(at('A', 100)), true);
   assert.ok(store.findByMessageId('A'), 'the late one is kept');
   assert.equal(store.count(CHAT), 2);
+  store.add(at('D', 400));
+  assert.equal(store.findByMessageId('A'), null, 'the next message evicts it, the oldest');
+});
+
+test('an evicted message redelivered never fires again, nor after a restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-store-'));
+  const path = join(dir, 'messages.json');
+  const at = (id, ts) => ({ ...message(id, { conversation: id }), messageTimestamp: ts });
+  const store = new MessageStore(1, path);
+  assert.equal(store.add(at('A', 100)), true);
+  assert.equal(store.add(at('B', 200)), true);
+  assert.equal(store.findByMessageId('A'), null, 'A was evicted');
+  assert.equal(store.add(at('A', 100)), false, 'its redelivery does not fire');
+  store.flushSync();
+
+  const after = new MessageStore(1, path);
+  assert.equal(after.add(at('A', 100)), false, 'nor after a restart');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the seen ids are bounded, oldest forgotten first', () => {
+  const store = new MessageStore(1, null, 2);
+  for (const id of ['A', 'B', 'C']) store.add(message(id, { conversation: id }));
+  assert.deepEqual([...store.seen], ['B', 'C']);
+});
+
+test('a kind the store does not know is unknown with no content, never an empty text', () => {
+  for (const content of [null, { reactionMessage: { text: 'x' } }, { pollCreationMessageV3: { name: 'Lunch?' } }]) {
+    assert.deepEqual(extractTextContent(message('U', content)), { content: null, messageType: 'unknown' });
+  }
+});
+
+test('a known kind keeps its type and its text or caption', () => {
+  assert.deepEqual(extractTextContent(message('T', { conversation: 'hi' })), { content: 'hi', messageType: 'text' });
+  assert.deepEqual(extractTextContent(message('V', voiceNote)), { content: null, messageType: 'audio' });
+  assert.deepEqual(
+    extractTextContent(message('I', { imageMessage: { caption: 'look' } })),
+    { content: 'look', messageType: 'image' },
+  );
 });

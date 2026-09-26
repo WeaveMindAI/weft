@@ -50,7 +50,7 @@ fn access_err(e: anyhow::Error) -> ApiError {
 /// base works and never rots; only a provider that refuses plain-http
 /// callbacks (`callback_https` on the spec) forces an https address,
 /// loudly when this weft has none.
-fn redirect_uri(state: &DispatcherState, spec: &weft_core::AccessSpec) -> Result<String, ApiError> {
+pub(crate) fn redirect_uri(state: &DispatcherState, spec: &weft_core::AccessSpec) -> Result<String, ApiError> {
     let base = callback_base(
         &state.public_base_url,
         state.internet_url.as_deref(),
@@ -97,16 +97,23 @@ pub async fn doors(
     _caller: CallerTenant,
     Json(req): Json<DoorsRequest>,
 ) -> Result<Json<DoorsStatus>, ApiError> {
+    doors_status(&state, &req).await.map(Json)
+}
+
+/// Which doors a connect page offers for `req`'s service, and where its
+/// consent comes back: what `/access/doors` answers the editor and
+/// `/member/doors` a member.
+pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) -> Result<DoorsStatus, ApiError> {
     let doors: DoorsAnswer =
-        crate::broker_admin::forward_json(&state, "/v1/access/admin/doors", &req).await?;
+        crate::broker_admin::forward_json(state, "/v1/access/admin/doors", req).await?;
     // A provider demanding https on a weft with no https address
     // blocks every CONSENT, not the panel: paste connects need no
     // callback, so the probe reports the block instead of failing.
-    let (redirect_uri, consent_blocked) = match redirect_uri(&state, &req.spec) {
+    let (redirect_uri, consent_blocked) = match redirect_uri(state, &req.spec) {
         Ok(uri) => (Some(uri), None),
         Err((_, msg)) => (None, Some(msg)),
     };
-    Ok(Json(DoorsStatus { doors, redirect_uri, consent_blocked }))
+    Ok(DoorsStatus { doors, redirect_uri, consent_blocked })
 }
 
 /// POST /access/mint-app: run the service's "Create it for me" recipe;
@@ -130,14 +137,20 @@ pub struct ListQuery {
     pub service: Option<String>,
 }
 
-/// GET /access/grants?service=: the tenant's connected accounts
-/// (summaries only).
+/// GET /access/grants?service=: the author's connected accounts
+/// (summaries only). A member's own connections are theirs, listed
+/// through the member door, never here.
 pub async fn list_grants(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<GrantSummary>>, ApiError> {
-    let mut grants = weft_access_store::list_grants(&state.pg_pool, &caller.0 .0, q.service.as_deref())
+    let mut grants = weft_access_store::list_grants(
+        &state.pg_pool,
+        &caller.0 .0,
+        q.service.as_deref(),
+        weft_access_store::GrantOwnerScope::Author,
+    )
         .await
         .map_err(access_err)?;
     // A runtime-owned row is a connection only while the key behind it
@@ -160,7 +173,7 @@ pub async fn list_grants(
 fn runtime_owned_services(grants: &[GrantSummary]) -> Vec<String> {
     let mut services: Vec<String> = grants
         .iter()
-        .filter(|g| g.owner == weft_core::CredentialOwner::Ours)
+        .filter(|g| g.owner.is_platform())
         .map(|g| g.service.clone())
         .collect();
     services.sort();
@@ -172,7 +185,7 @@ fn runtime_owned_services(grants: &[GrantSummary]) -> Vec<String> {
 /// credential for its service; stored-credential rows are left as the
 /// store answered them.
 fn stamp_runtime_credentials(grants: &mut [GrantSummary], available: &[String]) {
-    for grant in grants.iter_mut().filter(|g| g.owner == weft_core::CredentialOwner::Ours) {
+    for grant in grants.iter_mut().filter(|g| g.owner.is_platform()) {
         grant.has_credential = available.contains(&grant.service);
     }
 }
@@ -183,7 +196,7 @@ pub async fn delete_grant(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<()>, ApiError> {
-    weft_access_store::delete_grant(&state.pg_pool, &caller.0 .0, id)
+    weft_access_store::delete_grant(&state.pg_pool, &caller.0 .0, id, weft_access_store::GrantOwnerScope::Author)
         .await
         .map(Json)
         .map_err(access_err)
@@ -198,8 +211,11 @@ pub async fn delete_grant(
 pub async fn connect_direct(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<SharedDoorPick<ConnectDirect>>,
+    Json(mut req): Json<SharedDoorPick<ConnectDirect>>,
 ) -> Result<Json<CompletedConnect>, ApiError> {
+    // The author's door makes the author's connections; a member's are
+    // made at the member door, as that member.
+    req.inner.member = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/connect/direct",
@@ -218,6 +234,7 @@ pub async fn connect_begin(
     caller: CallerTenant,
     Json(mut req): Json<SharedDoorPick<BeginOAuth>>,
 ) -> Result<Json<StartedOAuth>, ApiError> {
+    req.inner.member = None;
     req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec)?;
     crate::broker_admin::forward_json(
         &state,
@@ -236,6 +253,8 @@ pub struct ConnectStatusQuery {
 /// GET /access/connect/status?state=: the editor's poll after opening
 /// the consent page. Answers the parked outcome once (`{"grant":..}`
 /// or `{"error":..}`), or `null` while the consent is still pending.
+/// 410 once nothing is live under the state (unknown, already taken,
+/// or expired): the poll stops there.
 pub async fn connect_status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -324,8 +343,11 @@ fn html_escape(s: &str) -> String {
 pub async fn lookup(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<weft_access_store::LookupRequest>,
+    Json(mut req): Json<weft_access_store::LookupRequest>,
 ) -> Result<Json<weft_access_store::LookupPage>, ApiError> {
+    // The author's door: a member's connection is never theirs to read
+    // through, whatever the body claims.
+    req.for_member = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/lookup",
@@ -346,8 +368,10 @@ pub async fn picker_begin(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     headers: axum::http::HeaderMap,
-    Json(req): Json<weft_access_store::BeginPicker>,
+    Json(mut req): Json<weft_access_store::BeginPicker>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The author's door (see `lookup`).
+    req.for_member = None;
     let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
@@ -387,6 +411,7 @@ pub async fn picker_page(
     struct TokenQuery {
         access_id: uuid::Uuid,
         service: String,
+        for_member: Option<weft_core::member::MemberScope>,
     }
     #[derive(Deserialize)]
     struct Token {
@@ -401,6 +426,7 @@ pub async fn picker_page(
             inner: TokenQuery {
                 access_id: session.access_id,
                 service: session.service.clone(),
+                for_member: session.for_member.clone(),
             },
         },
     )
@@ -488,6 +514,7 @@ fn render_picker_page(
 /// POST /access/picker/{state}/result: the picker page posts its
 /// outcome (outside surface; the single-use state nonce authenticates
 /// it). Only the two legal shapes are parked; anything else is a 400.
+// SYNC: the parked shapes <-> packages/weft-connect/src/core/wire.ts PickerOutcome
 pub async fn picker_result(
     State(state): State<DispatcherState>,
     Path(picker_state): Path<String>,
@@ -530,8 +557,10 @@ pub async fn picker_result(
 pub async fn granted(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<weft_access_store::GrantedQuery>,
+    Json(mut req): Json<weft_access_store::GrantedQuery>,
 ) -> Result<Json<Vec<weft_access_store::LookupItem>>, ApiError> {
+    // The author's door (see `lookup`).
+    req.for_member = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/granted",
@@ -553,6 +582,7 @@ mod credential_stamp_tests {
             id: uuid::Uuid::new_v4(),
             service: service.into(),
             project_id: None,
+            member: None,
             identity: None,
             label: None,
             scopes: vec![],
@@ -571,10 +601,10 @@ mod credential_stamp_tests {
     #[test]
     fn runtime_owned_rows_follow_the_brokers_answer_and_stored_ones_do_not() {
         let mut grants = vec![
-            row("openrouter", CredentialOwner::Ours, false),
-            row("openrouter", CredentialOwner::Ours, false),
-            row("exa", CredentialOwner::Ours, false),
-            row("slack", CredentialOwner::TheirOwn, true),
+            row("openrouter", CredentialOwner::Platform, false),
+            row("openrouter", CredentialOwner::Platform, false),
+            row("exa", CredentialOwner::Platform, false),
+            row("slack", CredentialOwner::Author, true),
         ];
         assert_eq!(runtime_owned_services(&grants), ["exa", "openrouter"]);
         stamp_runtime_credentials(&mut grants, &["openrouter".to_string()]);

@@ -32,6 +32,11 @@ pub struct RegisterRequest {
     /// to the right tenant. The dispatcher already knows the tenant at
     /// register time (it ran `TenantRouter`); it puts it on the wire.
     pub tenant_id: String,
+    /// Whose signal it is: the member whose trigger or run registered
+    /// it, or `None` for a shared one. The dispatcher's word, trusted
+    /// the same way as `tenant_id`; a member's trigger reads through
+    /// that member's connections alone.
+    pub for_member: Option<crate::member::MemberScope>,
     /// The resolved signal spec. Carries everything kind-specific.
     pub spec: SignalSpec,
     /// The PLACE this signal is registered at, spelled the way a person
@@ -329,6 +334,7 @@ mod tests {
         let req = RegisterRequest {
             token: "tok-1".into(),
             tenant_id: "acme".into(),
+            for_member: None,
             spec: spec(),
             node_id: "node-1".into(),
             is_resume: false,

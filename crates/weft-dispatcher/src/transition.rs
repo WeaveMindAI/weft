@@ -1,17 +1,17 @@
 //! Project-transition machinery: the driver-side pieces of the
 //! transitional-state model.
 //!
-//! The MODEL (see `project_store`): a transitional state is a real DB
-//! value on the project row (`status = activating/deactivating`, or
-//! `transition = building/cancelling_build`), entered via a
-//! single-flight guarded CAS. While a project sits in one, every
-//! conflicting verb is REJECTED instantly; the only offered action is
-//! the matching cancel. This module supplies what the DRIVING pod
-//! needs around that:
+//! The MODEL: a transitional state is a real DB value, entered via a
+//! single-flight guarded CAS: an activation's `status = activating /
+//! deactivating` on its `trigger_activation` row (`activation_store`),
+//! or the project row's build `transition = building/cancelling_build`
+//! (`project_store`). While something sits in one, every conflicting
+//! verb is REJECTED instantly; the only offered action is the matching
+//! cancel. This module supplies what the DRIVING pod needs around that:
 //!
-//! - `TransitionHeartbeat`: a drop-guarded background task bumping the
-//!   row's `transition_heartbeat_unix` so the stuck-transition reaper
-//!   (`reaper::sweep_stuck_transitions`) can tell a live transition
+//! - `TransitionHeartbeat` / `ActivationHeartbeat`: drop-guarded
+//!   background tasks bumping the row's heartbeat so the stuck-transition
+//!   reaper (`reaper::sweep_stuck_transitions`) can tell a live transition
 //!   (driver bumping) from an orphaned one (driver pod died).
 //! - `ProjectBuildGate` + `ensure_built_gated`: the `building`
 //!   transition around a verb's build. The gate engages
@@ -83,15 +83,59 @@ impl Drop for TransitionHeartbeat {
     }
 }
 
+/// The same drop-guarded heartbeat for an activation in flight: bumps the
+/// heartbeat of every activation row the setup color `activation` claimed.
+pub struct ActivationHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ActivationHeartbeat {
+    pub fn spawn(activations: crate::activation_store::ActivationStore, activation: uuid::Uuid) -> Self {
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(heartbeat_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The claim already stamped `now`; skip the immediate first tick.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = activations.bump_heartbeat(activation).await {
+                    tracing::warn!(
+                        target: "weft_dispatcher::transition",
+                        %activation,
+                        error = %e,
+                        "activation heartbeat bump failed; retrying next tick"
+                    );
+                }
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for ActivationHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Publish the transition event for a project's CURRENT row state.
 /// Called after every transition flip so both frontends observe the
 /// new state in near-real-time without a verb round-trip.
 pub(crate) async fn publish_transition_changed(state: &DispatcherState, id: uuid::Uuid) {
-    let status = match state.projects.lifecycle(id).await {
-        Ok(Some(l)) => l.status.as_str().to_string(),
-        // Row gone (removed mid-flip) or read failed: nothing useful
-        // to broadcast; the next /status read is authoritative.
-        Ok(None) => return,
+    // The project's status is its shared activations' aggregate, the
+    // same one `/status` answers with.
+    let status = match state.activations.list(id).await {
+        Ok(activations) => crate::activation_store::aggregate(
+            activations
+                .iter()
+                .filter(|a| a.key.owner == weft_core::member::Owner::Shared)
+                .map(|a| &a.lifecycle),
+        )
+        .status
+        .as_str()
+        .to_string(),
+        // A read failure: nothing useful to broadcast; the next /status
+        // read is authoritative.
         Err(e) => {
             tracing::warn!(
                 target: "weft_dispatcher::transition",
@@ -190,13 +234,10 @@ impl BuildGate for ProjectBuildGate {
                 .transition(self.id)
                 .await?
                 .unwrap_or(ProjectTransition::None);
-            let status = self
-                .state
-                .projects
-                .lifecycle(self.id)
-                .await?
-                .map(|l| l.status.as_str())
-                .unwrap_or("gone");
+            let activations = self.state.activations.list(self.id).await?;
+            let status = crate::activation_store::aggregate(activations.iter().map(|a| &a.lifecycle))
+                .status
+                .as_str();
             anyhow::bail!(
                 "cannot build now: project is {} (status {status}); wait for it to \
                  finish or cancel it first",

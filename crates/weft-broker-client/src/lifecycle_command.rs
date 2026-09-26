@@ -2,7 +2,7 @@
 //!
 //! Two consumers claim rows from this table, by DIFFERENT authorities:
 //!   - the dispatcher's `lifecycle_claimer` loop (dispatcher verbs:
-//!     deactivate / reactivate) serializes via the per-command
+//!     deactivate / reactivate / upgrade) serializes via the per-command
 //!     `claimed_by_pod` claim lease (`claimable_predicate`), because the
 //!     dispatcher has no per-project ownership lease of its own;
 //!   - the broker's `supervisor_claim_command` handler
@@ -26,13 +26,18 @@ use std::time::Duration;
 /// reclaimable. (Supervisor verbs do not use this lease; their authority
 /// is `owns_project_predicate`.)
 ///
-/// Tuned for k8s rolling updates: a graceful-shutdown deletes a pod in
-/// ~30s. A dispatcher pod that gets `SIGTERM` mid-verb drops its claim
-/// implicitly (the row sits with `claimed_by_pod = <old>` until the lease
-/// expires). 5 minutes is comfortably longer than a dispatcher verb's
-/// execution (deactivate/reactivate are signal-table transactions, not
-/// long kubectl drains), so a live claimer never has its row reclaimed.
+/// A live claimer renews its claim every [`CLAIM_RENEW_INTERVAL`] for as
+/// long as the verb runs (an upgrade waits on a drain and a setup run,
+/// for hours if the person asked to wait), so the TTL only bounds how
+/// long a DEAD claimer's command waits to be taken over. A dispatcher
+/// pod that gets `SIGTERM` mid-verb drops its claim implicitly (the row
+/// sits with `claimed_by_pod = <old>` until the lease expires).
 pub const CLAIM_LEASE_TTL: Duration = Duration::from_secs(300);
+
+/// How often a live dispatcher claimer renews its command's claim: a
+/// fifth of [`CLAIM_LEASE_TTL`], so a few missed renewals (a database
+/// briefly out of reach) never lose it.
+pub const CLAIM_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 
 /// TTL on a supervisor's EXCLUSIVE `infra_owner` lease over a project.
 /// The supervisor renews every owned project's lease on each ownership
@@ -165,11 +170,11 @@ pub const SUPERVISOR_VERBS_SQL: &str = supervisor_verbs_sql!();
 /// list inside `verb IN (...)`. A macro for the same reason as
 /// [`supervisor_verbs_sql!`]: its partial index splices it in.
 // SYNC: the dispatcher verbs <-> crates/weft-broker-client/src/protocol.rs
-//       (InfraLifecycleVerb Deactivate / Reactivate)
+//       (InfraLifecycleVerb Deactivate / Reactivate / Upgrade)
 #[macro_export]
 macro_rules! dispatcher_verbs_sql {
     () => {
-        "'deactivate', 'reactivate'"
+        "'deactivate', 'reactivate', 'upgrade'"
     };
 }
 
@@ -193,6 +198,21 @@ pub fn pending_supervisor_command(command_alias: &str) -> String {
         c = command_alias,
         verbs = SUPERVISOR_VERBS_SQL,
         claimable = claimable_project("cp"),
+    )
+}
+
+/// SQL condition that is true iff the `infra_lifecycle_command` row
+/// aliased `command_alias` acts on the infra copy `(node_expr,
+/// member_expr)`: it names that node or the whole project (`node_id IS
+/// NULL`), and its copies (`weft_core::member::Copies`) admit that
+/// member: every copy, or exactly that owner (the shared copy is the
+/// NULL member).
+// SYNC: command_reaches_copy <-> crates/weft-core/src/member.rs (Copies::admits), crates/weft-broker-client/src/protocol.rs (InFlightCommand::reaches)
+pub fn command_reaches_copy(command_alias: &str, node_expr: &str, member_expr: &str) -> String {
+    format!(
+        "({c}.node_id = {node_expr} OR {c}.node_id IS NULL) \
+         AND ({c}.every_copy OR {c}.member_id IS NOT DISTINCT FROM {member_expr})",
+        c = command_alias,
     )
 }
 
@@ -241,7 +261,7 @@ mod verb_tests {
     /// The literal list names exactly the dispatcher's verbs.
     #[test]
     fn the_dispatcher_verb_list_names_the_dispatcher_verbs() {
-        let want = [InfraLifecycleVerb::Deactivate, InfraLifecycleVerb::Reactivate]
+        let want = [InfraLifecycleVerb::Deactivate, InfraLifecycleVerb::Reactivate, InfraLifecycleVerb::Upgrade]
             .map(|v| format!("'{}'", v.as_str()))
             .join(", ");
         assert_eq!(super::DISPATCHER_VERBS_SQL, want);

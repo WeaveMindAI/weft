@@ -11,7 +11,7 @@
 #   scripts/run-e2e.sh --clean                # only remove what failed runs kept
 #
 # What a run does, once: brings the cluster to current code (setup.sh),
-# builds every test binary, removes whatever earlier failed runs kept, then
+# removes whatever earlier failed runs kept, builds every test binary, then
 # runs the tests one by one, as many at once as -j says, longest first (by
 # how long each took last time) so a slow one never starts last and holds
 # the run open. Each test's output goes to
@@ -453,18 +453,23 @@ record_unfinished
 ELAPSED=$(( $(date +%s) - RUN_STARTED ))
 echo ""
 printf 'the tests ran in %dm%02ds\n' $(( ELAPSED / 60 )) $(( ELAPSED % 60 ))
+
+# Reclaim what the run left, pass or fail: a passing test removed what it
+# made, so its fixtures' worker images now reference nothing; a failed
+# test kept its projects, and the reclaim keeps every image a project
+# still points at. The same pass drops the worker compile cache this
+# checkout moved off, which a long session of rebuilds otherwise piles up
+# by the tens of gigabytes.
+RECLAIMED=1
+weft clean --images --all >"$E2E_DIR/reclaim.log" 2>&1 || RECLAIMED=0
+if [ $RECLAIMED -eq 0 ]; then
+  echo "The final reclaim failed; its output is in $E2E_DIR/reclaim.log. Re-run 'weft clean --images --all' by hand." >&2
+fi
 if [ ${#FAILED[@]} -gt 0 ]; then
   echo "${#FAILED[@]} failed, ${#PASSED[@]} passed, $NOT_RUN not started."
   echo "Each failure kept what it made; its log and a post-mortem are in $RUN_DIR."
   echo "It stays until the next run starts. Re-run what has not passed yet (failed or not started) with --failed."
   exit 1
 fi
-
-# Every test passed, so every test removed what it made, and the worker
-# images of the fixtures this run built now reference nothing.
-if ! weft clean --images --all >"$E2E_DIR/clean.log" 2>&1; then
-  echo "All ${#PASSED[@]} e2e tests passed, BUT the final worker-image reclaim failed ($E2E_DIR/clean.log)." >&2
-  echo "Re-run 'weft clean --images --all' by hand." >&2
-  exit 1
-fi
+[ $RECLAIMED -eq 1 ] || exit 1
 echo "All ${#PASSED[@]} e2e tests passed."

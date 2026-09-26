@@ -14,6 +14,12 @@ use crate::Color;
 
 pub use crate::primitive::Phase;
 
+mod program_calls;
+pub use program_calls::{
+    ConnectionCalls, CostQuery, InfraCalls, MemberConnections, MemberTokens, MemberValueCalls, RunQuery, TokenCalls,
+    TriggerCalls, ValueCalls,
+};
+
 
 /// How long a node's provider work may take, unless it says otherwise
 /// ([`ExecutionContext::open_within`]). Generous for a normal API
@@ -34,7 +40,6 @@ pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::fr
 /// trait allows alternative implementations for testing.
 #[derive(Clone)]
 pub struct ExecutionContext {
-    pub execution_id: String,
     pub project_id: uuid::Uuid,
     pub node_id: String,
     pub node_type: String,
@@ -45,6 +50,10 @@ pub struct ExecutionContext {
     pub node_label: Option<String>,
     pub color: Color,
     pub frames: LoopFrames,
+    /// Who this run is for: the member whatever started it named, or
+    /// `None` for a run for nobody in particular. Read it through
+    /// [`Self::member`].
+    member: Option<crate::member::MemberId>,
     /// The node's INPUTS this firing, one bag: wired pulse values,
     /// braces/assignment literals from the `.weft` body, and declared
     /// defaults for anything still absent. However an input got its
@@ -128,21 +137,32 @@ impl ExecutionContext {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        execution_id: String,
         project_id: uuid::Uuid,
         node_id: String,
         node_type: String,
         node_label: Option<String>,
         color: Color,
         frames: LoopFrames,
+        member: Option<crate::member::MemberId>,
         inputs: ValueBag,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
         let wake = ValueBag::wake(handle.wake_payload());
         Self {
-            execution_id, project_id, node_id, node_type, node_label, color, frames,
+            project_id, node_id, node_type, node_label, color, frames, member,
             inputs, wake, handle,
         }
+    }
+
+    /// Who this run is for: the member whatever started it named (a
+    /// firing through a member's own copy, a member token, the
+    /// `Weft-Member` header on a gated route, `weft run --member`), or
+    /// `None` for a run for nobody in particular (a cron, an admin
+    /// route). A node that needs one says so with its own error; the
+    /// runtime has already refused a run that reaches a per-member node
+    /// without one.
+    pub fn member(&self) -> Option<&crate::member::MemberId> {
+        self.member.as_ref()
     }
 
     // ----- Wait-and-resume primitive ---------------------------------
@@ -2051,6 +2071,28 @@ pub trait ContextHandle: Send + Sync {
     /// Backs [`ExecutionContext::stop_tagged`]. `tag` is already
     /// validated.
     async fn stop_tagged(&self, tag: String, stop_self: StopSelf) -> WeftResult<()>;
+    /// Backs the program calls (`ctx.infra(..)`, `ctx.trigger(..)`,
+    /// `ctx.connections()`, `ctx.costs()`, `ctx.runs()`,
+    /// `ctx.tokens()`): carries `call` to the runtime as this run and
+    /// answers its value. When the call stops this run too
+    /// (`StopSelf::Include`, the run among what it reaches) it does not
+    /// return: the run waits for its own cancel. `call_index` is the
+    /// `ctx.run` step the answer is journaled under (`run_step`): the
+    /// same call on a replayed run has the same index, so the runtime
+    /// keys the call on it and a call carried twice is one call.
+    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: StopSelf, call_index: u32) -> WeftResult<Value>;
+    /// Backs `ctx.tokens().mint_for_member`: a member token for `member`
+    /// of this run's project, working for `expires_in_secs`, reading the
+    /// member's own copies' displays when `displays`. `id` is the token's
+    /// id, chosen by the run: minting under an id that already names this
+    /// member's token replaces that token.
+    async fn mint_member_token(
+        &self,
+        member: &crate::member::MemberId,
+        expires_in_secs: u64,
+        displays: bool,
+        id: uuid::Uuid,
+    ) -> WeftResult<crate::program::MintedMemberToken>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
     /// The output port names this node declares in its metadata.
@@ -2403,6 +2445,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
+        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
+        async fn mint_member_token(&self, _: &crate::member::MemberId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedMemberToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
@@ -2459,6 +2503,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
+        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
+        async fn mint_member_token(&self, _: &crate::member::MemberId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedMemberToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
@@ -2529,13 +2575,13 @@ mod value_bag_tests {
             filename: "p.png".into(),
         };
         let mut ctx = ExecutionContext::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
             crate::Color::nil(),
             LoopFrames::default(),
+            None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
             Arc::new(StorageProbeHandle { public_link: None, presign_fails: true, puts: Default::default() }),
         );
@@ -2561,13 +2607,13 @@ mod value_bag_tests {
     async fn copy_puts_the_source_stream_under_the_handles_scope() {
         let handle = Arc::new(StorageProbeHandle { public_link: None, presign_fails: false, puts: Default::default() });
         let ctx = ExecutionContext::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
             crate::Color::nil(),
             LoopFrames::default(),
+            None,
             inputs_bag(json!({})),
             handle.clone(),
         );
@@ -2599,13 +2645,13 @@ mod value_bag_tests {
             filename: "p.png".into(),
         };
         let mut ctx = ExecutionContext::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
             crate::Color::nil(),
             LoopFrames::default(),
+            None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
             Arc::new(StorageProbeHandle { public_link: None, presign_fails: false, puts: Default::default() }),
         );
@@ -2640,13 +2686,13 @@ mod value_bag_tests {
         let ty = WeftType::parse("Image").unwrap();
         let with_link = |link: Option<&str>| {
             ExecutionContext::new(
-                "exec-1".into(),
                 uuid::Uuid::nil(),
                 "node-1".into(),
                 "TestNode".into(),
                 None,
                 crate::Color::nil(),
                 LoopFrames::default(),
+                None,
                 inputs_bag(json!({})),
                 Arc::new(StorageProbeHandle { public_link: link.map(str::to_string), presign_fails: false, puts: Default::default() }),
             )
@@ -2674,13 +2720,13 @@ mod value_bag_tests {
 
     fn ctx(inputs_json: serde_json::Value) -> ExecutionContext {
         ExecutionContext::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
             crate::Color::nil(),
             LoopFrames::default(),
+            None,
             inputs_bag(inputs_json),
             Arc::new(DeadHandle),
         )

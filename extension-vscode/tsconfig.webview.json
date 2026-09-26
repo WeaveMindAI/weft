@@ -27,9 +27,13 @@
     "../packages/weft-graph/src/webview/**/*.ts",
     "../packages/weft-graph/src/webview/**/*.svelte",
     "../packages/weft-graph/src/index.ts",
-    "../packages/weft-graph/src/protocol.ts"
+    "../packages/weft-graph/src/protocol.ts",
+    // The connect library the editor's connection picker is built on,
+    // consumed from source the same way.
+    "../packages/weft-connect/src/**/*.ts",
+    "../packages/weft-connect/src/**/*.svelte"
   ],
   // Vitest specs are run by vitest (its own tsconfig/globals), not bundled into
   // the webview, so they don't belong to this typecheck.
-  "exclude": ["../packages/weft-graph/src/webview/**/*.test.ts"]
+  "exclude": ["../packages/weft-graph/src/webview/**/*.test.ts", "../packages/weft-connect/src/**/*.test.ts"]
 }

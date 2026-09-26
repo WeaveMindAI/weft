@@ -1,0 +1,12 @@
+[package]
+name = "members"
+
+# Nodes for a program with members: bringing a member's own copies up
+# and down, turning their triggers on and off, handing their browser a
+# member token, reading and setting the values a member provides, reading
+# who a run is for, what a member spent, which copies exist and every
+# member weft holds anything for, and wiping everything a member has. Each
+# is a thin node over the ctx calls (`ctx.infra(..)`, `ctx.triggers()`,
+# `ctx.tokens()`, `ctx.member()`, `ctx.values()`, `ctx.members()`,
+# `ctx.costs()`, ...); `lifecycle.rs` is how the nodes
+# read a member id and the take-down choices.

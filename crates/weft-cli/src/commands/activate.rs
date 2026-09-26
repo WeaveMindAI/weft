@@ -12,6 +12,8 @@
 //! `--running-policy` says whether its running executions are
 //! cancelled now (the default) or waited for, up to `--drain-timeout`.
 
+use anyhow::Context;
+
 use super::ensure::{parse_running_choice, running_choice_fields};
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -22,6 +24,7 @@ pub async fn run(
     reactivate_choice_flag: Option<String>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
+    scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
@@ -32,6 +35,7 @@ pub async fn run(
             reactivate_choice_flag,
             running_policy,
             drain_timeout,
+            scope,
         )
         .await
     })
@@ -45,17 +49,27 @@ async fn run_inner(
     reactivate_choice_flag: Option<String>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
+    scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     // Parsed before anything is built: a misspelt policy, or a cap with
     // nothing to bound, is refused here, not after a build that took a
     // minute.
     let (running_policy, drain_timeout) =
         parse_running_choice(running_policy.as_deref(), drain_timeout)?;
-    let (client, id, name, binary_hash, definition_hash, infra_hash) = match project {
+    let (client, id, name, binary_hash, definition_hash, infra_hash, image_hashes) = match project {
         // Activate-by-id skips the build/discover step entirely.
-        Some(id) => (ctx.client(), id.clone(), id, None, None, None),
+        Some(id) => (ctx.client(), id.clone(), id, None, None, None, None),
         None => {
             let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
+            // A program with per-member infra starts its members' copies
+            // itself, whenever it likes, and a copy is applied from the
+            // recorded image tags: they are built and recorded here, so
+            // no `weft infra start` has to come first.
+            let image_hashes = if has_per_member_infra(&handle.plan)? {
+                Some(super::infra::build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?)
+            } else {
+                None
+            };
             (
                 handle.client,
                 handle.id,
@@ -63,6 +77,7 @@ async fn run_inner(
                 Some(handle.plan.binary_hash),
                 Some(handle.plan.definition_hash),
                 Some(handle.plan.infra_hash),
+                image_hashes,
             )
         }
     };
@@ -97,16 +112,25 @@ async fn run_inner(
     if let Some(choice) = reactivate_choice {
         body.insert("reactivateChoice".into(), serde_json::Value::String(choice));
     }
+    // SYNC: imageHashes <-> crates/weft-dispatcher/src/api/project.rs ActivationTarget::image_hashes
+    if let Some(tags) = image_hashes {
+        body.insert("imageHashes".into(), serde_json::to_value(tags)?);
+    }
     body.extend(running_choice_fields(running_policy, drain_timeout));
+    body.insert("scope".into(), serde_json::to_value(&scope)?);
     // The one line that says the call may now sit for a while (only
     // under a wait: the progress reads the policy off the body), so a
     // quiet terminal is a wait and not a hang.
     progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let _: serde_json::Value = client.post_json(&path, &serde_json::Value::Object(body)).await?;
+    let answer: serde_json::Value = client.post_json(&path, &serde_json::Value::Object(body)).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     progress.trigger_register_done();
+    // SYNC: infra_not_running <-> crates/weft-dispatcher/src/api/project.rs ActivateResponse::infra_not_running
+    if let Some(note) = answer.get("infra_not_running").and_then(|v| v.as_str()) {
+        progress.warn(note);
+    }
     if !ctx.json() {
         println!("activated {name} ({id})");
     }
@@ -116,34 +140,36 @@ async fn run_inner(
 
 /// Read the project's preserved state from `/status`. Returns
 /// `Some((parked, suspended))` only when the project is `inactive`
-/// AND at least one count is non-zero. Otherwise `None`: either
-/// the project isn't in a state that has preserved state, or its
-/// preserved state is empty.
-///
-/// Status fetch errors map to None: an unreachable dispatcher will
-/// surface its own error on the activate POST that follows.
+/// AND at least one count is non-zero; `None` when the project is in no
+/// state that preserves anything, or preserved nothing. A status that
+/// cannot be read, or an inactive project whose answer carries no
+/// preservation counts, is an error: guessing "nothing preserved" would
+/// skip the choice and drop the parked work on the default.
 async fn fetch_preserved_state(
     client: &crate::client::DispatcherClient,
     id: &str,
-) -> Option<(u64, u64)> {
+) -> anyhow::Result<Option<(u64, u64)>> {
     let path = format!("/projects/{id}/status");
-    let resp: serde_json::Value = client.get_json(&path).await.ok()?;
-    let status = resp.get("status").and_then(|v| v.as_str())?;
+    let resp: serde_json::Value = client
+        .get_json(&path)
+        .await
+        .context("read the project's status to see what its inactive window preserved")?;
+    let mismatch = || {
+        anyhow::anyhow!(
+            "the dispatcher's status for {id} does not say what it preserved: {resp}; upgrade the \
+             dispatcher or this CLI so the versions match"
+        )
+    };
+    let status = resp.get("status").and_then(|v| v.as_str()).ok_or_else(mismatch)?;
     if status != "inactive" {
-        return None;
+        return Ok(None);
     }
-    let parked = resp
-        .pointer("/preservation/parked")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let suspended = resp
-        .pointer("/preservation/suspended")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let count = |key: &str| resp.pointer(&format!("/preservation/{key}")).and_then(|v| v.as_u64()).ok_or_else(mismatch);
+    let (parked, suspended) = (count("parked")?, count("suspended")?);
     if parked == 0 && suspended == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((parked, suspended))
+    Ok(Some((parked, suspended)))
 }
 
 /// JSON-mode preserved-state check. Bails with a clear message
@@ -153,7 +179,7 @@ async fn require_choice_when_preserved(
     client: &crate::client::DispatcherClient,
     id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some((parked, suspended)) = fetch_preserved_state(client, id).await else {
+    let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
         return Ok(None);
     };
     anyhow::bail!(
@@ -179,7 +205,7 @@ async fn prompt_reactivate_choice(
     client: &crate::client::DispatcherClient,
     id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some((parked, suspended)) = fetch_preserved_state(client, id).await else {
+    let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
         return Ok(None);
     };
     println!("Preserved during inactive window:");
@@ -198,4 +224,16 @@ async fn prompt_reactivate_choice(
         _ => anyhow::bail!("invalid reactivate choice '{line}'; expected 1, 2, or 3"),
     };
     Ok(Some(choice.to_string()))
+}
+
+/// Whether the compiled program has an infra node each member gets a copy
+/// of: one marked `@per_member`, one with a `@member_filled` field, or one
+/// reached from either (the compiler marks all three `per_member`).
+fn has_per_member_infra(plan: &weft_compiler::build_plan::BuildPlan) -> anyhow::Result<bool> {
+    let definition: weft_core::ProjectDefinition = serde_json::from_str(&plan.definition_json)
+        .map_err(|e| anyhow::anyhow!("read the build plan's compiled program: {e}"))?;
+    Ok(definition
+        .nodes
+        .iter()
+        .any(|n| n.requires_infra && n.per_member.is_some()))
 }

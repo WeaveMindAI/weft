@@ -301,7 +301,8 @@ pub struct Tree {
 pub struct Head {
     pub head_version: Option<String>,
     pub head_run: Option<String>,
-    pub activation_version: Option<String>,
+    #[serde(default)]
+    pub activated_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -601,6 +602,8 @@ pub struct RunFlags {
     pub feed: Vec<String>,
     pub fire: Vec<String>,
     pub emit: Vec<String>,
+    /// Who the run is for (`--member`).
+    pub member: Option<weft_core::member::MemberId>,
     pub clear: Vec<String>,
 }
 
@@ -613,6 +616,7 @@ impl RunFlags {
             && self.feed.is_empty()
             && self.fire.is_empty()
             && self.emit.is_empty()
+            && self.member.is_none()
             && self.clear.is_empty()
     }
 }
@@ -667,7 +671,8 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
             "group" => spec.group = None,
             "feed" => spec.feed.clear(),
             "fire" => spec.fire = None,
-            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, or fire"),
+            "member" => spec.member = None,
+            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, or member"),
         }
     }
     if !flags.from.is_empty() { spec.from = parse_port_flags(&flags.from, "--from", true)?; }
@@ -678,6 +683,9 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
         spec.group = parse_port_flags(std::slice::from_ref(group), "group", true)?.into_iter().next();
     }
     if let Some(fire) = flags.fire.first() { spec.fire = Some(parse_node_flag(fire, "--fire")?); }
+    if let Some(member) = &flags.member {
+        spec.member = Some(member.clone());
+    }
     for (node, ports) in parse_port_flags(&flags.emit, "--emit", false)? {
         spec.emit.entry(node).or_default().extend(ports);
     }

@@ -144,6 +144,10 @@ spec:
         app: weft-postgres
         weft.dev/role: postgres
     spec:
+      # ndots:1: a fully qualified internal name resolves as written,
+      # never walking the search list out to the host resolver first
+      # (weft_core::pod_dns, whose test holds this line in sync).
+      dnsConfig: {"options":[{"name":"ndots","value":"1"}]}
       containers:
         - name: postgres
           # SYNC: postgres image tag <-> setup.sh (--purge --postgres,

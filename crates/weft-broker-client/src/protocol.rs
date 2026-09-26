@@ -116,8 +116,11 @@ macro_rules! wire_enum_roundtrip_tests {
 wire_enum! {
     /// Lifecycle verb stored in `infra_lifecycle_command.verb`.
     /// `Apply` / `Stop` / `Terminate` are claimed by the per-tenant
-    /// supervisor pod; `Deactivate` / `Reactivate` are claimed by the
-    /// dispatcher's `lifecycle_claimer` loop. The split is enforced
+    /// supervisor pod; `Deactivate` / `Reactivate` / `Upgrade` are
+    /// claimed by the dispatcher's `lifecycle_claimer` loop. `Upgrade`
+    /// is a person's `weft infra upgrade`, issued by the dispatcher
+    /// alone (never by a supervisor: [`LifecycleSpec`] cannot name it).
+    /// The split is enforced
     /// in the claim queries' `verb IN (...)` predicates (and the
     /// matching partial-index `WHERE` clauses, which can't be
     /// parameterized), in `weft-broker/handlers.rs` and
@@ -128,6 +131,7 @@ wire_enum! {
         Terminate = "terminate",
         Deactivate = "deactivate",
         Reactivate = "reactivate",
+        Upgrade = "upgrade",
     }
 }
 
@@ -141,74 +145,10 @@ pub use weft_core::{
     DEFAULT_DRAIN_TIMEOUT_SECS,
 };
 
-wire_enum! {
-    /// Lifecycle-state of an infra node row, written into `infra_node.status`.
-    pub enum InfraNodeStatus {
-        /// Mid-apply: the apply task started but hasn't successfully
-        /// written `Running` yet.
-        Provisioning = "provisioning",
-        /// Infra node is up, supervisor sees at least one Pod Ready.
-        Running = "running",
-        /// Deployment scaled to 0 (user clicked Stop). PVCs preserved.
-        Stopped = "stopped",
-        /// Supervisor declared the node below its readiness threshold.
-        Flaky = "flaky",
-        /// The most recent apply (or post-apply execute) failed.
-        /// `failure_stage` carries the structured reason.
-        Failed = "failed",
-        /// Transient: supervisor mid-stop.
-        Stopping = "stopping",
-        /// Transient: supervisor mid-terminate. Row is removed on success.
-        Terminating = "terminating",
-    }
-}
-
-impl InfraNodeStatus {
-    /// Coarse precedence for rolling N per-unit statuses up to one
-    /// node-level status. Higher wins. Transient/bad states dominate
-    /// healthy ones so the node never looks "running" while a unit is
-    /// mid-terminate or failed. Must match the dispatcher's
-    /// `infra_rollup` precedence so the two agree.
-    pub fn rollup_rank(self) -> u8 {
-        match self {
-            Self::Terminating => 7,
-            Self::Stopping => 6,
-            Self::Provisioning => 5,
-            Self::Failed => 4,
-            Self::Flaky => 3,
-            Self::Running => 2,
-            Self::Stopped => 1,
-        }
-    }
-
-    /// Roll a set of per-unit statuses up to one node-level status by
-    /// `rollup_rank` (worst-of-units). Empty -> `Stopped` (no units
-    /// up is the degenerate "nothing running" case).
-    pub fn rollup<'a>(units: impl IntoIterator<Item = &'a InfraNodeStatus>) -> InfraNodeStatus {
-        units
-            .into_iter()
-            .copied()
-            .max_by_key(|s| s.rollup_rank())
-            .unwrap_or(InfraNodeStatus::Stopped)
-    }
-
-    /// The node status a completed apply stamps (`set_applied`), from
-    /// the roster it writes: every reconciled unit just came up
-    /// `Running`, and the only other status a unit can hold at that
-    /// point is `Flaky` (a frozen unit the apply left alone), so the
-    /// node is `Flaky` if any unit is and `Running` otherwise. The
-    /// general `rollup` would say `Stopped` for a unit-less roster
-    /// (a spec of shared resources only), which a successful apply is
-    /// not. The broker and the supervisor's test fake both stamp
-    /// through this, so the node status agrees with its roster.
-    pub fn applied_rollup<'a>(units: impl IntoIterator<Item = &'a InfraNodeStatus>) -> InfraNodeStatus {
-        if units.into_iter().any(|s| *s == InfraNodeStatus::Flaky) {
-            InfraNodeStatus::Flaky
-        } else {
-            InfraNodeStatus::Running
-        }
-    }
-}
+/// The lifecycle state of an infra node copy lives in weft-core, where a
+/// program's `ctx.infra(..).status()` decodes it too; re-exported here so
+/// the `weft_broker_client::protocol::*` paths keep working.
+pub use weft_core::infra::InfraNodeStatus;
 
 /// Per-unit runtime state carried in `infra_node.units_json`. The map
 /// key is the unit name. This is the per-unit truth: the node-level
@@ -239,13 +179,43 @@ pub struct UnitRuntime {
     /// patches (`jsonb_set ... 'status'`) leave this untouched.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub image_refs: std::collections::BTreeSet<String>,
+    /// Resolved at apply: whether the health loop's watch can ever see
+    /// this unit ready (`weft_core::infra::Unit::health_watched`). Only a
+    /// watched unit counts as seen from its row after the loop's memory
+    /// is lost (`NodeHealthState::seeded_from`); any other would read as
+    /// vanished and turn flaky. `false` on an entry stamped before the
+    /// field existed: such a unit is seeded as unseen until its next
+    /// apply, exactly as every unit was before.
+    #[serde(default)]
+    pub watched: bool,
+    /// The replica count weft itself set on this unit's workload, when
+    /// that count is one the health loop must know about: `Some(0)` from
+    /// an apply of a unit whose spec asks for zero (a fixed count, or an
+    /// autoscale floor, of 0), or the count a health protocol's `Scale`
+    /// set, recorded once the cluster took it
+    /// (`/v1/supervisor/set_scaled`). A reconciled unit's apply stamps
+    /// it afresh from the spec; a frozen unit (left up) carries it
+    /// forward, since its workload keeps whatever a protocol set. The
+    /// health loop reads it to tell a zero weft asked for from a
+    /// workload scaled down outside weft. `None` on an entry stamped
+    /// before the field existed: any zero there is unintended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaled_to: Option<u32>,
+}
+
+impl UnitRuntime {
+    /// Whether weft itself asked this unit's workload to run zero
+    /// replicas (see [`Self::scaled_to`]).
+    pub fn zero_replicas_intended(&self) -> bool {
+        self.scaled_to == Some(0)
+    }
 }
 
 wire_enum! {
     /// Lifecycle status of a project row, written into
     /// `project.status`. Both the dispatcher (writer) and the
     /// supervisor (reader, via the broker) consume this enum.
-    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts projectStatus,
+    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts LifecycleStatus,
     ///       crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.status
     pub enum ProjectStatus {
         /// Fresh row, never activated.
@@ -259,26 +229,6 @@ wire_enum! {
         Deactivating = "deactivating",
         /// Idle; gate refuses / parks fires per the lifecycle axes.
         Inactive = "inactive",
-    }
-}
-
-impl InfraNodeStatus {
-    /// Statuses where the node is expected to have running replicas
-    /// the health loop should observe. Used by the supervisor's
-    /// health tick: a node mid-apply or mid-stop has no SLO; only
-    /// `Running` / `Flaky` does.
-    pub fn expects_running_replicas(self) -> bool {
-        matches!(self, Self::Running | Self::Flaky)
-    }
-
-    /// Statuses where re-apply can reuse the existing instance_id
-    /// (PVCs may already be bound, services may already exist).
-    /// `Terminating` cannot: we're tearing it down, not reapplying.
-    /// Every other status either has live state to reattach to
-    /// (Running/Flaky/Stopped/Stopping) or is mid-failure that
-    /// sweep+re-apply handles idempotently (Provisioning/Failed).
-    pub fn permits_instance_id_reuse(self) -> bool {
-        !matches!(self, Self::Terminating)
     }
 }
 
@@ -308,6 +258,23 @@ pub struct JournalRecordRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordResponse {}
+
+/// `POST /v1/journal/record_retroactive`: a failed unrecorded run's whole
+/// record, written at once, which turns it into a recorded run. Worker-only
+/// and pod-bound like `journal_record`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalRecordRetroactiveRequest {
+    pub events: Vec<ExecEvent>,
+    pub pod_name: String,
+}
+
+/// `POST /v1/journal/forget_unrecorded`: an unrecorded run ended without
+/// failing; drop what is left of it. Worker-only and pod-bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalForgetUnrecordedRequest {
+    pub color: String,
+    pub pod_name: String,
+}
 
 // ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
 
@@ -562,11 +529,16 @@ pub struct WorkerPodMarkDoneIfIdleResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
-    pub project_id: Uuid,
+    /// The asking run. The broker resolves its project and member from
+    /// it, so a run reaches only its own member's copy.
+    pub color: weft_core::Color,
     /// The instance's place spelling (see `InfraEnqueueApplyRequest`):
     /// the asking node's own place, so a node inside a file included
     /// twice reaches the instance of its own call.
     pub node_id: String,
+    /// Whether the node exists once per member: then the copy is the
+    /// run's member's, else the shared one.
+    pub per_member: bool,
     pub endpoint_name: String,
 }
 
@@ -646,6 +618,11 @@ pub struct PublishAccessRequest {
     pub values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Whether the publishing node exists once per member: its
+    /// connection is then the run member's (whose, the broker reads off
+    /// the run, never from here), else the shared one.
+    #[serde(default)]
+    pub per_member: bool,
 }
 
 /// The reference the publisher gets back, to put on its output port.
@@ -660,6 +637,30 @@ pub struct PublishedAccessRequest {
     pub color: String,
     pub node_id: String,
     pub service: String,
+    /// As on [`PublishAccessRequest::per_member`].
+    #[serde(default)]
+    pub per_member: bool,
+}
+
+/// Worker: mint a member token for a member of the run's own project
+/// (`ctx.tokens().mint_for_member`). The project is the run's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramMintMemberTokenRequest {
+    /// The token's id, chosen by the run and journaled before this
+    /// request: a replayed run mints under the same id, which replaces
+    /// that token (a new value, the old one dead) instead of leaving a
+    /// second one behind.
+    pub id: uuid::Uuid,
+    pub color: String,
+    pub member: weft_core::member::MemberId,
+    /// How long it works, in seconds; required, a year at most.
+    pub expires_in_secs: u64,
+    /// Whether it reads its member's copies' displays (a bridge's pairing
+    /// code).
+    #[serde(default)]
+    pub displays: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The answer: the published connection, or nothing published yet.
@@ -805,18 +806,22 @@ pub struct SupervisorProject {
     /// a per-supervisor identity (it has none).
     pub tenant_id: String,
     pub project_namespace: String,
-    /// Current `project.status`. The supervisor's health protocol
-    /// engine consumes this so a `HealthCondition::ProjectStatusEq`
-    /// can fire based on lifecycle (e.g. "auto-recover only when
-    /// the project is currently parked"). No `serde(default)`:
-    /// broker and supervisor deploy together, a missing field is
-    /// schema drift and should fail loud on deserialize.
+    /// The project's listening as one status: the aggregate over all
+    /// its trigger activations, every owner's
+    /// (`weft_broker_client::activation::aggregate`). The supervisor's
+    /// health protocol engine consumes this so a
+    /// `HealthCondition::ProjectStatusEq` can fire based on lifecycle
+    /// (e.g. "auto-recover only when the project is currently
+    /// parked"). No `serde(default)`: broker and supervisor deploy
+    /// together, a missing field is schema drift and should fail loud
+    /// on deserialize.
     pub status: ProjectStatus,
-    /// True iff the current deactivation was performed by the health
-    /// loop (autonomous park), not the user. The default auto-recover
-    /// protocol gates its reactivate on this so it never overrides a
-    /// user-initiated stop / deactivate. See `ProjectLifecycle`.
-    pub deactivated_by_health: bool,
+    /// True iff some activation the health loop took down (it parks
+    /// only what reads a broken infra copy) is still down. A person's
+    /// deactivate clears the mark on what it takes down, so the default
+    /// auto-recover protocol, gated on this, reactivates only what the
+    /// health loop took and never overrides a person's stop.
+    pub health_parked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,9 +860,17 @@ pub struct SupervisorInfraNodesRequest {
 pub struct SupervisorInfraNode {
     /// The instance's place spelling (see `InfraEnqueueApplyRequest`).
     pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
     pub instance_id: String,
     pub status: InfraNodeStatus,
     pub applied_spec_hash: Option<String>,
+    /// When the last apply of this copy finished (unix seconds), `None`
+    /// before any. The health loop's durable "this copy's workloads
+    /// exist by now": a copy running past its apply by its flaky window
+    /// whose workload is missing is broken, whatever the loop's memory
+    /// lost in a restart or a move to another pod.
+    pub applied_at_unix: Option<i64>,
     /// Where the last apply stamped the endpoints. The apply's full
     /// skip compares it with what the spec gives now, so a row stamped
     /// before a field existed (or by an older rule) is applied again
@@ -926,6 +939,10 @@ pub struct SupervisorCommandRow {
     pub id: i64,
     pub project_id: Uuid,
     pub node_id: Option<String>,
+    /// Which copies the command acts on (an apply names exactly one:
+    /// shared, or one member's). Absent reads as the shared copies.
+    #[serde(default)]
+    pub copies: weft_core::member::Copies,
     pub verb: InfraLifecycleVerb,
     /// Whether the supervisor should wait for the project's
     /// running-execution count to reach 0 before performing the
@@ -956,6 +973,10 @@ pub struct SupervisorCommandRow {
 pub struct SupervisorEventRecordRequest {
     pub project_id: Uuid,
     pub node_id: Option<String>,
+    /// Whose copy the event is about: `None` for the shared one (or a
+    /// project-level event).
+    #[serde(default)]
+    pub member: Option<weft_core::member::MemberId>,
     pub kind: InfraEventKind,
     pub payload: serde_json::Value,
 }
@@ -1153,6 +1174,8 @@ pub struct SupervisorSetStatusRequest {
     pub command_id: Option<i64>,
     pub project_id: Uuid,
     pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
     /// The unit whose status this write sets. `Some(unit)` updates that
     /// unit's entry in `units_json` and recomputes the node-level
     /// rollup; the autonomous health loop always targets a unit.
@@ -1170,6 +1193,29 @@ pub struct SupervisorSetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusResponse {}
 
+/// Record the replicas a health protocol's `Scale` set on one unit of
+/// one copy, into that unit's `UnitRuntime::scaled_to`. The supervisor
+/// writes it AFTER the cluster took the scale, so the row never claims
+/// a count the cluster does not have; a refused write fails the action
+/// and the protocol retries. Fenced like the
+/// autonomous `set_status`: the caller must own the project, the unit
+/// must be in the row's roster, and no lifecycle command may be in
+/// flight for the copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetScaledRequest {
+    /// See [`SupervisorSetStatusRequest::pod_name`].
+    pub pod_name: String,
+    pub project_id: Uuid,
+    pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
+    pub unit: String,
+    pub replicas: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetScaledResponse {}
+
 /// Atomic post-apply state write: status, instance_id, applied spec
 /// hash, endpoints map. Supervisor calls this on successful apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1186,6 +1232,8 @@ pub struct SupervisorSetAppliedRequest {
     pub command_id: i64,
     pub project_id: Uuid,
     pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
     pub instance_id: String,
     pub applied_spec_hash: String,
     #[serde(flatten)]
@@ -1237,6 +1285,8 @@ pub struct SupervisorSetProvisioningRequest {
     pub command_id: i64,
     pub project_id: Uuid,
     pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
     pub instance_id: String,
     pub namespace: String,
     /// Carried forward to `set_applied`; needed at Terminate time
@@ -1274,25 +1324,99 @@ pub struct SupervisorEnqueueLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum LifecycleSpec {
-    Deactivate(DeactivateSpec),
-    Reactivate,
+    /// Take down what a health protocol reaches, under `spec`.
+    Deactivate(TakeDownReaders),
+    /// Bring back what the health loop took down: each activation it
+    /// took carries the mark (`deactivated_by_health`) the take-down
+    /// set, and of those this restores every one that reads none of the
+    /// `still_broken` copies.
+    Reactivate(RestoreReaders),
+}
+
+/// The health loop's recovery: the activations it took down that read
+/// none of the copies `still_broken` names. Named by what is still
+/// broken rather than by what recovered, so a trigger that also reads a
+/// copy the loop cannot see (an apply that failed, a unit with no
+/// replicas) comes back with the rest: nothing says that copy is broken.
+/// Empty when nothing is: every activation the loop took comes back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreReaders {
+    pub still_broken: Vec<InfraCopy>,
+}
+
+/// The health loop's take-down: `spec`, over the activations `reach`
+/// names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TakeDownReaders {
+    pub spec: DeactivateSpec,
+    pub reach: TakeDownReach,
+}
+
+/// Which live activations a health take-down reaches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TakeDownReach {
+    /// Every live activation of the project: the protocol's condition
+    /// names no infra, so nothing says which copies are broken.
+    Project,
+    /// The activations whose triggers read one of the `broken` copies,
+    /// and nothing else. A shared copy is read by every owner's triggers
+    /// that read the node; a member's copy only by that member's. Never
+    /// empty: a take-down aimed at no copy is refused.
+    ReadersOf { broken: Vec<InfraCopy> },
+}
+
+impl TakeDownReaders {
+    /// The spec's own rule, and a reach that names something.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.spec.validate()?;
+        if matches!(&self.reach, TakeDownReach::ReadersOf { broken } if broken.is_empty()) {
+            return Err("a health take-down aimed at broken infra copies must name them");
+        }
+        Ok(())
+    }
+}
+
+/// One copy of an infra node, as the health loop names what it found
+/// broken or recovered: the node's place, and whose copy (`None` for the
+/// shared one).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InfraCopy {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<weft_core::member::MemberId>,
 }
 
 impl LifecycleSpec {
+    /// A take-down's own rule ([`TakeDownReaders::validate`]); a
+    /// recovery has none (any set of still-broken copies, empty
+    /// included, says what to restore). Checked where the spec is
+    /// written and again where it is claimed.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Deactivate(take_down) => take_down.validate(),
+            Self::Reactivate(_) => Ok(()),
+        }
+    }
+
     /// Project the typed spec onto the (verb, running_policy,
     /// spec_json) columns the `infra_lifecycle_command` schema
     /// stores. `running_policy` is `None` for dispatcher-owned
     /// verbs: Deactivate carries it inside `spec_json` (single
-    /// source of truth); Reactivate has no running-fires concept.
+    /// source of truth); Reactivate has no running-fires concept, and
+    /// carries its still-broken copies in `spec_json`.
     /// Supervisor-owned verbs (Stop / Terminate) populate the
     /// column directly through `issue_lifecycle`; Apply ignores it.
     pub fn into_row_columns(self) -> (InfraLifecycleVerb, Option<RunningPolicy>, Option<Value>) {
         match self {
-            Self::Deactivate(spec) => {
-                let payload = serde_json::to_value(spec).expect("DeactivateSpec serializes");
+            Self::Deactivate(take_down) => {
+                let payload = serde_json::to_value(take_down).expect("TakeDownReaders serializes");
                 (InfraLifecycleVerb::Deactivate, None, Some(payload))
             }
-            Self::Reactivate => (InfraLifecycleVerb::Reactivate, None, None),
+            Self::Reactivate(restore) => {
+                let payload = serde_json::to_value(restore).expect("RestoreReaders serializes");
+                (InfraLifecycleVerb::Reactivate, None, Some(payload))
+            }
         }
     }
 
@@ -1301,11 +1425,11 @@ impl LifecycleSpec {
     /// encode and decode share one source of truth.
     ///
     /// Returns `Err` on:
-    /// - a verb that isn't dispatcher-claimable (`Apply`/`Stop`/
-    ///   `Terminate` shouldn't land here);
-    /// - `Deactivate` with NULL or malformed `spec_json`;
-    /// - `Reactivate` with non-NULL `spec_json` (would be a writer
-    ///   bug).
+    /// - a verb this spec does not carry (`Apply`/`Stop`/`Terminate`
+    ///   are the supervisor's, and an `Upgrade` carries the
+    ///   dispatcher's own spec);
+    /// - `Deactivate` or `Reactivate` with NULL or malformed
+    ///   `spec_json`.
     pub fn from_row_columns(
         verb: InfraLifecycleVerb,
         spec_json: Option<Value>,
@@ -1313,15 +1437,15 @@ impl LifecycleSpec {
         match verb {
             InfraLifecycleVerb::Deactivate => {
                 let json = spec_json.ok_or(FromRowColumnsError::DeactivateMissingSpec)?;
-                let spec: DeactivateSpec = serde_json::from_value(json)
+                let take_down: TakeDownReaders = serde_json::from_value(json)
                     .map_err(FromRowColumnsError::DeactivateMalformed)?;
-                Ok(Self::Deactivate(spec))
+                Ok(Self::Deactivate(take_down))
             }
             InfraLifecycleVerb::Reactivate => {
-                if spec_json.is_some() {
-                    return Err(FromRowColumnsError::ReactivateUnexpectedSpec);
-                }
-                Ok(Self::Reactivate)
+                let json = spec_json.ok_or(FromRowColumnsError::ReactivateMissingSpec)?;
+                let restore: RestoreReaders = serde_json::from_value(json)
+                    .map_err(FromRowColumnsError::ReactivateMalformed)?;
+                Ok(Self::Reactivate(restore))
             }
             other => Err(FromRowColumnsError::NotDispatcherClaimable(other)),
         }
@@ -1338,9 +1462,11 @@ pub enum FromRowColumnsError {
     DeactivateMissingSpec,
     #[error("deactivate spec_json malformed: {0}")]
     DeactivateMalformed(#[source] serde_json::Error),
-    #[error("reactivate command unexpectedly carries spec_json")]
-    ReactivateUnexpectedSpec,
-    #[error("verb '{0}' is not dispatcher-claimable; supervisor's filter must match")]
+    #[error("reactivate command missing spec_json")]
+    ReactivateMissingSpec,
+    #[error("reactivate spec_json malformed: {0}")]
+    ReactivateMalformed(#[source] serde_json::Error),
+    #[error("verb '{0}' carries no supervisor-issued spec")]
     NotDispatcherClaimable(InfraLifecycleVerb),
 }
 
@@ -1362,6 +1488,10 @@ pub struct InfraEnqueueApplyRequest {
     /// key its `infra_node` row and every resource are made under. A
     /// file included twice is applied twice, once per place.
     pub node_id: String,
+    /// Whose copy: the setup run's member, for a node that exists once
+    /// per member; `None` for a shared node.
+    #[serde(default)]
+    pub member: Option<weft_core::member::MemberId>,
     pub spec_json: serde_json::Value,
 }
 
@@ -1508,6 +1638,11 @@ pub struct SupervisorRemoveNodeRequest {
     pub pod_name: String,
     pub project_id: Uuid,
     pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
+    /// The terminate removing it: the one command of this copy the
+    /// cascade does not cancel, since it is the one finishing.
+    pub command_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1567,6 +1702,10 @@ pub struct SupervisorTriggerDepsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRunningCountRequest {
     pub project_id: Uuid,
+    /// Whose runs: a member's copy going waits on that member's runs
+    /// only; the shared copies wait on every run.
+    #[serde(default)]
+    pub copies: weft_core::member::Copies,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1584,33 +1723,58 @@ pub struct SupervisorInfraCommandInFlightRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraCommandInFlightResponse {
-    /// True if the project has an uncompleted `infra_lifecycle_command`
-    /// (a user infra action: apply / stop / terminate is in flight).
-    /// The health loop stands down for the whole project while this is
-    /// true so it never fights a user action over a node's status.
-    pub in_flight: bool,
+    /// The project's uncompleted supervisor commands (apply / stop /
+    /// terminate), each as the copies it acts on. The health loop stands
+    /// down for exactly those copies while they are here, so it never
+    /// fights a user action over a copy's status, and leaves every other
+    /// copy's health running.
+    pub commands: Vec<InFlightCommand>,
+}
+
+/// Which copies one uncompleted infra command acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightCommand {
+    /// The node it names; `None` for every node of the project.
+    pub node_id: Option<String>,
+    pub copies: weft_core::member::Copies,
+}
+
+impl InFlightCommand {
+    /// Whether it acts on the copy of `node_id` owned by `member`.
+    // SYNC: InFlightCommand::reaches <-> crates/weft-broker-client/src/lifecycle_command.rs (command_reaches_copy)
+    pub fn reaches(&self, node_id: &str, member: Option<&weft_core::member::MemberId>) -> bool {
+        self.node_id.as_deref().is_none_or(|n| n == node_id) && self.copies.admits(member)
+    }
 }
 
 // ---------- Signals ----------
 
-/// The `project.status` values whose signal rows belong in a listener
-/// pod's in-RAM registry: a project being activated (the rehydrate at
-/// the end of activate runs before the flip to active) or live. A
-/// hibernated or parked project keeps its rows in the table so
+/// The activation statuses whose signal rows belong in a listener pod's
+/// in-RAM registry: the activation governing the signal (its trigger's
+/// for an entry, the trigger's that fired its run for a wait) is being
+/// activated (the rehydrate at the end of activate runs before the flip
+/// to active) or live. A signal no activation governs reads as live. A
+/// hibernated or parked activation keeps its rows in the table so
 /// reactivate can restore them, but the pod was told to forget them at
 /// deactivate, and a pod restarting must not bring them back. Both
 /// readers of the table use this one list: the broker's
 /// `signal/list_for_pod` (what a booting pod rehydrates) and the
 /// dispatcher's `listener_inspect` (what it counts as placed).
-pub const LISTENER_HELD_PROJECT_STATUSES: [&str; 2] =
+pub const LISTENER_HELD_STATUSES: [&str; 2] =
     [ProjectStatus::Activating.as_str(), ProjectStatus::Active.as_str()];
+
+/// The join every "is this signal held" read goes through: the
+/// activation governing signal `s` as `a` (absent when none governs it).
+pub const SIGNAL_ACTIVATION_JOIN: &str = "LEFT JOIN trigger_activation a \
+    ON a.project_id = s.project_id AND a.trigger = s.activation_trigger \
+    AND a.member_id IS NOT DISTINCT FROM s.member_id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalListForPodRequest {
     /// The pooled listener pod asking for the signals placed on it.
     /// The broker returns rows where `signal.listener_pod = pod_name`
-    /// and the owning project's status is one of
-    /// [`LISTENER_HELD_PROJECT_STATUSES`].
+    /// and the governing activation's status is one of
+    /// [`LISTENER_HELD_STATUSES`].
     pub pod_name: String,
 }
 
@@ -1705,6 +1869,10 @@ pub struct SignalRowWire {
     /// held-event fire). Filled per row by the `list_for_pod` path the
     /// listener rehydrates from.
     pub tenant_id: String,
+    /// Whose signal it is (`None` for a shared one), from the row's
+    /// `project_id` and `member_id`: the rehydrated signal reads through
+    /// that member's connections alone, as it did when first registered.
+    pub for_member: Option<weft_core::member::MemberScope>,
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
@@ -1747,6 +1915,12 @@ pub struct SignalRowWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerResolveRequest {
     pub tenant: String,
+    /// Whose signal the connection serves (`None` for a shared one), as
+    /// registered, the same trust as `tenant`: a member's trigger reads
+    /// through that member's connection alone. Carried rather than read
+    /// off the signal row, because a trigger resolves while it is being
+    /// registered, before its row exists.
+    pub for_member: Option<weft_core::member::MemberScope>,
     pub access_id: String,
     pub service: String,
     /// The stored values the SIGNAL's input declared it needs (the
@@ -1776,6 +1950,10 @@ pub struct SubscriptionEnsureRequest {
     pub topic: String,
     pub access_id: String,
     pub signal_token: String,
+    /// Whose signal the subscription serves (`None` for a shared one),
+    /// as registered: the subscription dials through that member's
+    /// connection alone.
+    pub for_member: Option<weft_core::member::MemberScope>,
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, String>,
 }
@@ -1804,6 +1982,10 @@ pub struct SubscriptionDropRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerVerifyRequest {
     pub tenant: String,
+    /// The member whose route this is, when the gate is their own
+    /// connection (a member's trigger); `None`: a shared route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_member: Option<weft_core::member::MemberScope>,
     pub access_id: String,
     pub service: String,
     pub method: String,
@@ -1922,8 +2104,10 @@ mod supervisor_protocol_tests {
             spec,
             values: [("host".to_string(), "db.svc".to_string())].into_iter().collect(),
             label: Some("db".into()),
+            per_member: true,
         };
         let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["per_member"], true, "whose copy published it rides as a flag; the member is the run's");
         assert_eq!(v["color"], "c1");
         assert_eq!(v["node_id"], "db");
         assert_eq!(v["values"]["host"], "db.svc");
@@ -1989,7 +2173,7 @@ mod supervisor_protocol_tests {
                     "tenant_id": "alice",
                     "project_namespace": "wft-project-alice-p1",
                     "status": "active",
-                    "deactivated_by_health": false,
+                    "health_parked": false,
                 }
             ],
             "claimed": ["00000000-0000-0000-0000-0000000000a1"],
@@ -2020,6 +2204,7 @@ mod supervisor_protocol_tests {
             id: 7,
             project_id: uuid::Uuid::from_u128(0xa1),
             node_id: Some("db".into()),
+            copies: weft_core::member::Copies::Member(weft_core::member::MemberId::new("user-42").unwrap()),
             verb: InfraLifecycleVerb::Apply,
             running_policy: None,
             spec_json: None,
@@ -2048,7 +2233,7 @@ mod supervisor_protocol_tests {
                     "tenant_id": "alice",
                     "project_namespace": "wft-project-alice-p1",
                     "status": "active",
-                    "deactivated_by_health": false,
+                    "health_parked": false,
                 }
             ]
         }))
@@ -2074,13 +2259,13 @@ mod supervisor_protocol_tests {
         );
     }
 
-    /// `SupervisorProject::deactivated_by_health` also has NO
-    /// `serde(default)`: a missing field is schema drift and must fail
-    /// loud (the broker + supervisor deploy together). Pin it so a
-    /// future `serde(default)` slipping in would break CI rather than
-    /// silently defaulting the auto-recover gate to false.
+    /// `SupervisorProject::health_parked` also has NO `serde(default)`:
+    /// a missing field is schema drift and must fail loud (the broker +
+    /// supervisor deploy together). Pin it so a future `serde(default)`
+    /// slipping in would break CI rather than silently defaulting the
+    /// auto-recover gate to false.
     #[test]
-    fn owned_project_missing_deactivated_by_health_fails() {
+    fn owned_project_missing_health_parked_fails() {
         let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
             "owned": [
                 { "project_id": "00000000-0000-0000-0000-0000000000a1", "project_namespace": "wft-project-alice-p1", "status": "active" }
@@ -2088,7 +2273,7 @@ mod supervisor_protocol_tests {
         }));
         assert!(
             res.is_err(),
-            "missing deactivated_by_health should fail deserialize; got {:?}",
+            "missing health_parked should fail deserialize; got {:?}",
             res
         );
     }
@@ -2150,6 +2335,7 @@ mod supervisor_protocol_tests {
             command_id: 7,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
+            member: None,
             instance_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
@@ -2220,7 +2406,7 @@ mod supervisor_protocol_tests {
                 }],
                 identity: Some("Q @ Acme".into()),
                 relay_url: relay_url.clone(),
-                owner: weft_core::CredentialOwner::Ours,
+                owner: weft_core::CredentialOwner::Platform,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).
@@ -2233,13 +2419,13 @@ mod supervisor_protocol_tests {
                                "value": "Bearer {token}" }],
                     "identity": "Q @ Acme",
                     "relay_url": relay_url,
-                    "owner": "ours"
+                    "owner": "platform"
                 })
             );
             let back: ResolveConnectionResponse = serde_json::from_value(v).unwrap();
             assert_eq!(back.values["token"], "cred");
             assert_eq!(back.relay_url, relay_url);
-            assert_eq!(back.owner, weft_core::CredentialOwner::Ours);
+            assert_eq!(back.owner, weft_core::CredentialOwner::Platform);
         }
     }
 
@@ -2276,6 +2462,7 @@ mod supervisor_protocol_tests {
             command_id: 9,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
+            member: None,
             instance_id: "wn-abc-tgi-12".into(),
             namespace: "wft-x".into(),
             preserve_pvcs: vec!["data".into()],
@@ -2326,22 +2513,44 @@ mod supervisor_protocol_tests {
         assert_eq!(s, back);
     }
 
+    fn take_down(broken: Vec<InfraCopy>) -> TakeDownReaders {
+        TakeDownReaders {
+            spec: DeactivateSpec {
+                mode: DeactivationMode::Park,
+                grace_minutes: 0,
+                running_policy: RunningPolicy::Cancel,
+                drain_timeout_secs: None,
+            },
+            reach: TakeDownReach::ReadersOf { broken },
+        }
+    }
+
+    fn ada_svc() -> InfraCopy {
+        InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) }
+    }
+
     #[test]
     fn lifecycle_spec_round_trip_deactivate_and_reactivate() {
-        let d = LifecycleSpec::Deactivate(DeactivateSpec {
-            mode: DeactivationMode::Park,
-            grace_minutes: 0,
-            running_policy: RunningPolicy::Cancel,
-            drain_timeout_secs: None,
-        });
+        let d = LifecycleSpec::Deactivate(take_down(vec![
+            ada_svc(),
+            InfraCopy { node_id: "db".into(), member: None },
+        ]));
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["verb"], "deactivate");
+        assert_eq!(v["reach"]["kind"], "readers_of");
+        assert_eq!(v["reach"]["broken"], json!([{ "node_id": "svc", "member": "ada" }, { "node_id": "db" }]));
         let back: LifecycleSpec = serde_json::from_value(v).unwrap();
         assert_eq!(d, back);
 
-        let r = LifecycleSpec::Reactivate;
+        let whole = LifecycleSpec::Deactivate(TakeDownReaders { reach: TakeDownReach::Project, ..take_down(vec![]) });
+        let v = serde_json::to_value(&whole).unwrap();
+        assert_eq!(v["reach"], json!({ "kind": "project" }));
+        assert_eq!(serde_json::from_value::<LifecycleSpec>(v).unwrap(), whole);
+
+        let r = LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada_svc()] });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["verb"], "reactivate");
+        assert_eq!(v["still_broken"], json!([{ "node_id": "svc", "member": "ada" }]));
         let back: LifecycleSpec = serde_json::from_value(v).unwrap();
         assert_eq!(r, back);
     }
@@ -2391,6 +2600,7 @@ mod supervisor_protocol_tests {
             id: 42,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
+            copies: weft_core::member::Copies::Shared,
             verb: InfraLifecycleVerb::Terminate,
             running_policy: Some(RunningPolicy::Cancel),
             spec_json: None,
@@ -2417,21 +2627,39 @@ mod supervisor_protocol_tests {
     /// for these verbs breaks CI.
     #[test]
     fn into_row_columns_returns_none_policy_for_dispatcher_verbs() {
-        let (verb, policy, spec_json) = LifecycleSpec::Deactivate(DeactivateSpec {
-            mode: DeactivationMode::Hibernate,
-            grace_minutes: 5,
-            running_policy: RunningPolicy::Wait,
-            drain_timeout_secs: None,
-        })
-        .into_row_columns();
+        let d = LifecycleSpec::Deactivate(take_down(vec![ada_svc()]));
+        let (verb, policy, spec_json) = d.clone().into_row_columns();
         assert_eq!(verb, InfraLifecycleVerb::Deactivate);
         assert_eq!(policy, None);
-        assert!(spec_json.is_some());
+        // The row columns carry the whole take-down, broken copies too,
+        // and read back as what was written.
+        assert_eq!(LifecycleSpec::from_row_columns(verb, spec_json).unwrap(), d);
 
-        let (verb, policy, spec_json) = LifecycleSpec::Reactivate.into_row_columns();
+        let r = LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada_svc()] });
+        let (verb, policy, spec_json) = r.clone().into_row_columns();
         assert_eq!(verb, InfraLifecycleVerb::Reactivate);
         assert_eq!(policy, None);
-        assert_eq!(spec_json, None);
+        assert_eq!(LifecycleSpec::from_row_columns(verb, spec_json).unwrap(), r);
+        assert!(matches!(
+            LifecycleSpec::from_row_columns(InfraLifecycleVerb::Reactivate, None),
+            Err(FromRowColumnsError::ReactivateMissingSpec)
+        ));
+    }
+
+    /// A take-down aimed at broken copies names at least one, and one
+    /// aimed at the whole project names none; a spec the running-work
+    /// rule refuses is refused either way. A recovery has no rule: an
+    /// empty still-broken set restores everything the loop took.
+    #[test]
+    fn a_take_down_names_its_broken_copies() {
+        assert!(take_down(vec![ada_svc()]).validate().is_ok());
+        assert!(take_down(vec![]).validate().is_err());
+        assert!(TakeDownReaders { reach: TakeDownReach::Project, ..take_down(vec![]) }.validate().is_ok());
+        assert!(LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![] }).validate().is_ok());
+        let mut wipe_wait = take_down(vec![ada_svc()]);
+        wipe_wait.spec.mode = DeactivationMode::Wipe;
+        wipe_wait.spec.running_policy = RunningPolicy::Wait;
+        assert!(wipe_wait.validate().is_err());
     }
 
     #[test]
@@ -2441,6 +2669,7 @@ mod supervisor_protocol_tests {
             command_id: None,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
+            member: None,
             unit: None,
             status: InfraNodeStatus::Running,
             failure_stage: None,
@@ -2459,6 +2688,7 @@ mod supervisor_protocol_tests {
             command_id: Some(42),
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
+            member: None,
             unit: None,
             status: InfraNodeStatus::Stopping,
             failure_stage: None,
@@ -2475,6 +2705,7 @@ mod supervisor_protocol_tests {
         let r = SupervisorEventRecordRequest {
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
+            member: None,
             kind: InfraEventKind::Flaky,
             payload: json!({ "desired": 3, "ready": 1 }),
         };
@@ -2510,8 +2741,9 @@ mod supervisor_protocol_tests {
     #[test]
     fn endpoint_url_request_carries_endpoint_name() {
         let v = json!({
-            "project_id": "00000000-0000-0000-0000-0000000000a1",
+            "color": "00000000-0000-0000-0000-0000000000a1",
             "node_id": "n",
+            "per_member": false,
             "endpoint_name": "api"
         });
         let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
@@ -2527,6 +2759,7 @@ mod supervisor_protocol_tests {
         SignalRowWire {
             token: "t".into(),
             tenant_id: "tenant-a".into(),
+            for_member: None,
             node_id: "n".into(),
             kind_state_seq: 0,
             spec_json: "{}".into(),
@@ -2649,6 +2882,10 @@ mod supervisor_protocol_tests {
     fn listener_resolve_request_round_trip() {
         let req = ListenerResolveRequest {
             tenant: "tenant-a".into(),
+            for_member: Some(weft_core::member::MemberScope {
+                project_id: uuid::Uuid::from_u128(0xa1),
+                member: weft_core::member::MemberId::new("alice").unwrap(),
+            }),
             access_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "slack".into(),
             required_values: vec!["imap_host".into()],
@@ -2660,6 +2897,10 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "tenant-a",
+                "for_member": {
+                    "project_id": "00000000-0000-0000-0000-0000000000a1",
+                    "member": "alice"
+                },
                 "access_id": "11111111-2222-3333-4444-555555555555",
                 "service": "slack",
                 "required_values": ["imap_host"]
@@ -2667,12 +2908,15 @@ mod supervisor_protocol_tests {
         );
         let back: ListenerResolveRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.service, "slack");
-        // required_values defaults when absent.
+        assert_eq!(back.for_member, req.for_member);
+        // required_values defaults when absent; a shared signal's
+        // member is null.
         let bare: ListenerResolveRequest = serde_json::from_value(json!({
-            "tenant": "t", "access_id": "a", "service": "s"
+            "tenant": "t", "for_member": null, "access_id": "a", "service": "s"
         }))
         .unwrap();
         assert!(bare.required_values.is_empty());
+        assert!(bare.for_member.is_none());
     }
 
     #[test]
@@ -2719,6 +2963,7 @@ mod supervisor_protocol_tests {
             topic: "drive".into(),
             access_id: "a-1".into(),
             signal_token: "sig-1".into(),
+            for_member: None,
             params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -2726,7 +2971,7 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "tenant-a", "service": "google", "topic": "drive",
-                "access_id": "a-1", "signal_token": "sig-1",
+                "access_id": "a-1", "signal_token": "sig-1", "for_member": null,
                 "params": { "target": "file-9" }
             })
         );
@@ -2865,6 +3110,7 @@ mod supervisor_protocol_tests {
     fn caller_verify_wire_round_trips() {
         let req = CallerVerifyRequest {
             tenant: "alice".into(),
+            for_member: None,
             access_id: "acc-1".into(),
             service: "hmac_auth".into(),
             method: "POST".into(),

@@ -40,6 +40,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         SetConfig { node, key, value, form } => set_config(view, node, key, Some(value), *form),
         RemoveConfig { node, key, form } => set_config(view, node, key, None, *form),
         SetLabel { node, label } => set_label(view, node, label.as_deref()),
+        SetPerMember { node, per_member } => set_per_member(view, node, *per_member),
         AddNode { id, node_type, parent_group } => {
             // The type is written into the source too, so it is validated at the
             // door: a single identifier, and not one of the type names the
@@ -1264,6 +1265,54 @@ fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), 
     }
 }
 
+/// Add or remove a node's `@per_member` line. Whether the node may carry
+/// it is the compiler's call (it reads the node's metadata, which this
+/// layer has no catalog for); the editor only offers the toggle where the
+/// compiler would accept it. Idempotent both ways, and removing takes
+/// every copy, so a hand-written duplicate goes too.
+fn set_per_member(view: &FileView, node_id: &str, on: bool) -> Result<(), EditError> {
+    let decl = resolve(view, node_id)?;
+    match &decl {
+        Decl::Node(_) => {}
+        // An inline node sits inside another node's value; a directive
+        // line there would split that value across lines.
+        Decl::InlineNode(_) => {
+            return Err(EditError::InvalidArgument(format!(
+                "'{node_id}' is written inside another node's value; give it its own line \
+                 first, then mark it per member"
+            )));
+        }
+        other => return Err(kind_mismatch("setPerMember", node_id, "Node", other)),
+    }
+    let existing: Vec<SyntaxNode> = decl
+        .body()
+        .map(|body| {
+            body.syntax()
+                .children()
+                .filter(|n| n.kind() == SyntaxKind::DIRECTIVE)
+                .filter(|n| {
+                    n.children_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .find(|t| t.kind() == SyntaxKind::MARKER)
+                        .is_some_and(|t| {
+                            crate::cst::marker::directive(t.text()) == weft_core::member::PER_MEMBER_DIRECTIVE
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if on {
+        if existing.is_empty() {
+            insert_body_line(&decl, &format!("@{}", weft_core::member::PER_MEMBER_DIRECTIVE), BodyLine::Directive)?;
+        }
+    } else {
+        for directive in existing {
+            detach_body_member(&directive);
+        }
+    }
+    Ok(())
+}
+
 /// The string entries of a loop's `carry: [...]` config field. The `[...]`
 /// value lexes as ONE opaque JSON_VALUE token, so parse it as JSON (non-list
 /// or non-string entries are a config error the compiler reports; the sweep
@@ -1346,6 +1395,25 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
     // tree (the insert re-parses `key: value`, so a stray `}` closes the body
     // early). Reject loud before building, so insert and replace agree.
     reject_uncontained_value(value)?;
+    insert_body_line(decl, &format!("{key}: {value}"), BodyLine::Field)
+}
+
+/// What a line inserted into a body is, which decides how a one-line body
+/// takes it: a field joins it with a comma (`{ x: 1, v: 2 }`), a directive
+/// must stand on its own line, so the body is opened first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyLine {
+    Field,
+    Directive,
+}
+
+/// Insert one body line (`content`, already built and contained) into the
+/// decl's body. If the node has no body (bare or a one-liner), a fresh
+/// multi-line body is synthesized; otherwise the line is appended before the
+/// existing body's `}`, leaving every existing byte of the body untouched (so
+/// heredocs / hand-alignment / comments survive). Splices only the decl node,
+/// never lifts elements across trees.
+fn insert_body_line(decl: &Decl, content: &str, line: BodyLine) -> Result<(), EditError> {
     // An inline node sits MID-line (`data: Text {...}.out`), so its own
     // leading trivia is not a line indent; the enclosing field/statement
     // holds the line's real column.
@@ -1357,13 +1425,31 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
     };
     let body_indent = format!("{indent}  ");
     match decl.body() {
-        // Has a body: splice the new field before its close brace, in place.
+        // A directive in a one-line body: open the body so the directive
+        // gets its own line (`{ a: 1 }` becomes `{ a: 1` / the directive /
+        // `}`), since a directive is a whole line, never a list item.
+        Some(body) if line == BodyLine::Directive && body_is_single_line(&body) => {
+            if let Some(t) = body.close_brace().and_then(|brace| brace.prev_token()) {
+                if t.kind() == SyntaxKind::WHITESPACE {
+                    t.detach();
+                }
+            }
+            let at = body
+                .close_brace()
+                .map(|b| b.index())
+                .ok_or_else(|| EditError::Unparseable("node body has no closing brace".into()))?;
+            let mut elems = raw_token_elements(&[(SyntaxKind::WHITESPACE, &format!("\n{body_indent}"))]);
+            elems.extend(snippet_elements_as_body_content(content));
+            elems.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, &format!("\n{indent}"))]));
+            body.syntax().splice_children(at..at, elems);
+            Ok(())
+        }
+        // Has a body: splice the new line before its close brace, in place.
         Some(body) => {
-            // Snippet carries just the `key: value` content; the helper owns
+            // Snippet carries just the line's content; the helper owns
             // surrounding whitespace so repeated edits don't accumulate
             // blank lines.
-            let snippet = format!("{key}: {value}");
-            insert_before_close_with_indent(&body, &body_indent, snippet_elements_as_body_content(&snippet))
+            insert_before_close_with_indent(&body, &body_indent, snippet_elements_as_body_content(content))
         }
         // No body: synthesize one with the single field.
         None => {
@@ -1374,7 +1460,7 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
                 // wire survives.
                 Decl::InlineNode(inline) => {
                     let (rhs, port) = inline_decl_parts(inline)?;
-                    format!("{rhs} {{\n{body_indent}{key}: {value}\n{indent}}}.{port}")
+                    format!("{rhs} {{\n{body_indent}{content}\n{indent}}}.{port}")
                 }
                 _ => {
                     // The decl's ONE leading-whitespace token (see
@@ -1403,7 +1489,7 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
                         if carried { format!("{leading}{ws_indent}") } else { String::new() };
                     let header = decl_header_text(decl);
                     format!(
-                        "{prefix}{} {{\n{body_indent}{key}: {value}\n{ws_indent}}}",
+                        "{prefix}{} {{\n{body_indent}{content}\n{ws_indent}}}",
                         header.trim()
                     )
                 }

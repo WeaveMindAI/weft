@@ -97,6 +97,24 @@ item and then closes the port; `[]` closes it without an item. A
 list-typed ordinary port receives its array as one value, so you read the
 actual port type before choosing.
 
+If a branch needs a file its real source cannot give you here (a WhatsApp
+voice note needs a paired phone), you hand one from disk. Any value given to
+`--emit`, `--from`, `--group` or `--fire`, or saved in an example, may be a
+marker written exactly as in source, with the same meaning:
+`"@asset(\"samples/hello.ogg\", Audio)"` is uploaded into the project's
+storage and becomes the file value the port expects (its type names one
+kind: `Image`, `Video`, `Audio` or `Blob`), and `"@file(\"prompts/x.md\")"`
+becomes the file's text. A path is relative to the project root. Inside the
+JSON the inner quotes are escaped:
+
+```bash
+weft run --emit receive='{"messageType":"audio","file":"@asset(\"samples/hello.ogg\", Audio)","seconds":3}' --target transcribe
+```
+
+A missing file is refused before the run starts, and so is a file on a port
+whose type does not take it, the same check as any other handed value. A
+saved example keeps the marker, so it reads the file afresh on every run.
+
 A [cut] inside an ordinary group stays at the requested node, and the
 group's `_should_flow` gate still applies: false stops the branch; true
 dispatches only the selected work. Loops are indivisible: you use the

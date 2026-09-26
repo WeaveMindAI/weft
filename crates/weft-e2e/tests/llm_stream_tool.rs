@@ -75,7 +75,7 @@ async fn llm_stream_and_tool_loop_close_in_the_graph() -> anyhow::Result<()> {
 
     // The measured trail: exactly the three openrouter-served calls
     // (live, t1, t2), each with a resolved cost on the user's own key.
-    settled.assert_measured("openrouter", "their-own", 3).await?;
+    settled.assert_measured("openrouter", "author", 3).await?;
 
     project.finish().await?;
     conn.finish().await

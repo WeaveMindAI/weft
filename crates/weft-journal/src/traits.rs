@@ -96,6 +96,26 @@ pub trait JournalClient: Send + Sync {
     /// by the worker before writing its own terminal so the
     /// dispatcher's cancel path doesn't bridge double.
     async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool>;
+
+    /// An unrecorded run that failed: write its whole record (every
+    /// event, in order, terminal included) and make it an ordinary
+    /// recorded run, in one transaction, so it lists and inspects like
+    /// any other. Refused unless the color is still unrecorded. Only a
+    /// journal that reaches the database takes it; every other one
+    /// refuses loudly.
+    async fn record_retroactively(&self, events: &[ExecEvent], pod_name: Option<&str>) -> anyhow::Result<()> {
+        let _ = (events, pod_name);
+        anyhow::bail!("this journal cannot record an unrecorded run afterwards")
+    }
+
+    /// An unrecorded run that ended without failing: drop its color row
+    /// when nothing of it reached the journal (the costs it reported
+    /// keep it, since they are addressed by color), and release its run
+    /// files. Only a journal that reaches the database takes it.
+    async fn forget_unrecorded(&self, color: weft_core::Color, pod_name: Option<&str>) -> anyhow::Result<()> {
+        let _ = (color, pod_name);
+        anyhow::bail!("this journal cannot forget an unrecorded run")
+    }
 }
 
 /// The no-write implementation: every write vanishes, every read
@@ -156,6 +176,17 @@ impl JournalClient for PostgresJournalClient {
         crate::write::record_event_from_pod(&self.pool, event, pod_name)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn record_retroactively(&self, events: &[ExecEvent], pod_name: Option<&str>) -> anyhow::Result<()> {
+        crate::unrecorded::record_retroactively(&self.pool, events, pod_name).await
+    }
+
+    async fn forget_unrecorded(&self, color: weft_core::Color, _pod_name: Option<&str>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::unrecorded::forget_in(&mut tx, color).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn raw_rows_after(

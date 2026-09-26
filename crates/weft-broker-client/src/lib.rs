@@ -8,6 +8,7 @@
 //! token periodically; reading on each call keeps the auth fresh
 //! without any in-process refresh logic).
 
+pub mod activation;
 pub mod client;
 pub mod lifecycle_command;
 pub mod protocol;

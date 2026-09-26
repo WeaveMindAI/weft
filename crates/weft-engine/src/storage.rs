@@ -632,6 +632,7 @@ mod fake {
                     tenant: "t1".into(),
                     project_id: "p1".into(),
                     color: Some("c1".into()),
+                    member: None,
                 },
                 files: Mutex::new(BTreeMap::new()),
                 identities: Mutex::new(BTreeMap::new()),

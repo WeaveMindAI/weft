@@ -16,7 +16,7 @@
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
-	import { openPortMenu, buildPortMenuItems } from "../../utils/port-context-menu";
+	import { openPortMenu, buildPortMenuItems, memberFilledMenuItem, type MemberFilledToggle } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { portDeleteAction } from "../../projection/header-ports";
@@ -32,7 +32,7 @@
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, memberFilled, memberFilledValue } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -66,6 +66,10 @@
 			// holds resolved content.
 			fileContents?: Record<string, FileContent>;
 			includePath?: string;
+			/// Whether this node exists once per member: `marked` where the
+			/// source says `@per_member`, `derived` when it is reached from
+			/// a marked node. Drawn as a badge under the label.
+			perMember?: import('../../../../protocol').PerMember;
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			/// Flip the gate between `_should_flow` and
 			/// `_should_not_flow`. Its own hook rather than a
@@ -77,6 +81,8 @@
 			onSaveFileRef?: (path: string, content: string) => void;
 			onOpenInclude?: (path: string, alias: string) => void;
 			infraNodeStatus?: string;
+			/// For a `per_member` place: how many members have a copy.
+			infraMemberCopies?: number;
 			infraFailureStage?: string;
 			infraFailureMessage?: string;
 			debugData?: unknown;
@@ -415,6 +421,7 @@
 				configDerived: derivedNames.some((d) => d.name === port.name)
 					&& port.declaredType === undefined,
 				onSetType: (newType) => setPortType(portName, side, newType),
+				memberFilled: side === 'input' ? memberFilledToggle(portName) ?? undefined : undefined,
 				onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
 			});
 		}, () => { portContextMenu = null; });
@@ -615,9 +622,68 @@
 	const customFieldKeys = $derived.by(() => {
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
-			if (EXOTIC_FIELD_TYPES.has(field.type)) keys.add(field.key);
+			// A field each member fills shows that, never a control: the
+			// value is the member's, not the source's.
+			if (EXOTIC_FIELD_TYPES.has(field.type) || memberFilledField(field)) keys.add(field.key);
 		}
 		return keys;
+	});
+
+	/// The `@member_filled` marker a port field's written value is, or
+	/// null. Only a port can be member-filled (a config key is refused by
+	/// the compiler), so only the port literal is read.
+	function memberFilledField(field: FieldDefinition): { fallback?: unknown } | null {
+		return field.portDriven ? memberFilled(ownValue(portLiterals, field.key)) : null;
+	}
+
+	/// Hand a field to each member (`@member_filled`), or take it back.
+	/// Nothing written is lost either way: the value the source held
+	/// becomes the fallback a member who gives none gets, and taking the
+	/// field back writes that fallback as the one value for everyone
+	/// again (or leaves the field unset when there was none).
+	function toggleMemberFilled(field: FieldDefinition) {
+		const filled = memberFilledField(field);
+		if (filled) {
+			updatePortLiteral(field.key, filled.fallback === undefined ? null : filled.fallback);
+			return;
+		}
+		const written = ownValue(portLiterals, field.key);
+		updatePortLiteral(field.key, isFilledIn(written) ? memberFilledValue(written) : memberFilledValue());
+	}
+
+	/// The `@member_filled` toggle for `key`, or null where the compiler
+	/// would refuse the mark: a field with a wire into it (its value is
+	/// the wire's), a `_` key (the program's own), anything that is not
+	/// an input port's value, and an include's ports (a boundary; the
+	/// mark goes on the node inside).
+	function memberFilledToggle(key: string): MemberFilledToggle | null {
+		if (isInclude || key.startsWith('_')) return null;
+		const field = displayedFields.find((f) => f.key === key);
+		if (!field?.portDriven) return null;
+		if (edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === key)) return null;
+		return { filled: memberFilledField(field) !== null, onToggle: () => toggleMemberFilled(field) };
+	}
+
+	/// Right-click on a field in the node's body: its own menu, today the
+	/// `@member_filled` toggle. A right-click inside a text control keeps
+	/// the browser's own menu (copy, paste).
+	let fieldContextMenu = $state<{ key: string; x: number; y: number } | null>(null);
+	function openFieldMenu(e: MouseEvent) {
+		const target = e.target as HTMLElement | null;
+		if (!target || target.closest('input, textarea, select, [contenteditable="true"], .cm-editor')) return;
+		const key = target.closest<HTMLElement>('[data-field-key]')?.dataset.fieldKey;
+		if (!key || !memberFilledToggle(key)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		fieldContextMenu = { key, x: e.clientX, y: e.clientY };
+	}
+	$effect(() => {
+		if (!fieldContextMenu) return;
+		const { key, x, y } = fieldContextMenu;
+		return openPortMenu({ x, y }, () => {
+			const toggle = memberFilledToggle(key);
+			return toggle ? [memberFilledMenuItem(toggle)] : null;
+		}, () => { fieldContextMenu = null; });
 	});
 
 	/// FieldStrip display override: for a file-backed field, the store
@@ -879,7 +945,7 @@
 				scopes: string[];
 				verified: boolean;
 				valueNames: string[];
-				owner: string;
+				owner: import('../../../../protocol').CredentialOwner;
 				service: string;
 				hasCredential: boolean;
 			}
@@ -938,7 +1004,7 @@
 					scopes: string[];
 					verified: boolean;
 					valueNames: string[];
-					owner: string;
+					owner: import('../../../../protocol').CredentialOwner;
 					service: string;
 					hasCredential: boolean;
 				}
@@ -1005,7 +1071,7 @@
 			const required = i.requiresScopes ?? [];
 			if (required.length === 0) continue;
 			const grant = tracedGrants[i.name];
-			if (!grant || grant.owner !== 'ours') continue;
+			if (!grant || grant.owner !== 'platform') continue;
 			const catalogue = specForService(grant.service)?.permissions ?? [];
 			for (const p of catalogue) {
 				if (p.own_only && required.includes(p.id)) {
@@ -1713,7 +1779,7 @@
 					{data.infraNodeStatus === 'running' ? 'bg-green-100 text-green-700' : ''}
 					{data.infraNodeStatus === 'flaky' ? 'bg-amber-100 text-amber-700' : ''}
 					{data.infraNodeStatus === 'failed' ? 'bg-rose-100 text-rose-700' : ''}
-					{data.infraNodeStatus === 'stopped' ? 'bg-zinc-100 text-zinc-600' : ''}
+					{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_member' ? 'bg-zinc-100 text-zinc-600' : ''}
 					{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-100 text-sky-700' : ''}
 					"
 					title={data.infraFailureMessage
@@ -1724,10 +1790,15 @@
 						{data.infraNodeStatus === 'running' ? 'bg-green-500' : ''}
 						{data.infraNodeStatus === 'flaky' ? 'bg-amber-500' : ''}
 						{data.infraNodeStatus === 'failed' ? 'bg-rose-500' : ''}
-						{data.infraNodeStatus === 'stopped' ? 'bg-zinc-400' : ''}
+						{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_member' ? 'bg-zinc-400' : ''}
 						{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-500 animate-pulse' : ''}
 					"></span>
-					{data.infraNodeStatus}
+					<!-- A per-member place has no copy of its own: the node's
+					     "per member" badge already says so, so this says how
+					     many members have one. -->
+					{data.infraNodeStatus === 'per_member'
+						? `${data.infraMemberCopies ?? 0} ${data.infraMemberCopies === 1 ? 'copy' : 'copies'}`
+						: data.infraNodeStatus.replace('_', ' ')}
 				</span>
 			{/if}
 		</div>
@@ -1786,6 +1857,21 @@
 			>
 				{data.label || `${typeConfig.label} Node`}
 			</p>
+		{/if}
+		{#if data.perMember}
+			<!-- One copy of this node per member of the program. Solid where
+			     the source marks it, dashed where the compiler followed a
+			     marked node here (toggled only at the mark). -->
+			<span
+				class="mt-1 self-start text-[10px] font-medium px-1.5 py-0.5 rounded-full border {data.perMember === 'derived' ? 'border-dashed border-sky-300 text-sky-600' : 'border-sky-400 bg-sky-50 text-sky-700'}"
+				title={data.perMember === 'marked'
+					? 'One per member: every member of the program gets their own copy of this node (@per_member). Right-click to share it again.'
+					: data.perMember === 'filled'
+						? 'Per member: a field of this node is filled by each member (@member_filled), so it runs in each member\'s runs with their value.'
+						: 'Per member: this node reads a value each member has, so it runs in each member\'s runs with theirs.'}
+			>
+				{data.perMember === 'marked' ? 'per member' : data.perMember === 'filled' ? 'filled per member' : 'per member (follows)'}
+			</span>
 		{/if}
 		
 		<!-- Ports Section -->
@@ -1978,6 +2064,9 @@
 				     (code / entry_list) are claimed via
 				     customFieldKeys and drawn inline by the renderCustom
 				     snippet below, in the same authored order. -->
+				<!-- `contents`: no box of its own, only the field menu's
+				     right-click (see openFieldMenu). -->
+				<div class="contents" role="group" oncontextmenu={openFieldMenu}>
 				<FieldStrip
 					fields={displayedFields}
 					config={(data.config as Record<string, unknown>) ?? {}}
@@ -1995,6 +2084,7 @@
 					onReadonlyEdit={explainReadonlyField}
 					onClear={(key) => updatePortLiteral(key, null)}
 				/>
+				</div>
 
 				{#snippet headerBadge(field: FieldDefinition)}
 					{#if fileRefOf(field.key)}
@@ -2022,6 +2112,22 @@
 						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
 					{:else if field.portDriven && !isInclude}
 						{@const form = portFieldForm(field.key)}
+						{@const memberToggle = memberFilledToggle(field.key)}
+						{#if memberToggle}
+							<!-- Hand this value to each member of the program
+							     (`@member_filled`), or take it back; right-clicking
+							     the field offers the same. -->
+							<button
+								type="button"
+								class="text-[9px] px-1 py-0.5 rounded nodrag transition-colors
+									{memberToggle.filled ? 'bg-sky-100 text-sky-800 hover:bg-sky-200' : 'bg-muted text-muted-foreground hover:bg-accent'}"
+								title={memberToggle.filled
+									? `Filled by each member (@member_filled). Click to give it one value for everyone again.`
+									: `Click to have each member of the program fill this value (@member_filled).`}
+								aria-label={`Toggle whether each member fills ${field.key}`}
+								onclick={(e) => { e.stopPropagation(); memberToggle.onToggle(); }}
+							><span aria-hidden="true">👤</span></button>
+						{/if}
 						{@const hasLiteral = isFilledIn(ownValue(portLiterals, field.key))}
 						<!-- The form-toggle marker: which SOURCE FORM this port's
 						     value is written in, braces `{ }` vs statement `=`.
@@ -2044,12 +2150,21 @@
 				{/snippet}
 
 				{#snippet renderCustom(field: FieldDefinition)}
-					<div class="space-y-1">
+					<div class="space-y-1" data-field-key={field.key}>
 						<div class="flex items-center justify-between">
 							<label for={`${id}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium">{field.label}</label>
 							{@render headerBadge(field)}
 						</div>
-						{#if field.type === "code" && fileNotice(field.key) !== undefined}
+						{#if memberFilledField(field)}
+							{@const filled = memberFilledField(field)}
+							<!-- @member_filled: each member provides this value, on
+							     their own page or through the program; the source holds
+							     no value of its own to edit here. -->
+							<div class="text-[10px] text-sky-700 bg-sky-50 border border-sky-200 rounded px-2 py-1.5">
+								Filled by each member{#if filled?.fallback !== undefined}; a member who gives none gets
+									<span class="font-mono">{JSON.stringify(filled.fallback)}</span>{/if}.
+							</div>
+						{:else if field.type === "code" && fileNotice(field.key) !== undefined}
 							<!-- The file behind this field could not be read: the
 							     failure stands where the editor would, and nothing
 							     is editable (an error is not content). -->

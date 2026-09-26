@@ -4,6 +4,10 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   srcDir: 'src',
   modules: ['@wxt-dev/module-svelte'],
+  // The connect page is built from the shared connect library's source
+  // (`packages/weft-connect`), which has no install of its own: its bare
+  // `svelte` imports must resolve to THIS app's one copy.
+  vite: () => ({ resolve: { dedupe: ['svelte'] } }),
   // Single build dir under the extension folder so the project tree
   // stays self-contained: unpacked output lives under build/<browser>/,
   // zipped artifacts alongside them in build/. The zip filenames are

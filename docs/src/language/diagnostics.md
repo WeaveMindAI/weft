@@ -130,6 +130,17 @@ or a switch's cases.
 | `route-method-unknown` | That is not an HTTP method | Fix it |
 | `route-overlap` | Two nodes claim addresses one call could reach, and neither is more specific | Make one spell out what the other captures, or change a path or a method |
 
+## Members
+
+| Slug | What it found | What to do |
+|---|---|---|
+| `per-member-ineligible` | `@per_member` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each member gives (their connection included), write `@member_filled` on the field |
+| `member-filled-wired` | A `@member_filled` field also has a wire into it | Remove the wire, or the marker |
+| `member-filled-boundary` | `@member_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
+| `member-filled-not-an-input` | `@member_filled` on a key that is not one of the node's inputs | Put it on an input |
+
+For what `@per_member` and `@member_filled` do, go and read [Programs with members](../running/members.md).
+
 ## Types you named
 
 | Slug | What it found | What to do |

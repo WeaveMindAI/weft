@@ -19,13 +19,14 @@ Two jobs, one script, chosen by argv:
          still this database's password", which is how a caller finds
          out its disk was replaced underneath it.
 
-         It also serves the graph: `/live` says whether the password
-         is still readable, and its one button, `/action` with
+         It also serves the graph: `/live` shows the database and user
+         to sign in as and whether the password is still readable, and
+         its one button, `/action` with
          `reset_password`, mints a new password, sets it on the
          database over the unix socket (which needs no password), and
          makes it readable again. That is the way out when the
-         connection that held the password is gone: press it, then
-         `weft infra start`, and the node publishes a fresh one.
+         connection that held the password is gone: press it, and the
+         program's next run publishes a fresh one.
 
 Where the files live and which port to serve on come from the node
 that declares this container, so the two sides cannot drift.
@@ -43,10 +44,11 @@ PASSWORD_FILE = os.environ.get("WEFT_PASSWORD_FILE")
 PORT = os.environ.get("WEFT_CREDENTIAL_PORT")
 SOCKET_DIR = os.environ.get("WEFT_SOCKET_DIR")
 ADMIN_USER = os.environ.get("WEFT_ADMIN_USER")
-if not SECRET_DIR or not PASSWORD_FILE or not PORT or not SOCKET_DIR or not ADMIN_USER:
+DATABASE = os.environ.get("WEFT_DATABASE")
+if not SECRET_DIR or not PASSWORD_FILE or not PORT or not SOCKET_DIR or not ADMIN_USER or not DATABASE:
     sys.exit(
-        "WEFT_SECRET_DIR, WEFT_PASSWORD_FILE, WEFT_CREDENTIAL_PORT, WEFT_SOCKET_DIR and "
-        "WEFT_ADMIN_USER must be set by the node"
+        "WEFT_SECRET_DIR, WEFT_PASSWORD_FILE, WEFT_CREDENTIAL_PORT, WEFT_SOCKET_DIR, "
+        "WEFT_ADMIN_USER and WEFT_DATABASE must be set by the node"
     )
 PORT = int(PORT)
 SEALED_FILE = os.path.join(SECRET_DIR, "sealed")
@@ -287,16 +289,25 @@ def live_items() -> list:
             "label": "Password",
             "data": password,
         }
+    # The database and user a client signs in with, beside the
+    # password. Postgres answers under other database names too (its own
+    # `postgres` among them), so a client pointed at a guess connects
+    # fine and then never sees the program's tables.
+    names = [
+        {"type": "text", "label": "Database", "data": DATABASE},
+        {"type": "text", "label": "User", "data": ADMIN_USER},
+    ]
     item["action"] = {
         "label": "Reset password",
         "actionKind": RESET_ACTION,
         "confirm": (
             "Give the database a new password? Every connection holding the "
-            "old one stops working; run `weft infra start` afterwards so this "
-            "node publishes the new one."
+            "old one stops working. The program's own next run picks the new "
+            "one up by itself; anything outside it (a frontend, a psql "
+            "session) takes it from this card."
         ),
     }
-    return [item]
+    return names + [item]
 
 
 def serve() -> None:

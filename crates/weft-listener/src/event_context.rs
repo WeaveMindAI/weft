@@ -50,6 +50,10 @@ pub struct FireContext {
     /// The signal's tenant, stamped on every enqueued fire (a pooled
     /// listener serves many tenants, so it travels per-signal).
     tenant_id: String,
+    /// Whose signal it is (`None` for a shared one), as the dispatcher
+    /// registered it: a member's trigger reads through that member's
+    /// connections alone.
+    for_member: Option<weft_core::member::MemberScope>,
     /// The generation this pod holds the signal under, stamped on
     /// every fire so the broker can fence a stale old-pod fire during
     /// a scale-down move overlap.
@@ -63,10 +67,11 @@ impl FireContext {
         sink: FireSignalSink,
         token: String,
         tenant_id: String,
+        for_member: Option<weft_core::member::MemberScope>,
         placement_generation: i64,
         predicates: Vec<Predicate>,
     ) -> Self {
-        Self { sink, token, tenant_id, placement_generation, predicates }
+        Self { sink, token, tenant_id, for_member, placement_generation, predicates }
     }
 
     pub fn token(&self) -> &str {
@@ -75,6 +80,10 @@ impl FireContext {
 
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+
+    pub fn for_member(&self) -> Option<&weft_core::member::MemberScope> {
+        self.for_member.as_ref()
     }
 
     /// Fire one payload: evaluate the signal's filter, then enqueue.

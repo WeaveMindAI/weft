@@ -216,7 +216,7 @@ jobs:
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-vscode
-          borrow-packages: packages/weft-graph packages/weft-syntax
+          borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C extension-vscode run compile
       - run: pnpm -C extension-vscode run bundle:webview
       - run: pnpm -C extension-vscode run bundle:markdown-preview

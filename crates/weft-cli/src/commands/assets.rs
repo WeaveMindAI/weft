@@ -29,12 +29,68 @@ pub async fn resolve_project_assets(
     sources: Option<&weft_core::project::hash::Manifest>,
     publish: bool,
 ) -> Result<Vec<String>> {
-    let refs = weft_compiler::file_ref::collect_asset_refs(definition);
+    let project_id = definition.id.to_string();
+    let (key_refs, text_refs) = resolve_assets(client, project_root, &project_id, definition, publish).await?;
+    if !publish { return Ok(Vec::new()); }
+    // Publish only after every reference resolved successfully. This includes
+    // uploaded files selected by stored key, not just this build's disk refs.
+    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter().filter(|r| weft_compiler::file_ref::is_runtime_key_ref(r))))?;
+    if let Some(sources) = sources {
+        let scope = weft_core::storage::key::KeyScope::Asset { project_id: definition.id.to_string() };
+        for hash in sources.values().filter(|hash| !hash.is_empty()) {
+            references.keys.push(weft_core::storage::key::scope_key(&scope, hash).map_err(anyhow::Error::msg)?);
+        }
+    }
+    let (status, text) = client.post_json_status("/storage/assets/references", &serde_json::to_value(references)?)
+        .await.context("update project asset lifetimes")?;
+    if !(200..300).contains(&status) {
+        // The build's own file is what is missing here (a version's is a
+        // warning, never a refusal): the upload just made did not land.
+        bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for this project",
+            if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() });
+    }
+    let published: weft_core::storage::AssetsPublished = serde_json::from_str(&text).context("parse the publish answer")?;
+    Ok(published.warnings)
+}
+
+/// Resolve the `@file` and `@asset` markers in a run's handed values
+/// (`--emit`, `--from`, `--group`, `--fire`, or a saved example) exactly
+/// as the build resolves the same markers written in source: a `@file`
+/// read from the project and cast to its type, an `@asset` uploaded into
+/// the project's asset storage (or fetched, or looked up) and replaced by
+/// the value its declared type stands for. An uploaded file is not added
+/// to the project's published assets, so it lives on the store's own
+/// countdown, which every read of it pushes back.
+pub async fn resolve_run_values(
+    client: &DispatcherClient,
+    project_root: &std::path::Path,
+    project_id: &str,
+    spec: &mut weft_core::run_spec::RunSpec,
+) -> Result<()> {
+    let fs = weft_compiler::CompileFs::disk(project_root);
+    weft_compiler::file_ref::resolve_file_markers(spec, &fs)
+        .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
+    resolve_assets(client, project_root, project_id, spec, true).await?;
+    Ok(())
+}
+
+/// The asset step both callers share: sync the file-kind `@asset`s on
+/// disk, look up the stored-key ones, fetch and cast the text ones, and
+/// put every resolved value in place of its marker. Hands back the
+/// stored-key and text refs, which the build's publish names.
+async fn resolve_assets(
+    client: &DispatcherClient,
+    project_root: &std::path::Path,
+    project_id: &str,
+    target: &mut impl weft_compiler::file_ref::MarkedValues,
+    publish: bool,
+) -> Result<(Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
+    let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
     } else {
         let source = DiskSource::new(project_root.to_path_buf());
-        let mut store = DispatcherStore::new(client, definition.id.to_string());
+        let mut store = DispatcherStore::new(client, project_id.to_string());
         store.publish = publish;
         weft_assets::sync_assets(&refs, &source, &store).await.context("sync project assets")?
     };
@@ -42,7 +98,7 @@ pub async fn resolve_project_assets(
     // editor): nothing to sync, resolve them against the tenant's file
     // listing (the `weft files` door). The match itself is the compiler's
     // shared step so every build driver resolves identically.
-    let key_refs = weft_compiler::file_ref::collect_runtime_key_refs(definition);
+    let key_refs = weft_compiler::file_ref::collect_runtime_key_refs(target);
     if !key_refs.is_empty() {
         let listing: weft_core::storage::ListFilesResponse = serde_json::from_value(
             client.get_json("/storage/files").await.context("list stored files")?,
@@ -56,9 +112,9 @@ pub async fn resolve_project_assets(
     // root or anywhere on the machine), cast, and substituted like every
     // other deferred ref. Nothing is uploaded for a text asset: its value
     // is inlined into the build, so no stored copy would be referenced.
-    let text_refs = weft_compiler::file_ref::collect_text_refs(definition);
+    let text_refs = weft_compiler::file_ref::collect_text_refs(target);
     if !text_refs.is_empty() {
-        let project = Some(definition.id.to_string());
+        let project = Some(project_id.to_string());
         let http = reqwest::Client::new();
         let mut failed: Vec<String> = Vec::new();
         for r in &text_refs {
@@ -84,28 +140,9 @@ pub async fn resolve_project_assets(
             bail!("text assets could not be fetched:\n  {}", failed.join("\n  "));
         }
     }
-    weft_compiler::file_ref::apply_asset_resolutions(definition, &map)
+    weft_compiler::file_ref::apply_asset_resolutions(target, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
-    if !publish { return Ok(Vec::new()); }
-    // Publish only after every reference resolved successfully. This includes
-    // uploaded files selected by stored key, not just this build's disk refs.
-    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter().filter(|r| weft_compiler::file_ref::is_runtime_key_ref(r))))?;
-    if let Some(sources) = sources {
-        let scope = weft_core::storage::key::KeyScope::Asset { project_id: definition.id.to_string() };
-        for hash in sources.values().filter(|hash| !hash.is_empty()) {
-            references.keys.push(weft_core::storage::key::scope_key(&scope, hash).map_err(anyhow::Error::msg)?);
-        }
-    }
-    let (status, text) = client.post_json_status("/storage/assets/references", &serde_json::to_value(references)?)
-        .await.context("update project asset lifetimes")?;
-    if !(200..300).contains(&status) {
-        // The build's own file is what is missing here (a version's is a
-        // warning, never a refusal): the upload just made did not land.
-        bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for this project",
-            if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() });
-    }
-    let published: weft_core::storage::AssetsPublished = serde_json::from_str(&text).context("parse the publish answer")?;
-    Ok(published.warnings)
+    Ok((key_refs, text_refs))
 }
 
 fn asset_references<'a>(

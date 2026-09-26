@@ -1,11 +1,9 @@
 //! Infra typed surface + pure helpers shared by every party that
 //! needs to reason about an `InfraSpec`:
 //!
-//! - **engine** compiles + hashes a freshly-provisioned spec so it
-//!   can decide skip / fresh / replace before enqueuing a lifecycle
-//!   command;
-//! - **supervisor** compiles + applies (kubectl) when it claims an
-//!   `Apply` lifecycle command;
+//! - **supervisor** compiles, hashes the compiled manifests to decide
+//!   skip / replace, and applies them when it claims an `Apply`
+//!   lifecycle command;
 //! - **tests** round-trip specs through compile to pin manifest
 //!   shapes.
 //!
@@ -16,14 +14,16 @@
 mod compile;
 mod hash;
 mod instance;
+mod status;
 pub mod types;
 
+pub use status::InfraNodeStatus;
 pub use instance::{Instance, INSTANCE_ENV, MAX_INSTANCE_NAME};
 
 pub use compile::{
     compile, door_service_name, tenant_public_path, tenant_public_url, unit_image_refs, CompileContext, CompileError,
 };
-pub use hash::hash_spec;
+pub use hash::hash_manifests;
 pub use types::*;
 
 /// The whole node-port range this runtime's clusters use, inclusive.

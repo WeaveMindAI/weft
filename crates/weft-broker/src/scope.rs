@@ -45,7 +45,7 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct ScopeCache {
     project_to_tenant: Arc<Mutex<LruCache<uuid::Uuid, (String, Instant)>>>,
-    color_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
+    color_to_scope: Arc<Mutex<LruCache<String, (ExecutionScope, Instant)>>>,
     signal_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
     /// A worker's own (tenant, project), keyed by the pod it is.
     worker_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
@@ -116,6 +116,24 @@ pub struct ProjectScope {
     pub project: uuid::Uuid,
 }
 
+/// WHOSE an execution is, and who it is for: its project scope, plus the
+/// member its run was started for (`execution_color.member_id`, born with
+/// the color and never changed). What every worker call about a run
+/// resolves to, so a member's pick, copy or storage is found from the
+/// run itself and never from anything the worker says.
+#[derive(Debug, Clone)]
+pub struct ExecutionScope {
+    pub tenant: String,
+    pub project: uuid::Uuid,
+    pub member: Option<weft_core::member::MemberId>,
+}
+
+impl ExecutionScope {
+    pub fn project_scope(&self) -> ProjectScope {
+        ProjectScope { tenant: self.tenant.clone(), project: self.project }
+    }
+}
+
 /// Resolve who `color` belongs to, enforcing ownership. See
 /// `require_project_owned_by` for the tenant-vs-control-plane rule.
 pub async fn require_color_scope(
@@ -123,9 +141,9 @@ pub async fn require_color_scope(
     pool: &PgPool,
     caller: &CallerIdentity,
     color: &str,
-) -> Result<ProjectScope, (StatusCode, String)> {
+) -> Result<ExecutionScope, (StatusCode, String)> {
     let scope = lookup_color_scope(cache, pool, color).await?;
-    enforce_scope(caller, "color", color, &scope)?;
+    enforce_scope(caller, "color", color, &scope.project_scope())?;
     Ok(scope)
 }
 
@@ -226,18 +244,22 @@ async fn lookup_color_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     color: &str,
-) -> Result<ProjectScope, (StatusCode, String)> {
+) -> Result<ExecutionScope, (StatusCode, String)> {
     if let Some(scope) = cache_get(&cache.color_to_scope, color).await {
         return Ok(scope);
     }
-    let row: Option<(String, uuid::Uuid)> =
-        sqlx::query_as("SELECT tenant_id, project_id FROM execution_color WHERE color = $1")
+    let row: Option<(String, uuid::Uuid, Option<String>)> =
+        sqlx::query_as("SELECT tenant_id, project_id, member_id FROM execution_color WHERE color = $1")
             .bind(color)
             .fetch_optional(pool)
             .await
             .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("color lookup")))?;
-    let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?;
-    let scope = ProjectScope { tenant, project };
+    let (tenant, project, member) = row.ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?;
+    let member = member
+        .map(weft_core::member::MemberId::new)
+        .transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt execution_color.member_id: {e}")))?;
+    let scope = ExecutionScope { tenant, project, member };
     cache_put(&cache.color_to_scope, color.to_string(), scope.clone()).await;
     Ok(scope)
 }

@@ -15,6 +15,10 @@ overrides:
 importers:
 
   .:
+    dependencies:
+      '@weft/connect':
+        specifier: link:../packages/weft-connect
+        version: link:../packages/weft-connect
     devDependencies:
       '@tsconfig/svelte':
         specifier: ^5.0.8

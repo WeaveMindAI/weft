@@ -13,6 +13,7 @@ pub async fn run(
     node_set: weft_compiler::codegen::NodeSet,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
+    scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let inner = ctx.clone();
     ctx.with_progress(ActionVerb::Bake, |progress| async move {
@@ -28,7 +29,9 @@ pub async fn run(
             }
         };
         let path = format!("/projects/{id}/bake");
-        let body = serde_json::Value::Object(running_choice_fields(running_policy, drain_timeout));
+        let mut fields = running_choice_fields(running_policy, drain_timeout);
+        fields.insert("scope".into(), serde_json::to_value(&scope)?);
+        let body = serde_json::Value::Object(fields);
         progress.drain_wait(&body, drain_timeout);
         progress.dispatcher_call_start(&path);
         let result: serde_json::Value = client.post_json(&path, &body).await?;

@@ -125,15 +125,26 @@ two read apart, as `triage.classify` and `again.classify`.
 Cutting a run works inside a call too, so `--target triage.classify` runs
 inside that one call.
 
-### Types do not cross an include
+### Types reach down into an included file
 
-In either direction. An included file has to declare, or get from the catalog,
-every type name it uses, and it cannot see the names of the file that included
-it.
+A type declared above an `@include` is visible inside the file it pulls in, the
+same way it is visible inside a group written in place. Declare `Settings` once
+at the top of `main.weft`, and `bot.weft` and `facts.weft` can both use it. It
+keeps going down: a file `bot.weft` includes sees it too.
 
-What does cross is the resolved type itself, because a named type carries its
-shape along with its name. So the call site's ports type-check without the
-declaration being visible anywhere near them.
+It only goes down. A type declared inside a group reaches the includes inside
+that group and nothing beside it, and a type an included file declares stays in
+that file. Since nothing shadows, an included file can't declare a name its
+including file already has.
+
+A file included from several places has to find each type it uses at every one
+of them. If one place doesn't have it, the build says so on the file's own line.
+When you open an included file on its own, weft reads it with the types of the
+first place that includes it, so it looks the way the build compiles it.
+
+The including file doesn't see an included file's types, but the call site's
+ports still type-check, because a named type carries its shape along with its
+name.
 
 If two files use the same type name with different shapes, that is the
 `named-type-conflict` error. A named type has one body everywhere.

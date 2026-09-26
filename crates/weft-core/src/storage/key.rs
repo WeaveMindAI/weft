@@ -5,6 +5,7 @@
 //!   `<tenant>/exec/<color>/<id>`        execution scratch (swept unless kept)
 //!   `<tenant>/project/<project_id>/<id>`   per-project persistent
 //!   `<tenant>/shared/<name>/<id>`       tenant-shared by agreed name
+//!   `<tenant>/member/<project_id>/<member>/<id>`  one member's, in one project
 //!
 //! The wall: a verified caller identity + a key resolve to
 //! allowed/denied with NO policy configuration. The runtime-storage
@@ -34,6 +35,9 @@ pub enum CallerAuth {
         tenant: String,
         project_id: String,
         color: Option<String>,
+        /// Who the run behind `color` is for (verified with it); what a
+        /// member-scoped handle with no member named falls back to.
+        member: Option<String>,
     },
     /// The dispatcher (cluster control plane). Used only by the
     /// admin surface (presign, sweep, usage, wipe); the worker file
@@ -54,6 +58,11 @@ pub enum KeyScope {
     /// sync (through the control-plane surface); workers of the project READ
     /// it like project scope but may not write it.
     Asset { project_id: String },
+    /// `member/<project_id>/<member>/<id>`: one member's files in one
+    /// project. The only scope whose owner is two segments: the project is
+    /// the wall (a member id is only a name inside one project), the member
+    /// is whose.
+    Member { project_id: String, member: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,18 +82,22 @@ pub struct ParsedKey {
 /// or renamed scope is changed in exactly one place. Keep this in sync with
 /// the `KeyScope` variants + `KeyScope::tag`.
 // SYNC: SCOPE_TAGS <-> weavemind/website/src/lib/graph/runtime-files.ts Tier
-pub const SCOPE_TAGS: [&str; 4] = ["exec", "project", "shared", "asset"];
+pub const SCOPE_TAGS: [&str; 5] = ["exec", "project", "shared", "asset", "member"];
 
 /// Is `s` a TENANT-LESS runtime storage key (`<scope>/<owner>/<id>`, every
 /// segment in the wall's grammar)? The short address a human writes in source
 /// (`@asset("project/<id>/<file>", Image)`) and the form `weft files` shows;
 /// the build's resolution re-anchors it to the acting tenant. Distinguishes a
 /// storage address from an ordinary project path by the scope-tag first
-/// segment plus exact 3-segment shape.
+/// segment plus its exact shape: 3 segments, or 4 for member scope
+/// (`member/<project>/<member>/<id>`).
 pub fn is_scope_key(s: &str) -> bool {
     let parts: Vec<&str> = s.split('/').collect();
-    matches!(parts.as_slice(),
-        [tag, owner, id] if is_scope_tag(tag) && valid_segment(owner) && valid_segment(id))
+    match parts.as_slice() {
+        ["member", project, member, id] => valid_segment(project) && valid_segment(member) && valid_segment(id),
+        [tag, owner, id] => *tag != "member" && is_scope_tag(tag) && valid_segment(owner) && valid_segment(id),
+        _ => false,
+    }
 }
 
 /// Is `s` a known on-wire scope tag? The one predicate every "looks like a
@@ -104,20 +117,23 @@ pub fn is_scope_tag(s: &str) -> bool {
 /// key the storage surface refuses, which poisoned that project's whole
 /// asset-reference publish from then on.
 pub fn scope_key(scope: &KeyScope, id: &str) -> Result<String, String> {
-    let owner = scope.owner();
-    if !valid_segment(owner) {
-        return Err(format!("'{owner}' is not a valid key segment"));
+    for owner in scope.owner_segments() {
+        if !valid_segment(owner) {
+            return Err(format!("'{owner}' is not a valid key segment"));
+        }
     }
     if !valid_segment(id) {
         return Err(format!("'{id}' is not a valid key segment"));
     }
-    Ok(format!("{}/{}/{}", scope.tag(), owner, id))
+    Ok(format!("{}/{}/{}", scope.tag(), scope.owner_path(), id))
 }
 
 impl KeyScope {
     /// Build the scope for a `(tag, owner)` pair, or None if `tag` is not
     /// a known scope tag. The canonical tag -> variant mapping; `parse_key`
     /// routes through here so the grammar and `SCOPE_TAGS` cannot drift.
+    /// The member scope is not built here: its owner is two segments, and
+    /// `parse_key` / `owned_scope` build it from both.
     fn from_tag(tag: &str, owner: &str) -> Option<Self> {
         match tag {
             "exec" => Some(KeyScope::Exec { color: owner.to_string() }),
@@ -135,17 +151,25 @@ impl KeyScope {
             KeyScope::Project { .. } => "project",
             KeyScope::Shared { .. } => "shared",
             KeyScope::Asset { .. } => "asset",
+            KeyScope::Member { .. } => "member",
         }
     }
 
-    /// The owner segment (color / project id / shared name).
-    fn owner(&self) -> &str {
+    /// The owner segments (color / project id / shared name; project id
+    /// and member for the member scope).
+    fn owner_segments(&self) -> Vec<&str> {
         match self {
-            KeyScope::Exec { color } => color,
-            KeyScope::Project { project_id } => project_id,
-            KeyScope::Shared { name } => name,
-            KeyScope::Asset { project_id } => project_id,
+            KeyScope::Exec { color } => vec![color],
+            KeyScope::Project { project_id } => vec![project_id],
+            KeyScope::Shared { name } => vec![name],
+            KeyScope::Asset { project_id } => vec![project_id],
+            KeyScope::Member { project_id, member } => vec![project_id, member],
         }
+    }
+
+    /// The owner as it sits in a key, segments joined by `/`.
+    fn owner_path(&self) -> String {
+        self.owner_segments().join("/")
     }
 }
 
@@ -157,7 +181,7 @@ impl ParsedKey {
     /// so every store key-method takes a `&ParsedKey` and renders here
     /// rather than trusting a raw `&str`.
     pub fn to_key(&self) -> String {
-        format!("{}/{}/{}/{}", self.tenant, self.scope.tag(), self.scope.owner(), self.id)
+        format!("{}/{}/{}/{}", self.tenant, self.scope.tag(), self.scope.owner_path(), self.id)
     }
 
     /// The tenant prefix `<tenant>/` that ranges EVERY key this tenant
@@ -179,6 +203,22 @@ impl ParsedKey {
     /// persistent runtime files: the range the project reclaimer wipes.
     pub fn project_prefix(tenant: &str, project: &str) -> Result<String, String> {
         Self::owned_prefix(tenant, "project", project)
+    }
+
+    /// The `<tenant>/member/<project_id>/` prefix covering every member's
+    /// files in one project: what the project reclaimer wipes with the
+    /// project, and what `forget` of a member narrows to one member.
+    pub fn members_prefix(tenant: &str, project: &str) -> Result<String, String> {
+        Self::owned_prefix(tenant, "member", project)
+    }
+
+    /// The `<tenant>/member/<project_id>/<member>/` prefix covering one
+    /// member's files in one project.
+    pub fn member_prefix(tenant: &str, project: &str, member: &str) -> Result<String, String> {
+        if !valid_segment(member) {
+            return Err(format!("invalid member segment '{member}' for a member prefix"));
+        }
+        Ok(format!("{}{member}/", Self::owned_prefix(tenant, "member", project)?))
     }
 
     /// The `<tenant>/asset/<project_id>/` prefix covering one project's
@@ -211,7 +251,8 @@ impl std::fmt::Display for ParsedKey {
 /// separators, no traversal, no empties. Colors are UUIDs, project
 /// ids are UUIDs, ids are UUIDs; shared names are user-chosen and
 /// the reason this check exists.
-fn valid_segment(s: &str) -> bool {
+// SYNC: valid_segment <-> packages/weft-graph/src/run-spec.ts MEMBER_ID_PATTERN
+pub(crate) fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -228,9 +269,22 @@ fn valid_segment(s: &str) -> bool {
 /// identity to match against, so they parse here and trust the segment.
 pub fn parse_key(key: &str) -> Result<ParsedKey, String> {
     let parts: Vec<&str> = key.split('/').collect();
+    if let [tenant, "member", project, member, id] = parts.as_slice() {
+        for (label, segment) in [("tenant", tenant), ("project", project), ("member", member), ("id", id)] {
+            if !valid_segment(segment) {
+                return Err(format!("malformed storage key '{key}': bad {label} segment"));
+            }
+        }
+        return Ok(ParsedKey {
+            tenant: tenant.to_string(),
+            scope: KeyScope::Member { project_id: project.to_string(), member: member.to_string() },
+            id: id.to_string(),
+        });
+    }
     let [tenant, scope_tag, owner, id] = parts.as_slice() else {
         return Err(format!(
-            "malformed storage key '{key}': expected <tenant>/<scope>/<owner>/<id> (4 segments)"
+            "malformed storage key '{key}': expected <tenant>/<scope>/<owner>/<id> (4 segments; \
+             5 for <tenant>/member/<project>/<member>/<id>)"
         ));
     };
     if !valid_segment(tenant) {
@@ -277,7 +331,17 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        // Owner boundary within a tenant.
+        // One member's space within a project's members.
+        [tenant, "member", project, member] => {
+            for (label, segment) in [("tenant", tenant), ("project", project), ("member", member)] {
+                if !valid_segment(segment) {
+                    return Err(format!("wipe prefix '{prefix}': bad {label} segment"));
+                }
+            }
+            Ok(())
+        }
+        // Owner boundary within a tenant (for the member scope: every
+        // member of one project).
         [tenant, scope_tag, owner] => {
             if !valid_segment(tenant) {
                 return Err(format!("wipe prefix '{prefix}': bad tenant segment"));
@@ -294,31 +358,30 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!(
-            "wipe prefix '{prefix}' must be <tenant>/ or <tenant>/<scope>/<owner>/ ({})",
+            "wipe prefix '{prefix}' must be <tenant>/, <tenant>/<scope>/<owner>/ ({}), or \
+             <tenant>/member/<project>/<member>/",
             SCOPE_TAGS.join("|")
         )),
     }
 }
 
-/// Validate + resolve the OWNED `(tenant, scope_tag, owner)` triple a worker
-/// caller may address under `scope`. THE one place the wall's construction rules
-/// live, shared by `key_for_put` and `prefix_for_list` so neither can forget a
-/// check (an earlier `prefix_for_list` validated the tenant + shared name but NOT
-/// the color / project id, so a malformed owner could produce a list prefix that
-/// escaped the intended owner boundary; routing both through here makes the two
-/// paths validate identically by construction).
+/// Validate + resolve the OWNED `(tenant, scope)` a worker caller may address
+/// under `scope`. THE one place the wall's construction rules live, shared by
+/// `key_for_put` and `prefix_for_list` so neither can forget a check (an
+/// earlier `prefix_for_list` validated the tenant + shared name but NOT the
+/// color / project id, so a malformed owner could produce a list prefix that
+/// escaped the intended owner boundary; routing both through here makes the
+/// two paths validate identically by construction).
 ///
-/// Every returned segment (tenant AND owner) has passed `valid_segment`, so a key
-/// or prefix built from this triple is always one `parse_key` would also accept:
-/// the "a ParsedKey is the proof a key passed the grammar" invariant holds by
+/// Every returned segment has passed `valid_segment`, so a key or prefix
+/// built from it is always one `parse_key` would also accept: the "a
+/// ParsedKey is the proof a key passed the grammar" invariant holds by
 /// CONSTRUCTION, not by the accident that the broker happens to supply UUIDs.
-/// Errors when the caller is not a worker, an Execution scope carries no color, or
-/// any segment is not the wall's grammar.
-fn owned_scope_segments<'a>(
-    caller: &'a CallerAuth,
-    scope: &'a StorageScope,
-) -> Result<(String, &'static str, String), String> {
-    let CallerAuth::Worker { tenant, project_id, color } = caller else {
+/// Errors when the caller is not a worker, an Execution scope carries no
+/// color, a Member scope names nobody in a run for nobody, or any segment is
+/// not the wall's grammar.
+fn owned_scope(caller: &CallerAuth, scope: &StorageScope) -> Result<(String, KeyScope), String> {
+    let CallerAuth::Worker { tenant, project_id, color, member } = caller else {
         return Err("only workers address scoped files; the control plane uses the admin surface".into());
     };
     let owned = |label: &str, seg: &str| -> Result<String, String> {
@@ -333,50 +396,57 @@ fn owned_scope_segments<'a>(
     // tenant id with a '/' or '..' must fail loud, never mint a key the store could
     // not look up).
     let tenant = owned("tenant", tenant)?;
-    let (tag, owner) = match scope {
+    let scope = match scope {
         StorageScope::Execution => {
             let color = color.as_deref().ok_or(
                 "execution-scoped access requires a verified execution color and the caller \
                  presented none",
             )?;
-            ("exec", owned("color", color)?)
+            KeyScope::Exec { color: owned("color", color)? }
         }
-        StorageScope::Project => ("project", owned("project", project_id)?),
-        StorageScope::Shared { name } => ("shared", owned("shared-space name", name)?),
+        StorageScope::Project => KeyScope::Project { project_id: owned("project", project_id)? },
+        StorageScope::Shared { name } => KeyScope::Shared { name: owned("shared-space name", name)? },
         // Assets are keyed like project scope (owner = the caller's project).
         // WHO may put here is route policy, not grammar: the worker data path
         // refuses asset-scope writes (assets are sync-managed), the
         // control-plane surface allows them; both build keys through this.
-        StorageScope::Asset => ("asset", owned("project", project_id)?),
+        StorageScope::Asset => KeyScope::Asset { project_id: owned("project", project_id)? },
+        // The member named, or the run's own; always inside the caller's
+        // project, which is the wall.
+        StorageScope::Member { of } => {
+            let member = match of {
+                Some(of) => of.as_str().to_string(),
+                None => member.clone().ok_or(
+                    "member-scoped storage with no member named needs a run for a member, and \
+                     this run is for nobody; name one with .of(member)",
+                )?,
+            };
+            KeyScope::Member { project_id: owned("project", project_id)?, member: owned("member", &member)? }
+        }
     };
-    Ok((tenant, tag, owner))
+    Ok((tenant, scope))
 }
 
 /// Build the `ParsedKey` for a fresh put under `scope` by `caller`.
 /// Errors when the caller can't own the scope (no color claim for
 /// Execution scope, control-plane writes) or any segment is not the
 /// wall's grammar. Every segment (including the `id`) is validated via
-/// `owned_scope_segments` + the explicit `id` check below.
+/// `owned_scope` + the explicit `id` check below.
 pub fn key_for_put(caller: &CallerAuth, scope: &StorageScope, id: &str) -> Result<ParsedKey, String> {
-    let (tenant, tag, owner) = owned_scope_segments(caller, scope)?;
-    let id = if valid_segment(id) {
-        id.to_string()
-    } else {
+    let (tenant, scope) = owned_scope(caller, scope)?;
+    if !valid_segment(id) {
         return Err(format!("invalid id segment '{id}' for a storage key"));
-    };
-    // `tag` came from `owned_scope_segments`, always a known scope tag.
-    let key_scope = KeyScope::from_tag(tag, &owner)
-        .expect("owned_scope_segments only yields exec/project/shared tags");
-    Ok(ParsedKey { tenant, scope: key_scope, id })
+    }
+    Ok(ParsedKey { tenant, scope, id: id.to_string() })
 }
 
 /// The list prefix for `scope` as seen by `caller`, tenant-anchored.
 /// Same ownership + grammar rules as `key_for_put` (both route through
-/// `owned_scope_segments`). The leading `<tenant>/` is the outer wall: a list
+/// `owned_scope`). The leading `<tenant>/` is the outer wall: a list
 /// never sees another tenant's keys in the shared bucket.
 pub fn prefix_for_list(caller: &CallerAuth, scope: &StorageScope) -> Result<String, String> {
-    let (tenant, tag, owner) = owned_scope_segments(caller, scope)?;
-    Ok(format!("{tenant}/{tag}/{owner}/"))
+    let (tenant, scope) = owned_scope(caller, scope)?;
+    Ok(format!("{tenant}/{}/{}/", scope.tag(), scope.owner_path()))
 }
 
 /// The prefix covering one execution's files (`<tenant>/exec/<color>/`), for
@@ -401,7 +471,7 @@ pub fn exec_prefix(tenant: &str, color: &str) -> Result<String, String> {
 /// tenants' keys under one prefix space), then the key's own scope
 /// decides. Deny reasons are specific.
 pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), String> {
-    let CallerAuth::Worker { tenant, project_id, color } = caller else {
+    let CallerAuth::Worker { tenant, project_id, color, .. } = caller else {
         // Admin verbs run on dedicated routes; a control-plane call
         // landing on the worker data path is a caller bug.
         return Err("control-plane callers use the admin surface, not the data path".into());
@@ -450,6 +520,16 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
         // owns this key's tenant, so a shared space is only ever reachable
         // by workers of the SAME tenant.
         KeyScope::Shared { .. } => Ok(()),
+        // Any member of the caller's own project: inside its project the
+        // program may reach every member's files; another project's never,
+        // even under the same member id.
+        KeyScope::Member { project_id: key_project, .. } => {
+            if key_project == project_id {
+                Ok(())
+            } else {
+                Err("denied: member-scoped file belongs to a different project".into())
+            }
+        }
     }
 }
 
@@ -462,6 +542,7 @@ mod tests {
             tenant: "t1".into(),
             project_id: "p1".into(),
             color: color.map(String::from),
+            member: None,
         }
     }
 
@@ -472,8 +553,40 @@ mod tests {
     }
 
     #[test]
+    fn a_member_key_is_walled_by_its_project() {
+        let key = parse_key("t1/member/p1/ada/f").expect("five segments");
+        assert_eq!(key.scope, KeyScope::Member { project_id: "p1".into(), member: "ada".into() });
+        assert_eq!(key.to_key(), "t1/member/p1/ada/f");
+        assert!(check_key_access(&worker(None), &key).is_ok(), "any member of the caller's project");
+        let other_project = parse_key("t1/member/p2/ada/f").unwrap();
+        assert!(check_key_access(&worker(None), &other_project).is_err(), "same member id, other project");
+        assert!(parse_key("t1/member/p1/../f").is_err());
+        assert!(parse_key("t1/member/p1/f").is_err(), "a member key names its member");
+    }
+
+    #[test]
+    fn a_member_handle_falls_back_to_the_runs_member() {
+        let ada = CallerAuth::Worker {
+            tenant: "t1".into(),
+            project_id: "p1".into(),
+            color: Some("c1".into()),
+            member: Some("ada".into()),
+        };
+        let own = key_for_put(&ada, &StorageScope::Member { of: None }, "f").unwrap();
+        assert_eq!(own.to_key(), "t1/member/p1/ada/f");
+        let bob = crate::member::MemberId::new("bob").unwrap();
+        let named = key_for_put(&ada, &StorageScope::Member { of: Some(bob) }, "f").unwrap();
+        assert_eq!(named.to_key(), "t1/member/p1/bob/f");
+        let nobody = worker(Some("c1"));
+        assert!(key_for_put(&nobody, &StorageScope::Member { of: None }, "f").unwrap_err().contains("for nobody"));
+        assert_eq!(prefix_for_list(&ada, &StorageScope::Member { of: None }).unwrap(), "t1/member/p1/ada/");
+        assert!(validate_wipe_prefix("t1/member/p1/ada/").is_ok());
+        assert!(validate_wipe_prefix("t1/member/p1/").is_ok());
+    }
+
+    #[test]
     fn is_scope_key_accepts_tenant_less_keys_only() {
-        for ok in ["exec/c1/f1", "project/p1/f2", "shared/team/f3", "asset/p1/f4"] {
+        for ok in ["exec/c1/f1", "project/p1/f2", "shared/team/f3", "asset/p1/f4", "member/p1/ada/f5"] {
             assert!(is_scope_key(ok), "{ok}");
         }
         for no in [
@@ -518,6 +631,7 @@ mod tests {
             tenant: "t1".into(),
             project_id: "p2".into(),
             color: None,
+            member: None,
         };
         assert!(check_key_access(&other, &asset).is_err());
         assert!(check_key_access(&CallerAuth::ControlPlane, &asset).is_err());
@@ -600,6 +714,7 @@ mod tests {
             tenant: "a/b".into(),
             project_id: "p1".into(),
             color: Some("c1".into()),
+            member: None,
         };
         assert!(key_for_put(&bad_tenant, &StorageScope::Project, "id").is_err());
     }
@@ -711,6 +826,7 @@ mod tests {
             tenant: "t1".into(),
             project_id: "..".into(),
             color: None,
+            member: None,
         };
         assert!(prefix_for_list(&bad_project, &StorageScope::Project).is_err());
         assert!(key_for_put(&bad_project, &StorageScope::Project, "f").is_err());
@@ -719,6 +835,7 @@ mod tests {
             tenant: "a/b".into(),
             project_id: "p1".into(),
             color: Some("c1".into()),
+            member: None,
         };
         assert!(prefix_for_list(&bad_tenant, &StorageScope::Execution).is_err());
         assert!(key_for_put(&bad_tenant, &StorageScope::Execution, "f").is_err());

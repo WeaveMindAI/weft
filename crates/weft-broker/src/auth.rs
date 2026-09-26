@@ -85,7 +85,7 @@ impl Role {
 // NOTE: there is deliberately no `Infra` role. Pods the supervisor
 // brings up from an `InfraSpec` (`weft-infra-sa`) never talk to the
 // broker: their endpoint URLs are resolved by the WORKER via
-// `ctx.endpoint()` (the broker's `/infra/endpoint_url`, Worker|Listener
+// `ctx.endpoint()` (the broker's `/infra/endpoint_url`, Worker
 // only), and their lifecycle is the supervisor's job. So `weft-infra-sa`
 // has no SA-name mapping here; an infra pod that somehow presented a
 // token would fail role resolution (403), which is correct.
@@ -403,18 +403,20 @@ pub async fn resolve_storage_caller(
             )
             .await?;
             let (project_id, tenant_id) = (resolved.project, resolved.tenant);
-            let color = match color {
-                None => None,
+            // The run's member is read with its color, from the same row:
+            // a member-scoped handle with no member named falls back to it.
+            let (color, member) = match color {
+                None => (None, None),
                 Some(color) => {
-                    let row: Option<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-                        "SELECT tenant_id, project_id, owner_pod_name \
+                    let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+                        "SELECT tenant_id, project_id, owner_pod_name, member_id \
                          FROM execution_color WHERE color = $1",
                     )
                     .bind(color)
                     .fetch_optional(&state.pool)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-                    let Some((color_tenant, color_project, owner_pod)) = row else {
+                    let Some((color_tenant, color_project, owner_pod, member)) = row else {
                         return Err((StatusCode::FORBIDDEN, "unknown execution color".into()));
                     };
                     if color_tenant != tenant_id || color_project != project_id {
@@ -439,10 +441,10 @@ pub async fn resolve_storage_caller(
                             "color is not owned by the calling pod".into(),
                         ));
                     }
-                    Some(color.to_string())
+                    (Some(color.to_string()), member)
                 }
             };
-            Ok(CallerAuth::Worker { tenant: tenant_id, project_id: project_id.to_string(), color })
+            Ok(CallerAuth::Worker { tenant: tenant_id, project_id: project_id.to_string(), color, member })
         }
     }
 }

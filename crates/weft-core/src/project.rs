@@ -300,6 +300,18 @@ pub struct NodeDefinition {
     /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
     pub requires_infra: bool,
+    /// Whether this node exists once per member of the program, and why:
+    /// `Marked` when the source says `@per_member` in its braces (only an
+    /// infra node may, see `NodeMetadata::per_member_eligible`), `Filled`
+    /// when one of its fields is written `@member_filled`, `Derived` when
+    /// it reads a value that comes from a per-member node, found by the
+    /// compiler along the wires. `None` for a node every member shares. Written by the
+    /// lowering (the mark) and the compiler's propagation (the rest), and
+    /// only ever READ downstream: the runtime and the editor never
+    /// recompute it.
+    // SYNC: per_member <-> packages/weft-graph/src/protocol.ts NodeDefinition.perMember
+    #[serde(default, rename = "perMember", skip_serializing_if = "Option::is_none")]
+    pub per_member: Option<crate::member::PerMember>,
     /// Image source dirs the CLI builds for this node. Mirrored from
     /// NodeMetadata.images at enrich time. The CLI walks this to know
     /// which Dockerfiles to build before sending imageHashes to
@@ -323,6 +335,20 @@ pub struct NodeDefinition {
     /// the whole catalog.
     #[serde(default, rename = "publishedService", skip_serializing_if = "Option::is_none")]
     pub published_service: Option<crate::access::spec::AccessSpec>,
+    /// The recipe of the service this access node's connection field
+    /// connects to, carried when that field is `@member_filled`: a member
+    /// connects through the member door (their browser, never the
+    /// editor), and that door has only the program to read the recipe
+    /// from. It drives the member's connect page exactly as the catalog
+    /// entry drives the editor's.
+    #[serde(default, rename = "memberService", skip_serializing_if = "Option::is_none")]
+    pub member_service: Option<crate::access::spec::AccessSpec>,
+    /// The node type's validation rules, carried when a field of this
+    /// node is `@member_filled`: a member's value is checked against them
+    /// with the value swapped in (`weft_core::rules`), where no catalog
+    /// is at hand. Resolved at enrich time from the catalog.
+    #[serde(default, rename = "memberRules", skip_serializing_if = "Option::is_none")]
+    pub member_rules: Option<MemberRules>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,9 +437,10 @@ pub struct IncludedContents {
     /// deeply included file re-parses the graph that depends on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
-    /// The node types found inside, before the catalog was consulted.
-    /// The parser has no catalog, so it records the types and enrich
-    /// settles the two booleans above from them.
+    /// The types of the SHARED nodes found inside (a `@per_member` node
+    /// is its members' to run, so it is left out), before the catalog was
+    /// consulted. The parser has no catalog, so it records the types and
+    /// enrich settles the two booleans above from them.
     #[serde(default, rename = "nodeTypes", skip_serializing_if = "Vec::is_empty")]
     pub node_types: Vec<String>,
 }
@@ -552,7 +579,7 @@ pub struct GroupBoundary {
 /// (widget/default/label/placeholder) stamped from the metadata so the
 /// editor never re-derives any of it. The instance twin of the
 /// metadata's `InputSpec`; outputs use the slim [`PortDefinition`].
-// SYNC: InputDefinition <-> packages/weft-graph/src/protocol.ts InputDefinition
+// SYNC: InputDefinition <-> packages/weft-graph/src/protocol.ts InputDefinition, packages/weft-connect/src/core/wire.ts InputDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputDefinition {
     /// The wire-port half (name, type, requiredness, declared spelling,
@@ -563,13 +590,13 @@ pub struct InputDefinition {
     pub port: PortDefinition,
     /// Which drivers this input takes (resolved: the compiler-read fixed
     /// rule, else the metadata's list, else the type's own answer).
-    // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts
+    // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts, packages/weft-connect/src/core/wire.ts InputDefinition.accepts
     #[serde(default = "Accepts::both")]
     pub accepts: Accepts,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
-    // SYNC: InputDefinition.widget <-> packages/weft-graph/src/protocol.ts InputDefinition.widget
+    // SYNC: InputDefinition.widget <-> packages/weft-graph/src/protocol.ts InputDefinition.widget, packages/weft-connect/src/core/wire.ts InputDefinition.widget
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub widget: Option<crate::node::Widget>,
     /// The input's declared default value, if any (mirrored from the
@@ -588,7 +615,7 @@ pub struct InputDefinition {
     /// form-derived port, a carry ghost). The runtime uses it to hand
     /// node bodies their instance data ([`ValueBag::custom`]) without
     /// each node hardcoding its own setting names.
-    // SYNC: InputDefinition.from_spec <-> packages/weft-graph/src/protocol.ts InputDefinition.fromSpec
+    // SYNC: InputDefinition.from_spec <-> packages/weft-graph/src/protocol.ts InputDefinition.fromSpec, packages/weft-connect/src/core/wire.ts InputDefinition.fromSpec
     #[serde(default, rename = "fromSpec", skip_serializing_if = "std::ops::Not::not")]
     pub from_spec: bool,
     /// The permissions THIS consumer needs on the wired connection
@@ -597,7 +624,7 @@ pub struct InputDefinition {
     /// marker when this node's bag is built, so resolution can hold a
     /// verified connection to them; the editor reads them for its live
     /// shortfall check.
-    // SYNC: InputDefinition.requires_scopes <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresScopes
+    // SYNC: InputDefinition.requires_scopes <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresScopes, packages/weft-connect/src/core/wire.ts InputDefinition.requiresScopes
     #[serde(
         default,
         rename = "requiresScopes",
@@ -608,7 +635,7 @@ pub struct InputDefinition {
     /// [`crate::node::InputSpec::requires_values`]). Same three check
     /// points as the permissions above; the editor reads them for its
     /// live check.
-    // SYNC: InputDefinition.requires_values <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresValues
+    // SYNC: InputDefinition.requires_values <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresValues, packages/weft-connect/src/core/wire.ts InputDefinition.requiresValues
     #[serde(
         default,
         rename = "requiresValues",
@@ -662,7 +689,7 @@ impl std::ops::DerefMut for InputDefinition {
 /// A pure WIRE port on a node instance's OUTPUT side or a group/loop
 /// interface: a named, typed dock for edges. Inputs are the richer
 /// [`InputDefinition`].
-// SYNC: PortDefinition <-> packages/weft-graph/src/protocol.ts PortDefinition
+// SYNC: PortDefinition <-> packages/weft-graph/src/protocol.ts PortDefinition, packages/weft-connect/src/core/wire.ts PortDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDefinition {
     pub name: String,
@@ -688,7 +715,7 @@ pub struct PortDefinition {
     /// header from this, never from `port_type`: the rendered type may
     /// be an inference-resolved instantiation of a generic, which must
     /// not get frozen into source as if the author wrote it.
-    // SYNC: PortDefinition.declared_type <-> packages/weft-graph/src/protocol.ts PortDefinition.declaredType
+    // SYNC: PortDefinition.declared_type <-> packages/weft-graph/src/protocol.ts PortDefinition.declaredType, packages/weft-connect/src/core/wire.ts PortDefinition.declaredType
     #[serde(default, rename = "declaredType", skip_serializing_if = "Option::is_none")]
     pub declared_type: Option<String>,
 }
@@ -1134,6 +1161,42 @@ pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     selection::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
+/// Whether the node `id` exists once per member (`@per_member`): every
+/// copy of it (its infra, its trigger's activation) is a member's, and
+/// none is shared. Asked of a place by its `id`, of a spelled place
+/// after `resolve_address`.
+pub fn is_per_member(project: &ProjectDefinition, id: &str) -> bool {
+    project.nodes.iter().any(|n| n.id == id && n.per_member.is_some())
+}
+
+/// A node's validation rules, for checking a member's values on it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemberRules {
+    /// Every rule of the node type (the declared ones, and the ones the
+    /// language adds, like "no connection picked"), at every level: a
+    /// run for a member is a run, so runtime-level rules hold too.
+    pub rules: Vec<crate::node::ValidationRule>,
+    /// The output ports the source added beyond the type's own, which
+    /// `custom_outputs_declared` and `{custom_outputs}` read.
+    #[serde(default, rename = "customOutputs", skip_serializing_if = "Vec::is_empty")]
+    pub custom_outputs: Vec<String>,
+}
+
+/// Every place of a node with a `@member_filled` field, spelled, with the
+/// node: what the member door lists, and what a member's values are keyed
+/// by. A node inside a file included twice is at two places, and a member
+/// fills each on its own.
+pub fn member_filled_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
+    selection::every_place(project)
+        .into_iter()
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            crate::member::member_filled_fields(node).next()?;
+            Some((address_of(project, &place.id, &place.path), node))
+        })
+        .collect()
+}
+
 /// Every infra INSTANCE the program declares, each spelled the way a
 /// person writes its place (`db`, or `one.db` inside the file the site
 /// `one` includes): the key its `infra_node` row is stored under. THE
@@ -1236,8 +1299,11 @@ mod infra_triggers_depend_on_tests {
             outputs: vec![],
             features: NodeFeatures { is_trigger, ..Default::default() },
             requires_infra,
+            per_member: None,
             images: vec![],
             published_service: None,
+            member_service: None,
+            member_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1565,10 +1631,12 @@ mod project_wire_tests {
             inputs: vec![input.clone()],
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false,
+            requires_infra: false, per_member: None,
             images: vec![],
             fires_with: Default::default(),
             published_service: None,
+            member_service: None,
+            member_rules: None,
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
@@ -1663,9 +1731,12 @@ mod project_wire_tests {
             outputs: vec![],
             features: Default::default(),
             requires_infra,
+            per_member: None,
             images: vec![],
             fires_with: Default::default(),
             published_service: None,
+            member_service: None,
+            member_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),

@@ -64,6 +64,18 @@ spec:
     kubernetes:
       envoyService:
         type: ClusterIP
+      # The proxy pods resolve `<pod>.weft-workers.<ns>.svc.cluster.local`
+      # per live call; ndots:1 sends that name out as written instead of
+      # walking the search list to the host resolver first. The pod
+      # options here have no DNS field, so it rides a patch on the
+      # Deployment (weft_core::pod_dns, whose test holds this line in sync).
+      envoyDeployment:
+        patch:
+          value:
+            spec:
+              template:
+                spec:
+                  dnsConfig: {"options":[{"name":"ndots","value":"1"}]}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

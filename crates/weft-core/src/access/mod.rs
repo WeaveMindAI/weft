@@ -19,6 +19,8 @@
 pub mod client;
 pub mod events;
 #[cfg(feature = "runtime")]
+pub mod lookup;
+#[cfg(feature = "runtime")]
 pub mod socket;
 pub mod spec;
 // The connect wire types are runtime-side traffic (dispatcher, broker,
@@ -59,16 +61,41 @@ pub fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
 /// Whose credential a resolved connection rides; decides whose money a
 /// call on it spends. A fact of the STORED connection, answered by the
 /// resolver, never asserted by a client.
-// SYNC: CredentialOwner <-> packages/weft-graph/src/protocol.ts CredentialOwner
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// The two older spellings (`ours`, `their-own`) still read, as
+/// `Platform` and `Author`: journal rows written before members existed
+/// carry them, and a journal row is never rewritten.
+// SYNC: CredentialOwner <-> packages/weft-connect/src/core/wire.ts CredentialOwner, crates/weft-core/src/program.rs PaidBy
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CredentialOwner {
-    /// The user's own credential (their key, their signed-in account):
-    /// calls spend their money, so a measured figure is informational.
-    TheirOwn,
     /// The runtime's own credential: calls spend its credit, so a
     /// measured figure is a charge.
-    Ours,
+    #[serde(alias = "ours")]
+    Platform,
+    /// The author's own credential (their key, their signed-in account):
+    /// calls spend their money, so a measured figure is informational.
+    #[serde(alias = "their-own")]
+    Author,
+    /// A member's own credential, connected by that member: calls spend
+    /// the member's money.
+    Member(crate::member::MemberId),
+}
+
+impl CredentialOwner {
+    /// Whether calls spend the runtime's own credit.
+    pub fn is_platform(&self) -> bool {
+        matches!(self, CredentialOwner::Platform)
+    }
+
+    /// The owner of a connection somebody connected themselves: the
+    /// member's when it is a member's connection, the author's otherwise.
+    pub fn own(member: Option<crate::member::MemberId>) -> Self {
+        match member {
+            Some(member) => CredentialOwner::Member(member),
+            None => CredentialOwner::Author,
+        }
+    }
 }
 
 /// A connection opened for ONE firing: the signed-in client to call
@@ -118,8 +145,8 @@ impl OpenedConnection {
         self.identity.as_deref()
     }
 
-    pub fn owner(&self) -> CredentialOwner {
-        self.owner
+    pub fn owner(&self) -> &CredentialOwner {
+        &self.owner
     }
 
     /// The signed-in HTTP client: use it directly, or hand it to any
@@ -262,7 +289,7 @@ mod tests {
             values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),
             auth,
             None,
-            CredentialOwner::TheirOwn,
+            CredentialOwner::Author,
             client,
             std::sync::Arc::new(NoDial),
         )
@@ -352,5 +379,29 @@ mod tests {
         );
         let rendered = format!("{c:?}");
         assert!(!rendered.contains("sk-very-secret"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::CredentialOwner;
+
+    #[test]
+    fn an_owner_reads_its_older_spellings() {
+        let read = |s: &str| serde_json::from_value::<CredentialOwner>(serde_json::json!(s)).unwrap();
+        assert_eq!(read("ours"), CredentialOwner::Platform);
+        assert_eq!(read("their-own"), CredentialOwner::Author);
+        assert_eq!(read("platform"), CredentialOwner::Platform);
+        assert_eq!(read("author"), CredentialOwner::Author);
+    }
+
+    #[test]
+    fn a_members_own_names_the_member() {
+        let ada = crate::member::MemberId::new("ada").unwrap();
+        let owner = CredentialOwner::own(Some(ada.clone()));
+        assert_eq!(serde_json::to_value(&owner).unwrap(), serde_json::json!({ "member": "ada" }));
+        assert_eq!(serde_json::from_value::<CredentialOwner>(serde_json::json!({ "member": "ada" })).unwrap(), owner);
+        assert!(!owner.is_platform());
+        assert_eq!(CredentialOwner::own(None), CredentialOwner::Author);
     }
 }

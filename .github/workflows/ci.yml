@@ -110,8 +110,9 @@ jobs:
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-vscode
-          borrow-packages: packages/weft-graph packages/weft-syntax
+          borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C packages/weft-graph test
+      - run: pnpm -C packages/weft-connect test
       - run: pnpm -C packages/weft-syntax test
       - run: pnpm -C extension-vscode test
       - run: pnpm -C extension-vscode run compile

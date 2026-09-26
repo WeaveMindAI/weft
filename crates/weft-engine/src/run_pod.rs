@@ -282,6 +282,9 @@ struct LiveStart {
     runtime: weft_core::caller::CallerRuntimeConfig,
     heartbeat_secs: u64,
     request: Arc<weft_core::caller::LiveRequest>,
+    /// The run's journal: the pod's, or an unrecorded run's own memory,
+    /// so the exchange is kept wherever the rest of the run is.
+    journal: Arc<dyn weft_journal::JournalClient>,
 }
 
 type LiveConfigMap = Arc<std::sync::Mutex<HashMap<Color, Arc<LiveStart>>>>;
@@ -376,7 +379,6 @@ pub async fn run_pod(
             live_configs.clone(),
             cancel_registry.clone(),
             clients.clock.clone(),
-            clients.journal.clone(),
             clients.tasks.clone(),
             pod_name.clone(),
             tenant_id.clone(),
@@ -604,7 +606,7 @@ struct BrokerCallerJournal {
     /// races is exactly the pair whose order carries meaning: the window
     /// holding a conversation's last messages, and the row saying the
     /// caller hung up. A reader would see the goodbye before the words.
-    rows: tokio::sync::mpsc::UnboundedSender<weft_journal::ExecEvent>,
+    rows: tokio::sync::mpsc::UnboundedSender<CallerRow>,
     /// Why this conversation's journal stopped working, once it has.
     /// The next thing the program tries to send the caller fails with
     /// it, the same way a bus whose journal failed refuses the next
@@ -616,6 +618,14 @@ struct BrokerCallerJournal {
     /// gets trimmed or on what "ephemeral" means.
     policy: weft_core::stream_journal::JournalPolicy,
     pending: std::sync::Mutex<PendingCallerWindow>,
+}
+
+/// What the writer task is handed, in order: a row to write, or a
+/// closing sink asking to hear once everything before it is written.
+#[derive(Debug)]
+enum CallerRow {
+    Row(Box<weft_journal::ExecEvent>),
+    Drained(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Messages said since the last row went out.
@@ -650,7 +660,14 @@ impl BrokerCallerJournal {
         // closes, so a conversation never leaves a task behind.
         let writer_degraded = degraded.clone();
         tokio::spawn(async move {
-            while let Some(event) = incoming.recv().await {
+            while let Some(row) = incoming.recv().await {
+                let event = match row {
+                    CallerRow::Row(event) => *event,
+                    CallerRow::Drained(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 if let Err(e) = journal.record_event(&event, Some(&pod_name)).await {
                     tracing::error!(
                         target: "weft_engine::caller_conn",
@@ -769,7 +786,7 @@ impl BrokerCallerJournal {
     /// is gone, which happens when this sink is being dropped, so there
     /// is nothing left to tell.
     fn emit(&self, event: weft_journal::ExecEvent) {
-        let _ = self.rows.send(event);
+        let _ = self.rows.send(CallerRow::Row(Box::new(event)));
     }
 }
 
@@ -857,6 +874,17 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         });
         self.pending.lock().expect("caller journal buffer").closed = true;
     }
+    fn close(&self) -> futures::future::BoxFuture<'static, ()> {
+        self.flush();
+        self.pending.lock().expect("caller journal buffer").closed = true;
+        let (done, drained) = tokio::sync::oneshot::channel();
+        // The writer holds its receiver for as long as this sink lives,
+        // and this sink is alive here, so the ask always reaches it.
+        self.rows.send(CallerRow::Drained(done)).expect("the caller journal writer outlives its sink");
+        Box::pin(async move {
+            drained.await.expect("the caller journal writer answers every drain it is handed");
+        })
+    }
 }
 
 /// Resolver over the worker's per-color live-config map. The connection
@@ -865,7 +893,6 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
 /// or long after, the execute task) returns `None` and the server 404s.
 struct LiveConfigResolver {
     live_configs: LiveConfigMap,
-    journal: Arc<dyn weft_journal::JournalClient>,
     pod_name: String,
 }
 
@@ -878,7 +905,7 @@ impl crate::caller_conn::ConnConfigResolver for LiveConfigResolver {
             .get(&color)
             .cloned()?;
         let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
-            self.journal.clone(),
+            start.journal.clone(),
             self.pod_name.clone(),
             start.runtime.journal,
         );
@@ -921,7 +948,6 @@ fn spawn_connection_server(
     live_configs: LiveConfigMap,
     cancel_registry: CancelRegistry,
     clock: Arc<dyn weft_platform_traits::Clock>,
-    journal: Arc<dyn weft_journal::JournalClient>,
     tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     pod_name: String,
     tenant_id: String,
@@ -934,7 +960,6 @@ fn spawn_connection_server(
         pod_name: pod_name.clone(),
         resolver: Arc::new(LiveConfigResolver {
             live_configs,
-            journal,
             pod_name,
         }),
         clock,
@@ -984,6 +1009,42 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         let project = fetch_or_cached_project(ctx, &payload.definition_hash).await?;
         let _driving = ctx.driving.hold(color).await;
 
+        // An unrecorded run's journal is its own memory, seeded with the
+        // birth its task carried. It is never run twice: a second claim
+        // means the first one died somewhere in the middle, and running
+        // it again would repeat whatever it had already done.
+        // Refused that way, it is still written down: its birth and the
+        // failure become its record, as any failed unrecorded run's do,
+        // so it lists, and its ending reaches whoever waits on it.
+        let unrecorded = match &payload.unrecorded_birth {
+            None => None,
+            Some(birth) => {
+                let birth = birth
+                    .iter()
+                    .map(|row| weft_journal::decode_event(color, &row.to_string()).map_err(anyhow::Error::msg))
+                    .collect::<Result<Vec<_>>>()?;
+                if task.attempts > 1 {
+                    let error = format!(
+                        "unrecorded run {color} was already started once and its worker went away; \
+                         it is not run again, because a second run would repeat what the first did"
+                    );
+                    let mut record = weft_journal::unrecorded::as_recorded(birth);
+                    record.push(weft_journal::ExecEvent::ExecutionFailed { color, error: error.clone(), at_unix: crate::now_unix() });
+                    ctx.clients
+                        .journal
+                        .record_retroactively(&record, Some(ctx.pod_name.as_str()))
+                        .await
+                        .map_err(|e| e.context(format!("record refused unrecorded run {color}")))?;
+                    anyhow::bail!(error);
+                }
+                Some(weft_journal::UnrecordedJournal::seeded(color, birth, ctx.clients.journal.clone())?)
+            }
+        };
+        let clients = match &unrecorded {
+            Some(journal) => EngineClients { journal: journal.clone(), ..ctx.clients.clone() },
+            None => ctx.clients.clone(),
+        };
+
         let flag = CancellationFlag::new_arc();
         ctx.cancel_registry
             .lock()
@@ -1010,7 +1071,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         // malformed record is a dispatcher/worker mismatch: the execution
         // fails rather than running as if nobody were on the line.
         let caller = match &payload.live_connection {
-            Some(start) => attach_live_caller(ctx, color, start).await?,
+            Some(start) => attach_live_caller(ctx, color, start, clients.journal.clone()).await?,
             None => None,
         };
         // Keep the connection so we can end the exchange with the caller
@@ -1018,13 +1079,14 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         // Only a REAL caller needs this: a fired run's exchange is over
         // the moment the program answers, with no socket left to tell.
         let caller_after_run = caller.as_ref().and_then(RunCaller::live);
+        let caller_journal = caller.as_ref().map(RunCaller::journal);
         let caller = caller.map(|c| c.as_connection());
 
         let outcome = run_one_execution(
             project,
             ctx.catalog.clone(),
             color,
-            ctx.clients.clone(),
+            clients,
             ctx.pod_name.clone(),
             ctx.tenant_id.clone(),
             ctx.namespace.clone(),
@@ -1060,6 +1122,32 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
                     conn.surface_error("execution already ended before this worker claimed it").await
                 }
                 Ok(ExecutionOutcome::Completed) | Ok(ExecutionOutcome::Stalled) => conn.run_ended().await,
+            }
+            conn.hang_up().await;
+        }
+        // Everything the exchange said (the last window, the error row
+        // above, the disconnect the hang-up recorded) is in the run's
+        // journal before that journal is read to be settled: an
+        // unrecorded run's record is taken once, and a row still queued
+        // behind it would be lost.
+        if let Some(sink) = &caller_journal {
+            sink.close().await;
+        }
+
+        // An unrecorded run is over, and so is everything it will write:
+        // a failure is recorded whole, anything else is forgotten.
+        if let Some(journal) = &unrecorded {
+            let settled = journal.settle(Some(ctx.pod_name.as_str())).await;
+            match (&outcome, settled) {
+                (_, Ok(_)) => {}
+                // The run's own error says more than the settle's.
+                (Err(_), Err(e)) => tracing::error!(
+                    target: "weft_engine::run_pod",
+                    color = %color,
+                    error = %format!("{e:#}"),
+                    "an unrecorded run failed and its record could not be written"
+                ),
+                (Ok(_), Err(e)) => return Err(e.context(format!("settle unrecorded run {color}"))),
             }
         }
 
@@ -1110,12 +1198,21 @@ impl RunCaller {
             Self::Fired(_) => None,
         }
     }
+
+    /// The sink the exchange is recorded through, live or fired.
+    fn journal(&self) -> Arc<dyn crate::caller_conn::CallerJournalSink> {
+        match self {
+            Self::Live(c) => c.journal(),
+            Self::Fired(c) => c.journal(),
+        }
+    }
 }
 
 async fn attach_live_caller(
     ctx: &WorkerCtx,
     color: Color,
     start: &weft_task_store::kinds::LiveConnectionStart,
+    journal: Arc<dyn weft_journal::JournalClient>,
 ) -> Result<Option<RunCaller>> {
     // The record carries the full signal spec: the protocol is the kind
     // (tag), the connection knobs are the config body.
@@ -1136,6 +1233,7 @@ async fn attach_live_caller(
             runtime,
             heartbeat_secs: cfg.heartbeat_interval_secs,
             request: Arc::new(start.request.clone()),
+            journal: journal.clone(),
         }),
     );
     // A FIRED run has no socket coming, so waiting for one would burn
@@ -1151,7 +1249,7 @@ async fn attach_live_caller(
             );
         }
         let journal: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
-            ctx.clients.journal.clone(),
+            journal,
             ctx.pod_name.clone(),
             cfg.journal_policy(),
         );

@@ -6,7 +6,10 @@
 //! ProtocolAction enum). Stored in `project.health_protocols_json`
 //! as raw JSON; we deserialize on demand.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
+use weft_broker_client::protocol::InfraCopy;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthProtocols {
@@ -45,9 +48,22 @@ fn wildcard() -> String {
     "*".into()
 }
 
+/// A condition on units reads only the units whose workload the health
+/// loop has seen: a unit whose workload has not appeared yet is unknown,
+/// and no condition on units is true of it (it is neither ready nor
+/// broken). One that was seen and then vanished reads as zero ready.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HealthCondition {
+    /// Some matched unit is declared flaky: not ready for its
+    /// `flaky_after` window after having been ready, and not yet ready
+    /// again for its `recovery_after` window. The same latch that sets
+    /// the node's `flaky` status, so one bad reading never makes it true.
+    NodeFlaky {
+        node_id: String,
+        #[serde(default = "wildcard")]
+        unit: String,
+    },
     NodeReadyRatioBelow {
         node_id: String,
         /// Unit selector. `"*"` (default) scans every unit of the
@@ -73,13 +89,12 @@ pub enum HealthCondition {
     ProjectStatusEq {
         status: weft_broker_client::protocol::ProjectStatus,
     },
-    /// True iff the project's current deactivation was performed by
-    /// the health loop (not the user). The default auto-recover
-    /// protocol pairs this with `infra healthy` + `Inactive` so it
-    /// reactivates ONLY a deactivation it did itself: a user stop /
-    /// deactivate sets the flag false, so auto-recover leaves it
-    /// alone (the user is present and didn't ask to be reactivated).
-    DeactivatedByHealth,
+    /// True iff some activation the health loop took down is still
+    /// down. The default auto-recover protocol pairs this with "no infra
+    /// broken" so it reactivates ONLY what it took down itself: a
+    /// person's stop / deactivate clears the mark on what it takes down,
+    /// so auto-recover leaves that alone.
+    HealthParked,
     /// All sub-conditions must hold. Struct variant (`conds: [...]`)
     /// instead of tuple variant because internally-tagged enums
     /// can't serialize a tuple-newtype-with-Vec via serde_json.
@@ -113,60 +128,110 @@ pub enum CompareOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProtocolAction {
+    /// Park the live triggers that read an infra copy the protocol's
+    /// condition found broken (see [`broken_copies`]); the same for the
+    /// two below. A trigger that reads only healthy infra keeps running.
     ParkTriggers,
     HibernateTriggers { grace_minutes: u32 },
     WipeTriggers,
+    /// Bring back what the health loop took down, copy by copy: the
+    /// protocol's condition is read on each copy's own units, the copies
+    /// it fails for are still broken (see [`still_broken_copies`]), and
+    /// every trigger that reads none of them comes back. One copy still
+    /// broken holds back only its own readers.
     AutoRecover,
     Notify { channel: String },
+    /// Scale `unit` of the copies of `node_id` owned by whoever owns a
+    /// copy the condition finds broken: the shared copy for a broken
+    /// shared one, ada's for a broken copy of ada's.
     Scale {
         node_id: String,
         unit: String,
         replicas: u32,
     },
+    /// Delete the Pods of `unit` in the same copies `Scale` reaches.
     BouncePods {
         node_id: String,
         unit: String,
     },
 }
 
+impl ProtocolAction {
+    /// Whether this action acts on the copies its condition finds broken
+    /// ([`broken_copies`]): it takes their readers down, or scales or
+    /// bounces their owners' copies. When its condition names no infra
+    /// ([`names_infra`]), see [`ProtocolAction::unowned_scope`].
+    pub fn aims_at_broken_copies(&self) -> bool {
+        matches!(
+            self,
+            Self::ParkTriggers
+                | Self::HibernateTriggers { .. }
+                | Self::WipeTriggers
+                | Self::Scale { .. }
+                | Self::BouncePods { .. }
+        )
+    }
+
+    /// Where an action on broken copies lands when its condition names
+    /// no infra, so nothing says which copies are broken: a scale or a
+    /// bounce on the named node's shared copy, a take-down on the whole
+    /// project (the empty set).
+    pub fn unowned_scope(&self) -> BTreeSet<InfraCopy> {
+        match self {
+            Self::Scale { node_id, .. } | Self::BouncePods { node_id, .. } => {
+                BTreeSet::from([InfraCopy { node_id: node_id.clone(), member: None }])
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+}
+
+/// Whether `cond` holds a condition on units in a positive place (not
+/// under a `not`): the leaves [`broken_copies`] reads. A protocol acting
+/// on broken copies whose condition names none acts where it did before
+/// copies had owners: a take-down on the whole project, a scale or a
+/// bounce on the named node's shared copy.
+pub(crate) fn names_infra(cond: &HealthCondition) -> bool {
+    match cond {
+        HealthCondition::NodeFlaky { .. }
+        | HealthCondition::NodeReadyRatioBelow { .. }
+        | HealthCondition::NodeReadyReplicas { .. } => true,
+        HealthCondition::All { conds } | HealthCondition::Any { conds } => conds.iter().any(names_infra),
+        HealthCondition::Not { .. } | HealthCondition::ProjectStatusEq { .. } | HealthCondition::HealthParked => false,
+    }
+}
+
 /// Default protocol set if the project hasn't configured anything.
 ///
-/// Two-stage AutoRecover. The expressiveness comes from the
-/// `HealthCondition::ProjectStatusEq` clause that lets the
-/// protocol's preconditions look at lifecycle state. The condition
-/// language is the user-visible interface; the supervisor's
-/// handler is dumb.
+/// Two-stage AutoRecover. The expressiveness comes from the condition
+/// language (`ProjectStatusEq`, `HealthParked`); the supervisor's handler
+/// is dumb.
 ///
-/// 1. **Park on infra degradation.** While Active AND some infra
-///    node has zero ready replicas (for the flaky window), park
-///    triggers. New fires queue against parked signals; running
-///    executions either drain or get stuck on `endpoint_url` :
-///    that's the design's intent (no execution proceeds against
-///    broken infra).
+/// 1. **Park what reads broken infra.** While the project listens AND
+///    some unit is declared flaky (not ready for its whole flaky window
+///    after having been ready), park the triggers that read the broken
+///    copies. New fires queue against parked signals; running executions
+///    drain. Triggers reading only healthy infra keep running.
 ///
-/// 2. **Reactivate on infra recovery.** While Inactive AND every
-///    infra node has at least one ready replica, reactivate.
-///    Triggers come back online, parked fires drain.
+/// 2. **Reactivate on recovery.** While something the health loop
+///    parked is still down, reactivate what it parked that reads only
+///    copies with no unit flaky any more. Read copy by copy: one copy
+///    still flaky keeps only its own readers parked.
 ///
 /// Users can override the whole thing with their own
 /// `HealthProtocols` in `project.health_protocols_json`.
 pub fn default_protocols() -> HealthProtocols {
     use weft_broker_client::protocol::ProjectStatus;
-    // Any unit of any node with zero ready replicas. Per-unit: one
-    // broken unit is enough to consider the infra degraded.
-    let any_unit_zero_ready = HealthCondition::NodeReadyReplicas {
-        node_id: "*".into(),
-        unit: "*".into(),
-        op: CompareOp::Eq,
-        value: 0,
-    };
+    // Any unit of any node latched flaky. Per-unit: one broken unit is
+    // enough to consider its copy broken.
+    let any_unit_flaky = HealthCondition::NodeFlaky { node_id: "*".into(), unit: "*".into() };
     HealthProtocols {
         protocols: vec![
             HealthProtocol {
                 name: "park-while-infra-broken".into(),
                 when: HealthCondition::All {
                     conds: vec![
-                        any_unit_zero_ready.clone(),
+                        any_unit_flaky.clone(),
                         HealthCondition::ProjectStatusEq {
                             status: ProjectStatus::Active,
                         },
@@ -180,17 +245,13 @@ pub fn default_protocols() -> HealthProtocols {
                 when: HealthCondition::All {
                     conds: vec![
                         HealthCondition::Not {
-                            cond: vec![any_unit_zero_ready],
+                            cond: vec![any_unit_flaky],
                         },
-                        HealthCondition::ProjectStatusEq {
-                            status: ProjectStatus::Inactive,
-                        },
-                        // ONLY reactivate a park the health loop itself
-                        // did. A user stop / deactivate sets the flag
-                        // false, so this protocol never overrides the
-                        // user's explicit deactivation (they're present
-                        // and don't want a surprise reactivation).
-                        HealthCondition::DeactivatedByHealth,
+                        // ONLY reactivate what the health loop itself
+                        // parked. A user stop / deactivate clears the
+                        // mark, so this protocol never overrides the
+                        // user's explicit deactivation.
+                        HealthCondition::HealthParked,
                     ],
                 },
                 action: ProtocolAction::AutoRecover,
@@ -200,18 +261,72 @@ pub fn default_protocols() -> HealthProtocols {
     }
 }
 
+/// One unit of one deployed copy, as this look saw it. Only units whose
+/// workload the loop has seen are here (see [`HealthCondition`]), and
+/// only units expected to run now (running or flaky).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitView {
+    pub node_id: String,
+    /// Whose copy: `None` for the shared one.
+    pub member: Option<weft_core::member::MemberId>,
+    pub unit: String,
+    /// Ready over desired, clamped to [0, 1]; 1.0 when none is desired.
+    pub ready_ratio: f32,
+    pub ready: u32,
+    /// The unit's latched health (`evaluate_node_health`).
+    pub flaky: bool,
+}
+
+impl UnitView {
+    pub(crate) fn copy(&self) -> InfraCopy {
+        InfraCopy { node_id: self.node_id.clone(), member: self.member.clone() }
+    }
+
+    /// Whether this unit satisfies the unit condition `cond`; `None`
+    /// when `cond` is not a condition on units.
+    fn satisfies(&self, cond: &HealthCondition) -> Option<bool> {
+        let (node_id, unit) = match cond {
+            HealthCondition::NodeFlaky { node_id, unit }
+            | HealthCondition::NodeReadyRatioBelow { node_id, unit, .. }
+            | HealthCondition::NodeReadyReplicas { node_id, unit, .. } => (node_id, unit),
+            _ => return None,
+        };
+        if !selector_matches(node_id, unit, &self.node_id, &self.unit) {
+            return Some(false);
+        }
+        Some(match cond {
+            HealthCondition::NodeFlaky { .. } => self.flaky,
+            HealthCondition::NodeReadyRatioBelow { ratio, .. } => self.ready_ratio < *ratio,
+            HealthCondition::NodeReadyReplicas { op, value, .. } => op.holds(self.ready, *value),
+            _ => unreachable!("matched a condition on units above"),
+        })
+    }
+}
+
+impl CompareOp {
+    fn holds(self, n: u32, value: u32) -> bool {
+        match self {
+            CompareOp::Eq => n == value,
+            CompareOp::Ne => n != value,
+            CompareOp::Lt => n < value,
+            CompareOp::Lte => n <= value,
+            CompareOp::Gt => n > value,
+            CompareOp::Gte => n >= value,
+        }
+    }
+}
+
 /// Everything `evaluate_condition` needs from one tick. Grouped
 /// into a struct so adding new condition kinds doesn't blow up the
 /// arg list at every call site.
 #[derive(Debug, Clone)]
 pub struct ConditionContext<'a> {
-    /// Keyed by `(node_id, unit)`. Health is per-unit.
-    pub ready_ratio: &'a std::collections::HashMap<(String, String), f32>,
-    pub ready_replicas: &'a std::collections::HashMap<(String, String), u32>,
+    /// Every seen unit of every copy expected to run now.
+    pub units: &'a [UnitView],
     pub project_status: weft_broker_client::protocol::ProjectStatus,
-    /// Did the health loop perform the current deactivation? Feeds
-    /// `HealthCondition::DeactivatedByHealth`.
-    pub deactivated_by_health: bool,
+    /// Is something the health loop took down still down? Feeds
+    /// `HealthCondition::HealthParked`.
+    pub health_parked: bool,
 }
 
 /// True if a `(node_id, unit)` selector pair (each possibly `"*"`)
@@ -222,54 +337,16 @@ fn selector_matches(sel_node: &str, sel_unit: &str, node: &str, unit: &str) -> b
 
 pub fn evaluate_condition(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> bool {
     match cond {
-        HealthCondition::NodeReadyRatioBelow { node_id, unit, ratio } => {
-            // Any matched (node, unit) below the ratio fires. An exact
-            // selector with no matching key defaults to ready (1.0):
-            // a not-yet-observed unit isn't "broken".
-            let matched: Vec<f32> = ctx
-                .ready_ratio
-                .iter()
-                .filter(|((n, u), _)| selector_matches(node_id, unit, n, u))
-                .map(|(_, r)| *r)
-                .collect();
-            if matched.is_empty() {
-                // A named node with no observed matching unit defaults
-                // to ready (1.0): named-but-not-yet-observed isn't
-                // "below ratio". A `*` node wildcard over zero units
-                // stays false. (Mirrors the old node-level default.)
-                node_id != "*" && 1.0 < *ratio
-            } else {
-                matched.iter().any(|r| *r < *ratio)
-            }
-        }
-        HealthCondition::NodeReadyReplicas { node_id, unit, op, value } => {
-            let cmp = |n: u32| match op {
-                CompareOp::Eq => n == *value,
-                CompareOp::Ne => n != *value,
-                CompareOp::Lt => n < *value,
-                CompareOp::Lte => n <= *value,
-                CompareOp::Gt => n > *value,
-                CompareOp::Gte => n >= *value,
-            };
-            let matched: Vec<u32> = ctx
-                .ready_replicas
-                .iter()
-                .filter(|((n, u), _)| selector_matches(node_id, unit, n, u))
-                .map(|(_, r)| *r)
-                .collect();
-            if matched.is_empty() {
-                // A NAMED node with no observed matching unit is
-                // treated as 0 ready (named-and-absent = down; matches
-                // the old node-level `unwrap_or(0)`). A pure `*` node
-                // wildcard over zero units stays false (nothing to
-                // match), like the old `values().any()`.
-                node_id != "*" && cmp(0)
-            } else {
-                matched.iter().copied().any(cmp)
-            }
+        // A condition on units holds when some seen unit satisfies it;
+        // over no seen unit it is false (an unknown unit is neither
+        // ready nor broken).
+        HealthCondition::NodeFlaky { .. }
+        | HealthCondition::NodeReadyRatioBelow { .. }
+        | HealthCondition::NodeReadyReplicas { .. } => {
+            ctx.units.iter().any(|u| u.satisfies(cond) == Some(true))
         }
         HealthCondition::ProjectStatusEq { status } => ctx.project_status == *status,
-        HealthCondition::DeactivatedByHealth => ctx.deactivated_by_health,
+        HealthCondition::HealthParked => ctx.health_parked,
         HealthCondition::All { conds } => conds.iter().all(|c| evaluate_condition(c, ctx)),
         HealthCondition::Any { conds } => conds.iter().any(|c| evaluate_condition(c, ctx)),
         HealthCondition::Not { cond } => match cond.first() {
@@ -281,270 +358,221 @@ pub fn evaluate_condition(cond: &HealthCondition, ctx: &ConditionContext<'_>) ->
     }
 }
 
+/// The copies `cond` does NOT hold for when read on each copy's own
+/// units: what an auto-recover keeps the readers of down. A condition on
+/// units reads only that copy's; a condition on the project (its status,
+/// whether the health loop parked something) reads the same for every
+/// copy. Only seen copies are candidates: a copy whose workload is
+/// unknown is neither broken nor recovered, so it holds back nobody.
+pub fn still_broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> BTreeSet<InfraCopy> {
+    let copies: BTreeSet<InfraCopy> = ctx.units.iter().map(UnitView::copy).collect();
+    copies
+        .into_iter()
+        .filter(|copy| {
+            let own: Vec<UnitView> = ctx.units.iter().filter(|u| u.copy() == *copy).cloned().collect();
+            !evaluate_condition(cond, &ConditionContext { units: &own, ..ctx.clone() })
+        })
+        .collect()
+}
+
+/// The copies `cond` finds broken: every copy with a unit that satisfies
+/// one of its conditions on units in a positive place (not under a
+/// `not`). What a take-down action aims at: the triggers reading these.
+pub fn broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> BTreeSet<InfraCopy> {
+    match cond {
+        HealthCondition::NodeFlaky { .. }
+        | HealthCondition::NodeReadyRatioBelow { .. }
+        | HealthCondition::NodeReadyReplicas { .. } => ctx
+            .units
+            .iter()
+            .filter(|u| u.satisfies(cond) == Some(true))
+            .map(UnitView::copy)
+            .collect(),
+        HealthCondition::All { conds } | HealthCondition::Any { conds } => {
+            conds.iter().flat_map(|c| broken_copies(c, ctx)).collect()
+        }
+        HealthCondition::Not { .. } | HealthCondition::ProjectStatusEq { .. } | HealthCondition::HealthParked => {
+            BTreeSet::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use weft_broker_client::protocol::ProjectStatus;
+    use weft_core::member::MemberId;
 
-    /// Test helper: takes node-keyed maps (one unit per node, unit
-    /// name = node id) and wraps them into the per-(node,unit)
-    /// `ConditionContext` so the existing single-node tests stay
-    /// readable. Health is per-unit, but a one-unit-per-node fixture
-    /// exercises the same logic.
-    fn ev(
-        cond: &HealthCondition,
-        ready_ratio: &HashMap<String, f32>,
-        ready_replicas: &HashMap<String, u32>,
-    ) -> bool {
-        let rr: HashMap<(String, String), f32> = ready_ratio
-            .iter()
-            .map(|(n, v)| ((n.clone(), n.clone()), *v))
-            .collect();
-        let rp: HashMap<(String, String), u32> = ready_replicas
-            .iter()
-            .map(|(n, v)| ((n.clone(), n.clone()), *v))
-            .collect();
-        evaluate_condition(
-            cond,
-            &ConditionContext {
-                ready_ratio: &rr,
-                ready_replicas: &rp,
-                project_status: weft_broker_client::protocol::ProjectStatus::Active,
-                deactivated_by_health: false,
-            },
-        )
+    /// One seen unit of the shared copy of `node` (unit named after it).
+    fn unit(node: &str, ratio: f32, ready: u32, flaky: bool) -> UnitView {
+        UnitView { node_id: node.into(), member: None, unit: node.into(), ready_ratio: ratio, ready, flaky }
     }
 
+    fn ctx(units: &[UnitView]) -> ConditionContext<'_> {
+        ConditionContext { units, project_status: ProjectStatus::Active, health_parked: false }
+    }
+
+    fn ev(cond: &HealthCondition, units: &[UnitView]) -> bool {
+        evaluate_condition(cond, &ctx(units))
+    }
+
+    fn ratio_below(node: &str, ratio: f32) -> HealthCondition {
+        HealthCondition::NodeReadyRatioBelow { node_id: node.into(), unit: "*".into(), ratio }
+    }
+
+    fn replicas(node: &str, op: CompareOp, value: u32) -> HealthCondition {
+        HealthCondition::NodeReadyReplicas { node_id: node.into(), unit: "*".into(), op, value }
+    }
+
+    fn flaky(node: &str) -> HealthCondition {
+        HealthCondition::NodeFlaky { node_id: node.into(), unit: "*".into() }
+    }
 
     // ---------- evaluate_condition: NodeReadyRatioBelow ----------
 
     #[test]
     fn ratio_below_strict_for_named_node() {
-        let mut r = HashMap::new();
-        r.insert("n1".to_string(), 0.5);
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "n1".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(ev(&c, &r, &HashMap::new()));
-    }
-
-    #[test]
-    fn ratio_at_threshold_does_not_trigger() {
-        let mut r = HashMap::new();
-        r.insert("n1".to_string(), 1.0);
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "n1".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(!ev(&c, &r, &HashMap::new()));
-    }
-
-    #[test]
-    fn ratio_missing_node_defaults_to_1_safe() {
-        // A node we have no data on shouldn't trigger flaky detection.
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "ghost".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(!ev(&c, &HashMap::new(), &HashMap::new()));
+        assert!(ev(&ratio_below("n1", 1.0), &[unit("n1", 0.5, 1, false)]));
+        assert!(!ev(&ratio_below("n1", 1.0), &[unit("n1", 1.0, 1, false)]), "at the threshold is not below");
     }
 
     #[test]
     fn ratio_wildcard_scans_all_nodes() {
-        let mut r = HashMap::new();
-        r.insert("a".to_string(), 1.0);
-        r.insert("b".to_string(), 0.3);
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "*".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(ev(&c, &r, &HashMap::new()));
-    }
-
-    #[test]
-    fn ratio_wildcard_all_healthy_does_not_trigger() {
-        let mut r = HashMap::new();
-        r.insert("a".to_string(), 1.0);
-        r.insert("b".to_string(), 1.0);
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "*".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(!ev(&c, &r, &HashMap::new()));
-    }
-
-    #[test]
-    fn ratio_wildcard_empty_map_does_not_trigger() {
-        // No data at all: nothing to flag.
-        let c = HealthCondition::NodeReadyRatioBelow {
-            node_id: "*".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        };
-        assert!(!ev(&c, &HashMap::new(), &HashMap::new()));
+        assert!(ev(&ratio_below("*", 1.0), &[unit("a", 1.0, 1, false), unit("b", 0.3, 0, false)]));
+        assert!(!ev(&ratio_below("*", 1.0), &[unit("a", 1.0, 1, false), unit("b", 1.0, 1, false)]));
     }
 
     // ---------- evaluate_condition: NodeReadyReplicas ----------
 
-    fn reps(node: &str, n: u32) -> HashMap<String, u32> {
-        let mut m = HashMap::new();
-        m.insert(node.to_string(), n);
-        m
+    #[test]
+    fn replicas_compare_ops() {
+        let m = [unit("n", 1.0, 3, false)];
+        assert!(ev(&replicas("n", CompareOp::Eq, 3), &m));
+        assert!(!ev(&replicas("n", CompareOp::Eq, 2), &m));
+        assert!(ev(&replicas("n", CompareOp::Ne, 2), &m));
+        assert!(!ev(&replicas("n", CompareOp::Ne, 3), &m));
+        assert!(ev(&replicas("n", CompareOp::Lt, 5), &m));
+        assert!(!ev(&replicas("n", CompareOp::Lt, 3), &m));
+        assert!(ev(&replicas("n", CompareOp::Lte, 3), &m));
+        assert!(ev(&replicas("n", CompareOp::Gt, 1), &m));
+        assert!(!ev(&replicas("n", CompareOp::Gt, 3), &m));
+        assert!(ev(&replicas("n", CompareOp::Gte, 3), &m));
     }
 
+    /// A unit whose workload has not been seen is not in the look at all,
+    /// and no condition on units is true of it: not "zero ready", not
+    /// "below ratio", not flaky, named or wildcard. This is what keeps a
+    /// copy that was just applied, before its workload reached the
+    /// watch, from reading as broken.
     #[test]
-    fn replicas_eq() {
-        let m = reps("n1", 3);
-        assert!(ev(
-            &HealthCondition::NodeReadyReplicas {
-                node_id: "n1".into(),
-                unit: "*".into(),
-                op: CompareOp::Eq,
-                value: 3,
-            },
-            &HashMap::new(),
-            &m,
-        ));
-        assert!(!ev(
-            &HealthCondition::NodeReadyReplicas {
-                node_id: "n1".into(),
-                unit: "*".into(),
-                op: CompareOp::Eq,
-                value: 2,
-            },
-            &HashMap::new(),
-            &m,
-        ));
+    fn an_unseen_unit_satisfies_no_condition_on_units() {
+        for cond in [
+            replicas("ghost", CompareOp::Eq, 0),
+            replicas("*", CompareOp::Eq, 0),
+            ratio_below("ghost", 1.0),
+            ratio_below("*", 1.0),
+            flaky("ghost"),
+            flaky("*"),
+        ] {
+            assert!(!ev(&cond, &[]), "{cond:?} must be false over no seen unit");
+            assert!(broken_copies(&cond, &ctx(&[])).is_empty());
+        }
+        // The default park reads nothing broken either.
+        assert!(!ev(&default_protocols().protocols[0].when, &[]));
     }
 
+    // ---------- evaluate_condition: NodeFlaky ----------
+
+    /// `node_flaky` reads the latch, never the instantaneous count: a
+    /// unit at zero ready that is not (yet) declared flaky does not
+    /// satisfy it, and one declared flaky does even while momentarily
+    /// ready inside its recovery window.
     #[test]
-    fn replicas_ne_lt_lte_gt_gte() {
-        let m = reps("n", 3);
-        let case = |op: CompareOp, v: u32| {
-            ev(
-                &HealthCondition::NodeReadyReplicas {
-                    node_id: "n".into(),
-                    unit: "*".into(),
-                    op,
-                    value: v,
-                },
-                &HashMap::new(),
-                &m,
-            )
-        };
-        assert!(case(CompareOp::Ne, 2));
-        assert!(!case(CompareOp::Ne, 3));
-        assert!(case(CompareOp::Lt, 5));
-        assert!(!case(CompareOp::Lt, 3));
-        assert!(case(CompareOp::Lte, 3));
-        assert!(case(CompareOp::Gt, 1));
-        assert!(!case(CompareOp::Gt, 3));
-        assert!(case(CompareOp::Gte, 3));
+    fn flaky_reads_the_latch_not_the_reading() {
+        assert!(!ev(&flaky("*"), &[unit("n", 0.0, 0, false)]));
+        assert!(ev(&flaky("*"), &[unit("n", 1.0, 1, true)]));
+        assert!(!ev(&flaky("other"), &[unit("n", 0.0, 0, true)]));
     }
 
+    // ---------- broken_copies ----------
+
+    /// A take-down aims at the copies whose units make a positive
+    /// condition on units true: here ada's svc copy, not bob's healthy
+    /// one, not the shared db; nothing under a `not`.
     #[test]
-    fn replicas_missing_defaults_to_zero() {
-        // Missing → defaults to 0 in the implementation; verify the
-        // contract so tests catch a future drift.
-        assert!(ev(
-            &HealthCondition::NodeReadyReplicas {
-                node_id: "ghost".into(),
-                unit: "*".into(),
-                op: CompareOp::Eq,
-                value: 0,
-            },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+    fn broken_copies_name_whose_copy_is_broken() {
+        let ada = MemberId::new("ada").unwrap();
+        let units = [
+            UnitView { member: Some(ada.clone()), ..unit("svc", 0.0, 0, true) },
+            UnitView { member: Some(MemberId::new("bob").unwrap()), ..unit("svc", 1.0, 1, false) },
+            unit("db", 1.0, 1, false),
+        ];
+        let park = &default_protocols().protocols[0].when;
+        assert!(ev(park, &units));
+        assert_eq!(
+            broken_copies(park, &ctx(&units)),
+            BTreeSet::from([InfraCopy { node_id: "svc".into(), member: Some(ada) }])
+        );
+        let negated = HealthCondition::Not { cond: vec![replicas("*", CompareOp::Eq, 1)] };
+        assert!(broken_copies(&negated, &ctx(&units)).is_empty());
+    }
+
+    /// The default recovery reads each copy on its own units: bob's
+    /// copy is still flaky, while ada's healed copy and the healthy shared
+    /// one are not; with nothing parked every copy fails it.
+    #[test]
+    fn still_broken_copies_are_read_copy_by_copy() {
+        let bob = MemberId::new("bob").unwrap();
+        let units = [
+            UnitView { member: Some(MemberId::new("ada").unwrap()), ..unit("svc", 1.0, 1, false) },
+            UnitView { member: Some(bob.clone()), ..unit("svc", 0.0, 0, true) },
+            unit("db", 1.0, 1, false),
+        ];
+        let recover = &default_protocols().protocols[1].when;
+        let parked = ConditionContext { health_parked: true, ..ctx(&units) };
+        assert!(!evaluate_condition(recover, &parked), "read on the whole project, bob's copy holds it back");
+        assert_eq!(
+            still_broken_copies(recover, &parked),
+            BTreeSet::from([InfraCopy { node_id: "svc".into(), member: Some(bob) }])
+        );
+        assert_eq!(still_broken_copies(recover, &ctx(&units)).len(), 3);
     }
 
     // ---------- combinators ----------
 
     fn always_true() -> HealthCondition {
-        HealthCondition::NodeReadyReplicas {
-            node_id: "x".into(),
-            unit: "*".into(),
-            op: CompareOp::Eq,
-            value: 0,
-        }
+        HealthCondition::ProjectStatusEq { status: ProjectStatus::Active }
     }
     fn always_false() -> HealthCondition {
-        HealthCondition::NodeReadyReplicas {
-            node_id: "x".into(),
-            unit: "*".into(),
-            op: CompareOp::Ne,
-            value: 0,
-        }
+        HealthCondition::HealthParked
     }
 
     #[test]
     fn all_combinator_logic() {
-        assert!(ev(
-            &HealthCondition::All { conds: vec![always_true(), always_true()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
-        assert!(!ev(
-            &HealthCondition::All { conds: vec![always_true(), always_false()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(ev(&HealthCondition::All { conds: vec![always_true(), always_true()] }, &[]));
+        assert!(!ev(&HealthCondition::All { conds: vec![always_true(), always_false()] }, &[]));
         // Empty All is vacuously true.
-        assert!(ev(
-            &HealthCondition::All { conds: vec![] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(ev(&HealthCondition::All { conds: vec![] }, &[]));
     }
 
     #[test]
     fn any_combinator_logic() {
-        assert!(ev(
-            &HealthCondition::Any { conds: vec![always_false(), always_true()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
-        assert!(!ev(
-            &HealthCondition::Any { conds: vec![always_false(), always_false()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(ev(&HealthCondition::Any { conds: vec![always_false(), always_true()] }, &[]));
+        assert!(!ev(&HealthCondition::Any { conds: vec![always_false(), always_false()] }, &[]));
         // Empty Any is vacuously false.
-        assert!(!ev(
-            &HealthCondition::Any { conds: vec![] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(!ev(&HealthCondition::Any { conds: vec![] }, &[]));
     }
 
     #[test]
     fn not_combinator_inverts() {
-        assert!(ev(
-            &HealthCondition::Not { cond: vec![always_false()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
-        assert!(!ev(
-            &HealthCondition::Not { cond: vec![always_true()] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(ev(&HealthCondition::Not { cond: vec![always_false()] }, &[]));
+        assert!(!ev(&HealthCondition::Not { cond: vec![always_true()] }, &[]));
     }
 
     #[test]
     fn not_combinator_empty_is_false() {
         // Defensive: malformed `Not { cond: [] }` evaluates false.
-        assert!(!ev(
-            &HealthCondition::Not { cond: vec![] },
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
+        assert!(!ev(&HealthCondition::Not { cond: vec![] }, &[]));
     }
 
     #[test]
@@ -561,7 +589,7 @@ mod tests {
                 ],
             }],
         };
-        assert!(ev(&cond, &HashMap::new(), &HashMap::new()));
+        assert!(ev(&cond, &[]));
     }
 
     #[test]

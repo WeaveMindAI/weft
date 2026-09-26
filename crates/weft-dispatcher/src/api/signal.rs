@@ -52,6 +52,15 @@ pub struct ParkedFire {
     /// logs. Zero (the default) means due now.
     #[serde(default)]
     pub not_before_unix: i64,
+    /// Set when the fire parked because its member has not given (or gave
+    /// an invalid) value it needs: the refusal, naming each field. Such a
+    /// fire is not retried on a timer (the reaper's sweep passes it by,
+    /// whatever `not_before_unix` says); the member's next change of
+    /// values routes it again (`member_values::change`), and so does
+    /// activating its trigger. Shown per trigger by `weft status` and
+    /// `ctx.members().list()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_gap: Option<String>,
 }
 
 /// A parked fire's identity as a drain hands it to the fire path: the
@@ -74,6 +83,56 @@ pub(crate) fn park_backoff_secs(attempts: u32) -> i64 {
         return 0;
     }
     1i64.checked_shl(attempts - 1).unwrap_or(CAP_SECS).min(CAP_SECS)
+}
+
+/// Every member trigger's fires waiting on a value their member has not
+/// given (`ParkedFire::member_gap`) in `project_id`: how many, and the
+/// reason the one parked last gave.
+pub async fn member_waits(
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>> {
+    let rows: Vec<(String, Option<String>, i64, String)> = sqlx::query_as(
+        "SELECT s.activation_trigger, s.member_id, count(*)::bigint, \
+                (array_agg(t.elem ->> 'member_gap' ORDER BY t.ord DESC))[1] \
+         FROM signal s, jsonb_array_elements(s.parked_fires) WITH ORDINALITY AS t(elem, ord) \
+         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND t.elem ? 'member_gap' \
+         GROUP BY s.activation_trigger, s.member_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(trigger, member, fires, reason)| {
+            let member = member
+                .map(weft_core::member::MemberId::new)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("signal.member_id for trigger {trigger}: {e}"))?;
+            let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(member));
+            Ok((key, weft_core::program::WaitingFires { fires: fires as u32, reason }))
+        })
+        .collect()
+}
+
+/// The signal rows of `member` in `project_id` whose queue holds a fire
+/// waiting on that member's values, and whose activation is Active: what
+/// a change of the member's values routes again.
+pub async fn member_gap_tokens(
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    member: &weft_core::member::MemberId,
+) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT s.token FROM signal s {} \
+         WHERE s.project_id = $1 AND s.member_id = $2 \
+           AND COALESCE(a.status, 'active') = 'active' \
+           AND EXISTS (SELECT 1 FROM jsonb_array_elements(s.parked_fires) e WHERE e ? 'member_gap')",
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
+    .bind(project_id)
+    .bind(member.as_str())
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Ceiling on an ENTRY signal's `parked_fires` queue. Entry fires accumulate while
@@ -302,22 +361,23 @@ pub async fn listener_inspect(
         // here would defeat that. Propagate / report the failure shape.
         //
         // The placement table holds two kinds of row on purpose. A
-        // signal of a project in `LISTENER_HELD_PROJECT_STATUSES` is
-        // PLACED: expected in the pod's registry. A hibernated or
-        // parked project keeps its rows (that is what reactivate
-        // rehydrates from) while the pod has been told to forget them:
-        // PRESERVED, absent from the registry by design. Every row is
-        // named, never just counted, so the drift below can say WHICH
-        // signal is the odd one out.
-        let rows: Vec<(String, String, uuid::Uuid, bool)> = sqlx::query_as(
+        // signal whose governing activation is in `LISTENER_HELD_STATUSES`
+        // (or that none governs) is PLACED: expected in the pod's
+        // registry. A hibernated or parked activation keeps its rows
+        // (that is what reactivate rehydrates from) while the pod has
+        // been told to forget them: PRESERVED, absent from the registry
+        // by design. Every row is named, never just counted, so the
+        // drift below can say WHICH signal is the odd one out.
+        let rows: Vec<(String, String, uuid::Uuid, bool)> = sqlx::query_as(&format!(
             "SELECT s.token, s.node_id, s.project_id, \
-                    COALESCE(p.status = ANY($2), FALSE) \
-             FROM signal s LEFT JOIN project p ON p.id = s.project_id \
+                    COALESCE(a.status, 'active') = ANY($2) \
+             FROM signal s {} \
              WHERE s.listener_pod = $1 \
              ORDER BY s.project_id, s.node_id, s.token",
-        )
+            weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+        ))
         .bind(&pod_name)
-        .bind(&weft_broker_client::protocol::LISTENER_HELD_PROJECT_STATUSES[..])
+        .bind(&weft_broker_client::protocol::LISTENER_HELD_STATUSES[..])
         .fetch_all(&state.pg_pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placed signals: {e}")))?;
@@ -546,13 +606,12 @@ async fn apply_lifecycle_gate(
     routing: &FireGateInfo,
     payload: Value,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    use crate::project_store::ProjectStatus;
+    use crate::activation_store::ProjectStatus;
 
-    // Active project: live fire. Registered counts as live too: a
-    // project a plain `weft run` started can hold suspended executions
-    // whose resume signals are its ONLY signals (entry triggers appear
-    // at activation), and it has no activate/drain moment ever, so a
-    // fire parked here would strand the suspended run forever.
+    // The governing activation is live: live fire. A signal no
+    // activation governs (a wait of a run started by hand) reads as live
+    // too: it has no activate/drain moment ever, so a fire parked here
+    // would strand the suspended run forever.
     if matches!(
         routing.status,
         ProjectStatus::Active | ProjectStatus::Registered
@@ -604,6 +663,7 @@ async fn apply_lifecycle_gate(
             received_at_unix: crate::lease::now_unix(),
             attempts: 0,
             not_before_unix: 0,
+            member_gap: None,
         };
         // The shared append names its refusal; never swallow one under a
         // 200. A fresh-UUID id can't hit the dedup guard on a live fire, so
@@ -664,57 +724,75 @@ pub(crate) struct FireGateInfo {
     /// tenant router, so the answer comes from the same source that authorized
     /// the register.
     pub tenant_id: String,
-    pub status: crate::project_store::ProjectStatus,
+    /// The governing activation's status (`Active` when none governs it).
+    pub status: crate::activation_store::ProjectStatus,
     pub accepting_fires: bool,
     pub fires_deadline_unix: Option<i64>,
     pub surface_kind: String,
+}
+
+/// The gate columns of a signal, read through the activation that
+/// governs it (`signal.activation_trigger` + `signal.member_id`, the one
+/// join `SIGNAL_ACTIVATION_JOIN`). No governing activation reads as
+/// live and accepting.
+fn gate_select() -> String {
+    format!(
+        "SELECT s.token, s.project_id, s.tenant_id, s.surface_kind, s.auth_kind, \
+                COALESCE(a.status, 'active') AS status, \
+                COALESCE(a.accepting_fires, TRUE) AS accepting_fires, \
+                a.fires_deadline_unix \
+         FROM signal s {} \
+         WHERE s.token = $1",
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    )
+}
+
+fn gate_info(row: &sqlx::postgres::PgRow) -> Result<FireGateInfo, (StatusCode, String)> {
+    let get_err = |e: sqlx::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"));
+    let status_str: String = row.try_get("status").map_err(get_err)?;
+    Ok(FireGateInfo {
+        project_id: row.try_get("project_id").map_err(get_err)?,
+        tenant_id: row.try_get("tenant_id").map_err(get_err)?,
+        status: crate::activation_store::ProjectStatus::parse(&status_str)
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("unknown activation status '{status_str}'")))?,
+        accepting_fires: row.try_get("accepting_fires").map_err(get_err)?,
+        fires_deadline_unix: row.try_get("fires_deadline_unix").map_err(get_err)?,
+        surface_kind: row.try_get("surface_kind").map_err(get_err)?,
+    })
 }
 
 pub(crate) async fn lookup_signal_routing(
     state: &DispatcherState,
     token: &str,
 ) -> Result<FireGateInfo, (StatusCode, String)> {
-    let row = sqlx::query(
-        "SELECT s.project_id, s.tenant_id, s.surface_kind, \
-                COALESCE(p.status, 'inactive') AS status, \
-                COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
-                p.fires_deadline_unix \
-         FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         WHERE s.token = $1",
-    )
-    .bind(token)
-    .fetch_optional(&state.pg_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal lookup: {e}")))?
-    .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
-    let project_id: uuid::Uuid = row
-        .try_get("project_id")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let tenant_id: String = row
-        .try_get("tenant_id")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let surface_kind: String = row
-        .try_get("surface_kind")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let status_str: String = row
-        .try_get("status")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let accepting: bool = row
-        .try_get("accepting_fires")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let deadline: Option<i64> = row
-        .try_get("fires_deadline_unix")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    Ok(FireGateInfo {
-        project_id,
-        tenant_id,
-        status: crate::project_store::project_status_from_str(&status_str)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
-        accepting_fires: accepting,
-        fires_deadline_unix: deadline,
-        surface_kind,
-    })
+    let row = sqlx::query(&gate_select())
+        .bind(token)
+        .fetch_optional(&state.pg_pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal lookup: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
+    gate_info(&row)
+}
+
+/// The lifecycle of the activation governing `signal` (its entry
+/// trigger's, or the trigger's that fired its run), or a live one when
+/// none governs it. What route-time re-checks read.
+pub(crate) async fn signal_gate(
+    state: &DispatcherState,
+    signal: &crate::journal::SignalRegistration,
+) -> anyhow::Result<crate::activation_store::ActivationLifecycle> {
+    let Some(trigger) = &signal.activation_trigger else {
+        return Ok(crate::activation_store::ActivationLifecycle::active());
+    };
+    let key = weft_core::activation::ActivationKey::new(trigger.clone(), weft_core::member::Owner::from_member(signal.member.clone()));
+    Ok(state
+        .activations
+        .list(signal.project_id)
+        .await?
+        .into_iter()
+        .find(|a| a.key == key)
+        .map(|a| a.lifecycle)
+        .unwrap_or_else(crate::activation_store::ActivationLifecycle::active))
 }
 
 /// The post-park-gate processor. Relays the payload to the
@@ -935,7 +1013,7 @@ pub(crate) async fn dispatch_listener_outcome(
                             project_id,
                             color,
                             &definition_hash,
-                            Some(&tenant_str),
+                            &tenant_str,
                         )
                         .await?;
                         // The row is gone now, so the pod that held the
@@ -985,7 +1063,7 @@ pub(crate) async fn dispatch_listener_outcome(
                                 project_id: Some(project_id),
                                 dedup_key: Some(key),
                                 color: None,
-                                tenant_id: Some(tenant_str.clone()),
+                                tenant_id: tenant_str.clone(),
                                 target_pod_name: None,
                                 binary_hash: None,
                                 payload: task_payload,
@@ -1059,27 +1137,6 @@ pub(crate) async fn delete_signals(
         .signal_remove_many(&tokens)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_remove_many: {e}")))?;
-    if !deleted.is_empty() {
-        state
-            .listeners
-            .unregister_many(&state.pg_pool, &deleted)
-            .await;
-    }
-    Ok(())
-}
-
-/// Delete every signal row belonging to `project_id` and unregister
-/// each from the listener. Single SQL roundtrip for the DB delete
-/// (the journal returns the deleted rows for the unregister step).
-pub(crate) async fn delete_signals_for_project(
-    state: &DispatcherState,
-    project_id: uuid::Uuid,
-) -> Result<(), (StatusCode, String)> {
-    let deleted = state
-        .journal
-        .signal_remove_for_project(project_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_remove_for_project: {e}")))?;
     if !deleted.is_empty() {
         state
             .listeners
@@ -1283,6 +1340,10 @@ fn file_belongs_to_signal(
     }
     match &parsed.scope {
         KeyScope::Project { project_id } | KeyScope::Asset { project_id } => *project_id == sig.project_id.to_string(),
+        // A member's file shows on a form of that member's run alone.
+        KeyScope::Member { project_id, member } => {
+            *project_id == sig.project_id.to_string() && sig.member.as_ref().is_some_and(|m| m.as_str() == member)
+        }
         KeyScope::Exec { color } => sig.color.is_some_and(|c| c.to_string() == *color),
         KeyScope::Shared { .. } => true,
     }
@@ -1360,6 +1421,12 @@ pub async fn clear_all_signals(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let signal_token = bearer_token(&headers)?;
     let scope = require_scoped_signal_token(&state, &signal_token).await?;
+    if scope.row.member.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a member token answers its member's waits one by one; clearing everything is the author's".into(),
+        ));
+    }
     if !scope.row.allowed_tags.is_empty() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1436,13 +1503,16 @@ async fn require_scoped_signal_token(
     state: &DispatcherState,
     token: &str,
 ) -> Result<TokenScope, (StatusCode, String)> {
-    let hash = crate::api::signal_token_names::token_hash(token);
+    let hash = weft_core::signal_token::token_hash(token);
     let row = state
         .journal
         .get_signal_token(&hash)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_token: {e}")))?
         .ok_or((StatusCode::UNAUTHORIZED, "unknown signal token".into()))?;
+    if row.expired(crate::lease::now_unix() as u64) {
+        return Err((StatusCode::UNAUTHORIZED, "this token has expired; ask for a new one".into()));
+    }
     Ok(TokenScope { row })
 }
 
@@ -1483,18 +1553,24 @@ impl TokenScope {
         if !self.row.allowed_tags.is_empty() {
             return false;
         }
+        // A member token reaches its own member's rows alone.
+        if let Some(member) = &self.row.member {
+            if sig.member.as_ref() != Some(member) {
+                return false;
+            }
+        }
         self.row.covers_project(&sig.project_id)
     }
 
     /// Run the SQL filter to enumerate every signal this token sees.
-    /// Filters by token scope (tenant / projects / tags) AND by
-    /// project visibility: only projects with
-    /// `fires_visible_to_consumers = TRUE` show up. That covers
-    /// both active projects and parked projects (consumers can
+    /// Filters by token scope (tenant / projects / tags) AND by the
+    /// visibility of the activation governing each signal: only those
+    /// with `fires_visible_to_consumers = TRUE` (or none governing them)
+    /// show up. That covers active and parked activations (consumers can
     /// browse + submit; submissions still park at /signal/{token}).
-    /// Hibernate projects are hidden during the entire inactive
-    /// window because hibernate sets `fires_visible_to_consumers
-    /// = FALSE`. Wiped projects have no rows at all.
+    /// Hibernating ones are hidden during the entire inactive window
+    /// because hibernate sets `fires_visible_to_consumers = FALSE`.
+    /// Wiped ones have no rows at all.
     async fn visible_signals(
         &self,
         state: &DispatcherState,
@@ -1504,41 +1580,47 @@ impl TokenScope {
             &self.row.tenant_id,
             &self.row.allowed_projects,
             &self.row.allowed_tags,
+            self.row.member.as_ref(),
         )
         .await
     }
 }
 
 /// Every signal a consumer token scoped to `tenant`, `projects` (empty:
-/// all of the tenant's) and `tags` (empty: any) may see: rows of projects
-/// showing their fires to consumers, resume rows only while unanswered.
-/// Entry rows first, then by age.
+/// all of the tenant's), `tags` (empty: any) and `member` (a member
+/// token: that member's rows only, its runs' waits and its own
+/// per-member triggers) may see: rows of projects showing their fires to
+/// consumers, resume rows only while unanswered. Entry rows first, then
+/// by age.
 pub async fn signals_visible_to(
     pool: &sqlx::PgPool,
     tenant: &str,
     projects: &[uuid::Uuid],
     tags: &[String],
+    member: Option<&weft_core::member::MemberId>,
 ) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
     // One decoder for a signal row, shared with the journal
     // (`row_to_signal`): the SELECT differs (a join and the consumer
     // filters), the columns and the decoding must not.
-    let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(concat!(
-        "SELECT ", crate::journal::postgres::signal_columns!("s."), " \
-         FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
+    let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(&format!(
+        concat!("SELECT ", crate::journal::postgres::signal_columns!("s."), " \
+         FROM signal s {join} \
+         WHERE COALESCE(a.fires_visible_to_consumers, TRUE) = TRUE \
            AND s.tenant_id = $1 \
-           AND ($2::uuid[] = '{}'::uuid[] OR s.project_id = ANY($2)) \
-           AND ($3::text[] = '{}'::text[] OR s.tags && $3) \
+           AND ($2::uuid[] = '{{}}'::uuid[] OR s.project_id = ANY($2)) \
+           AND ($3::text[] = '{{}}'::text[] OR s.tags && $3) \
+           AND ($4::text IS NULL OR s.member_id = $4) \
            AND ( \
              s.is_resume = FALSE \
              OR jsonb_array_length(s.parked_fires) = 0 \
            ) \
-         ORDER BY s.is_resume ASC, s.created_at ASC"
+         ORDER BY s.is_resume ASC, s.created_at ASC"),
+        join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
     ))
     .bind(tenant)
     .bind(projects)
     .bind(tags)
+    .bind(member.map(|m| m.as_str()))
     .fetch_all(pool)
     .await
     .context("signals_visible_to (the consumer listing): read a signal row")?;
@@ -1560,9 +1642,23 @@ pub async fn signals_visible_to(
 /// matches nothing 404s.
 pub async fn fire_public_entry(
     State(state): State<DispatcherState>,
+    headers: HeaderMap,
     Path(mount_path): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // A bare fire runs for nobody: naming a member here would be dropped
+    // on the floor, so it is refused, pointing at the door that honours it.
+    for named in [weft_core::member::MEMBER_HEADER, weft_core::member::MEMBER_TOKEN_HEADER] {
+        if headers.contains_key(named) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "a bare fire runs for no member, so {named} is not taken here; call the route at \
+                     /connect/{mount_path} to start a run for a member"
+                ),
+            ));
+        }
+    }
     // Normalize: catch-all gives us a path without the leading
     // slash. Convert to `/foo` form (or `/` for empty) to match
     // the row.
@@ -1616,15 +1712,7 @@ pub async fn fire_public_entry(
             ),
         ));
     }
-    let row = sqlx::query(
-        "SELECT s.token, s.project_id, s.tenant_id, s.auth_kind, \
-                COALESCE(p.status, 'inactive') AS status, \
-                COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
-                p.fires_deadline_unix \
-         FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         WHERE s.token = $1",
-    )
+    let row = sqlx::query(&gate_select())
     .bind(&matched.token)
     .fetch_optional(&state.pg_pool)
     .await
@@ -1634,21 +1722,7 @@ pub async fn fire_public_entry(
     let token: String = row
         .try_get("token")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let project_id: uuid::Uuid = row
-        .try_get("project_id")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let tenant_id: String = row
-        .try_get("tenant_id")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let status_str: String = row
-        .try_get("status")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let accepting: bool = row
-        .try_get("accepting_fires")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let deadline: Option<i64> = row
-        .try_get("fires_deadline_unix")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
+    let routing = gate_info(&row)?;
     let auth_kind: String = row
         .try_get("auth_kind")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
@@ -1668,19 +1742,6 @@ pub async fn fire_public_entry(
 
     let payload = body.map(|Json(v)| v).unwrap_or(Value::Null);
 
-    let routing = FireGateInfo {
-        project_id,
-        tenant_id,
-        status: crate::project_store::project_status_from_str(&status_str)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
-        accepting_fires: accepting,
-        fires_deadline_unix: deadline,
-        // Catch-all is matched on mount_path; only public_entry rows
-        // get one, so this branch is always public_entry. Resume
-        // tokens use surface_kind='task_callback' and hit a
-        // different route (lookup-by-token), never this one.
-        surface_kind: "public_entry".to_string(),
-    };
     apply_lifecycle_gate(&state, &token, &routing, payload).await
 }
 
@@ -1733,6 +1794,8 @@ async fn caller_gate(
     auth_kind: &str,
     auth_config: Option<&Value>,
     tenant: &str,
+    // Whose route it is (its gate's connection is that member's own).
+    for_member: Option<weft_core::member::MemberScope>,
     call: &CallerRequestParts<'_>,
 ) -> Result<Option<Value>, (StatusCode, String)> {
     match auth_kind {
@@ -1748,6 +1811,7 @@ async fn caller_gate(
             };
             let verify = weft_broker_client::protocol::CallerVerifyRequest {
                 tenant: tenant.to_string(),
+                for_member,
                 access_id: field("access_id")?,
                 service: field("service")?,
                 method: call.method.to_string(),
@@ -1779,6 +1843,49 @@ async fn caller_gate(
             format!("unknown auth_kind: {other}"),
         )),
     }
+}
+
+/// Who a call through a live route is for. A member token
+/// ([`weft_core::member::MEMBER_TOKEN_HEADER`]) names its member on any
+/// route of its one project; otherwise the Weft-Member header names one,
+/// honoured only on a `gated` route. A token and a header that disagree
+/// are refused rather than one silently winning.
+async fn door_member(
+    state: &DispatcherState,
+    headers: &std::collections::BTreeMap<String, String>,
+    gated: bool,
+    project_id: uuid::Uuid,
+) -> Result<Option<weft_core::member::MemberId>, (StatusCode, String)> {
+    let named = weft_core::member::member_from_header(headers, gated).map_err(|why| (StatusCode::BAD_REQUEST, why));
+    let presented = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(weft_core::member::MEMBER_TOKEN_HEADER))
+        .map(|(_, value)| value.trim().to_string());
+    let Some(presented) = presented else { return named };
+    let token = require_scoped_signal_token(state, &presented).await?.row;
+    let Some((token_project, member)) = token.member_scope() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("{} holds a token that is not a member token", weft_core::member::MEMBER_TOKEN_HEADER),
+        ));
+    };
+    if token_project != project_id {
+        return Err((StatusCode::UNAUTHORIZED, "this member token is for another project".into()));
+    }
+    // The header is checked only against the token here: a token is its
+    // own proof, so the open-route rule does not apply to it.
+    let header_member = weft_core::member::member_from_header(headers, true).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    if header_member.as_ref().is_some_and(|m| m != member) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the {} header names member '{}', and the member token is member '{member}'s",
+                weft_core::member::MEMBER_HEADER,
+                header_member.expect("checked above"),
+            ),
+        ));
+    }
+    Ok(Some(member.clone()))
 }
 
 /// The parts of a caller's opening request the gate hands the broker.
@@ -1987,6 +2094,7 @@ pub async fn connect_live(
         auth_kind,
         auth_config.as_ref(),
         &tenant_segment,
+        route.member.clone().map(|member| weft_core::member::MemberScope { project_id: *project_id, member }),
         &CallerRequestParts {
             method: &method_name,
             path: &path,
@@ -1996,6 +2104,9 @@ pub async fn connect_live(
         },
     )
     .await?;
+    // Who the run is for: a member token, or the Weft-Member header
+    // behind the gate that just passed (an open route refuses it).
+    let member = door_member(&state, &header_map, auth_kind != "none", *project_id).await?;
 
     // What the gate approved, so the worker can hold the caller to it.
     // Only when something was actually checked: an open route approves
@@ -2061,6 +2172,7 @@ pub async fn connect_live(
             params,
             caller,
             approved,
+            member,
             // The same instant the hold was computed from, so the
             // ticket's life and the pod's promise cannot drift apart
             // (the DNS wait above sits between the two).
@@ -2123,12 +2235,16 @@ pub(crate) struct ArmedRoute {
     pub port_snapshot: Option<Value>,
     pub program: weft_core::project::hash::ProgramIdentity,
     pub source_version: String,
-    /// The project's lifecycle status at the read.
+    /// The status of the activation governing the route at the read.
     pub status: String,
+    /// Whose route it is: the member whose trigger registered it, `None`
+    /// for a shared one. Its gate's connection is that member's.
+    pub member: Option<weft_core::member::MemberId>,
 }
 
 impl ArmedRoute {
-    /// A live connection is accepted only while the project is Active.
+    /// A live connection is accepted only while the route's activation is
+    /// Active.
     pub(crate) fn require_active(&self) -> Result<(), (StatusCode, String)> {
         if crate::project_store::project_status_from_str(&self.status)
             .map(|s| s != crate::project_store::ProjectStatus::Active)
@@ -2146,14 +2262,18 @@ impl ArmedRoute {
 /// The armed route behind a signal token, or the HTTP answer when the
 /// row is missing or half-armed.
 pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<ArmedRoute, (StatusCode, String)> {
-    let row = sqlx::query(
+    // The status is the governing activation's (the route's own
+    // trigger, for its owner); a project row gone reads as inactive.
+    let row = sqlx::query(&format!(
         "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
-                s.port_snapshot, s.program_json, s.source_version, \
-                COALESCE(p.status, 'inactive') AS status \
+                s.port_snapshot, s.program_json, s.source_version, s.member_id, \
+                CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status \
          FROM signal s \
          LEFT JOIN project p ON p.id = s.project_id \
+         {} \
          WHERE s.token = $1",
-    )
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
     .bind(token)
     .fetch_optional(&state.pg_pool)
     .await
@@ -2169,6 +2289,11 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
     let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
     let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
     let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
+    let member: Option<String> = row.try_get("member_id").map_err(row_err)?;
+    let member = member
+        .map(weft_core::member::MemberId::new)
+        .transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal.member_id: {e}")))?;
     let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no original source version; activate it again")))?;
     let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
         .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no armed code identity; activate it again")))?)
@@ -2192,7 +2317,7 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config parse: {e}")))?;
     Ok(ArmedRoute {
         project_id, node_id, spec, protocol, live_config, auth_kind, auth_config,
-        port_snapshot, program, source_version, status,
+        port_snapshot, program, source_version, status, member,
     })
 }
 
@@ -2269,6 +2394,7 @@ pub(crate) async fn birth_on_arrival(
     tenant: &str,
     color: uuid::Uuid,
     pod_name: &str,
+    member: Option<&weft_core::member::MemberId>,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
     let project_id = route.project_id;
     let definition_hash = &route.program.definition_hash;
@@ -2288,6 +2414,13 @@ pub(crate) async fn birth_on_arrival(
     let crate::api::project::TriggerFire { kicks, subgraph } =
         crate::api::project::compute_trigger_fire(&project_def, &route.node_id, &payload, route.port_snapshot.as_ref())
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    // A run reaching something per member runs for one, finds what that
+    // member provides filled and valid, and finds that member's infra up:
+    // refused here, to the caller standing at the door, rather than
+    // mid-run. The values read are the run's.
+    let member_values = crate::api::project::refuse_member_gaps(state, project_id, &project_def, &subgraph, member)
+        .await
+        .map_err(<(StatusCode, String)>::from)?;
 
     let now = crate::lease::now_unix() as u64;
     // The fire's computed subgraph rides on ExecutionStarted: the
@@ -2303,8 +2436,15 @@ pub(crate) async fn birth_on_arrival(
         Some(&subgraph),
         None,
         Some(&route.source_version),
+        member.map(|member| crate::api::project::RunFor { member, values: &member_values }),
+        Some(&route.node_id),
+        route.live_config.run_kind(),
         now,
     );
+    // An unrecorded run's birth never reaches the journal: its rows ride
+    // the execute task, and the worker holds the run's journal in memory.
+    let unrecorded_birth: Option<Vec<weft_journal::ExecEvent>> = (!route.live_config.run_kind().journaled())
+        .then(|| std::iter::once(start.clone()).chain(kick_events.iter().cloned()).collect());
     let live_start = weft_task_store::kinds::LiveConnectionStart {
         spec: route.spec.clone(),
         request: request.clone(),
@@ -2322,9 +2462,10 @@ pub(crate) async fn birth_on_arrival(
         color,
         definition_hash,
         &route.program.binary_hash,
-        Some(tenant),
+        tenant,
         Some(pod_name.to_string()),
         Some(live_start),
+        unrecorded_birth.as_deref(),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
 
@@ -2479,7 +2620,7 @@ async fn spawn_worker_pod(
             project_id: Some(project_id),
             dedup_key: Some(format!("{project_id}:{binary_hash}:spawn")),
             color: None,
-            tenant_id: Some(tenant.to_string()),
+            tenant_id: tenant.to_string(),
             target_pod_name: None,
             binary_hash: Some(binary_hash.to_string()),
             payload: serde_json::to_value(weft_task_store::SpawnPodPayload {
@@ -2587,7 +2728,7 @@ pub async fn live_signal(
     Path((id, node)): Path<(uuid::Uuid, String)>,
 ) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    Ok(Json(read_signal_live(&state, id, &node).await?))
+    Ok(Json(read_signal_live(&state, id, &node, None).await?))
 }
 
 /// What a trigger node is showing right now, off the listener holding
@@ -2603,15 +2744,16 @@ pub(crate) async fn read_signal_live(
     state: &DispatcherState,
     id: uuid::Uuid,
     node: &str,
+    member: Option<&weft_core::member::MemberId>,
 ) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
-    // The entry registered at this place, read once: it carries the
+    // The entry registered at this place for this copy, read once: it carries the
     // token the listener is asked by, and the address the caller is
     // shown. A resume row of the same node is another registration
     // entirely (a display is what a TRIGGER shows), and the journal
     // never answers with one here.
     let entry = state
         .journal
-        .signal_entry_at(id, node)
+        .signal_entry_at(id, node, member)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
@@ -2708,6 +2850,8 @@ mod public_url_tests {
 
     fn fresh(surface: &str, mount: Option<&str>) -> SignalRegistration {
         SignalRegistration {
+            member: None,
+            activation_trigger: None,
             source_version: None,
             setup_color: None,
             program: None,
@@ -2905,12 +3049,16 @@ mod can_cancel_tests {
                 allowed_displays: vec![],
                 all_displays: false,
                 created_at: 0,
+                member: None,
+                expires_at: None,
             },
         }
     }
 
     fn signal(tenant: &str, project: uuid::Uuid) -> SignalRegistration {
         SignalRegistration {
+            member: None,
+            activation_trigger: None,
             source_version: None,
             setup_color: None,
             program: None,
@@ -2976,6 +3124,21 @@ mod can_cancel_tests {
     }
 
     #[test]
+    fn a_member_token_cancels_its_own_members_rows_only() {
+        let pid = uuid::Uuid::from_u128(1);
+        let ada = weft_core::member::MemberId::new("ada").unwrap();
+        let mut a = token("tenant-a", vec![pid], vec![]);
+        a.row.member = Some(ada.clone());
+        let mut own = signal("tenant-a", pid);
+        own.member = Some(ada);
+        assert!(a.can_cancel_within_tenant(&own));
+        let mut other = signal("tenant-a", pid);
+        other.member = Some(weft_core::member::MemberId::new("bob").unwrap());
+        assert!(!a.can_cancel_within_tenant(&other));
+        assert!(!a.can_cancel_within_tenant(&signal("tenant-a", pid)), "a shared row is not the member's");
+    }
+
+    #[test]
     fn project_scoped_token_cannot_cancel_uncovered_project() {
         let covered = uuid::Uuid::from_u128(1);
         let other = uuid::Uuid::from_u128(2);
@@ -3010,6 +3173,8 @@ mod signal_file_scope_tests {
 
     fn signal(color: Option<&str>) -> SignalRegistration {
         SignalRegistration {
+            member: None,
+            activation_trigger: None,
             source_version: None,
             setup_color: None,
             program: None,

@@ -13,9 +13,10 @@
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
+  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
+  import { credentialOwnerKind } from '../protocol';
   import type { Snippet } from 'svelte';
   import type { EditorContext } from './editor-context';
 
@@ -351,10 +352,27 @@
       });
     };
     window.addEventListener('weft-display-action', onDisplayAction as EventListener);
+    // The mouse's side buttons. Back (button 3) steps out of the
+    // included file this view descended into; forward (button 4) has
+    // nothing to redo, so it does nothing. Both are swallowed: left to
+    // the browser they navigate the webview's own frame away from the
+    // graph.
+    const onSideButton = (e: MouseEvent) => {
+      if (e.button !== 3 && e.button !== 4) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.type === 'mouseup' && e.button === 3 && navDepth > 0) onNavigateBack();
+    };
+    window.addEventListener('mousedown', onSideButton, true);
+    window.addEventListener('mouseup', onSideButton, true);
     const unsub = onMessage((msg) => {
       // editApplied and sourceResynced replies are consumed by the shared
       // hostRequest correlator (see requestEdit/requestResync above), not
       // handled here.
+      if (msg.kind === 'needsTriggerChoice') {
+        deactivationIntent = msg.intent;
+        return;
+      }
       if (msg.kind === 'codeEditTouched') {
         // An external change landed on the watched doc: slide the editor's
         // auto-lock forward (source-mutating graph gestures pause for 1s).
@@ -548,8 +566,8 @@
                     (r.inheritedCostUnknown ?? false) ||
                     (!!msg.inheritedFrom && msg.amountUsd === null),
                   credentialOwner:
-                    r.credentialOwner === undefined || r.credentialOwner === msg.origin
-                      ? msg.origin
+                    r.credentialOwner === undefined || r.credentialOwner === credentialOwnerKind(msg.origin)
+                      ? credentialOwnerKind(msg.origin)
                       : 'mixed',
                 }
               : r,
@@ -804,6 +822,8 @@
     return () => {
       unsub();
       window.removeEventListener('weft-display-action', onDisplayAction as EventListener);
+      window.removeEventListener('mousedown', onSideButton, true);
+      window.removeEventListener('mouseup', onSideButton, true);
       // The whole editor is going away: settle every in-flight host request
       // so nothing awaits a reply that will never be consumed.
       cancelPendingHostRequests('the editor closed');
@@ -926,12 +946,7 @@
   // model). The picker lives HERE (shared webview) so both hosts get
   // the exact same UX; the chosen spec rides on the verb message and
   // the host just forwards it.
-  type DeactivationIntent =
-    | 'deactivate'
-    | 'resync'
-    | 'infraStop'
-    | 'infraTerminate'
-    | 'infraUpgrade';
+  type DeactivationIntent = 'deactivate' | TriggerChoiceIntent;
   let deactivationIntent = $state<DeactivationIntent | undefined>(undefined);
   const PICKER_TITLES: Record<DeactivationIntent, string> = {
     deactivate: 'Deactivate',
@@ -940,9 +955,6 @@
     infraTerminate: 'Terminate infra',
     infraUpgrade: 'Upgrade infra',
   };
-  // The infra verbs only need the choice while the backend reports the
-  // project ACTIVE (a live trigger depends on the infra coming down).
-  const projectIsActive = $derived(actionBarState.backend.status === 'active');
   function onDeactivationSpecChosen(spec: DeactivationSpec) {
     const intent = deactivationIntent;
     deactivationIntent = undefined;
@@ -972,23 +984,23 @@
   }
   function onResync() {
     // Resync deactivates first, and the user picks how (same shared
-    // picker as Deactivate). Only offered when Active; the dispatcher
-    // refuses a resync of any other project, so the guard below only
-    // keeps a stale button from opening the picker for nothing.
-    if (projectIsActive) { deactivationIntent = 'resync'; return; }
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'resyncProject' });
+    // picker as Deactivate). The dispatcher offers it only while some
+    // trigger is on, the program's or a member's (a member's can be on
+    // while the program's own are off, so the project status is no
+    // guide here), which means the choice is always needed.
+    deactivationIntent = 'resync';
   }
   function onStartInfra() {
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'infraStart' });
   }
+  // The infra verbs go without a choice: only the dispatcher knows
+  // whether a trigger is on (the program's or a member's), and when one
+  // is, the host answers `needsTriggerChoice` and the picker opens.
   function onStopInfra() {
-    if (projectIsActive) { deactivationIntent = 'infraStop'; return; }
     send({ kind: 'infraStop' });
   }
   function onTerminateInfra() {
-    if (projectIsActive) { deactivationIntent = 'infraTerminate'; return; }
     send({ kind: 'infraTerminate' });
   }
   function onInfraNodeStop(node: string) {
@@ -998,7 +1010,6 @@
     send({ kind: 'infraNodeTerminate', node });
   }
   function onUpgradeInfra() {
-    if (projectIsActive) { deactivationIntent = 'infraUpgrade'; return; }
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'infraUpgrade' });
   }

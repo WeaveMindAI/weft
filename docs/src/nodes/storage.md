@@ -9,7 +9,7 @@ let stored = storage.put(bytes, "image/png", "chart.png", None).await?;
 ctx.pulse_downstream(NodeOutput::stored_file(stored)).await
 ```
 
-## The four scopes
+## The five scopes
 
 The scope decides where new files go, and how long they live.
 
@@ -19,6 +19,7 @@ The scope decides where new files go, and how long they live.
 | `Project` | Across runs of this project | `weft clean` or `weft rm` |
 | `Shared { name }` | Across projects that name the same space | Explicit removal only |
 | `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
+| `Member { of }` | One member's space in this project (`StorageScope::member()` for the run's own member, `member_of(id)` for any) | Until removed. For what removes them and who reaches them, go and read [a member's files](../running/members.md#a-members-files) |
 
 The scope governs **writes and lists**. Reading, deleting, keeping and signing
 act on whatever scope the key itself belongs to, so a later node can `get` a

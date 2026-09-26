@@ -135,7 +135,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                 project_id: Some(project_id),
                 dedup_key: Some(dedup),
                 color: None,
-                tenant_id: Some(tenant),
+                tenant_id: tenant,
                 target_pod_name: None,
                 binary_hash: Some(binary_hash),
                 payload: serde_json::to_value(&payload)?,

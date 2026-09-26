@@ -135,10 +135,10 @@
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: Some(selection),
             seed,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }
     }
 

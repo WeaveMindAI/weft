@@ -84,7 +84,7 @@ async fn a_job_read_back_records_what_the_provider_stated() -> anyhow::Result<()
     settled.completed()?;
 
     anyhow::ensure!(fake.reads() >= 1, "the answer was read back: {}", fake.reads());
-    settled.assert_measured("queue_fake", "their-own", 1).await?;
+    settled.assert_measured("queue_fake", "author", 1).await?;
     // Three units at a cent each, read off the provider's own header
     // rather than worked out from the request.
     let priced: Vec<f64> = settled

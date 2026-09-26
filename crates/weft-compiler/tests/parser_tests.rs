@@ -3633,3 +3633,70 @@ u = ExecPython(n: Number) -> (r: Number) {
         "a path on the target is refused: {errs:?}"
     );
 }
+
+// ─── Types reach down into an included file ────────────────────────────────
+
+const SETTINGS_USER: &str = r#"
+Group(s: Settings) -> (tone: String) {
+    t = ExecPython(s: Settings) -> (tone: String) { code: "return {'tone': s['tone']}" }
+    t.s = self.s
+    self.tone = t.tone
+}
+"#;
+
+/// A type declared in the including file is visible inside the file it
+/// includes, and in a file THAT file includes, the way a type reaches
+/// into a group written inline.
+#[test]
+fn a_type_declared_above_an_include_reaches_into_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bot.weft"), SETTINGS_USER).unwrap();
+    std::fs::write(dir.path().join("outer.weft"), "Group(s: Settings) -> (tone: String) {\n    b = @include(\"bot.weft\")\n    b.s = self.s\n    self.tone = b.tone\n}\n").unwrap();
+    let source = "type Settings = { tone: String }\no = @include(\"outer.weft\")\n";
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
+    let t = project.nodes.iter().find(|n| n.id == "@bot.t").expect("the included node");
+    assert!(matches!(&t.inputs[0].port_type, WeftType::Named { name, .. } if name == "Settings"), "{:?}", t.inputs[0]);
+}
+
+/// A type declared inside a group reaches an include inside that group,
+/// and no further: an include beside the group does not see it, and says
+/// the name is unknown on the included file's own line.
+#[test]
+fn a_type_reaches_only_includes_below_its_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bot.weft"), SETTINGS_USER).unwrap();
+    let inside = "g = Group() {\n  type Settings = { tone: String }\n  b = @include(\"bot.weft\")\n}\n";
+    compile(inside, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("an include inside the declaring group sees it");
+    let beside = "g = Group() {\n  type Settings = { tone: String }\n}\nb = @include(\"bot.weft\")\n";
+    let errors = compile(beside, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("Settings")), "{errors:?}");
+}
+
+/// An included file re-declaring a type the including file already has
+/// is refused like a nested group re-declaring one: nothing shadows.
+#[test]
+fn an_included_file_cannot_redeclare_a_visible_type() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dup.weft"), "Group() {\n  type Settings = { tone: String }\n}\n").unwrap();
+    let source = "type Settings = { tone: String }\nd = @include(\"dup.weft\")\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("Settings")), "{errors:?}");
+}
+
+/// An included file opened on its own (the editor walking into it) reads
+/// under the types of the place that includes it, so it shows the same
+/// program the build compiles instead of an unknown-type error.
+#[test]
+fn an_included_file_opened_alone_sees_the_types_of_its_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.weft"), "type Settings = { tone: String }\nb = @include(\"bot.weft\")\n").unwrap();
+    std::fs::write(root.join("src/bot.weft"), SETTINGS_USER).unwrap();
+    let file = root.join("src/bot.weft");
+    let id = weft_compiler::source_name::file_id(Some(&root), Some(&file)).expect("not the entry");
+    let src_dir = root.join("src");
+    let fs = CompileFs::disk(&root).anchored_at(Some(&src_dir));
+    let (_, errors) = compile_lenient(SETTINGS_USER, uuid::Uuid::new_v4(), fs, IncludeMode::Interface, Some(&id));
+    assert!(errors.is_empty(), "{errors:?}");
+}

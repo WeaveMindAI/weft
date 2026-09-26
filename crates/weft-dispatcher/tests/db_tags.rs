@@ -60,13 +60,13 @@ async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
 }
 
 /// Journal a fresh execution for `project` (the `execution_color` seed
-/// rides in the same transaction, exactly like production). `node_test`
-/// seeds the node-test kind instead, which the live read must never
+/// rides in the same transaction, exactly like production). `run_kind`
+/// seeds another kind instead, which the live read must never
 /// select no matter what it carries.
 async fn start_execution(
     journal: &PostgresJournal,
     project: Uuid,
-    node_test: bool,
+    run_kind: weft_core::exec::RunKind,
 ) -> weft_core::Color {
     let color = weft_core::Color::new_v4();
     journal
@@ -77,11 +77,11 @@ async fn start_execution(
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
             program: None,
-            node_test,
+            run_kind,
             source_version: None,
             subgraph: None,
             seed: None,
-            at_unix: 1,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 1,
         })
         .await
         .expect("ExecutionStarted");
@@ -104,8 +104,8 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let first = start_execution(&journal, project, false).await;
-    let second = start_execution(&journal, project, false).await;
+    let first = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let second = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
 
     tag(&pool, first, &["user_7"], 10).await;
     tag(&pool, second, &["user_7", "batch_a"], 11).await;
@@ -151,12 +151,12 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     seed_project(&projects, project).await;
     seed_project(&projects, other_project).await;
 
-    let a = start_execution(&journal, project, false).await;
-    let b = start_execution(&journal, project, false).await;
-    let done = start_execution(&journal, project, false).await;
-    let elsewhere = start_execution(&journal, other_project, false).await;
+    let a = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let b = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let done = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let elsewhere = start_execution(&journal, other_project, weft_core::exec::RunKind::Execution).await;
     // Same project, same tag, but a node-test run: never selectable.
-    let probe = start_execution(&journal, project, true).await;
+    let probe = start_execution(&journal, project, weft_core::exec::RunKind::NodeTest).await;
     tag(&pool, a, &["user_7"], 1).await;
     tag(&pool, done, &["user_7"], 2).await;
     tag(&pool, elsewhere, &["user_7"], 3).await;
@@ -197,8 +197,8 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let victim = start_execution(&journal, project, false).await;
-    let by = start_execution(&journal, project, false).await;
+    let victim = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let by = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
     tag(&pool, victim, &["user_7"], 1).await;
     journal
         .record_event(&ExecEvent::NodeStarted {
@@ -274,7 +274,7 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
     seed_listener_pod(&pool, "listener-a", "disp-1").await;
     let placement = SignalPlacement { listener_pod: "listener-a".into(), generation: 1 };
 
-    let done = start_execution(&journal, project, false).await;
+    let done = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
     journal
         .record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 5 })
         .await
@@ -299,6 +299,8 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
 /// A resume (form) signal parked on `color`.
 fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> SignalRegistration {
     SignalRegistration {
+        member: None,
+        activation_trigger: None,
         source_version: None,
         setup_color: None,
         program: None,
@@ -342,4 +344,52 @@ async fn seed_listener_pod(pool: &PgPool, pod_name: &str, owner: &str) {
     .execute(pool)
     .await
     .expect("insert listener_pod");
+}
+
+/// A member token names exactly one project and always expires, and
+/// revoking a member's tokens takes theirs and nobody else's.
+#[sqlx::test]
+async fn a_member_token_is_one_project_and_expires(pool: PgPool) {
+    use weft_core::member::MemberId;
+    use weft_dispatcher::journal::SignalToken;
+    let (journal, _) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    let ada = MemberId::new("ada").unwrap();
+    let token = |hash: &str, member: Option<&MemberId>, projects: Vec<Uuid>, expires_at: Option<u64>| SignalToken {
+        id: Uuid::new_v4(),
+        token_hash: hash.into(),
+        recognizer: "wft-test-...".into(),
+        tenant_id: TENANT.into(),
+        name: None,
+        allowed_projects: projects,
+        allowed_tags: Vec::new(),
+        allowed_displays: Vec::new(),
+        all_displays: false,
+        created_at: 0,
+        member: member.cloned(),
+        expires_at,
+    };
+    let err = journal.mint_signal_token(&token("h1", Some(&ada), vec![], Some(10))).await.unwrap_err();
+    assert!(format!("{err:#}").contains("signal_token_member_has_one_project"), "{err:#}");
+    let err = journal.mint_signal_token(&token("h2", Some(&ada), vec![project], None)).await.unwrap_err();
+    assert!(format!("{err:#}").contains("signal_token_member_expires"), "{err:#}");
+
+    journal.mint_signal_token(&token("ada-1", Some(&ada), vec![project], Some(10))).await.unwrap();
+    journal.mint_signal_token(&token("ada-2", Some(&ada), vec![project], Some(20))).await.unwrap();
+    let bob = MemberId::new("bob").unwrap();
+    journal.mint_signal_token(&token("bob-1", Some(&bob), vec![project], Some(10))).await.unwrap();
+    journal.mint_signal_token(&token("author", None, vec![project], None)).await.unwrap();
+    let read = journal.get_signal_token("ada-1").await.unwrap().expect("stored");
+    assert_eq!((read.member.as_ref(), read.expires_at), (Some(&ada), Some(10)));
+    assert!(read.expired(10) && !read.expired(9));
+
+    let other_project = Uuid::new_v4();
+    let revoke = weft_dispatcher::journal::postgres::revoke_member_tokens;
+    assert_eq!(revoke(&pool, TENANT, other_project, &ada, None).await.unwrap(), 0);
+    assert_eq!(revoke(&pool, "tenant-2", project, &ada, None).await.unwrap(), 0);
+    assert_eq!(revoke(&pool, TENANT, project, &ada, Some(read.id)).await.unwrap(), 1);
+    assert_eq!(revoke(&pool, TENANT, project, &ada, None).await.unwrap(), 1);
+    let left: Vec<String> = journal.list_signal_tokens(TENANT).await.unwrap().into_iter().map(|t| t.token_hash).collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left.contains(&"bob-1".to_string()) && left.contains(&"author".to_string()));
 }

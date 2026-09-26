@@ -66,7 +66,7 @@ pub async fn run(
             project_id: Some(id),
             dedup_key: None,
             color: None,
-            tenant_id: Some(caller.0 .0.clone()),
+            tenant_id: caller.0 .0.clone(),
             target_pod_name: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload)

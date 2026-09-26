@@ -41,6 +41,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             tenant_id   TEXT NOT NULL,
             project_id  UUID NOT NULL,
             node_id     TEXT,
+            -- Whose copy of the node the event is about: NULL for the
+            -- shared copy, or for a project-wide event.
+            member_id   TEXT,
             kind        TEXT NOT NULL,
             payload     JSONB NOT NULL,
             at_unix     BIGINT NOT NULL,

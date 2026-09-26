@@ -74,10 +74,15 @@ A credential. It gets a signed side-channel for its own follow-up queries and
 nothing else, which is what lets one meter work identically on a pasted key and
 on a sign-in.
 
+Each record also says whose credential paid. For what each value means and how
+to read one member's costs, go and read
+[who paid for a call](../running/members.md#who-paid-for-a-call).
+
 ## Where the number surfaces
 
-On the firing, in the inspector, beside the duration. And in the run's events,
-as the call happens rather than at the end.
+You see the number in the inspector beside the firing's duration, with whose
+key paid next to it. It also appears in the run's events as soon as the call
+happens.
 
 This is weft's own record of what it observed, not the provider's bill. They
 should agree, and when they do not, the provider is right.

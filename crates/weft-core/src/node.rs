@@ -713,6 +713,16 @@ impl NodeMetadata {
         self.inputs.iter().find(|i| matches!(i.effective_widget(), Widget::Access { .. }))
     }
 
+    /// Whether a node of this type may be marked `@per_member`: it runs a
+    /// container of its own (`requires_infra`), and each member gets one.
+    /// Anything a member PROVIDES (their connection, their sheet) is a
+    /// field written `@member_filled` instead. The one definition the
+    /// compiler's check and the editor's right-click toggle both read.
+    // SYNC: per_member_eligible <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts canBePerMember
+    pub fn per_member_eligible(&self) -> bool {
+        self.requires_infra
+    }
+
     /// Parse a compile-time-embedded `metadata.json`, merging the package
     /// root's partial defaults (`defaults_json`, the sibling package
     /// `metadata.json` when the node is a package member; `None` for a bare
@@ -2286,7 +2296,7 @@ pub trait NodeCatalog: Send + Sync {
 /// the source (whatever its spelling: braces, statement, `@file`,
 /// `@asset`), or a value another node produces at run time (an edge, a
 /// dotted value in the braces, an inline node).
-// SYNC: AcceptedForm <-> packages/weft-graph/src/protocol.ts AcceptedForm
+// SYNC: AcceptedForm <-> packages/weft-graph/src/protocol.ts AcceptedForm, packages/weft-connect/src/core/wire.ts AcceptedForm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcceptedForm {
@@ -2297,7 +2307,7 @@ pub enum AcceptedForm {
 /// Which drivers an input takes. On the wire it is the list of accepted
 /// forms (`["literal", "wire"]`); an empty list or a repeated entry is
 /// refused at parse, so a resolved value always accepts at least one.
-// SYNC: Accepts <-> packages/weft-graph/src/protocol.ts Accepts
+// SYNC: Accepts <-> packages/weft-graph/src/protocol.ts Accepts, packages/weft-connect/src/core/wire.ts Accepts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<AcceptedForm>", into = "Vec<AcceptedForm>")]
 pub struct Accepts {
@@ -2500,7 +2510,7 @@ pub struct OutputSpec {
 /// The editor control an input renders. The vocabulary of the node
 /// inspector: every input has exactly one effective widget (declared, or
 /// derived from the type via [`Widget::default_for_type`]).
-// SYNC: Widget <-> packages/weft-graph/src/protocol.ts Widget/WidgetKind
+// SYNC: Widget <-> packages/weft-graph/src/protocol.ts Widget/WidgetKind, packages/weft-connect/src/core/wire.ts Widget
 // The compact wiring view (`NodeMetadata::compact_json`) is a read-only
 // projection of this: it may cut a long `options` list and add a
 // `moreOptions` count, so its output is never parsed back into a
@@ -2783,7 +2793,7 @@ fn file_drop_default_type() -> crate::weft_type::WeftType {
 /// - `from_url`: the user pastes a link; a pattern extracts the id.
 ///   Requires nothing at all. It and a `public` list are the sources
 ///   standing with NO connection (the works-without-signing-in path).
-// SYNC: ResourceSource <-> packages/weft-graph/src/protocol.ts ResourceSource
+// SYNC: ResourceSource <-> packages/weft-connect/src/core/wire.ts ResourceSource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceSource {
@@ -2851,7 +2861,7 @@ fn granted_default_value() -> String {
 /// typed (`{query}`) and what's picked above (`{<parent>}` from
 /// `depends_on`). The dispatcher runs it through the stored access;
 /// the editor only ever sees label/value pairs.
-// SYNC: Lookup <-> packages/weft-graph/src/protocol.ts Lookup
+// SYNC: Lookup <-> packages/weft-connect/src/core/wire.ts Lookup
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lookup {
@@ -2878,7 +2888,7 @@ pub struct Lookup {
 /// Cursor pagination on a [`Lookup`]: the request param the cursor is
 /// sent in, and the response path the next cursor is read from (empty
 /// or absent = no more pages).
-// SYNC: PageSpec <-> packages/weft-graph/src/protocol.ts PageSpec
+// SYNC: PageSpec <-> packages/weft-connect/src/core/wire.ts PageSpec
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PageSpec {

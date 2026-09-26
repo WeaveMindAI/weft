@@ -192,6 +192,7 @@ pub async fn rehydrate(
             crate::kinds::SignalIdentity {
                 token: row.token,
                 tenant_id: row.tenant_id,
+                for_member: row.for_member,
                 node_id: row.node_id,
                 is_resume: row.is_resume,
                 color: row.color,

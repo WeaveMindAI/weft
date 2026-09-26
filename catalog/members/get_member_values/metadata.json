@@ -1,0 +1,28 @@
+{
+  "type": "GetMemberValues",
+  "label": "Get member values",
+  "description": "Read what one member gave for the fields the program writes `@member_filled` (their model, their sheet, their schedule, their connection). A field they left empty is not listed: a run for them uses its fallback, or the node's default. For a manager's overview of each member's settings, or to decide something from them.",
+  "tags": [
+    "members",
+    "values",
+    "settings"
+  ],
+  "icon": "SlidersHorizontal",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "member",
+      "type": "String",
+      "required": true,
+      "description": "The member, by the id your program uses for them (`user-42`)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "values",
+      "type": "JsonDict",
+      "description": "What they gave, by `node.field` the way the program writes it, the same keys `SetMemberValues` takes: `{\"answer.model\": \"deepseek/deepseek-chat\", \"digest.cron\": \"0 0 7 * * *\"}`. A connection reads as its `{\"id\", \"identity\"}` handle."
+    }
+  ],
+  "requires_infra": false
+}

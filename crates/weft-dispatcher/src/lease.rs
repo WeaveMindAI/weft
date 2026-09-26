@@ -154,6 +154,10 @@ pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
 /// reaper's name, so one dispatcher replica runs a given sweep at a
 /// time and the others skip that turn (see `reaper`).
 pub const REAPER_DOMAIN: &str = "weft_reaper";
+/// Serializes issuing an upgrade of one owner's copies, keyed by
+/// `<project>/<member>` (empty member: the shared copies), so the
+/// in-flight check and the insert are one step cluster-wide.
+pub const UPGRADE_ISSUE_DOMAIN: &str = "weft_upgrade_issue";
 
 /// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
 /// `key`, TRY-locking. Returns `Ok(None)` immediately if another holder

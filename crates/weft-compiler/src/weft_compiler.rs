@@ -117,6 +117,8 @@ struct ParsedNode {
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
     one_of_required: Vec<Vec<String>>,
+    /// The body says `@per_member`: this node exists once per member.
+    per_member: bool,
     /// Full source range of the declaration (header + config block).
     /// None for synthetic nodes (inline-expression children created
     /// during parsing have a span covering the inline fragment).
@@ -156,6 +158,8 @@ struct LoweredBody {
     optional_ports: std::collections::BTreeSet<String>,
     /// `@require_one_of(...)` groups written inside the body.
     one_of_required: Vec<Vec<String>>,
+    /// `@per_member` written inside the body.
+    per_member: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +299,12 @@ pub(crate) struct ParsedInclude {
     /// no ports of its own until the include resolves, so they wait here
     /// and land on whatever it resolves to.
     pending_literals: Vec<LiteralFill>,
+    /// The types visible where the `@include` line is written: the
+    /// including file's own, and every enclosing scope's up to the
+    /// catalog's. The included file compiles under them, so a type
+    /// declared above an include reaches down into the file (and into
+    /// whatever it includes in turn), the way it reaches into a group.
+    types: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -366,7 +376,14 @@ pub fn compile_lenient(
     // group (`Group(){...}`), so the file's anon root has the same id at parse,
     // edit, and render. `None` is the project's ENTRY file, which may hold no
     // anonymous group at all: the lowering refuses one there.
-    let mut state = parse_weft(source, source_name);
+    //
+    // A file some other file includes is compiled under the types visible
+    // where it is included, so opened on its own it reads exactly as the
+    // build reads it.
+    let mut state = match source_name.and_then(|id| types_where_included(&fs, id)) {
+        Some(types) => types.scoped(|| parse_weft(source, source_name)),
+        None => parse_weft(source, source_name),
+    };
     errors.append(&mut state.errors);
     // Resolve `@include` declarations (Full inlines, Interface emits opaque
     // nodes), collecting errors.
@@ -381,6 +398,56 @@ pub fn compile_lenient(
     // recorded source file rather than whichever include was visited last.
     crate::file_ref::resolve_project_file_refs(&mut project, &fs, &mut errors);
     (project, errors)
+}
+
+/// The types visible where the file whose body id is `id` is included:
+/// found by walking the program's includes from its entry file, each file
+/// parsed under the types of the place that includes it, as the build
+/// walks them. The first site in that walk answers; a type the file uses
+/// that some later site does not see is the build's error to report, at
+/// that site. `None` when the file is included nowhere (or there is no
+/// project around it), and it then reads under the catalog's types alone.
+fn types_where_included(fs: &CompileFs, id: &str) -> Option<std::sync::Arc<weft_core::weft_type::TypeRegistry>> {
+    let root = fs.root?;
+    let src = root.join(crate::project::SRC_DIR);
+    let entry = fs.reader.resolve_and_read(root, &src, std::path::Path::new(crate::project::ENTRY_FILE)).ok()?;
+    let state = parse_weft(entry.content.as_str(), None);
+    let mut seen = vec![entry.identity.clone()];
+    let entry_fs = fs.anchored_at(entry.identity.parent());
+    find_site_types(&state.includes, &state.groups, &entry_fs, root, id, &mut seen)
+}
+
+fn find_site_types(
+    includes: &[ParsedInclude],
+    groups: &[ParsedGroup],
+    fs: &CompileFs,
+    root: &std::path::Path,
+    id: &str,
+    seen: &mut Vec<std::path::PathBuf>,
+) -> Option<std::sync::Arc<weft_core::weft_type::TypeRegistry>> {
+    let base = fs.base?;
+    for inc in includes {
+        let Ok(resolved) = fs.reader.resolve_and_read(root, base, std::path::Path::new(&inc.path)) else { continue };
+        let body_id = crate::source_name::body_id(root, &resolved.identity);
+        if body_id == id {
+            return Some(inc.types.clone());
+        }
+        if seen.contains(&resolved.identity) {
+            continue;
+        }
+        seen.push(resolved.identity.clone());
+        let sub = inc.types.clone().scoped(|| parse_weft(resolved.content.as_str(), Some(&body_id)));
+        let sub_fs = fs.anchored_at(resolved.identity.parent());
+        if let Some(found) = find_site_types(&sub.includes, &sub.groups, &sub_fs, root, id, seen) {
+            return Some(found);
+        }
+    }
+    for group in groups {
+        if let Some(found) = find_site_types(&group.includes, &group.child_groups, fs, root, id, seen) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Strict parse of one included file. File references resolve on the final
@@ -684,7 +751,13 @@ fn resolve_one_include(
             other.display()
         )));
     }
-    let mut sub = parse_checked(source.as_str(), &body_id)
+    // Every site parses the file under the types visible AT that site:
+    // a type the file uses has to reach it from every place that
+    // includes it, and a site where one does not is refused here, with
+    // the file's own error. The body itself is still compiled once
+    // (below); a named type has one shape project-wide, so every site
+    // that compiles resolves it to the same one.
+    let mut sub = inc.types.clone().scoped(|| parse_checked(source.as_str(), &body_id))
         .map_err(|errs| {
             // The errors keep their own spans and name the included
             // file (a deeper include's stamp wins), so a click lands
@@ -722,6 +795,7 @@ fn resolve_one_include(
                 out_ports: group.out_ports.iter().cloned()
                     .map(|mut p| { p.type_text = None; p }).collect(),
                 one_of_required: Vec::new(),
+                per_member: false,
                 span: Some(inc.span),
                 header_span: Some(inc.span),
                 config_spans: Default::default(),
@@ -884,7 +958,10 @@ fn collect_included_contents(
     seen: &mut Vec<std::path::PathBuf>,
     contents: &mut weft_core::project::IncludedContents,
 ) {
-    for node in &group.nodes {
+    // A `@per_member` node is not counted: its copies are each member's
+    // to run, so it gives the project nothing to activate or start.
+    // SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (source_infra, shared_triggers)
+    for node in group.nodes.iter().filter(|node| !node.per_member) {
         contents.node_types.push(node.node_type.clone());
     }
     for child in &group.child_groups {
@@ -911,7 +988,8 @@ fn collect_included_contents(
         // build will use. Passing the call-site alias instead would be a
         // second spelling of the file's identity.
         let body_id = crate::source_name::body_id(root, &resolved.identity);
-        let Ok(mut sub) = parse_checked(resolved.content.as_str(), &body_id) else {
+        // Under the types visible at the include, as the build parses it.
+        let Ok(mut sub) = inc.types.clone().scoped(|| parse_checked(resolved.content.as_str(), &body_id)) else {
             continue;
         };
         // A file the build would refuse: counting its contents would
@@ -1775,6 +1853,7 @@ fn lower_node(
         in_ports,
         out_ports,
         one_of_required,
+        per_member: body_out.per_member,
         span: Some(li.span_of(n.syntax())),
         header_span: Some(li.span_of(header.syntax())),
         config_spans: body_out.config_spans,
@@ -1820,13 +1899,17 @@ fn lower_config_body(
                     }
                 }
             }
-            K::DIRECTIVE => {
+            K::DIRECTIVE => match lower_directive(&child, li, errors) {
                 // @require_one_of inside a config block: collected for the
-                // caller to merge onto the node/group.
-                if let Some(g) = lower_directive_require_one_of(&child, li, errors) {
-                    out.one_of_required.push(g);
-                }
-            }
+                // caller to merge onto the node.
+                Some(BodyDirective::RequireOneOf(g)) => out.one_of_required.push(g),
+                Some(BodyDirective::PerMember) if out.per_member => errors.push(CompileError::at(
+                    li.span_of(&child),
+                    format!("'{host_local}' says `@per_member` twice; once is enough"),
+                )),
+                Some(BodyDirective::PerMember) => out.per_member = true,
+                None => {}
+            },
             K::TYPE_DECL => {
                 // A node's braces hold its values; a type lives at the top
                 // of a scope, where every header in it can see the name.
@@ -2019,6 +2102,7 @@ fn lower_inline_expr(
         in_ports,
         out_ports,
         one_of_required,
+        per_member: body_out.per_member,
         span: Some(li.span_of(inline_node)),
         header_span: None,
         config_spans: body_out.config_spans,
@@ -2059,33 +2143,69 @@ fn merge_inline_nodes(dest: &mut Vec<ParsedNode>, incoming: Vec<ParsedNode>, err
     }
 }
 
-/// Lower a DIRECTIVE body item into an optional `@require_one_of` arg group.
-/// The single home for directive handling, shared by the node-body and group-
-/// body lowering so they can't drift. Returns the parsed port group, or None for
-/// a non-`require_one_of` directive (silently ignored: forward-compatible with
-/// future directives the lowering doesn't yet consume).
+/// What one body directive line says. The two a body takes; anything
+/// else is refused where it is written.
+enum BodyDirective {
+    /// `@require_one_of(a, b)`: at least one of these ports must get a value.
+    RequireOneOf(Vec<String>),
+    /// `@per_member`: this node exists once per member of the program.
+    PerMember,
+}
+
+/// Lower a DIRECTIVE body item. The single home for directive handling,
+/// shared by the node-body and group-body lowering so they can't drift;
+/// each caller decides whether the directive is legal where it stands.
+/// Returns None after pushing an error, never silently: a directive the
+/// language does not know would otherwise do nothing, and the author
+/// would never find out.
 ///
 /// A `require_one_of` with NO args fails LOUD rather than silently dropping the
 /// constraint: this catches the `@require_one_of (a, b)` space typo (the lexer
 /// only folds `(...)` into the marker when it abuts `@name`, so the space splits
 /// the args off and the marker arrives bare), and a genuinely empty `()`.
-fn lower_directive_require_one_of(
+fn lower_directive(
     child: &crate::cst::SyntaxNode,
     li: &LineIndex,
     errors: &mut Vec<CompileError>,
-) -> Option<Vec<String>> {
+) -> Option<BodyDirective> {
     use crate::cst::SyntaxKind as K;
     let tok = child.children_with_tokens().filter_map(|e| e.into_token()).find(|t| t.kind() == K::MARKER)?;
-    if crate::cst::marker::directive(tok.text()) != "require_one_of" {
-        return None;
+    let directive = crate::cst::marker::directive(tok.text());
+    if directive == "require_one_of" {
+        return match crate::cst::marker::require_one_of_ports(tok.text()) {
+            Ok(ports) => Some(BodyDirective::RequireOneOf(ports)),
+            Err(msg) => {
+                errors.push(CompileError::at(li.span_of(child), msg.to_string()));
+                None
+            }
+        };
     }
-    match crate::cst::marker::require_one_of_ports(tok.text()) {
-        Ok(ports) => Some(ports),
-        Err(msg) => {
-            errors.push(CompileError::at(li.span_of(child), msg.to_string()));
-            None
+    if directive == weft_core::member::PER_MEMBER_DIRECTIVE {
+        // The whole line is the marker: `@per_member (x)` would lex as the
+        // bare marker plus stray tokens, which is as wrong as `@per_member(x)`.
+        let line_is_marker = child
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia())
+            .count()
+            == 1;
+        if !line_is_marker || crate::cst::marker::has_abutting_args(tok.text()) {
+            errors.push(CompileError::at(
+                li.span_of(child),
+                "`@per_member` takes no arguments; write it alone on its line".to_string(),
+            ));
+            return None;
         }
+        return Some(BodyDirective::PerMember);
     }
+    errors.push(CompileError::at(
+        li.span_of(child),
+        format!(
+            "unknown directive '@{directive}'; inside braces a line may be \
+             `@require_one_of(a, b)` or `@per_member`"
+        ),
+    ));
+    None
 }
 
 /// The trailing `.port` of an inline expr: the IDENT after the LAST top-level
@@ -2669,11 +2789,22 @@ fn lower_grouplike_body_in_scope(
                     }
                 }
             }
-            K::DIRECTIVE => {
-                if let Some(grp) = lower_directive_require_one_of(&child, li, errors) {
+            K::DIRECTIVE => match lower_directive(&child, li, errors) {
+                Some(BodyDirective::RequireOneOf(grp)) => {
                     refuse_scope_one_of(group.kind.noun(), &id, &[grp], li.span_of(&child), errors);
                 }
-            }
+                Some(BodyDirective::PerMember) => errors.push(CompileError::at(
+                    li.span_of(&child),
+                    format!(
+                        "{} '{id}': `@per_member` goes inside the braces of the node that exists \
+                         once per member (an infra node), not on a {}. For a connection each member \
+                         picks, write `@member_filled` on the input of the node that uses it",
+                        group.kind.noun(),
+                        group.kind.noun(),
+                    ),
+                )),
+                None => {}
+            },
             _ => {}
         }
     }
@@ -2894,6 +3025,7 @@ fn lower_include(
         path,
         span: li.span_of(i.syntax()),
         pending_literals: Vec::new(),
+        types: weft_core::weft_type::TypeRegistry::current(),
     })
 }
 
@@ -3156,6 +3288,52 @@ fn node_config_key_ok(key: &str, span: Span, errors: &mut Vec<CompileError>) -> 
 /// in the messages only; whether the key itself is allowed is the
 /// target's question (`node_config_key_ok` for a node, the signature
 /// for a container), asked where the target is known.
+/// `@member_filled` (each member provides the value) or
+/// `@member_filled(<value>)` (and a member who gave none gets `<value>`),
+/// lowered to [`weft_core::member::member_filled_literal`]. The fallback is
+/// any literal a field takes, read by the same reader, `@file`/`@asset`
+/// included (resolved like a written one, inside the marker); any other
+/// marker inside it is refused.
+fn member_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<CompileError>) -> Option<serde_json::Value> {
+    use crate::cst::marker::{args, MarkerArgs};
+    if key.starts_with('_') {
+        errors.push(CompileError::at(span, format!(
+            "'{key}' is one of the program's own keys (the ones starting with `_`), so it holds one value \
+             for everyone and cannot be `@member_filled`"
+        )));
+        return None;
+    }
+    let fallback = match args(raw) {
+        MarkerArgs::NoList if raw.trim() == format!("@{}", weft_core::member::MEMBER_FILLED_MARKER) => None,
+        MarkerArgs::Args(body) if body.trim().is_empty() => {
+            errors.push(CompileError::at(span, format!(
+                "'{key}': `@member_filled()` names no value; write `@member_filled` alone, or put the value a \
+                 member who gives none gets inside the parentheses"
+            )));
+            return None;
+        }
+        MarkerArgs::Args(body) => {
+            let body = body.trim();
+            if body.starts_with('@') && !matches!(crate::cst::marker::directive(body), "file" | "asset") {
+                errors.push(CompileError::at(span, format!(
+                    "'{key}': the value inside `@member_filled(...)` is a value or a file (`@file(...)`, \
+                     `@asset(...)`), so it cannot be another marker (`{body}`)"
+                )));
+                return None;
+            }
+            Some(parse_config_literal(key, body, span, errors)?)
+        }
+        _ => {
+            errors.push(CompileError::at(span, format!(
+                "'{key}' has a malformed `@member_filled` (`{raw}`): write `@member_filled`, or \
+                 `@member_filled(<value>)` with the parenthesis right after the name"
+            )));
+            return None;
+        }
+    };
+    Some(weft_core::member::member_filled_literal(fallback))
+}
+
 fn parse_config_literal(
     key: &str,
     raw: &str,
@@ -3203,7 +3381,17 @@ fn parse_config_literal(
         // Malformed JSON is NOT silently coerced to a string (that hid
         // `[a, b]`-style typos); it fails loud, quoting what was written
         // rather than the rewritten text.
-        match serde_json::from_str(&quote_markers(raw)) {
+        match serde_json::from_str::<serde_json::Value>(&quote_markers(raw)) {
+            // The key a `@member_filled` lowers to is the language's: a
+            // written object carrying it would read as the marker.
+            Ok(v) if v.get(weft_core::member::MEMBER_FILLED_KEY).is_some() => {
+                errors.push(CompileError::at(span, format!(
+                    "'{key}': `{}` is a key the language uses for `@member_filled`; write `@member_filled` \
+                     instead, or name the key something else",
+                    weft_core::member::MEMBER_FILLED_KEY
+                )));
+                return None;
+            }
             Ok(v) => v,
             Err(e) => {
                 // The commonest way here is a wire written inside the
@@ -3226,17 +3414,21 @@ fn parse_config_literal(
             }
         }
     } else if raw.starts_with('@') {
-        // `@file(...)` / `@asset(...)` are the ONLY markers valid as a config
-        // value (resolved downstream by file_ref). Any other `@...` (a typo,
-        // `@include`, `@require_one_of`, a bare `@`) is not a value and fails
-        // loud rather than becoming a literal string.
-        if matches!(crate::cst::marker::directive(raw), "file" | "asset") {
-            serde_json::Value::String(raw.to_string())
-        } else {
-            errors.push(CompileError::at(span, format!(
-                "'{key}' has an invalid marker value `{raw}`: the only markers valid as a config value are `@file(\"path\")` and `@asset(\"path\", Type)`."
-            )));
-            return None;
+        // `@file(...)` / `@asset(...)` (resolved downstream by file_ref) and
+        // `@member_filled` are the ONLY markers valid as a config value.
+        // Any other `@...` (a typo, `@include`, `@require_one_of`, a bare
+        // `@`) is not a value and fails loud rather than becoming a
+        // literal string.
+        match crate::cst::marker::directive(raw) {
+            "file" | "asset" => serde_json::Value::String(raw.to_string()),
+            weft_core::member::MEMBER_FILLED_MARKER => return member_filled_value(key, raw, span, errors),
+            _ => {
+                errors.push(CompileError::at(span, format!(
+                    "'{key}' has an invalid marker value `{raw}`: the only markers valid as a config value are \
+                     `@file(\"path\")`, `@asset(\"path\", Type)` and `@member_filled`."
+                )));
+                return None;
+            }
         }
     } else if raw.is_empty() {
         // No value text reached us: the source had a key with nothing parseable
@@ -3677,10 +3869,12 @@ fn flatten_group(
         features: in_features,
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        requires_infra: false,
+        requires_infra: false, per_member: None,
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
+        member_service: None,
+        member_rules: None,
         span: None,
         // The group's header is where a diagnostic about either
         // boundary points: the boundaries are the header's two
@@ -3767,10 +3961,12 @@ fn flatten_group(
         features: NodeFeatures::default(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        requires_infra: false,
+        requires_infra: false, per_member: None,
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
+        member_service: None,
+        member_rules: None,
         span: None,
         header_span: group.header_span,
         config_spans: Default::default(),
@@ -3884,9 +4080,14 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         scope,
         group_boundary: None,
         requires_infra: false,
+        // The mark only; enrich checks the node may carry it and the
+        // propagation adds every node that reads from one.
+        per_member: pn.per_member.then_some(weft_core::member::PerMember::Marked),
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
+        member_service: None,
+        member_rules: None,
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),

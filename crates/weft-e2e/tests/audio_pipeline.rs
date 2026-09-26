@@ -7,8 +7,8 @@
 //!
 //! Two runs, one per credential door, mirroring the OpenRouter
 //! metering pair: the user's OWN pasted key (cost record says
-//! `their-own`) and the runtime's key from the shared-credentials file
-//! (cost record says `ours`; a silent fall-through to the wrong
+//! `author`) and the runtime's key from the shared-credentials file
+//! (cost record says `platform`; a silent fall-through to the wrong
 //! credential fails either test).
 //!
 //! Each run spends real money (~$0.006 of Scribe realtime time) and
@@ -65,7 +65,7 @@ async fn assert_transcribed(
 
 /// The user's OWN key: the real paste flow (the key lands in the store
 /// sealed, the spec's declared test call proves it against /v1/user),
-/// then the pipeline, measured as `their-own`.
+/// then the pipeline, measured as `author`.
 #[tokio::test]
 async fn a_wav_asset_streams_through_realtime_transcription_to_text() -> Result<()> {
     let Some(key) = env_or_skip("WEFT_E2E_ELEVENLABS_API_KEY") else { return Ok(()) };
@@ -77,12 +77,12 @@ async fn a_wav_asset_streams_through_realtime_transcription_to_text() -> Result<
         json!({ "key": key }),
     )
     .await?;
-    assert_transcribed(disp, conn, "their-own").await
+    assert_transcribed(disp, conn, "author").await
 }
 
 /// The RUNTIME's key: a one-click shared-door connection resolving to
 /// the `elevenlabs` api_key entry in the cluster's credentials file,
-/// then the same pipeline, measured as `ours`.
+/// then the same pipeline, measured as `platform`.
 #[tokio::test]
 async fn the_runtime_key_door_measures_the_session_as_ours() -> Result<()> {
     // Gate on the same var as the own-key run: it marks "this operator
@@ -95,5 +95,5 @@ async fn the_runtime_key_door_measures_the_session_as_ours() -> Result<()> {
     let conn =
         connect_direct(&disp, catalog_spec("ai/elevenlabs", "access")?, "shared", json!({}))
             .await?;
-    assert_transcribed(disp, conn, "ours").await
+    assert_transcribed(disp, conn, "platform").await
 }

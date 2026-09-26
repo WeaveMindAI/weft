@@ -8,12 +8,14 @@ pub mod bus;
 #[cfg(feature = "runtime")]
 pub mod caller;
 pub mod access;
+pub mod activation;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
 #[cfg(feature = "runtime")]
 pub mod context;
+pub mod deactivation;
 pub mod deref;
 pub mod error;
 pub mod exec;
@@ -24,6 +26,8 @@ pub mod generator;
 pub mod in_flight;
 pub mod infra;
 pub mod live;
+pub mod member;
+pub mod member_door;
 #[cfg(feature = "runtime")]
 pub mod liveness;
 #[cfg(feature = "runtime")]
@@ -32,9 +36,11 @@ pub mod node;
 #[cfg(feature = "runtime")]
 pub mod node_test;
 pub mod primitive;
+pub mod program;
 pub mod project;
 pub mod pulse;
 pub mod route;
+pub mod rules;
 pub mod run_spec;
 pub mod running_policy;
 #[cfg(feature = "runtime")]
@@ -44,8 +50,13 @@ pub mod seeding;
 // rest of the module (kind registry, typed kinds) is runtime-only and
 // gated inside the module.
 pub mod signal;
+// Signal-token values and their at-rest hash: minted by the dispatcher
+// (`weft token mint`) and the broker (a program's member token).
+pub mod signal_token;
 #[cfg(feature = "runtime")]
 pub mod signed_token;
+// The resolver settings every pod weft creates carries.
+pub mod pod_dns;
 // Mostly pure (key grammar, wire types, marker builders: the compiler needs
 // them, so the WASM parse build compiles them too); only its byte-stream
 // aliases are runtime-gated, inside the module.
@@ -192,8 +203,8 @@ pub use project::{
 };
 pub use pulse::Pulse;
 pub use running_policy::{
-    default_drain_timeout_secs, DeactivateSpec, DeactivationMode, RunningChoice, RunningPolicy,
-    DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES,
+    default_drain_timeout_secs, trigger_choice_required, DeactivateSpec, DeactivationMode, RunningChoice,
+    RunningPolicy, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES, TRIGGER_CHOICE_REQUIRED_HEADER,
 };
 pub use exec::CancelCause;
 pub use tag::StopSelf;

@@ -9,10 +9,10 @@
 use super::Ctx;
 use crate::progress::ActionVerb;
 
-pub async fn run(ctx: Ctx, project: Option<String>) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, project: Option<String>, scope: weft_core::activation::ActivationScope) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::CancelRunning, |progress| async move {
-        run_inner(&ctx_inner, &progress, project).await
+        run_inner(&ctx_inner, &progress, project, scope).await
     })
     .await
 }
@@ -21,12 +21,13 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     project: Option<String>,
+    scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let id = super::resolve_project_id(ctx, project)?;
     let client = ctx.client();
     let path = format!("/projects/{id}/cancel-running");
     progress.dispatcher_call_start(&path);
-    client.post_empty(&path).await?;
+    client.post_with_body(&path, &serde_json::to_value(&scope)?).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     if !ctx.json() {
         println!("cancel-running issued for {id}");

@@ -696,3 +696,97 @@ fn a_tilde_path_expands_to_the_home_directory() {
     let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
     assert_eq!(node.file_refs["value"].path, home.join("pics/logo.png").to_str().unwrap());
 }
+
+/// The values a run hands in (`--from`, `--emit`, `--group`, `--fire`)
+/// resolve the way the same markers written in source do.
+mod run_values {
+    use super::*;
+    use serde_json::json;
+    use weft_core::run_spec::RunSpec;
+
+    fn spec() -> RunSpec {
+        serde_json::from_value(json!({
+            "name": "voice",
+            "emit": { "receive": {
+                "messageType": "audio",
+                "file": "@asset(\"samples/hello.ogg\", Audio)",
+            } },
+            "from": { "summarize": { "prompt": "@file(\"prompts/short.md\")", "notes": ["@file mentioned in prose", "x"] } },
+            "group": ["triage", { "limit": "@file(\"limit.txt\", Number)" }],
+            "fire": ["inbound", { "attachments": ["@asset(\"samples/a.png\", Image)"] }],
+        }))
+        .unwrap()
+    }
+
+    fn reader() -> crate::file_reader::MapFileReader {
+        crate::file_reader::MapFileReader::new(
+            [("/p/prompts/short.md", "Be brief."), ("/p/limit.txt", "3")]
+                .into_iter()
+                .map(|(path, text)| (std::path::PathBuf::from(path), text.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn every_handed_value_is_walked() {
+        let spec = spec();
+        let paths: Vec<String> = collect_asset_refs(&spec).into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["samples/hello.ogg", "samples/a.png"]);
+        assert_eq!(spec.marked_values().len(), 6);
+    }
+
+    #[test]
+    fn a_file_is_read_and_cast_and_an_asset_waits_for_the_asset_step() {
+        let mut spec = spec();
+        let reader = reader();
+        let fs = CompileFs::with_reader(&reader, Some(std::path::Path::new("/p")));
+        resolve_file_markers(&mut spec, &fs).unwrap();
+        assert_eq!(spec.from["summarize"]["prompt"], json!("Be brief."));
+        // Prose inside a list that never opens a marker stays prose.
+        assert_eq!(spec.from["summarize"]["notes"], json!(["@file mentioned in prose", "x"]));
+        assert_eq!(spec.group.as_ref().unwrap().1["limit"], json!(3.0));
+        assert_eq!(spec.emit["receive"]["file"], json!("@asset(\"samples/hello.ogg\", Audio)"));
+
+        let audio = asset_ref("samples/hello.ogg", WeftType::Primitive(WeftPrimitive::Audio));
+        let image = asset_ref("samples/a.png", WeftType::Primitive(WeftPrimitive::Image));
+        let map = [(audio.resolution_key(), json!({ "stored": "hello" })), (image.resolution_key(), json!({ "stored": "a" }))]
+            .into_iter()
+            .collect();
+        apply_asset_resolutions(&mut spec, &map).unwrap();
+        assert_eq!(spec.emit["receive"]["file"], json!({ "stored": "hello" }));
+        assert_eq!(spec.emit["receive"]["messageType"], json!("audio"));
+        assert_eq!(spec.fire.as_ref().unwrap().1, json!({ "attachments": [{ "stored": "a" }] }));
+    }
+
+    #[test]
+    fn a_missing_file_or_a_bad_marker_is_named() {
+        let mut spec: RunSpec = serde_json::from_value(json!({
+            "name": "x",
+            "emit": { "n": { "a": "@file(\"gone.md\")", "b": "@asset(\"x.ogg\")" } },
+        }))
+        .unwrap();
+        let reader = reader();
+        let fs = CompileFs::with_reader(&reader, Some(std::path::Path::new("/p")));
+        let errors = resolve_file_markers(&mut spec, &fs).unwrap_err();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("gone.md") && e.contains("not found")), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("needs its type")), "{errors:?}");
+    }
+
+    /// Once resolved, a file value on a port that takes no file is
+    /// refused by the run's own port check, naming the port's type.
+    #[test]
+    fn a_file_on_a_port_that_takes_none_is_refused() {
+        let file = weft_core::storage::StoredFile {
+            key: "t/asset/p/abc".into(),
+            mime_type: "audio/ogg".into(),
+            size_bytes: 3,
+            filename: "hello.ogg".into(),
+        };
+        let audio = weft_core::storage::typed_file_value(&file, &WeftType::Primitive(WeftPrimitive::Audio));
+        let takes_file = WeftType::parse("File").unwrap();
+        assert!(weft_core::run_spec::validate_supplied_value(&takes_file, &audio).is_ok());
+        let number = WeftType::Primitive(WeftPrimitive::Number);
+        assert!(weft_core::run_spec::validate_supplied_value(&number, &audio).is_err());
+    }
+}

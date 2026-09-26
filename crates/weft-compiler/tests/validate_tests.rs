@@ -504,6 +504,16 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     );
 }
 
+/// A Route may both skip recording and outlive its caller: a caller
+/// leaving does not park the run, and an unrecorded run refuses every
+/// wait at the call, so nothing about the pair needs a journal.
+#[test]
+fn an_unrecorded_route_may_outlive_its_caller() {
+    let both = parse_enrich("t = Route { path: \"status\", recorded: false, outlivesCaller: true }\n");
+    let d = validate(&both, &catalog());
+    assert!(!d.iter().any(|x| x.message.contains("`recorded`")), "{d:?}");
+}
+
 /// `LlmInference`'s added output ports only fire with `parseJson: true`:
 /// the metadata says so through `custom_outputs_declared`, so a program
 /// declaring `-> (verdict: String)` without the flag is a structural
@@ -4388,4 +4398,49 @@ fn a_one_of_member_fed_by_the_loop_index_is_fed() {
         l.items = [\"a\"]\n\
         d = Debug { data: l.out }\n";
     assert!(unmet_is_empty(&entry_program(src, dir.path())));
+}
+
+/// A connection node joins nothing either: one key set gating two
+/// otherwise separate branches leaves them two branches, each counting
+/// the key set once. Eight and seven stay quiet, where one joined
+/// branch of seventeen would warn.
+#[test]
+fn a_connection_node_ends_the_walk_like_infra() {
+    let src = format!(
+        "\ngate = ApiKeyAuth\n{}{}",
+        chain("a", 8, Some("gate.access")).trim_start_matches('\n'),
+        chain("b", 7, Some("gate.access")).trim_start_matches('\n')
+    );
+    let d = validate(&parse_enrich(&src), &catalog());
+    assert!(!codes(&d).contains(&"level-too-large"), "9 and 8 with the key set: {d:?}");
+}
+
+/// A provider's model counts as given whether it is written on the node
+/// or wired in; only a node with neither is told it has no model.
+#[test]
+fn a_wired_model_is_a_model() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let no_model = |src: &str| {
+        validate_with_mode(&parse_enrich(src), &catalog(), ValidationMode::Runtime)
+            .into_iter()
+            .any(|d| d.message.contains("has no model"))
+    };
+    assert!(!no_model("m = Text { value: \"openai/gpt-5\" }\np = OpenRouterProvider { model: m.value }\n"));
+    assert!(!no_model("p = OpenRouterProvider { model: \"openai/gpt-5\" }\n"));
+    assert!(no_model("p = OpenRouterProvider\n"));
+}
+
+/// A cron expression is checked while it is typed: five fields (the
+/// minute-first cron) is refused naming the six-field shape, and six or
+/// seven (a year) pass.
+#[test]
+fn a_five_field_cron_is_refused_as_it_is_typed() {
+    let refused = |cron: &str| {
+        validate(&parse_enrich(&format!("c = Cron {{ cron: \"{cron}\" }}\n")), &catalog())
+            .into_iter()
+            .any(|d| d.message.contains("needs six fields"))
+    };
+    assert!(refused("0 3 * * *"));
+    assert!(!refused("0 0 3 * * *"));
+    assert!(!refused("0 0 3 * * * 2027"));
 }

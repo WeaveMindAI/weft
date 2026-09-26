@@ -29,8 +29,10 @@ weft token mint --name "my website" --display whatsapp
 It prints, once, an address of the form
 `http://host:port/signal-token/<token>`: the part before `/signal-token/`
 is the dispatcher the [consumer] talks to, the last segment is the token.
-The bare token follows on the second line, so a script takes `tail -n 1`
-(or `--json` for the whole answer). The server keeps a hash only, so a lost
+The bare token follows on the second line. A script reads it with `--json`
+and takes `.token` (`weft token mint ... --json | jq -r .token`): the
+"Copy it now" note goes to stderr, and a shell that merges the two streams
+puts it last, so `tail -n 1` would read the note. The server keeps a hash only, so a lost
 token is revoked (`weft token ls`, `weft token revoke <id>`) and a new one
 minted. A token with no scope sees every [signal] of the tenant;
 `--projects` and `--tags` narrow it, both repeat.
@@ -83,7 +85,7 @@ A [display] is what one node shows about itself while it runs. Three more
 
 | [door] | What it does |
 |---|---|
-| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label? }` each, `kind` being `infra` or `trigger`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
+| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `absent` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
 | `GET /signal-token/displays/{project}/{node}` | what that node is showing right now |
 | `POST /signal-token/displays/{project}/{node}/action` | press a button one of its items carried: `{ "kind": "<actionKind>", "payload": ... }`. Only an `infra` node has buttons; a `trigger`'s [display] is read-only and answers 400 |
 
@@ -129,6 +131,9 @@ await fetch(`${base}/signal-token/displays/${project}/${node}/action`, {
 
 `base` is the part of the minted address before `/signal-token/`, the same
 one every other door uses.
+If the page is part of a website, its browser never calls that address: it
+calls `/weft` on its own site, whose server passes the call on (the
+pass-through in the `weft-frontend` skill), so there `base` is `/weft`.
 
 **Read the display on every render, never store it.** A QR code expires in
 under a minute, and a bridge that got paired in between shows a phone number
@@ -149,9 +154,12 @@ nothing to show all answer 404, so a caller walking ids learns only "nothing
 here". A token that reaches no display at all gets a 403 naming the flag that
 would have given it one, so ask the operator to mint a token with `--display
 <node>` rather than guessing that the project shows nothing. While there
-is nothing behind the display yet (the infra is not started, the project is
-not activated) the door answers 404 as well: say that in the panel's place,
-because starting the infra is the reader's next move.
+is nothing behind the display yet the door answers 404 as well, so read the
+listing's `status` to say which: `provisioning` is "starting" (a copy can take
+minutes, so show that it is on its way, and read the feed again once it says
+`running`), `absent` or `stopped` is "not started" with the button that starts
+it, and `failed` is the error. A trigger's display 404s until the project is
+activated.
 
 ## What a listed signal looks like
 

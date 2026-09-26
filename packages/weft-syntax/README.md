@@ -58,7 +58,7 @@ does not. What each piece of source actually turns into is checked here, in
 |---|---|---|
 | `# a comment` | `comment.line.number-sign.weft` | `hljs-comment` |
 | `"a string"`, and a ` ``` ` block | `string.quoted.*.weft` | `hljs-string` |
-| `@include(...)`, `@file(...)`, `@require_one_of(...)` | `keyword.control.directive.weft` | `hljs-meta` |
+| `@include(...)`, `@file(...)`, `@require_one_of(...)`, `@per_member` | `keyword.control.directive.weft` | `hljs-meta` |
 | `Group`, `Loop`, `self` | `keyword.control.weft` | `hljs-keyword` |
 | `_label`, `_tags`, `_should_flow` | `keyword.other.reserved.weft` | `hljs-keyword` |
 | `String`, `List`, `Access`, every other type | `support.type.weft` | `hljs-type` |

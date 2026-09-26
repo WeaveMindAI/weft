@@ -1,0 +1,79 @@
+{
+  "type": "DeactivateMemberTriggers",
+  "label": "Deactivate member triggers",
+  "description": "Turn off a member's own triggers, the way `triggers` says (park, hibernate or wipe), with their runs still going following `running`.",
+  "tags": [
+    "members",
+    "triggers",
+    "deactivate"
+  ],
+  "icon": "ZapOff",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "member",
+      "type": "String",
+      "required": true,
+      "description": "The member, by the id your program uses for them (`user-42`)."
+    },
+    {
+      "name": "only",
+      "type": "List[String]",
+      "description": "Only these triggers. Every per-member trigger when not wired."
+    },
+    {
+      "name": "triggers",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "park",
+          "hibernate",
+          "wipe"
+        ]
+      },
+      "default": "park",
+      "label": "Triggers",
+      "description": "What happens to the member's triggers: park keeps what arrives for later, hibernate keeps it for a grace window, wipe drops it."
+    },
+    {
+      "name": "running",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "wait",
+          "cancel"
+        ]
+      },
+      "default": "wait",
+      "label": "Running work",
+      "description": "What happens to the member's runs still going: wait lets them finish, cancel stops them now. Wipe needs cancel."
+    },
+    {
+      "name": "graceMinutes",
+      "type": "Number",
+      "default": 15,
+      "label": "Grace minutes",
+      "description": "How long hibernate keeps accepting what arrives. Ignored by park and wipe."
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "widget": {
+        "kind": "checkbox"
+      },
+      "default": false,
+      "label": "Stop this run too",
+      "description": "Off: this run keeps going even when it is one of the runs reached. On: this run ends with them, cancelled."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the triggers are down (under `running: wait`, once they are draining: the runs they fired may still be finishing). Wire it into the `_should_flow` of what must happen after."
+    }
+  ],
+  "requires_infra": false
+}

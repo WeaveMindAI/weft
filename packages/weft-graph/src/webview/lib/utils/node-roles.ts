@@ -13,7 +13,7 @@
 // SYNC: role precedence <-> extension-vscode/src/graphView.ts syncDisplayPollers
 
 import { NODE_TYPE_CONFIG } from '../nodes';
-import type { IncludedContents } from '../../../protocol';
+import type { IncludedContents, PerMember } from '../../../protocol';
 
 /// Minimal NodeInstance shape this module reads. Avoids importing
 /// the full type from `../types` so this file stays focused.
@@ -35,6 +35,14 @@ export function nodeIsTrigger(node: RoleNodeShape): boolean {
   return node.features?.isTrigger ?? !!NODE_TYPE_CONFIG[node.nodeType]?.features?.isTrigger;
 }
 
+/// May this node carry `@per_member`? It must run a container of its
+/// own, which each member then gets. What a member provides (their
+/// connection, their sheet) is a field written `@member_filled` instead.
+// SYNC: canBePerMember <-> crates/weft-core/src/node.rs NodeMetadata::per_member_eligible
+export function canBePerMember(node: RoleNodeShape): boolean {
+  return nodeRequiresInfra(node);
+}
+
 /// The two PROJECT-level questions, which are not the same as the
 /// per-node ones above. An opaque `@include` node is neither infra nor a
 /// trigger (it gets no poller, no infra slot, no mount URL), but the file
@@ -43,19 +51,27 @@ export function nodeIsTrigger(node: RoleNodeShape): boolean {
 /// project need its infra up" have to count through includes, which is
 /// what `includeContents` is for. Get this wrong and a project whose only
 /// trigger sits in an included file shows no Activate button.
+///
+/// Only SHARED nodes count: a `@per_member` node's copies are each
+/// member's, armed and started by the program for that member, so the
+/// action bar's Activate and Start infra have nothing to act on for it
+/// (an included file's contents already leave such nodes out).
 type ProjectRoleNode = RoleNodeShape & {
   requiresInfra?: boolean;
+  perMember?: PerMember;
   includeContents?: IncludedContents | undefined;
 };
 
-/// True iff the project declares any infra, an included file's included.
+/// True iff the project declares any shared infra, an included file's included.
+// SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (source_infra)
 export function projectHasInfra(nodes: readonly ProjectRoleNode[]): boolean {
-  return nodes.some((n) => nodeRequiresInfra(n) || !!n.includeContents?.requiresInfra);
+  return nodes.some((n) => (!n.perMember && nodeRequiresInfra(n)) || !!n.includeContents?.requiresInfra);
 }
 
-/// True iff the project declares any trigger, an included file's included.
+/// True iff the project declares any shared trigger, an included file's included.
+// SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (shared_triggers)
 export function projectHasTriggers(nodes: readonly ProjectRoleNode[]): boolean {
-  return nodes.some((n) => nodeIsTrigger(n) || !!n.includeContents?.hasTrigger);
+  return nodes.some((n) => (!n.perMember && nodeIsTrigger(n)) || !!n.includeContents?.hasTrigger);
 }
 
 /// Does this node show a display on its body?

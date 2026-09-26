@@ -496,7 +496,7 @@ impl CostSink {
             model: cost.model,
             amount_usd: cost.amount_usd,
             billed: false,
-            origin: self.origin,
+            origin: self.origin.clone(),
             metadata: cost.metadata,
         };
         let payload_json = match serde_json::to_value(&payload) {
@@ -518,7 +518,7 @@ impl CostSink {
                 project_id: Some(self.project_id),
                 dedup_key: Some(dedup_key.clone()),
                 color: Some(self.color.to_string()),
-                tenant_id: Some(self.tenant_id.clone()),
+                tenant_id: self.tenant_id.clone(),
                 target_pod_name: None,
                 binary_hash: None,
                 payload: payload_json.clone(),
@@ -587,7 +587,7 @@ pub fn connection_client(
     // routes carry the measurement, free routes are declared free).
     // Without a meter there is no allowlist, so the shared door does
     // not open, on either lane.
-    if sink.origin == weft_core::CredentialOwner::Ours && meter.is_none() {
+    if sink.origin.is_platform() && meter.is_none() {
         return Err(WeftError::NodeExecution(format!(
             "service '{service}' offers a runtime credential but registers no meter; a \
              runtime credential only travels on meter-declared routes, so this door \
@@ -678,7 +678,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
             // it here. Without this the two worker lanes disagreed about
             // what the meter-as-allowlist means, and an undeclared route
             // went out on the platform's key.
-            if self.sink.origin == weft_core::CredentialOwner::Ours {
+            if self.sink.origin.is_platform() {
                 weft_providers::ours_route_on(
                     meter,
                     &self.sink.service,
@@ -701,7 +701,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // refuses everything else loud BEFORE the credential is
         // attached. A key the USER holds is theirs to aim: unknown
         // routes pass through unmeasured as always.
-        if self.sink.origin == weft_core::CredentialOwner::Ours {
+        if self.sink.origin.is_platform() {
             let Some(meter) = self.meter else {
                 return Err(middleware_err(
                     "this connection's credential is the runtime's, which may only be spent \
@@ -1165,7 +1165,7 @@ mod tests {
         relay_url: Option<String>,
     ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordingTaskStore>, Arc<PendingCostRecords>)
     {
-        rig_owned(base, relay_url, weft_core::CredentialOwner::TheirOwn, None)
+        rig_owned(base, relay_url, weft_core::CredentialOwner::Author, None)
     }
 
     fn rig_owned(
@@ -1303,7 +1303,7 @@ mod tests {
                     node_id: "node-x".into(),
                     frames: LoopFrames::default(),
                     service: "testprov".into(),
-                    origin: weft_core::CredentialOwner::TheirOwn,
+                    origin: weft_core::CredentialOwner::Author,
                 };
                 // The exact production stack (metering outer, auth inner),
                 // with the meter injected directly since the global
@@ -1343,7 +1343,7 @@ mod tests {
         assert_eq!(payloads.len(), 1, "the sign-in call was measured");
         assert_eq!(payloads[0].amount_usd, Some(0.5));
         assert!(!payloads[0].billed, "measured, never billed worker-side");
-        assert_eq!(payloads[0].origin, weft_core::CredentialOwner::TheirOwn);
+        assert_eq!(payloads[0].origin, weft_core::CredentialOwner::Author);
         // The wire really carried the auth step: the request reached
         // the server (it answered), and the recorded body proves the
         // prepared rewrite went out on the SAME request.
@@ -1358,7 +1358,7 @@ mod tests {
         let (base, chunk_tx, _received) = spawn_sse_server().await;
         let base: &'static str = Box::leak(base.into_boxed_str());
         let (client, tasks, pending) =
-            rig_owned(base, None, weft_core::CredentialOwner::TheirOwn, Some(0.001));
+            rig_owned(base, None, weft_core::CredentialOwner::Author, Some(0.001));
 
         chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
         drop(chunk_tx);
@@ -1402,7 +1402,7 @@ mod tests {
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
-            origin: weft_core::CredentialOwner::TheirOwn,
+            origin: weft_core::CredentialOwner::Author,
         };
         let client =
             connection_client("no_such_meterless_service", steps, None, Arc::new(sink))
@@ -1434,7 +1434,7 @@ mod tests {
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
-            origin: weft_core::CredentialOwner::Ours,
+            origin: weft_core::CredentialOwner::Platform,
         };
         let err = connection_client(
             "no_such_meterless_service",
@@ -1538,7 +1538,7 @@ mod tests {
         let (base, _chunk_tx, received) = spawn_sse_server().await;
         let leaked: &'static str = Box::leak(base.clone().into_boxed_str());
         let (ours, tasks, _pending) =
-            rig_owned(leaked, None, weft_core::CredentialOwner::Ours, None);
+            rig_owned(leaked, None, weft_core::CredentialOwner::Platform, None);
 
         // Unknown route: refused, the server never sees it.
         let err = ours
@@ -1814,7 +1814,7 @@ mod open_charge_tests {
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "queued".into(),
-            origin: weft_core::CredentialOwner::TheirOwn,
+            origin: weft_core::CredentialOwner::Author,
         })
     }
 
@@ -1835,7 +1835,7 @@ mod open_charge_tests {
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "queued".into(),
-            origin: weft_core::CredentialOwner::TheirOwn,
+            origin: weft_core::CredentialOwner::Author,
         })
     }
 

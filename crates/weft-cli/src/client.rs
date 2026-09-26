@@ -13,6 +13,19 @@ impl DispatcherClient {
         Self { base: base.into(), http: reqwest::Client::new() }
     }
 
+    /// The same dispatcher, with every request carrying `token` as its
+    /// bearer: how the CLI speaks at a door that answers to a token
+    /// rather than to the local operator (the member door).
+    pub fn with_bearer(&self, token: &str) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("the token is not a valid header value")?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        let http = reqwest::Client::builder().default_headers(headers).build().context("build the HTTP client")?;
+        Ok(Self { base: self.base.clone(), http })
+    }
+
     pub fn base(&self) -> &str {
         &self.base
     }
@@ -119,6 +132,27 @@ impl DispatcherClient {
         let url = format!("{}{}", self.base, path);
         let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
         Self::check(resp).await?.json().await.context("parse response")
+    }
+
+    /// POST with a JSON body, returning JSON, or `Ok(Err(refusal))` when
+    /// the dispatcher asks for the person's trigger-deactivation choice
+    /// (a 428 carrying `TRIGGER_CHOICE_REQUIRED_HEADER`; the other 428,
+    /// infra that is not running, stays an error), so the caller can ask
+    /// for the choice or pass the refusal on. Every other failure is
+    /// `check`'s.
+    pub async fn post_json_or_choice_needed(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<Result<serde_json::Value, String>> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        if resp.status() == reqwest::StatusCode::PRECONDITION_REQUIRED
+            && resp.headers().contains_key(weft_core::TRIGGER_CHOICE_REQUIRED_HEADER)
+        {
+            return Ok(Err(resp.text().await.unwrap_or_default().trim().to_string()));
+        }
+        Ok(Ok(Self::check(resp).await?.json().await.context("parse response")?))
     }
 
     /// POST with a JSON body, handing back the status and the body

@@ -53,6 +53,7 @@ async fn store(pool: &PgPool, tenant: &str, spec: AccessSpec, values: &[(&str, &
             label: Some("gate".into()),
             permissions: vec![],
             project_id: None,
+            member: None,
         },
     )
     .await
@@ -71,6 +72,7 @@ fn request(
     CallerVerifyRequest {
         tenant: tenant.into(),
         access_id: access_id.into(),
+        for_member: None,
         service: service.into(),
         method: "POST".into(),
         path: "chat/room7".into(),

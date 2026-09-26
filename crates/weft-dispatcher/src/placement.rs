@@ -172,7 +172,7 @@ impl ProjectReclaimer for WipeProjectFiles {
         tenant: &str,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        // Both prefixes through the validated constructors: a hand-built
+        // Every prefix through the validated constructors: a hand-built
         // format string would skip the segment grammar that keeps a wipe
         // inside its owner boundary.
         let project = project_id.to_string();
@@ -181,8 +181,13 @@ impl ProjectReclaimer for WipeProjectFiles {
                 .map_err(|e| anyhow::anyhow!("project wipe prefix: {e}"))?;
         let assets = weft_core::storage::key::ParsedKey::asset_prefix(tenant, &project)
             .map_err(|e| anyhow::anyhow!("asset wipe prefix: {e}"))?;
+        // Every member's files: a member id is only a name inside its
+        // project, so they go with the project.
+        let members = weft_core::storage::key::ParsedKey::members_prefix(tenant, &project)
+            .map_err(|e| anyhow::anyhow!("member wipe prefix: {e}"))?;
         crate::storage::wipe_prefix(state, &project_files).await?;
         crate::storage::wipe_prefix(state, &assets).await?;
+        crate::storage::wipe_prefix(state, &members).await?;
         Ok(())
     }
 }

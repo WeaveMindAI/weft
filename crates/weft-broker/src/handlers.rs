@@ -50,6 +50,56 @@ pub async fn journal_record(
     Ok(Json(JournalRecordResponse {}))
 }
 
+/// A failed unrecorded run's whole record, written at once: the run
+/// becomes a recorded run (`weft_journal::unrecorded`). Same gate as
+/// `journal_record`: the worker may only write the color it owns.
+pub async fn journal_record_retroactive(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<JournalRecordRetroactiveRequest>,
+) -> Resp<JournalRecordResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
+    }
+    let Some(first) = req.events.first() else {
+        return Err((StatusCode::BAD_REQUEST, "an unrecorded run's record has at least its birth".into()));
+    };
+    require_worker_owns_color(&state, &caller, first.color(), &req.pod_name).await?;
+    state
+        .journal
+        .record_retroactively(&req.events, Some(req.pod_name.as_str()))
+        .await
+        .map_err(internal)?;
+    Ok(Json(JournalRecordResponse {}))
+}
+
+/// An unrecorded run ended without failing: its color row goes (unless
+/// its costs keep it) and its un-kept run files start their linger, the
+/// same sweep a recorded run's ending queues.
+pub async fn journal_forget_unrecorded(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<JournalForgetUnrecordedRequest>,
+) -> Resp<JournalRecordResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
+    }
+    let color: weft_core::Color =
+        req.color.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad color: {e}")))?;
+    let scope = require_worker_owns_color(&state, &caller, color, &req.pod_name).await?;
+    // Files first: a failed sweep leaves the row, so the worker's error
+    // names a run that is still there to look at.
+    if let Some(store) = &state.runtime_store {
+        store.sweep_exec(&scope.tenant, &req.color).await.map_err(internal)?;
+    }
+    state
+        .journal
+        .forget_unrecorded(color, Some(req.pod_name.as_str()))
+        .await
+        .map_err(internal)?;
+    Ok(Json(JournalRecordResponse {}))
+}
+
 /// The gate every write a worker makes ABOUT a color passes: the color
 /// is in the caller's scope, the caller is the pod it claims to be, and
 /// that pod is the color's current owner. Returns the color's scope
@@ -73,7 +123,7 @@ async fn require_worker_owns_color(
     caller: &CallerIdentity,
     color: weft_core::Color,
     claimed_pod: &str,
-) -> Result<scope::ProjectScope, (StatusCode, String)> {
+) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     let color_scope =
         scope::require_color_scope(&state.scope_cache, &state.pool, caller, &color.to_string())
             .await?;
@@ -212,7 +262,7 @@ pub async fn execution_stop_tagged(
         project_id: Some(color_scope.project),
         dedup_key: Some(format!("stop_tagged:{}", uuid::Uuid::new_v4())),
         color: Some(color.to_string()),
-        tenant_id: Some(color_scope.tenant),
+        tenant_id: color_scope.tenant,
         target_pod_name: None,
         binary_hash: None,
         payload: serde_json::to_value(&payload).map_err(internal)?,
@@ -335,6 +385,7 @@ pub async fn task_enqueue_dedup(
                 TaskKind::LiveArrival.as_str(),
                 TaskKind::RecordCost.as_str(),
                 TaskKind::RecordLog.as_str(),
+                TaskKind::ProgramCall.as_str(),
             ]
             .contains(&kind.as_str())
             {
@@ -490,6 +541,32 @@ pub async fn task_enqueue_dedup(
         }
     }
 
+    // A program call acts on the asking run's own project, as that run:
+    // the task names the run (its color), the project the run belongs to,
+    // and the payload's asker is that same run. Nothing else is taken on
+    // the worker's word.
+    if kind == TaskKind::ProgramCall.as_str() {
+        let color = req.spec.color.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "a program call names the asking run (color)".to_string(),
+        ))?;
+        let run = scope::require_color_scope(&state.scope_cache, &state.pool, &caller, color).await?;
+        if req.spec.project_id != Some(run.project) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "a program call acts on the asking run's own project".into(),
+            ));
+        }
+        let payload: weft_core::program::ProgramCallPayload = serde_json::from_value(req.spec.payload.clone())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("program_call payload: {e}")))?;
+        if payload.by.to_string() != color {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "a program call's asker is the run that sends it".into(),
+            ));
+        }
+    }
+
     // A task with no tenant-bearing resource can only come from a
     // tenant-scoped caller (its own tenant is the anchor). A
     // control-plane caller MUST name a resource so the tenant is
@@ -512,7 +589,7 @@ pub async fn task_enqueue_dedup(
     // type). Stamp the RESOLVED tenant (the resource's true tenant),
     // never the wire value and never the caller identity.
     let mut new_task = req.spec;
-    new_task.tenant_id = Some(resolved_tenant);
+    new_task.tenant_id = resolved_tenant;
     let outcome = state.tasks.enqueue_dedup(new_task).await.map_err(internal)?;
     let (id, inserted) = match outcome {
         DedupOutcome::Inserted(id) => (id, true),
@@ -723,23 +800,42 @@ pub async fn worker_pod_mark_done_if_idle(
 
 // ---------- Infra ----------
 
+/// Whose copy a node's call reaches: the run's member when the node
+/// exists once per member, the shared copy otherwise. A per-member
+/// node asking from a run that carries no member is refused: reading
+/// the shared copy in its place would hand it someone else's thing.
+fn member_copy(
+    run_member: Option<&weft_core::member::MemberId>,
+    per_member: bool,
+) -> Result<Option<&weft_core::member::MemberId>, (StatusCode, String)> {
+    match (per_member, run_member) {
+        (false, _) => Ok(None),
+        (true, Some(member)) => Ok(Some(member)),
+        (true, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "this node exists once per member, but the run asking carries no member; \
+             start it from a member's door"
+                .into(),
+        )),
+    }
+}
+
 pub async fn infra_endpoint_url(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<InfraEndpointUrlRequest>,
 ) -> Resp<InfraEndpointUrlResponse> {
-    // Workers and listeners both need infra endpoint URLs.
-    // - Workers: at fire-time, hit the infra pod's `/action` etc.
-    // - Listeners: at signal registration time, subscribe to SSE
-    //   served from infra pods (e.g. WhatsApp messages).
-    if !matches!(caller.role, Role::Worker | Role::Listener) {
-        return Err((StatusCode::FORBIDDEN, "worker or listener only".into()));
-    }
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
+    // A worker's run asks, at fire time, for an endpoint of its node's
+    // infra. The copy is resolved from the run itself: its project, and
+    // its member when the node exists once per member. Nothing in the
+    // request names a member, so a run cannot reach another's copy.
+    require_worker(&caller)?;
+    let run = scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &req.color.to_string())
         .await?;
+    let member = member_copy(run.member.as_ref(), req.per_member)?;
     let address = state
         .infra
-        .endpoint_address(req.project_id, &req.node_id, &req.endpoint_name)
+        .endpoint_address(run.project, &req.node_id, member, &req.endpoint_name)
         .await
         .map_err(internal)?;
     Ok(Json(InfraEndpointUrlResponse { address }))
@@ -806,7 +902,7 @@ async fn worker_execution_scope(
     state: &BrokerState,
     caller: &crate::auth::CallerIdentity,
     color: &str,
-) -> Result<scope::ProjectScope, (StatusCode, String)> {
+) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
@@ -836,9 +932,15 @@ pub async fn resolve_connection(
     let connection_id: uuid::Uuid = req.connection_id.parse().map_err(|_| {
         (StatusCode::BAD_REQUEST, format!("malformed connection id '{}'", req.connection_id))
     })?;
+    // A member's connection serves that member's runs alone.
+    let for_member = owner
+        .member
+        .clone()
+        .map(|member| weft_core::member::MemberScope { project_id: owner.project, member });
     let resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &tenant,
+        weft_access_store::GrantUser::of(for_member.as_ref()),
         connection_id,
         &req.service,
         &req.required_permissions,
@@ -854,18 +956,18 @@ pub async fn resolve_connection(
         | Some(weft_access_store::AccessError::NeedsReconnect { .. }) => {
             (StatusCode::CONFLICT, format!("{e}"))
         }
-        None => internal(e),
+        Some(weft_access_store::AccessError::Gone(_)) | None => internal(e),
     })?;
 
     let response = match resolved.owner {
-        weft_core::CredentialOwner::TheirOwn => ResolveConnectionResponse {
+        weft_core::CredentialOwner::Author | weft_core::CredentialOwner::Member(_) => ResolveConnectionResponse {
             values: resolved.values,
             auth: resolved.auth,
             identity: resolved.identity,
             relay_url: None,
             owner: resolved.owner,
         },
-        weft_core::CredentialOwner::Ours => {
+        weft_core::CredentialOwner::Platform => {
             // The row's service (already matched against the request)
             // keys the credential source; nothing here trusts a
             // caller-supplied name for anything but that equality.
@@ -967,6 +1069,9 @@ pub async fn publish_access(
         weft_access_store::PublishAccess {
             spec: req.spec,
             project_id: owner.project,
+            // A member's copy of a node publishes that member's
+            // connection: the run it publishes from says whose.
+            member: member_copy(owner.member.as_ref(), req.per_member)?.cloned(),
             node_id: req.node_id,
             values: req.values,
             label: req.label,
@@ -996,6 +1101,7 @@ pub async fn published_access(
         &owner.tenant,
         owner.project,
         &req.node_id,
+        member_copy(owner.member.as_ref(), req.per_member)?,
         &req.service,
     )
     .await
@@ -1018,7 +1124,7 @@ async fn publisher_scope(
     caller: &crate::auth::CallerIdentity,
     color: &str,
     node_id: &mut String,
-) -> Result<scope::ProjectScope, (StatusCode, String)> {
+) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     let owner = worker_execution_scope(state, caller, color).await?;
     require_node_id(node_id)?;
     Ok(owner)
@@ -1064,9 +1170,9 @@ pub async fn supervisor_infra_nodes(
         .await?;
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT node_id, instance_id, status, applied_spec_hash, \
+        "SELECT node_id, member_id, instance_id, status, applied_spec_hash, applied_at_unix, \
                 endpoints_json, public_paths_json, preserve_pvcs_json, units_json \
-         FROM infra_node WHERE project_id = $1",
+         FROM infra_node WHERE project_id = $1 ORDER BY node_id, member_id NULLS FIRST",
     )
     .bind(req.project_id)
     .fetch_all(&state.pool)
@@ -1080,6 +1186,13 @@ pub async fn supervisor_infra_nodes(
         let node_id: String = r
             .try_get("node_id")
             .map_err(|e| internal(anyhow::anyhow!("decode node_id: {e}")))?;
+        let member: Option<String> = r
+            .try_get("member_id")
+            .map_err(|e| internal(anyhow::anyhow!("decode member_id: {e}")))?;
+        let member = member
+            .map(weft_core::member::MemberId::new)
+            .transpose()
+            .map_err(|e| internal(anyhow::anyhow!("infra_node.member_id for node='{node_id}': {e}")))?;
         let instance_id: String = r
             .try_get("instance_id")
             .map_err(|e| internal(anyhow::anyhow!("decode instance_id: {e}")))?;
@@ -1095,6 +1208,9 @@ pub async fn supervisor_infra_nodes(
         let applied_spec_hash: Option<String> = r
             .try_get::<Option<String>, _>("applied_spec_hash")
             .map_err(|e| internal(anyhow::anyhow!("decode applied_spec_hash: {e}")))?;
+        let applied_at_unix: Option<i64> = r
+            .try_get("applied_at_unix")
+            .map_err(|e| internal(anyhow::anyhow!("decode applied_at_unix: {e}")))?;
         let endpoints_json: serde_json::Value = r
             .try_get("endpoints_json")
             .map_err(|e| internal(anyhow::anyhow!("decode endpoints_json: {e}")))?;
@@ -1134,9 +1250,11 @@ pub async fn supervisor_infra_nodes(
         .map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
+            member,
             instance_id,
             status,
             applied_spec_hash,
+            applied_at_unix,
             addresses: weft_broker_client::protocol::AppliedEndpoints { urls: endpoints, public_paths },
             preserve_pvcs,
             units,
@@ -1248,6 +1366,7 @@ pub async fn supervisor_event_record(
         &project_tenant,
         req.project_id,
         req.node_id.as_deref(),
+        req.member.as_ref(),
         req.kind.as_str(),
         &req.payload,
     )
@@ -1303,6 +1422,29 @@ pub async fn supervisor_set_status(
     Ok(Json(SupervisorSetStatusResponse {}))
 }
 
+pub async fn supervisor_set_scaled(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(mut req): Json<SupervisorSetScaledRequest>,
+) -> Resp<SupervisorSetScaledResponse> {
+    require_supervisor(&caller)?;
+    require_node_id(&mut req.node_id)?;
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
+        .await?;
+    // The fenced write lives in `lifecycle_writes::set_scaled`; the pod
+    // identity is the supervisor's claim id, as for `set_status`.
+    let outcome = crate::lifecycle_writes::set_scaled(&state.pool, &req)
+        .await
+        .map_err(internal)?;
+    fenced_to_http(outcome, || {
+        format!(
+            "set_scaled(project={}, node={}, unit={}, replicas={})",
+            req.project_id, req.node_id, req.unit, req.replicas
+        )
+    })?;
+    Ok(Json(SupervisorSetScaledResponse {}))
+}
+
 /// Write the `infra_node` row for an apply command, gated on the
 /// caller still owning the command's claim. Shared by
 /// `set_applied` (Running + hash/endpoints) and
@@ -1337,6 +1479,7 @@ async fn write_apply_row(
     op: &str,
     project_id: uuid::Uuid,
     node_id: &str,
+    member: Option<&weft_core::member::MemberId>,
     instance_id: &str,
     namespace: &str,
     preserve_pvcs: &[String],
@@ -1355,20 +1498,21 @@ async fn write_apply_row(
     // file), gated on the bound `$7` flag via CASE.
     let res = sqlx::query(
         &format!("INSERT INTO infra_node \
-         (project_id, node_id, instance_id, namespace, status, \
+         (project_id, node_id, member_id, instance_id, namespace, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, public_paths_json, preserve_pvcs_json, units_json) \
-         SELECT $1, $2, $3, $4, $5, NULL, NULL, $6, \
+         SELECT $1, $2, $14, $3, $4, $5, NULL, NULL, $6, \
                 CASE WHEN $7 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
                 $8, $13, $9, $10 \
          FROM infra_lifecycle_command \
          WHERE id = $11 \
            AND project_id = $1 \
            AND node_id = $2 \
+           AND member_id IS NOT DISTINCT FROM $14 \
            AND verb = 'apply' \
            AND completed_at_unix IS NULL \
            AND {owns} \
-         ON CONFLICT (project_id, node_id) DO UPDATE SET \
+         ON CONFLICT (project_id, node_id, member_id) DO UPDATE SET \
             instance_id        = EXCLUDED.instance_id, \
             namespace          = EXCLUDED.namespace, \
             status             = EXCLUDED.status, \
@@ -1396,6 +1540,7 @@ async fn write_apply_row(
     .bind(command_id)
     .bind(owner_pod)
     .bind(row.public_paths_json)
+    .bind(member.map(|m| m.as_str()))
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1428,6 +1573,7 @@ pub async fn supervisor_set_applied(
         "set_applied",
         req.project_id,
         &req.node_id,
+        req.member.as_ref(),
         &req.instance_id,
         &req.namespace,
         &req.preserve_pvcs,
@@ -1476,6 +1622,7 @@ pub async fn supervisor_set_provisioning(
         "set_provisioning",
         req.project_id,
         &req.node_id,
+        req.member.as_ref(),
         &req.instance_id,
         &req.namespace,
         &req.preserve_pvcs,
@@ -1514,21 +1661,14 @@ pub async fn supervisor_enqueue_lifecycle(
     let project_tenant =
         scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
-    // Verify the typed spec's (mode, policy) combo is coherent
-    // before persisting. The rule lives next to `DeactivateSpec`
-    // in `weft_core::running_policy` so every caller (this
-    // handler, dispatcher /deactivate, supervisor's enqueue
-    // construction) shares one validator. Today the supervisor
-    // is the only caller and its three construction sites build
-    // sane combos, but a future caller (or a regression on the
-    // supervisor side) hits this boundary check.
-    if let weft_broker_client::protocol::LifecycleSpec::Deactivate(spec) = &req.spec {
-        if let Err(msg) = spec.validate() {
-            return Err((StatusCode::BAD_REQUEST, msg.to_string()));
-        }
+    // Verify the spec before persisting (`LifecycleSpec::validate`):
+    // a take-down's (mode, policy) combo is coherent and it names the
+    // broken copies it aims at; a recovery names the recovered ones.
+    if let Err(msg) = req.spec.validate() {
+        return Err((StatusCode::BAD_REQUEST, msg.to_string()));
     }
     // The typed `LifecycleSpec` only constructs `Deactivate(...)` /
-    // `Reactivate`, so a caller can't enqueue a supervisor-owned
+    // `Reactivate(...)`, so a caller can't enqueue a supervisor-owned
     // verb here. `into_row_columns()` returns running_policy =
     // None for both variants (Deactivate carries it inside
     // spec_json; Reactivate has no policy). Bind NULL.
@@ -1545,6 +1685,9 @@ pub async fn supervisor_enqueue_lifecycle(
             tenant_id: &project_tenant,
             project_id: req.project_id,
             node_id: None,
+            // A dispatcher verb acts on activations, not on infra
+            // copies; the column stays at its shared default.
+            copies: &weft_core::member::Copies::Shared,
             verb,
             running_policy,
             spec_json: spec_json.as_ref(),
@@ -1641,6 +1784,7 @@ pub async fn infra_enqueue_apply(
             tenant_id: &project_tenant,
             project_id: req.project_id,
             node_id: Some(&req.node_id),
+            copies: &weft_core::member::Copies::of(req.member.clone()),
             verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply,
             running_policy: None,
             spec_json: Some(&req.spec_json),
@@ -1796,24 +1940,32 @@ pub async fn supervisor_remove_node(
             ),
         ));
     }
-    let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2")
+    let member = req.member.as_ref().map(|m| m.as_str());
+    let res = sqlx::query(
+        "DELETE FROM infra_node \
+          WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3",
+    )
         .bind(req.project_id)
         .bind(&req.node_id)
+        .bind(member)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal(anyhow::anyhow!("delete infra_node: {e}")))?;
     sqlx::query(
-        "DELETE FROM infra_event WHERE project_id = $1 AND node_id = $2",
+        "DELETE FROM infra_event \
+          WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3",
     )
     .bind(req.project_id)
     .bind(&req.node_id)
+    .bind(member)
     .execute(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("delete infra_event: {e}")))?;
-    // Cancel any not-yet-completed lifecycle commands targeting this
-    // node_id by stamping a completion. Pending commands targeting
-    // `node_id IS NULL` (project-wide) are intentionally left in
-    // place; those are for the WHOLE project.
+    // Cancel any not-yet-completed lifecycle commands aimed at exactly
+    // this copy (this node, this owner) by stamping a completion, except
+    // the terminate doing the removing, which completes on its own.
+    // Commands for the whole project (`node_id IS NULL`) or for every
+    // copy are left in place: they still have other copies to act on.
     use weft_broker_client::protocol::LifecycleOutcome;
     sqlx::query(
         "UPDATE infra_lifecycle_command \
@@ -1821,11 +1973,14 @@ pub async fn supervisor_remove_node(
                 outcome = $3, \
                 outcome_message = 'node removed by remove_node' \
           WHERE project_id = $1 AND node_id = $2 \
-            AND completed_at_unix IS NULL",
+            AND NOT every_copy AND member_id IS NOT DISTINCT FROM $4 \
+            AND completed_at_unix IS NULL AND id <> $5",
     )
     .bind(req.project_id)
     .bind(&req.node_id)
     .bind(LifecycleOutcome::Cancelled.as_str())
+    .bind(member)
+    .bind(req.command_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("cancel pending commands: {e}")))?;
@@ -1837,7 +1992,7 @@ pub async fn supervisor_remove_node(
         &mut *tx,
         &tenant,
         req.project_id,
-        Some(&req.node_id),
+        Some((&req.node_id, req.member.as_ref())),
     )
     .await
     .map_err(|e| internal(anyhow::anyhow!("delete published connections: {e}")))?;
@@ -1908,27 +2063,49 @@ pub async fn supervisor_running_count(
     //
     // Live worker = `worker_pod` row in (spawning, alive). The
     // partial index `idx_worker_pod_project_alive` covers it.
-    use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS n \
-         FROM worker_pod \
-         WHERE project_id = $1 \
-           AND status IN ('spawning', 'alive') \
-           AND role = 'worker'",
-    )
-    .bind(req.project_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let running_count: i64 = row.try_get("n").map_err(|e| internal(anyhow::anyhow!("{e}")))?;
+    //
+    // A member's copy is used only by that member's runs, and one
+    // worker pod multiplexes every member's, so a pod count would make
+    // one member's copy wait on everybody. Its count is that member's
+    // live runs instead: started, not terminal, not parked on a resume.
+    let member_live = format!(
+        "SELECT COUNT(*)::bigint \
+         FROM execution_color ec \
+         WHERE ec.project_id = $1 \
+           AND ec.member_id = $2 \
+           AND {} \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM signal s \
+               WHERE s.color = ec.color AND s.is_resume \
+           )",
+        weft_journal::unrecorded::LIVE_RUN_SQL
+    );
+    let query = match &req.copies {
+        weft_core::member::Copies::Member(member) => {
+            sqlx::query_scalar(&member_live).bind(req.project_id).bind(member.as_str())
+        }
+        weft_core::member::Copies::Shared | weft_core::member::Copies::Every => sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint \
+             FROM worker_pod \
+             WHERE project_id = $1 \
+               AND status IN ('spawning', 'alive') \
+               AND role = 'worker'",
+        )
+        .bind(req.project_id),
+    };
+    let running_count: i64 = query
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     Ok(Json(SupervisorRunningCountResponse { running_count }))
 }
 
-/// Does the project have an uncompleted infra lifecycle command (a
-/// user infra action: apply / stop / terminate is running)?
-/// The supervisor's health loop checks this at the top of each project
-/// tick and stands down while it's true, so an autonomous health
-/// reconcile never races a user action over `infra_node.status`.
+/// The project's uncompleted supervisor commands (apply / stop /
+/// terminate), each as the copies it acts on. The supervisor's health
+/// loop stands down for exactly those copies, so an autonomous health
+/// reconcile never races a user action over a copy's status, and every
+/// other copy keeps its health. Dispatcher-owned verbs (deactivate /
+/// reactivate) are health's own requests and touch no copy's status.
 pub async fn supervisor_infra_command_in_flight(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -1937,19 +2114,24 @@ pub async fn supervisor_infra_command_in_flight(
     require_supervisor(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT EXISTS ( \
-           SELECT 1 FROM infra_lifecycle_command \
-           WHERE project_id = $1 AND completed_at_unix IS NULL \
-         ) AS in_flight",
-    )
+    let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(&format!(
+        "SELECT node_id, member_id, every_copy FROM infra_lifecycle_command \
+         WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
+        verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
+    ))
     .bind(req.project_id)
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let in_flight: bool = row.try_get("in_flight").map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    Ok(Json(SupervisorInfraCommandInFlightResponse { in_flight }))
+    let commands = rows
+        .into_iter()
+        .map(|(node_id, member, every)| {
+            let copies = weft_core::member::Copies::from_columns(member, every)
+                .map_err(|e| internal(anyhow::anyhow!("infra_lifecycle_command copies: {e}")))?;
+            Ok(InFlightCommand { node_id, copies })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(SupervisorInfraCommandInFlightResponse { commands }))
 }
 
 pub async fn supervisor_command_complete(

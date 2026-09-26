@@ -45,7 +45,9 @@ pub async fn display_stream(
     let mut feeds = Vec::new();
     for (param, source) in [("infra", DisplaySource::Infra), ("signals", DisplaySource::Signal)] {
         for node in query.get(param).into_iter().flat_map(|list| list.split(',')).filter(|n| !n.is_empty()) {
-            let key = DisplayKey { project, source, node: node.to_string() };
+            // The editor shows the program's shared copies; a member's
+            // own copy is theirs to look at, through their token.
+            let key = DisplayKey { project, source, node: node.to_string(), member: None };
             feeds.push(state.displays.watch(key, reader.clone()));
         }
     }
@@ -178,7 +180,7 @@ mod tests {
             }
         }
         let feeds = DisplayFeeds::default();
-        let key = DisplayKey { project: uuid::Uuid::nil(), source: DisplaySource::Signal, node: "one.door".into() };
+        let key = DisplayKey { project: uuid::Uuid::nil(), source: DisplaySource::Signal, node: "one.door".into(), member: None };
         let feed = feeds.watch(key, std::sync::Arc::new(Flip(AtomicUsize::new(0))));
         let stream = display_changes(feed);
         futures::pin_mut!(stream);

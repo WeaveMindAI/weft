@@ -1,0 +1,17 @@
+# Two routes that do not record their runs (`recorded: false`). The rig calls
+# each and asserts what the executions listing keeps.
+#
+#   GET status   answers every time; its runs leave nothing behind
+#   GET broken   fails every time; its run is written down afterwards
+
+status = Route { path: "__E2E_PATH__/status", method: "GET", recorded: false }
+ok = Reply { body: { "state": "fine" } }
+ok._should_flow = status.method
+
+broken = Route { path: "__E2E_PATH__/broken", method: "GET", recorded: false }
+explode = ExecPython(path: String) -> (body: JsonDict) {
+  code: "raise RuntimeError('the status table is gone')"
+}
+explode.path = broken.path
+never = Reply
+never.body = explode.body

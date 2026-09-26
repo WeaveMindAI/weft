@@ -66,12 +66,16 @@ pub fn dial_config(conn: &OpenedConnection) -> WeftResult<Config> {
     Ok(config)
 }
 
-/// Dial the wired database. The connection task is spawned; dropping
-/// the client ends it.
-pub async fn connect(
-    ctx: &ExecutionContext,
-    conn: &OpenedConnection,
-) -> WeftResult<tokio_postgres::Client> {
+/// The connection half of a dialed client: the future that must be
+/// driven for the client to work.
+type Connection = tokio_postgres::Connection<
+    tokio_postgres::Socket,
+    <tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream,
+>;
+
+/// Dial the wired database: the one handshake behind `connect` and
+/// `connect_listening`, each of which drives the connection its own way.
+async fn dial(conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
     let config = dial_config(conn)?;
     // The runtime's own trust settings, not a second opinion: one
     // answer to "which certificates does weft trust", and it pins the
@@ -79,7 +83,7 @@ pub async fn connect(
     // whichever one the host binary happened to install.
     let tls_config = weft::net::tls_config().map_err(WeftError::Config)?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new((*tls_config).clone());
-    let (client, connection) = config.connect(tls).await.map_err(|e| {
+    config.connect(tls).await.map_err(|e| {
         // A handshake failure is the one whose fix is not in the
         // message the driver gives back, because weft is stricter
         // than what a provider means by `require`: it checks the
@@ -97,7 +101,16 @@ pub async fn connect(
             ""
         };
         WeftError::NodeExecution(format!("postgres: connect: {}{hint}", pg_detail(&e)))
-    })?;
+    })
+}
+
+/// Dial the wired database. The connection task is spawned; dropping
+/// the client ends it.
+pub async fn connect(
+    ctx: &ExecutionContext,
+    conn: &OpenedConnection,
+) -> WeftResult<tokio_postgres::Client> {
+    let (client, connection) = dial(conn).await?;
     // The connection future must be driven for the client to work; it
     // ends when the client drops. A mid-run connection failure
     // surfaces on the next query as a loud error, so the task only
@@ -139,13 +152,7 @@ pub async fn connect_listening(
     channel: &str,
 ) -> WeftResult<(tokio_postgres::Client, tokio::sync::mpsc::UnboundedReceiver<ListenEvent>)> {
     use futures::StreamExt;
-    let config = dial_config(conn)?;
-    let tls_config = weft::net::tls_config().map_err(WeftError::Config)?;
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new((*tls_config).clone());
-    let (client, mut connection) = config
-        .connect(tls)
-        .await
-        .map_err(|e| WeftError::NodeExecution(format!("postgres: connect: {}", pg_detail(&e))))?;
+    let (client, mut connection) = dial(conn).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
@@ -229,9 +236,11 @@ impl SqlNumber {
         // A whole number that arrived tagged as a double still IS a
         // whole number, and everything that has been through
         // JavaScript or back out of jsonb arrives that way. Only the
-        // value matters, not how it was written.
+        // value matters, not how it was written. The top bound is
+        // strict: `i64::MAX as f64` rounds up to 2^63, one past the
+        // largest i64, while `i64::MIN as f64` is exactly -2^63.
         let wide = self.float();
-        if wide.fract() == 0.0 && wide >= i64::MIN as f64 && wide <= i64::MAX as f64 {
+        if wide.fract() == 0.0 && wide >= i64::MIN as f64 && wide < i64::MAX as f64 {
             return Ok(wide as i64);
         }
         Err(format!("{} does not fit a whole-number column", self.0).into())
@@ -414,11 +423,6 @@ fn cell_of(row: &Row, i: usize) -> WeftResult<Value> {
         Type::INT8 => row.try_get::<_, Option<i64>>(i).map(|v| json!(v)),
         Type::FLOAT4 => row.try_get::<_, Option<f32>>(i).map(|v| json!(v)),
         Type::FLOAT8 => row.try_get::<_, Option<f64>>(i).map(|v| json!(v)),
-        // Read back as the exact decimal it is stored as, then carried
-        // as a JSON number. A node that can WRITE a numeric column has
-        // to be able to read one: `insert_row` answers with the row it
-        // just stored, so a missing read arm here means writing the
-        // row and then failing on the way out.
         // A node that can WRITE a numeric column has to be able to
         // read one: `insert_row` answers with the row it just stored,
         // so a missing arm here means writing the row and then failing
@@ -448,6 +452,28 @@ fn cell_of(row: &Row, i: usize) -> WeftResult<Value> {
         Type::DATE => row
             .try_get::<_, Option<chrono::NaiveDate>>(i)
             .map(|v| json!(v.map(|d| d.to_string()))),
+        // An array (`array_agg`, a `text[]` column) comes back as a JSON
+        // list, each element read the way its scalar column would be.
+        // One dimension: that is what `Vec` reads, and a deeper array is
+        // refused by the driver with its own message.
+        Type::BOOL_ARRAY => array(row, i, |v: bool| json!(v)),
+        Type::INT2_ARRAY => array(row, i, |v: i16| json!(v)),
+        Type::INT4_ARRAY => array(row, i, |v: i32| json!(v)),
+        Type::INT8_ARRAY => array(row, i, |v: i64| json!(v)),
+        Type::FLOAT4_ARRAY => array(row, i, |v: f32| json!(v)),
+        Type::FLOAT8_ARRAY => array(row, i, |v: f64| json!(v)),
+        Type::NUMERIC_ARRAY => array(row, i, |v: rust_decimal::Decimal| {
+            use rust_decimal::prelude::ToPrimitive;
+            json!(v.to_f64())
+        }),
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY => {
+            array(row, i, |v: String| json!(v))
+        }
+        Type::JSON_ARRAY | Type::JSONB_ARRAY => array(row, i, |v: Value| v),
+        Type::UUID_ARRAY => array(row, i, |v: uuid::Uuid| json!(v)),
+        Type::TIMESTAMPTZ_ARRAY => array(row, i, |v: chrono::DateTime<chrono::Utc>| json!(v.to_rfc3339())),
+        Type::TIMESTAMP_ARRAY => array(row, i, |v: chrono::NaiveDateTime| json!(v.to_string())),
+        Type::DATE_ARRAY => array(row, i, |v: chrono::NaiveDate| json!(v.to_string())),
         _ => {
             weft::node_bail!(
                 "column '{name}' has type {ty}, which this node does not carry; cast it in \
@@ -456,6 +482,19 @@ fn cell_of(row: &Row, i: usize) -> WeftResult<Value> {
         }
     };
     v.node_err("postgres: read a cell")
+}
+
+/// One array cell as a JSON list (`null` for a NULL array, `null` for a
+/// NULL element), each element turned into JSON by `each`.
+fn array<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a Row,
+    i: usize,
+    each: impl Fn(T) -> Value,
+) -> Result<Value, tokio_postgres::Error> {
+    row.try_get::<_, Option<Vec<Option<T>>>>(i).map(|v| match v {
+        None => Value::Null,
+        Some(items) => Value::Array(items.into_iter().map(|e| e.map_or(Value::Null, &each)).collect()),
+    })
 }
 
 /// Answered rows as JSON objects keyed by column name.
@@ -692,17 +731,7 @@ pub fn ports_read(plan: &Plan) -> Vec<String> {
     match plan {
         Plan::Query { names, .. } => names.clone(),
         Plan::Script { .. } => Vec::new(),
-        Plan::Steps(steps) => {
-            let mut out: Vec<String> = Vec::new();
-            for s in steps {
-                for n in &s.names {
-                    if !out.contains(n) {
-                        out.push(n.clone());
-                    }
-                }
-            }
-            out
-        }
+        Plan::Steps(steps) => distinct_names(steps),
     }
 }
 
@@ -727,16 +756,21 @@ impl PlaceholderSql {
     /// Every port name any statement reads, first appearance first,
     /// each once.
     pub fn names(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for s in &self.statements {
-            for n in &s.names {
-                if !out.contains(n) {
-                    out.push(n.clone());
-                }
+        distinct_names(&self.statements)
+    }
+}
+
+/// Every port the statements read, each once, in order of first use.
+fn distinct_names(statements: &[Statement]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in statements {
+        for n in &s.names {
+            if !out.contains(n) {
+                out.push(n.clone());
             }
         }
-        out
     }
+    out
 }
 
 /// Read a query's `$name` placeholders, the way a node's custom input

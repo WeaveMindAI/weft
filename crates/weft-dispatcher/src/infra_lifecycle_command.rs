@@ -1,26 +1,35 @@
 //! `infra_lifecycle_command` table.
 //!
-//! The single bidirectional channel between the dispatcher (router)
-//! and a tenant's infra-supervisor (executor). Dispatcher writes
-//! intent rows for the three verbs we expose:
+//! The single channel between whoever asks for infra work and the
+//! tenant's infra-supervisor that does it. Intent rows carry one verb:
 //!
 //! - **Apply**: provision a new infra node OR roll an existing one
-//!   to a new spec. Body carries only the `InfraSpec` JSON. The
-//!   supervisor reads the prior `infra_node` row itself, compiles
-//!   the new spec with the real image-tag map + instance id, hashes,
-//!   and decides skip / fresh / replace internally.
-//! - **Stop**: scale to zero, preserve PVCs.
-//! - **Terminate**: delete every resource by label, PVCs too.
+//!   to a new spec. Issued by the broker for a worker's InfraSetup
+//!   run (`weft_broker::lifecycle_writes::issue_command`); the body
+//!   carries only the `InfraSpec` JSON. The supervisor reads the prior
+//!   `infra_node` row itself, compiles the new spec with the real
+//!   image-tag map + instance id, hashes, and decides skip / fresh /
+//!   replace internally.
+//! - **Stop**: scale to zero, preserve PVCs. Issued here.
+//! - **Terminate**: delete every resource by label, PVCs too. Issued
+//!   here.
 //!
-//! Supervisor polls per tenant via the broker's
-//! `supervisor_claim_command`, runs kubectl, writes completion via
+//! The supervisor claims through the broker's held
+//! `supervisor_claim_command` (woken by the row's own notification),
+//! acts on the cluster, and writes completion via
 //! `supervisor_command_complete`. Dispatcher-claimable verbs
-//! (Deactivate, Reactivate) go through `lifecycle_claimer` (this
-//! crate). No HTTP between supervisor and dispatcher; both sides
-//! talk to Postgres via the broker.
+//! (Deactivate, Reactivate, Upgrade) go through `lifecycle_claimer`
+//! (this crate). No HTTP between supervisor and dispatcher; both sides
+//! talk to Postgres, the supervisor through the broker.
+//!
+//! - **Upgrade**: a person's `weft infra upgrade`, once its gates passed.
+//!   Issued here ([`issue_upgrade`]) and run by a dispatcher pod
+//!   (`api::infra::run_upgrade`): the triggers reading the infra come
+//!   down, the stop leg, then the start. The row
+//!   is what the person follows, and what another pod takes over when
+//!   the one running it dies.
 
 use anyhow::Result;
-use serde_json::Value;
 use sqlx::postgres::PgPool;
 
 // `InfraLifecycleVerb` and `RunningPolicy` are the wire contract for
@@ -82,7 +91,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- picks it with the wait choice; the default mirrors
             -- weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS
             -- (SYNC: the two numbers move together, by migration here).
-            drain_timeout_secs BIGINT NOT NULL DEFAULT 60
+            drain_timeout_secs BIGINT NOT NULL DEFAULT 60,
+            -- Which copies of the infra the command acts on
+            -- (`weft_core::member::Copies`): the shared ones (member_id
+            -- NULL, every_copy FALSE), one member's (member_id set), or
+            -- every copy there is (every_copy TRUE; the project going).
+            -- An apply always names exactly one copy.
+            member_id         TEXT,
+            every_copy        BOOLEAN NOT NULL DEFAULT FALSE
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
@@ -103,7 +119,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ")",
         ),
         // Mirror for the dispatcher claim loop (deactivate /
-        // reactivate). No tenant filter: the dispatcher pool claims
+        // reactivate / upgrade). No tenant filter: the dispatcher pool claims
         // across all tenants.
         concat!(
             r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
@@ -119,7 +135,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // double-enqueueing the same apply; `infra_enqueue_apply`
         // catches the conflict and returns the existing row's id.
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
-              ON infra_lifecycle_command(project_id, node_id)
+              ON infra_lifecycle_command(project_id, node_id, member_id) NULLS NOT DISTINCT
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
         // Announce a command when it is issued (its claimers wake) and
         // when it completes (whoever waits on its outcome wakes), from
@@ -158,6 +174,7 @@ pub async fn issue_lifecycle(
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
+    copies: &weft_core::member::Copies,
     verb: InfraLifecycleVerb,
     running_policy: RunningPolicy,
     force: bool,
@@ -166,13 +183,14 @@ pub async fn issue_lifecycle(
 ) -> Result<i64> {
     assert!(
         matches!(verb, InfraLifecycleVerb::Stop | InfraLifecycleVerb::Terminate),
-        "issue_lifecycle is for Stop/Terminate; use issue_apply for Apply"
+        "issue_lifecycle is for Stop/Terminate; an apply is issued by the broker for a worker"
     );
+    let (member_id, every_copy) = copies.columns();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, running_policy, force, drain_timeout_secs, \
-          issued_by_pod, issued_at_unix) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT) \
+          issued_by_pod, issued_at_unix, member_id, every_copy) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10) \
          RETURNING id",
     )
     .bind(tenant_id)
@@ -183,47 +201,130 @@ pub async fn issue_lifecycle(
     .bind(force)
     .bind(drain_timeout_secs as i64)
     .bind(issued_by_pod)
+    .bind(member_id)
+    .bind(every_copy)
     .fetch_one(pool)
     .await?;
     Ok(row.0)
 }
 
-/// Enqueue an Apply command. The supervisor reads the row,
-/// deserializes `spec_json`, reads the prior `infra_node` row to
-/// decide skip / fresh / replace, and applies via kubectl.
-pub async fn issue_apply(
+/// An upgrade's work, carried in its command's `spec_json`; whose
+/// copies it cycles is the row's `member_id`, where a cancel of that
+/// owner's infra work finds it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpgradeWork {
+    /// The places to cycle, every one of the owner's kind when empty.
+    pub nodes: Vec<String>,
+    /// The running executions' answer, resolved when the upgrade was
+    /// asked for (the picker's, else the request's, else the default).
+    pub running_policy: RunningPolicy,
+    pub drain_timeout_secs: u64,
+    /// The person's answer for the triggers reading this infra, which
+    /// the run takes down before the stop leg. `None` when none was on
+    /// as the upgrade was asked for.
+    pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
+    /// What the start half runs, as the request's sync body carried it.
+    pub binary_hash: Option<String>,
+    pub definition_hash: Option<String>,
+    pub infra_hash: Option<String>,
+    pub image_hashes: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
+    /// The stop leg has landed: a claimer taking the upgrade over goes
+    /// straight to the start (stopping again would take down what the
+    /// start may already have brought up).
+    #[serde(default)]
+    pub stopped: bool,
+}
+
+/// What issuing an upgrade came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeIssued {
+    /// Issued; its id, what the person follows to the outcome.
+    Issued(i64),
+    /// An upgrade of the same copies is still in flight (its id): a
+    /// second one would cycle them under the first.
+    AlreadyInFlight(i64),
+}
+
+/// Issue an upgrade of `member`'s copies (the shared ones for `None`),
+/// unless one of the same copies is still in flight. The check and the
+/// insert run under one advisory lock keyed by the copies, so two
+/// requests racing each other issue one upgrade.
+pub async fn issue_upgrade(
     pool: &PgPool,
     tenant_id: &str,
     project_id: uuid::Uuid,
-    node_id: &str,
-    spec: &Value,
+    member: Option<&weft_core::member::MemberId>,
+    work: &UpgradeWork,
     issued_by_pod: &str,
-) -> Result<i64> {
-    // Apply ignores `running_policy` (there's nothing to drain
-    // before applying); leave it NULL. `SupervisorCommandRow.running_policy`
-    // is `Option<RunningPolicy>` so this round-trips cleanly.
-    let row: (i64,) = sqlx::query_as(
+) -> Result<UpgradeIssued> {
+    let member = member.map(|m| m.as_str());
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::lease::advisory_key(
+            crate::lease::UPGRADE_ISSUE_DOMAIN,
+            &format!("{project_id}/{}", member.unwrap_or("")),
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let in_flight: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM infra_lifecycle_command \
+         WHERE project_id = $1 AND verb = $2 AND member_id IS NOT DISTINCT FROM $3 \
+           AND completed_at_unix IS NULL \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(InfraLifecycleVerb::Upgrade.as_str())
+    .bind(member)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(id) = in_flight {
+        return Ok(UpgradeIssued::AlreadyInFlight(id));
+    }
+    let id: i64 = sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, \
-          spec_json, issued_by_pod, issued_at_unix) \
-         VALUES ($1, $2, $3, 'apply', NULL, $4, $5, \
-                 EXTRACT(EPOCH FROM NOW())::BIGINT) \
+         (tenant_id, project_id, verb, spec_json, issued_by_pod, issued_at_unix, member_id) \
+         VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
          RETURNING id",
     )
     .bind(tenant_id)
     .bind(project_id)
-    .bind(node_id)
-    .bind(spec)
+    .bind(InfraLifecycleVerb::Upgrade.as_str())
+    .bind(sqlx::types::Json(work))
     .bind(issued_by_pod)
-    .fetch_one(pool)
+    .bind(member)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(row.0)
+    tx.commit().await?;
+    Ok(UpgradeIssued::Issued(id))
 }
+
+/// Record that upgrade `command_id`'s stop leg landed, while `pod`
+/// still holds its claim. `false` when it does not (another pod took it
+/// over): the caller stops there.
+pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, pod: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
+         WHERE id = $1 AND claimed_by_pod = $2 AND completed_at_unix IS NULL",
+    )
+    .bind(command_id)
+    .bind(pod)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// The verbs that are a person's infra work, as the SQL list inside
+/// `verb IN (...)`: the supervisor's, and an upgrade. What makes a
+/// project infra-transitional ([`any_in_flight`]) and what an infra
+/// cancel reaches ([`request_cancel_owner`]); health's own dispatcher
+/// verbs (deactivate / reactivate) are neither.
+// SYNC: 'upgrade' <-> weft_broker_client::protocol::InfraLifecycleVerb::Upgrade
+const INFRA_WORK_VERBS_SQL: &str = concat!(weft_broker_client::supervisor_verbs_sql!(), ", 'upgrade'");
 
 // Note on missing `claim_one` / `complete`: claim/complete is owned
 // by the broker (`supervisor_claim_command` + `supervisor_command_complete`)
 // for supervisor verbs, and by the dispatcher's `lifecycle_claimer`
-// for Deactivate/Reactivate. There is no shared helper because the
+// for Deactivate / Reactivate / Upgrade. There is no shared helper because the
 // two claim paths enforce different ownership invariants (broker
 // requires SA-authenticated supervisor pod; dispatcher claims by
 // pod_id with a lease).
@@ -354,9 +455,10 @@ pub async fn held_command_outcome(
 /// trigger). Returns `(id, outcome)` pairs in input order, `Timeout`
 /// for any that did not finish in time.
 ///
-/// Used by `reap_orphans` and `delete_project::terminate`, both of
-/// which fan out N terminate commands and need to wait for the set, and
-/// through [`wait_for_command`] by every single-command wait.
+/// Used by `api::infra::reap_orphans`, which fans out N terminate
+/// commands and waits for the set, by the upgrade stop leg (a minute at
+/// a time, so it can leave a breadcrumb), and through
+/// [`wait_for_command`] by every single-command wait.
 pub async fn wait_for_commands(
     pool: &PgPool,
     signals: &weft_task_store::pg_signal::PgSignalWatch,
@@ -418,8 +520,8 @@ pub async fn wait_for_commands(
         .collect())
 }
 
-/// Whether any supervisor-verb lifecycle command (apply / stop /
-/// terminate) is uncompleted for the project. The dispatcher-side
+/// Whether any infra-work lifecycle command (apply / stop / terminate,
+/// or an upgrade) is uncompleted for the project. The dispatcher-side
 /// "infra operation in flight" fact: while it holds, the
 /// reconciliation treats the project as infra-transitional (only
 /// infra_cancel offered), which is what stops NEW runs from starving
@@ -432,9 +534,8 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
              SELECT 1 FROM infra_lifecycle_command \
              WHERE project_id = $1 \
                AND completed_at_unix IS NULL \
-               AND verb IN ({verbs}) \
+               AND verb IN ({INFRA_WORK_VERBS_SQL}) \
          )",
-        verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
     ))
     .bind(project_id)
     .fetch_one(pool)
@@ -442,33 +543,47 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
     Ok(exists)
 }
 
-/// Cancel every in-flight lifecycle command for a project: flag
-/// CLAIMED rows (`cancel_requested = TRUE`; the executing supervisor
-/// polls the flag between kubectl steps and halts) and complete
-/// still-UNCLAIMED rows outright with outcome `cancelled` (nothing has
-/// touched the cluster for them yet). Flag first, then complete: a row
-/// claimed between the two statements has its flag already set, so no
-/// window exists where a command escapes the cancel. Returns how many
+/// Cancel one owner's in-flight infra work (apply / stop / terminate,
+/// and an upgrade, whose claimer reads the flag between its stop and
+/// its start): the shared copies' (`member` `None`, which also reaches
+/// a command for every copy, since that one takes the shared copies
+/// down too) or one member's. Flags CLAIMED rows (`cancel_requested =
+/// TRUE`; the executing supervisor polls the flag between kubectl
+/// steps and halts) and completes still-UNCLAIMED rows outright with
+/// outcome `cancelled` (nothing has touched the cluster for them yet).
+/// Flag first, then complete: a row claimed between the two statements
+/// has its flag already set, so no window exists where a command
+/// escapes the cancel. Dispatcher-owned verbs (deactivate /
+/// reactivate) are health's work and never touched. Returns how many
 /// rows were touched.
-pub async fn request_cancel_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<u64> {
-    let flagged = sqlx::query(
-        "UPDATE infra_lifecycle_command SET cancel_requested = TRUE \
-         WHERE project_id = $1 AND completed_at_unix IS NULL",
-    )
+pub async fn request_cancel_owner(
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+    member: Option<&weft_core::member::MemberId>,
+) -> Result<u64> {
+    let owner = format!(
+        "project_id = $1 AND completed_at_unix IS NULL \
+         AND member_id IS NOT DISTINCT FROM $2 \
+         AND verb IN ({INFRA_WORK_VERBS_SQL})",
+    );
+    let member = member.map(|m| m.as_str());
+    let flagged = sqlx::query(&format!(
+        "UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE {owner}"
+    ))
     .bind(project_id)
+    .bind(member)
     .execute(pool)
     .await?
     .rows_affected();
-    let completed = sqlx::query(
+    let completed = sqlx::query(&format!(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = 'cancelled', \
              outcome_message = 'cancelled by user before execution' \
-         WHERE project_id = $1 \
-           AND completed_at_unix IS NULL \
-           AND claimed_by_pod IS NULL",
-    )
+         WHERE {owner} AND claimed_by_pod IS NULL"
+    ))
     .bind(project_id)
+    .bind(member)
     .execute(pool)
     .await?
     .rows_affected();
@@ -478,6 +593,7 @@ pub async fn request_cancel_project(pool: &PgPool, project_id: uuid::Uuid) -> Re
     tracing::info!(
         target: "weft_dispatcher::infra_lifecycle_command",
         project_id = %project_id,
+        member = member.unwrap_or("<shared>"),
         flagged,
         cancelled_unclaimed = completed,
         "infra cancel requested"
@@ -529,8 +645,23 @@ mod tests {
 
     #[test]
     fn verb_unknown_returns_none() {
-        assert_eq!(InfraLifecycleVerb::parse("upgrade"), None);
+        assert_eq!(InfraLifecycleVerb::parse("reboot"), None);
         assert_eq!(InfraLifecycleVerb::parse(""), None);
+    }
+
+    /// The infra-work list is the supervisor's verbs and an upgrade,
+    /// spelled the way the verb is stored.
+    #[test]
+    fn infra_work_is_the_supervisor_verbs_and_an_upgrade() {
+        let want = [
+            InfraLifecycleVerb::Apply,
+            InfraLifecycleVerb::Stop,
+            InfraLifecycleVerb::Terminate,
+            InfraLifecycleVerb::Upgrade,
+        ]
+        .map(|v| format!("'{}'", v.as_str()))
+        .join(", ");
+        assert_eq!(INFRA_WORK_VERBS_SQL, want);
     }
 
     #[test]

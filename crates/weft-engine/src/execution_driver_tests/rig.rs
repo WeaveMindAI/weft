@@ -148,12 +148,12 @@
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_address(&self, _p: uuid::Uuid, _n: &str, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
+        async fn endpoint_address(&self, _c: weft_core::Color, _n: &str, _p: bool, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]
     impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
+        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::member::MemberId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
         async fn wait_apply(&self, _p: uuid::Uuid, _c: i64, _w: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,
@@ -277,11 +277,11 @@
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
                 &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection")),
             seed: None,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }];
         for kick in kicks {
             rows.push(ExecEvent::NodeKicked {

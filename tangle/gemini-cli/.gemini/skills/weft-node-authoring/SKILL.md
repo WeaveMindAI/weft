@@ -252,6 +252,36 @@ anything else before writing. In the `fake` tier nothing is stopped:
 `rig.execution_tags()` and `rig.stops()` record what the node asked for, so
 you assert on those.
 
+A program with members reaches its own members from a node through the ctx.
+`ctx.member()` is who this run is for (`Option<&MemberId>`, `None` for a run
+for nobody, `.as_str()` for the id). The rest name a member with `.member(id)`
+and end in one call:
+
+| Call | Answers |
+|---|---|
+| `ctx.infra(node).member(id).start()` | `()` once the copy runs (the run parks between looks); fails with the copy's `failure` |
+| `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` | `()`; `spec` is a `DeactivateSpec`, `stop_self` a `StopSelf` |
+| `.status()` | `Option<InfraCopy>`: `{ node, member, status, failure }`, `None` when there is no copy |
+| `ctx.infra(node).copies()` | `Vec<InfraCopy>`, the shared copy and each member's |
+| `ctx.triggers().member(id).activate()` / `.deactivate(spec, stop_self)` | `()`; `.only([..])` narrows to named triggers |
+| `ctx.values().member(id).get()` | `MemberValues`: step -> field -> value, what the member gave for `@member_filled` fields |
+| `ctx.values().member(id).set(step, field, value).clear(step, field).apply()` | `Vec<String>`, the member's triggers set up again; each value is checked against its node first, all or none |
+| `ctx.values().member(id).forget()` | `Vec<String>`, as `apply()` |
+| `ctx.connections().member(id).list()` / `.forget()` | `Vec<GrantSummary>` / `u64` forgotten |
+| `ctx.costs().member(id).service(s).node(n).paid_by(p).since(unix).list()` | `Vec<CostRecord>`: `{ run, member, node, service, model, amount_usd: Option<f64>, paid_by, at_unix }` |
+| `ctx.runs().member(id).status(s).older_than(d).clean(running, stop_self)` | what was cleaned |
+| `ctx.tokens().mint_for_member(id, expires_in)` / `.member(id).revoke()` | `MintedMemberToken { id, token, expires_at_unix }` / `()` |
+
+The types are in `weft::program` (`InfraCopy`, `CostRecord`, `PaidBy`,
+`MintedMemberToken`). Every call is journaled, so none goes through
+`ctx.run`. The `members` package already wraps most of them (`CurrentMember`,
+`StartMemberInfra`, `ListMemberCopies`, `MemberCosts`, `SetMemberValues`, ...), so check it before
+writing one. In the `fake` tier, `rig.member("user-42")` makes the run a run
+for that member, `rig.answer_program_call("weft.infra.status", json!(..))`
+queues the answer to one call by its journal name (`weft.infra.copies`,
+`weft.costs.list`, ...; several queue in order), and `rig.program_calls()`
+records what the node asked for.
+
 ## The special shapes
 
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`

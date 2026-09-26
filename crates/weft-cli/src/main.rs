@@ -112,6 +112,21 @@ enum Cmd {
         #[command(flatten)]
         opts: commands::connect::ConnectOpts,
     },
+    /// List the choices a step's searchable field offers (a
+    /// `remote_select`, like a model or a spreadsheet picker): the same
+    /// list the graph editor shows when you search that field, through
+    /// the connection picked for the step. One `id  label` line each;
+    /// the id is what goes in the source.
+    Options {
+        /// The step, by its id as written in the source (or
+        /// `path/to/file.weft:id` when the id exists in several files).
+        step: String,
+        /// The field: the step's input port name.
+        field: String,
+        /// Narrow the list to this text, as typed in the editor's search box.
+        #[arg(long)]
+        search: Option<String>,
+    },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
     /// cluster needed). With a package name or node type: just that
@@ -230,11 +245,16 @@ enum Cmd {
         /// after it.
         #[arg(long, value_name = "node=json")]
         emit: Vec<String>,
+        /// Run for this member of the program: needed when the run
+        /// reaches a step that exists once per member (`@per_member`, or
+        /// anything reading from one).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
         /// Write the scope flags as `examples/<name>.json` before running.
         #[arg(long, value_name = "name")]
         save: Option<String>,
         /// Clear a saved setting before applying explicit flags: from,
-        /// emit, target, before, group, feed, or fire. Repeatable.
+        /// emit, target, before, group, feed, fire, or member. Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
     },
@@ -304,6 +324,8 @@ enum Cmd {
         referenced: bool,
         #[command(flatten)]
         running: RunningChoiceOpts,
+        #[command(flatten)]
+        scope: ScopeOpts,
     },
     /// Activate a project. Without a project id, discovers the cwd
     /// project, compiles + registers it first, then activates.
@@ -325,6 +347,8 @@ enum Cmd {
         reactivate_choice: Option<String>,
         #[command(flatten)]
         running: RunningChoiceOpts,
+        #[command(flatten)]
+        scope: ScopeOpts,
     },
     /// Deactivate a registered project. Choose --mode wipe, hibernate,
     /// or park explicitly in scripts; a terminal prompts when it is omitted.
@@ -334,10 +358,21 @@ enum Cmd {
     /// handled: `cancel` (the default) kills running executions and
     /// flips the project straight to inactive; `wait` leaves them to
     /// drain, parking new fires meanwhile, up to `--drain-timeout`.
+    ///
+    /// Plain, it takes down the program's own triggers and says how many
+    /// members still have theirs on. `--member <id>` takes down one
+    /// member's; `--all-members` takes down every member's that are on
+    /// and leaves the program's own alone.
     Deactivate {
         project: Option<String>,
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
+        #[command(flatten)]
+        scope: ScopeOpts,
+        /// Every member whose triggers are on, each with the same
+        /// choice. The program's own triggers are left as they are.
+        #[arg(long = "all-members", conflicts_with = "member")]
+        all_members: bool,
     },
     /// Cancel an in-flight `activate` (status=Activating). Wipes
     /// every signal row registered so far, cancels the
@@ -346,6 +381,8 @@ enum Cmd {
     #[command(name = "cancel-activate")]
     CancelActivate {
         project: Option<String>,
+        #[command(flatten)]
+        scope: ScopeOpts,
     },
     /// Cancel an in-flight build (transition=building).
     /// The dispatcher pod driving the build interrupts the builder
@@ -361,18 +398,26 @@ enum Cmd {
     #[command(name = "cancel-running")]
     CancelRunning {
         project: Option<String>,
+        #[command(flatten)]
+        scope: ScopeOpts,
     },
     /// Atomic deactivate-then-activate against a fresh worker image.
     /// Used after editing the trigger or fire subgraph: drops live
-    /// signals, rebuilds if needed, re-registers everything against
-    /// the new binary in one shot.
+    /// signals, rebuilds if needed, re-registers against the new binary
+    /// in one shot. Plain, it brings every trigger that is on up to
+    /// date: the program's own and every member's. `--member <id>` is
+    /// that member's alone; `--trigger` alone is the program's named
+    /// triggers.
     Resync {
         /// Trigger-deactivation choice (mode / grace / running-policy /
         /// drain cap): resync deactivates with YOUR spec before
         /// re-registering, exactly like the standalone Deactivate.
-        /// Missing flags prompt on a TTY or error in `--json`.
+        /// A missing `--mode` is asked on a TTY once the dispatcher
+        /// says triggers are on, and is `wipe` off one or in `--json`.
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
+        #[command(flatten)]
+        scope: ScopeOpts,
     },
     /// List every project registered with the dispatcher.
     Ps,
@@ -495,6 +540,38 @@ enum Cmd {
         #[command(subcommand)]
         action: CatalogAction,
     },
+    /// What one member of the program provides for the fields it writes
+    /// `@member_filled`: lists them with the member's values, or changes
+    /// them (`--set`, `--clear`), exactly as that member's own page
+    /// would, re-arming their live triggers that read a changed value.
+    /// Acts through a member token minted for the command and revoked
+    /// after.
+    #[command(name = "member-values")]
+    MemberValues {
+        /// The member, by the id the program uses for them.
+        #[arg(long)]
+        member: weft_core::member::MemberId,
+        /// Give a value: `<node>.<field>=<value>` (JSON when it reads as
+        /// JSON, a string otherwise). Repeatable; all are stored at once.
+        #[arg(long = "set", value_name = "NODE.FIELD=VALUE")]
+        set: Vec<String>,
+        /// Forget a value, so the field falls back as if never given:
+        /// `<node>.<field>`. Repeatable.
+        #[arg(long = "clear", value_name = "NODE.FIELD")]
+        clear: Vec<String>,
+    },
+    /// Copy weft's connect library into the project's frontend, so its
+    /// pages show the same connection pickers the editor shows, and a
+    /// member of the program gets their own connect page. Lands in
+    /// `front/src/lib/weft-connect` (the default SvelteKit `$lib`)
+    /// unless `--into` names another folder; that folder is the
+    /// library's, replaced whole each time. Run it again after updating
+    /// weft.
+    ConnectLib {
+        /// The folder to copy it into, relative to the project root.
+        #[arg(long, value_name = "dir")]
+        into: Option<std::path::PathBuf>,
+    },
     /// Manage the project's Tangle persona: the AI assistant prompts,
     /// skills and commands copied in by `weft new --assistant`.
     Tangle {
@@ -543,6 +620,12 @@ enum Cmd {
         /// of mine broke" is `--status failed`.
         #[arg(long, value_parser = parse_run_status)]
         status: Option<String>,
+        /// Only runs for this member.
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+        /// Only runs carrying this tag (`ctx.tag_execution`).
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Print a past execution's events in order, one line each:
     /// time, kind, node, and a short summary of the value or error.
@@ -618,6 +701,24 @@ enum Cmd {
         /// --keep-days to spare the recent ones.
         #[arg(long, value_name = "project-id")]
         project: Option<String>,
+        /// Only runs for this member.
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+        /// Only runs that ended this way (`completed`, `failed`,
+        /// `cancelled`), or `running` for the ones still going.
+        #[arg(long, value_parser = parse_run_status)]
+        status: Option<String>,
+        /// Only runs started by this node (a trigger that fired, or the
+        /// node a run was started from).
+        #[arg(long, value_name = "node")]
+        node: Option<String>,
+        /// Only runs carrying this tag.
+        #[arg(long, value_name = "tag")]
+        tag: Option<String>,
+        /// Cancel matching runs that are still going (their rows go with
+        /// the next clean). Without it they are left to finish.
+        #[arg(long)]
+        cancel_running: bool,
         /// Reclaim unreferenced worker images. Cwd-scoped unless
         /// --all, which spans every project AND drops old builder-base
         /// images (~1.4GB each; the next build re-makes the base).
@@ -697,6 +798,17 @@ enum TokenAction {
         /// Let the token reach EVERY node display in its projects.
         #[arg(long = "displays")]
         all_displays: bool,
+        /// Make a member token: it acts as this member of the project
+        /// you are standing in, and nothing else. It starts runs as the
+        /// member (through the project's live routes), answers that
+        /// member's waits, reads the member's copies' displays and
+        /// manages the member's connections. Needs --expires.
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+        /// How long the token works (`30m`, `12h`, `7d`). Required with
+        /// --member; without it a token works until revoked.
+        #[arg(long, value_name = "duration", value_parser = parse_duration_secs)]
+        expires: Option<u64>,
     },
     /// List existing signal tokens (metadata + recognizer; the full
     /// value is shown only once, at mint).
@@ -708,18 +820,42 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, projects, tags, displays, all_displays } => {
+            TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires } => {
                 commands::token::TokenAction::Mint {
                     name,
                     projects,
                     tags,
                     displays,
                     all_displays,
+                    member,
+                    expires_in_secs: expires,
                 }
             }
             TokenAction::Ls => commands::token::TokenAction::Ls,
             TokenAction::Revoke { id } => commands::token::TokenAction::Revoke { id },
         }
+    }
+}
+
+/// Which activations a lifecycle verb acts on: every shared trigger when
+/// nothing is named; `--trigger` narrows to those triggers; `--member`
+/// turns to that member's activations of the triggers that exist once
+/// per member.
+#[derive(Debug, clap::Args, Default)]
+struct ScopeOpts {
+    /// Only this trigger, named the way the program writes it
+    /// (`receive`, `one.receive`). Repeat for several.
+    #[arg(long = "trigger", value_name = "node")]
+    triggers: Vec<String>,
+    /// That member's activations, of the triggers that exist once per
+    /// member (a trigger reading a `@per_member` node).
+    #[arg(long, value_name = "id")]
+    member: Option<weft_core::member::MemberId>,
+}
+
+impl From<ScopeOpts> for weft_core::activation::ActivationScope {
+    fn from(opts: ScopeOpts) -> Self {
+        Self { triggers: opts.triggers, member: opts.member }
     }
 }
 
@@ -730,8 +866,12 @@ impl From<TokenAction> for commands::token::TokenAction {
 /// the same way, whether or not the verb ends up showing the picker.
 ///
 /// A missing `--mode` prompts on a TTY; off one (and under `--json`)
-/// it is `wipe`, the standing answer while building. A missing
-/// `--running-policy` is `cancel` everywhere: a wait is asked for.
+/// it is `wipe` for `deactivate` and `resync`, the standing answer while
+/// building. The infra verbs send the choice only when `--mode` or
+/// `--grace` is given, and otherwise ask on a TTY when the dispatcher
+/// says triggers reading that infra are on, or fail naming these flags.
+/// A missing `--running-policy` is `cancel` everywhere: a wait is asked
+/// for.
 #[derive(Debug, clap::Args, Default, Clone)]
 struct TriggerDeactivationOpts {
     /// Preservation mode for active triggers: wipe | hibernate | park.
@@ -743,6 +883,17 @@ struct TriggerDeactivationOpts {
     grace: Option<u32>,
     #[command(flatten)]
     running: RunningChoiceOpts,
+}
+
+impl From<TriggerDeactivationOpts> for commands::deactivate::TriggerChoiceFlags {
+    fn from(opts: TriggerDeactivationOpts) -> Self {
+        Self {
+            mode: opts.mode,
+            grace: opts.grace,
+            running_policy: opts.running.running_policy,
+            drain_timeout: opts.running.drain_timeout,
+        }
+    }
 }
 
 /// The running-work choice: what happens to the executions running
@@ -772,6 +923,10 @@ enum InfraAction {
     Start {
         #[command(flatten)]
         running: RunningChoiceOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
     /// Re-apply against current images / sources (stop then start).
     /// When the project is Active, triggers deactivate (same picker as
@@ -780,6 +935,10 @@ enum InfraAction {
     Upgrade {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
     /// The doors this project's infrastructure has: which pieces of it
     /// a client on this machine can reach, and at what address. A door
@@ -791,6 +950,10 @@ enum InfraAction {
     Stop {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
     /// Delete every infra resource (PVCs included unless preserved by
     /// the node's InfraSpec). When the project is Active, triggers
@@ -798,6 +961,65 @@ enum InfraAction {
     Terminate {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+    },
+    /// Write what an infra node's card shows into an env file, every
+    /// name in one go: `--set DATABASE_USER=User --set
+    /// DATABASE_PASSWORD=Password`. A `secret` item's value is never
+    /// printed; the other values are, in the confirmation line. A new
+    /// file is made readable by you only, an existing one gets those
+    /// lines set and keeps the rest.
+    Env {
+        /// The infra instance, named as `weft infra status` lists it.
+        #[arg(value_name = "node")]
+        node: String,
+        /// The env file to write (`.env`, `web/.env.local`).
+        #[arg(long, value_name = "file")]
+        into: std::path::PathBuf,
+        /// A variable and the card item it takes, by the item's label
+        /// as `weft infra show` prints it. Repeatable.
+        #[arg(long = "set", value_name = "NAME=Label")]
+        set: Vec<String>,
+        /// A variable for the card's only secret, whatever its label.
+        #[arg(long = "as", value_name = "NAME")]
+        secret_as: Option<String>,
+        /// That member's copy of a `@per_member` node (the shared one
+        /// when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+    },
+    /// Print an infra node's card: every item (label, kind, value) and
+    /// every button (its label, the action to hand `weft infra press`,
+    /// and what it asks before pressing). A `secret` item is never
+    /// printed, `--json` included; `weft infra env` writes it into a
+    /// file.
+    Show {
+        /// The infra instance, named as `weft infra status` lists it.
+        #[arg(value_name = "node")]
+        node: String,
+        /// That member's copy of a `@per_member` node (the shared one
+        /// when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+    },
+    /// Press a button on an infra node's card, the one whose action is
+    /// `<action>` (`weft infra show` lists them). It never asks: naming
+    /// the action is the choice, and the button's warning is printed with
+    /// the result.
+    Press {
+        /// The infra instance, named as `weft infra status` lists it.
+        #[arg(value_name = "node")]
+        node: String,
+        /// The button's action, as `weft infra show` prints it.
+        #[arg(value_name = "action")]
+        action: String,
+        /// That member's copy of a `@per_member` node (the shared one
+        /// when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
     /// Print the current lifecycle state of each infra node.
     Status,
@@ -807,7 +1029,12 @@ enum InfraAction {
     /// rollback: per-node partial state stays visible; terminate or
     /// retry per-node from where it stopped. 412 if nothing is in
     /// flight.
-    Cancel,
+    Cancel {
+        /// Only that member's copies' infra work (the shared infra's
+        /// when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
+    },
     /// Print what the project's infra containers wrote: every unit of
     /// every infra node, or one node's. Lines are prefixed with the pod
     /// and container they came from.
@@ -845,6 +1072,10 @@ enum InfraAction {
         force: bool,
         #[command(flatten)]
         running: RunningChoiceOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
     /// Per-instance terminate. Same scope as `node-stop` but deletes
     /// resources instead of scaling to 0, and the same running-policy
@@ -854,6 +1085,10 @@ enum InfraAction {
         node: String,
         #[command(flatten)]
         running: RunningChoiceOpts,
+        /// That member's copies of the nodes marked `@per_member` (the
+        /// shared infra when absent).
+        #[arg(long, value_name = "id")]
+        member: Option<weft_core::member::MemberId>,
     },
 }
 
@@ -960,58 +1195,81 @@ enum DaemonAction {
     },
 }
 
+/// What an `infra` verb asks for: a lifecycle request to the
+/// dispatcher, or one of the verbs on a node's card (env, which writes
+/// a file from it, and show and press).
+enum InfraRequest {
+    Lifecycle(commands::infra::InfraAction, commands::infra::InfraOpts),
+    Env(commands::infra_env::EnvArgs),
+    Show(commands::infra_card::ShowArgs),
+    Press(commands::infra_card::PressArgs),
+}
+
 impl InfraAction {
-    fn split(self) -> (commands::infra::InfraAction, commands::infra::InfraOpts) {
-        let opts_from = |t: TriggerDeactivationOpts| commands::infra::InfraOpts {
-            mode: t.mode,
-            grace: t.grace,
-            running_policy: t.running.running_policy,
-            drain_timeout: t.running.drain_timeout,
+    async fn run(self, ctx: commands::Ctx) -> anyhow::Result<()> {
+        match self.into_request() {
+            InfraRequest::Lifecycle(verb, opts) => commands::infra::run(ctx, verb, opts).await,
+            InfraRequest::Env(args) => commands::infra_env::run(ctx, args).await,
+            InfraRequest::Show(args) => commands::infra_card::run_show(ctx, args).await,
+            InfraRequest::Press(args) => commands::infra_card::run_press(ctx, args).await,
+        }
+    }
+
+    fn into_request(self) -> InfraRequest {
+        let opts_from = |t: TriggerDeactivationOpts, member| commands::infra::InfraOpts { trigger: t.into(), member };
+        let running_only = |running: RunningChoiceOpts, member| commands::infra::InfraOpts {
+            trigger: commands::deactivate::TriggerChoiceFlags {
+                running_policy: running.running_policy,
+                drain_timeout: running.drain_timeout,
+                ..Default::default()
+            },
+            member,
         };
-        match self {
-            InfraAction::Start { running } => (
+        let (verb, opts) = match self {
+            InfraAction::Start { running, member } => (
                 commands::infra::InfraAction::Start,
-                commands::infra::InfraOpts {
-                    running_policy: running.running_policy,
-                    drain_timeout: running.drain_timeout,
-                    ..Default::default()
-                },
+                running_only(running, member),
             ),
-            InfraAction::Stop { opts } => {
-                (commands::infra::InfraAction::Stop, opts_from(opts))
+            InfraAction::Stop { opts, member } => {
+                (commands::infra::InfraAction::Stop, opts_from(opts, member))
             }
-            InfraAction::Terminate { opts } => {
-                (commands::infra::InfraAction::Terminate, opts_from(opts))
+            InfraAction::Terminate { opts, member } => {
+                (commands::infra::InfraAction::Terminate, opts_from(opts, member))
             }
-            InfraAction::Upgrade { opts } => {
-                (commands::infra::InfraAction::Upgrade, opts_from(opts))
+            InfraAction::Upgrade { opts, member } => {
+                (commands::infra::InfraAction::Upgrade, opts_from(opts, member))
             }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
             InfraAction::ListDoors => {
                 (commands::infra::InfraAction::ListDoors, Default::default())
             }
-            InfraAction::Cancel => (commands::infra::InfraAction::Cancel, Default::default()),
-            InfraAction::NodeStop { node, force, running } => (
-                commands::infra::InfraAction::NodeStop { node, force },
-                commands::infra::InfraOpts {
-                    running_policy: running.running_policy,
-                    drain_timeout: running.drain_timeout,
-                    ..Default::default()
-                },
+            InfraAction::Cancel { member } => (
+                commands::infra::InfraAction::Cancel,
+                commands::infra::InfraOpts { member, ..Default::default() },
             ),
-            InfraAction::NodeTerminate { node, running } => (
+            InfraAction::NodeStop { node, force, running, member } => (
+                commands::infra::InfraAction::NodeStop { node, force },
+                running_only(running, member),
+            ),
+            InfraAction::NodeTerminate { node, running, member } => (
                 commands::infra::InfraAction::NodeTerminate { node },
-                commands::infra::InfraOpts {
-                    running_policy: running.running_policy,
-                    drain_timeout: running.drain_timeout,
-                    ..Default::default()
-                },
+                running_only(running, member),
             ),
             InfraAction::Logs { node, tail, follow } => (
                 commands::infra::InfraAction::Logs { node, tail, follow },
                 Default::default(),
             ),
-        }
+            InfraAction::Env { node, into, set, secret_as, member } => {
+                return InfraRequest::Env(commands::infra_env::EnvArgs { node, into, set, secret_as, member });
+            }
+            InfraAction::Show { node, member } => {
+                return InfraRequest::Show(commands::infra_card::ShowArgs { node, member });
+            }
+            InfraAction::Press { node, action, member } => {
+                return InfraRequest::Press(commands::infra_card::PressArgs { node, action, member });
+            }
+        };
+        InfraRequest::Lifecycle(verb, opts)
     }
 }
 
@@ -1071,6 +1329,16 @@ fn parse_run_status(text: &str) -> Result<String, String> {
 /// than a timestamp, because the question is always "the run I made a
 /// moment ago" and nobody wants to work out what time that was.
 fn parse_duration_ago(text: &str) -> Result<u64, String> {
+    let ago = parse_duration_secs(text)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("the machine clock is before 1970: {e}"))?
+        .as_secs();
+    Ok(now.saturating_sub(ago))
+}
+
+/// A duration (`30s`, `10m`, `2h`, `3d`) in seconds.
+fn parse_duration_secs(text: &str) -> Result<u64, String> {
     let text = text.trim();
     let (count, unit_secs) = match text.chars().last() {
         Some('s') => (&text[..text.len() - 1], 1u64),
@@ -1079,7 +1347,7 @@ fn parse_duration_ago(text: &str) -> Result<u64, String> {
         Some('d') => (&text[..text.len() - 1], 86_400),
         _ => {
             return Err(format!(
-                "'{text}' has no unit; say how long ago in seconds, minutes, hours or days \
+                "'{text}' has no unit; give it in seconds, minutes, hours or days \
                  (`30s`, `10m`, `2h`, `3d`)"
             ))
         }
@@ -1087,12 +1355,7 @@ fn parse_duration_ago(text: &str) -> Result<u64, String> {
     let count: u64 = count
         .parse()
         .map_err(|_| format!("'{text}' is not a whole number of units (`10m`, `2h`, `3d`)"))?;
-    let ago = count.saturating_mul(unit_secs);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("the machine clock is before 1970: {e}"))?
-        .as_secs();
-    Ok(now.saturating_sub(ago))
+    Ok(count.saturating_mul(unit_secs))
 }
 
 /// `--phase` as the phase itself, so the set of names has ONE
@@ -1174,6 +1437,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             commands::build::run_build_images(push, push_suffix, print).await
         }
         Cmd::Connect { opts } => commands::connect::run(ctx, opts).await,
+        Cmd::Options { step, field, search } => {
+            commands::options::run(ctx, &step, &field, search.as_deref()).await
+        }
         Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,
@@ -1190,7 +1456,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, save, clear } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, member, save, clear } => {
             commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -1201,7 +1467,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     seed_until,
                     seed_before,
                     root,
-                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, clear },
+                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, member, clear },
                     save,
                 },
             )
@@ -1217,51 +1483,42 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Wake { color, node } => commands::wake::run(ctx, color, node).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
-        Cmd::Bake { project, referenced, running } => {
-            commands::bake::run(ctx, project, node_set(referenced), running.running_policy, running.drain_timeout)
-                .await
+        Cmd::Bake { project, referenced, running, scope } => {
+            commands::bake::run(
+                ctx,
+                project,
+                node_set(referenced),
+                running.running_policy,
+                running.drain_timeout,
+                scope.into(),
+            )
+            .await
         }
-        Cmd::Activate { project, reactivate_choice, running } => {
+        Cmd::Activate { project, reactivate_choice, running, scope } => {
             commands::activate::run(
                 ctx,
                 project,
                 reactivate_choice,
                 running.running_policy,
                 running.drain_timeout,
+                scope.into(),
             )
             .await
         }
-        Cmd::Deactivate { project, opts } => {
-            commands::deactivate::run(
-                ctx,
-                project,
-                opts.mode,
-                opts.grace,
-                opts.running.running_policy,
-                opts.running.drain_timeout,
-            )
-            .await
+        Cmd::Deactivate { project, opts, scope, all_members } => {
+            commands::deactivate::run(ctx, project, opts.into(), scope.into(), all_members).await
         }
-        Cmd::CancelActivate { project } => {
-            commands::cancel_activate::run(ctx, project).await
+        Cmd::CancelActivate { project, scope } => {
+            commands::cancel_activate::run(ctx, project, scope.into()).await
         }
         Cmd::CancelBuild { project } => {
             commands::cancel_build::run(ctx, project).await
         }
-        Cmd::CancelRunning { project } => {
-            commands::cancel_running::run(ctx, project).await
+        Cmd::CancelRunning { project, scope } => {
+            commands::cancel_running::run(ctx, project, scope.into()).await
         }
-        Cmd::Resync { opts } => {
-            commands::resync::run(
-                ctx,
-                commands::infra::InfraOpts {
-                    mode: opts.mode,
-                    grace: opts.grace,
-                    running_policy: opts.running.running_policy,
-                    drain_timeout: opts.running.drain_timeout,
-                },
-            )
-            .await
+        Cmd::Resync { opts, scope } => {
+            commands::resync::run(ctx, scope.into(), opts.into()).await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, journal, local, all, force, yes } => {
@@ -1274,10 +1531,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Logs { target, limit } => commands::logs::run(ctx, target, limit).await,
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
-        Cmd::Infra { action } => {
-            let (verb, opts) = action.split();
-            commands::infra::run(ctx, verb, opts).await
-        }
+        Cmd::Infra { action } => action.run(ctx).await,
         Cmd::DescribeNodes { list, stdlib, node, compact } => {
             commands::describe_nodes::run(ctx, stdlib, node, compact, list).await
         }
@@ -1287,15 +1541,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Catalog { action } => match action {
             CatalogAction::Update => commands::catalog::update(ctx).await,
         },
+        Cmd::ConnectLib { into } => commands::connect_lib::install(ctx, into).await,
+        Cmd::MemberValues { member, set, clear } => commands::member_values::run(ctx, member, set, clear).await,
         Cmd::Tangle { action } => match action {
             TangleAction::Update { assistants } => commands::tangle::update(ctx, assistants).await,
         },
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit, project, phase, node, since, offset, status } => {
+        Cmd::Executions { limit, project, phase, node, since, offset, status, member, tag } => {
             commands::executions::list(
                 ctx,
                 commands::executions::ListFilter {
-                    limit, offset, project, phase, node, since, status,
+                    limit, offset, project, phase, node, since, status, member, tag,
                 },
             )
             .await
@@ -1320,9 +1576,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
-        Cmd::Clean { color, keep_days, all, images, build_cache, project, yes } => {
+        Cmd::Clean {
+            color, keep_days, all, images, build_cache, project, member, status, node, tag, cancel_running, yes,
+        } => {
+            let narrow = commands::executions::CleanNarrowing { member, status, node, tag, cancel_running };
             commands::executions::clean(
-                ctx, color, keep_days, all, images, build_cache, project, yes,
+                ctx, color, keep_days, all, images, build_cache, project, narrow, yes,
             )
             .await
         }

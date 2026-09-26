@@ -3921,3 +3921,60 @@ fn the_gate_toggles_between_its_two_spellings() {
     assert!(!flipped.contains("_should_flow: false"), "{flipped}");
     parse_ok(&flipped);
 }
+
+fn per_member_of(source: &str, id: &str) -> Option<weft_core::member::PerMember> {
+    let (project, errors) = crate::weft_compiler::compile_lenient(
+        source, uuid::Uuid::nil(), crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Full, None,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    project.nodes.into_iter().find(|n| n.id == id).and_then(|n| n.per_member)
+}
+
+fn set_per_member(node: &str, per_member: bool) -> EditOp {
+    EditOp::SetPerMember { node: node.into(), per_member }
+}
+
+/// The toggle round-trips every body shape: none, one line, many lines.
+/// The lowering reads the written line back as the mark.
+#[test]
+fn set_per_member_adds_and_removes_the_line() {
+    for src in [
+        "bridge = Bridge\n",
+        "bridge = Bridge {}\n",
+        "bridge = Bridge { a: 1 }\n",
+        "bridge = Bridge {\n  a: 1\n}\n",
+    ] {
+        let on = apply(src, vec![set_per_member("bridge", true)]);
+        parse_ok(&on);
+        assert!(on.contains("\n  @per_member\n"), "{src:?} -> {on:?}");
+        assert_eq!(per_member_of(&on, "bridge"), Some(weft_core::member::PerMember::Marked), "{on}");
+        let again = apply(&on, vec![set_per_member("bridge", true)]);
+        assert_eq!(again, on, "adding twice writes one line");
+        let off = apply(&on, vec![set_per_member("bridge", false)]);
+        parse_ok(&off);
+        assert!(!off.contains("@per_member"), "{off}");
+        assert_eq!(per_member_of(&off, "bridge"), None, "{off}");
+    }
+}
+
+/// A node nested in a group gets the line at the node's own indent.
+#[test]
+fn set_per_member_inside_a_group() {
+    let src = "g = Group() -> () {\n  bridge = Bridge {\n    a: 1\n  }\n}\n";
+    let on = apply(src, vec![set_per_member("g.bridge", true)]);
+    parse_ok(&on);
+    assert!(on.contains("    a: 1\n    @per_member\n  }"), "{on}");
+    let off = apply(&on, vec![set_per_member("g.bridge", false)]);
+    assert_eq!(off, src);
+}
+
+/// Only a node carries it: a group, and a node written inside another
+/// node's value, are refused with the reason.
+#[test]
+fn set_per_member_refuses_what_cannot_carry_it() {
+    let err = apply_err("g = Group() -> () {}\n", vec![set_per_member("g", true)]);
+    assert!(err.contains("setPerMember"), "{err}");
+    let err = apply_err("d = Debug {\n  data: Text { value: \"x\" }.value\n}\n", vec![set_per_member("d__data", true)]);
+    assert!(err.contains("its own line"), "{err}");
+}

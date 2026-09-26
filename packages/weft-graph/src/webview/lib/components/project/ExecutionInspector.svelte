@@ -252,7 +252,7 @@
 		inheritedFrom?: string;
 		inheritedCostUsd?: number;
 		inheritedCostUnknown?: boolean;
-		credentialOwner?: 'their-own' | 'ours' | 'mixed';
+		credentialOwner?: import('../../../../protocol').CredentialOwnerKind | 'mixed';
 	}): string {
 		let amount: string;
 		if (firing.costUnknown) {
@@ -263,13 +263,15 @@
 			return '';
 		}
 		const origin =
-			firing.credentialOwner === 'their-own'
+			firing.credentialOwner === 'author'
 				? ' (own key)'
-				: firing.credentialOwner === 'ours'
-					? ' (platform key)'
-					: firing.credentialOwner === 'mixed'
-						? ' (mixed keys)'
-						: '';
+				: firing.credentialOwner === 'member'
+					? " (member's key)"
+					: firing.credentialOwner === 'platform'
+						? ' (platform key)'
+						: firing.credentialOwner === 'mixed'
+							? ' (mixed keys)'
+							: '';
 		if (firing.inheritedFrom) return amount + origin + ' (reused, no new charge)';
 		const reused = firing.inheritedCostUsd ?? 0;
 		if (reused > 0 || firing.inheritedCostUnknown) {

@@ -24,6 +24,24 @@ fn rig() -> SupervisorTestRig {
     rig
 }
 
+/// The hash an apply of `spec` for `instance_id` stamps: the compiled
+/// manifests under this rig's context.
+fn applied_hash(spec: &serde_json::Value, instance_id: &str) -> String {
+    let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
+    let tags = std::collections::BTreeMap::new();
+    let install = weft_core::infra::Instance::default_install();
+    let ctx = weft_core::infra::CompileContext {
+        tenant_id: TENANT,
+        project_id: PROJECT,
+        node_id: NODE,
+        instance_id,
+        namespace: NAMESPACE,
+        local_image_tags: &tags,
+        install: &install,
+    };
+    weft_core::infra::hash_manifests(&weft_core::infra::compile(&parsed, &ctx).unwrap())
+}
+
 /// Workload with an explicit `weft.dev/unit` label.
 fn workload_with_unit(
     instance: &str,
@@ -72,6 +90,7 @@ fn cmd(id: i64, verb: Verb, node: Option<&str>) -> SupervisorCommandRow {
         spec_json: None,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+        copies: weft_core::member::Copies::Shared,
     }
 }
 
@@ -104,8 +123,8 @@ async fn stop_flips_status_then_scales_then_emits_stopped() {
     assert_eq!(
         writes
             .iter()
-            .filter(|(_, n, _)| n == NODE)
-            .map(|(_, _, s)| *s)
+            .filter(|(_, n, _, _)| n == NODE)
+            .map(|(_, _, _, s)| *s)
             .collect::<Vec<_>>(),
         vec![Status::Stopping, Status::Stopped]
     );
@@ -124,7 +143,7 @@ async fn stop_flips_status_then_scales_then_emits_stopped() {
 
     // A `stopped` event was emitted.
     let events = rig.broker.events();
-    assert!(events.iter().any(|(_, n, k, _)| {
+    assert!(events.iter().any(|(_, n, _, k, _)| {
         n.as_deref() == Some(NODE) && k == "stopped"
     }));
 
@@ -170,6 +189,8 @@ async fn stop_skips_noop_units_and_scales_only_scale_to_zero() {
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
             image_refs: Default::default(),
+            watched: true,
+            scaled_to: None,
         },
     );
     units.insert(
@@ -180,6 +201,8 @@ async fn stop_skips_noop_units_and_scales_only_scale_to_zero() {
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
             image_refs: Default::default(),
+            watched: true,
+            scaled_to: None,
         },
     );
     rig.broker.add_infra_node_with(
@@ -238,6 +261,8 @@ async fn force_stop_takes_down_noop_units_too() {
                 flaky_after_seconds: 30,
                 recovery_after_seconds: 30,
                 image_refs: Default::default(),
+                watched: true,
+                scaled_to: None,
             },
         );
     }
@@ -297,7 +322,7 @@ async fn terminate_flips_status_deletes_then_removes_row() {
 
     // Status flipped to terminating before delete.
     let writes = rig.broker.status_writes();
-    assert!(writes.iter().any(|(_, n, s)| n == NODE && *s == Status::Terminating));
+    assert!(writes.iter().any(|(_, n, _, s)| n == NODE && *s == Status::Terminating));
 
     // Delete-by-label call issued for this instance.
     let deletes = rig.kube.delete_calls();
@@ -310,7 +335,7 @@ async fn terminate_flips_status_deletes_then_removes_row() {
 
     // A `terminated` event was emitted.
     let events = rig.broker.events();
-    assert!(events.iter().any(|(_, _, k, _)| k == "terminated"));
+    assert!(events.iter().any(|(_, _, _, k, _)| k == "terminated"));
 }
 
 // ---------- no matching rows (soft no-op) ----------
@@ -367,7 +392,7 @@ async fn running_policy_wait_drains_then_proceeds() {
 
     // Pretend there are 0 running executions from the start (the
     // simplest path). Drain returns immediately.
-    rig.broker.set_running_count(PROJECT, 0);
+    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 0);
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
@@ -385,7 +410,7 @@ async fn running_policy_wait_times_out_after_deadline() {
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     rig.kube
         .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
-    rig.broker.set_running_count(PROJECT, 5);
+    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 5);
 
     let mut command = cmd(6, Verb::Stop, Some(NODE));
     command.running_policy = Some(Policy::Wait);
@@ -396,7 +421,7 @@ async fn running_policy_wait_times_out_after_deadline() {
     // Stop should still complete (timeout proceeds).
     assert_eq!(rig.broker.completed_commands(), vec![(6, None, false)]);
     let writes = rig.broker.status_writes();
-    assert!(writes.iter().any(|(_, _, s)| *s == Status::Stopped));
+    assert!(writes.iter().any(|(_, _, _, s)| *s == Status::Stopped));
 }
 
 // ---------- apply verb ----------
@@ -425,6 +450,7 @@ fn apply_cmd(id: i64) -> SupervisorCommandRow {
         spec_json: Some(spec),
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+        copies: weft_core::member::Copies::Shared,
     }
 }
 
@@ -487,7 +513,7 @@ async fn apply_failure_flips_to_failed_and_bubbles() {
     // The row was flipped to Failed (set_status with FailureStage).
     let writes = rig.broker.status_writes();
     assert!(
-        writes.iter().any(|(_, n, s)| n == NODE && *s == Status::Failed),
+        writes.iter().any(|(_, n, _, s)| n == NODE && *s == Status::Failed),
         "expected a Failed status write; got {writes:?}"
     );
     // Command completed WITH an error (apply bubbled).
@@ -512,8 +538,7 @@ async fn apply_skip_path_no_provisioning() {
             }]
         }]
     });
-    let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
-    let hash = weft_core::infra::hash_spec(&parsed, &std::collections::BTreeMap::new()).unwrap();
+    let hash = applied_hash(&spec, "inst1");
     rig.broker.add_infra_node_with(
         PROJECT,
         NODE,
@@ -531,6 +556,8 @@ async fn apply_skip_path_no_provisioning() {
                     flaky_after_seconds: 30,
                     recovery_after_seconds: 30,
                     image_refs: Default::default(),
+                    watched: true,
+                    scaled_to: None,
                 },
             );
             m
@@ -577,8 +604,6 @@ async fn apply_does_not_skip_a_row_missing_its_public_paths() {
             "expose": { "kind": "tenant_public", "path": "/hooks" }
         }]
     });
-    let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
-    let hash = weft_core::infra::hash_spec(&parsed, &std::collections::BTreeMap::new()).unwrap();
     let applied = |rig: &SupervisorTestRig| -> Vec<(String, weft_broker_client::protocol::AppliedEndpoints)> {
         rig.broker
             .calls()
@@ -608,7 +633,7 @@ async fn apply_does_not_skip_a_row_missing_its_public_paths() {
         NODE,
         &instance_id,
         Status::Running,
-        Some(hash),
+        Some(applied_hash(&spec, &instance_id)),
         stamped.urls.clone(),
         {
             let mut m = std::collections::BTreeMap::new();
@@ -620,6 +645,8 @@ async fn apply_does_not_skip_a_row_missing_its_public_paths() {
                     flaky_after_seconds: 30,
                     recovery_after_seconds: 30,
                     image_refs: Default::default(),
+                    watched: true,
+                    scaled_to: None,
                 },
             );
             m
@@ -657,6 +684,8 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
         image_refs: Default::default(),
+        watched: true,
+        scaled_to: None,
     });
     prior_units.insert("license".to_string(), UnitRuntime {
         status: Status::Running,
@@ -664,6 +693,8 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
         image_refs: Default::default(),
+        watched: true,
+        scaled_to: None,
     });
     rig.broker.add_infra_node_with(
         PROJECT, NODE, "inst1", Status::Running, Some("oldhash".into()),
@@ -734,12 +765,14 @@ async fn fresh_apply_over_terminating_row_deletes_the_prior_instance_first() {
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
         image_refs: ["weft-infra-bridge:old".to_string()].into_iter().collect(),
+        watched: true,
+        scaled_to: None,
     });
     rig.broker.add_infra_node_with(
         PROJECT, NODE, "inst-old", Status::Terminating, Some("oldhash".into()),
         std::collections::BTreeMap::new(), prior_units,
     );
-    rig.broker.set_preserve_pvcs(PROJECT, NODE, vec!["data".to_string()]);
+    rig.broker.set_preserve_pvcs(PROJECT, NODE, None, vec!["data".to_string()]);
     rig.kube.set_workloads(
         NAMESPACE,
         vec![workload_with_unit("inst-old", "inst-old-bridge", "bridge", 1, 1)],
@@ -830,7 +863,7 @@ async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
     );
     // No `terminated` event was emitted (we aborted before it).
     assert!(
-        !rig.broker.events().iter().any(|(_, _, k, _)| k == "terminated"),
+        !rig.broker.events().iter().any(|(_, _, _, k, _)| k == "terminated"),
         "no terminated event when ownership moved mid-terminate"
     );
 }
@@ -889,7 +922,7 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
     );
     let writes = rig.broker.status_writes();
     assert!(
-        writes.iter().any(|(_, _, s)| *s == Status::Stopped),
+        writes.iter().any(|(_, _, _, s)| *s == Status::Stopped),
         "the new owner actually performed the stop"
     );
 }
@@ -918,6 +951,7 @@ fn stop_of(id: i64, project: uuid::Uuid, policy: Policy) -> SupervisorCommandRow
         spec_json: None,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+        copies: weft_core::member::Copies::Shared,
     }
 }
 
@@ -940,7 +974,7 @@ fn running_count_calls(rig: &SupervisorTestRig, project: uuid::Uuid) -> usize {
     rig.broker
         .calls()
         .iter()
-        .filter(|c| matches!(c, BrokerCall::RunningCount { project_id } if *project_id == project))
+        .filter(|c| matches!(c, BrokerCall::RunningCount { project_id, .. } if *project_id == project))
         .count()
 }
 
@@ -1065,3 +1099,138 @@ weft_core::stress_test!(
         lifecycle.abort();
     }
 );
+
+// ---------- per-member copies ----------
+
+fn ada() -> weft_core::member::MemberId {
+    weft_core::member::MemberId::new("ada").unwrap()
+}
+
+#[tokio::test]
+async fn terminating_one_members_copy_leaves_the_shared_copy_and_the_others() {
+    let rig = rig();
+    let bob = weft_core::member::MemberId::new("bob").unwrap();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
+    let mut terminate = cmd(2, Verb::Terminate, Some(NODE));
+    terminate.copies = weft_core::member::Copies::Member(ada());
+    rig.broker.enqueue_command(terminate);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    let deletes: Vec<String> = rig.kube.delete_calls().into_iter().map(|(_, sel, _)| sel).collect();
+    assert_eq!(deletes, vec!["weft.dev/instance=inst-ada".to_string()]);
+    assert!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).is_none());
+    assert!(rig.broker.infra_copy(PROJECT, NODE, Some(&bob)).is_some());
+    assert!(rig.broker.infra_node(PROJECT, NODE).is_some());
+}
+
+#[tokio::test]
+async fn a_project_wide_terminate_for_every_copy_takes_them_all() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    let mut terminate = cmd(2, Verb::Terminate, None);
+    terminate.copies = weft_core::member::Copies::Every;
+    rig.broker.enqueue_command(terminate);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).is_none());
+    assert!(rig.broker.infra_node(PROJECT, NODE).is_none());
+}
+
+#[tokio::test]
+async fn a_shared_stop_never_touches_a_members_copy() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![
+            workload_for("inst-shared", "inst-shared-bridge", 1, 1),
+            workload_for("inst-ada", "inst-ada-bridge", 1, 1),
+        ],
+    );
+    rig.broker.enqueue_command(cmd(3, Verb::Stop, Some(NODE)));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Stopped);
+    assert_eq!(
+        rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).unwrap().status,
+        Status::Running
+    );
+    let scaled: Vec<String> = rig.kube.scale_calls().into_iter().map(|(_, _, name, _)| name).collect();
+    assert!(!scaled.is_empty(), "the shared copy was scaled down");
+    assert!(scaled.iter().all(|name| name == "inst-shared-bridge"), "only the shared instance: {scaled:?}");
+}
+
+#[tokio::test]
+async fn a_members_apply_builds_their_own_copy_under_a_fresh_instance() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
+    let mut apply = apply_cmd(4);
+    apply.copies = weft_core::member::Copies::Member(ada());
+    rig.broker.enqueue_command(apply);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert_eq!(rig.broker.completed_commands(), vec![(4, None, false)]);
+    let copy = rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).expect("the member's copy");
+    assert_eq!(copy.member, Some(ada()));
+    assert_ne!(copy.instance_id, "inst-shared");
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().instance_id, "inst-shared");
+}
+
+#[tokio::test]
+async fn an_apply_for_every_copy_is_refused() {
+    let rig = rig();
+    let mut apply = apply_cmd(5);
+    apply.copies = weft_core::member::Copies::Every;
+    rig.broker.enqueue_command(apply);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    let failed = rig.broker.failed_commands();
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0].1.contains("every copy"), "{failed:?}");
+}
+
+#[tokio::test]
+async fn a_members_wait_drains_on_that_members_runs() {
+    use weft_infra_supervisor::broker_ops::BrokerCall;
+    let rig = rig();
+    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.kube.set_workloads(NAMESPACE, vec![workload_for("inst-ada", "inst-ada-bridge", 1, 1)]);
+    let mut stop = cmd(6, Verb::Stop, Some(NODE));
+    stop.running_policy = Some(Policy::Wait);
+    stop.copies = weft_core::member::Copies::Member(ada());
+    rig.broker.enqueue_command(stop);
+
+    // The shared copies' runs are busy; ada has none. Her wait drains
+    // on her own runs only, so the stop goes through at once.
+    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 3);
+    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Member(ada()), 0);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert!(rig.broker.calls().iter().any(|c| matches!(
+        c,
+        BrokerCall::RunningCount { copies: weft_core::member::Copies::Member(m), .. } if *m == ada()
+    )));
+    assert!(
+        !rig.broker.calls().iter().any(|c| matches!(
+            c,
+            BrokerCall::RunningCount { copies: weft_core::member::Copies::Shared | weft_core::member::Copies::Every, .. }
+        )),
+        "the shared runs are never waited on"
+    );
+    assert_eq!(rig.broker.completed_commands(), vec![(6, None, false)]);
+    assert_eq!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).unwrap().status, Status::Stopped);
+    assert!(
+        rig.broker.status_writes().iter().all(|(_, _, member, _)| member.as_ref() == Some(&ada())),
+        "every status write is ada's copy's"
+    );
+}

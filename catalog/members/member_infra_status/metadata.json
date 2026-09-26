@@ -1,0 +1,39 @@
+{
+  "type": "MemberInfraStatus",
+  "label": "Member infra status",
+  "description": "Read the state of one member's copy of an infra node: `none` when it was never started (or was terminated), else provisioning, running, flaky, stopping, stopped, terminating or failed. A start or stop on its way reads provisioning or stopping at once, the same answer `weft status` gives.",
+  "tags": [
+    "members",
+    "infra",
+    "status"
+  ],
+  "icon": "Activity",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The infra node marked `@per_member`, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+    },
+    {
+      "name": "member",
+      "type": "String",
+      "required": true,
+      "description": "The member, by the id your program uses for them (`user-42`)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "status",
+      "type": "String",
+      "description": "The copy's state, `none` when there is no copy."
+    },
+    {
+      "name": "running",
+      "type": "Boolean",
+      "description": "True when the copy answers now."
+    }
+  ],
+  "requires_infra": false
+}

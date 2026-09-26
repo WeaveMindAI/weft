@@ -33,6 +33,7 @@ export interface RawStatusPayload {
     status?: string;
     failureStage?: string;
     failureMessage?: string;
+    member_copies?: number;
   }>;
   drift?: {
     binary_drift?: boolean;
@@ -130,6 +131,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     status: n.status ?? 'unknown',
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
     ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
+    ...(n.member_copies !== undefined ? { memberCopies: n.member_copies } : {}),
   }));
   return {
     availableActions: (Array.isArray(raw.available_actions)

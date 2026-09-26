@@ -35,7 +35,7 @@ fn task(target: TaskTarget, dedup: &str) -> tasks::NewTask {
         project_id: (target == TaskTarget::Worker).then_some(PROJECT),
         dedup_key: Some(dedup.to_string()),
         color: None,
-        tenant_id: Some("tenant-1".to_string()),
+        tenant_id: "tenant-1".to_string(),
         target_pod_name: None,
         binary_hash: None,
         payload: json!({}),

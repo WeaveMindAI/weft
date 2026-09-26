@@ -110,7 +110,7 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
     );
 
     // Every turn was measured on the runtime's key.
-    settled.assert_measured("openrouter", "ours", 3).await?;
+    settled.assert_measured("openrouter", "platform", 3).await?;
 
     project.finish().await?;
     conn.finish().await

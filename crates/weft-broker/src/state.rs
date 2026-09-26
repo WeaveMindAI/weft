@@ -10,7 +10,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use weft_journal::{JournalClient, PostgresJournalClient};
 use weft_task_store::pg_signal::PgSignalWatch;
 use weft_task_store::{
-    InfraReader, PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
+    PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
     TaskStoreClient, WorkerPodClient,
 };
 
@@ -40,7 +40,7 @@ pub struct BrokerState {
     pub journal: Arc<dyn JournalClient>,
     pub tasks: Arc<dyn TaskStoreClient>,
     pub worker_pods: Arc<dyn WorkerPodClient>,
-    pub infra: Arc<dyn InfraReader>,
+    pub infra: Arc<PostgresInfraReader>,
     pub auth: AuthConfig,
     pub identity_cache: IdentityCache,
     pub scope_cache: ScopeCache,
@@ -145,7 +145,7 @@ impl BrokerState {
         // The front door a `TenantPublic` endpoint hangs off is the
         // dispatcher's stable base: both are served by the gateway's
         // `local` listener (deploy/k8s/gateway.yaml).
-        let infra: Arc<dyn InfraReader> =
+        let infra =
             Arc::new(PostgresInfraReader::new(pool.clone(), public_base_url.clone()));
 
         // Wire the runtime-file plane over the slot when one is configured. The

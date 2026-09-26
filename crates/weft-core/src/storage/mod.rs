@@ -259,8 +259,29 @@ pub enum StorageScope {
     /// default access-renewed TTL (content-hash ids). Workers READ this
     /// scope like project scope; the worker data path refuses writes to it.
     Asset,
+    /// `member/<project_id>/<member>/`: one member's files in this
+    /// project, living until deleted. `of` names the member; absent, the
+    /// run's own member (an error in a run for nobody). Any run of the
+    /// project may name any member (the program is the author's code);
+    /// another project never reaches them, even for the same member id.
+    Member {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<crate::member::MemberId>,
+    },
 }
 
+
+impl StorageScope {
+    /// The run's own member's files (`StorageScope::Member { of: None }`).
+    pub fn member() -> Self {
+        StorageScope::Member { of: None }
+    }
+
+    /// One member's files in this project, named by id.
+    pub fn member_of(member: crate::member::MemberId) -> Self {
+        StorageScope::Member { of: Some(member) }
+    }
+}
 
 /// Lifetime of a KEPT execution-scoped file. Every access bumps the
 /// expiry back to now + TTL, so actively-used survivors never

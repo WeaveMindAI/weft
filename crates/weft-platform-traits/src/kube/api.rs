@@ -234,6 +234,7 @@ impl KubeReader for KubeApiClient {
         Ok(out)
     }
 
+    // SYNC: watched kinds <-> crates/weft-core/src/infra/types.rs Unit::health_watched
     async fn watch_replica_state(&self, namespace: &str, selector: &str) -> Result<ReplicaWatch> {
         let config = watcher::Config::default().labels(selector);
         let (deployments, deployments_writer) = reflector::store::<Deployment>();

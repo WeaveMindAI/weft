@@ -47,6 +47,7 @@ fn worker(tenant: &str, project: &str, color: Option<&str>) -> CallerAuth {
         tenant: tenant.into(),
         project_id: project.into(),
         color: color.map(String::from),
+        member: None,
     }
 }
 

@@ -116,6 +116,7 @@ mod tests {
                 journal_mode: Default::default(),
                 journal_window_secs: None,
                 window: None,
+                recorded: true,
             },
         })
     }

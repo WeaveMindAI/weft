@@ -4,11 +4,12 @@
 //! differ in the EDIT CONTRACT. `@file` is bidirectional: the referenced
 //! file's text content is the value, and editing the field writes back to
 //! the file; it requires a type that `supports_bidirectional_edit`. `@asset`
-//! is pull-only: nothing ever writes back. A file-typed `@asset` (Image,
-//! Audio, ...) defers to the build's asset resolution; a text-typed one
-//! from a project file is read + cast at parse exactly like `@file`, just
-//! rendered read-only, and one from a URL or a stored-file key is fetched
-//! at build. `@file`'s type defaults to `String`; `@asset` always names its
+//! is pull-only: nothing ever writes back, and every `@asset` defers to the
+//! build (the parse's reader is walled to the project, and an asset may sit
+//! anywhere on the machine, at a URL, or under a stored-file key). A
+//! file-typed one (Image, Audio, ...) goes through the asset sync; a
+//! text-typed one is read or fetched by the build driver and inlined.
+//! `@file`'s type defaults to `String`; `@asset` always names its
 //! type (a value carries exactly one concrete marker, and the compiler
 //! never guesses a kind from a name or from bytes), so it is `Image`,
 //! `Video`, `Audio`, `Blob`, or a text type. Types are drawn from the
@@ -34,9 +35,10 @@ use crate::weft_compiler::CompileError;
 /// marker (so the caller leaves ordinary values untouched), `Some(Err(..))`
 /// if it looks like one but is malformed.
 ///
-/// The path must be a double-quoted string. The optional second argument is
-/// a type expression parsed with the same `WeftType::parse` that port
-/// declarations use; when omitted the type is `String`.
+/// The path must be a double-quoted string. The second argument is a type
+/// expression parsed with the same `WeftType::parse` that port declarations
+/// use: optional on `@file` (it defaults to `String`), required on `@asset`
+/// (a missing one is an error naming the choices).
 pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
     let trimmed = raw.trim();
     // Exactly the `@file` / `@asset` directive (not `@filesystem`); the marker
@@ -170,16 +172,13 @@ fn marker_text(file_ref: &FileRef) -> String {
     format!("{}({}, {})", file_ref.marker.directive(), serde_json::to_string(&file_ref.path).expect("a path serializes"), file_ref.ty.wire_string())
 }
 
-/// Does this ref DEFER to the build: an `@asset` whose type is a stored
-/// file (its bytes never ride the compile), or whose source is a URL or a
-/// stored-file key (there is nothing on disk to read at parse, whatever
-/// the type). Every other ref (both markers, text-typed, from a project
-/// file) reads + casts inline at parse.
+/// Does this ref DEFER to the build: every `@asset`, whatever its type or
+/// source. Only `@file` reads + casts inline at parse.
 pub fn is_deferred_ref(file_ref: &FileRef) -> bool {
-    // Every `@asset`, whatever its type or source: an asset may sit
-    // anywhere on the machine, and the parse's reader is walled to the
-    // project. The build driver reads it (a file kind through the asset
-    // sync, a text kind straight from disk) and substitutes the value.
+    // An asset may sit anywhere on the machine, and the parse's reader is
+    // walled to the project. The build driver reads it (a file kind
+    // through the asset sync, a text kind straight from its source) and
+    // substitutes the value.
     file_ref.marker == FileMarker::Asset
 }
 
@@ -244,31 +243,77 @@ fn each_value_mut(value: &mut serde_json::Value, visit: &mut impl FnMut(&mut ser
     }
 }
 
-/// The one walk behind both public collectors: every `@asset` ref in
-/// every node's config and port literals, deduplicated by path (first
-/// declared type wins), filtered by `keep`.
-fn collect_refs(
-    project: &weft_core::project::ProjectDefinition,
-    keep: impl Fn(&FileRef) -> bool,
-) -> Vec<FileRef> {
+/// Somewhere written values live that may hold `@file` / `@asset`
+/// markers: a compiled program's node config and port literals, or the
+/// values a run hands in (`weft run --emit/--from/--group/--fire`, and the
+/// examples saved from them). The collectors and the resolution step walk
+/// either the same way, so a value written in a run and one written in
+/// source resolve to the same thing.
+pub trait MarkedValues {
+    fn marked_values(&self) -> Vec<&serde_json::Value>;
+    fn marked_values_mut(&mut self) -> Vec<&mut serde_json::Value>;
+}
+
+impl MarkedValues for weft_core::project::ProjectDefinition {
+    fn marked_values(&self) -> Vec<&serde_json::Value> {
+        self.nodes
+            .iter()
+            .flat_map(|node| {
+                node.config.as_object().map(|o| o.values()).into_iter().flatten().chain(node.port_literals.values())
+            })
+            .collect()
+    }
+
+    fn marked_values_mut(&mut self) -> Vec<&mut serde_json::Value> {
+        self.nodes
+            .iter_mut()
+            .flat_map(|node| {
+                node.config
+                    .as_object_mut()
+                    .map(|o| o.values_mut())
+                    .into_iter()
+                    .flatten()
+                    .chain(node.port_literals.values_mut())
+            })
+            .collect()
+    }
+}
+
+/// A run's handed values: every `--from` and `--emit` port, the
+/// `--group` boundary inputs, and the `--fire` payload.
+impl MarkedValues for weft_core::run_spec::RunSpec {
+    fn marked_values(&self) -> Vec<&serde_json::Value> {
+        self.from
+            .values()
+            .chain(self.emit.values())
+            .chain(self.group.iter().map(|(_, ports)| ports))
+            .flat_map(|ports| ports.values())
+            .chain(self.fire.iter().map(|(_, payload)| payload))
+            .collect()
+    }
+
+    fn marked_values_mut(&mut self) -> Vec<&mut serde_json::Value> {
+        self.from
+            .values_mut()
+            .chain(self.emit.values_mut())
+            .chain(self.group.iter_mut().map(|(_, ports)| ports))
+            .flat_map(|ports| ports.values_mut())
+            .chain(self.fire.iter_mut().map(|(_, payload)| payload))
+            .collect()
+    }
+}
+
+/// The one walk behind the public collectors: every deferred `@asset`
+/// ref in `target`'s values, filtered by `keep`, deduplicated by
+/// `FileRef::resolution_key` (path AND declared type: one path declared
+/// with two types is two refs, each checked and resolved on its own).
+fn collect_refs(target: &impl MarkedValues, keep: impl Fn(&FileRef) -> bool) -> Vec<FileRef> {
     let mut seen = std::collections::BTreeSet::new();
     let mut refs = Vec::new();
-    for node in &project.nodes {
-        for value in node
-            .config
-            .as_object()
-            .map(|o| o.values())
-            .into_iter()
-            .flatten()
-            .chain(node.port_literals.values())
-        {
-            for file_ref in refs_in_value(value) {
-                if is_deferred_ref(&file_ref)
-                    && keep(&file_ref)
-                    && seen.insert(file_ref.resolution_key())
-                {
-                    refs.push(file_ref);
-                }
+    for value in target.marked_values() {
+        for file_ref in refs_in_value(value) {
+            if is_deferred_ref(&file_ref) && keep(&file_ref) && seen.insert(file_ref.resolution_key()) {
+                refs.push(file_ref);
             }
         }
     }
@@ -287,21 +332,17 @@ pub(crate) fn refs_in_value(value: &serde_json::Value) -> Vec<FileRef> {
 /// [`is_runtime_key_ref`]), deduplicated. The build driver resolves each
 /// through the storage listing into the same `path -> value` map the sync's
 /// file refs use, so [`apply_asset_resolutions`] treats both identically.
-pub fn collect_runtime_key_refs(
-    project: &weft_core::project::ProjectDefinition,
-) -> Vec<FileRef> {
-    collect_refs(project, |r| is_runtime_key_ref(r) && r.ty.references_file())
+pub fn collect_runtime_key_refs(target: &impl MarkedValues) -> Vec<FileRef> {
+    collect_refs(target, |r| is_runtime_key_ref(r) && r.ty.references_file())
 }
 
 /// Collect every TEXT-typed `@asset`: a URL, a stored-file key, or a disk
 /// path (in the project or anywhere on the machine). The parse reads none
 /// of them; the build driver fetches or reads the bytes, casts them to the
 /// declared type through [`resolve_text_bytes`], and puts the value into
-/// the same map. Deduplicated by path.
-pub fn collect_text_refs(
-    project: &weft_core::project::ProjectDefinition,
-) -> Vec<FileRef> {
-    collect_refs(project, |r| !r.ty.references_file())
+/// the same map. Deduplicated like every collector (see `collect_refs`).
+pub fn collect_text_refs(target: &impl MarkedValues) -> Vec<FileRef> {
+    collect_refs(target, |r| !r.ty.references_file())
 }
 
 /// Turn the bytes a build driver fetched for a text-typed remote `@asset`
@@ -512,59 +553,73 @@ pub(crate) fn resolve_project_file_refs(
         // or inside a list (`attachments: [@asset(...), @asset(...)]`), and
         // every one of them resolves. Only a field that is ONE marker is
         // recorded as file-backed: that record drives editing the file
-        // through the field, which is a thing you do to one file.
-        let single = value.as_str().is_some();
-        each_value_mut(value, &mut |leaf| {
-            let Some(raw) = leaf.as_str() else { return };
-            let Some(marker) = parse_marker(raw) else { return }; // ordinary value
-            let file_ref = match marker {
-                Ok(fr) => fr,
-                Err(msg) => {
-                    // A NESTED string that merely starts with the
-                    // directive word and never OPENS an argument list
-                    // ("@file the report please" inside a prompt array)
-                    // is user prose: the abutting paren is what states
-                    // intent. A string that DID open one is always an
-                    // attempted marker, however malformed (an unclosed
-                    // paren split across lines, trailing text), and
-                    // stays loud; so does a field that IS the string.
-                    if !single && !crate::cst::marker::has_abutting_args(raw.trim()) {
-                        return;
-                    }
-                    errors.push(CompileError::at(span, msg).in_file(source_file));
-                    return;
-                }
-            };
-            let file_ref = match spell_from_root(file_ref, home.as_deref()) {
-                Ok(fr) => fr,
-                Err(msg) => {
-                    errors.push(CompileError::at(span, msg).in_file(source_file));
-                    return;
-                }
-            };
-            match resolve(&file_ref, root_fs) {
-                Ok(Resolved::Value(resolved)) => {
-                    *leaf = resolved;
-                    if single {
-                        node.file_refs.insert(key.clone(), file_ref);
-                    }
-                }
-                // A deferred media ref: the marker stays in config (the
-                // editor renders it, the build resolves it), respelled
-                // under the root so the sync and the resolution map find
-                // the same file, and the ref is recorded so the field is
-                // known to be file-backed.
-                Ok(Resolved::Deferred) => {
-                    *leaf = serde_json::Value::String(marker_text(&file_ref));
-                    if single {
-                        node.file_refs.insert(key.clone(), file_ref);
-                    }
-                }
-                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
+        // through the field, which is a thing you do to one file. A
+        // `@member_filled(@file(...))` fallback is one marker too, so the
+        // editor can put it back inside the marker.
+        let single = value.as_str().is_some()
+            || weft_core::member::as_member_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string());
+        each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+            Ok(Some(file_ref)) if single => {
+                node.file_refs.insert(key.clone(), file_ref);
             }
+            Ok(_) => {}
+            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
         });
       }
     }
+}
+
+/// Resolve the marker one written value holds, in place, the way the
+/// parse does: a `@file` is read and cast to its type, a deferred
+/// `@asset` stays a marker respelled under the root (so the asset sync
+/// and the resolution map find the same file). Hands back the ref when
+/// the value was one, `None` for an ordinary value.
+///
+/// `whole` says the value is a whole field rather than one string inside
+/// a list or an object: there, a string that merely starts with the
+/// directive word and never OPENS an argument list ("@file the report
+/// please" inside a prompt array) is prose, the abutting paren being what
+/// states intent. A string that did open one is always an attempted
+/// marker, however malformed, and stays loud; so does a whole field.
+fn resolve_leaf(
+    leaf: &mut serde_json::Value,
+    fs: &CompileFs,
+    home: Option<&std::path::Path>,
+    whole: bool,
+) -> Result<Option<FileRef>, String> {
+    let Some(raw) = leaf.as_str() else { return Ok(None) };
+    let file_ref = match parse_marker(raw) {
+        None => return Ok(None),
+        Some(Ok(file_ref)) => file_ref,
+        Some(Err(_)) if !whole && !crate::cst::marker::has_abutting_args(raw.trim()) => return Ok(None),
+        Some(Err(msg)) => return Err(msg),
+    };
+    let file_ref = spell_from_root(file_ref, home)?;
+    *leaf = match resolve(&file_ref, fs)? {
+        Resolved::Value(resolved) => resolved,
+        Resolved::Deferred => serde_json::Value::String(marker_text(&file_ref)),
+    };
+    Ok(Some(file_ref))
+}
+
+/// Resolve every `@file` in values written outside a source file (a
+/// run's handed values), exactly as the parse resolves one written in a
+/// `.weft`: read from the project, cast to its declared type. Each
+/// `@asset` is left a marker, respelled under the root, for the build
+/// driver's asset step ([`collect_asset_refs`] and friends, then
+/// [`apply_asset_resolutions`]). Every failure is named at once.
+pub fn resolve_file_markers(target: &mut impl MarkedValues, fs: &CompileFs) -> Result<(), Vec<String>> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut errors = Vec::new();
+    for value in target.marked_values_mut() {
+        let whole = value.is_string();
+        each_value_mut(value, &mut |leaf| {
+            if let Err(msg) = resolve_leaf(leaf, fs, home.as_deref(), whole) {
+                errors.push(msg);
+            }
+        });
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 /// Resolve every deferred `@asset` ref in a compiled definition, in
@@ -582,7 +637,7 @@ pub(crate) fn resolve_project_file_refs(
 /// a step). Project-file text refs were already resolved at parse and never
 /// appear here.
 pub fn apply_asset_resolutions(
-    project: &mut weft_core::project::ProjectDefinition,
+    target: &mut impl MarkedValues,
     map: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<(), Vec<String>> {
     let mut missing = Vec::new();
@@ -621,15 +676,8 @@ pub fn apply_asset_resolutions(
             )),
         }
     }
-    for node in &mut project.nodes {
-        if let Some(config) = node.config.as_object_mut() {
-            for value in config.values_mut() {
-                each_value_mut(value, &mut |leaf| resolve_value(leaf, map, &mut missing));
-            }
-        }
-        for value in node.port_literals.values_mut() {
-            each_value_mut(value, &mut |leaf| resolve_value(leaf, map, &mut missing));
-        }
+    for value in target.marked_values_mut() {
+        each_value_mut(value, &mut |leaf| resolve_value(leaf, map, &mut missing));
     }
     if missing.is_empty() {
         Ok(())
@@ -638,17 +686,13 @@ pub fn apply_asset_resolutions(
     }
 }
 
-/// Collect every deferred `@asset` ref in a project definition whose source
-/// is a DISK PATH (URL and stored-key refs never sync; a text-typed one
-/// from disk resolved at parse). The pre-build asset sync's input: run over
-/// a DEFERRED parse (asset refs still hold their raw `@asset` strings).
-/// Deduplicated by path, first declared type wins (the type only picks the
-/// marker kind; the bytes are the identity, and the sync checks them
-/// against that kind).
-/// The file-kind `@asset`s on disk: what the asset sync hashes and
-/// uploads. A text kind is read and inlined instead (`collect_text_refs`).
-pub fn collect_asset_refs(project: &weft_core::project::ProjectDefinition) -> Vec<FileRef> {
-    collect_refs(project, |r| !is_url_ref(r) && !is_runtime_key_ref(r) && r.ty.references_file())
+/// The file-kind `@asset`s whose source is a DISK PATH: what the pre-build
+/// asset sync hashes and uploads (URL and stored-key refs never sync, and a
+/// text kind is read and inlined instead, see `collect_text_refs`). Run over
+/// a DEFERRED parse, where asset refs still hold their raw `@asset` strings.
+/// Deduplicated like every collector (see `collect_refs`).
+pub fn collect_asset_refs(target: &impl MarkedValues) -> Vec<FileRef> {
+    collect_refs(target, |r| !is_url_ref(r) && !is_runtime_key_ref(r) && r.ty.references_file())
 }
 
 #[cfg(test)]

@@ -315,6 +315,8 @@ pub enum RoutingSource {
 pub struct SignalIdentity {
     pub token: String,
     pub tenant_id: String,
+    /// Whose signal it is (`None` for a shared one).
+    pub for_member: Option<weft_core::member::MemberScope>,
     pub node_id: String,
     /// True iff this is a mid-execution resume (HumanQuery, etc).
     pub is_resume: bool,
@@ -342,6 +344,7 @@ pub async fn register_in_registry(
     let SignalIdentity {
         token,
         tenant_id,
+        for_member,
         node_id,
         is_resume,
         color,
@@ -382,6 +385,7 @@ pub async fn register_in_registry(
             sink.clone(),
             token.clone(),
             tenant_id.clone(),
+            for_member,
             placement_generation,
             spec.match_predicates.clone(),
         ),

@@ -28,10 +28,20 @@ use weft_core::Color;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriggerBake {
     pub project_id: uuid::Uuid,
+    /// Whose triggers these are: the setup run's member, `None` for the
+    /// shared ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<weft_core::member::MemberId>,
     pub source_version: String,
     pub program: weft_core::project::hash::ProgramIdentity,
     pub color: Color,
     pub captured: std::collections::BTreeMap<String, TriggerCapture>,
+    /// The triggers this setup set out to capture (spelled). A setup of
+    /// some triggers replaces what an earlier one captured for THOSE (one
+    /// it skipped behind a closed gate loses its old capture) and keeps
+    /// the rest. Stamped by whoever ran the setup, which is who knows.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub targets: std::collections::BTreeSet<String>,
     pub at_unix: u64,
 }
 
@@ -42,6 +52,22 @@ pub struct TriggerCapture {
 }
 
 impl TriggerBake {
+    /// This bake with `newer`'s captures laid over it: a setup of some
+    /// of the triggers refreshes those, and the others keep what an
+    /// earlier setup of the same code captured. The rest of the bake
+    /// (which setup, when, which source) is `newer`'s.
+    pub fn refreshed_by(self, newer: &TriggerBake) -> TriggerBake {
+        let mut captured: std::collections::BTreeMap<String, TriggerCapture> = self
+            .captured
+            .into_iter()
+            .filter(|(trigger, _)| !newer.targets.contains(trigger))
+            .collect();
+        captured.extend(newer.captured.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let mut targets = self.targets;
+        targets.extend(newer.targets.iter().cloned());
+        TriggerBake { captured, targets, ..newer.clone() }
+    }
+
     pub fn summary(&self) -> weft_core::run_spec::BakeSummary {
         weft_core::run_spec::BakeSummary { program: self.program.clone(), captured: self.captured.keys().cloned().collect(),
             color: self.color, at_unix: self.at_unix }
@@ -51,7 +77,7 @@ impl TriggerBake {
     /// leaves its trigger absent from this capture, including on a refresh.
     pub fn from_events(events: &[ExecEvent]) -> anyhow::Result<Option<Self>> {
         let Some(ExecEvent::ExecutionStarted { color, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
-            phase: weft_core::context::Phase::TriggerSetup, .. }) = events.first() else {
+            phase: weft_core::context::Phase::TriggerSetup, member, .. }) = events.first() else {
             anyhow::bail!("trigger setup has no original program or source identity");
         };
         anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash),
@@ -72,9 +98,9 @@ impl TriggerBake {
                 }).is_none(), "trigger '{node_id}' captured twice in setup {color}");
             }
         }
-        Ok(Some(Self { project_id: *project_id, program: program.clone(), color: *color,
+        Ok(Some(Self { project_id: *project_id, member: member.clone(), program: program.clone(), color: *color,
             source_version: source_version.clone(),
-            captured, at_unix: *at_unix }))
+            captured, targets: Default::default(), at_unix: *at_unix }))
     }
 }
 
@@ -103,7 +129,9 @@ pub trait Journal: Send + Sync {
     /// A failed/cancelled setup releases ownership without replacing any bake.
     async fn finish_trigger_setup(&self, color: Color, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<TriggerBake>>;
+    /// The bakes of one owner's triggers: the shared ones for `None`, a
+    /// member's for `Some`.
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, member: Option<&weft_core::member::MemberId>) -> anyhow::Result<Vec<TriggerBake>>;
 
     // ----- Event log (state source of truth) -------------------------
 
@@ -386,15 +414,17 @@ pub trait Journal: Send + Sync {
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
 
     /// The ENTRY registered at the place `node` spells in `project_id`
-    /// (`door`, or `one.door` inside the file the site `one` includes),
-    /// or `None` when nothing is armed there. One row at most: entries
-    /// are unique per (project, place) (`idx_signal_entry_node`). A
-    /// resume row of the same node is another registration entirely
-    /// and is never this.
+    /// (`door`, or `one.door` inside the file the site `one` includes)
+    /// for `member`'s copy (`None`: the shared one), or `None` when
+    /// nothing is armed there. One row at most: entries are unique per
+    /// (project, place, member) (`idx_signal_entry_node`). A resume row
+    /// of the same node is another registration entirely and is never
+    /// this.
     async fn signal_entry_at(
         &self,
         project_id: uuid::Uuid,
         node: &str,
+        member: Option<&weft_core::member::MemberId>,
     ) -> anyhow::Result<Option<SignalRegistration>>;
 
     /// Persist a kind's evolving durable state (a delta-poll cursor)
@@ -486,6 +516,14 @@ pub trait Journal: Send + Sync {
 /// Durable replacement for the in-RAM `SignalTracker` row.
 #[derive(Debug, Clone)]
 pub struct SignalRegistration {
+    /// Whose signal: the member whose copy of a per-member trigger this
+    /// is, or whose run waits on it. `None` for the program's shared ones.
+    pub member: Option<weft_core::member::MemberId>,
+    /// The trigger whose activation gates this signal (with `member`):
+    /// an entry signal's own trigger, or the trigger that fired the run a
+    /// wait belongs to. `None` for a wait of a run started by hand, which
+    /// no activation governs, so it is always live.
+    pub activation_trigger: Option<String>,
     pub source_version: Option<String>,
     /// Setup whose completed capture armed this entry; absent for suspensions.
     pub setup_color: Option<Color>,
@@ -676,6 +714,10 @@ pub struct CancelWrite {
 pub struct ExecutionOwner {
     pub project_id: uuid::Uuid,
     pub tenant: String,
+    /// Who the run is for (`execution_color.member_id`).
+    pub member: Option<weft_core::member::MemberId>,
+    /// The trigger that fired the run (`execution_color.fired_by`).
+    pub fired_by: Option<String>,
 }
 
 // SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
@@ -713,6 +755,10 @@ pub struct ExecutionSummary {
     /// flow). A completed run with skips is still completed; the count
     /// is what the panel says beside it.
     pub skipped_nodes: u64,
+    /// Who the run is for (`ExecutionStarted.member`); `None` for a run
+    /// for nobody in particular.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<weft_core::member::MemberId>,
 }
 
 /// The query for a page of a tenant's executions: pagination plus optional
@@ -742,6 +788,16 @@ pub struct ExecutionQuery {
     /// `cancelled`, or `running` for the ones that have not ended at
     /// all. "Which of mine broke" in one question.
     pub status: Option<String>,
+    /// Only runs for this member.
+    pub member: Option<weft_core::member::MemberId>,
+    /// Only runs carrying this tag (`ctx.tag_execution`).
+    pub tag: Option<String>,
+    /// Keyset cursor: only runs strictly after this `(started_at,
+    /// color)` in the listing's order (newest first, then color
+    /// descending). A walk that hands each page's last run back here
+    /// reaches every run exactly once, whatever it deletes or changes
+    /// behind itself. `total` ignores it.
+    pub below: Option<(u64, Color)>,
 }
 
 /// One page of executions plus the total number matching the same filters
@@ -807,9 +863,28 @@ pub struct SignalToken {
     /// ones. What `weft token mint --displays` sets.
     pub all_displays: bool,
     pub created_at: u64,
+    /// A member token: the member it acts as, in its one project. It
+    /// starts runs as that member, answers that member's waits, reads
+    /// that member's displays, and manages that member's connections;
+    /// nothing else.
+    pub member: Option<weft_core::member::MemberId>,
+    /// When it stops working (unix seconds); `None` never. A member
+    /// token always has one.
+    pub expires_at: Option<u64>,
 }
 
 impl SignalToken {
+    /// Whether the token has stopped working at `now` (unix seconds).
+    pub fn expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|at| now >= at)
+    }
+
+    /// The member and project a member token acts as.
+    pub fn member_scope(&self) -> Option<(uuid::Uuid, &weft_core::member::MemberId)> {
+        let member = self.member.as_ref()?;
+        Some((*self.allowed_projects.first()?, member))
+    }
+
     /// Does this token's project scope cover `project_id`?
     ///
     /// Empty means every project of the tenant, the same
@@ -1010,7 +1085,7 @@ mod bake_tests {
                 program: Some(weft_core::project::hash::ProgramIdentity {
                     definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
                 }),
-                source_version: Some("source".into()), node_test: false, subgraph: None, seed: None, at_unix: 1,
+                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 1,
             },
             ExecEvent::ExecutionCompleted { color, at_unix: 2 },
         ]

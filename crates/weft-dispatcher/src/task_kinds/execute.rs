@@ -43,7 +43,7 @@ pub async fn enqueue_resume(
     project_id: uuid::Uuid,
     color: weft_core::Color,
     definition_hash: &str,
-    tenant_id: Option<&str>,
+    tenant_id: &str,
 ) -> Result<()> {
     // Pin to the color's owner IFF it is still alive; a dead/absent owner
     // leaves the resume unpinned so a fresh pod takes over.
@@ -101,7 +101,7 @@ pub fn execution_task_spec(
     color: weft_core::Color,
     definition_hash: &str,
     binary_hash: &str,
-    tenant_id: Option<&str>,
+    tenant_id: &str,
     // The pod to pin the task to, or None to let any alive worker for
     // the project claim it. New executions pass None (a fresh color has
     // no owner; whichever worker claims first becomes owner, and the
@@ -109,6 +109,9 @@ pub fn execution_task_spec(
     // owner so a sibling worker can't steal a live color.
     target_pod_name: Option<String>,
     live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
+    // An unrecorded run's birth rows (`ExecutionPayload::unrecorded_birth`),
+    // `None` for every recorded run.
+    unrecorded_birth: Option<&[weft_journal::ExecEvent]>,
 ) -> Result<NewTask> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
@@ -116,6 +119,9 @@ pub fn execution_task_spec(
         color: color_str.clone(),
         definition_hash: definition_hash.to_string(),
         live_connection,
+        unrecorded_birth: unrecorded_birth
+            .map(|rows| rows.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>())
+            .transpose()?,
     };
     let dedup = format!("{color_str}:{}", kind.as_str());
     Ok(NewTask {
@@ -124,7 +130,7 @@ pub fn execution_task_spec(
         project_id: Some(project_id),
         dedup_key: Some(dedup),
         color: Some(color_str),
-        tenant_id: tenant_id.map(str::to_string),
+        tenant_id: tenant_id.to_string(),
         target_pod_name,
         binary_hash: Some(binary_hash.to_string()),
         payload: serde_json::to_value(&payload)?,
@@ -136,7 +142,7 @@ async fn enqueue_execution(
     project_id: uuid::Uuid,
     color: weft_core::Color,
     definition_hash: &str,
-    tenant_id: Option<&str>,
+    tenant_id: &str,
     target_pod_name: Option<String>,
 ) -> Result<()> {
     let payload: String = sqlx::query_scalar(
@@ -156,6 +162,7 @@ async fn enqueue_execution(
         &program.binary_hash,
         tenant_id,
         target_pod_name,
+        None,
         None,
     )?;
     enqueue_or_rearm(pool, task).await?;
@@ -187,7 +194,7 @@ pub async fn enqueue_cancel_in(
     conn: &mut sqlx::PgConnection,
     project_id: uuid::Uuid,
     color: weft_core::Color,
-    tenant_id: Option<&str>,
+    tenant_id: &str,
     cause: &weft_core::exec::CancelCause,
 ) -> Result<bool> {
     let Some(pod_name) = alive_color_owner(&mut *conn, color).await? else {
@@ -208,7 +215,7 @@ pub async fn enqueue_cancel_in(
             project_id: Some(project_id),
             dedup_key: Some(dedup),
             color: Some(color_str),
-            tenant_id: tenant_id.map(str::to_string),
+            tenant_id: tenant_id.to_string(),
             target_pod_name: Some(pod_name),
             // Pinned to the color's owner: must reach THAT pod whatever
             // image it runs (the claim filter bypasses on pinned tasks).

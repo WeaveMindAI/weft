@@ -78,6 +78,9 @@ pub struct DispatcherState {
     /// does not hold those.
     pub ensure_built: Option<Arc<dyn ProjectBuilder>>,
     pub projects: ProjectStore,
+    /// Which triggers listen, per trigger per owner
+    /// (`crate::activation_store`).
+    pub activations: crate::activation_store::ActivationStore,
     /// The version tree (`crate::versions`): every version a project has
     /// been, every run under one, and head.
     pub versions: crate::versions::VersionStore,

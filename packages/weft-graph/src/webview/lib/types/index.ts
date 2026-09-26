@@ -442,7 +442,7 @@ export interface NodeExecution {
 	costUnknown?: boolean;
 	/// Whose key this firing's cost records spent; 'mixed' when records
 	/// disagree (e.g. a group row aggregating both kinds of member).
-	credentialOwner?: 'their-own' | 'ours' | 'mixed';
+	credentialOwner?: import('../../../protocol').CredentialOwnerKind | 'mixed';
 	/// Identities of the cost records already folded into `costUsd` /
 	/// `costUnknown`. The dispatcher re-streams journal events on every
 	/// follow/reconnect (replay + live overlap), so the reducer dedups on
@@ -636,6 +636,10 @@ export interface NodeInstance {
 	/// added in the editor and not yet parsed carries none, and the
 	/// catalog answers for it (`nodeRequiresInfra`).
 	requiresInfra?: boolean;
+	/// Set when the node exists once per member of the program: `marked`
+	/// where the source says `@per_member`, `derived` for a node the
+	/// compiler found reached from one.
+	perMember?: import('../../../protocol').PerMember;
 	scope?: string[];
 	groupBoundary?: GroupBoundary | null;
 	// Source line where this node was declared in the weft code. Populated

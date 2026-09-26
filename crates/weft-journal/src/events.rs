@@ -72,13 +72,14 @@ pub enum ExecEvent {
         program: Option<weft_core::project::hash::ProgramIdentity>,
         /// Immutable source version used to start this execution.
         source_version: Option<String>,
-        /// True for a node self-test's execution identity: the color
-        /// is real (cost attribution, broker scoping, a terminal
-        /// event) but its lifecycle is owned by the test task, so
-        /// project-lifecycle sweeps (cancel, wipe, drain counting)
-        /// must not touch it.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        node_test: bool,
+        /// What the run is (`weft_core::exec::RunKind`): a project
+        /// run, a node self-test (real color, lifecycle owned by the
+        /// test task, so project sweeps never touch it), or an
+        /// unrecorded run (its rows live in the worker's memory and
+        /// reach the journal only if it fails). Rows written before the
+        /// kind existed carry the `node_test` boolean, read as the kind.
+        #[serde(default, alias = "node_test", skip_serializing_if = "weft_core::exec::RunKind::is_execution")]
+        run_kind: weft_core::exec::RunKind,
         /// The node set this execution is allowed to dispatch, or
         /// `None` for the whole graph. A trigger fire journals its
         /// computed program here (the fired trigger's downstream plus
@@ -98,6 +99,34 @@ pub enum ExecEvent {
         /// color: they are read off the seed's journal at fold time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<Seed>,
+        /// Who the run is for: the member whatever started it named (a
+        /// `--member`, a member token, the `Weft-Member` header on a gated
+        /// route, a firing through a member's copy). `None` for a run for
+        /// nobody in particular. Written ONCE here, at birth; the
+        /// `execution_color` row copies it in the same transaction so the
+        /// member filters read a column, and the engine folds it into
+        /// `ctx.member()`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<weft_core::member::MemberId>,
+        /// What that member provides for the run's `@member_filled`
+        /// fields, by place and field, read and checked ONCE here, at
+        /// birth (`weft_core::run_spec::member_run_values`). Every firing
+        /// reads these, never the live store, so a replay sees the values
+        /// the run was born with and a value changed meanwhile reaches the
+        /// next run.
+        /// Boxed: most runs carry none, and the birth event is the
+        /// enum's largest variant already.
+        #[serde(default, skip_serializing_if = "no_member_values")]
+        member_values: Box<weft_core::member::MemberValues>,
+        /// The trigger whose firing started this run, spelled the way the
+        /// program reads it (`door`, `one.door`): a listener fire, a
+        /// route call, a replayed parked fire, or `weft run --fire`.
+        /// `None` for a run started by hand and for every setup run. The
+        /// run belongs to that trigger's activation (for the member
+        /// above): taking the activation down takes the run's waits with
+        /// it, and `execution_color.fired_by` copies it for that join.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fired_trigger: Option<String>,
         at_unix: u64,
     },
 
@@ -736,6 +765,11 @@ impl ExecEvent {
 }
 
 
+/// Whether a birth carries no member values (then the field is left out).
+fn no_member_values(values: &weft_core::member::MemberValues) -> bool {
+    values.is_empty()
+}
+
 #[cfg(test)]
 mod wire_tests {
     use super::*;
@@ -847,6 +881,32 @@ mod wire_tests {
         assert!(err.contains("weft clean"), "{err}");
     }
 
+    /// A birth written before the run kind existed carried
+    /// `"node_test": true` for a node test; it reads as that kind, and
+    /// a kind written now is spelled out only when it is not a plain run.
+    #[test]
+    fn a_birth_reads_its_run_kind_old_and_new() {
+        let birth = |extra: Value| {
+            let mut row = json!({
+                "kind": "execution_started", "color": color(), "project_id": Uuid::nil(),
+                "entry_node": "n", "phase": "fire", "definition_hash": null,
+                "program": null, "source_version": null, "at_unix": 1
+            });
+            row.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ExecEvent>(row).unwrap()
+        };
+        let kind_of = |event: ExecEvent| match event {
+            ExecEvent::ExecutionStarted { run_kind, .. } => run_kind,
+            _ => unreachable!(),
+        };
+        use weft_core::exec::RunKind;
+        assert_eq!(kind_of(birth(json!({ "node_test": true }))), RunKind::NodeTest);
+        assert_eq!(kind_of(birth(json!({}))), RunKind::Execution);
+        assert_eq!(kind_of(birth(json!({ "run_kind": "unrecorded" }))), RunKind::Unrecorded);
+        let plain = round_trip(birth(json!({})));
+        assert!(plain.get("run_kind").is_none(), "a plain run spells no kind");
+    }
+
     fn old_started_text() -> String {
         json!({ "kind": "node_started", "color": color(), "node_id": "n", "frames": [], "input": {}, "at_unix": 1 }).to_string()
     }
@@ -871,12 +931,14 @@ mod wire_tests {
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                program: None, source_version: Some("version".into()), node_test: false,
+                program: None, source_version: Some("version".into()), run_kind: weft_core::exec::RunKind::Execution,
                 subgraph: Some(weft_core::project::selection::RunSelection {
                     nodes: [Located::top("out"), Located::top("src")].into_iter().collect(),
                     ..Default::default()
                 }),
                 seed: Some(Seed { parent: color(), origins: BTreeMap::from([(Located::top("source"), color())]) }),
+                member: Some(weft_core::member::MemberId::new("user-42").unwrap()),
+                fired_trigger: Some("trigger".into()), member_values: Default::default(),
                 at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
@@ -885,10 +947,21 @@ mod wire_tests {
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                program: None, source_version: None, node_test: true,
+                program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                 subgraph: None,
                 seed: None,
-                at_unix: 7,
+                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 7,
+            },
+            ExecEvent::ExecutionStarted {
+                color: color(),
+                project_id: uuid::Uuid::nil(),
+                entry_node: "node-test:MyNode::my_test".into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: None,
+                program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
+                subgraph: None,
+                seed: None,
+                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 7,
             },
             ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
             ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
@@ -921,7 +994,7 @@ mod wire_tests {
                 model: Some("m".into()),
                 amount_usd: Some(0.5),
                 billed: true,
-                origin: weft_core::CredentialOwner::TheirOwn,
+                origin: weft_core::CredentialOwner::Author,
                 metadata: json!({}),
                 at_unix: 1,
             },

@@ -642,6 +642,20 @@ pub fn enrich_collecting(
             }
         }
         normalize_port_literals(node);
+        // A node with a `@member_filled` field carries what checking a
+        // member's value needs (its rules) and, when the field is its
+        // connection, what the member's connect page needs (the
+        // service's recipe): the member door has only the program to read
+        // them from.
+        let filled: Vec<String> = weft_core::member::member_filled_fields(node).map(|(field, _)| field.to_string()).collect();
+        node.member_rules = (!filled.is_empty()).then(|| weft_core::project::MemberRules {
+            rules: crate::validate::node_rules(meta, node),
+            custom_outputs: crate::validate::node_custom_outputs(node, meta),
+        });
+        node.member_service = match (meta.access_input(), &meta.service) {
+            (Some(input), Some(spec)) if filled.contains(&input.name) => Some(spec.clone()),
+            _ => None,
+        };
     }
 
     // Type resolution runs whatever the merge found: it is a per-edge
@@ -669,7 +683,62 @@ pub fn enrich_collecting(
         }
         cast_literals(node);
     }
+    mark_per_member_slice(project);
     errors
+}
+
+/// Everything that reads a per-member value becomes per-member too.
+///
+/// The author writes only the starting points (`@per_member` on an infra
+/// node, `@member_filled` on a field); whatever sits downstream of one along the
+/// wires reads that member's value, so it exists per member as well: a
+/// trigger reading a member's bridge address is armed once per member,
+/// and a step reading a member's connection runs in that member's runs.
+/// Group, loop and include boundaries are ordinary nodes after
+/// flattening, so the walk crosses them without knowing they exist. A
+/// node an include's body shares between call sites is one node, so one
+/// per-member site makes it per-member for every site: the conservative
+/// answer, and the one that never lets a member's value reach a shared
+/// run unnoticed.
+///
+/// Derived and filled marks are recomputed from scratch each time, so a
+/// stale one can never outlive what it came from.
+pub fn mark_per_member_slice(project: &mut ProjectDefinition) {
+    use weft_core::member::PerMember;
+    for node in project.nodes.iter_mut() {
+        if matches!(node.per_member, Some(PerMember::Derived | PerMember::Filled)) {
+            node.per_member = None;
+        }
+    }
+    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for edge in &project.edges {
+        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+    }
+    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The second starting point: a node with a field each member fills.
+    for node in project.nodes.iter_mut() {
+        if node.per_member.is_none() && weft_core::member::member_filled_fields(node).next().is_some() {
+            node.per_member = Some(PerMember::Filled);
+        }
+    }
+    let mut frontier: Vec<&str> = project
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.per_member, Some(PerMember::Marked | PerMember::Filled)))
+        .map(|n| n.id.as_str())
+        .collect();
+    while let Some(id) = frontier.pop() {
+        for &next in downstream.get(id).map(Vec::as_slice).unwrap_or_default() {
+            if reached.insert(next.to_string()) {
+                frontier.push(next);
+            }
+        }
+    }
+    for node in project.nodes.iter_mut() {
+        if node.per_member.is_none() && reached.contains(&node.id) {
+            node.per_member = Some(PerMember::Derived);
+        }
+    }
 }
 
 /// Literal lenience: a written literal whose JSON shape doesn't match
@@ -690,6 +759,18 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
             continue;
         }
         let Some(value) = node.port_literals.get(&input.name).cloned() else { continue };
+        // A `@member_filled` field casts its fallback, inside the marker;
+        // the marker itself is never a value to cast.
+        if let Some(filled) = weft_core::member::as_member_filled(&value) {
+            let Some(fallback) = filled.fallback.cloned() else { continue };
+            if WeftType::is_compatible(&crate::file_ref::literal_type(&fallback), &input.port_type) {
+                continue;
+            }
+            if let Ok(cast) = input.port_type.cast_value(&fallback) {
+                node.port_literals.insert(input.name.clone(), weft_core::member::member_filled_literal(Some(cast)));
+            }
+            continue;
+        }
         if WeftType::is_compatible(&crate::file_ref::literal_type(&value), &input.port_type) {
             continue;
         }

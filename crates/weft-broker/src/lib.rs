@@ -15,6 +15,7 @@ pub mod credential;
 pub mod entitlement;
 pub mod handlers;
 pub mod lifecycle_writes;
+pub mod program_tokens;
 pub mod access_admin;
 pub mod app_provider;
 pub mod caller_auth;
@@ -95,6 +96,12 @@ pub fn spawn_connect_sweep(state: Arc<BrokerState>) {
 /// ever dies on its journal write.
 pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
 
+/// The cap on a failed unrecorded run's whole record
+/// (`/v1/journal/record_retroactive`): sixteen of the largest single
+/// rows. An unrecorded run is a short request answered in one go, so a
+/// record past this is refused by name rather than read into memory.
+pub const JOURNAL_RETROACTIVE_BODY_LIMIT: usize = 16 * JOURNAL_RECORD_BODY_LIMIT;
+
 pub fn router(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(handlers::health))
@@ -103,6 +110,14 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/journal/record",
             post(handlers::journal_record).layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RECORD_BODY_LIMIT)),
         )
+        // A whole failed run at once, so it may carry many rows of the
+        // size `record` takes one of.
+        .route(
+            "/v1/journal/record_retroactive",
+            post(handlers::journal_record_retroactive)
+                .layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RETROACTIVE_BODY_LIMIT)),
+        )
+        .route("/v1/journal/forget_unrecorded", post(handlers::journal_forget_unrecorded))
         .route("/v1/journal/wait", post(handlers::journal_wait))
         .route(
             "/v1/journal/has_terminal",
@@ -166,6 +181,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // publishing can never reach the runtime's.
         .route("/v1/access/publish", post(handlers::publish_access))
         .route("/v1/access/published", post(handlers::published_access))
+        .route("/v1/program/mint_member_token", post(program_tokens::mint_member_token))
         // Signals (listener-only rehydrate read, by placement = pod)
         .route(
             "/v1/signal/list_for_pod",
@@ -202,6 +218,10 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/supervisor/set_status",
             post(handlers::supervisor_set_status),
+        )
+        .route(
+            "/v1/supervisor/set_scaled",
+            post(handlers::supervisor_set_scaled),
         )
         .route(
             "/v1/supervisor/remove_node",

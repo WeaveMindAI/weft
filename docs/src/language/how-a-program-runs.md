@@ -246,6 +246,11 @@ that work needs upstream, again stopping at other triggers. Only the trigger
 that fired gets the event; any others close. Two triggers can share the steps
 in the middle without becoming one run.
 
+In a program with members, a run is also for one member or for nobody
+(`weft run --member user-42` picks one). For what is checked before such a run
+starts, go and read
+[programs with members](../running/members.md#what-is-checked-before-a-run-starts).
+
 ## How a run ends
 
 A run is finished when there is no work left and nothing still in flight. It

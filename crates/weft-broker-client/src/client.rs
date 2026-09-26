@@ -300,6 +300,24 @@ impl JournalClient for BrokerJournalClient {
         Ok(())
     }
 
+    async fn record_retroactively(&self, events: &[ExecEvent], pod_name: Option<&str>) -> Result<()> {
+        let pod_name = pod_name.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires a pod_name (worker-only path)")
+        })?;
+        let req = JournalRecordRetroactiveRequest { events: events.to_vec(), pod_name: pod_name.to_string() };
+        let _: JournalRecordResponse = self.http.post("/v1/journal/record_retroactive", &req).await?;
+        Ok(())
+    }
+
+    async fn forget_unrecorded(&self, color: Color, pod_name: Option<&str>) -> Result<()> {
+        let pod_name = pod_name.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires a pod_name (worker-only path)")
+        })?;
+        let req = JournalForgetUnrecordedRequest { color: color.to_string(), pod_name: pod_name.to_string() };
+        let _: JournalRecordResponse = self.http.post("/v1/journal/forget_unrecorded", &req).await?;
+        Ok(())
+    }
+
     async fn raw_rows_after(
         &self,
         color: Color,
@@ -586,13 +604,15 @@ impl BrokerInfraClient {
 impl InfraReader for BrokerInfraClient {
     async fn endpoint_address(
         &self,
-        project_id: Uuid,
+        color: weft_core::Color,
         node_id: &str,
+        per_member: bool,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let req = InfraEndpointUrlRequest {
-            project_id,
+            color,
             node_id: node_id.to_string(),
+            per_member,
             endpoint_name: endpoint_name.to_string(),
         };
         let resp: InfraEndpointUrlResponse =
@@ -629,6 +649,13 @@ impl BrokerAccessClient {
         req: &ReleaseConnectionRequest,
     ) -> Result<ReleaseConnectionResponse> {
         self.http.post("/v1/access/close", req).await
+    }
+
+    pub async fn mint_member_token(
+        &self,
+        req: &ProgramMintMemberTokenRequest,
+    ) -> Result<weft_core::program::MintedMemberToken> {
+        self.http.post("/v1/program/mint_member_token", req).await
     }
 
     pub async fn publish_access(
@@ -844,12 +871,14 @@ impl BrokerSupervisorClient {
         &self,
         project_id: Uuid,
         node_id: Option<&str>,
+        member: Option<&weft_core::member::MemberId>,
         event: crate::protocol::InfraEvent,
     ) -> Result<i64> {
         let (kind, payload) = event.into_record();
         let req = SupervisorEventRecordRequest {
             project_id,
             node_id: node_id.map(|s| s.to_string()),
+            member: member.cloned(),
             kind,
             payload,
         };
@@ -864,6 +893,7 @@ impl BrokerSupervisorClient {
         command_id: Option<i64>,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         unit: Option<&str>,
         status: crate::protocol::InfraNodeStatus,
         failure_stage: Option<crate::protocol::FailureStage>,
@@ -874,6 +904,7 @@ impl BrokerSupervisorClient {
             command_id,
             project_id,
             node_id: node_id.to_string(),
+            member: member.cloned(),
             unit: unit.map(|s| s.to_string()),
             status,
             failure_stage,
@@ -881,6 +912,28 @@ impl BrokerSupervisorClient {
         };
         self.http
             .post_fenced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
+            .await
+    }
+
+    pub async fn set_scaled(
+        &self,
+        pod_name: &str,
+        project_id: Uuid,
+        node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        unit: &str,
+        replicas: u32,
+    ) -> Result<WriteOutcome<SupervisorSetScaledResponse>> {
+        let req = SupervisorSetScaledRequest {
+            pod_name: pod_name.to_string(),
+            project_id,
+            node_id: node_id.to_string(),
+            member: member.cloned(),
+            unit: unit.to_string(),
+            replicas,
+        };
+        self.http
+            .post_fenced::<_, SupervisorSetScaledResponse>("/v1/supervisor/set_scaled", &req)
             .await
     }
 
@@ -892,11 +945,15 @@ impl BrokerSupervisorClient {
         pod_name: &str,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
+        command_id: i64,
     ) -> Result<WriteOutcome<SupervisorRemoveNodeResponse>> {
         let req = SupervisorRemoveNodeRequest {
             pod_name: pod_name.to_string(),
             project_id,
             node_id: node_id.to_string(),
+            member: member.cloned(),
+            command_id,
         };
         self.http
             .post_fenced::<_, SupervisorRemoveNodeResponse>("/v1/supervisor/remove_node", &req)
@@ -935,20 +992,21 @@ impl BrokerSupervisorClient {
         Ok(resp.cancel_requested)
     }
 
-    pub async fn running_count(&self, project_id: Uuid) -> Result<i64> {
+    pub async fn running_count(&self, project_id: Uuid, copies: &weft_core::member::Copies) -> Result<i64> {
         let req = SupervisorRunningCountRequest {
             project_id,
+            copies: copies.clone(),
         };
         let resp: SupervisorRunningCountResponse =
             self.http.post("/v1/supervisor/running_count", &req).await?;
         Ok(resp.running_count)
     }
 
-    /// True if a user infra action (any uncompleted
-    /// infra_lifecycle_command: apply / stop / terminate) is in flight
-    /// for the project. The health loop stands down for the project
-    /// while this holds, so it never fights the action.
-    pub async fn infra_command_in_flight(&self, project_id: Uuid) -> Result<bool> {
+    /// The project's uncompleted supervisor commands (apply / stop /
+    /// terminate), each as the copies it acts on. The health loop stands
+    /// down for those copies while they are here, so it never fights the
+    /// action.
+    pub async fn infra_commands_in_flight(&self, project_id: Uuid) -> Result<Vec<InFlightCommand>> {
         let req = SupervisorInfraCommandInFlightRequest {
             project_id,
         };
@@ -956,7 +1014,7 @@ impl BrokerSupervisorClient {
             .http
             .post("/v1/supervisor/infra_command_in_flight", &req)
             .await?;
-        Ok(resp.in_flight)
+        Ok(resp.commands)
     }
 
     pub async fn trigger_deps(
@@ -977,6 +1035,7 @@ impl BrokerSupervisorClient {
         command_id: i64,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         applied_spec_hash: &str,
         addresses: AppliedEndpoints,
@@ -989,6 +1048,7 @@ impl BrokerSupervisorClient {
             command_id,
             project_id,
             node_id: node_id.to_string(),
+            member: member.cloned(),
             instance_id: instance_id.to_string(),
             applied_spec_hash: applied_spec_hash.to_string(),
             addresses,
@@ -1013,6 +1073,7 @@ impl BrokerSupervisorClient {
         command_id: i64,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
         namespace: &str,
         preserve_pvcs: Vec<String>,
@@ -1023,6 +1084,7 @@ impl BrokerSupervisorClient {
             command_id,
             project_id,
             node_id: node_id.to_string(),
+            member: member.cloned(),
             instance_id: instance_id.to_string(),
             namespace: namespace.to_string(),
             preserve_pvcs,
@@ -1093,11 +1155,13 @@ impl BrokerInfraStateClient {
         &self,
         project_id: Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         spec_json: serde_json::Value,
     ) -> Result<i64> {
         let req = InfraEnqueueApplyRequest {
             project_id,
             node_id: node_id.to_string(),
+            member: member.cloned(),
             spec_json,
         };
         let resp: InfraEnqueueApplyResponse =

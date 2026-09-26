@@ -1,0 +1,1 @@
+ALTER TABLE project ALTER COLUMN tenant_id DROP DEFAULT;

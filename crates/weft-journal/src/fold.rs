@@ -1463,10 +1463,10 @@ mod tests {
             entry_node: "src".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
-            program: None, source_version: None, node_test: false,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
         }
     }
 

@@ -20,6 +20,8 @@ pub mod rm;
 pub mod logs;
 pub mod daemon;
 pub mod infra;
+pub mod infra_card;
+pub mod infra_env;
 pub mod catalog;
 pub mod describe_nodes;
 pub mod parse;
@@ -27,8 +29,11 @@ pub mod executions;
 pub mod status;
 pub mod test_node;
 pub mod tangle;
+pub mod connect_lib;
+pub mod member_values;
 pub mod token;
 pub mod connect;
+pub mod options;
 pub mod listener;
 pub mod files;
 // The version tree and its verbs.
@@ -191,9 +196,7 @@ impl Ctx {
                 // a second `error` phase with a flattened message
                 // and overwrite the structured one in its store.
                 if !progress.has_emitted_error() {
-                    // The whole chain: a context alone ("update project
-                    // asset lifetimes") hides the cause the reader needs.
-                    progress.error(&format!("{e:#}"));
+                    progress.error(&e);
                 }
                 Err(anyhow::Error::new(crate::progress::Reported(e)))
             }
@@ -226,18 +229,12 @@ pub async fn resolve_color(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color: {resp}"))
 }
 
-/// One node of the program, from the way a person spells it: `store`
-/// for a node of the entry file, `setup.store` for the `store` inside
-/// the file the site `setup` includes, the whole path from the entry
-/// file down through every site. Outside a project the spelling is
+/// One node of the program, from the way a person spells it:
+/// `store` for a node of the entry file, `setup.store` for the `store`
+/// inside the file the site `setup` includes, the whole path from the
+/// entry file down through every site (see [`resolve_spelling`], the
+/// one reading every command shares). Outside a project the spelling is
 /// taken as the node itself, at the top.
-///
-/// The commands that hand the daemon a place (`weft wake`, the per-node
-/// infra verbs) go through here; the ones that keep the id and call
-/// path for themselves (`weft events --node`) go through
-/// [`resolve_spelling`], which is the one reading of a spelling both
-/// share. `spell_node` is the way back out for journal rows, which are
-/// still keyed by the compiled id and its frames.
 ///
 /// What comes back is the PLACE, spelled the one way the daemon keys a
 /// place by (`setup.store`, the person's own spelling written back
@@ -249,15 +246,10 @@ pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
     // daemon checks every node it is handed anyway (an unknown one is
     // refused there, naming the run or the project). So the spelling
     // goes as it is, and it is the top-level node it names.
-    let Ok(project) = ctx.project() else { return Ok(spelled.to_string()) };
+    let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
     let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
-    match resolve_spelling(&definition, spelled)? {
-        Spelled::Node { id, call_path } => Ok(weft_core::project::address_of(&definition, &id, &call_path)),
-        Spelled::Group { .. } => anyhow::bail!(
-            "'{spelled}' is a group or an include site, and this takes a node; name one of \
-             its nodes, like `{spelled}.<node>`"
-        ),
-    }
+    let (id, call_path) = resolve_node(project, &definition, spelled)?;
+    Ok(weft_core::project::address_of(&definition, &id, &call_path))
 }
 
 /// What a spelling a person wrote names in the compiled definition:
@@ -271,8 +263,62 @@ pub enum Spelled {
     Group { id: String, call_path: Vec<String> },
 }
 
-/// Read a spelling the way a person writes it (`auth.check` for the
-/// `check` of the file the site `auth` includes) into what it names,
+/// [`resolve_spelling`] for a command that takes a node: a group or an
+/// include site is refused, naming how to reach one of its nodes.
+pub fn resolve_node(
+    project: &weft_compiler::project::Project,
+    definition: &weft_core::ProjectDefinition,
+    name: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    match resolve_spelling(project, definition, name)? {
+        Spelled::Node { id, call_path } => Ok((id, call_path)),
+        Spelled::Group { .. } => {
+            let spelled = unqualified(name);
+            anyhow::bail!(
+                "'{spelled}' is a group or an include site, and this takes a node; name one of \
+                 its nodes, like `{spelled}.<node>`"
+            )
+        }
+    }
+}
+
+/// A name as a person typed it, without the `<file>:` qualifier
+/// [`resolve_spelling`] accepts: the spelling to answer them by.
+pub fn unqualified(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(_, spelled)| spelled)
+}
+
+/// Read a name the way a person writes it into what it names: the ONE
+/// reading every command that takes a node shares (`weft options`,
+/// `weft connect --node`, `weft wake`, the infra verbs, `weft events
+/// --node`). The name is a place spelling (`auth.check` for the `check`
+/// of the file the site `auth` includes), optionally qualified by the
+/// file it is written in, relative to the project's root
+/// (`src/auth.weft:auth.check`), which is then checked.
+pub fn resolve_spelling(
+    project: &weft_compiler::project::Project,
+    definition: &weft_core::ProjectDefinition,
+    name: &str,
+) -> anyhow::Result<Spelled> {
+    let Some((file, spelled)) = name.split_once(':') else { return read_spelling(definition, name) };
+    let found = read_spelling(definition, spelled)?;
+    let (Spelled::Node { id, .. } | Spelled::Group { id, .. }) = &found;
+    let asked = project.root.join(file);
+    // A node of an included file is keyed by that file's body id (the
+    // part before the first dot); anything else is written in the entry
+    // file.
+    let written_there = match id.strip_prefix('@') {
+        Some(_) => id.split('.').next() == Some(weft_compiler::source_name::body_id(&project.root, &asked).as_str()),
+        None => asked == project.main_weft(),
+    };
+    anyhow::ensure!(
+        written_there,
+        "'{spelled}' is not written in {file}; name it as `{spelled}`, or qualify it with the file it is in"
+    );
+    Ok(found)
+}
+
+/// Read a place spelling (no file qualifier) into what it names,
 /// refusing every spelling that names nothing with the one that would.
 ///
 /// The compiled id is not something a person can be asked to type: a
@@ -283,7 +329,7 @@ pub enum Spelled {
 /// spelling no other command accepts; so it is refused with the one
 /// that works. A boundary the compiler made (`gate__in`) is named by
 /// its group.
-pub fn resolve_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> anyhow::Result<Spelled> {
+fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> anyhow::Result<Spelled> {
     if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
         anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `{group}`, and its rows come with it");
     }

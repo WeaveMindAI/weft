@@ -82,6 +82,19 @@ trigger that looks live and is dead.
 Project status moves `registered` → `activating` → `active` →
 `deactivating` → `inactive`.
 
+### One trigger at a time
+
+Each trigger is turned on separately, so `weft activate --trigger inbound`
+turns on one and leaves the rest alone; for the other flags, go and read
+[the CLI](cli.md). The project shows `active` while any of its shared triggers
+listens and none is part way through turning on or off, and `weft status` lists
+each trigger's own state under `triggers:`.
+
+A trigger that reads a member's copy or a member's value (`@per_member`,
+`@member_filled`) exists once per member, and its copies are turned on with
+`--member <id>`. For those, go and read
+[programs with members](members.md).
+
 ### Frozen inputs
 
 Setup snapshots the trigger's input values along with the registration, and a
@@ -109,10 +122,13 @@ them land first, capped at a minute (`--drain-timeout`), and `weft
 cancel-running` ends that wait early.
 
 The infra verbs that take triggers down (`weft infra stop`, `terminate`,
-`upgrade`) ask you the same thing, and their answer means the same. If the
-project is not active there are no triggers to take down, so nothing is asked,
-but a run may still be using that infrastructure: `--running-policy wait` on
-its own lets it land before the containers go.
+`upgrade`) ask you the same thing, and their answer means the same. They ask
+only when a trigger reading that infrastructure is on, the program's own or a
+member's. With no terminal, or with `--json`, they do not pick for you: they
+stop and name the flags, for example `--mode park --running-policy wait`, and
+if you passed those flags already they are used. When no trigger reading it is
+on, nothing is asked, but a run may still be using that infrastructure:
+`--running-policy wait` on its own lets it land before the containers go.
 
 `weft activate` and `weft bake` make the same choice about a worker still up
 from an older build: by default what it runs is cancelled and it is replaced
@@ -130,7 +146,7 @@ A trigger that reads its address off one of your containers cannot be set up
 until that container answers:
 
 ```text
-these triggers' infra is not running: pg. Start it with `weft infra start` and run this again.
+these triggers' infra is not running: pg. Start it with `weft infra start`, then run this again.
 ```
 
 Infrastructure that only a run touches does not hold activation back.

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
 
 /**
  * In-memory message store, keyed by chatId, with optional disk persistence.
@@ -15,19 +15,33 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
  * fetch-media node for one out of history). The live SSE path and the
  * fetchMessages action carry text and captions only.
  *
- * Each chat keeps at most `maxPerChat` messages (oldest evicted).
- * If `persistPath` is provided, the store is loaded from disk on construction
- * and flushed to disk (debounced) after mutations.
+ * Each chat keeps at most `maxPerChat` messages, the newest by timestamp.
+ * A late delivery older than a full chat is kept when it arrives (the
+ * trigger fires for it, and its `/media` has to be there), but it is the
+ * oldest message the chat holds, so the chat's next message evicts it.
+ * Its media is served until then; after that it is gone like any evicted
+ * message.
+ *
+ * Which ids the store has already seen is kept apart from the messages:
+ * evicting a message never forgets its id, so a redelivery of an evicted
+ * message never fires the trigger again. The seen ids are bounded too
+ * (`maxSeen`, oldest forgotten first), far above what the chats hold.
+ *
+ * If `persistPath` is provided, the messages are loaded from it on
+ * construction and flushed to it (debounced) after mutations, and the seen
+ * ids the same way from `<persistPath>.seen`.
  */
 export class MessageStore {
-  constructor(maxPerChat = 500, persistPath = null) {
+  constructor(maxPerChat = 500, persistPath = null, maxSeen = 200_000) {
     // Eviction keeps the message just added, so a chat holds at least one.
     if (!(maxPerChat >= 1)) throw new RangeError(`maxPerChat must be at least 1, got ${maxPerChat}`);
+    if (!(maxSeen >= maxPerChat)) throw new RangeError(`maxSeen must be at least maxPerChat (${maxPerChat}), got ${maxSeen}`);
     this.maxPerChat = maxPerChat;
+    this.maxSeen = maxSeen;
     this.persistPath = persistPath;
     /** @type {Map<string, Array<Object>>} chatId -> sorted array of raw WAMessages */
     this.chats = new Map();
-    /** @type {Set<string>} messageId dedup set */
+    /** @type {Set<string>} every messageId ever added, oldest first, never pruned by eviction */
     this.seen = new Set();
     this._dirty = false;
     this._flushTimer = null;
@@ -70,7 +84,7 @@ export class MessageStore {
       this._markDirty();
       return true;
     }
-    this.seen.add(msgId);
+    this._see(msgId);
 
     if (!this.chats.has(chatId)) {
       this.chats.set(chatId, []);
@@ -86,8 +100,7 @@ export class MessageStore {
     // late delivery older than everything stored is still the message
     // the trigger fires for, and `/media` has to find it.
     while (list.length > this.maxPerChat) {
-      const [removed] = list.splice(list[0] === msg ? 1 : 0, 1);
-      this.seen.delete(removed.key?.id);
+      list.splice(list[0] === msg ? 1 : 0, 1);
     }
 
     this._markDirty();
@@ -197,6 +210,18 @@ export class MessageStore {
 
   // ── Internal ──
 
+  /** Remember an id, forgetting the oldest one past `maxSeen`. */
+  _see(msgId) {
+    this.seen.add(msgId);
+    if (this.seen.size > this.maxSeen) {
+      this.seen.delete(this.seen.values().next().value);
+    }
+  }
+
+  _seenPath() {
+    return `${this.persistPath}.seen`;
+  }
+
   _markDirty() {
     if (!this.persistPath) return;
     this._dirty = true;
@@ -215,7 +240,8 @@ export class MessageStore {
       for (const [chatId, msgs] of this.chats.entries()) {
         data[chatId] = msgs;
       }
-      writeFileSync(this.persistPath, JSON.stringify(data));
+      writeAtomic(this.persistPath, JSON.stringify(data));
+      writeAtomic(this._seenPath(), JSON.stringify([...this.seen]));
       this._dirty = false;
       const total = this.totalCount();
       console.log(`[message-store] Flushed ${total} messages to disk`);
@@ -225,40 +251,69 @@ export class MessageStore {
   }
 
   _loadFromDisk() {
-    if (!this.persistPath || !existsSync(this.persistPath)) return;
+    // The seen ids first, oldest first, so what the messages add below
+    // lands after them. A store flushed before the ids were persisted has
+    // no `.seen` file; its messages' ids are then all it knows.
+    // A `.seen` file that is there but does not read stops the store:
+    // going on without it would fire again every message still in the
+    // chats' history.
+    if (existsSync(this._seenPath())) {
+      let ids;
+      try {
+        ids = JSON.parse(readFileSync(this._seenPath(), 'utf-8'));
+        if (!Array.isArray(ids)) throw new Error('not a list of ids');
+      } catch (err) {
+        throw new Error(
+          `[message-store] cannot read the seen ids at ${this._seenPath()} (${err.message}); ` + START_AGAIN,
+        );
+      }
+      for (const id of ids) this._see(id);
+    }
+    if (!existsSync(this.persistPath)) return;
+    // An unreadable history stops the store: carrying on empty would
+    // let the next flush overwrite it for good.
+    let data;
     try {
-      const raw = readFileSync(this.persistPath, 'utf-8');
-      const data = JSON.parse(raw);
-      let count = 0;
-      for (const [chatId, msgs] of Object.entries(data)) {
-        if (!Array.isArray(msgs)) continue;
-        for (const msg of msgs) {
-          const msgId = msg.key?.id;
-          if (!msgId || this.seen.has(msgId)) continue;
-          this.seen.add(msgId);
-          if (!this.chats.has(chatId)) {
-            this.chats.set(chatId, []);
-          }
-          this.chats.get(chatId).push(msg);
-          count++;
+      data = JSON.parse(readFileSync(this.persistPath, 'utf-8'));
+      if (data === null || typeof data !== 'object' || Array.isArray(data) || !Object.values(data).every(Array.isArray)) {
+        throw new Error('not a map of chats to message lists');
+      }
+    } catch (err) {
+      throw new Error(`[message-store] cannot read the message history at ${this.persistPath} (${err.message}); ` + START_AGAIN);
+    }
+    const loaded = new Set();
+    let count = 0;
+    for (const [chatId, msgs] of Object.entries(data)) {
+      for (const msg of msgs) {
+        const msgId = msg.key?.id;
+        if (!msgId || loaded.has(msgId)) continue;
+        loaded.add(msgId);
+        this._see(msgId);
+        if (!this.chats.has(chatId)) {
+          this.chats.set(chatId, []);
         }
-        // Re-sort after bulk load
-        const list = this.chats.get(chatId);
-        if (list) {
-          list.sort((a, b) => toNumber(a.messageTimestamp) - toNumber(b.messageTimestamp));
-          // Trim to capacity
-          if (list.length > this.maxPerChat) {
-            const removed = list.splice(0, list.length - this.maxPerChat);
-            for (const r of removed) this.seen.delete(r.key?.id);
-          }
+        this.chats.get(chatId).push(msg);
+        count++;
+      }
+      // Re-sort after bulk load
+      const list = this.chats.get(chatId);
+      if (list) {
+        list.sort((a, b) => toNumber(a.messageTimestamp) - toNumber(b.messageTimestamp));
+        // Trim to capacity
+        if (list.length > this.maxPerChat) {
+          list.splice(0, list.length - this.maxPerChat);
         }
       }
-      console.log(`[message-store] Loaded ${count} messages from disk (${this.chats.size} chats)`);
-    } catch (err) {
-      console.error('[message-store] Failed to load from disk:', err.message);
     }
+    console.log(`[message-store] Loaded ${count} messages from disk (${this.chats.size} chats)`);
   }
 }
+
+// Both files live on the bridge's own volume, which no weft command
+// edits file by file; the way to start again is to drop that volume.
+const START_AGAIN =
+  'to start again, run `weft infra node-terminate <this bridge node>` (it deletes the bridge volume: this ' +
+  'history, the seen ids and the WhatsApp login, so you pair the phone again) and then `weft infra start`';
 
 export function toNumber(ts) {
   if (typeof ts === 'number') return ts;
@@ -273,11 +328,16 @@ export function toNumber(ts) {
  * Extract text content and message type from a raw Baileys WAMessage:
  * the text of a text message, the caption (or null) of a media one. The
  * bytes are never downloaded here; `/media/:messageId` serves them on
- * demand.
+ * demand. A kind this list does not know (a poll, a reaction, a protocol
+ * message) and a message with no `message` at all are `unknown` with no
+ * content, never an empty text a program would run on as if a person
+ * sent it.
  */
+// SYNC: the messageTypes returned here <-> MESSAGE_TYPES in
+// catalog/bailey/receive/mod.rs.
 export function extractTextContent(msg) {
   const m = msg.message;
-  if (!m) return { content: '', messageType: 'text' };
+  if (!m) return { content: null, messageType: 'unknown' };
 
   if (m.audioMessage) return { content: null, messageType: 'audio' };
   if (m.conversation) return { content: m.conversation, messageType: 'text' };
@@ -292,7 +352,7 @@ export function extractTextContent(msg) {
   if (m.contactMessage) return { content: null, messageType: 'contact' };
   if (m.locationMessage) return { content: null, messageType: 'location' };
 
-  return { content: '', messageType: 'text' };
+  return { content: null, messageType: 'unknown' };
 }
 
 /**
@@ -322,4 +382,12 @@ export function contentDisposition(name) {
   const plain = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
   const encoded = encodeURIComponent(name).replace(/['()*!]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
   return `inline; filename="${plain}"; filename*=UTF-8''${encoded}`;
+}
+
+/** Write a whole file or nothing: a crash mid-write leaves the old file,
+ *  never half of the new one. */
+function writeAtomic(path, text) {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, path);
 }

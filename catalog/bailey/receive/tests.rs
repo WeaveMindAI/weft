@@ -1,8 +1,11 @@
 //! BaileyReceive self-tests: the SSE subscription, a text fire's
-//! fan-out, and a media fire's storage pull.
+//! fan-out, a media fire's storage pull, and the filter settings as
+//! the predicates that drop an event before any run starts.
 
 use serde_json::json;
 
+use weft::signal::predicate::matches;
+use weft::signal::Predicate;
 use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::BaileyReceiveNode;
@@ -14,9 +17,120 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_media_fire_pulls_the_bytes_into_storage", media_fire),
         NodeTest::fake("a_voice_note_says_its_size_and_length", voice_note_facts),
         NodeTest::fake("a_smuggled_file_key_never_starts_a_run", a_smuggled_file_key_never_starts_a_run),
+        NodeTest::fake("no_filter_settings_fire_on_every_known_message", no_filters),
+        NodeTest::fake("an_unknown_message_fires_only_when_listed", unknown_listed),
+        NodeTest::fake("an_event_without_a_message_type_fails_loudly", missing_message_type),
+        NodeTest::fake("ignore_groups_drops_a_group_message", ignore_groups),
+        NodeTest::fake("message_types_keep_only_the_listed_types", message_types),
+        NodeTest::fake("both_filters_must_pass", both_filters),
+        NodeTest::fake("an_unknown_message_type_is_refused_at_setup", unknown_type),
     ]
 }
 
+/// Run setup with the given inputs and return the one signal's
+/// predicates.
+async fn filters_for(rig: &FakeRig, inputs: serde_json::Value) -> WeftResult<Vec<Predicate>> {
+    rig.run_setup_trigger(&BaileyReceiveNode, inputs).await.ok()?;
+    let registered = rig.registered_signals();
+    assert_eq!(registered.len(), 1, "one SSE signal");
+    Ok(registered[0].0.match_predicates.clone())
+}
+
+fn message(message_type: &str, is_group: bool) -> serde_json::Value {
+    json!({ "messageType": message_type, "isGroup": is_group, "messageId": "wa-1" })
+}
+
+async fn no_filters(rig: FakeRig) -> WeftResult<()> {
+    let f = filters_for(
+        &rig,
+        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": [] }),
+    )
+    .await?;
+    for t in ["text", "image", "audio", "contact", "location"] {
+        assert!(matches(&f, &message(t, false)), "{t} fires");
+        assert!(matches(&f, &message(t, true)), "a group {t} fires");
+    }
+    assert!(!matches(&f, &message("unknown", false)), "an unknown message is dropped: {f:?}");
+    Ok(())
+}
+
+async fn unknown_listed(rig: FakeRig) -> WeftResult<()> {
+    let f = filters_for(
+        &rig,
+        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["unknown"] }),
+    )
+    .await?;
+    assert!(matches(&f, &message("unknown", false)), "listed by name, it fires");
+    assert!(!matches(&f, &message("text", false)), "an unlisted type is dropped");
+    Ok(())
+}
+
+async fn missing_message_type(rig: FakeRig) -> WeftResult<()> {
+    rig.wake(json!({ "from": "4915112345678", "messageId": "wa-9", "content": "" }));
+    let err = rig
+        .run(&BaileyReceiveNode, json!({ "endpointUrl": "http://bridge.example:8090" }))
+        .await
+        .result
+        .expect_err("an event with no messageType is refused, never read as text")
+        .to_string();
+    assert!(err.contains("messageType"), "{err}");
+    Ok(())
+}
+
+async fn ignore_groups(rig: FakeRig) -> WeftResult<()> {
+    let f = filters_for(
+        &rig,
+        json!({ "endpointUrl": "http://bridge.example:8090", "ignoreGroups": true }),
+    )
+    .await?;
+    assert!(matches(&f, &message("text", false)), "a direct message fires");
+    assert!(!matches(&f, &message("text", true)), "a group message is dropped");
+    Ok(())
+}
+
+async fn message_types(rig: FakeRig) -> WeftResult<()> {
+    let f = filters_for(
+        &rig,
+        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["text", "audio"] }),
+    )
+    .await?;
+    assert!(matches(&f, &message("text", false)));
+    assert!(matches(&f, &message("audio", true)), "groups still fire when not ignored");
+    assert!(!matches(&f, &message("image", false)), "an unlisted type is dropped");
+    assert!(!matches(&f, &message("textual", false)), "the match is whole-word");
+    Ok(())
+}
+
+async fn both_filters(rig: FakeRig) -> WeftResult<()> {
+    let f = filters_for(
+        &rig,
+        json!({
+            "endpointUrl": "http://bridge.example:8090",
+            "ignoreGroups": true,
+            "messageTypes": ["image"],
+        }),
+    )
+    .await?;
+    assert!(matches(&f, &message("image", false)));
+    assert!(!matches(&f, &message("image", true)), "a group image is dropped");
+    assert!(!matches(&f, &message("text", false)), "a direct text is dropped");
+    Ok(())
+}
+
+async fn unknown_type(rig: FakeRig) -> WeftResult<()> {
+    let err = rig
+        .run_setup_trigger(
+            &BaileyReceiveNode,
+            json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["photo"] }),
+        )
+        .await
+        .result
+        .expect_err("a type the bridge never sends is refused")
+        .to_string();
+    assert!(err.contains("photo") && err.contains("image"), "{err}");
+    assert!(rig.registered_signals().is_empty(), "nothing registers");
+    Ok(())
+}
 async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     rig.run_setup_trigger(
         &BaileyReceiveNode,

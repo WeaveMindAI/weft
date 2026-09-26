@@ -91,3 +91,84 @@ async fn a_project_runs_its_own_postgres_and_talks_to_it() -> Result<()> {
 
     project.finish().await
 }
+
+/// `weft infra env` writes the database's password into an env file
+/// without printing it. Once a run has taken the password it refuses and
+/// names `weft infra press`; `weft infra show` lists the card's reset
+/// button without printing anything secret; pressing it never asks, and
+/// after it `env` writes the fresh password and
+/// the user in one go, printing the user, keeping the file's other lines.
+#[tokio::test]
+async fn the_password_goes_into_an_env_file_and_a_reset_gets_a_new_one() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("postgres_db", disp).await?;
+    project.substitute_in_main("__E2E_BODY__", BODY)?;
+    infra::start_and_wait_running(&mut project, "db").await?;
+
+    // Starting the database runs its setup, which takes the password: by
+    // the time anyone looks, the card says it was handed over. So the
+    // plain call refuses and names the press that gets a new one.
+    let env = project.dir().join("web.env");
+    let into = env.to_string_lossy().to_string();
+    let only_secret: [&str; 7] = ["infra", "env", "db", "--into", &into, "--as", "PG_PASSWORD"];
+    let refused = project.weft_refused(&only_secret).await?;
+    anyhow::ensure!(refused.contains("weft infra press"), "the refusal should name `weft infra press`: {refused}");
+
+    // The card lists the reset button, and the action to press it by.
+    let shown = project.weft(&["infra", "show", "db"]).await?;
+    anyhow::ensure!(shown.contains("weft infra press db reset_password"), "show should list the reset button: {shown}");
+
+    let press: [&str; 4] = ["infra", "press", "db", "reset_password"];
+    // What a failure message may show of a text holding the password:
+    // the name of each line, never its value.
+    let names = |text: &str| -> Vec<String> {
+        text.lines().map(|l| l.split_once('=').map_or("<no name>", |(name, _)| name).to_string()).collect()
+    };
+    let password_in = |text: &str| -> Result<String> {
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("PG_PASSWORD="))
+            .ok_or_else(|| anyhow::anyhow!("the env file does not set PG_PASSWORD, its lines: {:?}", names(text)))?;
+        anyhow::ensure!(!line.trim().is_empty(), "an empty password was written");
+        Ok(line.trim().to_string())
+    };
+
+    let pressed = project.weft(&press).await?;
+    // Now the card holds the fresh password, and show still masks it.
+    let shown = project.weft(&["infra", "show", "db"]).await?;
+    let shown_json = project.weft(&["infra", "show", "db", "--json"]).await?;
+    let secret: [&str; 9] =
+        ["infra", "env", "db", "--into", &into, "--set", "PG_PASSWORD=Password", "--set", "PG_USER=User"];
+    let written = project.weft(&secret).await?;
+    anyhow::ensure!(written.contains("PG_USER="), "env should print the plain values it wrote, its lines: {:?}", names(&written));
+    let user_line = std::fs::read_to_string(&env)?;
+    anyhow::ensure!(
+        user_line.lines().any(|l| l.starts_with("PG_USER=") && l.len() > "PG_USER=".len()),
+        "the env file does not set PG_USER, its lines: {:?}",
+        names(&user_line)
+    );
+    let first = password_in(&std::fs::read_to_string(&env)?)?;
+    for (what, out) in [("press", &pressed), ("show", &shown), ("show --json", &shown_json), ("env", &written)] {
+        anyhow::ensure!(!out.contains(&first), "`{what}` printed the password");
+    }
+    let mode = std::fs::metadata(&env)?.permissions().mode() & 0o777;
+    anyhow::ensure!(mode == 0o600, "a new env file should be the owner's only, got {mode:o}");
+    // The program's own next run picks the new password up by itself.
+    round_trip(&mut project).await?;
+
+    // Another reset replaces only its own line.
+    let before = std::fs::read_to_string(&env)?;
+    std::fs::write(&env, format!("OTHER=kept\n{before}"))?;
+    project.weft(&press).await?;
+    project.weft(&only_secret).await?;
+    let after = std::fs::read_to_string(&env)?;
+    anyhow::ensure!(after.starts_with("OTHER=kept\nPG_PASSWORD=") && after.contains("\nPG_USER="), "the other line was not kept, its lines: {:?}", names(&after));
+    anyhow::ensure!(password_in(&after)? != first, "the reset wrote the old password back");
+
+    // The program's own next run picks the new password up by itself.
+    round_trip(&mut project).await?;
+    infra::terminate_and_wait_gone(&project, "db").await?;
+    project.finish().await
+}

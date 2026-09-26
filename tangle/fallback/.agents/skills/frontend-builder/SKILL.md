@@ -26,6 +26,10 @@ The routes' URLs and bodies in [the brief] are the contract whether or not [the 
 
 You write under `front/` and nothing else: never `src/main.weft`, the catalog under `nodes/`, or a node. A change [the program] needs is [a boundary].
 
+Your throwaway files (a test script, a screenshot, a probe) go in your scratch folder: the one your session gives you, or a fresh `mktemp -d` when it gives none. Never under `front/`, where they would ship with the site.
+
+A value the program's infrastructure hands out (a database's user and password) reaches `front/` only through `weft infra env`, as the `weft-frontend` skill lays out: read the card, press its button if the secret was handed over already (a secret handed out once usually has been by the time you look), then write the values. If the environment's permission checker refuses one of those commands, you stop that part, put the exact command in [the report] for the user to run, and go on with the rest. You never go round it by reading the secret yourself or copying it onto a command line; plain values (a host, a port) you write into the env file yourself.
+
 ## Method
 
 1. Read the `weft-frontend` skill: the default stack and the house rules; it beats what you remember.
@@ -40,6 +44,7 @@ You prove the frontend, never [the program]: whether a node produces the right v
 
 - The build: `pnpm install && pnpm run build` passes, and you quote its real output. A passing build is the floor, never [the proof] on its own.
 - [the one task] driven through the page: you start the dev server and use the page (or call the server route the page uses) and show what the page puts on screen when [the program] answers. That response proves the frontend wires the route or door correctly.
+- Driving the page: you start the dev server in the background on a port you pick (`pnpm run dev --port <n> --strictPort`), and you stop it by that process or that port (`kill <pid>` of what you started, or `fuser -k <n>/tcp`), never with `pkill -f`: its pattern also matches the shell running the `pkill` itself, which then dies with the server. In a browser test you wait for the page to finish loading before you click (in Playwright, `await page.waitForLoadState('networkidle')`, or wait for something only the running page draws): until the page's scripts have taken over (hydration), what is on screen is the server's HTML with no handlers, and a click on it does nothing.
 - The error path: a route or door that answers 404 or 410, a field the answer must carry; you show the message text the page renders. Handling what [the program] sends back, a failure included, is the frontend's job.
 
 [a stand-in] is a recorded or seeded response used in place of [the program]. It is a stopgap for one reason only: [the program] is not reachable yet (no daemon, no credential, nothing activated). Then you drive the page against [a stand-in] so the wiring is still proven, you say so in [the report] in as many words, and you say what is still unproven. The moment [the program] answers you drive the page against it again and report THAT: a page only ever driven against a stand-in is a sketch, whoever wrote the stand-in, and Tangle sends it back.

@@ -220,9 +220,9 @@ impl ExecutionProjector {
                 })
                 .collect()
         } else { match ev {
-            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, .. } => {
+            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, member, .. } => {
                 vec![DispatcherEvent::ExecutionStarted {
-                    color, at_unix,
+                    color, member: member.clone(), at_unix,
                     entry_node: entry_node.clone(),
                     phase: *phase,
                     subgraph: subgraph.as_ref().map(|s| s.nodes.iter().cloned().collect()),
@@ -360,7 +360,7 @@ impl ExecutionProjector {
                     cost_id: cost_id.clone(),
                     service: service.clone(),
                     amount_usd: *amount_usd,
-                    origin: *origin,
+                    origin: origin.clone(),
                 }]
             }
             // Bus events: surfaced so the inspector renders a live IRC-style
@@ -1015,10 +1015,10 @@ mod tests {
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                program: None, source_version: None, node_test: false,
+                program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                 subgraph: None,
                 seed: None,
-                at_unix: 0,
+                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
             },
             ExecEvent::NodeKicked { color: color(), node_id: "src".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             started("src", 1),
@@ -1058,7 +1058,7 @@ mod tests {
             rows.push(ExecEvent::CostReported {
                 color: color(), node_id: node.into(), frames: vec![], cost_id: node.into(),
                 service: "provider".into(), model: None, amount_usd: Some(0.25), billed: false,
-                origin: weft_core::CredentialOwner::TheirOwn, metadata: Value::Null, at_unix: 2,
+                origin: weft_core::CredentialOwner::Author, metadata: Value::Null, at_unix: 2,
             });
         }
         rows.splice(3..3, [
@@ -1242,10 +1242,10 @@ mod tests {
                 entry_node: "probe".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                program: None, source_version: None, node_test: true,
+                program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                 subgraph: None,
                 seed: None,
-                at_unix: 0,
+                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
             },
             started("probe", 1),
             ExecEvent::ExecutionCompleted { color: color(), at_unix: 2 },

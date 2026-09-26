@@ -22,7 +22,7 @@ impl Node for TestSseTriggerNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let event_name: String = ctx.inputs.get("event_name")?;
-        ctx.register_signal(SseSubscribe { url, event_name }).await
+        ctx.register_signal(SseSubscribe { url, event_name, filters: Vec::new() }).await
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {

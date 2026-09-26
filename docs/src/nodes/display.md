@@ -56,7 +56,7 @@ A list of items, each with a label, and at most one action.
 | `text` | a string | A box you can copy from |
 | `image` | a string an `<img src>` takes, so a URL or a `data:` URI | The picture |
 | `progress` | a number from 0 to 1 | A bar |
-| `secret` | a string | Masked behind dots until somebody clicks the eye. Copy gives the real value either way |
+| `secret` | a string | Masked behind dots until somebody clicks the eye. Copy gives the real value either way, and `weft infra env` writes it into an env file without anyone seeing it |
 
 An answer that is not a list of items comes back to the reader as an error
 naming what you sent, rather than an empty panel. One item it cannot read

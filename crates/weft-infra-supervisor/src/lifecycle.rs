@@ -1,8 +1,8 @@
 //! Lifecycle loop. Claims the `infra_lifecycle_command` rows of the
-//! projects this pod owns and executes them via kubectl. Three verbs:
+//! projects this pod owns and executes them against the Kubernetes API. Three verbs:
 //!
 //! - **apply**: compile the InfraSpec (weft-core), resolve local
-//!   image tags, kubectl-apply, wait for readiness, write the
+//!   image tags, apply, wait for readiness, write the
 //!   `infra_node` row via `set_applied`. Fresh applies mint a new
 //!   instance_id; Replace reuses the prior one (PVCs reattach by
 //!   name) and sweeps workload-shaped resources before applying.
@@ -48,7 +48,7 @@ use crate::SupervisorState;
 ///
 /// Also under `transitioning` only: a unit in `prior` but DROPPED from
 /// the spec is carried forward verbatim. Its workload is reaped later
-/// in the same apply, but a cancel or kubectl failure BEFORE the reap
+/// in the same apply, but a cancel or cluster failure BEFORE the reap
 /// leaves the row `Failed` with those pods still running - carried,
 /// they keep their refs in the keep-set and the honest roster shows a
 /// unit that may still exist in the cluster. The post-readiness stamp
@@ -69,7 +69,7 @@ fn resolve_units(
     use crate::health_engine::{FLAKY_AFTER, RECOVERY_AFTER};
     let mut out = std::collections::BTreeMap::new();
     for u in &spec.units {
-        let (unit_status, image_refs) = if reconciled.contains(&u.name) {
+        let (unit_status, image_refs, scaled_to, watched) = if reconciled.contains(&u.name) {
             let mut refs = infra::unit_image_refs(u, node_id, image_tags)?;
             if transitioning {
                 // The sweep half of this apply may not have taken the
@@ -79,10 +79,12 @@ fn resolve_units(
                     refs.extend(p.image_refs.iter().cloned());
                 }
             }
-            (status, refs)
+            (status, refs, u.zero_by_spec().then_some(0), u.health_watched())
         } else {
             // Left up / frozen: keep its current status (Running or
-            // Flaky) AND the refs its last apply recorded (they can be
+            // Flaky), the replicas a protocol scaled its workload to and
+            // whether the watch sees it (both describe the workload as it
+            // runs, not a spec it has not been re-applied with), AND the refs its last apply recorded (they can be
             // older than the project's current tag map). A frozen unit
             // is by construction in `prior` (`units_to_reconcile`
             // reconciles every unit that is not), so its absence is a
@@ -94,7 +96,7 @@ fn resolve_units(
                     u.name
                 )
             })?;
-            (p.status, p.image_refs.clone())
+            (p.status, p.image_refs.clone(), p.scaled_to, p.watched)
         };
         out.insert(
             u.name.clone(),
@@ -110,6 +112,8 @@ fn resolve_units(
                     .recovery_after_seconds
                     .unwrap_or(RECOVERY_AFTER.as_secs() as u32),
                 image_refs,
+                watched,
+                scaled_to,
             },
         );
     }
@@ -198,12 +202,12 @@ pub(crate) const INFRA_SELECTOR: &str = "weft.dev/role=infra";
 
 /// How often the executing supervisor polls the command's
 /// `cancel_requested` flag while inside a wait loop (readiness /
-/// drain). Between discrete kubectl steps the check is per-step.
+/// drain). Between discrete cluster steps the check is per-step.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Marker error: the command was HALTED because the user requested
 /// cancellation. `tick` maps it to a `cancelled` outcome (never a
-/// failure). Cancel = halt, not rollback: kubectl is not
+/// failure). Cancel = halt, not rollback: the cluster API is not
 /// transactional, so per-node partial state is left visible (the
 /// apply error path stamps `Failed("cancelled ...")` on the node so
 /// the user terminates/retries per-node from where it stopped).
@@ -314,6 +318,7 @@ async fn wait_for_drain(
     command_id: i64,
     drain_timeout_secs: u64,
     project_id: uuid::Uuid,
+    copies: &weft_core::member::Copies,
 ) -> Result<()> {
     let outcome = weft_platform_traits::drain_until_zero(
         state.clock.as_ref(),
@@ -321,7 +326,7 @@ async fn wait_for_drain(
         "infra lifecycle op",
         || async {
             check_cancel(state, command_id, "waiting for running executions to drain").await?;
-            state.broker.running_count(project_id).await
+            state.broker.running_count(project_id, copies).await
         },
     )
     .await?;
@@ -353,7 +358,7 @@ const CLAIM_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// change (`changes`). A project this pod took on may have had its
 /// command issued while nobody owned it; a project it lost has a new
 /// owner, which runs its command again from the start, so the command
-/// running here is stopped rather than left issuing kubectl calls for a
+/// running here is stopped rather than left issuing cluster calls for a
 /// project that is no longer this pod's. When the broker answers that a
 /// command waits on a project nobody owns, the ownership loop is asked
 /// to tick now.
@@ -519,12 +524,15 @@ async fn execute(
     // already ran cancel_running_non_suspended when it issued the
     // command, so any colors still alive are draining naturally.
     if cmd.running_policy == Some(RunningPolicy::Wait) {
-        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, cmd.project_id).await?;
+        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, cmd.project_id, &cmd.copies).await?;
     }
     let nodes = state.broker.infra_nodes(cmd.project_id).await?;
     let targets: Vec<&weft_broker_client::protocol::SupervisorInfraNode> = match &cmd.node_id {
-        Some(node_id) => nodes.iter().filter(|n| n.node_id == *node_id).collect(),
-        None => nodes.iter().collect(),
+        Some(node_id) => nodes
+            .iter()
+            .filter(|n| n.node_id == *node_id && cmd.copies.admits(n.member.as_ref()))
+            .collect(),
+        None => nodes.iter().filter(|n| cmd.copies.admits(n.member.as_ref())).collect(),
     };
     if targets.is_empty() {
         // No matching rows is a soft no-op, not a failure. Happens
@@ -631,6 +639,7 @@ async fn execute(
                             Some(cmd.id),
                             cmd.project_id,
                             &n.node_id,
+                            n.member.as_ref(),
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopping,
                             None,
@@ -657,6 +666,7 @@ async fn execute(
                             Some(cmd.id),
                             cmd.project_id,
                             &n.node_id,
+                            n.member.as_ref(),
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopped,
                             None,
@@ -710,6 +720,7 @@ async fn execute(
                         .event_record(
                             cmd.project_id,
                             Some(&n.node_id),
+                            n.member.as_ref(),
                             weft_broker_client::protocol::InfraEvent::Stopped,
                         )
                         .await?;
@@ -753,6 +764,7 @@ async fn execute(
                         Some(cmd.id),
                         cmd.project_id,
                         &n.node_id,
+                        n.member.as_ref(),
                         None,
                         weft_broker_client::protocol::InfraNodeStatus::Terminating,
                         None,
@@ -791,7 +803,7 @@ async fn execute(
                 // taken down.
                 if !state
                     .broker
-                    .remove_node(&state.pod_name, cmd.project_id, &n.node_id)
+                    .remove_node(&state.pod_name, cmd.project_id, &n.node_id, n.member.as_ref(), cmd.id)
                     .await?
                     .is_applied()
                 {
@@ -812,6 +824,7 @@ async fn execute(
                     .event_record(
                         cmd.project_id,
                         Some(&n.node_id),
+                        n.member.as_ref(),
                         weft_broker_client::protocol::InfraEvent::Terminated,
                     )
                     .await?;
@@ -823,7 +836,7 @@ async fn execute(
             // verb a compile error rather than a silent fallthrough.
             unreachable!("Apply is routed before the verb match");
         }
-        InfraLifecycleVerb::Deactivate | InfraLifecycleVerb::Reactivate => {
+        InfraLifecycleVerb::Deactivate | InfraLifecycleVerb::Reactivate | InfraLifecycleVerb::Upgrade => {
             // The supervisor's `claim_command` filters these out
             // (they're dispatcher-claimable); if one ever lands
             // here it's a routing bug at the broker, fail loud.
@@ -844,6 +857,14 @@ async fn execute_apply(
         .node_id
         .as_deref()
         .ok_or_else(|| anyhow!("apply command missing node_id"))?;
+    // An apply builds exactly one copy: the shared one, or one member's.
+    let member = match &cmd.copies {
+        weft_core::member::Copies::Shared => None,
+        weft_core::member::Copies::Member(m) => Some(m),
+        weft_core::member::Copies::Every => {
+            return Err(anyhow!("apply command names every copy; an apply builds exactly one"))
+        }
+    };
     let spec_value = cmd
         .spec_json
         .as_ref()
@@ -868,9 +889,7 @@ async fn execute_apply(
 
     // Per-(project, node) image tag map, used to resolve
     // `Image::Local { name }` references at compile time. Converted
-    // to `BTreeMap` so the downstream `hash_spec` walk is
-    // deterministic (HashMap iteration order would randomize the
-    // hash).
+    // to `BTreeMap` so compile resolves it deterministically.
     let image_tags_unsorted = state
         .broker
         .project_image_tags(cmd.project_id, node_id)
@@ -884,7 +903,7 @@ async fn execute_apply(
         .infra_nodes(cmd.project_id)
         .await?
         .into_iter()
-        .find(|n| n.node_id == node_id);
+        .find(|n| n.node_id == node_id && n.member.as_ref() == member);
 
     // Mint or reuse instance_id BEFORE the compile so the hash we
     // compute is the same one we'll write on success.
@@ -921,13 +940,12 @@ async fn execute_apply(
         install: &state.install,
     };
 
-    // Hash the typed spec FIRST (with image_tags mixed in) so the
-    // skip-vs-replace decision is stable across compile.rs changes.
-    // Then compile to manifests for kubectl apply.
-    let applied_spec_hash = infra::hash_spec(&spec, &image_tags)
-        .map_err(|e| anyhow!("hash_spec: {e}"))?;
+    // Compile, then hash exactly what will be applied: a spec edit, a
+    // rebuilt local image and a change to how weft compiles a unit all
+    // change the manifests, so all three defeat the skip below.
     let manifests = infra::compile(&spec, &compile_ctx)
         .map_err(|e| anyhow!("compile: {e}"))?;
+    let applied_spec_hash = infra::hash_manifests(&manifests);
 
     // Per-unit apply. Reconcile only the units that are DOWN (or new);
     // leave UP units (Running/Flaky) frozen at their current version,
@@ -961,6 +979,7 @@ async fn execute_apply(
             .event_record(
                 cmd.project_id,
                 Some(node_id),
+                member,
                 weft_broker_client::protocol::InfraEvent::Started(
                     weft_broker_client::protocol::StartedPayload {
                         instance_id: instance_id.clone(),
@@ -1005,6 +1024,7 @@ async fn execute_apply(
                 Some(cmd.id),
                 cmd.project_id,
                 node_id,
+                member,
                 None,
                 weft_broker_client::protocol::InfraNodeStatus::Terminating,
                 None,
@@ -1055,6 +1075,7 @@ async fn execute_apply(
             cmd.id,
             cmd.project_id,
             node_id,
+            member,
             &instance_id,
             &namespace,
             spec.lifecycle.on_terminate.preserve_pvcs.clone(),
@@ -1170,6 +1191,7 @@ async fn execute_apply(
                     Some(cmd.id),
                     cmd.project_id,
                     node_id,
+                    member,
                     None, // apply failure fails the whole node, all units
                     weft_broker_client::protocol::InfraNodeStatus::Failed,
                     Some(weft_broker_client::protocol::FailureStage::Apply),
@@ -1195,6 +1217,7 @@ async fn execute_apply(
             cmd.id,
             cmd.project_id,
             node_id,
+            member,
             &instance_id,
             &applied_spec_hash,
             addresses,
@@ -1233,6 +1256,7 @@ async fn execute_apply(
         .event_record(
             cmd.project_id,
             Some(node_id),
+            member,
             weft_broker_client::protocol::InfraEvent::Started(
                 weft_broker_client::protocol::StartedPayload {
                     instance_id: instance_id.clone(),
@@ -1404,6 +1428,8 @@ mod tests {
                 flaky_after_seconds: 1,
                 recovery_after_seconds: 1,
                 image_refs: refs.iter().map(|s| s.to_string()).collect(),
+                watched: true,
+                scaled_to: None,
             }
         }
 
@@ -1508,5 +1534,57 @@ mod tests {
         // post-readiness row is rebuilt from the CURRENT spec only, so
         // it disappears here (and with it, its ref leaves the keep-set).
         assert!(!applied.contains_key("gone"));
+    }
+    /// Where a unit's `scaled_to` comes from at apply: a reconciled unit
+    /// whose spec asks for zero (a fixed 0, or an autoscale floor of 0)
+    /// is stamped `Some(0)`, so its zero reads as intended; one asking
+    /// for replicas is stamped `None`, clearing a protocol's old scale;
+    /// a frozen unit keeps what a protocol set, since its workload does.
+    #[test]
+    fn resolve_units_stamps_where_the_replicas_come_from() {
+        use std::collections::{BTreeMap, HashSet};
+        use weft_broker_client::protocol::{InfraNodeStatus, UnitRuntime};
+        use weft_core::infra::*;
+
+        let unit = |name: &str, scaling: ScalingPolicy| Unit {
+            name: name.into(),
+            containers: vec![Container::new("c", Image::Upstream { reference: "busybox:1".into() })],
+            scaling,
+            ..Default::default()
+        };
+        let fixed = |replicas| ScalingPolicy { replicas, autoscale: None };
+        let spec = InfraSpec {
+            units: vec![
+                unit("frozen", fixed(1)),
+                unit("spec-zero", fixed(0)),
+                unit("floor-zero", ScalingPolicy {
+                    replicas: 1,
+                    autoscale: Some(AutoscaleSpec { min_replicas: 0, max_replicas: 3, metrics: vec![], behavior: None }),
+                }),
+                unit("scaled-before", fixed(2)),
+            ],
+            ..Default::default()
+        };
+        let runtime = |scaled_to| UnitRuntime {
+            status: InfraNodeStatus::Running,
+            stop_behavior: weft_core::StopBehavior::ScaleToZero,
+            flaky_after_seconds: 1,
+            recovery_after_seconds: 1,
+            image_refs: Default::default(),
+            watched: true,
+            scaled_to,
+        };
+        let mut prior = BTreeMap::new();
+        prior.insert("frozen".to_string(), runtime(Some(0)));
+        prior.insert("scaled-before".to_string(), runtime(Some(0)));
+        let reconciled: HashSet<String> =
+            ["spec-zero", "floor-zero", "scaled-before"].into_iter().map(String::from).collect();
+
+        let applied =
+            resolve_units(&spec, "n1", &prior, &reconciled, InfraNodeStatus::Running, &BTreeMap::new(), false).unwrap();
+        assert_eq!(applied["frozen"].scaled_to, Some(0), "a frozen unit keeps its protocol scale");
+        assert!(applied["spec-zero"].zero_replicas_intended());
+        assert!(applied["floor-zero"].zero_replicas_intended());
+        assert_eq!(applied["scaled-before"].scaled_to, None, "a reconciled unit runs what its spec asks");
     }
 }

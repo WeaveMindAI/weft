@@ -1251,6 +1251,7 @@ mod tests {
             journal_mode: crate::signal::JournalMode::Journaled,
             journal_window_secs: None,
             window: None,
+            recorded: true,
         };
         let rc = CallerRuntimeConfig::from_config(&cfg, Protocol::Websocket);
         assert_eq!(rc.protocol, Protocol::Websocket);

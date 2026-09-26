@@ -51,6 +51,13 @@ A permission a recipe marks as only working on your own account can never be
 served by the runtime's credential. The editor greys that option out and
 resolution refuses it.
 
+## A member's own connections
+
+In a program with members, an access step whose connection is written
+`account: @member_filled` holds no connection in the source: each member
+connects their own, and a run for them uses it. For how that works, go and read
+[programs with members](../running/members.md#what-a-member-fills-member_filled).
+
 ## What weft can actually tell you about a credential
 
 Providers differ in how much they admit, and weft records which kind of answer

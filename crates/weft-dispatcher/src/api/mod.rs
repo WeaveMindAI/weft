@@ -50,7 +50,6 @@ pub mod execution;
 mod events;
 mod provider_events;
 mod signal_token;
-mod signal_token_names;
 pub(crate) mod infra;
 mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
@@ -59,6 +58,7 @@ mod display;
 // exercises against a real Postgres.
 pub mod signal;
 pub mod access;
+pub mod member_door;
 pub mod node_tests;
 pub mod storage;
 pub mod versions;
@@ -105,6 +105,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         // the build gate polls) + interrupts the local builder job.
         .route("/projects/{id}/cancel-build", post(project::cancel_build))
         .route("/projects/{id}/deactivate", post(project::deactivate))
+        .route("/projects/{id}/quiesce", post(project::quiesce))
         // While the project is in `deactivating`, this endpoint
         // cancels every running, non-suspended execution; the
         // journal-bridge drain-watcher then CASes status to
@@ -116,6 +117,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         // All three CLI verbs POST here; the dispatcher uses the
         // resolved-spec-hash to decide skip-vs-apply per node.
         .route("/projects/{id}/infra/sync", post(infra::sync))
+        .route("/projects/{id}/infra/upgrade", post(infra::upgrade))
         .route("/projects/{id}/infra/stop", post(infra::stop))
         .route("/projects/{id}/infra/terminate", post(infra::terminate))
         // Cancel in-flight infra work: halt claimed lifecycle commands
@@ -146,6 +148,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             get(execution::get).delete(execution::delete_execution),
         )
         .route("/executions", get(execution::list_executions))
+        .route("/executions/clean", post(execution::clean))
         .route("/events/project/{id}", get(events::project_stream))
         .route("/events/project/{id}/displays", get(events::display_stream))
         .route("/events/execution/{color}", get(events::execution_stream))
@@ -220,6 +223,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
 /// the surface contract, attached here rather than left to composition. The
 /// composition-time `cors` on [`core_routes`] governs only the tenant/admin
 /// surface.
+// SYNC: the doors <-> packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
 fn outside_caller_routes() -> Router<DispatcherState> {
     Router::new()
         .route(
@@ -245,6 +249,19 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             get(signal::signal_file_for_token),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
+        // The member door: one member of one program, with their member
+        // token in `Authorization: Bearer` (see `api/member_door.rs`).
+        .route("/member/fields", get(member_door::fields))
+        .route("/member/values", axum::routing::put(member_door::set_values))
+        .route("/member/lookup", post(member_door::lookup))
+        .route("/member/picker", post(member_door::picker))
+        .route("/member/connections", get(member_door::list_connections))
+        .route("/member/connections/{id}", axum::routing::delete(member_door::delete_connection))
+        .route("/member/connections/direct", post(member_door::connect_direct))
+        .route("/member/connections/begin", post(member_door::connect_begin))
+        .route("/member/connections/status", get(member_door::connect_status))
+        .route("/member/doors", post(member_door::doors))
+        .route("/member/runs", get(member_door::runs))
         // What a node is SHOWING, for a client built on top of a weft
         // program (a website that renders the bridge's QR code rather
         // than sending its user to the editor). The same two feeds the

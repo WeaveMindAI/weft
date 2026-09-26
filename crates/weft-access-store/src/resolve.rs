@@ -71,11 +71,11 @@ pub fn permission_shortfall<'r>(
 /// a policy of the capability, not a provider-reported scope.
 /// `Some(reason)` = refuse.
 pub fn own_only_refusal(
-    owner: weft_core::CredentialOwner,
+    owner: &weft_core::CredentialOwner,
     spec: &AccessSpec,
     required: &[String],
 ) -> Option<String> {
-    if owner != weft_core::CredentialOwner::Ours {
+    if !owner.is_platform() {
         return None;
     }
     let p = spec.permissions.iter().find(|p| p.own_only && required.contains(&p.id))?;
@@ -121,6 +121,41 @@ struct WalledGrant {
     provider_account: Option<String>,
 }
 
+/// Who is about to use a connection. A member's connection is theirs,
+/// in their project, alone: only a run for that member of that project
+/// (or that member at their own door) may use it. Anyone else, the
+/// author's editor, a run for nobody, another member's run, reads it as
+/// not there. Every other connection is the tenant's, usable by any of
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantUser<'a> {
+    /// The author, or a run for nobody in particular.
+    Author,
+    Member { project_id: uuid::Uuid, member: &'a weft_core::member::MemberId },
+}
+
+impl<'a> GrantUser<'a> {
+    /// The user a carried scope names: that member, or the author.
+    pub fn of(scope: Option<&'a weft_core::member::MemberScope>) -> Self {
+        match scope {
+            Some(scope) => GrantUser::Member { project_id: scope.project_id, member: &scope.member },
+            None => GrantUser::Author,
+        }
+    }
+
+    /// Whether this user may use a connection whose row says
+    /// `row_project` / `row_member`.
+    fn may_use(&self, row_project: Option<uuid::Uuid>, row_member: Option<&str>) -> bool {
+        match (row_member, self) {
+            (None, _) => true,
+            (Some(_), GrantUser::Author) => false,
+            (Some(row_member), GrantUser::Member { project_id, member }) => {
+                row_project == Some(*project_id) && row_member == member.as_str()
+            }
+        }
+    }
+}
+
 /// Whether a walled read runs the lazy refresh. A `Stored` read is a
 /// pure read (no row lock, no provider call): what an editor lookup
 /// wants, where holding the row's write lock across a provider's HTTP
@@ -141,6 +176,7 @@ enum Freshness {
 async fn read_walled_grant(
     pool: &PgPool,
     tenant: &str,
+    user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     required_permissions: &[String],
@@ -153,7 +189,7 @@ async fn read_walled_grant(
     // queueing). A Stored read takes no lock: it writes nothing.
     const COLUMNS: &str = "SELECT tenant_id, service, registration_sealed, spec_json, \
                            values_sealed, granted_scopes, permissions_verified, owner, door, \
-                           identity, provider_account, expires_at \
+                           identity, provider_account, expires_at, member_id, project_id \
                            FROM access_grant WHERE id = $1";
     #[allow(clippy::type_complexity)]
     type Row = (
@@ -169,6 +205,8 @@ async fn read_walled_grant(
         Option<String>,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+        Option<uuid::Uuid>,
     );
     let mut tx = None;
     let row: Option<Row> = match freshness {
@@ -198,11 +236,14 @@ async fn read_walled_grant(
         identity,
         provider_account,
         expires_at,
+        member,
+        row_project,
     )) = row
     else {
         return Err(AccessError::NotFound.into());
     };
-    if row_tenant != tenant {
+    // Somebody else's reads the same as none at all: no existence leak.
+    if row_tenant != tenant || !user.may_use(row_project, member.as_deref()) {
         return Err(AccessError::NotFound.into());
     }
     if row_service != service {
@@ -212,7 +253,7 @@ async fn read_walled_grant(
         ))
         .into());
     }
-    let owner = crate::owner_of(&owner)?;
+    let owner = crate::owner_of(&owner, member.as_deref())?;
     let door = crate::door_of(&door)?;
     let granted = scopes_of(&granted);
     if let Some(missing) = permission_shortfall(verified, &granted, required_permissions) {
@@ -227,7 +268,7 @@ async fn read_walled_grant(
     }
 
     let spec = spec_of(&spec_json)?;
-    if let Some(reason) = own_only_refusal(owner, &spec, required_permissions) {
+    if let Some(reason) = own_only_refusal(&owner, &spec, required_permissions) {
         return Err(AccessError::NeedsReconnect { service: service.to_string(), reason }.into());
     }
     let registration = registration_sealed
@@ -296,13 +337,14 @@ async fn read_walled_grant(
 pub async fn resolve_for_worker(
     pool: &PgPool,
     tenant: &str,
+    user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     required_permissions: &[String],
     required_values: &[String],
 ) -> anyhow::Result<ResolvedAccess> {
     let grant =
-        read_walled_grant(pool, tenant, access_id, service, required_permissions, Freshness::Refreshed)
+        read_walled_grant(pool, tenant, user, access_id, service, required_permissions, Freshness::Refreshed)
             .await?;
     worker_handoff(grant, service, required_values)
 }
@@ -387,12 +429,13 @@ fn worker_handoff(
 pub async fn resolve_event_source(
     pool: &PgPool,
     tenant: &str,
+    user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     required_values: &[String],
 ) -> anyhow::Result<ResolvedEventSource> {
     let grant =
-        read_walled_grant(pool, tenant, access_id, service, &[], Freshness::Refreshed).await?;
+        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Refreshed).await?;
     // A recipe value may live on the GRANT (a pasted token) or on the
     // APP the connection was made through. The app's values join ONLY
     // for an own-door grant, where the app is the user's; a
@@ -440,11 +483,12 @@ pub struct CallerVerifier {
 pub async fn caller_verifier(
     pool: &PgPool,
     tenant: &str,
+    user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
 ) -> anyhow::Result<CallerVerifier> {
     let grant =
-        read_walled_grant(pool, tenant, access_id, service, &[], Freshness::Stored).await?;
+        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     let values = grant.spec.handoff_values(&grant.values);
     Ok(CallerVerifier { verify: grant.spec.verify.clone(), values })
 }
@@ -852,57 +896,7 @@ pub(crate) async fn mint_and_exchange(
 
 // ---------- Editor resource lookups ----------
 
-/// One page of lookup options, as the editor renders them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LookupPage {
-    pub items: Vec<LookupItem>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LookupItem {
-    pub id: String,
-    pub label: String,
-}
-
-/// One `remote_select` lookup request as it travels the wire: the
-/// editor posts it to the dispatcher, and the dispatcher forwards it
-/// (tenant-wrapped) to the broker, which makes the outbound call.
-/// ONE definition so the two hops cannot drift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LookupRequest {
-    /// The connection to sign with; `None` for a `public` lookup (no
-    /// connection is involved at all, and `service` may be empty).
-    #[serde(default)]
-    pub access_id: Option<uuid::Uuid>,
-    #[serde(default)]
-    pub service: String,
-    /// The widget's declarative lookup, verbatim from the node's
-    /// (compiler-resolved) metadata.
-    pub lookup: Lookup,
-    #[serde(default)]
-    pub query: String,
-    /// Picked parent values for drill-down (`depends_on`).
-    #[serde(default)]
-    pub parents: BTreeMap<String, String>,
-    #[serde(default)]
-    pub cursor: Option<String>,
-}
-
-/// A `granted` resource-source read as it travels the wire (editor ->
-/// dispatcher -> broker): which connection, and which stored capture's
-/// id/label pairs to read. ONE definition so the hops cannot drift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantedQuery {
-    pub access_id: uuid::Uuid,
-    pub service: String,
-    /// The stored value (captured at connect) holding the JSON array.
-    pub from: String,
-    /// Dotted path to one item's label (same vocabulary as [`Lookup`]).
-    pub label: String,
-    /// Dotted path to one item's id.
-    pub value: String,
-}
+pub use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, LookupRequest};
 
 /// Read a `granted` resource source off the connection row: the stored
 /// value `from` (captured at connect) parsed as a JSON array;
@@ -912,6 +906,7 @@ pub struct GrantedQuery {
 pub async fn granted_items(
     pool: &PgPool,
     tenant: &str,
+    user: GrantUser<'_>,
     access_id: uuid::Uuid,
     service: &str,
     from: &str,
@@ -925,7 +920,7 @@ pub async fn granted_items(
     // refresh (a dropdown click would stall running work on the same
     // connection).
     let grant =
-        read_walled_grant(pool, tenant, access_id, service, &[], Freshness::Stored).await?;
+        read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     let Some(raw) = grant.values.get(from) else {
         // The connection recorded nothing under that name: an empty
         // list, so the editor falls through to the next source.
@@ -1176,15 +1171,15 @@ mod tests {
             ],
         }))
         .expect("spec parses");
-        use weft_core::CredentialOwner::{Ours, TheirOwn};
+        use weft_core::CredentialOwner::{Author as TheirOwn, Platform as Ours};
         let need = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let reason =
-            own_only_refusal(Ours, &spec, &need(&["voice_lab"])).expect("Ours is refused");
+            own_only_refusal(&Ours, &spec, &need(&["voice_lab"])).expect("Ours is refused");
         assert!(reason.contains("Voice creation"), "{reason}");
         assert!(reason.contains("https://example/voices"), "{reason}");
-        assert_eq!(own_only_refusal(Ours, &spec, &need(&["generate"])), None);
-        assert_eq!(own_only_refusal(TheirOwn, &spec, &need(&["voice_lab"])), None);
-        assert_eq!(own_only_refusal(Ours, &spec, &[]), None);
+        assert_eq!(own_only_refusal(&Ours, &spec, &need(&["generate"])), None);
+        assert_eq!(own_only_refusal(&TheirOwn, &spec, &need(&["voice_lab"])), None);
+        assert_eq!(own_only_refusal(&Ours, &spec, &[]), None);
     }
 }

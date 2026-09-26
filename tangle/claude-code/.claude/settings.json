@@ -47,6 +47,14 @@
       "Bash(weft infra upgrade:*)",
       "Bash(weft infra status)",
       "Bash(weft infra node-stop:*)",
+      "Bash(weft infra show:*)",
+      "Bash(weft infra press:*)",
+      "Bash(weft infra env:*)",
+      "Bash(weft infra --json:*)",
+      "Bash(weft infra logs:*)",
+      "Bash(weft infra list-doors:*)",
+      "Bash(weft infra status:*)",
+      "Bash(cd:*)",
       "Bash(weft test-node:*)",
       "Bash(weft node-test-hash:*)",
       "Bash(weft files ls:*)",
@@ -66,8 +74,8 @@
       "Bash(weft resync:*)",
       "Bash(weft rm:*)",
       "Bash(weft clean:*)",
-      "Bash(weft prune:*)"
+      "Bash(weft prune:*)",
+      "Bash(weft options:*)"
     ]
-
   }
 }

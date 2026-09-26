@@ -98,7 +98,9 @@ pub struct Task {
     pub status: TaskStatus,
     pub project_id: Option<Uuid>,
     pub color: Option<String>,
-    pub tenant_id: Option<String>,
+    /// The tenant the task belongs to: every task has one, and the dedup
+    /// uniqueness is scoped by it.
+    pub tenant_id: String,
     /// Requested executable, retained when claimed and handed to a spawn handler.
     pub binary_hash: Option<String>,
     /// How many times this row has been claimed, INCLUDING the claim
@@ -125,7 +127,10 @@ pub struct NewTask {
     pub project_id: Option<Uuid>,
     pub dedup_key: Option<String>,
     pub color: Option<String>,
-    pub tenant_id: Option<String>,
+    /// The tenant the task belongs to: required, because the dedup
+    /// uniqueness is scoped by it (a NULL tenant would never dedup) and
+    /// every task is somebody's.
+    pub tenant_id: String,
     /// If set, only the named pod can claim this task. Used by
     /// `cancel_execution` so a multi-pod project pool routes the
     /// cancel to the pod that owns the running color, not whoever
@@ -230,7 +235,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             project_id UUID,
             dedup_key TEXT,
             color TEXT,
-            tenant_id TEXT,
+            tenant_id TEXT NOT NULL,
             target_pod_name TEXT,
             binary_hash TEXT,
             payload JSONB NOT NULL,
@@ -267,9 +272,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_task_color
             ON task(color)
             WHERE color IS NOT NULL"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_task_tenant
-            ON task(tenant_id)
-            WHERE tenant_id IS NOT NULL"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_task_tenant ON task(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_project
             ON task(project_id)
             WHERE project_id IS NOT NULL"#,
@@ -326,7 +329,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(spec.project_id)
     .bind(spec.dedup_key.as_deref())
     .bind(spec.color.as_deref())
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(spec.target_pod_name.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
@@ -372,7 +375,7 @@ pub async fn enqueue_dedup_in(
     // a tenant boundary. (`tenant_id IS NOT DISTINCT FROM $3` so a
     // NULL-tenant task dedups against other NULL-tenant tasks, matching
     // how the unique index treats them.)
-    let tenant = spec.tenant_id.as_deref().unwrap_or("");
+    let tenant = spec.tenant_id.as_str();
     let lock_input = format!("{}|{}|{}", tenant, spec.kind.as_str(), dedup);
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
@@ -385,7 +388,7 @@ pub async fn enqueue_dedup_in(
              AND kind = $2 AND dedup_key = $3 AND status IN ('pending', 'claimed')
            LIMIT 1"#,
     )
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(spec.kind.as_str())
     .bind(dedup)
     .fetch_optional(&mut *conn)
@@ -408,7 +411,7 @@ pub async fn enqueue_dedup_in(
     .bind(spec.project_id)
     .bind(dedup)
     .bind(spec.color.as_deref())
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(spec.target_pod_name.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
@@ -433,7 +436,7 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
         .dedup_key
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("enqueue_or_rearm requires dedup_key"))?;
-    let lock_input = format!("{}|{}|{}", spec.tenant_id.as_deref().unwrap_or(""), spec.kind.as_str(), dedup);
+    let lock_input = format!("{}|{}|{}", spec.tenant_id.as_str(), spec.kind.as_str(), dedup);
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
         .execute(&mut *tx)
@@ -448,7 +451,7 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
              AND kind = $2 AND dedup_key = $3 AND status = 'claimed'
            RETURNING id"#,
     )
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(spec.kind.as_str())
     .bind(dedup)
     .fetch_optional(&mut *tx)
@@ -545,7 +548,7 @@ pub async fn admit_live_execution_in(
              AND t.status IN ('pending', 'claimed')
            LIMIT 1"#,
     )
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(dedup)
     .fetch_optional(&mut *conn)
     .await?;
@@ -587,7 +590,7 @@ pub async fn admit_live_execution_in(
     .bind(project_id)
     .bind(dedup)
     .bind(color)
-    .bind(spec.tenant_id.as_deref())
+    .bind(spec.tenant_id.as_str())
     .bind(&pod_name)
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
@@ -1134,7 +1137,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         .ok_or_else(|| anyhow::anyhow!("unknown task status '{status_str}'"))?;
     let project_id: Option<Uuid> = row.try_get("project_id")?;
     let color: Option<String> = row.try_get("color")?;
-    let tenant_id: Option<String> = row.try_get("tenant_id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
     let binary_hash: Option<String> = row.try_get("binary_hash")?;
     let attempts: i32 = row.try_get("attempts")?;
     let payload: Value = row.try_get("payload")?;
@@ -1175,7 +1178,7 @@ mod wire_tests {
             project_id: Some(Uuid::from_u128(1)),
             dedup_key: Some("d1".to_string()),
             color: Some("c1".to_string()),
-            tenant_id: Some("t1".to_string()),
+            tenant_id: "t1".to_string(),
             target_pod_name: Some("pod-0".to_string()),
             binary_hash: Some("abc123".to_string()),
             payload: serde_json::json!({ "a": 1, "nested": [true, null] }),
@@ -1209,7 +1212,7 @@ mod wire_tests {
             "project_id": null,
             "dedup_key": null,
             "color": null,
-            "tenant_id": null,
+            "tenant_id": "t",
             "target_pod_name": null,
             "payload": {}
         }"#;
@@ -1225,7 +1228,7 @@ mod wire_tests {
             status: TaskStatus::Pending,
             project_id: None,
             color: None,
-            tenant_id: None,
+            tenant_id: "t".into(),
             binary_hash: Some("original-image".into()),
             attempts: 2,
             payload: serde_json::json!(null),
@@ -1244,6 +1247,23 @@ mod wire_tests {
         assert!(json.contains("\"status\":\"pending\""));
     }
 
+    /// Every task is somebody's: a task naming no tenant is refused on
+    /// the wire, never stored as one that would never dedup.
+    #[test]
+    fn a_task_without_a_tenant_is_refused() {
+        let json = r#"{
+            "kind": "fire_signal",
+            "target": "dispatcher",
+            "project_id": null,
+            "dedup_key": null,
+            "color": null,
+            "tenant_id": null,
+            "target_pod_name": null,
+            "payload": {}
+        }"#;
+        assert!(serde_json::from_str::<NewTask>(json).is_err());
+    }
+
     #[test]
     fn task_tolerates_an_omitted_attempts() {
         // `#[serde(default)]` on `attempts`: a producer that omits the
@@ -1255,7 +1275,7 @@ mod wire_tests {
             "status": "pending",
             "project_id": null,
             "color": null,
-            "tenant_id": null,
+            "tenant_id": "t",
             "payload": {}
         }"#;
         let back: Task = serde_json::from_str(json).unwrap();

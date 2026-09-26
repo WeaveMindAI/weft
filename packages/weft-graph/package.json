@@ -29,6 +29,7 @@
     "@codemirror/view": "^6.43.13",
     "@lucide/svelte": "^1.47.0",
     "@uiw/codemirror-theme-github": "^4.25.11",
+    "@weft/connect": "link:../weft-connect",
     "bits-ui": "^2.19.2",
     "clsx": "^2.1.1",
     "codemirror": "^6.0.2",

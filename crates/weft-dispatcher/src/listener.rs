@@ -267,6 +267,7 @@ spec:
     spec:
       serviceAccountName: weft-listener-sa
       automountServiceAccountToken: false
+      {dns_config}
       containers:
         - name: listener
           image: {image}
@@ -328,6 +329,7 @@ spec:
       targetPort: 8080
 "#,
         time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
+        dns_config = weft_core::pod_dns::pod_dns_config_yaml(),
         time_scale = weft_core::time_scale::factor(),
     )
 }
@@ -392,6 +394,7 @@ pub async fn register_signal(
     handle: &ListenerHandle,
     token: &str,
     tenant_id: &str,
+    for_member: Option<&weft_core::member::MemberScope>,
     spec: &SignalSpec,
     node_id: &str,
     is_resume: bool,
@@ -407,6 +410,7 @@ pub async fn register_signal(
     let req = weft_core::signal::listener_protocol::RegisterRequest {
         token: token.to_string(),
         tenant_id: tenant_id.to_string(),
+        for_member: for_member.cloned(),
         spec: spec.clone(),
         node_id: node_id.to_string(),
         is_resume,
@@ -736,10 +740,12 @@ impl ListenerPool {
             Option<Value>,
             Value,
             i64,
+            uuid::Uuid,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT tenant_id, node_id, spec_json, is_resume, color, \
                     surface_kind, mount_path, mount_methods, auth_kind, auth_config, kind_state, \
-                    kind_state_seq \
+                    kind_state_seq, project_id, member_id \
              FROM signal WHERE token = $1",
         )
         .bind(token)
@@ -758,6 +764,8 @@ impl ListenerPool {
             auth_config,
             kind_state,
             kind_state_seq,
+            project_id,
+            member_id,
         )) = row
         else {
             anyhow::bail!(
@@ -767,6 +775,8 @@ impl ListenerPool {
         };
         let spec: SignalSpec = serde_json::from_str(&spec_json)
             .with_context(|| format!("parse spec_json for re-placing signal {token}"))?;
+        let for_member = weft_core::member::MemberScope::from_columns(project_id, member_id)
+            .map_err(|e| anyhow::anyhow!("corrupt member_id on signal {token}: {e}"))?;
         let routing = {
             let surface: weft_broker_client::protocol::SignalSurfaceKind =
                 serde_json::from_value(Value::String(surface_kind))
@@ -795,6 +805,7 @@ impl ListenerPool {
                 let spec = spec.clone();
                 let node_id = node_id.clone();
                 let tenant_id = tenant_id.clone();
+                let for_member = for_member.clone();
                 let color = color.clone();
                 let routing = routing.clone();
                 let kind_state = kind_state.clone();
@@ -803,6 +814,7 @@ impl ListenerPool {
                         &handle,
                         &token_owned,
                         &tenant_id,
+                        for_member.as_ref(),
                         &spec,
                         &node_id,
                         is_resume,
@@ -1541,5 +1553,9 @@ mod tests {
         // `app: <name>`, which the pod template carries.
         assert!(yaml.contains("app: listener-x"));
         assert!(yaml.contains("weft.dev/role: listener"));
+        assert!(
+            yaml.contains(&format!("\n      {}\n      containers:", weft_core::pod_dns::pod_dns_config_yaml())),
+            "ndots:1 at the pod spec level"
+        );
     }
 }

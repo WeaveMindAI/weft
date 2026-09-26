@@ -2,6 +2,8 @@
 //! and cleanup. Graph view replay is an extension command; these are
 //! the scripting surface.
 
+use anyhow::Context;
+
 use super::{local_time, Ctx};
 use crate::commands::daemon::ClusterBackend;
 
@@ -48,6 +50,12 @@ async fn executions_page(
     if let Some(status) = &filter.status {
         path.push_str(&format!("&status={status}"));
     }
+    if let Some(member) = &filter.member {
+        path.push_str(&format!("&member={member}"));
+    }
+    if let Some(tag) = &filter.tag {
+        path.push_str(&format!("&tag={}", query_escaped(tag)));
+    }
     let resp: serde_json::Value = client.get_json(&path).await?;
     let rows = resp
         .get("executions")
@@ -78,6 +86,10 @@ pub struct ListFilter {
     pub since: Option<u64>,
     /// How the run ended: completed, failed, cancelled, or running.
     pub status: Option<String>,
+    /// Who the run is for.
+    pub member: Option<weft_core::member::MemberId>,
+    /// A tag the run carries.
+    pub tag: Option<String>,
 }
 
 pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
@@ -109,8 +121,14 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
             .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
             .unwrap_or_default();
         let tags = if tags.is_empty() { String::new() } else { format!("  {}", tags.join(",")) };
+        // Who the run is for, when it is for a member.
+        let member = row
+            .get("member")
+            .and_then(|v| v.as_str())
+            .map(|m| format!("  (member {m})"))
+            .unwrap_or_default();
         println!(
-            "{color:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}",
+            "{color:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{member}",
             local_time(started)
         );
     }
@@ -151,12 +169,16 @@ impl EventsFilter {
     /// definition the spelling is taken as the id itself. A node of an
     /// included file has no spelling of its own: it is always named
     /// through a site.
-    pub fn resolve_node(&mut self, project: &weft_core::ProjectDefinition) -> anyhow::Result<()> {
+    pub fn resolve_node(
+        &mut self,
+        project: &weft_compiler::project::Project,
+        definition: &weft_core::ProjectDefinition,
+    ) -> anyhow::Result<()> {
         if let Some(spelled) = &self.node {
             // A node or a group: `--node gate` names a group, whose own
             // two boundaries are its rows too (see `keeps`), so a group
             // is taken here where the daemon-facing commands refuse it.
-            let (id, call_path) = match super::resolve_spelling(project, spelled)? {
+            let (id, call_path) = match super::resolve_spelling(project, definition, spelled)? {
                 super::Spelled::Node { id, call_path } | super::Spelled::Group { id, call_path } => (id, call_path),
             };
             self.node = Some(id);
@@ -320,17 +342,58 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
 
 pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow::Result<()> {
     let color = super::resolve_color(&ctx, &color).await?;
+    let client = ctx.client();
     // `--node` is spelled through the call sites, the way the program
     // reads; the project's compiled definition says which id and which
     // call path that is, and the rows print their node the same way.
-    // Outside a project the spelling is the id and the rows show ids.
-    let definition = ctx.project().ok()
-        .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
-        .map(|(definition, _)| definition);
-    if let Some(definition) = &definition {
-        filter.resolve_node(definition)?;
-    }
-    let client = ctx.client();
+    // That definition is this folder's project, so it only reads a run
+    // of that same project: another project's run shows ids, and a
+    // `--node` for it is refused, since this folder's spellings name
+    // other nodes. Outside a project the spelling is the id and the
+    // rows show ids. A project here that does not load (a compile
+    // error, a bad `weft.toml`) only stops a `--node` filter, which
+    // cannot be read without it; the journal itself still prints, by
+    // id, saying why.
+    let loaded = ctx.project_here().and_then(|here| match here {
+        Some(project) => {
+            let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
+            Ok(Some((project, definition)))
+        }
+        None => Ok(None),
+    });
+    let definition = match loaded {
+        Ok(Some((project, definition))) => {
+            let summary: serde_json::Value = client.get_json(&format!("/executions/{color}")).await?;
+            let run_project = summary
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("/executions/{color} named no project_id: {summary}"))?;
+            if run_project == definition.id.to_string() {
+                filter.resolve_node(project, &definition)?;
+                Some(definition)
+            } else if filter.node.is_some() {
+                anyhow::bail!(
+                    "run {color} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
+                     through this folder's program, so run `weft events` from that project's folder",
+                    definition.id
+                );
+            } else {
+                eprintln!(
+                    "warning: nodes show as ids, because run {color} belongs to project {run_project}, not to this folder's project {}",
+                    definition.id
+                );
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(e) if filter.node.is_some() => {
+            return Err(e.context("`--node` is read the way the program is written, so this folder's project must load"));
+        }
+        Err(e) => {
+            eprintln!("warning: nodes show as ids, because this folder's project did not load: {e:#}");
+            None
+        }
+    };
     let resp: serde_json::Value = client
         .get_json(&format!("/executions/{color}/replay"))
         .await?;
@@ -444,6 +507,18 @@ pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefini
     Some(row)
 }
 
+/// What narrows a bulk clean beyond project and age: the same filters a
+/// program's `ctx.runs()` takes (`weft_core::program::RunFilter`).
+#[derive(Debug, Default)]
+pub struct CleanNarrowing {
+    pub member: Option<weft_core::member::MemberId>,
+    pub status: Option<String>,
+    pub node: Option<String>,
+    pub tag: Option<String>,
+    /// Cancel matching runs still going, instead of leaving them.
+    pub cancel_running: bool,
+}
+
 pub async fn clean(
     ctx: Ctx,
     color: Option<String>,
@@ -452,6 +527,7 @@ pub async fn clean(
     images: bool,
     build_cache: bool,
     project: Option<String>,
+    narrow: CleanNarrowing,
     yes: bool,
 ) -> anyhow::Result<()> {
     if images || build_cache {
@@ -503,30 +579,33 @@ pub async fn clean(
         return Ok(());
     }
 
-    // Bulk clean: page through the listing and delete what the cutoff
-    // selects. Deleting shifts the pages, so every pass re-reads from
-    // offset 0 and stops when a pass deletes nothing (rows it chose to
-    // keep are all that remain).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock past UNIX_EPOCH")
-        .as_secs();
-    // One predicate: `None` = take them all, `Some(c)` = take what
-    // started before c. Naming a SUBJECT means you mean all of it (a
-    // color deletes outright; a project takes its whole history), so
-    // the 30-day default guards only the sweep that names nothing.
-    // `--keep-days` still narrows any of them when asked for.
-    let days = match (keep_days, all, project.is_some()) {
+    // Bulk clean. Naming a SUBJECT means you mean all of it (a color
+    // deletes outright; a project, a member or a tag takes every run it
+    // names), so the 30-day default guards only the sweep that names
+    // nothing. `--keep-days` still narrows any of them when asked for.
+    let named = project.is_some() || narrow.member.is_some() || narrow.tag.is_some();
+    let days = match (keep_days, all, named) {
         (Some(d), _, _) => Some(d),
-        (None, true, _) => None,  // --all: no cutoff, as before
-        (None, false, true) => None,  // a named project: all of its runs
+        (None, true, _) => None,  // --all: no cutoff
+        (None, false, true) => None,  // a named subject: all of its runs
         (None, false, false) => Some(30),  // the unnamed sweep's guard
     };
-    let cutoff = days.map(|d| now.saturating_sub(d as u64 * 24 * 3600));
-    let scope = match &project {
+    let mut scope = match &project {
         Some(p) => format!(" of project {p}"),
         None => String::new(),
     };
+    if let Some(member) = &narrow.member {
+        scope.push_str(&format!(" for member {member}"));
+    }
+    if let Some(tag) = &narrow.tag {
+        scope.push_str(&format!(" tagged {tag}"));
+    }
+    if let Some(status) = &narrow.status {
+        scope.push_str(&format!(" {status}"));
+    }
+    if let Some(node) = &narrow.node {
+        scope.push_str(&format!(" started by {node}"));
+    }
     let subject = match days {
         Some(d) => format!("every execution{scope} older than {d} days"),
         None => format!("every execution{scope}"),
@@ -534,78 +613,36 @@ pub async fn clean(
     if !confirm(subject)? {
         return Ok(());
     }
-    let mut count = 0usize;
-    let mut swept = 0usize;
-    loop {
-        let mut offset = 0u32;
-        let mut deleted_this_pass = 0usize;
-        loop {
-            // The sweep wants every run, so it narrows by project only.
-            let page = ListFilter {
-                limit: 200,
-                offset,
-                project: project.clone(),
-                phase: None,
-                node: None,
-                since: None,
-                status: None,
-            };
-            let (rows, total) = executions_page(&client, &page).await?;
-            if rows.is_empty() {
-                break;
-            }
-            let fetched = rows.len() as u32;
-            for row in rows {
-                let Some(color) = row.get("color").and_then(|v| v.as_str()) else { continue };
-                let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
-                if cutoff.is_none_or(|c| started < c) {
-                    // A failed delete must not hide how far the sweep
-                    // got: what is already gone stays gone.
-                    match client.delete_json(&format!("/executions/{color}")).await {
-                        // The dispatcher sweeps each run's own project as
-                        // it deletes it, so a bulk clean spanning several
-                        // projects leaves none of them holding a bare
-                        // version. This only adds up what it did.
-                        Ok(answer) => {
-                            swept += answer
-                                .get("swept")
-                                .and_then(|v| v.as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0);
-                        }
-                        Err(e) => anyhow::bail!(
-                            "deleted {count} executions, then deleting {color} failed: {e}. \
-                             Re-run to continue the sweep."
-                        ),
-                    }
-                    count += 1;
-                    deleted_this_pass += 1;
-                }
-            }
-            offset += fetched;
-            if u64::from(offset) >= total {
-                break;
-            }
-        }
-        if deleted_this_pass == 0 {
-            break;
-        }
+    let filter = weft_core::program::RunFilter {
+        member: narrow.member,
+        status: narrow.status,
+        node: narrow.node,
+        tag: narrow.tag,
+        older_than_secs: days.map(|d| d as u64 * 24 * 3600),
+    };
+    // The dispatcher deletes what the filter reaches and sweeps the
+    // versions the deletes left bare, project by project; a run still
+    // going follows `--cancel-running` (stopped now, its rows gone with
+    // the next clean) or is left to finish.
+    let body = serde_json::json!({
+        "project": project,
+        "filter": filter,
+        "running": if narrow.cancel_running { "cancel" } else { "wait" },
+    });
+    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/executions/clean", &body).await?)
+        .map_err(|e| anyhow::anyhow!("unexpected /executions/clean answer: {e}"))?;
+    if ctx.json_out(&serde_json::to_value(&answer)?)? {
+        return Ok(());
     }
-    // What was deleted is reported FIRST. The sweep below can fail (a
-    // `--project` the dispatcher will not parse, a project that is not
-    // registered), and failing before this line threw away the one number
-    // the person needed: the rows are already gone, and the loop above
-    // goes to real trouble to keep that count honest when a delete fails
-    // part way.
     match days {
-        Some(d) => println!("deleted {count} executions{scope} older than {d}d"),
-        None => println!("deleted {count} executions{scope} (all)"),
+        Some(d) => println!("deleted {} executions{scope} older than {d}d", answer.deleted),
+        None => println!("deleted {} executions{scope}", answer.deleted),
     }
-    // Versions left with no runs, no descendants, no label, and not
-    // head went with the runs, project by project, as each run was
-    // deleted; a labelled checkpoint is never swept.
-    if swept > 0 {
-        println!("dropped {swept} bare versions");
+    if answer.cancelled > 0 {
+        println!("cancelled {} still running (their rows go with the next clean)", answer.cancelled);
+    }
+    if answer.left_running > 0 {
+        println!("left {} still running (--cancel-running stops them)", answer.left_running);
     }
     Ok(())
 }
@@ -1025,8 +1062,9 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     }).collect();
     println!(
         "worker compile cache: {} across {} cache(s) (one per key and compile lane); a build drops the per-project crates no build on this host \
-         has linked for {} days, `weft clean --images --all` drops another key's spare lanes once unused for a day \
-         and its first lane once unused that long, `weft clean --build-cache` drops everything now",
+         has linked for {} days, `weft clean --images --all` (the last step of `setup.sh`) drops at once the key this checkout \
+         moved off, and another key's spare lanes once unused for a day and its first lane once unused that long, \
+         `weft clean --build-cache` drops everything now",
         sizes.join(" + "),
         caches.len(),
         weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
@@ -1038,30 +1076,94 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
 /// changes with the build environment or the builder, and nothing mounts
 /// the old one again unless a checkout goes back to it (a branch switch),
 /// so its own sweep never runs; this is the only thing that reclaims it.
-/// A key that is not this checkout's may still be another worktree's on
-/// this machine, so a lane goes only once no build has used it for a
-/// while: a spare lane after [`SPARE_LANE_IDLE_DAYS`], the first lane
-/// after the retention period. The current checkout's key is never
-/// dropped, however long since the last build: it is the
-/// one the next build wants.
+///
+/// A key THIS checkout moved off is junk at once: it is dropped whole,
+/// every lane, unless another checkout on this machine still names it as
+/// its own. Each checkout records the key it last swept with (in
+/// [`CACHE_KEYS_DIR`], one file per checkout), which is how an update
+/// through `setup.sh` (whose last step is this sweep) leaves nothing of
+/// the version it replaced. A key no checkout here recorded may still be
+/// another worktree's that never swept, so it goes only once no build
+/// has used it for a while: a spare lane after [`SPARE_LANE_IDLE_DAYS`],
+/// the first lane after the retention period. The current key is never
+/// dropped: it is the one the next build wants.
 async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
     let retention = u64::from(weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS);
     let weft_root = weft_compiler::build::resolve_weft_root()?;
     let current = weft_compiler::hash::compute_worker_cache_key(&weft_root, "builder-base")?;
+    let registry = super::daemon::data_dir().join(CACHE_KEYS_DIR);
+    let mine = registry.join(checkout_record_name(&weft_root));
+    let keys = CheckoutKeys::read(&registry, &mine)?;
     let mut failures = Vec::new();
     for cache in crate::images::worker_compile_caches().await? {
-        let Some(why) = retired_cache_drop(&cache, &current, retention) else { continue };
-        if why == RetiredDrop::SpareLane {
-            println!("dropping a retired worker compile cache's spare lane {} ({})", cache.lane.unwrap_or_default(), cache.size);
-        } else {
-            println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size);
+        let Some(why) = retired_cache_drop(&cache, &current, &keys, retention) else { continue };
+        match why {
+            RetiredDrop::MovedOff => println!(
+                "dropping the worker compile cache this checkout moved off (lane {}, {})",
+                cache.lane.unwrap_or_default(),
+                cache.size
+            ),
+            RetiredDrop::SpareLane => println!(
+                "dropping a retired worker compile cache's spare lane {} ({})",
+                cache.lane.unwrap_or_default(),
+                cache.size
+            ),
+            RetiredDrop::Unused => {
+                println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size)
+            }
         }
         if let Err(error) = crate::images::prune_build_record(&cache.id).await {
             failures.push(format!("{error:#}"));
         }
     }
+    // Recorded after the drops, so a sweep that failed part way still
+    // knows the key it has to finish dropping next time.
+    if failures.is_empty() {
+        std::fs::create_dir_all(&registry).with_context(|| format!("create {}", registry.display()))?;
+        std::fs::write(&mine, &current).with_context(|| format!("record this checkout's compile cache key in {}", mine.display()))?;
+    }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
+}
+
+/// Under the weft data dir: one file per checkout, named by a hash of its
+/// path, holding the compile cache key that checkout last swept with.
+const CACHE_KEYS_DIR: &str = "compile-cache-keys";
+
+/// The record file name for the checkout at `root`.
+fn checkout_record_name(root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the checkouts on this machine recorded: the key this one moved
+/// off, and the keys the others still call their own.
+#[derive(Debug, Default)]
+struct CheckoutKeys {
+    moved_off: Option<String>,
+    others: std::collections::BTreeSet<String>,
+}
+
+impl CheckoutKeys {
+    fn read(registry: &std::path::Path, mine: &std::path::Path) -> anyhow::Result<Self> {
+        let mut keys = CheckoutKeys::default();
+        let Ok(entries) = std::fs::read_dir(registry) else { return Ok(keys) };
+        for entry in entries {
+            let path = entry?.path();
+            let key = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?.trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            if path == mine {
+                keys.moved_off = Some(key);
+            } else {
+                keys.others.insert(key);
+            }
+        }
+        Ok(keys)
+    }
 }
 
 /// A spare lane of another key goes once unused this long. Lanes only
@@ -1073,6 +1175,9 @@ const SPARE_LANE_IDLE_DAYS: u64 = 1;
 /// Why [`retired_compile_cache_sweep`] drops a cache.
 #[derive(Debug, PartialEq, Eq)]
 enum RetiredDrop {
+    /// Under the key this checkout moved off, which no other checkout
+    /// here names: junk now, whatever its age.
+    MovedOff,
     /// Another key's lane other than its first, unused for
     /// [`SPARE_LANE_IDLE_DAYS`].
     SpareLane,
@@ -1080,19 +1185,22 @@ enum RetiredDrop {
     Unused,
 }
 
-/// Whether a compile cache goes, and why: never under the `current` key;
-/// under any other, a spare lane once unused for
+/// Whether a compile cache goes, and why: never under the `current` key
+/// or one another checkout here names; at once under the key this
+/// checkout moved off; under any other, a spare lane once unused for
 /// [`SPARE_LANE_IDLE_DAYS`] and the first lane once unused for
-/// `retention` days. A key that is not this checkout's may still be
-/// another worktree's on this machine, so how recently a lane was used
-/// is the only sign it is retired.
+/// `retention` days (it may be a worktree's that never swept, so how
+/// recently a lane was used is the only sign it is retired).
 fn retired_cache_drop(
     cache: &crate::images::CompileCacheRecord,
     current: &str,
+    keys: &CheckoutKeys,
     retention: u64,
 ) -> Option<RetiredDrop> {
-    if cache.key == current {
+    if cache.key == current || keys.others.contains(&cache.key) {
         None
+    } else if keys.moved_off.as_deref() == Some(cache.key.as_str()) {
+        Some(RetiredDrop::MovedOff)
     } else if cache.lane.is_some_and(|lane| lane > 0) {
         (cache.idle_days >= SPARE_LANE_IDLE_DAYS).then_some(RetiredDrop::SpareLane)
     } else {
@@ -1136,12 +1244,50 @@ mod tests {
             size: "1GB".into(),
             idle_days,
         };
-        assert_eq!(retired_cache_drop(&cache("now", Some(3), 99), "now", 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(2), 0), "now", 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(2), 1), "now", 30), Some(RetiredDrop::SpareLane));
-        assert_eq!(retired_cache_drop(&cache("old", Some(0), 0), "now", 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(0), 30), "now", 30), Some(RetiredDrop::Unused));
-        assert_eq!(retired_cache_drop(&cache("old", None, 5), "now", 30), None);
+        let none = super::CheckoutKeys::default();
+        assert_eq!(retired_cache_drop(&cache("now", Some(3), 99), "now", &none, 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(2), 0), "now", &none, 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(2), 1), "now", &none, 30), Some(RetiredDrop::SpareLane));
+        assert_eq!(retired_cache_drop(&cache("old", Some(0), 0), "now", &none, 30), None);
+        assert_eq!(retired_cache_drop(&cache("old", Some(0), 30), "now", &none, 30), Some(RetiredDrop::Unused));
+        assert_eq!(retired_cache_drop(&cache("old", None, 5), "now", &none, 30), None);
+    }
+
+    /// The key this checkout moved off goes at once, every lane, unless
+    /// another checkout here still names it as its own.
+    #[test]
+    fn the_key_this_checkout_moved_off_goes_at_once() {
+        use super::{retired_cache_drop, CheckoutKeys, RetiredDrop};
+        let cache = |key: &str, lane: Option<u32>| crate::images::CompileCacheRecord {
+            id: "x".into(),
+            key: key.into(),
+            lane,
+            unreadable_lane: None,
+            size: "1GB".into(),
+            idle_days: 0,
+        };
+        let keys = CheckoutKeys { moved_off: Some("prev".into()), others: ["theirs".to_string()].into() };
+        assert_eq!(retired_cache_drop(&cache("prev", Some(0)), "now", &keys, 30), Some(RetiredDrop::MovedOff));
+        assert_eq!(retired_cache_drop(&cache("prev", Some(3)), "now", &keys, 30), Some(RetiredDrop::MovedOff));
+        assert_eq!(retired_cache_drop(&cache("theirs", Some(3)), "now", &keys, 30), None, "another checkout's");
+        assert_eq!(retired_cache_drop(&cache("now", Some(0)), "now", &keys, 30), None);
+        let shared = CheckoutKeys { moved_off: Some("prev".into()), others: ["prev".to_string()].into() };
+        assert_eq!(retired_cache_drop(&cache("prev", Some(0)), "now", &shared, 30), None, "still another checkout's own");
+    }
+
+    /// Each checkout reads its own record as the key it moved off, and
+    /// every other checkout's as a key in use.
+    #[test]
+    fn checkout_records_split_mine_from_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("aaaa");
+        std::fs::write(&mine, "prev\n").unwrap();
+        std::fs::write(dir.path().join("bbbb"), "theirs").unwrap();
+        let keys = super::CheckoutKeys::read(dir.path(), &mine).unwrap();
+        assert_eq!(keys.moved_off.as_deref(), Some("prev"));
+        assert_eq!(keys.others.into_iter().collect::<Vec<_>>(), vec!["theirs".to_string()]);
+        let missing = super::CheckoutKeys::read(&dir.path().join("nowhere"), &mine).unwrap();
+        assert!(missing.moved_off.is_none() && missing.others.is_empty());
     }
 
     use super::{event_line, EventsFilter, Reclaimed};

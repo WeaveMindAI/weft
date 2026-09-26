@@ -21,6 +21,7 @@ import type { DispatcherClient } from './dispatcher';
 import type {
   WirePayload,
   CancelCause,
+  CredentialOwner,
   CorruptionSite,
   ExecutionPhase,
   HostMessage,
@@ -88,7 +89,7 @@ export type DispatcherEvent = { event_id: string } & (
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
   // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
-  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
+  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: CredentialOwner; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.

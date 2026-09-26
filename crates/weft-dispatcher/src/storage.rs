@@ -259,7 +259,7 @@ impl LinkBase {
 
     /// The choice `for_request` makes, over plain values.
     fn from_request_host(requested: Option<String>) -> Result<Self, String> {
-        let base = requested.ok_or_else(|| "cannot construct a link: request has no valid Host header".to_string())?;
+        let base = requested.ok_or_else(|| "cannot construct a link: the request has no valid Host (or X-Forwarded-Host / X-Forwarded-Prefix) header".to_string())?;
         Ok(Self(base.trim_end_matches('/').to_string()))
     }
 
@@ -462,6 +462,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// Enqueue a terminate sweep for `color`. Called by the journal bridge when it
 /// observes a terminal exec event; idempotent.
 pub async fn enqueue_sweep(pool: &PgPool, tenant: &str, color: &str) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    enqueue_sweep_in(&mut conn, tenant, color).await
+}
+
+/// [`enqueue_sweep`] on the caller's connection, for a writer that queues
+/// the sweep in the same transaction as the run's ending.
+pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, color: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO storage_sweep (color, tenant_id, enqueued_at_unix) \
          VALUES ($1, $2, $3) ON CONFLICT (color) DO NOTHING",
@@ -469,7 +476,7 @@ pub async fn enqueue_sweep(pool: &PgPool, tenant: &str, color: &str) -> Result<(
     .bind(color)
     .bind(tenant)
     .bind(crate::lease::now_unix())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

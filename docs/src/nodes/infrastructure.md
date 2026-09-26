@@ -112,6 +112,13 @@ It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
 infrastructure is down, the error says which and points at `weft infra status`.
 
+When a program marks your node `@per_member`, each member gets their own
+container, and `ctx.endpoint` answers with the copy of the member the run is
+for; your node's code does not change. Each copy has its own instance, so its
+`public_url()` is its own too. A connection your node publishes
+(`ctx.publish_access`) from a member's copy is recorded as that member's. For
+what a member is, go and read [programs with members](../running/members.md).
+
 ## A live panel
 
 If your container serves `/live`, name that endpoint and the editor shows the

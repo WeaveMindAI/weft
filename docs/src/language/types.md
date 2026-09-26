@@ -79,7 +79,10 @@ type Ticket = { id: CustomerId, body: String, priority?: Number }
 ```
 
 A declaration goes at the top of a scope, meaning the file, or a group's or a
-loop's body. Not inside a node's braces. Order does not matter.
+loop's body. Not inside a node's braces. Order does not matter. A name is
+visible in its scope and every scope inside it, included files too: for how a
+type reaches into an `@include`, go and read
+[files and reuse](files-and-reuse.md#types-reach-down-into-an-included-file).
 
 **Names are compared as names.** `CustomerId` and `String` are different types
 even though one is the other underneath. That is the point: a customer id

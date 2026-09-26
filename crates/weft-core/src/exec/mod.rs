@@ -14,6 +14,7 @@ pub mod execution;
 pub mod loop_runtime;
 pub mod postprocess;
 pub mod ready;
+pub mod run_kind;
 pub mod skip;
 pub mod stuck;
 
@@ -26,5 +27,6 @@ pub use execution::{
 };
 pub use postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};
 pub use ready::{find_ready_nodes, InputBag, ReadyGroup};
+pub use run_kind::{unrecorded_wait_error, RunKind};
 pub use skip::check_should_skip;
 pub use stuck::{stuck_report, StuckFiring, StuckReport};

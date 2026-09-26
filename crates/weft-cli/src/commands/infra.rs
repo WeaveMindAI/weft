@@ -1,9 +1,11 @@
 //! `weft infra start | restart | upgrade | stop | terminate | status`.
 //!
-//! Start / Restart / Upgrade map to the same dispatcher endpoint
-//! (`/projects/{id}/infra/sync`); the label is purely UX. The
-//! dispatcher decides per-node skip-vs-apply via the resolved
-//! spec hash.
+//! Start / Restart map to `/projects/{id}/infra/sync`, which answers
+//! once the infra is up. Upgrade maps to `/projects/{id}/infra/upgrade`,
+//! which issues a command the dispatcher runs on its own (stop leg, then
+//! the start) and answers with its id at once; the CLI follows the
+//! command to its outcome. The dispatcher decides per-node
+//! skip-vs-apply via the resolved spec hash.
 //!
 //! Stop / Terminate are direct: they enqueue an
 //! `infra_lifecycle_command` row that the tenant's supervisor pod
@@ -48,22 +50,20 @@ pub enum InfraAction {
 /// down (Stop, Terminate, Upgrade). Mirrors the shared
 /// `prompt_trigger_deactivation` argument shape.
 ///
-/// All fields are optional at the CLI surface; missing fields prompt
-/// the user on a TTY or error in `--json` mode (per the shared
-/// helper's contract). There is NO auto-reactivate: a user-triggered
+/// All fields are optional at the CLI surface. A choice given with
+/// `--mode` or `--grace` is always sent; without one, the dispatcher
+/// says when it needs one (a trigger reading this infra is on), and
+/// then a TTY is asked and `--json` or a script fails naming the flags
+/// (see `post_with_trigger_choice`). There is NO auto-reactivate: a user-triggered
 /// upgrade leaves the project deactivated, and the user clicks Activate
 /// when ready. Automatic reactivation belongs only to the autonomous
 /// health-recovery path (deactivate -> fix infra -> reactivate with no
 /// human present), not to a verb the user invoked themselves.
 #[derive(Default, Clone)]
 pub struct InfraOpts {
-    pub mode: Option<String>,
-    pub grace: Option<u32>,
-    pub running_policy: Option<String>,
-    /// Cap on a `wait` drain in seconds (worker replacement inside
-    /// sync; the supervisor's stop drain). `None` = the server
-    /// default (`DEFAULT_DRAIN_TIMEOUT_SECS`).
-    pub drain_timeout: Option<u64>,
+    pub trigger: super::deactivate::TriggerChoiceFlags,
+    /// A member's copies (`--member`); the shared infra when absent.
+    pub member: Option<weft_core::member::MemberId>,
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
@@ -123,14 +123,14 @@ async fn run_inner(
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
         InfraAction::Start => infra_sync(ctx, progress, action, opts).await?,
-        // Upgrade: ONE `/infra/sync` POST with `upgrade: true`. The
-        // SERVER owns the decomposition (deactivate per the user's
-        // spec when active, stop leg, then apply), so every client
-        // gets the same upgrade from a single request.
+        // Upgrade: ONE `/infra/upgrade` POST. The SERVER owns the
+        // decomposition (deactivate per the user's spec when active,
+        // stop leg, then apply) and runs it as a command this follows,
+        // so every client gets the same upgrade from a single request.
         InfraAction::Upgrade => infra_sync(ctx, progress, action, opts).await?,
         InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
         InfraAction::Terminate => infra_terminate(ctx, progress, opts).await?,
-        InfraAction::Cancel => infra_cancel(ctx, progress).await?,
+        InfraAction::Cancel => infra_cancel(ctx, progress, opts.member.as_ref()).await?,
         // The place is read here, inside the progress wrapper, so a
         // refusal ("names no node") reaches the graph's action bar as
         // this verb's error like every other failure of the verb; the
@@ -151,10 +151,14 @@ async fn run_inner(
 
 /// POST `/infra/cancel`: halt/cancel in-flight infra work. 202 on
 /// success (cancel reconciles, never asserts: poll `weft status` for
-/// where things settled); 412 when nothing is in flight.
-async fn infra_cancel(ctx: &Ctx, progress: &Progress) -> Result<()> {
+/// where things settled); 412 when nothing is in flight. With a member,
+/// only that member's copies' work is cancelled.
+async fn infra_cancel(ctx: &Ctx, progress: &Progress, member: Option<&weft_core::member::MemberId>) -> Result<()> {
     let (client, project_id, _name) = super::resolve_project(ctx)?;
-    let path = format!("/projects/{project_id}/infra/cancel");
+    let path = match member {
+        Some(member) => format!("/projects/{project_id}/infra/cancel?member={member}"),
+        None => format!("/projects/{project_id}/infra/cancel"),
+    };
     progress.dispatcher_call_start(&path);
     client.post_empty(&path).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id }));
@@ -169,7 +173,7 @@ async fn infra_cancel(ctx: &Ctx, progress: &Progress) -> Result<()> {
 /// what these verbs are for; so a spelling the program does not know is
 /// taken as typed when the daemon lists an instance under it, and
 /// refused with the program's answer otherwise.
-async fn instance_named(ctx: &Ctx, spelled: &str) -> Result<String> {
+pub(crate) async fn instance_named(ctx: &Ctx, spelled: &str) -> Result<String> {
     let refusal = match super::node_address_for(ctx, spelled) {
         Ok(place) => return Ok(place),
         Err(refusal) => refusal,
@@ -211,11 +215,14 @@ async fn infra_node_verb(
     // a person who passes nothing gets cancel, and a cap beside cancel
     // is refused here rather than sent to bound nothing.
     let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.running_policy.as_deref(),
-        opts.drain_timeout,
+        opts.trigger.running_policy.as_deref(),
+        opts.trigger.drain_timeout,
     )?;
     let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
     body.insert("force".into(), serde_json::json!(force));
+    if let Some(member) = &opts.member {
+        body.insert("member".into(), serde_json::json!(member));
+    }
     let body = serde_json::Value::Object(body);
     progress.drain_wait(&body, drain_timeout);
     progress.dispatcher_call_start(&path);
@@ -257,7 +264,7 @@ async fn infra_sync(
     // no deactivation questions. An UPGRADE of an ACTIVE project takes
     // live infra down (the server's stop leg), so it collects the
     // user's deactivation choice (same picker as `weft deactivate`)
-    // and sends it with `upgrade: true`; the server decomposes.
+    // and sends it to `/infra/upgrade`; the server decomposes.
     // The running-work pair, read the one way every verb reads it (a
     // misspelt policy is refused here with the CLI's own words, a cap
     // beside cancel is refused rather than sent to bound nothing). It
@@ -265,48 +272,70 @@ async fn infra_sync(
     // leg; when the picker is shown its answer outranks these fields,
     // and it is built from the same pair.
     let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.running_policy.as_deref(),
-        opts.drain_timeout,
+        opts.trigger.running_policy.as_deref(),
+        opts.trigger.drain_timeout,
     )?;
+    // Only an upgrade carries the choice (the dispatcher refuses it on a
+    // plain start), and only the dispatcher knows whether a trigger
+    // reading this infra is on, the program's or a member's: a given
+    // choice always goes, and otherwise `post_with_trigger_choice` asks
+    // or names the flags when the dispatcher says it needs one.
     let upgrade = matches!(action, InfraAction::Upgrade);
-    let trigger_deactivation = if upgrade
-        && super::deactivate::project_is_active(&handle.client, &handle.id).await?
-    {
-        Some(serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
+    let given = if upgrade {
+        super::deactivate::given_trigger_deactivation(
             ctx.json(),
-            opts.mode.as_deref(),
-            opts.grace,
+            opts.trigger.mode.as_deref(),
+            opts.trigger.grace,
             running_policy,
             drain_timeout,
-        )?)?)
+        )?
     } else {
         None
     };
 
     // SYNC: sync body keys <-> crates/weft-dispatcher/src/api/infra.rs
-    // (SyncRequest). All its fields are serde-defaulted, so a key drift here
-    // would silently become the default at the receiving end; change both together.
+    // (SyncRequest, and UpgradeRequest which adds `triggerDeactivation`).
+    // All its fields are serde-defaulted, so a key drift here would
+    // silently become the default at the receiving end; change both together.
     let mut body = serde_json::Map::new();
     handle.inject_hash_fields(&mut body);
     body.insert("imageHashes".into(), serde_json::to_value(&image_tags)?);
-    if upgrade {
-        body.insert("upgrade".into(), true.into());
-    }
-    if let Some(td) = trigger_deactivation {
-        body.insert("triggerDeactivation".into(), td);
-    }
     body.extend(super::ensure::running_choice_fields(running_policy, drain_timeout));
-    let path = format!("/projects/{}/infra/sync", handle.id);
-    let body = serde_json::Value::Object(body);
+    if let Some(member) = &opts.member {
+        body.insert("member".into(), serde_json::json!(member));
+    }
+    let path = format!("/projects/{}/infra/{}", handle.id, if upgrade { "upgrade" } else { "sync" });
     // The one line that says the call may now sit for a while (an
     // upgrade's stop leg, or the worker replacement, draining up to the
     // cap), so a quiet terminal is a wait and not a hang.
-    progress.drain_wait(&body, drain_timeout);
+    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
     let node_ids: Vec<String> = image_tags.keys().cloned().collect();
     progress.infra_provision_start(&node_ids);
     progress.dispatcher_call_start(&path);
-    let resp: serde_json::Value = handle.client.post_json(&path, &body).await?;
+    let resp = super::deactivate::post_with_trigger_choice(
+        &handle.client,
+        &path,
+        body,
+        ctx.json(),
+        given,
+        running_policy,
+        drain_timeout,
+    )
+    .await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+    // An upgrade answers 202 with the command the dispatcher runs it
+    // as; its outcome is the upgrade's, and the infra status after it
+    // is what is shown. A sync answers with the status itself.
+    let resp = if upgrade {
+        let command_id = resp
+            .get("command_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("infra upgrade: response missing command_id"))?;
+        wait_for_command(progress, &handle.client, &handle.id, command_id, "upgrade").await?;
+        handle.client.get_json(&format!("/projects/{}/infra/status", handle.id)).await?
+    } else {
+        resp
+    };
     progress.infra_provision_done();
     if !ctx.json() {
         print_status(&handle.name, &handle.id, &resp);
@@ -328,11 +357,13 @@ async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Res
     infra_destroy(ctx, progress, opts, "terminate").await
 }
 
-/// Stop / Terminate share this body. Prompts for trigger
-/// deactivation only when the project is active; the running-work
-/// choice goes on the body either way, because an inactive project
-/// can still have executions running on this infra and `wait` is how
-/// they get to land first. Waits on the COMMAND's completion (not the
+/// Stop / Terminate share this body. The trigger-deactivation choice
+/// goes along when it was given; otherwise the dispatcher, which knows
+/// whether a trigger reading this infra is on (the program's or a
+/// member's), asks for it and `post_with_trigger_choice` prompts or
+/// names the flags. The running-work choice goes on the body either
+/// way, because with no trigger on there can still be executions
+/// running on this infra and `wait` is how they get to land first. Waits on the COMMAND's completion (not the
 /// rollup): a stop where a NoOp unit stays up never drives the rollup
 /// to "stopped", so the command outcome is the only honest done
 /// signal.
@@ -345,32 +376,28 @@ async fn infra_destroy(
     // Read the one way every verb reads it, before anything is asked
     // or sent: a misspelt policy or a cap beside cancel is refused here.
     let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.running_policy.as_deref(),
-        opts.drain_timeout,
+        opts.trigger.running_policy.as_deref(),
+        opts.trigger.drain_timeout,
+    )?;
+    let given = super::deactivate::given_trigger_deactivation(
+        ctx.json(),
+        opts.trigger.mode.as_deref(),
+        opts.trigger.grace,
+        running_policy,
+        drain_timeout,
     )?;
     let (client, id, name) = super::resolve_project(ctx)?;
-    let active = super::deactivate::project_is_active(&client, &id).await?;
-    let trigger_deactivation = if active {
-        Some(serde_json::to_value(super::deactivate::prompt_trigger_deactivation(
-            ctx.json(),
-            opts.mode.as_deref(),
-            opts.grace,
-            running_policy,
-            drain_timeout,
-        )?)?)
-    } else {
-        None
-    };
     let path = format!("/projects/{id}/infra/{verb}");
     let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
-    if let Some(td) = trigger_deactivation {
-        body.insert("triggerDeactivation".into(), td);
+    if let Some(member) = &opts.member {
+        body.insert("member".into(), serde_json::json!(member));
     }
-    let body = serde_json::Value::Object(body);
-    progress.drain_wait(&body, drain_timeout);
+    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
     progress.dispatcher_call_start(&path);
     // 202 Accepted with { command_id }.
-    let issued: serde_json::Value = client.post_json(&path, &body).await?;
+    let issued =
+        super::deactivate::post_with_trigger_choice(&client, &path, body, ctx.json(), given, running_policy, drain_timeout)
+            .await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     let command_id = issued
         .get("command_id")
@@ -572,8 +599,10 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    // The copies that exist, not the nodes the program declares (`weft
+    // status` lists those, started or not).
     if nodes.is_empty() {
-        println!("no infra nodes in this project");
+        println!("no infra copy exists in this project (none started, or all terminated)");
         return;
     }
     println!("infra for {name} ({id}):");
@@ -581,6 +610,11 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
         // `node` is the instance's place, spelled the way the source
         // reads it (`one.db`): the key and the label are one.
         let node = n.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+        // A member's copy of a `@per_member` node is its own row.
+        let node = match n.get("member").and_then(|v| v.as_str()) {
+            Some(member) => format!("{node} (member {member})"),
+            None => node.to_string(),
+        };
         let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let url = n
             .get("endpoint_url")
@@ -614,7 +648,7 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
 /// node (full content hash, matching the worker tag `weft-worker:<binary_hash>`);
 /// the supplied map value is exactly the local tag the supervisor resolves
 /// `Image::Local` to.
-async fn build_infra_images(
+pub(crate) async fn build_infra_images(
     progress: &Progress,
     plan: &weft_compiler::build_plan::BuildPlan,
     project_id: &str,

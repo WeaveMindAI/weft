@@ -321,7 +321,7 @@ pub async fn program_for_cancel(
 /// nodes inside it take. Only the absence of any task says nobody is
 /// coming.
 pub(crate) async fn execution_is_being_worked_on(
-    state: &DispatcherState,
+    pool: &sqlx::PgPool,
     color: Color,
 ) -> anyhow::Result<bool> {
     // `task.color` is TEXT, so the color goes in as its string form;
@@ -332,7 +332,7 @@ pub(crate) async fn execution_is_being_worked_on(
          WHERE color = $1 AND status IN ('pending', 'claimed')",
     )
     .bind(color.to_string())
-    .fetch_optional(&state.pg_pool)
+    .fetch_optional(pool)
     .await?;
     Ok(row.map(|(n,)| n > 0).unwrap_or(false))
 }
@@ -699,6 +699,10 @@ pub struct ListExecutionsParams {
     /// Only runs that ended this way (`completed`, `failed`,
     /// `cancelled`, `running`).
     pub status: Option<String>,
+    /// Only runs for this member.
+    pub member: Option<weft_core::member::MemberId>,
+    /// Only runs carrying this tag.
+    pub tag: Option<String>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
@@ -718,6 +722,9 @@ pub async fn list_executions(
         phase: params.phase,
         entry_node: params.entry_node,
         status: params.status,
+        member: params.member,
+        tag: params.tag,
+        below: None,
     };
     let mut page = state
         .journal
@@ -750,6 +757,9 @@ pub async fn latest_for_project(
         phase: None,
         entry_node: None,
         status: None,
+        member: None,
+        tag: None,
+        below: None,
     };
     let mut page = state
         .journal
@@ -828,6 +838,124 @@ pub async fn wake(
         ));
     };
     crate::api::signal::fire_registered_signal(&state, &wait.token, payload).await
+}
+
+/// `POST /executions/clean`: delete every run the filter reaches. What
+/// `weft clean --project .. --member .. --status ..` sends; a program's
+/// `ctx.runs()..clean(..)` runs the same [`clean_runs`].
+#[derive(Debug, Deserialize)]
+pub struct CleanRequest {
+    /// Only this project's runs; every project of the caller's when absent.
+    #[serde(default)]
+    pub project: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub filter: weft_core::program::RunFilter,
+    /// What happens to matching runs still going.
+    #[serde(default = "default_clean_running")]
+    pub running: weft_core::running_policy::RunningPolicy,
+}
+
+fn default_clean_running() -> weft_core::running_policy::RunningPolicy {
+    weft_core::running_policy::RunningPolicy::Wait
+}
+
+pub async fn clean(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    axum::Json(body): axum::Json<CleanRequest>,
+) -> Result<axum::Json<weft_core::program::CleanOutcome>, (StatusCode, String)> {
+    if let Some(project) = body.project {
+        authorize_project(&state, &caller.0, project).await?;
+    }
+    clean_runs(&state, &caller.0, body.project, &body.filter, body.running, None)
+        .await
+        .map(axum::Json)
+}
+
+/// Delete every run `filter` reaches, in `project` (or every project of
+/// `tenant`). A run still going is never deleted from under itself:
+/// `cancel` stops it (its rows go with the next clean), `wait` leaves it
+/// running. `asked_by` is never touched: a program cleaning runs is not
+/// among them. Each deleted project's bare versions are swept as its runs
+/// go, the way `weft clean <color>` sweeps them.
+pub(crate) async fn clean_runs(
+    state: &DispatcherState,
+    tenant: &crate::tenant::TenantId,
+    project: Option<uuid::Uuid>,
+    filter: &weft_core::program::RunFilter,
+    running: weft_core::running_policy::RunningPolicy,
+    asked_by: Option<Color>,
+) -> Result<weft_core::program::CleanOutcome, (StatusCode, String)> {
+    let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let now = crate::lease::now_unix() as u64;
+    let query = ExecutionQuery {
+        limit: MAX_PAGE,
+        offset: 0,
+        project_id: project,
+        started_after: None,
+        started_before: None,
+        phase: None,
+        entry_node: filter.node.clone(),
+        status: filter.status.clone(),
+        member: filter.member.clone(),
+        tag: filter.tag.clone(),
+        below: None,
+    };
+    let mut outcome = weft_core::program::CleanOutcome::default();
+    // The pages walk back in time from a bound fixed now (a run that
+    // starts while this cleans is never reached), each page starting
+    // strictly after the last run the one before it listed. Whatever the
+    // walk deletes, cancels or leaves behind itself, the next page is
+    // exactly the runs it has not reached yet.
+    let before = filter.older_than_secs.map_or(now + 1, |secs| now.saturating_sub(secs));
+    let mut below = None;
+    let mut swept_projects: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+    loop {
+        let page = state
+            .journal
+            .list_executions(
+                tenant.as_str(),
+                &ExecutionQuery { started_before: Some(before), below, ..query.clone() },
+            )
+            .await
+            .map_err(|e| internal("list runs", e))?;
+        let Some(last) = page.executions.last().map(|run| (run.started_at, run.color)) else {
+            break;
+        };
+        below = Some(last);
+        for run in page.executions {
+            if Some(run.color) == asked_by {
+                continue;
+            }
+            if run.status == "running" {
+                match running {
+                    weft_core::running_policy::RunningPolicy::Cancel => {
+                        cancel_color(state, run.color, &weft_core::exec::CancelCause::User)
+                            .await
+                            .map_err(|e| internal("cancel", e))?;
+                        outcome.cancelled += 1;
+                    }
+                    weft_core::running_policy::RunningPolicy::Wait => outcome.left_running += 1,
+                }
+                continue;
+            }
+            let project_id = clean_execution(state, tenant, run.color)
+                .await
+                .map_err(|status| (status, format!("delete run {}", run.color)))?;
+            swept_projects.insert(project_id);
+            outcome.deleted += 1;
+        }
+    }
+    for project_id in swept_projects {
+        if let Err((status, message)) = crate::api::versions::sweep_bare_versions(state, project_id).await {
+            tracing::warn!(
+                target: "weft_dispatcher::versions",
+                %project_id, %status, %message,
+                "the runs are deleted; the versions they may have left bare could not be swept"
+            );
+        }
+    }
+    Ok(outcome)
 }
 
 /// Remove one run, and sweep the version its removal left bare.
@@ -951,6 +1079,8 @@ mod waits_tests {
 
     fn signal(token: &str, color: Option<Color>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
         crate::journal::SignalRegistration {
+            member: None,
+            activation_trigger: None,
             source_version: None,
             setup_color: None,
             program: None,

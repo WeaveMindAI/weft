@@ -266,6 +266,7 @@ pub trait InfraStateClient: Send + Sync {
         &self,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         spec_json: serde_json::Value,
     ) -> anyhow::Result<i64>;
 
@@ -284,9 +285,10 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
         &self,
         project_id: uuid::Uuid,
         node_id: &str,
+        member: Option<&weft_core::member::MemberId>,
         spec_json: serde_json::Value,
     ) -> anyhow::Result<i64> {
-        self.enqueue_apply(project_id, node_id, spec_json).await
+        self.enqueue_apply(project_id, node_id, member, spec_json).await
     }
     async fn wait_apply(
         &self,
@@ -324,6 +326,12 @@ pub trait AccessBroker: Send + Sync {
         &self,
         req: &weft_broker_client::protocol::PublishedAccessRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse>;
+
+    /// A member token for a member of the run's project.
+    async fn mint_member_token(
+        &self,
+        req: &weft_broker_client::protocol::ProgramMintMemberTokenRequest,
+    ) -> anyhow::Result<weft_core::program::MintedMemberToken>;
 }
 
 #[async_trait]
@@ -354,6 +362,13 @@ impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
         req: &weft_broker_client::protocol::ReleaseConnectionRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
         self.release_connection(req).await
+    }
+
+    async fn mint_member_token(
+        &self,
+        req: &weft_broker_client::protocol::ProgramMintMemberTokenRequest,
+    ) -> anyhow::Result<weft_core::program::MintedMemberToken> {
+        self.mint_member_token(req).await
     }
 }
 
@@ -403,7 +418,7 @@ impl FakeAccessBroker {
         self.set_owned_bearer_connection(
             connection_id,
             key,
-            weft_core::CredentialOwner::TheirOwn,
+            weft_core::CredentialOwner::Author,
         );
     }
 
@@ -480,6 +495,17 @@ impl AccessBroker for FakeAccessBroker {
                 connection: published_connection(&req.node_id, &req.service),
             },
             false => weft_broker_client::protocol::PublishedAccessResponse::NothingPublished,
+        })
+    }
+
+    async fn mint_member_token(
+        &self,
+        req: &weft_broker_client::protocol::ProgramMintMemberTokenRequest,
+    ) -> anyhow::Result<weft_core::program::MintedMemberToken> {
+        Ok(weft_core::program::MintedMemberToken {
+            id: req.id,
+            token: format!("wft-fake-{}", req.member),
+            expires_at_unix: req.expires_in_secs,
         })
     }
 }
@@ -1274,9 +1300,18 @@ struct PortClaims {
 }
 
 pub struct RunnerHandle {
-    execution_id: String,
     project_id: uuid::Uuid,
     color: Color,
+    /// Who the run is for (its `ExecutionStarted`'s member). Picks the
+    /// member's copy of a per-member infra node, the member's storage,
+    /// and the member's pick at a per-member access step.
+    member: Option<weft_core::member::MemberId>,
+    /// What the run is (its `ExecutionStarted`'s kind). An unrecorded
+    /// run keeps no journal to park in, so its waits are refused.
+    run_kind: weft_core::exec::RunKind,
+    /// Whether this node exists once per member: its infra is then the
+    /// run member's copy, never the shared one.
+    per_member: Option<weft_core::member::PerMember>,
     node_id: String,
     /// The PLACE this firing runs at, spelled the way a person writes
     /// the node (`store`, or `one.store` inside the file the site `one`
@@ -1438,7 +1473,6 @@ impl RunnerHandle {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        execution_id: String,
         project_id: uuid::Uuid,
         color: Color,
         node_id: String,
@@ -1457,9 +1491,11 @@ impl RunnerHandle {
         has_generator_input: bool,
     ) -> Self {
         Self {
-            execution_id,
             project_id,
             color,
+            member: None,
+            run_kind: weft_core::exec::RunKind::Execution,
+            per_member: None,
             place,
             node_id,
             node_type,
@@ -1583,6 +1619,51 @@ impl RunnerHandle {
         self
     }
 
+    /// The kind of run this firing belongs to, stamped by the loop
+    /// driver from the run's `ExecutionStarted`.
+    pub fn with_run_kind(mut self, run_kind: weft_core::exec::RunKind) -> Self {
+        self.run_kind = run_kind;
+        self
+    }
+
+    /// Who the run is for, stamped by the loop driver from the run's
+    /// `ExecutionStarted` on every firing (left `None` for a run for
+    /// nobody in particular), and whether this node exists once per
+    /// member (from its definition).
+    pub fn with_member(
+        mut self,
+        member: Option<weft_core::member::MemberId>,
+        per_member: Option<weft_core::member::PerMember>,
+    ) -> Self {
+        self.member = member;
+        self.per_member = per_member;
+        self
+    }
+
+    /// Wait for this run's own cancel, which something this run asked for
+    /// (`what`) already issued, warning every [`SELF_STOP_BREADCRUMB`] so a
+    /// stop that never lands reads as stuck in the logs (`weft stop` ends
+    /// it). Answers the cancel.
+    async fn wait_for_own_stop(&self, what: &str) -> WeftError {
+        let cancelled = self.cancellation.cancelled_err();
+        tokio::pin!(cancelled);
+        let mut breadcrumb = tokio::time::interval(SELF_STOP_BREADCRUMB);
+        breadcrumb.tick().await;
+        loop {
+            tokio::select! {
+                err = &mut cancelled => return err,
+                _ = breadcrumb.tick() => tracing::warn!(
+                    target: "weft_engine::context",
+                    color = %self.color,
+                    node = %self.node_id,
+                    what,
+                    "this run asked to be stopped with the rest and is waiting for its own stop to \
+                     land; if it never does, `weft stop` ends the run"
+                ),
+            }
+        }
+    }
+
     fn next_side_effect_index(&self) -> u32 {
         self.next_side_effect_index.fetch_add(1, Ordering::SeqCst)
     }
@@ -1622,7 +1703,7 @@ impl RunnerHandle {
                 project_id: Some(project_id),
                 dedup_key: Some(dedup_key),
                 color: Some(self.color.to_string()),
-                tenant_id: Some(self.tenant_id.clone()),
+                tenant_id: self.tenant_id.clone(),
                 target_pod_name: None,
                 binary_hash: None,
                 payload: payload_json,
@@ -2017,6 +2098,11 @@ impl ContextHandle for RunnerHandle {
                 weft_core::context::emitted_then_await_signal_error(&self.place),
             ));
         }
+        // An unrecorded run has no journal to park in, so it can never
+        // wait: refused at the call, naming the setting that decides it.
+        if !self.run_kind.journaled() {
+            return Err(WeftError::NodeExecution(weft_core::exec::unrecorded_wait_error(&self.place)));
+        }
         // A stream CONSUMER cannot durably suspend either: the resume
         // replays the body from the top, and the items its earlier
         // pulls consumed were delivered live and cannot be replayed.
@@ -2320,7 +2406,7 @@ impl ContextHandle for RunnerHandle {
         let endpoint = self
             .clients
             .infra
-            .endpoint_address(self.project_id, &self.place, name)
+            .endpoint_address(self.color, &self.place, self.per_member.is_some(), name)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         let address = endpoint.ok_or_else(|| {
@@ -2460,6 +2546,7 @@ impl ContextHandle for RunnerHandle {
             spec,
             values,
             label: Some(self.place.clone()),
+            per_member: self.per_member.is_some(),
         };
         let resp = self.clients.access_broker.publish_access(&req).await.map_err(|e| {
             WeftError::NodeExecution(format!("publish the '{service}' connection: {e:#}"))
@@ -2478,6 +2565,7 @@ impl ContextHandle for RunnerHandle {
             // By place, the key `publish_access` wrote under.
             node_id: self.place.clone(),
             service: service.clone(),
+            per_member: self.per_member.is_some(),
         };
         let resp = self.clients.access_broker.published_access(&req).await.map_err(|e| {
             WeftError::NodeExecution(format!(
@@ -2514,7 +2602,7 @@ impl ContextHandle for RunnerHandle {
         // Ours-owned connection is remembered: a release retires a
         // runtime-supplied credential, and a their-own connection's
         // stored values are the user's own and never travel back.
-        if resp.owner == weft_core::CredentialOwner::Ours {
+        if resp.owner.is_platform() {
             self.opened_accesses
                 .lock()
                 .unwrap()
@@ -2537,7 +2625,7 @@ impl ContextHandle for RunnerHandle {
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             service: service.clone(),
-            origin: resp.owner,
+            origin: resp.owner.clone(),
         });
         let client = crate::metering::connection_client(
             &service,
@@ -2571,7 +2659,7 @@ impl ContextHandle for RunnerHandle {
         };
         tracing::info!(
             target: "weft_engine::node",
-            exec = %self.execution_id,
+            color = %self.color,
             level = level_str,
             "{message}"
         );
@@ -2594,6 +2682,16 @@ impl ContextHandle for RunnerHandle {
     /// (color, tag) row, so a body replayed after a crash re-tags onto
     /// the same state. Not journaled through `ctx.run` for that reason.
     async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        // A tag is a row in the journal about this run, and an
+        // unrecorded run writes none: it is not listed, and a stop by
+        // tag selects only recorded runs.
+        if !self.run_kind.journaled() {
+            return Err(WeftError::Config(format!(
+                "node '{}' tags this run, and the run is not recorded (its Route has `recorded` \
+                 off), so there is no run to find by that tag. Turn `recorded` back on to tag it",
+                self.place
+            )));
+        }
         self.clients
             .steering
             .tag_execution(self.color, tags, &self.pod_name)
@@ -2619,22 +2717,101 @@ impl ContextHandle for RunnerHandle {
         if !stops_self {
             return Ok(());
         }
+        Err(self.wait_for_own_stop("stop_tagged").await)
+    }
+
+    /// Carried as a durable `program_call` task for the dispatcher, keyed
+    /// to the call's journal step (`call_index`, which a replay reaches
+    /// at the same index) so a retried or replayed enqueue while the task
+    /// lives is one task. The answer is waited for with no
+    /// deadline (an infra start can wait out a drain the person chose),
+    /// saying so every [`SELF_STOP_BREADCRUMB`]. A call that stops this
+    /// run too never returns: the run waits for its own cancel, which the
+    /// dispatcher already issued.
+    async fn program_call(
+        &self,
+        call: weft_core::program::ProgramCall,
+        stop_self: weft_core::StopSelf,
+        call_index: u32,
+    ) -> WeftResult<Value> {
+        let name = call.journal_name();
+        let frames = frames_dedup_key(&self.node_frames)
+            .map_err(|e| WeftError::NodeExecution(format!("{name}: frames: {e}")))?;
+        let payload = weft_core::program::ProgramCallPayload { by: self.color, stop_self, call };
+        let id = self
+            .clients
+            .tasks
+            .enqueue_dedup(task_store::NewTask {
+                kind: TaskKind::ProgramCall.into(),
+                target: task_store::TaskTarget::Dispatcher,
+                project_id: Some(self.project_id),
+                dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.color, self.node_id)),
+                color: Some(self.color.to_string()),
+                tenant_id: self.tenant_id.clone(),
+                target_pod_name: None,
+                binary_hash: None,
+                payload: serde_json::to_value(&payload)
+                    .map_err(|e| WeftError::NodeExecution(format!("{name}: {e}")))?,
+            })
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("{name}: {e:#}")))?
+            .id()
+            .expect("a program call enqueue is never fenced");
         let cancelled = self.cancellation.cancelled_err();
         tokio::pin!(cancelled);
-        let mut breadcrumb = tokio::time::interval(SELF_STOP_BREADCRUMB);
-        breadcrumb.tick().await;
         loop {
-            tokio::select! {
+            let outcome = tokio::select! {
                 err = &mut cancelled => return Err(err),
-                _ = breadcrumb.tick() => tracing::warn!(
+                outcome = self.clients.tasks.wait_for_terminal(id, TASK_WAIT_TIMEOUT) => outcome
+                    .map_err(|e| WeftError::NodeExecution(format!("{name}: {e:#}")))?,
+            };
+            match outcome.status {
+                task_store::TaskStatus::Complete => {
+                    let answer: weft_core::program::ProgramCallOutcome = serde_json::from_value(
+                        outcome.result.unwrap_or(Value::Null),
+                    )
+                    .map_err(|e| WeftError::NodeExecution(format!("{name}: unreadable answer: {e}")))?;
+                    if answer.stops_asker {
+                        return Err(self.wait_for_own_stop(name).await);
+                    }
+                    return Ok(answer.value);
+                }
+                task_store::TaskStatus::Failed => {
+                    return Err(WeftError::NodeExecution(format!(
+                        "{name}: {}",
+                        outcome.error.unwrap_or_else(|| "the call failed".into())
+                    )))
+                }
+                task_store::TaskStatus::Pending | task_store::TaskStatus::Claimed => tracing::info!(
                     target: "weft_engine::context",
                     color = %self.color,
                     node = %self.node_id,
-                    "stop_tagged reached this run, which is waiting for its own stop to land; \
-                     if it never does, `weft stop` ends the run"
+                    call = name,
+                    "still waiting for the program call's answer"
                 ),
             }
         }
+    }
+
+    async fn mint_member_token(
+        &self,
+        member: &weft_core::member::MemberId,
+        expires_in_secs: u64,
+        displays: bool,
+        id: uuid::Uuid,
+    ) -> WeftResult<weft_core::program::MintedMemberToken> {
+        self.clients
+            .access_broker
+            .mint_member_token(&weft_broker_client::protocol::ProgramMintMemberTokenRequest {
+                id,
+                color: self.color.to_string(),
+                member: member.clone(),
+                expires_in_secs,
+                displays,
+                name: Some(format!("minted by {}", self.place)),
+            })
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("mint a member token: {e:#}")))
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -2874,7 +3051,7 @@ async fn enqueue_register_signal_task(
             project_id: None,
             dedup_key: Some(dedup_key),
             color: Some(color.to_string()),
-            tenant_id: Some(tenant_id.to_string()),
+            tenant_id: tenant_id.to_string(),
             target_pod_name: None,
             binary_hash: None,
             payload,
@@ -3126,7 +3303,6 @@ mod replay_tests {
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             "node-x".into(),
@@ -3196,7 +3372,6 @@ mod replay_tests {
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             "node-x".into(),
@@ -3225,13 +3400,13 @@ mod replay_tests {
     /// `close_opened_accesses` after the body).
     fn ctx_over_arc(handle: Arc<RunnerHandle>) -> weft_core::ExecutionContext {
         weft_core::ExecutionContext::new(
-            "exec-1".into(),
             uuid::Uuid::nil(),
             "node-x".into(),
             "TestNode".into(),
             None,
             uuid::Uuid::nil(),
             weft_core::frames::LoopFrames::default(),
+            None,
             weft_core::context::ValueBag::inputs(Default::default(), Default::default(), Vec::new()),
             handle,
         )
@@ -3248,14 +3423,14 @@ mod replay_tests {
     #[tokio::test]
     async fn open_resolves_once_and_the_runtime_releases_the_lease() {
         let fake = FakeAccessBroker::new();
-        fake.set_owned_bearer_connection("conn-1", "sk-1", weft_core::CredentialOwner::Ours);
+        fake.set_owned_bearer_connection("conn-1", "sk-1", weft_core::CredentialOwner::Platform);
         let handle = Arc::new(handle_with_access_broker(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
         let access = weft_core::Access::new("conn-1", "openrouter", None);
         let conn = ctx.open_within(&access, CALL_WINDOW).await.unwrap();
         assert_eq!(conn.credential().unwrap(), "sk-1", "one bearer step derives the string");
-        assert_eq!(conn.owner(), weft_core::CredentialOwner::Ours);
+        assert_eq!(conn.owner(), &weft_core::CredentialOwner::Platform);
 
         let resolved = fake.resolved.lock().unwrap().clone();
         assert_eq!(resolved.len(), 1);
@@ -3294,7 +3469,7 @@ mod replay_tests {
             .open_within(&weft_core::Access::new("conn-1", "openrouter", None), CALL_WINDOW)
             .await
             .unwrap();
-        assert_eq!(conn.owner(), weft_core::CredentialOwner::TheirOwn);
+        assert_eq!(conn.owner(), &weft_core::CredentialOwner::Author);
         handle.close_opened_accesses().await;
         assert!(
             fake.released.lock().unwrap().is_empty(),
@@ -3357,7 +3532,7 @@ mod replay_tests {
         // Ours exercises the lease path (only a runtime credential
         // releases), and a runtime credential only opens for a METERED
         // service, so the fixture is a metered one.
-        fake.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Ours);
+        fake.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Platform);
         let handle = Arc::new(handle_with_access_broker(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
@@ -3441,7 +3616,7 @@ mod replay_tests {
         // connection, the shape that exercises the proxy/lease path.
         let make_broker = || {
             let b = FakeAccessBroker::new();
-            b.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Ours);
+            b.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Platform);
             b
         };
 
@@ -3462,7 +3637,6 @@ mod replay_tests {
         };
         let color = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
-            color.to_string(),
             uuid::Uuid::from_u128(0x108),
             color,
             "node-x".into(),
@@ -3748,8 +3922,9 @@ mod replay_tests {
     impl InfraReader for NoopInfra {
         async fn endpoint_address(
             &self,
-            _project_id: uuid::Uuid,
+            _color: weft_core::Color,
             _node_id: &str,
+            _per_member: bool,
             _endpoint_name: &str,
         ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
             Ok(None)
@@ -3763,6 +3938,7 @@ mod replay_tests {
             &self,
             _project_id: uuid::Uuid,
             _node_id: &str,
+            _member: Option<&weft_core::member::MemberId>,
             _spec_json: serde_json::Value,
         ) -> anyhow::Result<i64> {
             Ok(0)
@@ -4041,6 +4217,7 @@ pub async fn apply_via_supervisor(
     clock: &dyn weft_platform_traits::Clock,
     project_id: uuid::Uuid,
     place: &str,
+    member: Option<&weft_core::member::MemberId>,
     spec: &weft_core::infra::InfraSpec,
 ) -> anyhow::Result<()> {
     // `place` is the node spelled the way a person writes it (`one.db`
@@ -4049,7 +4226,7 @@ pub async fn apply_via_supervisor(
     // are keyed by: a file included twice is provisioned twice.
     let spec_json = serde_json::to_value(spec)?;
     let cmd_id = infra_state
-        .enqueue_apply(project_id, place, spec_json)
+        .enqueue_apply(project_id, place, member, spec_json)
         .await?;
     let started = clock.now();
     loop {
@@ -4110,7 +4287,13 @@ mod infra_apply_tests {
 
     #[async_trait]
     impl InfraStateClient for ApplyState {
-        async fn enqueue_apply(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<i64> {
+        async fn enqueue_apply(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+            _: Option<&weft_core::member::MemberId>,
+            _: Value,
+        ) -> anyhow::Result<i64> {
             Ok(42)
         }
         async fn wait_apply(&self, _: uuid::Uuid, id: i64, wait: Duration) -> anyhow::Result<InfraWaitApplyResponse> {
@@ -4129,7 +4312,7 @@ mod infra_apply_tests {
             InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
         ])) };
-        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", &Default::default()).await.unwrap();
+        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap();
         assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
         assert!(state.responses.lock().unwrap().is_empty());
     }
@@ -4140,7 +4323,7 @@ mod infra_apply_tests {
         let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
         ])) };
-        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", &Default::default()).await.unwrap_err();
+        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap_err();
         assert!(error.to_string().contains("image cannot start"));
     }
 }
