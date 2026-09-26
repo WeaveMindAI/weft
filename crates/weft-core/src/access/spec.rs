@@ -933,6 +933,11 @@ impl MintedSocket {
 #[serde(transparent)]
 pub struct Template(pub String);
 
+
+/// The values a consent stores that are secrets by nature, whatever the
+/// recipe declares: the tokens and the app's own secret.
+const SECRET_TOKEN_NAMES: &[&str] = &["access_token", "refresh_token", "client_secret"];
+
 impl Template {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -1412,6 +1417,12 @@ impl AccessSpec {
                 }
             }
         }
+        let secret_fields: std::collections::HashSet<String> = field_lists
+            .iter()
+            .flat_map(|fs| fs.iter())
+            .filter(|f| f.secret)
+            .map(|f| f.name.clone())
+            .collect();
         for fields in field_lists {
             let mut seen = std::collections::HashSet::new();
             for f in fields {
@@ -1433,7 +1444,17 @@ impl AccessSpec {
             validate_captures(&test.captures)?;
         }
         if let Some(identity) = &self.identity {
-            identity.placeholders()?;
+            // The identity is shown wherever a connection is listed (the
+            // editor, `weft connect --list`, a member's settings page), so
+            // it may never be assembled from a secret.
+            for name in identity.placeholders()? {
+                if SECRET_TOKEN_NAMES.contains(&name.as_str()) || secret_fields.contains(&name) {
+                    return Err(format!(
+                        "identity names '{name}', a secret: it is shown wherever the connection \
+                         is listed, so build it from a non-secret value (an account name, a host)"
+                    ));
+                }
+            }
         }
         if self.doors.is_empty() {
             return Err("a service must declare at least one door".into());
@@ -2005,6 +2026,28 @@ mod tests {
         .unwrap();
         let names: Vec<String> = telegram.own_fields().into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["token"]);
+    }
+
+    /// A connection's identity is listed everywhere, so a recipe may
+    /// never build it from a secret field or a stored token.
+    #[test]
+    fn an_identity_built_from_a_secret_is_refused() {
+        let spec = |identity: &str| -> AccessSpec {
+            serde_json::from_value(json!({
+                "service": "svc",
+                "acquisition": { "kind": "static", "fields": [
+                    { "name": "api_key", "label": "Key" },
+                    { "name": "user", "label": "User", "secret": false }
+                ] },
+                "doors": ["own"],
+                "identity": identity
+            }))
+            .unwrap()
+        };
+        assert!(spec("{user}").validate().is_ok());
+        let err = spec("{api_key}").validate().unwrap_err();
+        assert!(err.contains("'api_key', a secret"), "{err}");
+        assert!(spec("{access_token}").validate().is_err());
     }
 
     /// Guide steps are generated from the ticked permissions, never a

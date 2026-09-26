@@ -568,7 +568,9 @@ async fn member_connect(
                 grant.id, grant.id
             )
         })?;
-    let rearmed: Vec<String> = serde_json::from_value(changed["rearmed"].clone()).unwrap_or_default();
+    let rearmed = serde_json::from_value::<weft_core::member_door::ValuesChanged>(changed)
+        .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
+        .rearmed;
     if json {
         println!("{}", serde_json::json!({ "node": step, "member": member, "picked": grant.id, "rearmed": rearmed }));
     } else {
