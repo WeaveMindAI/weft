@@ -41,7 +41,7 @@ You create exactly one folder per node in [the brief]: `src/<area>/<snake_name>/
    - `tests.rs`: the tests under Testing rules. An access node (the `access_node!` macro is its whole body) has none: there is nothing of yours to test, and you say so in the report instead of writing a rig for the macro.
    Two kinds of node have rules beyond the anatomy: one that brings up
    INFRASTRUCTURE (what its image owes you, what its display must
-   offer, what may be reachable from outside the cluster) and an ACCESS
+   offer, what may be reachable from outside the project) and an ACCESS
    node (the connection story the compiler builds from its declaration).
    Both are in the manual's "The special shapes", and several of the
    rules there fail [the review] outright, so read it before you write
@@ -50,7 +50,7 @@ You create exactly one folder per node in [the brief]: `src/<area>/<snake_name>/
    worked example. A TRIGGER node writes no display at all, because the
    signal kind serves one inside weft; say so in your report rather
    than trying.
-5. Prove it. [the local tiers] are `basic` and `fake`; `weft test-node <Type>` runs them on this machine with plain cargo, no cluster, no credentials, no money. You iterate there until every test is green.
+5. Prove it. [the local tiers] are `basic` and `fake`; `weft test-node <Type>` runs them on this machine with plain cargo, no weft install, no credentials, no money. You iterate there until every test is green.
 6. Confirm the catalog took the node: `weft describe-nodes --node <Type> --compact` succeeds (an unknown-type error means the node was not picked up or a service-name collision dropped it), and `weft validate --file src/main.weft < src/main.weft` passes: the program does not use the node yet, but validate builds the whole catalog strictly, so a type-name collision is a hard error there.
 
 ## Testing rules

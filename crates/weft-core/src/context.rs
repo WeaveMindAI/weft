@@ -10,7 +10,7 @@ use crate::frames::LoopFrames;
 use crate::primitive::SignalSpec;
 use crate::tag::StopSelf;
 use crate::weft_type::WeftType;
-use crate::Color;
+use crate::ExecutionId;
 
 pub use crate::primitive::Phase;
 
@@ -48,7 +48,7 @@ pub struct ExecutionContext {
     /// the node; runtime callers decide whether to fall back to
     /// node_id or omit the label entirely.
     pub node_label: Option<String>,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub frames: LoopFrames,
     /// Who this run is for: the member whatever started it named, or
     /// `None` for a run for nobody in particular. Read it through
@@ -141,7 +141,7 @@ impl ExecutionContext {
         node_id: String,
         node_type: String,
         node_label: Option<String>,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         member: Option<crate::member::MemberId>,
         inputs: ValueBag,
@@ -149,7 +149,7 @@ impl ExecutionContext {
     ) -> Self {
         let wake = ValueBag::wake(handle.wake_payload());
         Self {
-            project_id, node_id, node_type, node_label, color, frames, member,
+            project_id, node_id, node_type, node_label, execution_id, frames, member,
             inputs, wake, handle,
         }
     }
@@ -206,6 +206,14 @@ impl ExecutionContext {
     /// Every public URL is derived from the signal's mount_path on
     /// the dispatcher; nodes don't need the URL handed back. Returns
     /// `()` once the dispatcher has acknowledged the registration.
+    ///
+    /// The settings the language gives the trigger
+    /// (`NodeMetadata::add_language_inputs`) are read here from the
+    /// node's inputs, never by the node: the run class (`longRuns`)
+    /// and the trigger's entry limits (`callsPerMinutePerCaller` on a
+    /// trigger called from outside, `callsPerMinute`, `callsAtOnce`),
+    /// which the dispatcher enforces. A trigger without one of them
+    /// gets its default.
     pub async fn register_signal<K: crate::signal::Signal>(
         &self,
         kind: K,
@@ -218,6 +226,8 @@ impl ExecutionContext {
             crate::storage::media::strip_links(&Value::Object(self.inputs.values.clone()));
         let mut spec = crate::signal::to_spec(kind);
         spec.config = crate::storage::media::strip_links(&spec.config);
+        spec.limits = crate::signal::EntryLimits::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
+        spec.run_class = crate::run_class::RunClass::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
         self.handle.register_signal(spec, port_snapshot).await
     }
 
@@ -461,7 +471,7 @@ impl ExecutionContext {
     /// lookups.
     ///
     /// The address is handed over only once something ANSWERS on it. A
-    /// workload is marked ready a moment before the cluster routes to
+    /// workload is marked ready a moment before the install routes to
     /// it, so anything dialling straight away would be refused; this
     /// waits that gap out, whatever the node speaks next.
     ///
@@ -472,7 +482,7 @@ impl ExecutionContext {
     ///
     /// Returns an error if the endpoint doesn't exist or the infra
     /// isn't applied. The dispatcher resolves the URL from the
-    /// `infra_node` row so node code never touches k8s.
+    /// `infra_node` row so node code never touches the platform.
     pub async fn endpoint(&self, name: &str) -> WeftResult<EndpointHandle> {
         let address = self.handle.endpoint_address(name).await?;
         Ok(EndpointHandle {
@@ -495,7 +505,7 @@ impl ExecutionContext {
     /// (`get`/`delete`/`keep`/`presign`) act on the key's OWN scope
     /// (the key encodes its prefix), so a downstream node can `get` a
     /// stored-file value without knowing which scope produced it; the box
-    /// still enforces the wall (own color, own project, granted
+    /// still enforces the wall (own execution, own project, granted
     /// shared names). `copy` is both: it reads the key's own scope and
     /// writes the handle's, which is how a file crosses from one scope
     /// to another.
@@ -1408,7 +1418,7 @@ pub enum EndpointMethod {
 /// Obtained via `ctx.endpoint(name)`: one broker round-trip
 /// resolves the URL, the handle caches it. After that:
 ///
-///   - `.url()` is a sync getter for the bare cluster-internal URL
+///   - `.url()` is a sync getter for the bare install-internal URL
 ///     (e.g. to forward as a NodeOutput port value);
 ///   - `.call(method, path, body)` issues an HTTP request to the
 ///     cached URL + `path` and returns the JSON response.
@@ -1482,17 +1492,17 @@ impl EndpointHandle {
         endpoint_host_and_port(&self.url)
     }
 
-    /// Cluster-internal URL of this endpoint. No broker call; the
-    /// URL was resolved by `ctx.endpoint(name)`.
+    /// The address the project's own workers reach this endpoint at. No
+    /// broker call; the URL was resolved by `ctx.endpoint(name)`.
     pub fn url(&self) -> &str {
         &self.url
     }
 
-    /// The address a caller outside the cluster reaches this endpoint
+    /// The address a caller outside the install reaches this endpoint
     /// at, to hand to whoever calls in (a provider's webhook target, a
-    /// browser). `Some` only for an `Expose::TenantPublic` endpoint, on
-    /// an install that has a front-door address. The node declares
-    /// `/hooks`; this is `<front door>/infra/<namespace>/<instance>/hooks`,
+    /// browser). `Some` only for an `Expose::Public` endpoint, on an
+    /// install that has a front-door address. The node declares
+    /// `/hooks`; this is `<front door>/infra/<project>/<instance>/hooks`,
     /// which the door rewrites back to `/hooks` on the way in.
     pub fn public_url(&self) -> Option<&str> {
         self.public_url.as_deref()
@@ -1791,7 +1801,7 @@ impl StorageHandle {
     /// Mint a TEMPORARY link to this file: the internet-reachable one
     /// when the install serves one (a tunnel, a real ingress, a bucket
     /// declared public), which an external URL-accepting API streams
-    /// from directly, else one signed for the cluster's own address,
+    /// from directly, else one signed for the install's own address,
     /// which your body can fetch and nothing outside can. When the
     /// consumer is outside and inline bytes are an option, use
     /// [`Self::public_link`], which says which case you are in.
@@ -2579,7 +2589,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
@@ -2611,7 +2621,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({})),
@@ -2649,7 +2659,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
@@ -2690,7 +2700,7 @@ mod value_bag_tests {
                 "node-1".into(),
                 "TestNode".into(),
                 None,
-                crate::Color::nil(),
+                crate::ExecutionId::nil(),
                 LoopFrames::default(),
                 None,
                 inputs_bag(json!({})),
@@ -2724,7 +2734,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(inputs_json),

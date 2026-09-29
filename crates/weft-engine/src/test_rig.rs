@@ -10,7 +10,7 @@
 //!   - emitted outputs are captured at the ctx seam instead of routed
 //!     (there is no downstream graph);
 //!   - each RUNNER carries one execution identity (execution id +
-//!     color), so a test's spends attribute to one real color, however
+//!     execution), so a test's spends attribute to one real execution, however
 //!     many times its body fires the rig.
 
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use weft_core::access::Access;
 use weft_core::cancellation::CancellationFlag;
 use weft_core::context::ContextHandle;
 use weft_core::node_test::LiveHandleFactory;
-use weft_core::{Color, LiveRig};
+use weft_core::{ExecutionId, LiveRig};
 
 use crate::context::{BusCoordinator, EngineClients, RunnerHandle};
 
@@ -30,16 +30,16 @@ use crate::context::{BusCoordinator, EngineClients, RunnerHandle};
 /// dropped.
 pub struct LiveTestRunner {
     clients: EngineClients,
-    pod_name: String,
+    instance: String,
     tenant_id: String,
     project_id: uuid::Uuid,
-    /// THE run's execution identity: the pre-registered color the
-    /// spawning runtime supplied (it registered the color so the
+    /// THE run's execution identity: the pre-registered execution the
+    /// spawning runtime supplied (it registered the execution so the
     /// broker can scope the run), or a fresh mint. One runner serves
     /// one test run, so the runner IS one execution: every rig and
-    /// every handle it mints carries this same color, and every spend
+    /// every handle it mints carries this same execution, and every spend
     /// attributes to it.
-    color: Color,
+    execution_id: ExecutionId,
     /// Every handle a rig minted, so `settle` can release the
     /// runtime-owned connections their bodies opened.
     handles: Arc<Mutex<Vec<Arc<RunnerHandle>>>>,
@@ -91,18 +91,18 @@ impl LiveTestRunner {
     pub fn new(
         mut clients: EngineClients,
         catalog: &'static dyn weft_core::NodeCatalog,
-        pod_name: String,
+        instance: String,
         tenant_id: String,
         project_id: uuid::Uuid,
-        fixed_color: Option<Color>,
+        fixed_execution_id: Option<ExecutionId>,
     ) -> Self {
         clients.journal = Arc::new(weft_journal::NoopJournal);
         Self {
             clients,
-            pod_name,
+            instance,
             tenant_id,
             project_id,
-            color: fixed_color.unwrap_or_else(Color::new_v4),
+            execution_id: fixed_execution_id.unwrap_or_else(ExecutionId::new_v4),
             handles: Arc::new(Mutex::new(Vec::new())),
             catalog,
             watchdogs: Mutex::new(Vec::new()),
@@ -116,14 +116,14 @@ impl LiveTestRunner {
     /// like several calls inside one firing would. Must be called from
     /// within a tokio runtime (it spawns the rig's parked-body
     /// watchdog).
-    pub fn rig(&self, connection_id: &str, service: &str) -> LiveRig {
+    pub fn rig(&self, connection_id: &str, service: &str, fixtures: std::collections::BTreeMap<String, String>) -> LiveRig {
         let access = Access::new(connection_id, service, None);
         let clients = self.clients.clone();
-        let pod_name = self.pod_name.clone();
+        let instance = self.instance.clone();
         let tenant_id = self.tenant_id.clone();
         let project_id = self.project_id;
         let handles = self.handles.clone();
-        let color = self.color;
+        let execution_id = self.execution_id;
         let catalog = self.catalog;
         // ONE coordinator per rig, shared by every handle it mints:
         // the rig is one test, and a bus the test seeds (`rig.bus`)
@@ -201,14 +201,14 @@ impl LiveTestRunner {
                 .map_err(weft_core::WeftError::Config)?;
             let handle = Arc::new(RunnerHandle::new(
                 project_id,
-                color,
+                execution_id,
                 node_id.to_string(),
                 node_id.to_string(),
                 node_type,
                 weft_core::frames::LoopFrames::default(),
                 clients.clone(),
                 published,
-                pod_name.clone(),
+                instance.clone(),
                 tenant_id.clone(),
                 Arc::new(CancellationFlag::new()),
                 waits.clone(),
@@ -227,12 +227,12 @@ impl LiveTestRunner {
             handles.lock().unwrap().push(handle.clone());
             Ok(handle as Arc<dyn ContextHandle>)
         });
-        LiveRig::new(factory, access)
+        LiveRig::new(factory, access, fixtures)
     }
 
-    /// The execution color this run's cost is recorded under.
-    pub fn color(&self) -> Color {
-        self.color
+    /// The execution this run's cost is recorded under.
+    pub fn execution_id(&self) -> ExecutionId {
+        self.execution_id
     }
 
     /// Settle everything the runs left open: releases every leased
@@ -253,7 +253,7 @@ impl LiveTestRunner {
         for handle in handles {
             failures.extend(handle.close_opened_accesses().await);
         }
-        self.clients.open_charges.flush_color(self.color, "the node test ended before the job was read back");
+        self.clients.open_charges.flush_execution_id(self.execution_id, "the node test ended before the job was read back");
         self.clients.pending_costs.wait_zero().await;
         failures
     }

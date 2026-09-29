@@ -2,9 +2,12 @@
 
 Every command, grouped by what you are trying to do.
 
-Two flags work everywhere. `--dispatcher <url>` points at a different runtime,
-and also reads from `WEFT_DISPATCHER_URL`. `--json` prints machine-readable
-output, which is how the VS Code extension drives all of this.
+Three flags work everywhere. `--on <target>` acts on an install named in
+`weft.toml` instead of the one on your machine
+([deploying to your cloud](cloud.md)). If you want to reach a runtime by its address
+rather than a target name, pass `--dispatcher <url>` or set
+`WEFT_DISPATCHER_URL`; you cannot combine it with `--on`. If you are scripting weft, pass `--json` for machine-readable
+output.
 
 `--json` changes behaviour, not just formatting, in three places:
 
@@ -25,7 +28,7 @@ up as soon as you update it.
 
 | Command | What it does |
 |---|---|
-| `weft new <name> [--assistant <who>]` | Scaffolds `weft.toml`, `src/main.weft`, `nodes/`, a git repo and a `.gitignore`. `--assistant` copies Tangle in, is repeatable, and is remembered for next time |
+| `weft new <name> [--assistant <who>] [--ci <cloud>]` | Scaffolds `weft.toml`, `src/main.weft`, `nodes/`, a git repo and a `.gitignore`. `--assistant` copies Tangle in, is repeatable, and is remembered for next time. `--ci gcp` also writes the deploy workflow. If any step fails, nothing is written |
 | `weft catalog update` | Re-copies `nodes/base_catalog/` from the installed weft. Replaces the folder, so your edits in there go |
 | `weft tangle update [--assistant <who>]` | Re-copies Tangle. Replaces every file the template owns; anything your assistant wrote beside them stays |
 
@@ -37,8 +40,8 @@ up as soon as you update it.
 | `weft run <example>` | The same, with a saved example's starting values |
 | `weft build` | Compiles and registers, starting nothing. Also how you put back code the dispatcher no longer holds |
 | `weft bake` | Prepares every trigger's settings and starts no listeners. Takes the same `--running-policy` and `--drain-timeout` as `weft activate`, for the same reason: the setup runs on a worker, and one still up from an older build is replaced first |
-| `weft stop <color>` | Cancels a run |
-| `weft wake <color> <node>` | Resolves a pure time wait now. Refused for a wait that expects a value |
+| `weft stop <execution-id>` | Cancels a run |
+| `weft wake <execution-id> <node>` | Resolves a pure time wait now. Refused for a wait that expects a value |
 | `weft follow <project>` | Streams a project's events live |
 
 Flags on `weft run`:
@@ -58,7 +61,8 @@ Flags on `weft run`:
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
-| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `member` |
+| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `member`, `long` |
+| `--long` | Gives the run a worker of its own, for a run that may take longer than an hour on a cloud install (Cloud Run cuts an ordinary request at an hour). A trigger's `longRuns` field does the same for every run it starts |
 | `--member <id>` | Run for this member of the program. Needed when the run reaches a step that exists once per member (see [programs with members](members.md)) |
 
 If you want to hand a run a file its real source cannot give you here (a
@@ -84,11 +88,10 @@ reads the file again.
 | Command | What it does |
 |---|---|
 | `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status`, `--member`, `--tag`. A run of a `Route` with `recorded: false` shows only if it failed |
-| `weft events <color>` | One run's events in order. `--node`, `--kind`, `--full` for whole values |
-| `weft logs [<color>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
+| `weft events <execution-id>` | One run's events in order. `--node`, `--kind`, `--full` for whole values |
+| `weft logs [<execution-id>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
 | `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_member` one how many members have a copy), each trigger (with the events a member's trigger holds until they fill a field), recent runs, what drifted, and what you can do next |
 | `weft ps` | Every project the dispatcher knows |
-| `weft listener inspect` | Every listener pod and the signals on it. An operator's view |
 
 `--phase fire` hides the setup runs that an activate or a resync makes, so it
 answers "has my trigger fired since I changed it".
@@ -100,8 +103,8 @@ answers "has my trigger fired since I changed it".
 | `weft tree` | The version tree, with runs beneath each version and head marked |
 | `weft checkpoint [<label>]` | Records the files as a version. No run, no build |
 | `weft branch <ref> [--discard]` | Restores a version's files and moves head. Refuses if you have uncommitted changes, unless `--discard` |
-| `weft diff <left> <right>` | Compares what two runs put on their wires. A ref is a color or `example:<name>`. `--full` for every wire |
-| `weft freeze <name> [<color>]` | Writes `examples/<name>.json` from a run: its parameters, the answers people gave, and the outputs you accept. `--expect <node>` emphasises a node in later diffs |
+| `weft diff <left> <right>` | Compares what two runs put on their wires. A ref is an execution id or `example:<name>`. `--full` for every wire |
+| `weft freeze <name> [<execution-id>]` | Writes `examples/<name>.json` from a run: its parameters, the answers people gave, and the outputs you accept. `--expect <node>` emphasises a node in later diffs |
 | `weft examples` | Saved examples, whether each is frozen, and its latest run |
 | `weft prune <version>` | Deletes a version, everything under it, and their runs |
 
@@ -113,7 +116,7 @@ answers "has my trigger fired since I changed it".
 | `weft deactivate` | Stops the program's own triggers listening, and tells you how many members still have theirs on. `--member <id>` stops one member's, `--all-members` stops every member's and leaves the program's own alone |
 | `weft resync` | Deactivate and re-activate in one shot against your current program. With no flag it does every trigger that is on, the program's own and every member's, and prints whose it did. It only touches triggers that are on; for ones that are off, use `weft activate` |
 | `weft cancel-activate` | Cancels an activate in flight |
-| `weft cancel-build` | Cancels a build in flight. Only for a build running in the cluster; Ctrl+C handles a local one |
+| `weft cancel-build` | Cancels a build in flight. The install stops the build, and the command that was building fails saying it was cancelled |
 | `weft cancel-running` | Ends a drain early while a deactivate is waiting |
 
 `deactivate`, `resync` and the infra verbs share four flags. `activate` and
@@ -172,12 +175,31 @@ instead of the shared infra, `start`, `stop`, `terminate`, `upgrade`,
 | `weft member-values --member <id>` | Lists what the program asks that member to fill and what they gave; `--set node.field=value` and `--clear node.field` (both repeatable) change it in one go, re-arming their live triggers that read a changed value |
 | `weft connect --door shared\|own` | Which door to connect through, without being asked |
 | `weft connect --set NAME=VALUE` | Fill a credential field. The value is visible to other processes, so prefer the prompt or `--set-env NAME=ENV_VAR` |
-| `weft token mint` | Mint a signal token. `--name`, `--projects`, `--tags`, `--display <node>`, `--displays`, and `--expires <duration>` (`30m`, `12h`, `7d`; without it the token works until revoked). Printed once and never again |
+| `weft token mint` | Mint a signal token. `--name`, `--projects`, `--tags`, `--display <node>`, `--displays`, and `--expires <duration>` (`30m`, `12h`, `7d`; without it the token works until revoked). Printed once and never again. `--operator` mints an operator key instead, which administers the whole install and takes no scope |
 | `weft token mint --member <id> --expires <duration>` | A member token for the project you are in: it acts as that member and nothing else. `--expires` (`30m`, `12h`, `7d`) is required |
 | `weft token ls` | The tokens you have, by their recognizer prefix |
 | `weft token revoke <id>` | Revoke one |
 | `weft options <step> <field> [--search <text>]` | Lists the choices a field with a searchable list offers (a model, a spreadsheet, a channel), the same list the editor shows when you search that field, read through the connection picked for it. One `id  label` line each; the id is what you write in the field |
 | `weft connect-lib` | Copies weft's connect library into the project's frontend (`front/src/lib/weft-connect`, or the folder `--into` names), so its pages show the editor's connection pickers and list fields, and a member gets their own settings page. The folder is the library's: each run replaces it, so run it again after updating weft and keep your own code outside it |
+
+## Cloud installs
+
+| Command | What it does |
+|---|---|
+| `weft target add <name> <url>` | Names an install in `weft.toml`. Replaces the address when the name exists |
+| `weft target list` | The targets, and whether you are logged in to each |
+| `weft target remove <name>` | Takes one out of `weft.toml` |
+| `weft login <name>` | Stores your operator key for it, after checking the install accepts it. `--key-stdin` for a script |
+| `weft logout <name>` | Forgets your key for it |
+| `weft running-source <folder>` | Writes the program an install is running into a new folder, without touching your own files. Add `--on <target>` to get what a cloud install runs |
+| `weft ci add --cloud gcp` | Writes `.github/workflows/deploy.yml`. Refuses to replace one somebody edited |
+| `weft target export <name> [--github]` | Mints a CI operator key and a frontend token on the install. With `--github` it sets them, and the workflow's other settings, on the repository through `gh`; without it, it prints them |
+| `weft domain add <name>` | Makes the install answer at a domain you own: prints the DNS record to set and waits until it points here. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record |
+| `weft domain list` | Every domain, with its DNS record |
+| `weft domain rm <name>` | Stops answering at it |
+| `weft workers` | The project's worker settings: copies kept warm, the most copies, runs per copy, CPU, memory. It shows which the project sets and which come from the install |
+| `weft workers set --min-instances 1 ...` | Changes settings for this project; the change reaches its running workers at once |
+| `weft workers reset [<setting>...]` | Puts settings back to the install's values |
 
 ## Stored files
 
@@ -195,20 +217,20 @@ instead of the shared infra, `start`, `stop`, `terminate`, `upgrade`,
 | Command | What it does |
 |---|---|
 | `weft daemon start` | Brings the runtime to the state the code describes. Idempotent, so it is both first boot and refresh. `restart` is the same thing |
-| `weft daemon stop` | Scales the dispatcher to nothing. The cluster and your data stay |
+| `weft daemon stop` | Stops the runtime and the workers it started. The database, your infrastructure and your data stay |
 | `weft daemon status` | Whether it is reachable, and the public address if one is open |
-| `weft daemon logs` | The dispatcher's log. `--tail` (100), `-f` |
+| `weft daemon logs` | The runtime's log. `--tail` (100), `-f` |
+| `weft daemon remove` | Takes a named install (`WEFT_INSTANCE`) off this machine, everything of it included. The default install is removed by `./setup.sh --uninstall` |
 
-Flags on `weft daemon start`: `--rebuild` forces every shared image to rebuild,
-`--rebuild-cluster` rebuilds the kind node, `--public-url` and `--no-public-url`
-open and close the public trigger surface, and `--clear-access-apps` empties the
-shared credentials when your checkout has no `access-apps.json`.
+Flags on `weft daemon start`: `--rebuild` forces every shared image to rebuild.
+`--public-url` and `--no-public-url` open and close
+[the public address](../build/public-address.md).
 
 ## Testing nodes
 
 | Command | What it does |
 |---|---|
-| `weft test-node [<node or package>]` | Runs node tests. Without `--tier`, the basic and fake tiers, which need no cluster |
+| `weft test-node [<node or package>]` | Runs node tests. Without `--tier`, the basic and fake tiers, which need no install |
 | `weft test-node --tier live` | Calls the real provider with a real credential, and can spend money |
 | `weft node-test-hash [<target>]` | The content hash naming a package's test inputs |
 
@@ -231,7 +253,7 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 | Command | What it does |
 |---|---|
 | `weft clean` | Deletes runs older than `--keep-days`, 30 by default |
-| `weft clean <color>` | Deletes one run |
+| `weft clean <execution-id>` | Deletes one run |
 | `weft clean --all` | Deletes every run |
 | `weft clean --project <id>` | Deletes that project's whole history, which outlives the project |
 | `weft clean --member <id>`, `--tag <tag>`, `--status <how>`, `--node <node>` | Deletes only the runs these name, across the projects you name (or every one). Naming a member or a tag takes all their runs; add `--keep-days` to spare recent ones. A run still going is left to finish unless you pass `--cancel-running` |
@@ -276,7 +298,7 @@ when needed and ignored otherwise.
 | `weft rm --journal` | Also every run and log row |
 | `weft rm --local` | Also `.weft/target/` and its slice of the node-test cache |
 | `weft prune <version>` | That version, every version under it, and every run beneath them |
-| `weft clean <color>` | One run, for good |
+| `weft clean <execution-id>` | One run, for good |
 | `weft clean --all` | Every run |
 | `weft clean --project <id>` | That project's entire history |
 | `weft clean --build-cache` | The docker build cache and the node-test cache |
@@ -288,7 +310,6 @@ when needed and ignored otherwise.
 | `weft tangle update` | Your edits to the Tangle files the template owns |
 | `weft freeze <name>` | The previous `examples/<name>.json`, replaced whole |
 | `weft infra terminate` | Every infra resource, **disks included**, unless the node preserves them |
-| `weft daemon start --rebuild-cluster` | The kind node, and with it **every project's own database**. The runtime's own database lives on the host and survives |
 | `weft connect --forget <id>` | A stored connection. Other projects using it then fail at run time asking for a reconnect |
 
 Worker images are shared between projects, so no level of `weft rm` reclaims

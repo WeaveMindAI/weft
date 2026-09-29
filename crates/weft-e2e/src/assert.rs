@@ -24,15 +24,15 @@ impl SettledRun {
             "completed" => Ok(self),
             "failed" => bail!(
                 "execution {} FAILED: {}",
-                self.color,
+                self.execution_id,
                 self.failure_message().unwrap_or_else(|| "<no error text>".into())
             ),
             "cancelled" => bail!(
                 "execution {} was CANCELLED: {}",
-                self.color,
+                self.execution_id,
                 self.cancel_reason().unwrap_or_else(|| "<no reason>".into())
             ),
-            other => bail!("execution {} has unexpected status {other}", self.color),
+            other => bail!("execution {} has unexpected status {other}", self.execution_id),
         }
     }
 
@@ -49,7 +49,7 @@ impl SettledRun {
         if self.status != "failed" {
             bail!(
                 "expected execution {} to FAIL, but status is {}",
-                self.color,
+                self.execution_id,
                 self.status
             );
         }
@@ -57,7 +57,7 @@ impl SettledRun {
         if !msg.contains(needle) {
             bail!(
                 "execution {} failed but error did not contain '{needle}': {msg}",
-                self.color
+                self.execution_id
             );
         }
         Ok(self)

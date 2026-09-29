@@ -1,0 +1,22 @@
+{
+  "type": "GpuProbe",
+  "label": "GPU Probe",
+  "description": "An infra node whose unit asks for a GPU. Its container lists the GPUs it can see, so the e2e rig can check a GPU really reached it.",
+  "tags": [
+    "infra",
+    "e2e"
+  ],
+  "icon": "Cpu",
+  "color": "#22c55e",
+  "outputs": [
+    {
+      "name": "gpus",
+      "type": "String"
+    }
+  ],
+  "requires_infra": true,
+  "images": [
+    "images/gpu_probe"
+  ],
+  "features": {}
+}

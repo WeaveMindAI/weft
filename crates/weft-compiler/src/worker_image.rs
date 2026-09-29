@@ -108,6 +108,16 @@ impl PackageManager {
 
 pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
 
+/// The two images a worker Dockerfile FROMs unless the project names its
+/// own: the shared pre-built builder base, and the runtime base a project
+/// that sets no `base_image` runs on ([`DEFAULT_BASE_IMAGE`], or the
+/// install's own copy of it, so a build never has to reach Docker Hub).
+#[derive(Debug, Clone)]
+pub struct BaseImages {
+    pub builder: String,
+    pub runtime: String,
+}
+
 /// Weft workspace mount point INSIDE the builder container. The
 /// docker build context copies the language-runtime workspace
 /// (`crates/`, `Cargo.toml`, `Cargo.lock`) to this path, giving the
@@ -154,8 +164,9 @@ pub const BASE_CONTEXT_DIR: &str = ".weft-base-context";
 /// the build context must include (the codegen's `#[path]`
 /// includes point at these).
 ///
-/// `builder_base_ref` is the fully-qualified ref of the shared
-/// pre-built builder-base image. The CLI computes it from the
+/// `bases.builder` is the fully-qualified ref of the shared
+/// pre-built builder-base image, `bases.runtime` the runtime base a
+/// project that names none runs on. The CLI computes it from the
 /// engine workspace hash and ensures the image exists. When the
 /// user's runtime base is debian-family and they haven't supplied a
 /// custom Dockerfile template, the builder stage `FROM`s this image
@@ -176,13 +187,11 @@ pub fn emit(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     binary_name: &str,
-    builder_base_ref: &str,
+    bases: &BaseImages,
     baked: &BuilderStage,
 ) -> CompileResult<WorkerDockerfile> {
-    let base_image_str = build
-        .base_image
-        .clone()
-        .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string());
+    let builder_base_ref = bases.builder.as_str();
+    let base_image_str = build.base_image.clone().unwrap_or_else(|| bases.runtime.clone());
     let base = parse_base_image(&base_image_str);
 
     let mut build_packages =
@@ -246,6 +255,7 @@ pub fn emit(
         .replace("{{worker_cache_key}}", &worker_cache_key)
         .replace("{{cache_gc_script}}", CACHE_GC_SCRIPT_NAME)
         .replace("{{cache_retention_days}}", &WORKER_CACHE_RETENTION_DAYS.to_string())
+        .replace("{{cache_versions_kept}}", &WORKER_CACHE_VERSIONS_KEPT.to_string())
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),
@@ -706,7 +716,7 @@ const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "    && cp {{seed_lock}} /work/Cargo.lock \\\n",
     "    && cargo build --release \\\n",
     "    && cp /cache/target/release/{{binary_name}} /worker \\\n",
-    "    && ( sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} \\\n",
+    "    && ( sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} {{cache_versions_kept}} \\\n",
     "         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 )\n",
 );
 
@@ -736,6 +746,13 @@ pub const WORKER_CACHE_MOUNT_ID_PREFIX: &str = "weft-worker-target-";
 /// this a host that edits nodes would keep every version it ever built.
 pub const WORKER_CACHE_RETENTION_DAYS: u32 = 30;
 
+/// How many compiled versions of one node package (and of the worker
+/// crate on top) stay in the cache, newest by last link: the current one
+/// and a couple of edits back, so going back an edit relinks instead of
+/// recompiling, while a node edited all day keeps three copies, not one
+/// per save.
+pub const WORKER_CACHE_VERSIONS_KEPT: u32 = 3;
+
 /// File name of [`CACHE_GC_SCRIPT`] inside the generated crate (`/work`
 /// in the builder stage).
 pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
@@ -762,9 +779,9 @@ pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
 /// copy. The engine and the shared dependencies are never touched.
 pub const CACHE_GC_SCRIPT: &str = r#"#!/bin/sh
 # Emitted by weft codegen. Do not edit by hand.
-# usage: weft-cache-gc.sh <target/release> <retention days> <crate root> <worker binary name>
+# usage: weft-cache-gc.sh <target/release> <retention days> <crate root> <worker binary name> [versions kept]
 set -eu
-release="$1"; days="$2"; work="$3"; worker="$4"
+release="$1"; days="$2"; work="$3"; worker="$4"; versions="${5:-3}"
 deps="$release/deps"; fingerprints="$release/.fingerprint"; scripts="$release/build"
 [ -d "$deps" ] || exit 0
 # Mark: every file of a package crate this build linked is touched. One
@@ -783,6 +800,20 @@ if [ -s "$slots" ]; then
   done
 fi
 rm -f "$slots"
+# Bound: of each package's compiled versions (every stem of one crate
+# name) and of the worker crate's, only the newest few by last link stay.
+drop_stem() {
+  rm -f "$deps/$1" "$deps/$1".* "$deps/lib$1".*
+  rm -rf "$fingerprints/$1"
+}
+for name in $(for d in "$deps"/pkg_*.d "$deps"/"$worker"-*.d; do [ -e "$d" ] && basename "$d" .d; done | sed 's/-[^-]*$//' | sort -u); do
+  n=0
+  for d in $(ls -t "$deps"/"$name"-*.d 2>/dev/null); do
+    n=$((n + 1))
+    [ "$n" -le "$versions" ] && continue
+    drop_stem "$(basename "$d" .d)"
+  done
+done
 # Expire: a per-project crate any of whose files is older than the
 # retention period (a used crate had every file touched above; an orphan
 # missing its dep-info still ages by its rlib or fingerprint).
@@ -832,8 +863,6 @@ const RUNTIME_STAGE_FRAGMENT: &str = concat!(
 fn default_template() -> String {
     [
         concat!(
-            "# syntax=docker/dockerfile:1.6\n",
-            "\n",
             "FROM {{base_image}} AS builder\n",
             "\n",
             "# Always-present builder toolchain: every cargo build needs\n",
@@ -880,8 +909,6 @@ fn default_template() -> String {
 fn prebuilt_base_template() -> String {
     [
         concat!(
-            "# syntax=docker/dockerfile:1.6\n",
-            "\n",
             "FROM {{builder_base_image}} AS builder\n",
             "\n",
             "# Node-specific build packages. Base packages (build-essential,\n",
@@ -1127,7 +1154,7 @@ mod tests {
             &catalog,
             &referenced,
             "worker_test",
-            "weft-builder-base:irrelevant",
+            &BaseImages { builder: "weft-builder-base:irrelevant".into(), runtime: DEFAULT_BASE_IMAGE.into() },
             &nothing_baked(),
         )
         .expect("emit");
@@ -1185,7 +1212,7 @@ mod tests {
             &catalog,
             &referenced,
             "worker_test",
-            "weft-builder-base:cafebabe",
+            &BaseImages { builder: "weft-builder-base:cafebabe".into(), runtime: DEFAULT_BASE_IMAGE.into() },
             &nothing_baked(),
         )
         .expect("emit");
@@ -1218,7 +1245,7 @@ mod tests {
             &catalog,
             &referenced,
             "worker_test",
-            "weft-builder-base:abcdef0123456789",
+            &BaseImages { builder: "weft-builder-base:abcdef0123456789".into(), runtime: DEFAULT_BASE_IMAGE.into() },
             &nothing_baked(),
         )
         .expect("emit");
@@ -1353,5 +1380,45 @@ mod tests {
             "an unmatched glob never becomes a file");
         assert!(scripts.join("worker_test-hhhh").exists(), "a fresh build-script unit stays");
         assert!(!scripts.join("worker_test-iiii").exists(), "an old build-script unit goes");
+    }
+
+    /// Of one package's compiled versions, only the newest few by last
+    /// link stay, however recent the others are; another package counts
+    /// on its own.
+    #[test]
+    fn the_cache_sweep_keeps_only_the_newest_versions_of_a_package() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        let deps = release.join("deps");
+        let fingerprints = release.join(".fingerprint");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+        let now = filetime::FileTime::now().unix_seconds();
+        let version = |stem: &str, minutes_ago: i64| {
+            let when = filetime::FileTime::from_unix_time(now - minutes_ago * 60, 0);
+            for file in [format!("{stem}.d"), format!("lib{stem}.rlib")] {
+                std::fs::write(deps.join(&file), b"x").unwrap();
+                filetime::set_file_mtime(deps.join(&file), when).unwrap();
+            }
+            std::fs::create_dir_all(fingerprints.join(stem)).unwrap();
+        };
+        for (i, stem) in ["pkg_mine-a", "pkg_mine-b", "pkg_mine-c", "pkg_mine-d", "pkg_mine-e"].into_iter().enumerate() {
+            version(stem, i as i64 + 1); // a is the newest
+        }
+        version("pkg_other-z", 10);
+        let script = root.path().join(CACHE_GC_SCRIPT_NAME);
+        std::fs::write(&script, CACHE_GC_SCRIPT).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg(&script).arg(&release).arg(WORKER_CACHE_RETENTION_DAYS.to_string()).arg(&work).arg("worker_test")
+            .arg(WORKER_CACHE_VERSIONS_KEPT.to_string())
+            .status().unwrap();
+        assert!(status.success());
+        for kept in ["pkg_mine-a", "pkg_mine-b", "pkg_mine-c", "pkg_other-z"] {
+            assert!(deps.join(format!("lib{kept}.rlib")).exists(), "{kept} stays");
+        }
+        for gone in ["pkg_mine-d", "pkg_mine-e"] {
+            assert!(!deps.join(format!("lib{gone}.rlib")).exists() && !fingerprints.join(gone).exists(), "{gone} goes");
+        }
     }
 }

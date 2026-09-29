@@ -6,7 +6,7 @@
 //!   - download: `POST /storage/files/download { key, project }` -> `{ url }`,
 //!               then GET the bytes from that (box-public) URL.
 //!
-//! File keys are scoped: `exec/<color>/<id>` (execution scratch, swept on
+//! File keys are scoped: `exec/<execution_id>/<id>` (execution scratch, swept on
 //! terminate unless kept), `project/<project_id>/<id>`, `shared/<name>/<id>`.
 
 use std::time::Duration;
@@ -52,7 +52,7 @@ pub async fn list(disp: &Dispatcher, project_id: &Uuid) -> Result<Vec<StoredFile
     Ok(files.into_iter().map(StoredFile).collect())
 }
 
-/// Find files under a SCOPE key prefix (e.g. `exec/<color>/` for one run's
+/// Find files under a SCOPE key prefix (e.g. `exec/<execution_id>/` for one run's
 /// scratch). Wire keys are tenant-anchored (`<tenant>/<scope>/<owner>/<id>`),
 /// but tests think in the scope portion, so match the key with its leading
 /// `<tenant>/` segment stripped. Tenant-agnostic, so it works for any

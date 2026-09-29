@@ -38,7 +38,10 @@ export class ReconnectingStream<T> {
   constructor(
     private readonly client: DispatcherClient,
     private readonly name: string,
-  ) {}
+  ) {
+    // Another install answers now: the same path, asked there.
+    client.onInstallChange(() => this.setPath(this.path));
+  }
 
   onMessage(listener: (msg: T) => void): void {
     this.messageListeners.push(listener);

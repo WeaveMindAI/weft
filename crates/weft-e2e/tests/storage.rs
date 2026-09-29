@@ -20,7 +20,7 @@ async fn fetched_file_is_stored_and_downloadable() -> anyhow::Result<()> {
 
     // The kept execution-scoped file is downloadable and matches the bytes the
     // program fetched.
-    let prefix = format!("exec/{}/", settled.color);
+    let prefix = format!("exec/{}/", settled.execution_id);
     let key = storage::assert_file_contents(&disp, &pid, &prefix, &content).await?;
     eprintln!("stored file verified at key {key}");
 

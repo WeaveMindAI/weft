@@ -3,12 +3,10 @@
 This gets you a weft runtime on your own machine, the `weft` command, and the
 graph editor in VS Code. It is mostly waiting, so keep reading while it runs.
 
-Three tools have to be there first: [Docker](https://docs.docker.com/get-docker/),
-[kubectl](https://kubernetes.io/docs/tasks/tools/) and
-[kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation). kind runs
-a Kubernetes cluster inside Docker, and that cluster is where your programs
-live. The installer checks for all three and stops with the install links if
-one is missing.
+One tool has to be there first: [Docker](https://docs.docker.com/get-docker/).
+weft's runtime is a program on your machine, and everything it starts (your
+programs, their databases and servers) runs in Docker containers next to it.
+If Docker is missing, the installer stops and prints the link to install it.
 
 The installer is a bash script, so on Windows run it inside WSL.
 
@@ -56,8 +54,9 @@ For the whole format, go and read
 ./setup.sh
 ```
 
-It asks you nothing. The first run creates the cluster and pulls images, which
-the installer itself estimates at two to three minutes.
+The installer asks no questions: the first run starts the database and pulls
+images, then sets the runtime up as a service of your user (systemd on Linux, launchd on macOS), so it comes
+back on its own after a reboot.
 
 ## Check it came up
 
@@ -65,18 +64,20 @@ the installer itself estimates at two to three minutes.
 weft daemon status
 ```
 
-A healthy answer names the cluster and counts your projects:
+A healthy answer counts your projects:
 
 ```text
-daemon: running (cluster 'weft', system ns 'weft-system'); 0 project(s)
-public trigger surface: closed
+weft: running at http://127.0.0.1:14111 (install 'default'); 0 project(s)
+public address: closed
 ```
 
 `closed` there is the normal state and not a fault. It means nothing of yours
 is reachable from the internet, which is what you want until you need
 [a public address](../build/public-address.md).
 
-If it says `daemon: unreachable at ...`, run `./setup.sh` again and read the
+If it says `weft: unreachable at ...`, run `weft daemon logs` to see how the
+runtime's log ends (the line also names the log file), then run `./setup.sh`
+again and read the
 last block it prints. If that block has scrolled away, every run writes the
 same thing to `~/.local/share/weft/setup-runs.log`.
 
@@ -119,16 +120,25 @@ Then [build your first program](first-program.md).
 
 ## When you come back to this page
 
-**To change your keys**, edit `access-apps.json` in the checkout and run
-`weft daemon start`. It takes a few seconds and you do not need the installer.
-Deleting the file does not wipe the keys weft already holds; for that, run
-`weft daemon start --clear-access-apps`.
+**To change your keys**, edit `access-apps.json` in the checkout; the change takes effect at once
+([the apps file](../connections/the-apps-file.md)).
 
 **To update**, pull and run `./setup.sh` again. Your projects and their history
-stay where they are.
+stay where they are. Before you do, check the
+[changelog](https://github.com/WeaveMindAI/weft/blob/main/CHANGELOG.md) for
+anything that needs you.
+
+If you installed weft before it stopped running on Kubernetes, that update is
+the exception: its database cannot come along. `./setup.sh` finds the old
+install and asks before wiping it. The wipe deletes the old cluster, your run
+history, versions and stored connections, and every container and image weft
+made, along with every named install on the machine (the question lists them).
+Your project folders stay, and `weft run` registers them again. If
+`./setup.sh` has no terminal to ask on, run `scripts/scrub-old-install.sh`
+yourself first.
 
 **To remove it**, run `./setup.sh --uninstall`. It stops the runtime and
-removes the CLI and the editor extension. Your cluster, database and stored
-connections stay, so a later `./setup.sh` brings everything back. Adding
-`--purge` deletes all of that too, and your programs' own databases live in
-that cluster.
+removes the CLI and the editor extension. Your database, stored connections
+and your programs' infrastructure stay, so a later `./setup.sh` brings
+everything back. Adding `--purge` deletes all of that too, your programs' own
+databases included.

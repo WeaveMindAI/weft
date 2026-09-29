@@ -3,14 +3,13 @@
 //! its endpoint and emits the sidecar's `/outputs` plus the resolved URL.
 //!
 //! Exists so the e2e rig can drive the full infra lifecycle (provision ->
-//! running -> read outputs -> terminate) end to end against a real pod, with no
+//! running -> read outputs -> terminate) end to end against a real container, with no
 //! domain weight (no PVC, no external service, just a tiny HTTP server).
 
 use async_trait::async_trait;
 
 use weft::infra::{
-    Container, ContainerPort, Endpoint, Expose, Image, InfraSpec, Probe, Protocol, Resources, Unit,
-    UnitKind,
+    Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Limits, Probe, Protocol, Unit,
 };
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
@@ -28,10 +27,10 @@ impl Node for MiniServiceNode {
         input: ValueBag,
     ) -> WeftResult<InfraSpec> {
         let reachable: bool = input.get("reachable")?;
+        let public: bool = input.get("public")?;
         Ok(InfraSpec {
             units: vec![Unit {
                 name: "svc".into(),
-                kind: UnitKind::Deployment,
                 containers: vec![Container::new("app", Image::Local {
                     name: "mini_service".into(),
                 })
@@ -40,30 +39,24 @@ impl Node for MiniServiceNode {
                     port: PORT,
                     protocol: Protocol::Tcp,
                 }])
-                .with_resources(Resources {
-                    cpu_request: Some("50m".into()),
-                    memory_request: Some("32Mi".into()),
-                    cpu_limit: Some("250m".into()),
-                    memory_limit: Some("128Mi".into()),
-                    ..Default::default()
-                })
+                .with_limits(Limits { cpu: Some("0.25".into()), memory: Some("128Mi".into()) })
                 .with_readiness(Probe::http("/health", PORT).with_initial_delay(2))],
                 ..Default::default()
             }],
             // A door is part of what this node IS, and its author left
             // the choice to whoever writes it into a program. Off, the
-            // endpoint answers only inside the cluster, as it always
-            // did; on, it gets an address on the machine the runtime
-            // runs on, and `weft infra list-doors` prints it.
+            // endpoint answers only the project's own workers; on, it
+            // gets an address on the install's network, and `weft infra
+            // list-doors` prints it.
             endpoints: vec![Endpoint {
                 name: "api".into(),
-                unit: "svc".into(),
-                container: "app".into(),
-                port: "http".into(),
-                expose: if reachable {
+                target: EndpointTarget::Unit { unit: "svc".into(), container: "app".into(), port: "http".into() },
+                expose: if public {
+                    Expose::Public { path: "/svc".into() }
+                } else if reachable {
                     Expose::SameNetwork
                 } else {
-                    Expose::ClusterInternal
+                    Expose::Project
                 },
             }],
             ..Default::default()

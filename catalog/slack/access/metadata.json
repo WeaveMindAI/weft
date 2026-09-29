@@ -13,7 +13,7 @@
     "service": "slack",
     "label": "Slack",
     "grants": "exclusive",
-    "callback_https": true,
+    "callback": "https",
     "acquisition": {
       "kind": "oauth2",
       "grant": {

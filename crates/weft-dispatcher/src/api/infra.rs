@@ -19,7 +19,6 @@
 //! for the supervisor that owns the project to claim and execute. Per-node
 //! variants scope to a single (project, node).
 
-use std::collections::BTreeMap;
 
 use axum::{
     extract::{Path, Query, State},
@@ -30,10 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::project::StatusError;
 use crate::authenticator::{authorize_project, CallerTenant};
-use crate::infra_lifecycle_command::{self, InfraLifecycleVerb};
+use crate::infra_lifecycle_command::{self, InfraLifecycleVerb, TakeDown};
+use weft_core::infra::wire::{CopyRef, Door, DoorsResponse, InfraLogs, LogBlock, LogCursor, LogsFrom};
 use weft_core::{DeactivateSpec, RunningChoice, RunningPolicy};
 use crate::infra_node::{self, InfraNodeRow, InfraNodeStatus};
-use crate::project_namespace;
 use crate::state::DispatcherState;
 
 // =================================================================
@@ -41,34 +40,28 @@ use crate::state::DispatcherState;
 // =================================================================
 
 // SYNC: SyncRequest body keys <-> crates/weft-cli/src/commands/infra.rs (the
-// hand-built sync body map). Every field here is `#[serde(default)]`, so a
-// renamed key would silently deserialize to its default instead of failing:
-// change both sides together.
+// hand-built sync body map). The optional fields are `#[serde(default)]`, so
+// a renamed optional key would silently deserialize to its default instead
+// of failing: change both sides together.
 #[derive(Debug, Default, Deserialize)]
 pub struct SyncRequest {
+    /// The build the client just made (`POST /projects/{id}/builds`).
+    /// Named, the sync applies it and refuses when the registered build
+    /// is another (a teammate's landed between the two). Absent (a
+    /// program starting a member's copy, which builds nothing), it
+    /// applies the registered build. The images every place runs come
+    /// with the build, never from here.
     #[serde(default, rename = "binaryHash")]
     pub binary_hash: Option<String>,
     #[serde(default, rename = "definitionHash")]
     pub definition_hash: Option<String>,
     #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
-    /// Per-(place, image_name) hash map. Shape:
-    /// `{ "<node>": { "<image_name>": "<hash_tag>" } }`, `<node>` being
-    /// the infra node's place spelled the way a person writes it
-    /// (`one.db`), the key its `infra_node` row is stored under. The
-    /// supervisor reads it (executing a claimed infra lifecycle command)
-    /// to resolve `Image::Local { name }` references to concrete docker tags.
-    /// Absent leaves the stored map as it is: a program starting a
-    /// member's copy builds nothing, so it has no new tags to write.
-    #[serde(default, rename = "imageHashes")]
-    pub image_hashes: Option<BTreeMap<String, BTreeMap<String, String>>>,
     /// How the worker reconciliation inside sync (and an upgrade's
-    /// stop leg) treats RUNNING executions when a worker must be
-    /// replaced (stale image, or its namespace no longer matches
-    /// placement after infra appeared / went away). `cancel` (the
-    /// default) cancels the running executions first; `wait` drains
-    /// the doomed workers (no new admissions; in-flight work finishes)
-    /// up to `drainTimeoutSecs`, then replaces. Never a silent kill.
+    /// stop leg) treats executions still running on an older image once
+    /// a new one went live. `cancel` (the default) cancels them; `wait`
+    /// lets them finish up to `drainTimeoutSecs`, then cancels what is
+    /// left. Never a silent kill.
     /// On an upgrade, outranked by `triggerDeactivation`'s answer when
     /// that picker was shown.
     #[serde(flatten)]
@@ -96,10 +89,23 @@ pub struct SyncBody {
     upgrade: Option<serde_json::Value>,
     #[serde(default, rename = "triggerDeactivation")]
     trigger_deactivation: Option<serde_json::Value>,
+    /// The image map clients used to send, from before the install built
+    /// the images itself: refused, so an old client learns it is old
+    /// rather than having the images it names quietly ignored.
+    #[serde(default, rename = "imageHashes")]
+    image_hashes: Option<serde_json::Value>,
 }
 
 impl SyncBody {
     fn into_sync(self) -> Result<SyncRequest, (StatusCode, String)> {
+        if self.image_hashes.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "`imageHashes` is not a key of /infra/sync any more: the install builds every \
+                 image with the version (POST /projects/{id}/builds); update the client"
+                    .into(),
+            ));
+        }
         if self.upgrade.is_some() || self.trigger_deactivation.is_some() {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -150,20 +156,20 @@ pub(crate) async fn settle_running_before_infra_op(
     trigger_deactivation_ran: bool,
     // The run that asked (a program's `ctx.infra(..).stop(..)`): never
     // among the runs this cancels; its own `StopSelf` decides its fate.
-    asked_by: Option<weft_core::Color>,
+    asked_by: Option<weft_core::ExecutionId>,
 ) -> Result<(), (StatusCode, String)> {
     if running_policy == RunningPolicy::Cancel && !trigger_deactivation_ran {
         let runs = crate::take_down::live_runs(state, project_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live runs: {e}")))?;
         let user = weft_core::exec::CancelCause::User;
-        let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> =
+        let targets: Vec<(weft_core::ExecutionId, &weft_core::exec::CancelCause)> =
             crate::take_down::runs_using_copies(copies, &runs, asked_by)
                 .into_iter()
                 .filter(|r| !r.suspended)
-                .map(|r| (r.color, &user))
+                .map(|r| (r.execution_id, &user))
                 .collect();
-        crate::api::execution::cancel_colors(state, &targets)
+        crate::api::execution::cancel_execution_ids(state, &targets)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     }
@@ -276,8 +282,8 @@ pub struct InfraStatusEntry {
     pub member: Option<weft_core::member::MemberId>,
     pub status: String,
     pub endpoint_url: Option<String>,
-    /// Endpoint name to the address a caller outside the cluster uses,
-    /// for each `TenantPublic` endpoint (the same address
+    /// Endpoint name to the address a caller outside the install uses,
+    /// for each `Public` endpoint (the same address
     /// `ctx.endpoint(name)?.public_url()` gives the node).
     pub public_urls: std::collections::BTreeMap<String, String>,
     pub failure_stage: Option<String>,
@@ -338,12 +344,6 @@ pub async fn sync(
     authorize_project(&state, &caller.0, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default().into_sync()?;
 
-    // No sync-in-flight sentinel: the supervisor pool reaps a supervisor
-    // by OWNERSHIP (a pod owning zero projects), not by a global idle
-    // scan that a sync would need to block. A project being synced is
-    // owned by its supervisor (non-zero, so never reaped), and
-    // `ensure_supervisor` below guarantees a live pod exists; there is no
-    // reaper race for a sentinel to prevent.
     sync_inner(state, id, body).await
 }
 
@@ -363,10 +363,10 @@ pub(super) async fn sync_inner(
 /// (the person's answer in `triggerDeactivation` is required when a
 /// trigger reading the infra is on), then issues an `upgrade` command
 /// and answers 202 with its id at once; 409 while another upgrade of
-/// the same copies is in flight. A dispatcher pod runs it
+/// the same copies is in flight. A dispatcher runs it
 /// ([`run_upgrade`]): the triggers down, the stop leg, then the start. The caller follows
 /// the command (`/infra/commands/{id}`) to its outcome; nothing about it
-/// depends on this request staying open, and a pod dying mid-way hands
+/// depends on this request staying open, and a process dying mid-way hands
 /// it to another.
 pub async fn upgrade(
     State(state): State<DispatcherState>,
@@ -386,7 +386,6 @@ pub async fn upgrade(
         binary_hash: sync.binary_hash,
         definition_hash: sync.definition_hash,
         infra_hash: sync.infra_hash,
-        image_hashes: sync.image_hashes,
         stopped: false,
     };
     let tenant = state
@@ -400,7 +399,7 @@ pub async fn upgrade(
         id,
         sync.member.as_ref(),
         &work,
-        state.pod_id.as_str(),
+        state.instance.as_str(),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("issue upgrade: {e:#}")))?;
@@ -483,14 +482,13 @@ async fn upgrade_legs(
         // meanwhile is the person's answer: `wait` lets them finish up
         // to their cap, `cancel` ends them first.
         settle_running_before_infra_op(state, id, &copies, work.running_policy, triggers_taken_down, None).await?;
-        let mut pending = issue_per_nodes_ensuring_supervisor(
+        let mut pending = issue_per_nodes_kicking_supervisor(
             state,
             id,
             &targeted,
             &copies,
-            InfraLifecycleVerb::Stop,
+            TakeDown::Stop { force: false },
             work.running_policy,
-            false,
             work.drain_timeout_secs,
         )
         .await?;
@@ -538,7 +536,7 @@ async fn upgrade_legs(
                 );
             }
         }
-        let still_ours = infra_lifecycle_command::mark_upgrade_stopped(&state.pg_pool, command_id, state.pod_id.as_str())
+        let still_ours = infra_lifecycle_command::mark_upgrade_stopped(&state.pg_pool, command_id, state.instance.as_str())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("record the stop leg: {e:#}")))?;
         if !still_ours {
@@ -559,15 +557,15 @@ async fn upgrade_legs(
     // Its outcome is not this upgrade's: whatever it ended in, the start
     // below goes again (a cancel meant for this upgrade is read off the
     // command's own flag, right after).
-    let left = crate::api::project::live_infra_setup_colors(state, id, Some(member))
+    let left = crate::api::project::live_infra_setup_execution_ids(state, id, Some(member))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e:#}")))?;
-    for color in left {
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e:#}")))?;
+    for execution_id in left {
         if let Err(ended) =
-            crate::api::project::await_infra_setup(state, crate::api::project::InfraSetupRun::follow(state, id, color).await)
+            crate::api::project::await_infra_setup(state, crate::api::project::InfraSetupRun::follow(state, id, execution_id).await)
                 .await
         {
-            tracing::info!(%id, %color, ?ended, "an earlier infra setup ended before this upgrade's start");
+            tracing::info!(%id, %execution_id, ?ended, "an earlier infra setup ended before this upgrade's start");
         }
     }
     if infra_lifecycle_command::cancel_requested(&state.pg_pool, command_id)
@@ -580,7 +578,6 @@ async fn upgrade_legs(
         binary_hash: work.binary_hash.clone(),
         definition_hash: work.definition_hash.clone(),
         infra_hash: work.infra_hash.clone(),
-        image_hashes: work.image_hashes.clone(),
         running: RunningChoice {
             running_policy: Some(work.running_policy),
             drain_timeout_secs: Some(work.drain_timeout_secs),
@@ -722,12 +719,18 @@ async fn gate_sync(
         ));
     }
 
-    // Verb auto-build, BEFORE the transition lock: a build
-    // takes minutes and must never run while the per-project advisory
-    // lock pins a pool connection. The `coherent_definition` call
-    // inside the locked `start_infra_setup` then cache-hits
-    // (nothing left to build) and stays lock-cheap.
-    crate::transition::ensure_built_gated(state, id).await?;
+    // The build this sync applies is the one registered last; the hashes
+    // a client names are the build it just made, and a sync against
+    // another one (a teammate's build landed between the two) is refused
+    // rather than applied under the wrong name.
+    crate::api::project::require_registered_build(
+        state,
+        id,
+        body.binary_hash.as_deref(),
+        body.definition_hash.as_deref(),
+        body.infra_hash.as_deref(),
+    )
+    .await?;
 
     // Enforce against the same reconciliation the action bar renders:
     // the two faces of sync are distinct table verbs. A plain START is
@@ -783,115 +786,39 @@ fn live_reader_keys(readers: &[crate::activation_store::Activation]) -> Vec<weft
 }
 
 /// A gated sync (or an upgrade past its stop leg) from the orphans'
-/// reap to its InfraSetup being journaled and queued: the running
-/// hashes, the namespace and the worker.
+/// reap to its InfraSetup being journaled and queued.
 async fn apply_sync(
     state: &DispatcherState,
     id: uuid::Uuid,
     body: &SyncRequest,
 ) -> Result<BegunSync, (StatusCode, String)> {
-    // Lazy supervisor spawn. The supervisor is what applies user
-    // infra to the cluster; sync is the first verb that needs it (orphan
-    // reap and Apply commands both depend on a live supervisor).
-    // Idempotent: applies the same Deployment manifest every time;
-    // k8s no-ops if already present. MUST land before any code path
-    // that enqueues a lifecycle command (orphan reap, start_infra_setup).
-    ensure_supervisor(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
     // Orphan reap. An `infra_node` row whose `node_id` isn't in the
     // current project source (or no longer carries `requires_infra`)
     // is stale: the user removed it from .weft but the supervisor
-    // still has Pods/Services/PVCs deployed for it. Reap before
+    // still runs its units and keeps its disks. Reap before
     // running the subworkflow so the new shape is the only thing
     // alive afterwards. Hard error: leaking stale infra is silently
     // worse than asking the user to retry.
     reap_orphans(state, id).await?;
 
-    // There is NO worker "move": a worker's namespace is fixed at
-    // spawn; a placement change is drain-or-cancel-gated
-    // kill-then-respawn (`reconcile_worker`). Infra Pods are
-    // reachable ONLY from inside the project namespace (the
-    // namespace's ingress policy), so EVERY worker that may talk to
-    // infra, including the InfraSetup provisioning execution, must
-    // run there; placement anchors on the namespace existing, which
-    // is why the namespace is created FIRST. Sequencing:
+    // Sequencing:
     //
-    //   1. ensure_project_namespace_if_infra: create the project
-    //      namespace + RBAC before any infra Pod is applied AND
-    //      before the reconcile, so the placement resolver already
-    //      answers "project namespace" for everything that follows.
-    //      Idempotent, so safe outside the lock.
-    //   2. retire_stale_workers (pre-apply): mark a stale-image or
-    //      misplaced worker draining, so the InfraSetup exec never
-    //      lands on an old binary or on a shared-pool pod the infra
-    //      network wall would block; the cold-start sweep brings up a
-    //      fresh one for it. The old worker's work is waited for (or
-    //      cancelled) and the pod killed in step 5, after the setup:
-    //      a run on it may be the very one waiting for this setup.
-    //   3. UNDER the per-project transition lock (short; two
-    //      concurrent syncs serialize here and the second is rejected
-    //      by the in-flight re-check):
+    //   1. UNDER the per-project transition lock (short; two concurrent
+    //      syncs serialize here and the second is rejected by the
+    //      in-flight re-check):
     //      a. re-check no InfraSetup execution is in flight;
-    //      b. start_infra_setup: journal the InfraSetup color (the
-    //         durable "sync in flight" state) + enqueue.
-    //   4. OUTSIDE the lock: await the InfraSetup execution (user
-    //      code upstream of infra nodes may legitimately be slow;
-    //      never hold a lock across it).
-    //   5. reconcile_worker (post-apply, outside the lock again):
-    //      placement may have changed (a no-longer-infra source's
-    //      namespace is about to go); kill-then-respawn the worker
-    //      into the right namespace, drained/cancelled per
-    //      `runningPolicy`.
-    //   6. UNDER the lock: teardown_project_namespace_if_no_infra,
-    //      deleting the (now worker-less) namespace + its registry row
-    //      when the project no longer has ANY infra state.
+    //      b. start_infra_setup: journal the InfraSetup execution (the
+    //         durable "sync in flight" state) + enqueue. It runs on the
+    //         image armed now, like every execution.
+    //   2. OUTSIDE the lock: await the InfraSetup execution (user code
+    //      upstream of infra nodes may legitimately be slow; never hold
+    //      a lock across it).
+    //   3. reconcile_worker: settle what still runs on an older image,
+    //      per `runningPolicy`. After the setup, never before it: a run
+    //      on the older image may be the very one waiting for this setup
+    //      (a program that starts infra and waits for it).
     let (running_policy, drain_timeout_secs) = body.running.resolve(None);
 
-    // Advance the running-hash trio + infra image-tag map NOW: every reject gate
-    // has passed and an upgrade's stop leg (if any) succeeded, so from here the sync
-    // is committed to applying the new spec. The running pointers must reflect
-    // committed reality, never intent, or drift detection lies. ONE ATOMIC write
-    // for the trio AND the complete tag map: separate statements opened a window
-    // where a crash (or a sibling Pod's /run between them) saw a new binary hash
-    // paired with an old definition hash, OR a project stamped runnable with its
-    // infra tags absent/half-written (a supervisor apply then resolves
-    // `Image::Local { name }` to nothing and dangles). The whole tag map is
-    // REPLACED (this sync recomputed every node's tags). The supervisor's
-    // apply-hash compute reads the trio on its next tick to decide
-    // skip/fresh/replace, and `reconcile_worker` below reads the binary hash to
-    // decide whether to kill the running pod.
-    let infra_image_tags: Option<crate::project_store::InfraImageTags> = body.image_hashes.as_ref().map(|hashes| {
-        hashes
-            .iter()
-            .map(|(node_id, tags)| {
-                (
-                    node_id.clone(),
-                    tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                )
-            })
-            .collect()
-    });
-    state
-        .projects
-        .set_running_hashes(
-            id,
-            body.binary_hash.as_deref(),
-            body.definition_hash.as_deref(),
-            body.infra_hash.as_deref(),
-            infra_image_tags.as_ref(),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
-
-    ensure_project_namespace_if_infra(state, id).await?;
-    // New work stops landing on stale workers now, so the setup below
-    // runs on a fresh one; waiting for the old ones' work and killing
-    // them is `finish_sync`'s, after the setup. Waiting here would hold
-    // the setup behind a run that is itself waiting for it (a program
-    // that starts infra and waits for it to run).
-    crate::api::project::retire_stale_workers(state, id).await?;
     let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
         crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
             if crate::api::project::infra_setup_in_flight(state, id, Some(body.member.as_ref())).await? {
@@ -909,9 +836,8 @@ async fn apply_sync(
     Ok(BegunSync { run: started?, running_policy, drain_timeout_secs })
 }
 
-/// The rest of a sync: wait for its InfraSetup to land, then move the
-/// worker to where placement now puts it and drop a namespace that holds
-/// no infra any more.
+/// The rest of a sync: wait for its InfraSetup to land, then settle what
+/// still runs on an older image.
 pub(crate) async fn finish_sync(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -922,18 +848,8 @@ pub(crate) async fn finish_sync(
         crate::api::project::await_infra_setup(state, run).await?;
     }
 
-    // The landing flip: relocate the worker to match post-apply
-    // placement (drain outside the lock), then tear down an
-    // infra-less namespace under it.
     crate::api::project::reconcile_worker(state, id, running_policy, drain_timeout_secs)
         .await?;
-    let landing: Result<(), (StatusCode, String)> =
-        crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
-            Ok(teardown_project_namespace_if_no_infra(state, id).await)
-        })
-        .await
-        .map_err(|e| crate::lease::lock_answer("project transition lock", e))?;
-    landing?;
 
     // No auto-reactivate. An upgrade takes its triggers down before its
     // stop leg, and a user-invoked
@@ -976,12 +892,12 @@ pub async fn terminate(
 /// `POST /projects/{id}/infra/cancel[?member=<id>]`. Cancel one
 /// owner's in-flight infra work: the shared copies' (no `member`) or
 /// one member's. Flags that owner's claimed supervisor commands (the
-/// executing supervisor halts between cluster calls), cancels its
+/// executing supervisor halts between platform calls), cancels its
 /// still-unclaimed ones outright, and cancels its non-terminal
 /// InfraSetup provisioning execution. Dispatcher-owned verbs
 /// (deactivate / reactivate) are never touched: they are health's own
 /// work, not something a person started. Cancel = HALT, never
-/// rollback: the Kubernetes API is not transactional, so per-node partial state
+/// rollback: no platform applies a project transactionally, so per-node partial state
 /// stays visible and the user terminates/retries per-node from where
 /// it stopped.
 ///
@@ -1001,14 +917,14 @@ pub async fn cancel(
 
     // Cancel the provisioning sub-execution too (the InfraSetup worker
     // run that computes specs and enqueues applies).
-    let colors = crate::api::project::non_terminal_infra_setup_colors(&state, id, Some(copy.member.as_ref()))
+    let execution_ids = crate::api::project::non_terminal_infra_setup_execution_ids(&state, id, Some(copy.member.as_ref()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e}")))?;
-    let had_setup = !colors.is_empty();
-    for color in colors {
-        crate::api::execution::cancel_color(&state, color, &weft_core::exec::CancelCause::User)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e}")))?;
+    let had_setup = !execution_ids.is_empty();
+    for execution_id in execution_ids {
+        crate::api::execution::cancel_execution_id(&state, execution_id, &weft_core::exec::CancelCause::User)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_execution_id: {e}")))?;
     }
 
     if touched == 0 && !had_setup {
@@ -1039,9 +955,9 @@ async fn issue_destroy(
     // own infra lifecycle command). Deactivate / Reactivate are
     // dispatcher-owned and don't take this path either. If we get here,
     // a caller wired a new verb without updating this match.
-    let action = match verb {
-        InfraLifecycleVerb::Stop => "infra_stop",
-        InfraLifecycleVerb::Terminate => "infra_terminate",
+    let (action, take_down) = match verb {
+        InfraLifecycleVerb::Stop => ("infra_stop", TakeDown::Stop { force: false }),
+        InfraLifecycleVerb::Terminate => ("infra_terminate", TakeDown::TERMINATE),
         other => {
             return Err(StatusError::Other(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1097,14 +1013,13 @@ async fn issue_destroy(
         crate::api::project::execute_trigger_deactivation(&state, id, live_readers, deactivation).await?;
     }
     settle_running_before_infra_op(&state, id, &copies, running_policy, was_active, None).await?;
-    let command_id = issue_lifecycle_ensuring_supervisor(
+    let command_id = issue_lifecycle_kicking_supervisor(
         &state,
         id,
         None,
         &copies,
-        verb,
+        take_down,
         running_policy,
-        false,
         drain_timeout_secs,
     )
     .await?;
@@ -1184,9 +1099,10 @@ async fn issue_per_node(
     // project-level one is: it is held to the same reconciliation the
     // action bar renders, so a transitional project refuses it here
     // instead of tearing one node out from under a build.
-    let action = match verb {
-        InfraLifecycleVerb::Stop => "infra_stop",
-        InfraLifecycleVerb::Terminate => "infra_terminate",
+    // force only applies to Stop (terminate removes everything anyway).
+    let (action, take_down) = match verb {
+        InfraLifecycleVerb::Stop => ("infra_stop", TakeDown::Stop { force: body.force }),
+        InfraLifecycleVerb::Terminate => ("infra_terminate", TakeDown::TERMINATE),
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1229,8 +1145,6 @@ async fn issue_per_node(
         ));
     }
 
-    // force only applies to Stop (terminate removes everything anyway).
-    let force = matches!(verb, InfraLifecycleVerb::Stop) && body.force;
     // No picker on a per-node verb (an active project's dependent
     // triggers refused it above; the rest run on), so nothing else
     // cancelled the running executions. Which executions use this one
@@ -1243,14 +1157,13 @@ async fn issue_per_node(
     if !orphan {
         settle_running_before_infra_op(&state, id, &copies, running_policy, false, None).await?;
     }
-    let command_id = issue_lifecycle_ensuring_supervisor(
+    let command_id = issue_lifecycle_kicking_supervisor(
         &state,
         id,
         Some(&node),
         &copies,
-        verb,
+        take_down,
         running_policy,
-        force,
         drain_timeout_secs,
     )
     .await?;
@@ -1271,33 +1184,10 @@ pub async fn status(
     }))
 }
 
-/// One door serving right now, as `weft door --list` prints it.
-#[derive(serde::Serialize)]
-pub struct DoorEntry {
-    /// The node as the program spells it.
-    pub node: String,
-    /// Whose copy: absent for the shared one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
-    pub endpoint: String,
-    /// The loopback port on the operator's machine. Not a URL: a door
-    /// carries whatever protocol the endpoint speaks, and most of them
-    /// are not HTTP.
-    pub port: u16,
-}
-
-#[derive(serde::Serialize)]
-pub struct DoorsResponse {
-    pub doors: Vec<DoorEntry>,
-}
-
-/// The doors this project has SERVING, read from the cluster rather
-/// than from a row of ours.
-///
-/// The apiserver owns these numbers: it is what allocated them and
-/// what refuses a duplicate, so it is the honest place to ask. A row
-/// would be a second copy, free to go stale the moment an apply
-/// changed one.
+/// The doors this project has serving: every `SameNetwork` endpoint of
+/// every copy, at the address its host gave it when it applied the unit
+/// (`infra_node.doors`), plus the copies still being applied, whose doors
+/// have no address yet.
 pub async fn doors(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -1307,38 +1197,103 @@ pub async fn doors(
     let rows = infra_node::list_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
-    let held = state
-        .kube
-        .node_ports()
+    Ok(Json(doors_of(&rows)))
+}
+
+fn copy_ref(row: &InfraNodeRow) -> CopyRef {
+    CopyRef { node: row.node_id.clone(), member: row.member.clone() }
+}
+
+/// One entry per door of each row, at its address as the host wrote it,
+/// and every copy mid-apply.
+fn doors_of(rows: &[InfraNodeRow]) -> DoorsResponse {
+    DoorsResponse {
+        doors: rows
+            .iter()
+            .flat_map(|row| {
+                row.doors.iter().map(move |(endpoint, address)| Door {
+                    copy: copy_ref(row),
+                    endpoint: endpoint.clone(),
+                    address: address.clone(),
+                })
+            })
+            .collect(),
+        applying: rows.iter().filter(|r| r.status == InfraNodeStatus::Provisioning).map(copy_ref).collect(),
+    }
+}
+
+/// `GET /projects/{id}/infra/logs?node=&tail=&after=`.
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    /// One infra instance (`db`, `one.db`); every one when absent.
+    pub node: Option<String>,
+    #[serde(default = "default_tail")]
+    pub tail: usize,
+    /// A follower's `LogCursor` (JSON, as the previous answer gave it):
+    /// only the lines written after it, `tail` ignored.
+    pub after: Option<String>,
+}
+
+fn default_tail() -> usize {
+    100
+}
+
+/// The infra units' own output, every container of every unit of every
+/// copy of the node (or of every node), each block headed by what wrote
+/// it, and the cursor that asks for exactly what comes next.
+pub async fn logs(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    axum::extract::Query(q): axum::extract::Query<LogsQuery>,
+) -> Result<Json<InfraLogs>, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, id).await?;
+    let after: Option<LogCursor> = q
+        .after
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("after: not a log cursor: {e}")))?;
+    let rows = infra_node::list_for_project(&state.pg_pool, id)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("read the cluster's node ports: {e}")))?;
-    let mut doors = Vec::new();
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
+    let rows: Vec<&InfraNodeRow> = rows.iter().filter(|r| q.node.as_deref().is_none_or(|n| r.node_id == n)).collect();
+    if rows.is_empty() {
+        let why = match &q.node {
+            Some(node) => format!("no infra instance `{node}`: it is not provisioned (`weft infra status` says where each instance stands), or it is not an infra node"),
+            None => "nothing is provisioned for this project (`weft infra start`)".to_string(),
+        };
+        return Err((StatusCode::NOT_FOUND, why));
+    }
+    let mut out = InfraLogs { blocks: Vec::new(), cursor: after.clone().unwrap_or_default() };
     for row in rows {
-        for endpoint in row.endpoints.keys() {
-            // The Service the compiler emits for a door on this
-            // endpoint. Present means serving; absent means the node
-            // has no door there.
-            let name = weft_core::infra::door_service_name(&row.instance_id, endpoint);
-            // Namespace AND name: `node_ports` is cluster wide (a node
-            // port is), so a name on its own would answer with another
-            // tenant's Service. We are holding this project's namespace
-            // already, and the holder carries one, so there is no
-            // reason to key on the name alone.
-            let Some(holder) = held
-                .iter()
-                .find(|h| h.namespace == row.namespace && h.service == name)
-            else {
-                continue;
+        let node = weft_core::infra::NodeRef {
+            tenant: caller.0.as_str().to_string(),
+            project: id,
+            node: row.node_id.clone(),
+            instance: row.instance_id.clone(),
+        };
+        for unit in row.units.keys() {
+            let from = match &after {
+                Some(cursor) => LogsFrom::After(cursor.for_unit(&row.instance_id, unit)),
+                None => LogsFrom::Tail(q.tail),
             };
-            doors.push(DoorEntry {
-                node: row.node_id.clone(),
-                member: row.member.clone(),
-                endpoint: endpoint.clone(),
-                port: holder.port,
-            });
+            let streams = state
+                .host
+                .logs(&node, unit, &from)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the logs of {} {unit}: {e:#}", row.node_id)))?;
+            for stream in streams {
+                // The host made the mark: it reads the clock that stamped
+                // the lines, which this process's clock may not agree with.
+                out.cursor.0.insert(LogCursor::key(&row.instance_id, unit, &stream.source), stream.mark);
+                if !stream.lines.is_empty() {
+                    out.blocks.push(LogBlock { copy: copy_ref(row), unit: unit.clone(), stream });
+                }
+            }
         }
     }
-    Ok(Json(DoorsResponse { doors }))
+    Ok(Json(out))
 }
 
 #[derive(serde::Serialize)]
@@ -1537,7 +1492,7 @@ pub(crate) async fn press_live(
         return Err((code, format!("the container answered {status}: {text}")));
     }
     // The press changed what the node shows (a fresh QR code, a new
-    // key): an editor watching it through any pod sees it now rather
+    // key): an editor watching it through any process sees it now rather
     // than at the next look.
     crate::display_feeds::DisplayFeeds::announce_look_now(
         &state.pg_pool,
@@ -1612,7 +1567,7 @@ pub(crate) async fn live_endpoint_url(
             None => (StatusCode::NOT_FOUND, "no such infra node".to_string()),
         })?;
     // A copy that is not up has nothing behind its address (a stopped
-    // one is scaled to zero, a starting one has no ready Pod yet), so
+    // one runs nothing, a starting one is not ready yet), so
     // asking it would be a connection error. Nothing to show is a 404,
     // naming the state so a reader can say "starting" rather than
     // "not started".
@@ -1622,7 +1577,7 @@ pub(crate) async fn live_endpoint_url(
             format!("infra node '{node}' is {}, so it has nothing to show yet", row.status.as_str()),
         ));
     }
-    row.endpoints.get(live_endpoint).cloned().ok_or((
+    row.install_endpoints.get(live_endpoint).cloned().ok_or((
         StatusCode::NOT_FOUND,
         format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
     ))
@@ -1649,7 +1604,7 @@ async fn read_infra_entries(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra copies: {e:#}")))?;
     let mut entries: Vec<InfraStatusEntry> =
-        copies.rows.into_iter().map(|row| row_to_entry(row, &state.public_base_url)).collect();
+        copies.rows.into_iter().map(|row| row_to_entry(row, state.external_base_url())).collect();
     entries.extend(copies.starting.into_iter().map(|(node, member)| InfraStatusEntry {
         node,
         member,
@@ -1667,7 +1622,7 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
         public_urls: row
             .public_paths
             .iter()
-            .map(|(name, path)| (name.clone(), weft_core::infra::tenant_public_url(front_door, path)))
+            .map(|(name, path)| (name.clone(), weft_core::infra::public_url(front_door, path)))
             .collect(),
         node: row.node_id,
         member: row.member,
@@ -1675,252 +1630,70 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
         // Coarse UI hint: the first endpoint by name (BTreeMap, so
         // deterministic). Node code resolves a specific endpoint by
         // name via ctx.endpoint(...); this is just a status summary.
-        endpoint_url: row.endpoints.values().next().cloned(),
+        endpoint_url: row.install_endpoints.values().next().cloned(),
         failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
         failure_message: row.failure_message,
     }
 }
 
-/// Lazy supervisor spawn. Ensures AT LEAST ONE pooled infra-supervisor
-/// pod is live in the control-plane namespace (the pool scales up from
-/// there by load). Idempotent: a no-op when any live pod already exists,
-/// spawns one when the pool is empty. Called at the top of sync before
-/// any orphan reap or Apply command enqueue, so a project that just
-/// declared infra has a supervisor able to claim it.
-async fn ensure_supervisor(state: &DispatcherState) -> anyhow::Result<()> {
-    state
-        .supervisors
-        .ensure_at_least_one(
-            state.supervisor_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("ensure supervisor pool: {e}"))
-}
-
-/// CREATE half of per-project-namespace reconciliation: if the project
-/// declares infra, ensure its own namespace + RBAC bundle exists and
-/// stamp the row. No-op for a no-infra project. Split from the teardown
-/// half because they sit at opposite ends of the sync sequence: create
-/// runs BEFORE any infra Pod is applied; teardown runs at the landing
-/// flip, after the worker reconciliation has already respawned the
-/// worker in the shared pool (there is no worker "move"; a placement
-/// change is a kill-then-respawn, see `reconcile_worker`).
-///
-/// The namespace + RBAC bundle (worker/infra SAs, NetworkPolicies,
-/// RoleBindings to the pooled supervisor/listener ClusterRoles) is what
-/// every infra Pod the supervisor applies needs around it, so this
-/// create must run before the supervisor touches the project. The row's
-/// `project_namespace <> ''` is the broker's "this project has a
-/// namespace to manage" signal, stamped only after the namespace lands.
-async fn ensure_project_namespace_if_infra(
-    state: &DispatcherState,
-    id: uuid::Uuid,
-) -> Result<(), (StatusCode, String)> {
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    if !weft_core::has_infra(&project) {
-        return Ok(());
-    }
-    let tenant = state
-        .tenant_router
-        .tenant_for_project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let project_namespace =
-        crate::project_namespace::name_for(&state.instance, tenant.as_str(), id);
-    let args = crate::project_namespace::ProjectNamespaceArgs {
-        project_id: id,
-        tenant_id: tenant.as_str(),
-        namespace: &project_namespace,
-        pod_cidr: &state.cluster_pod_cidr,
-        service_cidr: &state.cluster_service_cidr,
-        instance: &state.instance,
-    };
-    crate::project_namespace::ensure(&*state.kube, &args)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("ensure project namespace {project_namespace}: {e}"),
-            )
-        })?;
-    // Stamp only after the namespace actually landed, so
-    // `project_namespace <> ''` is never true for a namespace that
-    // doesn't exist (which would make the supervisor try to apply into a
-    // missing namespace).
-    state
-        .projects
-        .set_project_namespace(id, &project_namespace)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("set_project_namespace: {e}"),
-            )
-        })?;
-    Ok(())
-}
-
-/// TEARDOWN half: if the project no longer declares infra AND no live
-/// infra state remains, delete the per-project namespace and clear the
-/// row pointing at it. Runs at the sync landing flip, AFTER
-/// `reconcile_worker` has kill-then-respawned the worker into the
-/// shared pool, so we never delete a namespace that still hosts the
-/// project's worker.
-///
-/// The live-rows guard is Model 1's never-silently-kill guarantee: an
-/// orphaned infra node whose terminate timed out still has an
-/// `infra_node` row, and deleting the namespace under it would kill
-/// live (billed) infra the user can still see and act on. Skip with a
-/// breadcrumb; the user terminates the orphan via the always-visible
-/// infra controls and the next sync (or `weft rm`) tears down.
-///
-/// Clears the row BEFORE deleting the namespace: a cleared row pointing
-/// at a not-yet-deleted namespace is benign (the supervisor simply stops
-/// managing it), whereas a set row pointing at a DELETED namespace would
-/// make the supervisor flap its cluster calls against a gone namespace. So clear
-/// first, delete second; a crash between leaves only an empty orphan
-/// namespace (reclaimed on project rm or by a manual delete), never a
-/// live-advertised dead namespace. Nothing else has to be retired in
-/// step with the namespace object: a worker inside it is identified by
-/// its pod, not by where it sits, so a namespace that lingers while it
-/// terminates takes nobody's identity with it.
-async fn teardown_project_namespace_if_no_infra(
-    state: &DispatcherState,
-    id: uuid::Uuid,
-) -> Result<(), (StatusCode, String)> {
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    if weft_core::has_infra(&project) {
-        return Ok(());
-    }
-    let existing = state
-        .projects
-        .project_namespace(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project_namespace: {e}")))?
-        .unwrap_or_default();
-    if existing.is_empty() {
-        return Ok(());
-    }
-    if crate::infra_node::any_for_project(&state.pg_pool, id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?
-    {
-        tracing::warn!(
-            target: "weft_dispatcher::api::infra",
-            project_id = %id,
-            namespace = %existing,
-            "namespace teardown skipped: live infra rows remain (orphaned infra whose \
-             terminate has not completed); terminate it via the infra controls, then \
-             re-sync"
-        );
-        return Ok(());
-    }
-    // Clear the row first (stop advertising the namespace to supervisors)
-    // ...
-    state
-        .projects
-        .clear_project_namespace(id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("clear_project_namespace: {e}"),
-            )
-        })?;
-    // ... then delete the now-unadvertised, now-worker-less namespace.
-    // Nothing about a worker's identity hangs off this namespace, so
-    // there is no record to retire in step with it: a worker is known
-    // by its pod, whose row outlives the pod itself.
-    if let Err(e) = crate::project_namespace::delete(&*state.kube, &existing).await {
-        tracing::warn!(
-            target: "weft_dispatcher::api::infra",
-            error = %e,
-            project_id = %id,
-            "delete now-infra-less project namespace failed (continuing); \
-             row already cleared so no supervisor manages it"
-        );
-    }
-    Ok(())
-}
-
-/// Enqueue a lifecycle command AFTER making sure at least one pooled
-/// supervisor is alive. A supervisor only claims a command for a project
-/// it owns, and only a live supervisor claims+owns projects, so an
-/// enqueue with an empty supervisor pool would sit unclaimed forever.
+/// Enqueue a lifecycle command and kick the supervisor, which may be
+/// scaled to zero and would otherwise not hear of it until its next
+/// safety tick.
 ///
 /// Every dispatcher-side enqueue path goes through this helper.
-/// `issue_lifecycle` itself stays a plain DB-write helper (no
-/// supervisor coupling) so the supervisor-side code that ALREADY runs
-/// inside a live supervisor can call it directly without recursing
-/// into `ensure_supervisor`.
-pub(crate) async fn issue_lifecycle_ensuring_supervisor(
+/// `issue_lifecycle` itself stays a plain DB-write helper so the
+/// supervisor-side code can call it directly.
+pub(crate) async fn issue_lifecycle_kicking_supervisor(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
     copies: &weft_core::member::Copies,
-    verb: InfraLifecycleVerb,
+    take_down: TakeDown,
     running_policy: RunningPolicy,
-    force: bool,
     drain_timeout_secs: u64,
 ) -> Result<i64, (StatusCode, String)> {
-    ensure_supervisor(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ensure_supervisor: {e}")))?;
     let tenant = state
         .tenant_router
         .tenant_for_project(project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    infra_lifecycle_command::issue_lifecycle(
+    let issued = infra_lifecycle_command::issue_lifecycle(
         &state.pg_pool,
         tenant.as_str(),
         project_id,
         node_id,
         copies,
-        verb,
+        take_down,
         running_policy,
-        force,
         drain_timeout_secs,
-        state.pod_id.as_str(),
+        state.instance.as_str(),
     )
     .await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("issue {}: {e}", verb.as_str()),
+            format!("issue {}: {e}", take_down.verb().as_str()),
         )
-    })
+    })?;
+    state.kick.kick(weft_platform_traits::CoreRole::Supervisor);
+    Ok(issued)
 }
 
 /// One command per node for `nodes` of `copies` (an upgrade's stop leg
-/// over exactly the nodes it re-applies), the supervisor ensured first.
-async fn issue_per_nodes_ensuring_supervisor(
+/// over exactly the nodes it re-applies), the supervisor kicked.
+async fn issue_per_nodes_kicking_supervisor(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     nodes: &std::collections::BTreeSet<String>,
     copies: &weft_core::member::Copies,
-    verb: InfraLifecycleVerb,
+    take_down: TakeDown,
     running_policy: RunningPolicy,
-    force: bool,
     drain_timeout_secs: u64,
 ) -> Result<Vec<i64>, (StatusCode, String)> {
     let mut ids = Vec::with_capacity(nodes.len());
     for node in nodes {
         ids.push(
-            issue_lifecycle_ensuring_supervisor(state, project_id, Some(node), copies, verb, running_policy, force, drain_timeout_secs)
+            issue_lifecycle_kicking_supervisor(state, project_id, Some(node), copies, take_down, running_policy, drain_timeout_secs)
                 .await?,
         );
     }
@@ -1940,6 +1713,12 @@ async fn issue_per_nodes_ensuring_supervisor(
 /// (the rest of sync can't reason about state without them).
 /// Per-orphan supervisor outcomes (Failed / Timeout / Cancelled)
 /// are logged; one wedged orphan does not block the rest.
+///
+/// The terminate keeps the disks the node listed in `keepOnTerminate`,
+/// like any terminate: the supervisor's sweep of copies the program no
+/// longer declares deletes them once the row is gone (see
+/// `weft_infra_supervisor::ownership::sweep_gone_copies`), which is also
+/// what reaches a kept copy that had no row left to reap.
 async fn reap_orphans(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -1950,11 +1729,7 @@ async fn reap_orphans(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let declared = weft_core::project::infra_place_spellings(&project);
-    let per_member_of = |spelled: &str| {
-        let (node_id, _) = weft_core::project::resolve_address(&project, spelled);
-        project.nodes.iter().any(|n| n.id == node_id && n.per_member.is_some())
-    };
+    let declared = weft_core::project::DeclaredInfra::of(&project);
     let rows = crate::infra_node::list_for_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
@@ -1963,7 +1738,7 @@ async fn reap_orphans(
     // copies behind, a node now per member leaves its shared one).
     let orphans: Vec<(String, Option<weft_core::member::MemberId>)> = rows
         .into_iter()
-        .filter(|r| !declared.contains(&r.node_id) || per_member_of(&r.node_id) != r.member.is_some())
+        .filter(|r| !declared.declares(&r.node_id, r.member.is_some()))
         .map(|r| (r.node_id, r.member))
         .collect();
     if orphans.is_empty() {
@@ -1983,7 +1758,7 @@ async fn reap_orphans(
         let node_id = node_id.clone();
         let copies = weft_core::member::Copies::of(member.clone());
         let pool = state.pg_pool.clone();
-        let pod = state.pod_id.as_str().to_string();
+        let instance = state.instance.as_str().to_string();
         async move {
             let res = infra_lifecycle_command::issue_lifecycle(
                 &pool,
@@ -1991,13 +1766,12 @@ async fn reap_orphans(
                 id,
                 Some(&node_id),
                 &copies,
-                InfraLifecycleVerb::Terminate,
+                TakeDown::TERMINATE,
                 RunningPolicy::Cancel,
-                false,
                 // Cancel never drains; the cap is inert. Default keeps
                 // the row honest.
                 weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-                &pod,
+                &instance,
             )
             .await;
             (node_id, res)
@@ -2083,15 +1857,15 @@ async fn reap_orphans(
 /// For a project with infra, issues a `Terminate` of every copy (the
 /// shared ones and each member's) and waits up to 120s for the
 /// supervisor to complete it. Then removes the connections the
-/// project's nodes published, deletes the project namespace (which
-/// takes any leftover resources with it), and releases the project's
-/// supervisor lease. The `infra_*` rows go with the project row itself
+/// project's nodes published and releases the project's supervisor
+/// lease. The `infra_*` rows go with the project row itself
 /// (`ProjectStore::remove`), not here.
 ///
 /// `force = true` (i.e. `weft rm --force`) skips the wait: the
-/// dispatcher proceeds immediately. Any in-flight supervisor work
-/// for the project errors on its cluster calls because the namespace
-/// is gone; the supervisor logs but doesn't retry.
+/// dispatcher proceeds immediately. What the host still holds for the
+/// project once its rows are gone (what a forced removal did not wait
+/// for, and every disk its nodes listed in `keepOnTerminate`) is deleted
+/// by the supervisor's sweep of copies whose project no longer exists.
 pub async fn delete_project(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -2113,19 +1887,20 @@ pub async fn delete_project(
         .unwrap_or(false);
     if has_infra {
         // Step 1: enqueue a project-wide terminate so the supervisor
-        // tears down the workloads. `issue_lifecycle_ensuring_supervisor`
-        // guarantees the supervisor is alive first; if the reaper scaled
-        // it to 0 during an idle period, `weft rm` would otherwise leave
-        // k8s resources behind. A silent failure here is not acceptable;
+        // tears down the workloads. `issue_lifecycle_kicking_supervisor`
+        // wakes the supervisor first (a serverless one may be at zero), or
+        // `weft rm` would leave the project's infrastructure behind. A
+        // silent failure here is not acceptable;
         // refuse the rm and let the user retry.
-        let cmd_id = issue_lifecycle_ensuring_supervisor(
+        let cmd_id = issue_lifecycle_kicking_supervisor(
             state,
             id,
             None,
             &weft_core::member::Copies::Every,
-            InfraLifecycleVerb::Terminate,
+            // The disks the nodes keep go with the project: the
+            // supervisor's sweep deletes a removed project's copies.
+            TakeDown::TERMINATE,
             RunningPolicy::Cancel,
-            false,
             weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
         )
         .await?;
@@ -2202,59 +1977,15 @@ pub async fn delete_project(
                 format!("delete the connections this project's nodes published: {e}"),
             )
         })?;
-    // Step 4: delete the project's own k8s namespace. Clear the row
-    // FIRST then delete (same ordering as the sync-time teardown): a
-    // cleared row pointing at a not-yet-deleted namespace is benign,
-    // whereas a set row pointing at a DELETED namespace makes the broker
-    // advertise a gone namespace to supervisors. Only logged on error: a
-    // missing namespace is a no-op, and a transient delete failure
-    // leaves a tenant-empty namespace that the next sync will repurpose
-    // (or the user can manually `kubectl delete ns`). An empty string
-    // means the project never had a per-project namespace (a no-infra
-    // project, whose worker lives in the shared namespace); nothing to
-    // delete and nothing to clear.
-    let namespace = state.projects.project_namespace(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("project_namespace: {e}"),
-        )
-    })?;
-    if let Some(ns) = namespace.filter(|n| !n.is_empty()) {
-        // Clear the row first so a re-registered project under the same
-        // id (or the broker's supervisor-claim) never sees a stale
-        // namespace, even if the delete below fails or we crash after it.
-        if let Err(e) = state.projects.clear_project_namespace(id).await {
-            tracing::warn!(
-                target: "weft_dispatcher::api::infra",
-                error = %e,
-                project_id = %id,
-                "clear project_namespace row failed (continuing)"
-            );
-        }
-        if let Err(e) = project_namespace::delete(&*state.kube, &ns).await {
-            tracing::warn!(
-                target: "weft_dispatcher::api::infra",
-                error = %e,
-                project_id = %id,
-                "delete project namespace failed (continuing); row already cleared"
-            );
-        }
-    }
-    // Step 5: release the project's exclusive supervisor lease
-    // (`infra_owner`). AFTER the namespace-row clear on purpose: the
-    // broker's claim path only offers projects with a non-empty
-    // `project_namespace`, so with the row cleared a released project
-    // cannot be re-claimed mid-teardown (release-first left a window
-    // where a supervisor re-adopted the dying project and started
-    // reconciling its infra). Left behind, the owning supervisor would
-    // renew a lease on a ghost forever: it never becomes idle, the pool
-    // never drains to zero, and rows accumulate one per removed project.
-    crate::supervisor_pool::release_project(&state.pg_pool, id)
+    // Step 4: release the project's exclusive supervisor lease
+    // (`infra_owner`). Left behind, the supervisor would renew a lease on
+    // a ghost until the reaper's ghost sweep dropped it.
+    crate::infra_owner::release_project(&state.pg_pool, id)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("supervisor_pool::release_project: {e}"),
+                format!("release the project's infra lease: {e}"),
             )
         })?;
     Ok(())
@@ -2279,68 +2010,98 @@ mod tests {
         assert_eq!(plain.into_sync().unwrap().binary_hash.as_deref(), Some("h"));
     }
 
+    fn door_row(node_id: &str, member: Option<&str>, status: InfraNodeStatus, doors: &[(&str, &str)]) -> InfraNodeRow {
+        InfraNodeRow {
+            project_id: uuid::Uuid::nil(),
+            node_id: node_id.into(),
+            member: member.map(|m| weft_core::member::MemberId::new(m).unwrap()),
+            instance_id: String::new(),
+            status,
+            failure_stage: None,
+            failure_message: None,
+            applied_spec_hash: None,
+            applied_at_unix: None,
+            endpoints: Default::default(),
+            public_paths: Default::default(),
+            doors: doors.iter().map(|(e, a)| (e.to_string(), a.to_string())).collect(),
+            install_endpoints: Default::default(),
+            keep_disks: Vec::new(),
+            units: Default::default(),
+        }
+    }
+
+    /// Every door keeps its address as the host wrote it (a name as the
+    /// host part too), names whose copy it is, and a copy mid-apply is
+    /// reported rather than left out.
     #[test]
-    fn sync_request_defaults() {
-        let r: SyncRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.binary_hash.is_none());
-        assert!(r.definition_hash.is_none());
-        assert!(r.infra_hash.is_none());
-        assert!(r.image_hashes.is_none(), "absent means keep the stored map");
+    fn doors_carry_every_address_and_the_copies_still_applying() {
+        let rows = [
+            door_row("db", None, InfraNodeStatus::Running, &[("pg", "weft-db-main:5432")]),
+            door_row("db", Some("ann"), InfraNodeStatus::Running, &[("pg", "10.0.0.3:5432")]),
+            door_row("cache", None, InfraNodeStatus::Provisioning, &[]),
+        ];
+        let answer = doors_of(&rows);
+        assert_eq!(answer.doors.len(), 2);
+        assert_eq!(answer.doors[0].address, "weft-db-main:5432");
+        assert_eq!(answer.doors[1].copy.member.as_ref().map(|m| m.as_str()), Some("ann"));
+        assert_eq!(answer.applying, vec![CopyRef { node: "cache".into(), member: None }]);
+    }
+
+    fn build() -> serde_json::Value {
+        json!({ "binaryHash": "abc", "definitionHash": "def0", "infraHash": "def" })
+    }
+
+    #[test]
+    fn a_sync_names_the_build_it_applies_or_none() {
+        let r: SyncRequest = serde_json::from_value(build()).unwrap();
+        assert_eq!(r.binary_hash.as_deref(), Some("abc"));
+        assert_eq!(r.definition_hash.as_deref(), Some("def0"));
+        assert_eq!(r.infra_hash.as_deref(), Some("def"));
+        let bare: SyncRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(bare.binary_hash.is_none(), "a program's sync applies the registered build");
+        let old: SyncBody = serde_json::from_value(json!({ "imageHashes": {} })).unwrap();
+        assert!(old.into_sync().unwrap_err().1.contains("builds"), "images come with the build, never from the client");
         assert_eq!(r.running, RunningChoice::default());
     }
 
     #[test]
     fn sync_request_running_policy_round_trips() {
-        let r: SyncRequest =
-            serde_json::from_value(json!({ "runningPolicy": "cancel", "drainTimeoutSecs": 30 })).unwrap();
+        let mut body = build();
+        body["runningPolicy"] = json!("cancel");
+        body["drainTimeoutSecs"] = json!(30);
+        let r: SyncRequest = serde_json::from_value(body).unwrap();
         assert_eq!(r.running.running_policy, Some(RunningPolicy::Cancel));
         assert_eq!(r.running.drain_timeout_secs, Some(30));
         // ONE wire spelling: snake_case is an unknown field.
-        let r: SyncRequest =
-            serde_json::from_value(json!({ "running_policy": "cancel" })).unwrap();
+        let mut body = build();
+        body["running_policy"] = json!("cancel");
+        let r: SyncRequest = serde_json::from_value(body).unwrap();
         assert_eq!(r.running.running_policy, None);
     }
 
     #[test]
     fn sync_request_parses_camelcase_only() {
-        let camel: UpgradeRequest = serde_json::from_value(json!({
-            "binaryHash": "abc",
-            "definitionHash": "def0",
-            "infraHash": "def",
-            "imageHashes": { "node1": { "bridge": "x:1" } },
-            "triggerDeactivation": {
-                "mode": "park",
-                "graceMinutes": 30,
-                "runningPolicy": "wait",
-            },
-        }))
-        .unwrap();
+        let mut body = build();
+        body["triggerDeactivation"] = json!({ "mode": "park", "graceMinutes": 30, "runningPolicy": "wait" });
+        let camel: UpgradeRequest = serde_json::from_value(body).unwrap();
         assert_eq!(camel.sync.binary_hash.as_deref(), Some("abc"));
-        assert_eq!(camel.sync.definition_hash.as_deref(), Some("def0"));
         let td = camel.trigger_deactivation.expect("trigger_deactivation present");
         assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
         assert_eq!(td.grace_minutes, 30);
         assert_eq!(td.running_policy, RunningPolicy::Wait);
 
-        // ONE wire spelling: snake_case keys are unknown fields, not
-        // a tolerated second dialect. (`SyncRequest`'s fields are all
-        // defaulted, so unknown top-level keys are silently ignored
-        // by serde; the load-bearing check is that the snake key does
-        // NOT populate the field.)
+        // ONE wire spelling: the build's hashes spelled snake_case are
+        // not read, so the sync names no build.
         let snake: SyncRequest = serde_json::from_value(json!({
-            "binary_hash": "abc",
+            "binary_hash": "abc", "definition_hash": "d", "infra_hash": "i",
         }))
         .unwrap();
-        assert_eq!(snake.binary_hash, None, "snake_case must not populate the field");
+        assert!(snake.binary_hash.is_none());
         // A required inner field spelled snake_case fails the parse
         // outright (`runningPolicy` has no default).
-        let bad_inner: Result<UpgradeRequest, _> = serde_json::from_value(json!({
-            "triggerDeactivation": {
-                "mode": "wipe",
-                "running_policy": "cancel",
-            },
-        }));
-        assert!(bad_inner.is_err(), "snake_case runningPolicy must not parse");
+        let mut body = build();
+        body["triggerDeactivation"] = json!({ "mode": "wipe", "running_policy": "cancel" });
+        assert!(serde_json::from_value::<UpgradeRequest>(body).is_err(), "snake_case runningPolicy must not parse");
     }
 
     #[test]
@@ -2392,25 +2153,6 @@ mod tests {
         let r: PerNodeRequest =
             serde_json::from_value(json!({"running_policy": "wait"})).unwrap();
         assert_eq!(r.running.running_policy, None, "snake_case must not populate the field");
-    }
-
-    #[test]
-    fn image_hashes_nested_shape() {
-        // Per-(node_id, image_name) map. Verify the wire shape
-        // deserializes via the documented `imageHashes` key.
-        let r: SyncRequest = serde_json::from_value(json!({
-            "imageHashes": {
-                "tgi": { "bridge": "weft-infra-bridge:abc123", "engine": "weft-infra-engine:def456" },
-                "whatsapp": { "bridge": "weft-infra-bridge:111" }
-            }
-        }))
-        .unwrap();
-        let hashes = r.image_hashes.as_ref().expect("sent");
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(
-            hashes.get("tgi").unwrap().get("bridge").unwrap(),
-            "weft-infra-bridge:abc123"
-        );
     }
 
     #[test]

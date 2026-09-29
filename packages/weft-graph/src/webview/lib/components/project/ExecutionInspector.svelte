@@ -552,7 +552,7 @@
 			{/if}
 			{#if runTerminal?.state === 'cancelled'}
 				{#if runTerminal.cause?.kind === 'execution'}
-					<!-- The structured cause: the run that asked is a color a
+					<!-- The structured cause: the run that asked is an execution a
 					     person can look up, the tag is what it matched on. -->
 					<span title="Stopped by execution {runTerminal.cause.by} (a sibling run's stop_tagged)">
 						stopped by run <span class="font-mono">{runTerminal.cause.by.slice(0, 8)}</span> on tag <span class="font-mono">{runTerminal.cause.tag}</span>

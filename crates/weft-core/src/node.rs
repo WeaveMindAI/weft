@@ -50,7 +50,7 @@ mod node_trait {
         }
 
         /// Build the desired infrastructure for this node. Returns the
-        /// desired k8s state as a typed value; the engine has it applied,
+        /// desired state as a typed value; the engine has it applied,
         /// then calls `run`. The default impl returns Err; nodes that
         /// declare `requires_infra=true` MUST override.
         async fn provision_infra(
@@ -202,7 +202,7 @@ pub struct NodeMetadata {
     #[serde(default)]
     pub outputs: Vec<OutputSpec>,
     /// Whether this node implements `Node::provision_infra` and needs
-    /// dispatcher-driven infrastructure (k8s pods, services, etc).
+    /// dispatcher-driven infrastructure (containers, disks, endpoints).
     /// Explicit flag in metadata.json; mirrored to
     /// `NodeDefinition.requires_infra` at enrich time.
     #[serde(default)]
@@ -753,8 +753,55 @@ impl NodeMetadata {
         }
         refuse_removed_metadata_keys(&value)
             .unwrap_or_else(|e| panic!("{site}: metadata.json: {e}"));
-        serde_json::from_value(value)
-            .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
+        let mut metadata: Self = serde_json::from_value(value)
+            .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"));
+        metadata
+            .add_language_inputs()
+            .unwrap_or_else(|e| panic!("{site}: metadata.json: {e}"));
+        metadata
+    }
+
+    /// Give a trigger the settings the LANGUAGE owns, so no node
+    /// declares them and the ctx reads them when the node registers its
+    /// signal. Every trigger is an entry the dispatcher limits, so every
+    /// trigger gets the per-minute and at-once limits; one somebody
+    /// outside calls ([`NodeFeatures::has_outside_caller`]) also gets the
+    /// per-caller limit, the only one that needs a caller to count
+    /// ([`crate::signal::EntryLimits::node_inputs`]). A trigger whose run
+    /// does not answer a live caller (no `features.liveConnection`) also
+    /// gets the long-runs switch
+    /// ([`crate::run_class::RunClass::node_input`]). A trigger that
+    /// declares one of the names it receives is refused, so each setting
+    /// has exactly one spelling; a node that receives none of them may
+    /// use those names for its own inputs. Run once, on the authored document, by
+    /// both loaders (the catalog's and the derive's `parse_embedded`),
+    /// so the editor, the compiler and the worker all see the same
+    /// inputs.
+    pub fn add_language_inputs(&mut self) -> Result<(), String> {
+        let features = &self.features;
+        if (features.live_connection || features.called_from_outside) && !features.is_trigger {
+            return Err("features.liveConnection and features.calledFromOutside are only for a trigger (features.isTrigger)".into());
+        }
+        if features.live_connection && features.called_from_outside {
+            return Err("features.liveConnection already means somebody outside calls the trigger; remove features.calledFromOutside".into());
+        }
+        let mut added: Vec<InputSpec> = Vec::new();
+        if features.is_trigger {
+            added.extend(crate::signal::EntryLimits::node_inputs(features.has_outside_caller()));
+            if !features.live_connection {
+                added.push(crate::run_class::RunClass::node_input());
+            }
+        }
+        for name in added.iter().map(|i| &i.name) {
+            if self.inputs.iter().any(|i| i.name == *name) {
+                return Err(format!(
+                    "input '{name}' is a setting the language gives every trigger that \
+                     needs it; remove it from this node's inputs"
+                ));
+            }
+        }
+        self.inputs.extend(added);
+        Ok(())
     }
 
     /// Semantic metadata rules serde cannot express. One name = one
@@ -1852,6 +1899,23 @@ pub struct NodeFeatures {
     /// events rather than running as part of an execution).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
+    /// The trigger's run answers a caller who holds the connection
+    /// open for it (a route, a socket), so the run is always one
+    /// request long and the caller's own traffic is what needs
+    /// bounding. Decides which settings the language gives the trigger
+    /// ([`NodeMetadata::add_language_inputs`]): the entry limits, and
+    /// never the long-runs switch. Backend-only: the editor never
+    /// reads it, it only sees the inputs it produces.
+    #[serde(default, rename = "liveConnection", skip_serializing_if = "std::ops::Not::not")]
+    pub live_connection: bool,
+    /// The trigger fires when somebody outside calls its address and
+    /// the call ends there (a form somebody submits), so a caller exists
+    /// to count per caller. A `liveConnection` trigger is called from
+    /// outside already and never declares it; a trigger that picks its
+    /// events up itself (a schedule, a feed, a provider's push) has no
+    /// caller and does not either. Backend-only, like `liveConnection`.
+    #[serde(default, rename = "calledFromOutside", skip_serializing_if = "std::ops::Not::not")]
+    pub called_from_outside: bool,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
@@ -1883,6 +1947,14 @@ pub struct NodeFeatures {
     /// not catalog nodes, they're inline-dispatched in the engine.)
     #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+}
+
+impl NodeFeatures {
+    /// Whether somebody outside calls this trigger, so a caller exists
+    /// to count: a live connection, or a trigger that says so.
+    pub fn has_outside_caller(&self) -> bool {
+        self.live_connection || self.called_from_outside
+    }
 }
 
 /// Where a node's ports come from when they come from its own config:
@@ -3312,7 +3384,7 @@ mod widget_default_tests {
         let strings = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::String)));
         assert_eq!(Widget::default_for_type(&strings).kind_name(), "text_list");
 
-        let numbers = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::Number)));
+        let numbers = WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::Number)));
         assert_eq!(Widget::default_for_type(&numbers).kind_name(), "textarea");
 
         // A plain String is a single line; a prose field declares
@@ -3571,6 +3643,77 @@ mod input_semantics_tests {
             m
         })
         .unwrap()
+    }
+
+    /// The language owns the long-runs switch and the entry limits:
+    /// every trigger gets the per-minute and at-once limits, one called
+    /// from outside also the per-caller one, a non-live one also the
+    /// long-runs switch, a plain node none of them. A trigger declaring a name it receives is
+    /// refused; a plain node may use those names for its own inputs.
+    #[test]
+    fn a_trigger_gets_the_settings_the_language_owns() {
+        let names = |m: &NodeMetadata| m.inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let mut plain = metadata_with(vec![]);
+        plain.add_language_inputs().unwrap();
+        assert!(plain.inputs.is_empty());
+
+        let mut trigger = metadata_with(vec![]);
+        trigger.features.is_trigger = true;
+        trigger.add_language_inputs().unwrap();
+        // Nobody calls a schedule: no per-caller limit.
+        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS[1..].to_vec();
+        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        assert_eq!(names(&trigger), expected);
+        trigger.validate_semantics().expect("the added inputs pass the semantic rules");
+
+        let mut form = metadata_with(vec![]);
+        form.features.is_trigger = true;
+        form.features.called_from_outside = true;
+        form.add_language_inputs().unwrap();
+        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS.to_vec();
+        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        assert_eq!(names(&form), expected);
+
+        let mut both = metadata_with(vec![]);
+        both.features.is_trigger = true;
+        both.features.called_from_outside = true;
+        both.features.live_connection = true;
+        assert!(both.add_language_inputs().unwrap_err().contains("calledFromOutside"));
+
+        let mut live = metadata_with(vec![]);
+        live.features.is_trigger = true;
+        live.features.live_connection = true;
+        live.add_language_inputs().unwrap();
+        assert_eq!(names(&live), crate::signal::EntryLimits::NODE_FIELDS);
+        live.validate_semantics().expect("the added inputs pass the semantic rules");
+
+        let mut not_a_trigger = metadata_with(vec![]);
+        not_a_trigger.features.live_connection = true;
+        assert!(not_a_trigger.add_language_inputs().is_err());
+        let mut not_a_trigger = metadata_with(vec![]);
+        not_a_trigger.features.called_from_outside = true;
+        assert!(not_a_trigger.add_language_inputs().is_err());
+
+        let mut declares_it = metadata_with(vec![crate::run_class::RunClass::node_input()]);
+        declares_it.features.is_trigger = true;
+        let e = declares_it.add_language_inputs().unwrap_err();
+        assert!(e.contains("longRuns"), "{e}");
+
+        let mut declares_a_limit = metadata_with(vec![input("callsAtOnce", WeftType::primitive(WeftPrimitive::Number))]);
+        declares_a_limit.features.is_trigger = true;
+        declares_a_limit.features.live_connection = true;
+        let e = declares_a_limit.add_language_inputs().unwrap_err();
+        assert!(e.contains("callsAtOnce"), "{e}");
+
+        // A rate limiter is no trigger: its own `callsPerMinute` and
+        // `longRuns` inputs are its own.
+        let own = vec![
+            input("callsPerMinute", WeftType::primitive(WeftPrimitive::Number)),
+            crate::run_class::RunClass::node_input(),
+        ];
+        let mut limiter = metadata_with(own.clone());
+        limiter.add_language_inputs().expect("a plain node keeps its own names");
+        assert_eq!(limiter.inputs.len(), own.len());
     }
 
     /// A node whose ports come from a config list: the list has to live
@@ -3842,7 +3985,7 @@ mod input_semantics_tests {
             (serde_json::json!({ "kind": "number", "min": 5, "max": 1 }), "minimum of 5 above"),
             (serde_json::json!({ "kind": "number", "step": 0 }), "step of 0"),
         ] {
-            let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+            let mut n = input("count", WeftType::primitive(WeftPrimitive::Number));
             n.widget = Some(serde_json::from_value(widget).unwrap());
             let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
             assert!(e.contains("count") && e.contains(wanted), "{e}");
@@ -3853,7 +3996,7 @@ mod input_semantics_tests {
     /// the message reading as one sentence.
     #[test]
     fn a_default_outside_its_own_number_box_is_refused() {
-        let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+        let mut n = input("count", WeftType::primitive(WeftPrimitive::Number));
         n.widget = Some(serde_json::from_value(
             serde_json::json!({ "kind": "number", "min": 1, "max": 8, "step": 1 }),
         ).unwrap());

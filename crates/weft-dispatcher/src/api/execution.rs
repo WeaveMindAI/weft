@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft_core::exec::CancelCause;
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 use crate::authenticator::{authorize_execution, authorize_project, CallerTenant};
 use crate::journal::{ExecutionPage, ExecutionQuery};
@@ -25,10 +25,10 @@ use crate::state::DispatcherState;
 /// them is still on screen.
 const AMBIGUOUS_PREFIX_SHOWN: usize = 5;
 
-/// The one execution of the caller's whose color starts with `prefix`
+/// The one execution of the caller's whose execution starts with `prefix`
 /// (a full uuid resolves to itself). 404 when nothing matches, 409
 /// when the prefix is short enough to match several, naming them.
-pub async fn resolve_color(
+pub async fn resolve_execution_id(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(prefix): Path<String>,
@@ -37,17 +37,17 @@ pub async fn resolve_color(
     if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("'{prefix}' is not the start of a color: give at least four hex characters"),
+            format!("'{prefix}' is not the start of an execution id: give at least four hex characters"),
         ));
     }
     let matches = state
         .journal
-        .colors_with_prefix(caller.0.as_str(), &prefix)
+        .execution_ids_with_prefix(caller.0.as_str(), &prefix)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("colors_with_prefix: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execution_ids_with_prefix: {e}")))?;
     match matches.as_slice() {
         [] => Err((StatusCode::NOT_FOUND, format!("no execution starts with '{prefix}'"))),
-        [one] => Ok(Json(serde_json::json!({ "color": one.to_string() }))),
+        [one] => Ok(Json(serde_json::json!({ "execution_id": one.to_string() }))),
         // A count and a few short ids, never the whole list: an empty or
         // one-character prefix matches everything the project ever ran,
         // and printing a hundred full uuids buries the one sentence that
@@ -72,28 +72,28 @@ pub async fn resolve_color(
 pub async fn cancel(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let color: Color = color_str
+    let execution_id: ExecutionId = execution_id_str
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    authorize_execution(&*state.journal, &caller.0, color).await?;
+    authorize_execution(&*state.journal, &caller.0, execution_id).await?;
     // A run that already ended has nothing to cancel: said so, with
     // its status, instead of a silent no-op the caller would wait on
     // forever (the editor's Stop once sat on "Cancelling..." for a run
     // that had finished an hour before).
     if let Some(summary) = state
         .journal
-        .execution_summary(color)
+        .execution_summary(execution_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execution summary: {e}")))?
     {
         if let Some(refusal) = already_ended(&summary.status) {
-            return Err((StatusCode::CONFLICT, format!("execution {color} already ended ({refusal})")));
+            return Err((StatusCode::CONFLICT, format!("execution {execution_id} already ended ({refusal})")));
         }
     }
-    cancel_color(&state, color, &CancelCause::User).await.map_err(|e| {
-        tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
+    cancel_execution_id(&state, execution_id, &CancelCause::User).await.map_err(|e| {
+        tracing::error!(target: "weft_dispatcher::cancel", execution_id = %execution_id, error = %e, "cancel_execution_id failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     Ok(StatusCode::NO_CONTENT)
@@ -109,23 +109,23 @@ fn already_ended(status: &str) -> Option<&str> {
     }
 }
 
-/// Cancel every color in `targets`, each with its own cause, attempting
-/// ALL of them before reporting. One failing color must not strand the
+/// Cancel every execution in `targets`, each with its own cause, attempting
+/// ALL of them before reporting. One failing execution must not strand the
 /// ones after it (they would stay live with their wakes registered), and
 /// a failure must not disappear either: if any cancel failed, the
-/// result is an error naming every failed color and why, so a task
+/// result is an error naming every failed execution and why, so a task
 /// built on this is recorded failed with the real errors, never
-/// completed with a count nobody reads. Returns the colors cancelled.
-pub async fn cancel_colors(
+/// completed with a count nobody reads. Returns the executions cancelled.
+pub async fn cancel_execution_ids(
     state: &DispatcherState,
-    targets: &[(Color, &CancelCause)],
-) -> anyhow::Result<Vec<Color>> {
+    targets: &[(ExecutionId, &CancelCause)],
+) -> anyhow::Result<Vec<ExecutionId>> {
     let mut cancelled = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    for (color, cause) in targets {
-        match cancel_color(state, *color, cause).await {
-            Ok(()) => cancelled.push(*color),
-            Err(e) => failures.push(format!("{color}: {e:#}")),
+    for (execution_id, cause) in targets {
+        match cancel_execution_id(state, *execution_id, cause).await {
+            Ok(()) => cancelled.push(*execution_id),
+            Err(e) => failures.push(format!("{execution_id}: {e:#}")),
         }
     }
     if !failures.is_empty() {
@@ -151,47 +151,44 @@ pub async fn cancel_colors(
 ///
 /// The durable part is ONE transaction (`Journal::cancel_execution`):
 /// strip the wake signals, journal the terminals, queue the cancel
-/// task for the alive owner pod. Either all of it lands or none does,
+/// task for the alive owner process. Either all of it lands or none does,
 /// so a database failure mid-cancel leaves the run exactly as it was
 /// and the next attempt succeeds; nothing can strip a run's wakes and
 /// then fail to end it. Two paths then converge on the one observable
 /// outcome (the journal reads `ExecutionCancelled`):
 ///
-///   - When a worker Pod is alive and driving this color, the task
-///     fires the per-color `CancellationFlag` (~50ms), the loop driver
+///   - When a worker is alive and driving this execution, the task
+///     fires the per-execution `CancellationFlag` (~50ms), the loop driver
 ///     exits, and the worker's own terminal write finds the rows
 ///     already there and skips (idempotent).
-///   - With no worker driving it (a suspended run, no pod at all), the
+///   - With no worker driving it (a suspended run, no process at all), the
 ///     rows written here ARE the terminal.
 ///
 /// After the commit the listener forgets the stripped signals in RAM
 /// (the durable row is already gone, so a late fire finds nothing),
 /// and the journal bridge publishes the new rows onto the project's
 /// SSE bus so the frontend exits "Cancelling...".
-pub async fn cancel_color(
+pub async fn cancel_execution_id(
     state: &DispatcherState,
-    color: Color,
+    execution_id: ExecutionId,
     cause: &CancelCause,
 ) -> anyhow::Result<()> {
     tracing::info!(
         target: "weft_dispatcher::cancel",
-        color = %color,
+        execution_id = %execution_id,
         %cause,
-        "cancel_color start"
+        "cancel_execution_id start"
     );
     // The per-node cancels come off the fold, which needs the run's
-    // program; a color with none (never started, a node self-test)
+    // program; an execution with none (never started, a node self-test)
     // has no nodes to cancel, and a program that cannot be found is no
     // reason to leave the run running: the terminal lands anyway.
-    let program = program_for_cancel(state, color).await?;
-    let write = state.journal.cancel_execution(color, program.as_deref(), cause).await?;
-    state
-        .listeners
-        .unregister_many(&state.pg_pool, &write.removed)
-        .await;
+    let program = program_for_cancel(state, execution_id).await?;
+    let write = state.journal.cancel_execution(execution_id, program.as_deref(), cause).await?;
+    state.listener.unregister_many(&write.removed).await;
     tracing::info!(
         target: "weft_dispatcher::cancel",
-        color = %color,
+        execution_id = %execution_id,
         signals_removed = write.removed.len(),
         task_enqueued = write.task_enqueued,
         node_cancellations = ?write.node_cancellations,
@@ -201,7 +198,7 @@ pub async fn cancel_color(
 }
 
 /// THE definition of a dispatcher-side cancel write: the ordered
-/// `(event, dedup_key)` list that flips a color terminal. Pure, so
+/// `(event, dedup_key)` list that flips an execution terminal. Pure, so
 /// every transactional cancel writer emits IDENTICAL rows and can
 /// never drift on the ordering rule, the dedup-key format, or the
 /// closure-emission policy.
@@ -210,13 +207,13 @@ pub async fn cancel_color(
 /// entry). Otherwise a partial run that journaled the terminal event first
 /// would set has-terminal=true, and a retry would skip the per-node writes
 /// forever, leaving node UI states stuck on "running". Each per-node write is
-/// dedup-keyed on (color, node, frame-stack) so a partial failure + retry
+/// dedup-keyed on (execution, node, frame-stack) so a partial failure + retry
 /// (e.g. the orphan sweep's retry-next-tick loop) collapses instead of
 /// stacking a duplicate NodeCancelled row (which would also republish a
 /// duplicate UI event); the terminal's key makes the row-level write safe even
-/// if two cancels for the same color race past their has-terminal checks.
+/// if two cancels for the same execution race past their has-terminal checks.
 pub fn cancel_terminal_events(
-    color: Color,
+    execution_id: ExecutionId,
     events: &[weft_journal::ExecEvent],
     program: Option<&ProjectDefinition>,
     cause: &CancelCause,
@@ -232,7 +229,7 @@ pub fn cancel_terminal_events(
             // level and is the inspector's `/replay` to show; the
             // records that did fold are the ones to flip.
             let snapshot = weft_journal::fold_to_snapshot(
-                color,
+                execution_id,
                 Arc::new(program.clone()),
                 events,
             );
@@ -245,19 +242,19 @@ pub fn cancel_terminal_events(
                         weft_core::frames::frames_text(&e.frames);
                     writes.push((
                         ExecEvent::NodeCancelled {
-                            color,
+                            execution_id,
                             node_id: node_id.clone(),
                             frames: e.frames.clone(),
                             reason: reason.clone(),
                             at_unix: now,
                         },
-                        format!("cancel:{color}:{node_id}:{frames_key}"),
+                        format!("cancel:{execution_id}:{node_id}:{frames_key}"),
                     ));
                 }
             }
         }
-        // No program: a color that never ran a node body (a node
-        // self-test) has nothing per node to flip. A color whose
+        // No program: an execution that never ran a node body (a node
+        // self-test) has nothing per node to flip. An execution whose
         // program is gone (its project was removed) or cannot be read
         // still ends, on the terminal alone: the stop must land, and
         // the run's status is read off the terminal. Its node records
@@ -268,7 +265,7 @@ pub fn cancel_terminal_events(
             if events.iter().any(|e| matches!(e, ExecEvent::NodeStarted { .. })) {
                 tracing::warn!(
                     target: "weft_dispatcher::cancel",
-                    %color,
+                    %execution_id,
                     "cancelling without the run's program: the terminal is written, the \
                      per-node cancels cannot be derived"
                 );
@@ -276,21 +273,21 @@ pub fn cancel_terminal_events(
         }
     }
     writes.push((
-        ExecEvent::ExecutionCancelled { color, reason, cause: Some(cause.clone()), at_unix: now },
-        format!("execution_cancelled:{color}"),
+        ExecEvent::ExecutionCancelled { execution_id, reason, cause: Some(cause.clone()), at_unix: now },
+        format!("execution_cancelled:{execution_id}"),
     ));
     Ok(writes)
 }
 
 /// The program a cancel folds with to derive its per-node cancels, or
-/// `None` when the color has none to fold with: no program at all, a
+/// `None` when the execution has none to fold with: no program at all, a
 /// removed project, or a program that cannot be read (logged; the
 /// stop still lands on the terminal). `Err` only for the database.
 pub async fn program_for_cancel(
     state: &crate::state::DispatcherState,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> anyhow::Result<Option<Arc<ProjectDefinition>>> {
-    let lookup = crate::projection::execution_program(state, color).await?;
+    let lookup = crate::projection::execution_program(state, execution_id).await?;
     // Both unpaintable states are worth saying out loud here, and
     // `unpaintable` is the one place that knows which they are: an
     // unreadable row and a retired program both end with the terminal
@@ -299,7 +296,7 @@ pub async fn program_for_cancel(
     if let Some((site, reason)) = lookup.unpaintable() {
         tracing::warn!(
             target: "weft_dispatcher::cancel",
-            %color, %reason, ?site,
+            %execution_id, %reason, ?site,
             "cancelling a run whose program cannot be folded: the terminal is written, the \
              per-node cancels cannot be derived"
         );
@@ -322,38 +319,38 @@ pub async fn program_for_cancel(
 /// coming.
 pub(crate) async fn execution_is_being_worked_on(
     pool: &sqlx::PgPool,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> anyhow::Result<bool> {
-    // `task.color` is TEXT, so the color goes in as its string form;
+    // `task.execution_id` is TEXT, so the execution goes in as its string form;
     // binding the uuid itself matches nothing and would read as "no
     // task", which here means "declare every run dead".
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT count(*) FROM task \
-         WHERE color = $1 AND status IN ('pending', 'claimed')",
+         WHERE execution_id = $1 AND status IN ('pending', 'claimed')",
     )
-    .bind(color.to_string())
+    .bind(execution_id.to_string())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(n,)| n > 0).unwrap_or(false))
 }
 
-/// The terminal outcome recorded for a color, if any. The journal is
+/// The terminal outcome recorded for an execution, if any. The journal is
 /// the authoritative source: `Completed`/`Failed`/`Cancelled` are the
 /// three terminal `exec_event` kinds. `None` means the execution is
 /// still in flight. Used both for cancel-dedup and as the source of
 /// truth when the in-RAM event bus drops events (broadcast `Lagged`).
 pub(crate) async fn terminal_outcome(
     pool: &sqlx::PgPool,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
     // SYNC: terminal_outcome (SQL kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT kind FROM exec_event \
-         WHERE color = $1 \
+         WHERE execution_id = $1 \
            AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
          LIMIT 1",
     )
-    .bind(color.to_string())
+    .bind(execution_id.to_string())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(kind,)| match kind.as_str() {
@@ -387,7 +384,7 @@ async fn overlay_suspended(
     summaries: &mut [crate::journal::ExecutionSummary],
 ) -> Result<(), StatusCode> {
     use std::collections::HashMap;
-    let mut sets: HashMap<uuid::Uuid, std::collections::HashSet<Color>> = HashMap::new();
+    let mut sets: HashMap<uuid::Uuid, std::collections::HashSet<ExecutionId>> = HashMap::new();
     for s in summaries.iter_mut() {
         if s.status != "running" {
             continue;
@@ -395,12 +392,12 @@ async fn overlay_suspended(
         let set = match sets.entry(s.project_id) {
             std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
-                crate::api::project::suspended_color_set(state, s.project_id)
+                crate::api::project::suspended_execution_id_set(state, s.project_id)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
             ),
         };
-        if set.contains(&s.color) {
+        if set.contains(&s.execution_id) {
             s.status = "waiting_for_input".to_string();
         }
     }
@@ -410,18 +407,18 @@ async fn overlay_suspended(
 pub async fn get(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&*state.journal, &caller.0, color)
+    let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    authorize_execution(&*state.journal, &caller.0, execution_id)
         .await
         .map_err(|(s, _)| s)?;
-    // Direct point-lookup by color (authorization above already proved the
+    // Direct point-lookup by execution (authorization above already proved the
     // caller owns it), so an execution older than any list window still
     // resolves instead of 404ing.
     let summary = state
         .journal
-        .execution_summary(color)
+        .execution_summary(execution_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -434,12 +431,12 @@ pub async fn get(
     // its wait, then returns), so a client that learns the run is
     // parked learns from the same read what it is parked on.
     let waiting = if summary.status == "waiting_for_input" {
-        parked_waits(&state, color).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        parked_waits(&state, execution_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
         Vec::new()
     };
     Ok(Json(serde_json::json!({
-        "color": summary.color.to_string(),
+        "execution_id": summary.execution_id.to_string(),
         "project_id": summary.project_id,
         "entry_node": summary.entry_node,
         "status": summary.status,
@@ -453,8 +450,8 @@ pub async fn get(
 
 /// One wait a parked run holds: the node, the token that answers it,
 /// and the signal kind (a `timer` is woken, anything else expects a
-/// value). Rides `GET /executions/{color}` as `waiting`, which is what
-/// `wake` matches a `weft wake <color> <node>` against.
+/// value). Rides `GET /executions/{execution_id}` as `waiting`, which is what
+/// `wake` matches a `weft wake <execution_id> <node>` against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParkedWait {
     /// The waiting node's place, spelled the way a person writes it
@@ -466,17 +463,17 @@ pub struct ParkedWait {
     pub kind: String,
 }
 
-/// The waits of `color`, from the resume-signal rows that make it
+/// The waits of `execution_id`, from the resume-signal rows that make it
 /// `waiting_for_input`, in registration order.
-async fn parked_waits(state: &DispatcherState, color: Color) -> anyhow::Result<Vec<ParkedWait>> {
-    let signals = state.journal.signal_list_for_color(color).await?;
-    waits_of(&signals, color)
+async fn parked_waits(state: &DispatcherState, execution_id: ExecutionId) -> anyhow::Result<Vec<ParkedWait>> {
+    let signals = state.journal.signal_list_for_execution_id(execution_id).await?;
+    waits_of(&signals, execution_id)
 }
 
-fn waits_of(signals: &[crate::journal::SignalRegistration], color: Color) -> anyhow::Result<Vec<ParkedWait>> {
+fn waits_of(signals: &[crate::journal::SignalRegistration], execution_id: ExecutionId) -> anyhow::Result<Vec<ParkedWait>> {
     signals
         .iter()
-        .filter(|s| s.is_resume && s.color == Some(color))
+        .filter(|s| s.is_resume && s.execution_id == Some(execution_id))
         .map(|s| {
             let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&s.spec_json)?;
             Ok(ParkedWait { node: s.node_id.clone(), token: s.token.clone(), kind: spec.kind })
@@ -487,7 +484,7 @@ fn waits_of(signals: &[crate::journal::SignalRegistration], color: Color) -> any
 #[derive(Debug, Serialize)]
 pub struct LogLineOut {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<Color>,
+    pub inherited_from: Option<ExecutionId>,
     pub at_unix: u64,
     pub level: String,
     /// The firing this line is about: the node, and the loop
@@ -525,13 +522,13 @@ pub struct LogsOut {
 pub async fn list_logs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
     Query(params): Query<ListLogsParams>,
 ) -> Result<Json<LogsOut>, (StatusCode, String)> {
-    let color: Color = color_str
+    let execution_id: ExecutionId = execution_id_str
         .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{color_str}' is not a color (a uuid)")))?;
-    authorize_execution(&*state.journal, &caller.0, color).await?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{execution_id_str}' is not an execution id (a uuid)")))?;
+    authorize_execution(&*state.journal, &caller.0, execution_id).await?;
     let limit = params.limit.unwrap_or(DEFAULT_LOG_LINES);
     if !(1..=MAX_LOG_LINES).contains(&limit) {
         return Err((
@@ -539,9 +536,9 @@ pub async fn list_logs(
             format!("limit is {limit}; one read holds between 1 and {MAX_LOG_LINES} lines"),
         ));
     }
-    // The journal's error names the color and `weft clean` when a row
+    // The journal's error names the execution and `weft clean` when a row
     // no longer decodes; the reader gets it, not a bare 500.
-    let entries = crate::projection::execution_logs(&state, color, limit)
+    let entries = crate::projection::execution_logs(&state, execution_id, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let lines = entries
@@ -562,13 +559,13 @@ pub async fn list_logs(
 pub async fn outputs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
 ) -> Result<Json<weft_core::run_spec::Expected>, (StatusCode, String)> {
-    let color: Color = color_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
-    authorize_execution(&*state.journal, &caller.0, color).await?;
-    let sources = crate::projection::reconstruct_execution(&state, color).await
+    let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad execution".into()))?;
+    authorize_execution(&*state.journal, &caller.0, execution_id).await?;
+    let sources = crate::projection::reconstruct_execution(&state, execution_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
-    let project = sources[&color].project();
+    let project = sources[&execution_id].project();
     // A forwarding boundary is the compiler's: what entered a group is
     // the wire of the node that fed it, what left is the wire of the
     // node that filled it, so its wire says nothing a person's wire
@@ -578,7 +575,7 @@ pub async fn outputs(
     // output (`doubler.results`).
     let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
         && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
-    let wires = sources[&color].output_wires()
+    let wires = sources[&execution_id].output_wires()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .iter().filter(|wire| !boundary(&wire.node))
         .map(|wire| weft_core::run_spec::ExpectedWire::spell(project, wire)).collect();
@@ -595,15 +592,15 @@ pub async fn outputs(
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
 ) -> Result<Json<Vec<crate::events::LiveEvent>>, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     // Resolve + tenant-gate in the ONE place that owns "who owns this
     // execution": a lookup failure is 500, an unknown or cross-tenant
-    // color is 404, and the resolved project rides back for the
+    // execution is 404, and the resolved project rides back for the
     // replay's event attribution.
     let project_id =
-        authorize_execution(&*state.journal, &caller.0, color).await.map_err(|(s, _)| s)?.project_id;
+        authorize_execution(&*state.journal, &caller.0, execution_id).await.map_err(|(s, _)| s)?.project_id;
     // The full ExecEvent log, folded over the run's program through
     // the SAME projection the live `journal_bridge` runs, so replay and
     // live cannot drift; bus and caller events ride along.
@@ -611,10 +608,10 @@ pub async fn replay(
     // that no longer decodes lands below as its own JournalCorruption
     // entry, naming `weft clean`, instead of taking the response down.
     let (raw_events, unreadable_rows) =
-        state.journal.events_log_lossy(color).await.map_err(|e| {
+        state.journal.events_log_lossy(execution_id).await.map_err(|e| {
             tracing::error!(
                 target: "weft_dispatcher::api",
-                %color, error = %e,
+                %execution_id, error = %e,
                 "replay: reading the journal failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR
@@ -628,10 +625,10 @@ pub async fn replay(
         .into_iter()
         .map(|reason| (weft_core::primitive::CorruptionSite::UndecodableRow, reason))
         .collect();
-    let found = crate::projection::execution_program(&state, color).await.map_err(|e| {
+    let found = crate::projection::execution_program(&state, execution_id).await.map_err(|e| {
         tracing::error!(
             target: "weft_dispatcher::api",
-            %color, error = %e,
+            %execution_id, error = %e,
             "replay: looking up the run's program failed"
         );
         StatusCode::INTERNAL_SERVER_ERROR
@@ -657,7 +654,7 @@ pub async fn replay(
             weft_journal::SeedChain::default()
         }
     };
-    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id)
+    let mut projector = crate::projection::ExecutionProjector::new(execution_id, program, project_id)
         .with_inheritance(inheritance);
     let mut out: Vec<crate::events::LiveEvent> = Vec::new();
     for record in raw_events {
@@ -671,7 +668,7 @@ pub async fn replay(
     // the row, by the projector; the rows that never decoded follow.
     for (site, reason) in corruptions {
         out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
-            color,
+            execution_id,
             project_id,
             site,
             reason,
@@ -737,7 +734,7 @@ pub async fn list_executions(
 
 /// Return the most recent execution for a project, or 404 if
 /// the project has none. Used by `weft logs` (no-arg form) to
-/// find the color to dump logs for.
+/// find the execution to dump logs for.
 pub async fn latest_for_project(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -770,11 +767,11 @@ pub async fn latest_for_project(
     page.executions.into_iter().next().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `POST /executions/{color}/wake/{node}`: resolve a wait now, instead
+/// `POST /executions/{execution_id}/wake/{node}`: resolve a wait now, instead
 /// of waiting for whatever it waits for.
 ///
 /// This side decides whether the wake may happen: the caller's tenancy,
-/// and that the node really has a wait parked on this color. What the
+/// and that the node really has a wait parked on this execution. What the
 /// wait then wakes WITH is the signal kind's own shape, so the listener
 /// holding it is asked, and it answers with nothing for every kind that
 /// has no truthful stand-in (a form is waiting for an answer; there is
@@ -786,13 +783,13 @@ pub async fn latest_for_project(
 pub async fn wake(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((color_str, node)): Path<(String, String)>,
+    Path((execution_id_str, node)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let color: Color = color_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".to_string()))?;
-    // Authorization only: the color's own waits are read below, and the
+    let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad execution".to_string()))?;
+    // Authorization only: the execution's own waits are read below, and the
     // wall this crosses is the caller's tenancy, not the project id.
-    authorize_execution(&*state.journal, &caller.0, color).await?;
-    let waits = parked_waits(&state, color)
+    authorize_execution(&*state.journal, &caller.0, execution_id).await?;
+    let waits = parked_waits(&state, execution_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
     // The node is named the way a person writes it (`one.review`), which
@@ -805,26 +802,18 @@ pub async fn wake(
         let node = weft_core::truncate_user_string(&node, 256);
         return Err((
             StatusCode::NOT_FOUND,
-            format!("'{node}' is not waiting on anything in {color}; `weft events {color} --node {node}` shows what it did"),
+            format!("'{node}' is not waiting on anything in {execution_id}; `weft events {execution_id} --node {node}` shows what it did"),
         ));
     };
     // WHETHER a wake may happen is this side's question, and it has been
     // answered above: the project is live, the node really is waiting,
     // the caller may touch it. WHAT it wakes with is the signal kind's,
-    // so the listener holding it is asked. A kind that cannot be woken
-    // by hand answers with nothing, and the refusal below names the kind
-    // without this tier ever knowing one.
-    let handle = state
-        .listeners
-        .ensure_placed_handle(
-            &wait.token,
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve the signal's listener: {e:#}")))?;
-    let payload = crate::listener::wake_by_hand(&handle, &wait.token)
+    // so the listener is asked. A kind that cannot be woken by hand
+    // answers with nothing, and the refusal below names the kind without
+    // this tier ever knowing one.
+    let payload = state
+        .listener
+        .wake_by_hand(&wait.token)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ask what it wakes with: {e:#}")))?;
     let Some(payload) = payload else {
@@ -877,14 +866,14 @@ pub async fn clean(
 /// `cancel` stops it (its rows go with the next clean), `wait` leaves it
 /// running. `asked_by` is never touched: a program cleaning runs is not
 /// among them. Each deleted project's bare versions are swept as its runs
-/// go, the way `weft clean <color>` sweeps them.
+/// go, the way `weft clean <execution_id>` sweeps them.
 pub(crate) async fn clean_runs(
     state: &DispatcherState,
     tenant: &crate::tenant::TenantId,
     project: Option<uuid::Uuid>,
     filter: &weft_core::program::RunFilter,
     running: weft_core::running_policy::RunningPolicy,
-    asked_by: Option<Color>,
+    asked_by: Option<ExecutionId>,
 ) -> Result<weft_core::program::CleanOutcome, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     let now = crate::lease::now_unix() as u64;
@@ -919,18 +908,18 @@ pub(crate) async fn clean_runs(
             )
             .await
             .map_err(|e| internal("list runs", e))?;
-        let Some(last) = page.executions.last().map(|run| (run.started_at, run.color)) else {
+        let Some(last) = page.executions.last().map(|run| (run.started_at, run.execution_id)) else {
             break;
         };
         below = Some(last);
         for run in page.executions {
-            if Some(run.color) == asked_by {
+            if Some(run.execution_id) == asked_by {
                 continue;
             }
             if run.status == "running" {
                 match running {
                     weft_core::running_policy::RunningPolicy::Cancel => {
-                        cancel_color(state, run.color, &weft_core::exec::CancelCause::User)
+                        cancel_execution_id(state, run.execution_id, &weft_core::exec::CancelCause::User)
                             .await
                             .map_err(|e| internal("cancel", e))?;
                         outcome.cancelled += 1;
@@ -939,9 +928,9 @@ pub(crate) async fn clean_runs(
                 }
                 continue;
             }
-            let project_id = clean_execution(state, tenant, run.color)
+            let project_id = clean_execution(state, tenant, run.execution_id)
                 .await
-                .map_err(|status| (status, format!("delete run {}", run.color)))?;
+                .map_err(|status| (status, format!("delete run {}", run.execution_id)))?;
             swept_projects.insert(project_id);
             outcome.deleted += 1;
         }
@@ -966,24 +955,24 @@ pub(crate) async fn clean_runs(
 /// ever, with no verb that reaches it. The CLI used to do the sweep
 /// itself, which left the editor's own delete not doing it at all, and
 /// the CLI could only sweep the project it was standing in, which for
-/// `weft clean <color>` (a color can be cleaned from anywhere) was
+/// `weft clean <execution_id>` (an execution can be cleaned from anywhere) was
 /// frequently the wrong one.
 ///
 /// Answers the project and what was swept, so a caller can say so.
 pub async fn delete_execution(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path(color_str): Path<String>,
+    Path(execution_id_str): Path<String>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let project_id = clean_execution(&state, &caller.0, color).await?;
+    let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let project_id = clean_execution(&state, &caller.0, execution_id).await?;
     // The run IS deleted, which is what was asked for, so a sweep that
     // cannot run is said out loud and does not fail the delete: the
     // reaper and the next `weft clean` both reach the same rows.
     let swept = crate::api::versions::sweep_bare_versions(&state, project_id).await.unwrap_or_else(|(status, message)| {
         tracing::warn!(
             target: "weft_dispatcher::versions",
-            %color, project_id = %project_id, %status, %message,
+            %execution_id, project_id = %project_id, %status, %message,
             "the run is deleted; the version it may have left bare could not be swept"
         );
         Vec::new()
@@ -991,33 +980,33 @@ pub async fn delete_execution(
     Ok(axum::Json(serde_json::json!({ "project": project_id, "swept": swept })))
 }
 
-/// THE removal of one execution (`weft clean <color>`, and each run a
+/// THE removal of one execution (`weft clean <execution_id>`, and each run a
 /// prune drops): its storage folder, then its journal, its tags, its
-/// resume tokens (on the pod that served them too), and its row in
+/// resume tokens (on the process that served them too), and its row in
 /// the version tree, together; then the word to every client.
 pub(crate) async fn clean_execution(
     state: &DispatcherState,
     caller: &crate::tenant::TenantId,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> Result<uuid::Uuid, StatusCode> {
     // The gate already read the owning row; keep it rather than asking
     // again. Its tenant is the one the storage prefix was WRITTEN
     // under, so the wipe below addresses the same bytes the run
     // created even for a project that has since been removed (asking
     // the project store for the tenant would fail exactly there).
-    let owner = authorize_execution(&*state.journal, caller, color).await.map_err(|(s, _)| s)?;
+    let owner = authorize_execution(&*state.journal, caller, execution_id).await.map_err(|(s, _)| s)?;
     // Wipe the execution's storage folder (kept survivors included:
-    // `weft clean <color>` IS the explicit removal verb for them)
-    // BEFORE the journal rows go, while the color's row still exists.
-    // A spent color's storage address dies with its journal history;
+    // `weft clean <execution_id>` IS the explicit removal verb for them)
+    // BEFORE the journal rows go, while the execution's row still exists.
+    // A spent execution's storage address dies with its journal history;
     // every failure below aborts so a retry can still wipe, never
     // orphaning the prefix.
-    crate::storage::wipe_prefix(state, &format!("{}/exec/{color}/", owner.tenant))
+    crate::storage::wipe_prefix(state, &format!("{}/exec/{execution_id}/", owner.tenant))
         .await
         .map_err(|e| {
             tracing::error!(
                 target: "weft_dispatcher::storage",
-                %color, error = %e,
+                %execution_id, error = %e,
                 "could not wipe execution storage; aborting clean so a retry can"
             );
             StatusCode::SERVICE_UNAVAILABLE
@@ -1026,7 +1015,7 @@ pub(crate) async fn clean_execution(
     // store that owns that table.
     //
     // Before the journal, because the journal row is what makes this
-    // call REACHABLE: `authorize_execution` reads `execution_color`,
+    // call REACHABLE: `authorize_execution` reads `execution`,
     // which `delete_execution` removes. Deleting the journal first and
     // failing here left a tree row with no journal, and then `weft
     // clean` answered 404 for ever (no owner row to authorize against)
@@ -1034,29 +1023,29 @@ pub(crate) async fn clean_execution(
     // terminal row reads as still in flight. This way round, a failure
     // leaves everything reachable and the same command retries: the
     // tree delete is idempotent.
-    state.versions.delete_run(color).await.map_err(|e| {
+    state.versions.delete_run(execution_id).await.map_err(|e| {
         tracing::error!(
             target: "weft_dispatcher::versions",
-            %color, error = %e,
+            %execution_id, error = %e,
             "could not drop this run from the version tree; nothing was deleted, retry"
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     let removed = state
         .journal
-        .delete_execution(color)
+        .delete_execution(execution_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // The questions the run was parked on went with its rows, and the
-    // listener pod holding each one still serves it until told: a
+    // listener holding each one still serves it until told: a
     // client with a signal token could list and answer a form
     // belonging to a run that no longer exists. Same call as a cancel.
-    state.listeners.unregister_many(&state.pg_pool, &removed).await;
+    state.listener.unregister_many(&removed).await;
     // Every window learns the run is gone the way it learns a cancel.
     // NOTIFY, not the journal: the journal is what was just erased.
     state
         .events
-        .publish(DispatcherEvent::ExecutionDeleted { color, project_id: owner.project_id })
+        .publish(DispatcherEvent::ExecutionDeleted { execution_id, project_id: owner.project_id })
         .await;
     // This may have been the last run keeping a removed project's code
     // and tree rows on file. A failure here leaves rows nobody reads and
@@ -1066,7 +1055,7 @@ pub(crate) async fn clean_execution(
     if let Err(e) = crate::api::project::retire_what_no_run_needs(state, owner.project_id).await {
         tracing::warn!(
             target: "weft_dispatcher::projection",
-            %color, project_id = %owner.project_id, error = %e,
+            %execution_id, project_id = %owner.project_id, error = %e,
             "could not retire what this run was the last to need; the reaper will retry"
         );
     }
@@ -1077,17 +1066,17 @@ pub(crate) async fn clean_execution(
 mod waits_tests {
     use super::*;
 
-    fn signal(token: &str, color: Option<Color>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
+    fn signal(token: &str, execution_id: Option<ExecutionId>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
         crate::journal::SignalRegistration {
             member: None,
             activation_trigger: None,
             source_version: None,
-            setup_color: None,
+            setup_execution_id: None,
             program: None,
             token: token.into(),
             tenant_id: "t".into(),
             project_id: uuid::Uuid::from_u128(0x100),
-            color,
+            execution_id,
             node_id: node.into(),
             is_resume,
             spec_json: serde_json::json!({ "kind": kind }).to_string(),
@@ -1103,7 +1092,6 @@ mod waits_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
-            listener_pod: None,
         }
     }
 
@@ -1111,7 +1099,7 @@ mod waits_tests {
     /// signals and another run's waits are not.
     #[test]
     fn a_runs_waits_are_its_resume_signals() {
-        let (mine, other) = (Color::new_v4(), Color::new_v4());
+        let (mine, other) = (ExecutionId::new_v4(), ExecutionId::new_v4());
         let signals = vec![
             signal("e", None, "tick", false, "timer"),
             signal("a", Some(mine), "hold", true, "timer"),
@@ -1134,7 +1122,7 @@ mod waits_tests {
     /// spelling, and nothing here has to tell them apart.
     #[test]
     fn a_wait_inside_an_included_file_goes_out_as_its_place() {
-        let mine = Color::new_v4();
+        let mine = ExecutionId::new_v4();
         let signals = vec![
             signal("a", Some(mine), "sweep.key", true, "timer"),
             signal("b", Some(mine), "again.key", true, "timer"),
@@ -1165,10 +1153,10 @@ mod cancel_tests {
         .expect("program")
     }
 
-    fn open_firing(color: Color) -> Vec<ExecEvent> {
+    fn open_firing(execution_id: ExecutionId) -> Vec<ExecEvent> {
         vec![
-            ExecEvent::NodeKicked { color, node_id: "wait".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
-            ExecEvent::NodeStarted { color, node_id: "wait".into(), frames: vec![], at_unix: 1 },
+            ExecEvent::NodeKicked { execution_id, node_id: "wait".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeStarted { execution_id, node_id: "wait".into(), frames: vec![], at_unix: 1 },
         ]
     }
 
@@ -1177,13 +1165,13 @@ mod cancel_tests {
     /// program, a node self-test) the terminal still lands, alone.
     #[test]
     fn cancel_writes_per_node_rows_with_the_program_and_the_terminal_without() {
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let program = program();
-        let with = cancel_terminal_events(color, &open_firing(color), Some(&program), &CancelCause::User, 9).unwrap();
+        let with = cancel_terminal_events(execution_id, &open_firing(execution_id), Some(&program), &CancelCause::User, 9).unwrap();
         let kinds: Vec<&str> = with.iter().map(|(e, _)| e.kind_str()).collect();
         assert_eq!(kinds, vec!["node_cancelled", "execution_cancelled"]);
-        assert_eq!(with[0].1, format!("cancel:{color}:wait:"));
-        let without = cancel_terminal_events(color, &open_firing(color), None, &CancelCause::User, 9).unwrap();
+        assert_eq!(with[0].1, format!("cancel:{execution_id}:wait:"));
+        let without = cancel_terminal_events(execution_id, &open_firing(execution_id), None, &CancelCause::User, 9).unwrap();
         let kinds: Vec<&str> = without.iter().map(|(e, _)| e.kind_str()).collect();
         assert_eq!(kinds, vec!["execution_cancelled"]);
         assert!(matches!(&without[0].0, ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));

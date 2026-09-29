@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
 
 # Every crate whose tests need a database. A new one goes here.
-ALL_CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store)
+ALL_CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store weft-platform-local)
 CRATES=("${ALL_CRATES[@]}")
 
 only_crate="${1:-}"

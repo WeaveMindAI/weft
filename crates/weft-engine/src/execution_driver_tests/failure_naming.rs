@@ -44,7 +44,7 @@
             logs: Vec::new(),
             mentioned_ports: Default::default(),
             closed_output_ports: Default::default(),
-            color: uuid::Uuid::new_v4(),
+            execution_id: uuid::Uuid::new_v4(),
             frames,
             inherited_from: None,
         }

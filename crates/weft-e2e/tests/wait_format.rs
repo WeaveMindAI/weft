@@ -2,7 +2,7 @@
 //! own declared input ports, `Wait` suspends the branch for five seconds, and
 //! the value it was holding flows on unchanged when the timer fires.
 //!
-//! The park is what needs a cluster: the worker records a timer suspension and
+//! The park is what needs an install: the worker records a timer suspension and
 //! the execution resumes from the journal when the dispatcher fires it, so a
 //! completed run with the right value on the far side of the wait is the proof.
 //!
@@ -11,11 +11,9 @@
 //! is not added on top: a five-second wait resumes about five seconds after
 //! the node started, where it used to take several more.
 //!
-//! And parking is quick once a listener is up: the worker hears its timer is
-//! registered the moment that happens, not on a polling tick. The first run
-//! may have to start a listener pod (none runs while nothing is listening),
-//! which takes seconds of its own, so the park is timed on a second run that
-//! finds that pod still there.
+//! And parking is quick: the worker hears its timer is registered the moment
+//! that happens, not on a polling tick. The park is timed on a second run, so
+//! the first one's compile and worker start stay out of it.
 #![cfg(feature = "e2e")]
 
 use serde_json::json;
@@ -31,7 +29,7 @@ async fn a_formatted_line_survives_a_timer_park() -> anyhow::Result<()> {
     settled.assert_input("out", "data", &json!("Hi quentin, you have 3 left"))?;
     let (started, suspended, resumed) = hold_stamps(&settled)?;
     // The wait ends five seconds after the node asked, or as soon as it is
-    // registered if registering took longer (a cold listener pod), never
+    // registered if registering took longer, never
     // five seconds after registering. Journal stamps are whole seconds and
     // the resume itself takes a moment, hence the two seconds of room.
     let (waited, parking) = (resumed - started, suspended - started);
@@ -40,11 +38,9 @@ async fn a_formatted_line_survives_a_timer_park() -> anyhow::Result<()> {
         "a 5 second Wait resumed {waited}s after it started, {parking}s of it parking; the registration trip must not add to it"
     );
 
-    // The listener the first run placed its timer on is kept for a while
-    // after its last signal, so this run registers without starting one.
     // Well under a second on a quiet machine; the room is for the whole
-    // suite running at once, where a warm registration still takes a few
-    // seconds and a cold one (a listener pod starting) takes far longer.
+    // suite running at once, where a registration still takes a few
+    // seconds.
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     let (started, suspended, _) = hold_stamps(&settled)?;

@@ -5,8 +5,8 @@
 //! manifest maps every covered path to the sha256 of its bytes, so
 //! identical code is one row however often it is run, and a version
 //! points at the version it was edited from (`parent_id`; a tree root
-//! has none). A **run** is one color under a version, with the run it
-//! was seeded from (`seed_color`), the stale set of that seed edge, and
+//! has none). A **run** is one execution under a version, with the run it
+//! was seeded from (`seed_execution_id`), the stale set of that seed edge, and
 //! the spec it ran. The files themselves live in the project's asset
 //! plane, published through `weft_assets::publish_files` under
 //! `asset/<project>/<sha>`: a blob identical to one any earlier version
@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use weft_core::run_spec::RunSpec;
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 /// Postgres SQLSTATE for a foreign key violation.
 const FOREIGN_KEY_VIOLATION: &str = "23503";
@@ -76,7 +76,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             PRIMARY KEY (project_id, id)
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_version_parent ON project_version(project_id, parent_id)",
-        // version_run: one row per color started on a version. `spec`
+        // version_run: one row per execution started on a version. `spec`
         // is the run spec as resolved (NULL for a plain whole-graph run
         // or a real event's run); `example` names its saved example,
         // if any. Removed by `weft clean` through
@@ -84,10 +84,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // store's; the journal owns the journal) and with its version
         // by prune's cascade.
         r#"CREATE TABLE IF NOT EXISTS version_run (
-            color            UUID PRIMARY KEY,
+            execution_id            UUID PRIMARY KEY,
             project_id       UUID NOT NULL,
             version_id       TEXT NOT NULL,
-            seed_color       UUID,
+            seed_execution_id       UUID,
             stale            TEXT[] NOT NULL DEFAULT '{}',
             spec             JSONB,
             definition_hash  TEXT NOT NULL,
@@ -141,8 +141,8 @@ pub struct VersionMissing {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// One recorded run.
 ///
-/// `seed_color`, `stale`, `definition_hash` and `created_at` are also
-/// on that color's birth row in the journal. That is deliberate, not
+/// `seed_execution_id`, `stale`, `definition_hash` and `created_at` are also
+/// on that execution's birth row in the journal. That is deliberate, not
 /// drift: they are written once, in the same handler, from the same
 /// values, and are never updated afterwards, and they exist here so
 /// `weft tree` can draw the whole tree without opening one journal per
@@ -151,10 +151,10 @@ pub struct VersionMissing {
 /// copy. If a reader ever needs to DECIDE something from them, read the
 /// journal instead.
 pub struct RunRow {
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub project_id: uuid::Uuid,
     pub version_id: String,
-    pub seed_color: Option<Color>,
+    pub seed_execution_id: Option<ExecutionId>,
     pub stale: Vec<String>,
     pub spec: Option<RunSpec>,
     pub definition_hash: String,
@@ -168,7 +168,7 @@ pub struct RunRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Head {
     pub head_version: Option<String>,
-    pub head_run: Option<Color>,
+    pub head_run: Option<ExecutionId>,
     /// Every version some activation's listeners run (one per trigger
     /// and owner at most, deduplicated, sorted). Empty while nothing
     /// listens.
@@ -202,13 +202,13 @@ pub trait VersionStoreOps: Send + Sync {
     /// Once the project row is gone, drop every tree row no surviving run
     /// needs, and answer how many went.
     ///
-    /// `known` is the set of colors the JOURNAL still holds for this
+    /// `known` is the set of executions the JOURNAL still holds for this
     /// project. A run row outside it is a row nothing can ever read: the
     /// journal never had it (a start that failed between recording the run
     /// and journaling it) or no longer does. Those go first, because
     /// nothing else can reach them once the project row is gone: `weft rm`
     /// refuses a project it cannot find, and `weft clean` enumerates
-    /// journal colors, so such a row used to pin its version for ever and
+    /// journal executions, so such a row used to pin its version for ever and
     /// the sweep reported the project every hour while dropping nothing.
     ///
     /// A version is then kept when a surviving run is recorded under it OR
@@ -222,7 +222,7 @@ pub trait VersionStoreOps: Send + Sync {
     /// more are of no use to anybody. Refuses to do anything while the
     /// project still exists, so a live project's tree can never be
     /// swept by this path.
-    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[Color]) -> anyhow::Result<u64>;
+    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[ExecutionId]) -> anyhow::Result<u64>;
 
     /// Every project id that still has tree rows while the project itself
     /// is gone. What the reaper sweeps; see
@@ -231,13 +231,13 @@ pub trait VersionStoreOps: Send + Sync {
     async fn projects_with_orphan_versions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
 
     async fn insert_run(&self, run: &RunRow) -> anyhow::Result<()>;
-    async fn run(&self, color: Color) -> anyhow::Result<Option<RunRow>>;
+    async fn run(&self, execution_id: ExecutionId) -> anyhow::Result<Option<RunRow>>;
     /// Every run of the project, in the order they were recorded.
     async fn runs(&self, project: uuid::Uuid) -> anyhow::Result<Vec<RunRow>>;
     /// Set or clear the saved example associated with one recorded run.
     async fn set_run_example(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         example: Option<&str>,
     ) -> anyhow::Result<()>;
 
@@ -251,15 +251,15 @@ pub trait VersionStoreOps: Send + Sync {
     /// test of `weft clean` and of prune ran against a world where the run
     /// row outlived its journal and head still pointed at a deleted run,
     /// while production deleted both.
-    async fn delete_run(&self, color: Color) -> anyhow::Result<()>;
+    async fn delete_run(&self, execution_id: ExecutionId) -> anyhow::Result<()>;
 
     /// Move head, but only if it is still where `expected` says.
     ///
     /// Every caller decided WHERE to move head by first reading it (a
     /// checkpoint parents its version on head, a run seeds from head's
-    /// run), so a blind write is a lost update: two Pods reading head A
+    /// run), so a blind write is a lost update: two processes reading head A
     /// both parent on A and the second overwrites the first, and that
-    /// run's version and color vanish from the lineage the next seeded
+    /// run's version and execution vanish from the lineage the next seeded
     /// run walks. Answers false when head moved underneath.
     ///
     /// What the handler does with a false is its own call: `checkpoint`
@@ -273,7 +273,7 @@ pub trait VersionStoreOps: Send + Sync {
         project: uuid::Uuid,
         expected: &Head,
         version: Option<&str>,
-        run: Option<Color>,
+        run: Option<ExecutionId>,
     ) -> anyhow::Result<bool>;
 }
 
@@ -305,12 +305,12 @@ async fn source_versions_in_use(
         "SELECT source_version FROM signal WHERE project_id = $1 \
          UNION SELECT e.payload_json::jsonb ->> 'source_version' FROM exec_event e \
          WHERE e.kind = 'execution_started' AND e.payload_json::jsonb ->> 'project_id' = $1::text \
-           AND (EXISTS (SELECT 1 FROM trigger_setup s WHERE s.color = e.color) \
-             OR NOT EXISTS (SELECT 1 FROM exec_event t WHERE t.color = e.color \
+           AND (EXISTS (SELECT 1 FROM trigger_setup s WHERE s.execution_id = e.execution_id) \
+             OR NOT EXISTS (SELECT 1 FROM exec_event t WHERE t.execution_id = e.execution_id \
                  AND t.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled')) \
              OR (e.payload_json::jsonb ->> 'phase' = 'fire' \
-                 AND EXISTS (SELECT 1 FROM execution_color ec WHERE ec.color = e.color AND ec.kind = 'execution') \
-                 AND NOT EXISTS (SELECT 1 FROM version_run r WHERE r.color::text = e.color))) \
+                 AND EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = e.execution_id AND ec.kind = 'execution') \
+                 AND NOT EXISTS (SELECT 1 FROM version_run r WHERE r.execution_id::text = e.execution_id))) \
          UNION SELECT bake_json::jsonb ->> 'source_version' FROM trigger_bake WHERE project_id = $1 AND $2"
     ).bind(project).bind(include_bakes).fetch_all(conn).await?;
     Ok(versions.into_iter().flatten().collect())
@@ -340,12 +340,12 @@ fn version_from(row: VersionTuple) -> anyhow::Result<VersionRow> {
 }
 
 fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
-    let (color, project_id, version_id, seed_color, stale, spec, definition_hash, example, created_at) = row;
+    let (execution_id, project_id, version_id, seed_execution_id, stale, spec, definition_hash, example, created_at) = row;
     Ok(RunRow {
-        color,
+        execution_id,
         project_id,
         version_id,
-        seed_color,
+        seed_execution_id,
         stale,
         spec: spec.map(serde_json::from_value).transpose()?,
         definition_hash,
@@ -356,7 +356,7 @@ fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
 
 const VERSION_COLUMNS: &str = "id, project_id, parent_id, manifest, label, created_at";
 const RUN_COLUMNS: &str =
-    "color, project_id, version_id, seed_color, stale, spec, definition_hash, example, created_at";
+    "execution_id, project_id, version_id, seed_execution_id, stale, spec, definition_hash, example, created_at";
 
 #[async_trait]
 impl VersionStoreOps for PostgresVersionStore {
@@ -449,7 +449,7 @@ impl VersionStoreOps for PostgresVersionStore {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[Color]) -> anyhow::Result<u64> {
+    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[ExecutionId]) -> anyhow::Result<u64> {
         // Nothing at all while the project row is there. Checked in the
         // same statement as each DELETE, so a project registered again in
         // between cannot lose its history.
@@ -463,7 +463,7 @@ impl VersionStoreOps for PostgresVersionStore {
         let runs = sqlx::query(
             "DELETE FROM version_run vr \
              WHERE vr.project_id = $1 \
-               AND NOT (vr.color = ANY($2)) \
+               AND NOT (vr.execution_id = ANY($2)) \
                AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = $1)",
         )
         .bind(project)
@@ -503,10 +503,10 @@ impl VersionStoreOps for PostgresVersionStore {
         sqlx::query(&format!(
             "INSERT INTO version_run ({RUN_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         ))
-        .bind(run.color)
+        .bind(run.execution_id)
         .bind(run.project_id)
         .bind(&run.version_id)
-        .bind(run.seed_color)
+        .bind(run.seed_execution_id)
         .bind(&run.stale)
         .bind(run.spec.as_ref().map(serde_json::to_value).transpose()?)
         .bind(&run.definition_hash)
@@ -525,10 +525,10 @@ impl VersionStoreOps for PostgresVersionStore {
         Ok(())
     }
 
-    async fn run(&self, color: Color) -> anyhow::Result<Option<RunRow>> {
+    async fn run(&self, execution_id: ExecutionId) -> anyhow::Result<Option<RunRow>> {
         let row: Option<RunTuple> =
-            sqlx::query_as(&format!("SELECT {RUN_COLUMNS} FROM version_run WHERE color = $1"))
-                .bind(color)
+            sqlx::query_as(&format!("SELECT {RUN_COLUMNS} FROM version_run WHERE execution_id = $1"))
+                .bind(execution_id)
                 .fetch_optional(&self.pool)
                 .await?;
         row.map(run_from).transpose()
@@ -544,13 +544,13 @@ impl VersionStoreOps for PostgresVersionStore {
         rows.into_iter().map(run_from).collect()
     }
 
-    async fn delete_run(&self, color: Color) -> anyhow::Result<()> {
+    async fn delete_run(&self, execution_id: ExecutionId) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM version_run WHERE color = $1").bind(color).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM version_run WHERE execution_id = $1").bind(execution_id).execute(&mut *tx).await?;
         // A project whose head pointed at this run keeps its version and
         // loses the run pointer, so the next `--seed` walks the tree.
         sqlx::query("UPDATE project SET head_run = NULL WHERE head_run = $1")
-            .bind(color)
+            .bind(execution_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -559,17 +559,17 @@ impl VersionStoreOps for PostgresVersionStore {
 
     async fn set_run_example(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         example: Option<&str>,
     ) -> anyhow::Result<()> {
         let rows = sqlx::query(
-            "UPDATE version_run SET example = $2 WHERE color = $1",
+            "UPDATE version_run SET example = $2 WHERE execution_id = $1",
         )
-        .bind(color)
+        .bind(execution_id)
         .bind(example)
         .execute(&self.pool)
         .await?;
-        anyhow::ensure!(rows.rows_affected() == 1, "run {color} is not recorded in the version tree");
+        anyhow::ensure!(rows.rows_affected() == 1, "run {execution_id} is not recorded in the version tree");
         Ok(())
     }
 
@@ -594,10 +594,10 @@ impl VersionStoreOps for PostgresVersionStore {
         project: uuid::Uuid,
         expected: &Head,
         version: Option<&str>,
-        run: Option<Color>,
+        run: Option<ExecutionId>,
     ) -> anyhow::Result<bool> {
         // One statement, so the check and the write cannot be split by
-        // a sibling Pod. `IS NOT DISTINCT FROM` because both columns
+        // a sibling process. `IS NOT DISTINCT FROM` because both columns
         // are nullable and NULL = NULL is not true in SQL.
         let rows = sqlx::query(
             "UPDATE project SET head_version = $2, head_run = $3 \
@@ -633,7 +633,7 @@ impl VersionStoreOps for PostgresVersionStore {
 
 /// In-memory store for layer-3 tests: plain maps, no logic.
 ///
-/// It refuses exactly what the schema refuses (a duplicate color, a run
+/// It refuses exactly what the schema refuses (a duplicate execution, a run
 /// under a version that does not exist, a head on an unknown project),
 /// because a fake looser than its constraints is how a violation
 /// reaches production with the tests green.
@@ -789,7 +789,7 @@ impl VersionStoreOps for FakeVersionStore {
         Ok(ids)
     }
 
-    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[Color]) -> anyhow::Result<u64> {
+    async fn retire_unused_versions(&self, project: uuid::Uuid, known: &[ExecutionId]) -> anyhow::Result<u64> {
         // Nothing at all while the project row is there, which is what
         // Postgres's `NOT EXISTS (SELECT 1 FROM project ...)` says.
         if self.projects.lock().unwrap().contains(&project) {
@@ -799,7 +799,7 @@ impl VersionStoreOps for FakeVersionStore {
         let mut versions = self.versions.lock().unwrap();
         let before = runs.len() + versions.len();
         // The run rows the journal has never heard of.
-        runs.retain(|r| r.project_id != project || known.contains(&r.color));
+        runs.retain(|r| r.project_id != project || known.contains(&r.execution_id));
         // Then every version a surviving run needs, closed up the lineage
         // so a survivor's parent is never deleted out from under it.
         let mut kept: BTreeSet<String> = runs
@@ -827,7 +827,7 @@ impl VersionStoreOps for FakeVersionStore {
         // The primary key and the composite foreign key, as Postgres
         // enforces them.
         let mut runs = self.runs.lock().unwrap();
-        anyhow::ensure!(!runs.iter().any(|r| r.color == run.color), "run {} is already recorded", run.color);
+        anyhow::ensure!(!runs.iter().any(|r| r.execution_id == run.execution_id), "run {} is already recorded", run.execution_id);
         let known = self
             .versions
             .lock()
@@ -841,18 +841,18 @@ impl VersionStoreOps for FakeVersionStore {
         Ok(())
     }
 
-    async fn delete_run(&self, color: Color) -> anyhow::Result<()> {
-        self.runs.lock().unwrap().retain(|r| r.color != color);
+    async fn delete_run(&self, execution_id: ExecutionId) -> anyhow::Result<()> {
+        self.runs.lock().unwrap().retain(|r| r.execution_id != execution_id);
         for head in self.heads.lock().unwrap().values_mut() {
-            if head.head_run == Some(color) {
+            if head.head_run == Some(execution_id) {
                 head.head_run = None;
             }
         }
         Ok(())
     }
 
-    async fn run(&self, color: Color) -> anyhow::Result<Option<RunRow>> {
-        Ok(self.runs.lock().unwrap().iter().find(|r| r.color == color).cloned())
+    async fn run(&self, execution_id: ExecutionId) -> anyhow::Result<Option<RunRow>> {
+        Ok(self.runs.lock().unwrap().iter().find(|r| r.execution_id == execution_id).cloned())
     }
 
     async fn runs(&self, project: uuid::Uuid) -> anyhow::Result<Vec<RunRow>> {
@@ -861,14 +861,14 @@ impl VersionStoreOps for FakeVersionStore {
 
     async fn set_run_example(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         example: Option<&str>,
     ) -> anyhow::Result<()> {
         let mut runs = self.runs.lock().unwrap();
         let row = runs
             .iter_mut()
-            .find(|r| r.color == color)
-            .ok_or_else(|| anyhow::anyhow!("run {color} is not recorded in the version tree"))?;
+            .find(|r| r.execution_id == execution_id)
+            .ok_or_else(|| anyhow::anyhow!("run {execution_id} is not recorded in the version tree"))?;
         row.example = example.map(str::to_string);
         Ok(())
     }
@@ -883,7 +883,7 @@ impl VersionStoreOps for FakeVersionStore {
         project: uuid::Uuid,
         expected: &Head,
         version: Option<&str>,
-        run: Option<Color>,
+        run: Option<ExecutionId>,
     ) -> anyhow::Result<bool> {
         self.require_project(project)?;
         let mut heads = self.heads.lock().unwrap();
@@ -905,24 +905,24 @@ impl VersionStoreOps for FakeVersionStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedChoice {
     /// Inherit from this run.
-    Run(Color),
+    Run(ExecutionId),
     /// Nothing to inherit: no head, `--root`, or no settled run
     /// anywhere on head's ancestry.
     Nothing,
     /// Head's run is still running; nothing is cancelled on the user's
-    /// behalf. The message names `weft stop <color>`.
-    HeadRunning(Color),
+    /// behalf. The message names `weft stop <execution_id>`.
+    HeadRunning(ExecutionId),
 }
 
 /// Pick the seed: head's run, or when head has no run the newest
 /// settled run on head's version or its nearest ancestor with one.
-/// `settled` answers whether a color is terminal or suspended (a
+/// `settled` answers whether an execution is terminal or suspended (a
 /// running run is never a seed).
 pub fn resolve_seed(
     head: &Head,
     versions: &[VersionRow],
     runs: &[RunRow],
-    settled: impl Fn(Color) -> bool,
+    settled: impl Fn(ExecutionId) -> bool,
 ) -> SeedChoice {
     if let Some(run) = head.head_run {
         return if settled(run) { SeedChoice::Run(run) } else { SeedChoice::HeadRunning(run) };
@@ -941,9 +941,9 @@ pub fn resolve_seed(
             .iter()
             .filter(|r| r.version_id == version)
             .rev()
-            .find(|r| settled(r.color));
+            .find(|r| settled(r.execution_id));
         if let Some(run) = newest_settled {
-            return SeedChoice::Run(run.color);
+            return SeedChoice::Run(run.execution_id);
         }
         match by_id.get(version.as_str()).and_then(|v| v.parent_id.clone()) {
             Some(parent) => version = parent,
@@ -1022,7 +1022,7 @@ pub struct PruneRefusal {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrunePlan {
     pub versions: Vec<String>,
-    pub runs: Vec<Color>,
+    pub runs: Vec<ExecutionId>,
     /// `sha256` of every blob only the pruned versions held.
     pub blobs: Vec<String>,
 }
@@ -1031,7 +1031,7 @@ pub struct PrunePlan {
 /// version that is or is an ancestor of a frozen example's origin
 /// (unfreeze the example first), or a subtree with a run still in
 /// flight (stop or wait). `frozen_from` is every `frozen_from.version`
-/// in the project's examples; `in_flight` says whether a color is
+/// in the project's examples; `in_flight` says whether an execution is
 /// neither terminal nor suspended.
 pub fn plan_prune(
     root: &str,
@@ -1039,7 +1039,7 @@ pub fn plan_prune(
     runs: &[RunRow],
     head: &Head,
     frozen_from: &[String],
-    in_flight: impl Fn(Color) -> bool,
+    in_flight: impl Fn(ExecutionId) -> bool,
 ) -> Result<PrunePlan, PruneRefusal> {
     let mut reasons = Vec::new();
     if !versions.iter().any(|v| v.id == root) {
@@ -1066,8 +1066,8 @@ pub fn plan_prune(
     }
     let doomed_runs: Vec<&RunRow> = runs.iter().filter(|r| doomed.contains(&r.version_id)).collect();
     for run in &doomed_runs {
-        if in_flight(run.color) {
-            reasons.push(format!("run {} is still running; `weft stop {}` or wait", run.color, run.color));
+        if in_flight(run.execution_id) {
+            reasons.push(format!("run {} is still running; `weft stop {}` or wait", run.execution_id, run.execution_id));
         }
     }
     if !reasons.is_empty() {
@@ -1088,7 +1088,7 @@ pub fn plan_prune(
     }
     Ok(PrunePlan {
         versions: doomed,
-        runs: doomed_runs.iter().map(|r| r.color).collect(),
+        runs: doomed_runs.iter().map(|r| r.execution_id).collect(),
         blobs: blobs.into_iter().collect(),
     })
 }
@@ -1111,8 +1111,8 @@ pub fn sweepable_versions(versions: &[VersionRow], runs: &[RunRow], head: &Head)
 mod tests {
     use super::*;
 
-    fn color(n: u8) -> Color {
-        Color::from_bytes([n; 16])
+    fn execution_id(n: u8) -> ExecutionId {
+        ExecutionId::from_bytes([n; 16])
     }
 
     fn version(id: &str, parent: Option<&str>, files: &[(&str, &str)], at: u64) -> VersionRow {
@@ -1128,10 +1128,10 @@ mod tests {
 
     fn run(n: u8, version: &str, at: u64) -> RunRow {
         RunRow {
-            color: color(n),
+            execution_id: execution_id(n),
             project_id: uuid::Uuid::nil(),
             version_id: version.into(),
-            seed_color: None,
+            seed_execution_id: None,
             stale: vec![],
             spec: None,
             definition_hash: "d".into(),
@@ -1152,9 +1152,9 @@ mod tests {
 
     #[test]
     fn the_seed_is_heads_run_when_settled_and_a_refusal_when_running() {
-        let head = Head { head_version: Some("v1".into()), head_run: Some(color(1)), activated_versions: vec![] };
-        assert_eq!(resolve_seed(&head, &[], &[], |_| true), SeedChoice::Run(color(1)));
-        assert_eq!(resolve_seed(&head, &[], &[], |_| false), SeedChoice::HeadRunning(color(1)));
+        let head = Head { head_version: Some("v1".into()), head_run: Some(execution_id(1)), activated_versions: vec![] };
+        assert_eq!(resolve_seed(&head, &[], &[], |_| true), SeedChoice::Run(execution_id(1)));
+        assert_eq!(resolve_seed(&head, &[], &[], |_| false), SeedChoice::HeadRunning(execution_id(1)));
     }
 
     #[test]
@@ -1162,9 +1162,9 @@ mod tests {
         let versions = vec![version("v1", None, &[], 1), version("v2", Some("v1"), &[], 2), version("v3", Some("v2"), &[], 3)];
         let runs = vec![run(1, "v1", 1), run(2, "v1", 2), run(3, "v2", 3)];
         let head = Head { head_version: Some("v3".into()), head_run: None, activated_versions: vec![] };
-        assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Run(color(3)));
+        assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Run(execution_id(3)));
         // v2's run still running: skip to v1's newest settled.
-        assert_eq!(resolve_seed(&head, &versions, &runs, |c| c != color(3)), SeedChoice::Run(color(2)));
+        assert_eq!(resolve_seed(&head, &versions, &runs, |c| c != execution_id(3)), SeedChoice::Run(execution_id(2)));
         let head = Head { head_version: None, head_run: None, activated_versions: vec![] };
         assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Nothing);
     }
@@ -1205,7 +1205,7 @@ mod tests {
         let away = Head { head_version: Some("side".into()), head_run: None, activated_versions: vec![] };
         let err = plan_prune("v2", &tree(), &runs, &away, &["v3".into()], |_| false).unwrap_err();
         assert!(err.reasons[0].contains("frozen example"), "{:?}", err);
-        let err = plan_prune("v2", &tree(), &runs, &away, &[], |c| c == color(2)).unwrap_err();
+        let err = plan_prune("v2", &tree(), &runs, &away, &[], |c| c == execution_id(2)).unwrap_err();
         assert!(err.reasons[0].contains("weft stop"), "{:?}", err);
         assert!(plan_prune("nope", &tree(), &runs, &away, &[], |_| false).is_err());
     }
@@ -1227,7 +1227,7 @@ mod tests {
         let away = Head { head_version: Some("side".into()), head_run: None, activated_versions: vec![] };
         let plan = plan_prune("v2", &tree(), &runs, &away, &[], |_| false).unwrap();
         assert_eq!(plan.versions, vec!["v2", "v3"]);
-        assert_eq!(plan.runs, vec![color(1), color(2)]);
+        assert_eq!(plan.runs, vec![execution_id(1), execution_id(2)]);
         assert_eq!(plan.blobs, vec!["2", "3"], "blob 1 survives on root and side");
     }
 
@@ -1294,7 +1294,7 @@ mod tests {
 
         // Nothing is pruned while the project is still registered: a
         // version with no run is still a version you can go back to.
-        assert_eq!(store.retire_unused_versions(project, &[color(1)]).await.unwrap(), 0);
+        assert_eq!(store.retire_unused_versions(project, &[execution_id(1)]).await.unwrap(), 0);
         assert_eq!(store.versions(project).await.unwrap().len(), 2);
 
         store.remove_project(project);
@@ -1311,7 +1311,7 @@ mod tests {
     /// The first is what a start that failed between recording the run and
     /// journaling it leaves. Nothing else can reach such a row once the
     /// project is gone (`weft rm` refuses a project it cannot find, `weft
-    /// clean` enumerates journal colors), so it used to pin its version for
+    /// clean` enumerates journal executions), so it used to pin its version for
     /// ever. The second is `parent_id`, which carries no foreign key:
     /// deleting a run-less ancestor would leave the survivor parented on a
     /// row that is gone, and nothing would reject it.
@@ -1335,12 +1335,12 @@ mod tests {
         store.insert_run(&run(2, "stillborn", 6)).await.unwrap();
 
         store.forget_project_row(project);
-        // The journal knows only the first color.
-        let dropped = store.retire_unused_versions(project, &[color(1)]).await.unwrap();
+        // The journal knows only the first execution.
+        let dropped = store.retire_unused_versions(project, &[execution_id(1)]).await.unwrap();
         assert_eq!(dropped, 2, "the unknown run row and its now-bare version");
         let left: Vec<String> = store.versions(project).await.unwrap().into_iter().map(|v| v.id).collect();
         assert_eq!(left, vec!["root", "middle", "leaf"], "the survivor's ancestors stay");
-        let runs: Vec<Color> = store.runs(project).await.unwrap().into_iter().map(|r| r.color).collect();
-        assert_eq!(runs, vec![color(1)]);
+        let runs: Vec<ExecutionId> = store.runs(project).await.unwrap().into_iter().map(|r| r.execution_id).collect();
+        assert_eq!(runs, vec![execution_id(1)]);
     }
 }

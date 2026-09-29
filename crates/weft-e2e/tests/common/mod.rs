@@ -1,8 +1,10 @@
-//! Shared scaffolding for the lifecycle-transition e2e suites
-//! (`lifecycle_transitions.rs`, `multi_worker.rs`): the `lifecycle`
-//! fixture's graph shapes, the HoldGate release protocol, and the
-//! drive/observe helpers built on them. One definition, used by every
-//! test binary that evolves a `lifecycle` project through verbs.
+//! Shared scaffolding for the e2e suites that drive a project through
+//! verbs and read what the CLI printed: the `lifecycle` fixture's graph
+//! shapes, the HoldGate release protocol, the drive/observe helpers built
+//! on them (`lifecycle_transitions.rs`, `version_tree_edges.rs`), and the
+//! readers of a `weft run`'s output (an execution id, a summary, the
+//! warnings, the version tree) that the run, include and version-tree
+//! suites share. One definition, used by every test binary that needs it.
 //!
 //! Rust compiles each integration-test file as its own binary, so not
 //! every binary uses every item; the allow keeps that from spraying
@@ -58,7 +60,7 @@ pub fn graph_infra_hold(release_url: &str) -> String {
 /// execution that holds until released.
 pub fn graph_trigger_hold(sse_url: &str, event_name: &str, release_url: &str) -> String {
     format!(
-        "start = TestSseTrigger {{\n\
+        "start = TestSseTrigger -> (value: String) {{\n\
          \x20 url: \"{sse_url}\"\n\
          \x20 event_name: \"{event_name}\"\n\
          }}\n\
@@ -134,8 +136,8 @@ pub const INFRA_GATE: &str = "infra not running for";
 /// The current status string of one execution (`running` /
 /// `waiting_for_input` / `completed` / `cancelled` / `failed`), read live
 /// (no settle wait).
-pub async fn exec_status(disp: &Dispatcher, color: Uuid) -> anyhow::Result<String> {
-    let v: Value = disp.get_json(&format!("/executions/{color}")).await?;
+pub async fn exec_status(disp: &Dispatcher, execution_id: Uuid) -> anyhow::Result<String> {
+    let v: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
     Ok(v.get("status").and_then(Value::as_str).unwrap_or("").to_string())
 }
 
@@ -144,7 +146,7 @@ pub async fn exec_status(disp: &Dispatcher, color: Uuid) -> anyhow::Result<Strin
 /// The push happens after `wait_for_subscriber` confirms a connection is reading,
 /// so a single push is delivered (not lost on a stale reader). We then wait the
 /// FULL worker-settle deadline for the execution to appear, because a trigger fire
-/// cold-starts a worker pod (spawn + image pull + fold + run) and is legitimately
+/// cold-starts a worker (spawn + image pull + fold + run) and is legitimately
 /// slow. We do NOT re-push on a short timeout: pushing again while the first push's
 /// execution is still cold-starting would start a SECOND execution and make the
 /// "exactly one new execution" contract fail. A second push is attempted ONLY after
@@ -165,7 +167,7 @@ pub async fn fire_until_execution(
         // here, so a timeout is real evidence the push was dropped, not just a slow
         // cold start.
         match run::wait_for_triggered_execution(disp, pid, before, run::RUN_SETTLE_DEADLINE).await {
-            Ok(color) => return Ok(color),
+            Ok(execution_id) => return Ok(execution_id),
             Err(e) => last_err = Some(e),
         }
     }
@@ -178,20 +180,20 @@ pub async fn fire_until_execution(
 // verbatim copy in two test files, which is how two readers of one
 // output format stop agreeing.
 
-/// The execution color returned by run or bake.
-pub fn color_of(stdout: &str) -> anyhow::Result<Uuid> {
+/// The execution returned by run or bake.
+pub fn execution_id_of(stdout: &str) -> anyhow::Result<Uuid> {
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        let color = if v.get("verb").and_then(Value::as_str) == Some("bake") {
-            v.pointer("/detail/result/color")
+        let execution_id = if v.get("verb").and_then(Value::as_str) == Some("bake") {
+            v.pointer("/detail/result/execution_id")
         } else {
-            v.pointer("/detail/color")
+            v.pointer("/detail/execution_id")
         };
-        if let Some(c) = color.and_then(Value::as_str) {
+        if let Some(c) = execution_id.and_then(Value::as_str) {
             return Ok(c.parse()?);
         }
     }
-    anyhow::bail!("no execution color in command output:\n{stdout}")
+    anyhow::bail!("no execution in command output:\n{stdout}")
 }
 
 /// The one-line summary on the terminal event.

@@ -30,7 +30,13 @@ pub trait SignedClaims: Serialize + DeserializeOwned {
     fn exp(&self) -> i64;
 }
 
-/// Mint a signed token for `claims`. `secret` is the cluster signing key.
+/// Whether two secrets are equal, in time that depends only on their
+/// lengths, so a comparison leaks nothing about where they differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Mint a signed token for `claims`. `secret` is the install's signing key.
 pub fn mint<C: SignedClaims>(secret: &[u8], claims: &C) -> String {
     let payload = B64.encode(serde_json::to_vec(claims).expect("claims serialize"));
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
@@ -42,7 +48,7 @@ pub fn mint<C: SignedClaims>(secret: &[u8], claims: &C) -> String {
 /// Validate a signed token and return its claims. Rejects on format,
 /// signature, and expiry. `noun` names the artifact in the (caller-safe,
 /// secret-free) error strings, e.g. `"routing token"` -> "malformed routing
-/// token". Any extra policy (pod pinning, resource binding) is the caller's
+/// token". Any extra policy (project binding, resource binding) is the caller's
 /// to apply on top of the returned claims.
 pub fn validate<C: SignedClaims>(
     secret: &[u8],

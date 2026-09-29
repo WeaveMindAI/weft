@@ -196,6 +196,8 @@
   // owns include navigation sends it; a host without one has only entry
   // files, which is what the default says.
   let interactive = $state(true);
+  /// The installs the project can be shown on (the switch, top right).
+  let installView = $state<import('../protocol').InstallView | undefined>(undefined);
   // The raw source text of the CURRENTLY ACTIVE file (the entry file at depth 0,
   // or the included sub-file after navigation). Set from every `parseResult`'s
   // `source`, so it tracks include navigation. Exposed on `EditorContext` for
@@ -304,7 +306,7 @@
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
   let followMode = $state<FollowMode>('following');
-  let followColor = $state<string | undefined>(undefined);
+  let followExecutionId = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
   /// Why the followed run cannot be painted whole, when it cannot: the
   /// code it ran is no longer recorded, so the rows are all there and
@@ -377,6 +379,10 @@
         // An external change landed on the watched doc: slide the editor's
         // auto-lock forward (source-mutating graph gestures pause for 1s).
         editorRef?.setCodeEditTouched?.();
+        return;
+      }
+      if (msg.kind === 'installView') {
+        installView = msg.view;
         return;
       }
       if (msg.kind === 'setGraphLogicLock') {
@@ -473,7 +479,7 @@
         return;
       }
       if (msg.kind === 'execVersion') {
-        if (followColor && msg.color !== followColor) return;
+        if (followExecutionId && msg.executionId !== followExecutionId) return;
         // Both null means there is no followed run here any more (the
         // graph moved to another project), so the banner goes rather
         // than reading as "this run matches disk".
@@ -612,7 +618,7 @@
               error: e.error,
               costUsd: 0,
               logs: [],
-              color: '',
+              executionId: '',
               frames: e.frames,
               framesKey,
               input: e.input,
@@ -780,7 +786,7 @@
       }
       if (msg.kind === 'followStatus') {
         followMode = msg.status.mode;
-        followColor = msg.status.color;
+        followExecutionId = msg.status.executionId;
         followPendingCount = msg.status.pendingCount;
         return;
       }
@@ -931,7 +937,7 @@
   }
   // Stop is generic now: the host inspects the bar's current
   // state and either kills the spawned CLI process group
-  // (cli_running) or POSTs /executions/{color}/cancel
+  // (cli_running) or POSTs /executions/{executionId}/cancel
   // (execution_running). One verb, state-aware behavior.
   function onStop() { send({ kind: 'stopAction' }); }
   function onDismissError() { send({ kind: 'dismissError' }); }
@@ -1093,7 +1099,7 @@
         <div class="relative min-w-0 flex-1">
           <GraphToolbar
             mode={followMode}
-            color={followColor}
+            executionId={followExecutionId}
             pendingCount={followPendingCount}
             notPainted={runNotPainted}
             onSetMode={(mode) => send({ kind: 'followSetMode', mode })}
@@ -1174,6 +1180,8 @@
       {callPath}
       {interactive}
       {fileContents}
+      {installView}
+      onSwitchInstall={(install) => send({ kind: 'switchInstall', install })}
       {autoOrganizeOnMount}
       {onRun}
       {specs}

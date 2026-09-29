@@ -4,9 +4,9 @@
 #
 # By default, runs the install pipeline for the everyday loop:
 #   - CLI                  (cargo build, symlink into ~/.local/bin)
-#   - Daemon               (rebuild dispatcher/listener images and
-#                          restart the kind pod if it's running;
-#                          if it's not, start it fresh)
+#   - Daemon               (bring the local install up, or refresh it:
+#                          Postgres, the object store, and weft's
+#                          runtime restarted on the new binary)
 #   - VS Code extension    (compile, package .vsix, install into VS Code)
 #
 # The browser extension is OPT-IN via `--browser` since rebuilding
@@ -14,9 +14,9 @@
 # most rebuild loops need.
 #
 # Prebuilt artifacts: on a CLEAN checkout of a commit CI has already
-# built (the rolling `latest` release), the CLI binary and the
-# .vsix are downloaded instead of compiled and the daemon images are
-# pulled from the registry, so a fresh install needs no Rust or Node
+# built (the rolling `latest` release), the CLI and runtime binaries
+# and the .vsix are downloaded instead of compiled and the shared
+# images are pulled from the registry, so a fresh install needs no Rust or Node
 # toolchain and takes minutes, not tens of minutes. Any local change
 # at all, tracked or not, takes the build path for everything (the
 # published artifacts are keyed to one exact commit).
@@ -28,22 +28,20 @@
 #     never touched),
 #   - a --cli install (the default includes it) bounds the two local
 #     build caches: the BuildKit cache to 20GB (LRU) and the workspace
-#     target/ (WEFT_TARGET_CAP_GB, default 40G; under the cap the
+#     target/ (WEFT_TARGET_CAP_GB, default 15G; under the cap the
 #     incremental cache is untouched),
 #   - after the daemon refresh, `weft clean --images --all` reclaims
 #     every weft image nothing runs any more (unreferenced worker
-#     images, stale weft-infra-* tags, old builder bases, on host
-#     docker and the kind node, and the worker compile cache this
-#     checkout used before the update, every lane of it). KEEP set = the dispatcher's
-#     referenced set (running projects' worker hashes, live pods',
-#     live tasks', every project's infra image tags, every live infra
-#     unit's recorded refs), so a running project's current worker
-#     image and a live project's infra images survive the update
-#     untouched; the user resyncs a project when they want it on the
-#     new engine, and that project's old image goes on a LATER
-#     install's reclaim once nothing points at it. Stale
-#     dispatcher/listener/broker/supervisor images are reclaimed by
-#     the daemon refresh itself.
+#     images, stale weft-infra-* tags, old builder bases and
+#     runtimes, and the worker compile cache this checkout used before
+#     the update, every lane of it). KEEP set = the dispatcher's
+#     referenced set (running projects' worker hashes, live tasks',
+#     every project's infra image tags, every live infra unit's
+#     recorded refs), so a running project's current worker image and
+#     a live project's infra images survive the update untouched; the
+#     user resyncs a project when they want it on the new engine, and
+#     that project's old image goes on a LATER install's reclaim once
+#     nothing points at it.
 #
 # Component flags pick a subset (multiple combine):
 #   --cli         build CLI only
@@ -83,11 +81,11 @@
 #   install starts a fresh one.
 #
 # Public trigger surface (event triggers delivered BY providers):
-#   --public-url    expose the public trigger surface (/events/...,
-#                   /signal/..., the file relay, the OAuth callback) to
-#                   the internet through an outbound tunnel onto an
-#                   allowlisting door, so provider event pushes reach
-#                   this local install. Nothing else is exposed.
+#   --public-url    open a public address for the doors outside callers
+#                   use (/events/..., /signal/..., the file links, live
+#                   routes, the OAuth callback) through an outbound
+#                   tunnel, so provider event pushes reach this local
+#                   install. The management API is never on it.
 #                   Persisted across runs.
 #   --no-public-url close it again.
 #
@@ -100,14 +98,11 @@
 #   (multiple combine)
 #
 # CLI knobs:
-#   --rebuild     force the daemon images to be rebuilt even when nothing
-#                 they are built from has changed. For when an image is
-#                 corrupt or hand-modified; a plain run already rebuilds
-#                 whatever actually moved.
-#   --rebuild-cluster  delete and recreate the kind cluster even when its
-#                 shape did not change (a shape change rebuilds on its
-#                 own). Every project's own database lives inside the
-#                 node and is destroyed with it.
+#   --rebuild     force the shared images (the runtime and the worker
+#                 builder base) to be rebuilt even when nothing they are
+#                 built from has changed. For when an image is corrupt or
+#                 hand-modified; a plain run already rebuilds whatever
+#                 actually moved.
 #   --debug       build CLI with the debug profile
 #   --prefix PATH install CLI binary into PATH/bin (default ~/.local)
 #
@@ -129,33 +124,34 @@
 #
 # Removal:
 #   --uninstall   Remove user-facing pieces but preserve work. Stops
-#                 the daemon (graceful: leases released on the Pod's
-#                 SIGTERM), uninstalls the VS Code extension, drops
-#                 the CLI symlink. PRESERVES: kind cluster,
-#                 postgres data, the object-store container + its
-#                 data volume, docker images, BuildKit cache,
-#                 cargo target/, manifest stamps, browser
-#                 extensions. Reinstall via ./setup.sh and your
-#                 projects + history come back instantly.
-#   --purge       TRUE clean slate. Deletes the kind cluster (and
-#                 the `kind` docker network once no clusters
-#                 remain), every weft-built docker image
-#                 (dispatcher, listener, every weft-worker),
-#                 every weft infra image, the object-store
-#                 container + data volume + seaweedfs image, the
-#                 BuildKit cache, the workspace target/ cargo
-#                 cache, ~/.local/share/weft (THE DATABASE'S FILES
-#                 under postgres-data/, manifest stamps, prebuilt
-#                 binaries), and the untracked
-#                 extension build artifacts. The next install pays a
-#                 full cold-rebuild cost. Can combine with --uninstall.
+#                 weft's runtime and takes it off the service manager,
+#                 uninstalls the VS Code extension, drops the CLI and
+#                 the runtime binary. PRESERVES: the Postgres container
+#                 and its files, the object-store container + its data
+#                 volume, infra units, docker images, BuildKit cache,
+#                 cargo target/, browser extensions. Reinstall via
+#                 ./setup.sh and your projects + history come back
+#                 instantly.
+#   --purge       TRUE clean slate. Deletes every container weft
+#                 started (workers, infra units, Postgres, the tunnel)
+#                 and their volumes, every weft-built docker image
+#                 (weft-runtime, every weft-worker, every weft infra
+#                 image), the object-store container + data volume +
+#                 seaweedfs image, the BuildKit cache, the workspace
+#                 target/ cargo cache, ~/.local/share/weft (THE
+#                 DATABASE'S FILES under postgres-data/, the install's
+#                 config and keys, prebuilt binaries), and the
+#                 untracked extension build artifacts. Also deletes the
+#                 Kubernetes cluster an older weft ran, if this machine
+#                 still has it. The next install pays a full
+#                 cold-rebuild cost. Can combine with --uninstall.
 #
 #                 SHARED base images (commonly reused by other
 #                 docker projects on the host) are kept by default.
 #                 Add the matching flag to remove them too:
 #                   --postgres   remove postgres:18-alpine (and the
 #                                postgres:18 image --migration pulls)
-#                   --kind       remove kindest/node images
+#                   --kind       remove kindest/node images (an older weft's)
 #                   --debian     remove debian:bookworm-slim
 #
 # Examples:
@@ -180,6 +176,18 @@ orig_args="$*"
 # Single source so install, version-probe, and uninstall can never drift (a
 # stale `weavemindai.` typo made --uninstall silently match nothing).
 ext_id="weavemind.weft-vscode"
+# Where the default install answers (its API and dashboard): the public
+# port it saved in ports.json when it started, so a port moved once stays
+# found. Before its first start, the port that start will take.
+# SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC, InstallPorts),
+# deploy/terraform/gcp/network.tf (local.public_port),
+# extension-vscode/src/localInstall.ts,
+# extension-browser/src/entrypoints/popup/App.svelte
+weft_local_url() {
+  local saved
+  saved="$(sed -n 's/.*"public":\([0-9]*\).*/\1/p' "${HOME}/.local/share/weft/ports.json" 2>/dev/null || true)"
+  printf 'http://127.0.0.1:%s' "${saved:-${WEFT_PUBLIC_PORT:-14111}}"
+}
 
 # ---- visual library --------------------------------------------------
 #
@@ -310,21 +318,11 @@ sha256() {
   ${sha256_bin} "$@"
 }
 
-# IDs of host docker images whose repo, with any registry prefix
-# stripped, matches the anchored regex. Content-addressed tags mean
-# the repo is the only stable part of a ref, and the system images +
-# builder base are registry-qualified (ghcr.io/...) while workers and
-# node-test images stay bare, so every sweep matches through this one
-# helper instead of hand-rolling the strip.
-weft_image_ids() {
-  # Returns non-zero when `docker images` itself fails (pipefail
-  # carries it through the pipeline): an unanswerable daemon must
-  # never read as "no images", so every caller decides what a failed
-  # listing means instead of receiving a silent empty.
-  docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
-    | awk -v re="$1" '{repo=$1; sub(/^.*\//,"",repo); if (repo ~ re) print $2}' \
-    | sort -u
-}
+# weft_image_ids, remove_docker_object, remove_docker_images_by_id and
+# what --uninstall / --purge remove, shared with scripts/scrub-old-install.sh.
+# shellcheck source=scripts/lib/weft-cleanup.sh
+. "${here}/scripts/lib/weft-cleanup.sh"
+
 # One docker-daemon reachability probe, the same shape everywhere it
 # gates a best-effort action. (The --purge refusal keeps its own
 # PATH-then-daemon form: it must TELL docker-missing and daemon-down
@@ -351,29 +349,6 @@ docker_server_major() {
 # dispatcher's referenced set no longer covers and keeps the rest.
 build_plane_repos_re='^(weft-builder-base|weft-node-tests)$'
 
-# Remove one docker object (image | container | volume) if it is
-# there. THE one removal shape, so absence always reads as absence, a
-# stuck removal as a warning, and neither ever prints as success.
-# Callers gate on the daemon being reachable; this assumes it is.
-remove_docker_object() { # kind ref [note]
-  local kind="$1" ref="$2" note="${3:-}"
-  if ! docker "${kind}" inspect "${ref}" >/dev/null 2>&1; then
-    hint "${ref}: not present${note}"
-    return 0
-  fi
-  # -v on a container: an image that declares a VOLUME (postgres,
-  # the object store) leaves an anonymous volume behind on a plain
-  # rm; -v takes it along and never touches named volumes. Ignored
-  # by the image and volume kinds.
-  local -a rm_flags=(-f)
-  [[ "${kind}" == container ]] && rm_flags+=(-v)
-  if docker "${kind}" rm "${rm_flags[@]}" "${ref}" >/dev/null 2>&1; then
-    ok "removed ${ref}${note}"
-  else
-    warn "could not remove ${ref} (still in use?)"
-  fi
-}
-
 # Remove a directory tree and report: ok exactly when it is gone,
 # warn when something survived. ONE shape for every best-effort tree
 # removal, so partial removals never print as success.
@@ -391,23 +366,9 @@ remove_dir_reporting() { # path label [ok_note] [fail_note]
   fi
 }
 
-# Its sibling for a SET of image ids (from `weft_image_ids` or a
-# `docker images -q` listing): one shape for "remove these, say what
-# happened", so every multi-image sweep reports the same way.
-remove_docker_images_by_id() { # label ids [note] [warn_reason]
-  local label="$1" ids="$2" note="${3:-}" reason="${4:-still referenced by a container?}"
-  if [[ -z "${ids}" ]]; then
-    hint "no ${label} to remove"
-  elif echo "${ids}" | xargs docker rmi -f >/dev/null 2>&1; then
-    ok "removed ${label}${note}"
-  else
-    warn "some ${label} could not be removed (${reason})"
-  fi
-}
-
 # Drop everything an engine change strands: the tagged build-plane
-# images (builder base + node-test image) on host docker and inside
-# the kind node, and the node-test cargo cache under target/tmp.
+# images (builder base + node-test image) on host docker, and the
+# node-test cargo cache under target/tmp.
 #
 # NOT the BuildKit cache. This used to run an unbounded
 # `docker builder prune --force` here, on the theory that every cargo
@@ -417,7 +378,7 @@ remove_docker_images_by_id() { # label ids [note] [warn_reason]
 # which no engine edit can invalidate, and cargo already refuses to
 # reuse its own stale artifacts by fingerprint. Wiping it meant every
 # install after an engine edit recompiled the dependency tree from
-# cold, in BOTH the system-image build and the builder-base build:
+# cold, in BOTH the runtime-image build and the builder-base build:
 # measured at 336 and 198 crates, 162 of them the same crate twice,
 # and roughly four minutes of an install that has about one minute of
 # real work in it. The 20 GB LRU bound the CLI section applies is what
@@ -441,7 +402,7 @@ sweep_stale_build_plane() {
   local docker_up=1
   docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || docker_up=0
   if [[ ${docker_up} -eq 0 ]]; then
-    warn "docker unreachable; the stale build-plane images (host docker and the kind node's containerd) and the BuildKit cache stay until the next install with docker up"
+    warn "docker unreachable; the stale build-plane images and the BuildKit cache stay until the next install with docker up"
     remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
       " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
     return 0
@@ -458,35 +419,6 @@ sweep_stale_build_plane() {
   fi
   remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
     " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
-  if command -v kind >/dev/null 2>&1; then
-    local kind_node="" cluster node tags
-    for cluster in $(kind get clusters 2>/dev/null); do
-      node="${cluster}-control-plane"
-      if docker inspect "${node}" >/dev/null 2>&1; then
-        kind_node="${node}"
-        break
-      fi
-    done
-    if [[ -n "${kind_node}" ]]; then
-      # `crictl images` lists repo and tag as separate columns; the
-      # repo may carry a registry prefix, stripped the same way
-      # `weft_image_ids` strips it.
-      tags="$(
-        docker exec "${kind_node}" crictl images 2>/dev/null \
-          | awk -v re="${build_plane_repos_re}" \
-              'NR>1 {repo=$1; sub(/^.*\//,"",repo); if (repo ~ re) print $1":"$2}' \
-          | sort -u || true
-      )"
-      if [[ -n "${tags}" ]]; then
-        # shellcheck disable=SC2086
-        if docker exec "${kind_node}" crictl rmi ${tags} >/dev/null 2>&1; then
-          ok "removed cached weft-builder-base + weft-node-tests images in kind containerd"
-        else
-          warn "some cached build-plane images in kind containerd could not be removed (a pod still runs one?); they go on a later install"
-        fi
-      fi
-    fi
-  fi
 }
 
 # One `code` call through a live IPC socket, with a deadline.
@@ -571,7 +503,6 @@ do_purge=0
 write_migration=""
 do_release=0
 rebuild_flag=""
-rebuild_cluster_flag=""
 purge_debian=0
 purge_kind=0
 purge_postgres=0
@@ -652,6 +583,11 @@ if ! mkdir -p "${run_log_dir}" 2>/dev/null || ! { : >> "${run_log}"; } 2>/dev/nu
   run_log=/dev/null
   warn "cannot write the run journal under ${run_log_dir}; continuing without it"
 fi
+# The journal keeps the last 400 lines (a couple of hundred runs), so it
+# never grows without end.
+if [[ "${run_log}" != /dev/null ]] && [[ "$(wc -l < "${run_log}")" -gt 400 ]]; then
+  tail -n 400 "${run_log}" > "${run_log}.tmp" 2>/dev/null && mv "${run_log}.tmp" "${run_log}" 2>/dev/null || rm -f "${run_log}.tmp"
+fi
 current_section="(argument parsing)"
 # The exit code arrives as $1: a composite trap (`cleanup; log_run_exit`)
 # would otherwise have $? read the CLEANUP's status and journal a died
@@ -711,7 +647,6 @@ while [[ $# -gt 0 ]]; do
     --safari)    targets_flip; target_safari=1 ;;
 
     --rebuild)   rebuild_flag="--rebuild" ;;
-    --rebuild-cluster) rebuild_cluster_flag="--rebuild-cluster" ;;
     --debug)     profile="dev" ;;
     --prefix)
       shift
@@ -753,10 +688,10 @@ done
 # and --migration's draft is only APPLIED by the refresh).
 if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
   if [[ $do_bump -eq 1 || $do_sign -eq 0 || $target_flag_seen -eq 1 || -n "${write_migration}" \
-    || -n "${public_url_flag}" || -n "${rebuild_flag}" || -n "${rebuild_cluster_flag}" \
+    || -n "${public_url_flag}" || -n "${rebuild_flag}" \
     || $from_source -eq 1 || "${profile}" != "release" \
     || $component_flag_seen -eq 1 || $no_daemon_seen -eq 1 ]]; then
-    fail "an --uninstall / --purge run builds and refreshes nothing, so --bump, --no-sign, --migration, --public-url/--no-public-url, --rebuild, --rebuild-cluster, --debug, --from-source, the component flags (--cli/--daemon/--vscode/--browser), --no-daemon and the browser-target flags do not apply here"
+    fail "an --uninstall / --purge run builds and refreshes nothing, so --bump, --no-sign, --migration, --public-url/--no-public-url, --rebuild, --debug, --from-source, the component flags (--cli/--daemon/--vscode/--browser), --no-daemon and the browser-target flags do not apply here"
     exit 1
   fi
 else
@@ -841,11 +776,15 @@ prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
 # place, so no build cache is ever load-bearing.
 installed_bin_dir="${HOME}/.local/share/weft/bin"
 installed_bin="${installed_bin_dir}/weft"
+# weft's runtime, which `weft daemon start` runs from beside the CLI.
+# SYNC: the runtime's home <-> crates/weft-cli/src/commands/daemon.rs (runtime_binary)
+installed_runtime="${installed_bin_dir}/weft-runtime"
 prebuilt_commit=""
 prebuilt_vscode_version=""
 use_prebuilt_cli=0
 use_prebuilt_vsix=0
 cli_sha256=""
+runtime_sha256=""
 vsix_sha256=""
 cli_asset=""
 case "$(uname -s)-$(uname -m)" in
@@ -854,6 +793,9 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)   cli_asset="weft-aarch64-macos" ;;
   Darwin-x86_64)  cli_asset="weft-x86_64-macos" ;;
 esac
+# The runtime published beside each CLI.
+# SYNC: asset names <-> .github/workflows/release.yml (the runtime binaries)
+runtime_asset="${cli_asset:+${cli_asset/weft-/weft-runtime-}}"
 # One string value out of the fetched manifest, empty when the key is
 # absent (an asset key missing means "not published; build locally
 # there"). THE one JSON-string extractor, `[^"]*` so no value alphabet
@@ -903,10 +845,11 @@ decide_prebuilt_use() {
       hint "no published CLI for $(uname -s)-$(uname -m); building the CLI locally"
     else
       cli_sha256="$(manifest_value "sha256_${cli_asset}")"
-      if [[ -n "${cli_sha256}" ]]; then
+      runtime_sha256="$(manifest_value "sha256_${runtime_asset}")"
+      if [[ -n "${cli_sha256}" && -n "${runtime_sha256}" ]]; then
         use_prebuilt_cli=1
       else
-        hint "this commit's ${cli_asset} was not published (its build failed in CI); building the CLI locally"
+        hint "this commit's ${cli_asset} or ${runtime_asset} was not published (its build failed in CI); building the CLI and the runtime locally"
       fi
     fi
   fi
@@ -994,11 +937,10 @@ acquire_prebuilt() {
 
 # ---- --migration: write the migration, then carry on installing -------
 #
-# Writing it needs a Postgres to build two schemas in and compare them, and the
-# one weft runs lives inside the cluster where nothing outside can reach it, so
-# this runs a throwaway container and takes it away again. Releasing also needs
-# to reach the real one, to swap its drafts for the released file, which it
-# does through a port-forward the way the tests do.
+# Writing it needs a Postgres to build two schemas in and compare them, which
+# must not be the one weft runs, so this runs a throwaway container and takes
+# it away again. Releasing also needs to reach the real one (the local
+# install's), to swap its drafts for the released file.
 if [[ $do_release -eq 1 && -z "${write_migration}" ]]; then
   fail "--release only means something with --migration <name>: it collapses that run's drafts"
   exit 1
@@ -1008,16 +950,12 @@ if [[ -n "${write_migration}" ]]; then
   section "migration"
   # Everything this run's shape needs, named up front instead of a
   # bare command-not-found mid-run: cargo (the schema generators
-  # compile even when the CLI came prebuilt), docker (the throwaway
-  # scratch postgres), and kubectl when releasing (the release records
-  # itself on the live database through a port-forward).
+  # compile even when the CLI came prebuilt) and docker (the throwaway
+  # scratch postgres).
   migration_missing=""
   command -v cargo >/dev/null 2>&1 || migration_missing="cargo (install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)"
   command -v docker >/dev/null 2>&1 \
     || migration_missing="${migration_missing:+${migration_missing}; }docker (runs the scratch postgres)"
-  if [[ $do_release -eq 1 ]] && ! command -v kubectl >/dev/null 2>&1; then
-    migration_missing="${migration_missing:+${migration_missing}; }kubectl (--release reaches the live database)"
-  fi
   if [[ -n "${migration_missing}" ]]; then
     fail "--migration needs: ${migration_missing}"
     exit 1
@@ -1025,10 +963,8 @@ if [[ -n "${write_migration}" ]]; then
   # shellcheck source=scripts/lib/throwaway-postgres.sh
   . "${here}/scripts/lib/throwaway-postgres.sh"
   # Chain onto the script's existing exit logger so a Ctrl-C mid-run
-  # leaves neither the container nor the port-forward behind.
-  pf_pid=""
+  # leaves no container behind.
   migration_cleanup() {
-    [[ -n "${pf_pid}" ]] && { kill "${pf_pid}" 2>/dev/null || true; }
     # -v: the scratch postgres leaves an anonymous volume behind on a
     # plain rm (see scripts/lib/throwaway-postgres.sh).
     [[ -n "${THROWAWAY_PG_CONTAINER:-}" ]] \
@@ -1044,26 +980,16 @@ if [[ -n "${write_migration}" ]]; then
   release_flag=""
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
-    # SYNC: weft-db <-> crates/weft-core/src/infra/instance.rs (the default install's db_namespace)
-    if ! kubectl get namespace weft-db >/dev/null 2>&1; then
-      fail "releasing has to reach the database you have been working against, and no cluster is up"
+    # The local install's own database, as its runtime reaches it.
+    # SYNC: secrets.env <-> crates/weft-cli/src/commands/daemon.rs (Install::secrets_path,
+    #       the WEFT_DATABASE_URL line), the Postgres container's name (weft-postgres)
+    live_url="$(sed -n 's/^WEFT_DATABASE_URL=//p' "${HOME}/.local/share/weft/secrets.env" 2>/dev/null || true)"
+    if [[ -z "${live_url}" ]] \
+      || [[ "$(docker inspect -f '{{.State.Running}}' weft-postgres 2>/dev/null)" != "true" ]]; then
+      fail "releasing has to reach the database you have been working against, and the local install's Postgres is not up (./setup.sh --daemon starts it)"
       exit 1
     fi
-    kubectl -n weft-db port-forward svc/weft-postgres 15433:5432 >/dev/null 2>&1 &
-    pf_pid=$!
-    # SYNC: local-dev PG credentials <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret),
-    #       crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME),
-    #       scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL)
-    export WEFT_LIVE_DATABASE_URL="postgres://weft:weft-local-dev@127.0.0.1:15433/weft"
-    pf_up=0
-    for _ in $(seq 1 30); do
-      (exec 3<>/dev/tcp/127.0.0.1/15433) 2>/dev/null && { pf_up=1; break; }
-      sleep 1
-    done
-    if [[ $pf_up -ne 1 ]]; then
-      fail "the port-forward to weft-postgres (127.0.0.1:15433) never came up"
-      exit 1
-    fi
+    export WEFT_LIVE_DATABASE_URL="${live_url}"
   fi
 
   # A failure in one crate leaves the other's release intact and this
@@ -1126,14 +1052,6 @@ if [[ $do_uninstall -eq 0 && $do_purge -eq 0 ]]; then
     if ! command -v docker >/dev/null 2>&1; then
       missing+=("docker")
       install_hints+=("  Docker:  https://docs.docker.com/get-docker/")
-    fi
-    if ! command -v kubectl >/dev/null 2>&1; then
-      missing+=("kubectl")
-      install_hints+=("  kubectl: https://kubernetes.io/docs/tasks/tools/")
-    fi
-    if ! command -v kind >/dev/null 2>&1; then
-      missing+=("kind")
-      install_hints+=("  kind:    https://kind.sigs.k8s.io/docs/user/quick-start/#installation")
     fi
   fi
 
@@ -1211,21 +1129,23 @@ fi
 if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
   if [[ $do_uninstall -eq 1 ]]; then
     section "Uninstall"
-    hint "${C_DIM}preserving cluster + data; pass --purge to wipe everything${C_RESET}"
+    hint "${C_DIM}preserving data; pass --purge to wipe everything${C_RESET}"
 
-    # 1. Stop the daemon. Scales the StatefulSet to 0 which fires
-    #    SIGTERM on the Pod, which triggers the dispatcher's
-    #    graceful_shutdown to release leases cleanly. Best-effort:
-    #    a missing CLI or already-stopped daemon doesn't fail.
+    # 1. Stop weft's runtime, then take it off the service manager so
+    #    it does not come back at the next login. Best-effort: a
+    #    missing CLI or an already-stopped runtime doesn't fail.
     if command -v "${weft_bin}" >/dev/null 2>&1 || [[ -L "${weft_bin}" ]]; then
       if "${weft_bin}" daemon stop >/dev/null 2>&1; then
-        ok "daemon stopped (cluster + data kept)"
+        ok "weft's runtime stopped (data kept)"
       else
-        hint "daemon: already stopped, or its cluster is unreachable; nothing to stop"
+        hint "weft's runtime: already stopped; nothing to stop"
       fi
     else
-      hint "daemon: no weft binary on disk; nothing to stop"
+      hint "weft's runtime: no weft binary on disk; nothing to stop"
     fi
+    # Every install's runtime (named ones too) off the service manager,
+    # and any a detached start left running.
+    weft_stop_runtimes
 
     # 2. Remove the VS Code extension if `code` is on PATH. Uses
     #    the same live-IPC-socket discovery as the install side
@@ -1264,10 +1184,12 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     else
       hint "CLI symlink at ${weft_bin} already absent"
     fi
-    if [[ -f "${installed_bin}" ]]; then
-      rm -f "${installed_bin}"
-      ok "removed ${C_DIM}${installed_bin}${C_RESET}"
-    fi
+    for installed in "${installed_bin}" "${installed_runtime}"; do
+      if [[ -f "${installed}" ]]; then
+        rm -f "${installed}"
+        ok "removed ${C_DIM}${installed}${C_RESET}"
+      fi
+    done
     if [[ -f "${fish_completion_file}" ]]; then
       rm -f "${fish_completion_file}"
       ok "removed ${C_DIM}${fish_completion_file}${C_RESET}"
@@ -1287,13 +1209,13 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    user chained --purge, those things are already gone.
     if [[ $do_purge -eq 0 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-      printf "  %skind cluster%s %s'%s' (the running pods)%s\n" \
-        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
+      printf '  %sPostgres%s %s(the weft-postgres container, still running)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects; manifest stamps, prebuilt binaries)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-      printf '  %sdocker images%s %s(dispatcher, listener, weft-worker)%s\n' \
+      printf '  %sdocker images%s %s(weft-runtime, weft-worker, weft-infra-*)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sworkspace target/%s %s(cargo cache)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
@@ -1314,106 +1236,61 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     # wall of green over untouched state.
     if command -v docker >/dev/null 2>&1 \
       && ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-      fail "the docker daemon is not reachable, so nothing docker holds can be purged: the kind cluster, weft images, the object-store container + volume, and the BuildKit cache all remain"
+      fail "the docker daemon is not reachable, so nothing docker holds can be purged: weft's containers, images, the object-store container + volume, and the BuildKit cache all remain"
       hint "start docker and re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
       exit 1
     fi
 
-    # 1. Delete the kind cluster. `kind delete` leaves the shared
-    #    `kind` docker network behind; once no clusters remain it is
-    #    pure leftover, so remove it too (best-effort: another tool's
-    #    running container on it just keeps it alive).
-    if command -v kind >/dev/null 2>&1; then
-      cluster="${WEFT_CLUSTER_NAME:-weft-local}"
-      if kind get clusters 2>/dev/null | grep -qx "${cluster}"; then
-        if kind delete cluster --name "${cluster}" >/dev/null 2>&1; then
-          ok "kind cluster ${C_DIM}'${cluster}'${C_RESET} deleted"
-        else
-          warn "could not delete the kind cluster '${cluster}'; delete it by hand: kind delete cluster --name ${cluster}"
-        fi
-      else
-        hint "kind cluster ${C_DIM}'${cluster}'${C_RESET}: not present"
-      fi
-      if [[ -z "$(kind get clusters 2>/dev/null)" ]] \
-        && docker network inspect kind >/dev/null 2>&1; then
-        if docker network rm kind >/dev/null 2>&1; then
-          ok "removed the ${C_DIM}kind${C_RESET} docker network"
-        else
-          warn "could not remove the kind docker network (another tool's container still on it?)"
-        fi
-      fi
-    fi
+    # 1. Every install's runtime, so nothing writes while its data goes
+    #    (a purge without --uninstall has not stopped it yet), then the
+    #    Kubernetes cluster an older weft ran, when this machine still
+    #    has it.
+    weft_stop_runtimes
+    weft_delete_old_cluster
 
-    # 2. Reclaim every weft-related host docker image. The system images
-    # carry content-addressed tags under any registry prefix, so match
-    # the repo with the prefix stripped. (The daemon answered the gate
-    # above, so "not present" below really means absent.)
+    # 2. Every container and volume weft started, then every image it
+    #    built or ran. (The daemon answered the gate above, so "not
+    #    present" below really means absent.)
     if ! command -v docker >/dev/null 2>&1; then
       warn "docker not on PATH; everything docker holds (images, the object store, the BuildKit cache) is untouched"
     else
-      system_ids="$(weft_image_ids '^(weft-dispatcher|weft-listener|weft-broker|weft-infra-supervisor)$')" || {
-        fail "could not list the weft system images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
+      weft_remove_containers_and_volumes
+      weft_remove_images || {
+        fail "could not list weft's images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
         exit 1
       }
-      remove_docker_images_by_id "dispatcher + listener + broker + supervisor images" "${system_ids}"
-
       if docker image prune --force \
         --filter "label=weft.dev/project" >/dev/null 2>&1; then
         ok "pruned dangling project-labelled images"
       else
         warn "could not prune the dangling project-labelled images"
       fi
-      # Remove every CONTENT-ADDRESSED image the build builds, by REPOSITORY (the
-      # `<repo>:<hash>` form has no hyphen, so a `<repo>-*` glob silently matches
-      # nothing). These accumulate with no implicit GC, so a purge must clear ALL:
-      #   - `weft-worker`        : one per project build.
-      #   - `weft-builder-base`  : one ~1.4GB image per engine version.
-      #   - `weft-infra-<name>`  : one per infra node, built locally by the CLI as
-      #                            `weft-infra-<name>:<hash>` (see weft-compiler
-      #                            `infra_image_repo`). A tagged image is NOT
-      #                            dangling, so the `image prune --filter label`
-      #                            above does NOT remove these; match the repo.
-      #     SYNC: weft-infra-<name> repo <-> crates/weft-compiler/src/image_set.rs
-      #           (infra_image_repo). Sidecar images are a REMOVED concept; the
-      #           current code builds no `weft-sidecar-*`, so none is matched here.
-      bp_ids="$(weft_image_ids '^(weft-worker|weft-builder-base|weft-node-tests)$|^weft-infra-')" || {
-        fail "could not list the weft build-plane images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
-        exit 1
-      }
-      remove_docker_images_by_id "weft-worker / weft-builder-base / weft-node-tests / weft-infra-* images" "${bp_ids}"
 
       # Shared base images, gated. `--postgres` covers BOTH postgres
-      # images weft pulls: the in-cluster one and the --migration
+      # images weft pulls: the install's one and the --migration
       # scratch one (leaving the scratch image behind would break the
       # clean-slate floor with a ~450MB orphan nobody is told about).
-      # SYNC: postgres image tags <-> deploy/k8s/postgres.yaml (the
-      #       postgres container image, 18-alpine),
+      # SYNC: postgres image tags <-> crates/weft-cli/src/commands/daemon.rs
+      #       (POSTGRES_IMAGE, 18-alpine),
       #       scripts/lib/throwaway-postgres.sh (the scratch image, 18)
       if [[ $purge_postgres -eq 1 ]]; then
         remove_docker_object image postgres:18-alpine " ${C_DIM}(--postgres)${C_RESET}"
         remove_docker_object image postgres:18 " ${C_DIM}(--postgres, the --migration scratch image)${C_RESET}"
       fi
       if [[ $purge_kind -eq 1 ]]; then
-        kind_ids="$(docker images kindest/node -q 2>/dev/null | sort -u)" || {
+        weft_remove_kind_images " ${C_DIM}(--kind)${C_RESET}" || {
           fail "could not list the kindest/node images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
           exit 1
         }
-        remove_docker_images_by_id "kindest/node images" "${kind_ids}" \
-          " ${C_DIM}(--kind)${C_RESET}" "a kind cluster still running?"
       fi
       if [[ $purge_debian -eq 1 ]]; then
         remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian)${C_RESET}"
       fi
 
-      # The daemon's host-side object store: a docker container, its
-      # named data volume, and the pulled seaweedfs image. All three
-      # are weft-created (the image is niche enough that nothing else
-      # on the host wants it), so a purge removes them unconditionally.
-      # SYNC: weft-object-store <-> crates/weft-cli/src/commands/daemon.rs
-      #       (OBJECT_STORE_CONTAINER; the volume is "<container>-data",
-      #       the image is the `docker run` line below the constant)
-      remove_docker_object container weft-object-store
-      remove_docker_object volume weft-object-store-data
+      # The object store's image: niche enough that nothing else on the
+      # host wants it, so a purge removes it unconditionally.
+      # SYNC: seaweedfs image <-> crates/weft-cli/src/commands/daemon.rs
+      #       (the `docker run` line below OBJECT_STORE_CONTAINER)
       remove_docker_object image chrislusf/seaweedfs:3.80
 
       if docker buildx prune --force >/dev/null 2>&1; then
@@ -1436,26 +1313,16 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       " ${C_DIM}(builder-base staging context)${C_RESET}" "; remove it by hand: rm -rf ${here}/.weft-base-context"
     remove_dir_reporting "${here}/.weft-base-context.lock" "${C_DIM}.weft-base-context.lock${C_RESET}"
 
-    # 4. Daemon-local state. Docker may have auto-created root-owned
-    # entries under it (a missing bind-mount source becomes a root
-    # directory); the plain rm fails on those, so docker itself (root)
-    # cleans them first.
-    if [[ -d "${HOME}/.local/share/weft" ]]; then
-      if ! rm -rf "${HOME}/.local/share/weft" 2>/dev/null; then
-        docker run --rm -v "${HOME}/.local/share/weft:/heal" alpine:3 \
-          sh -c "rm -rf /heal/* /heal/.[!.]*" >/dev/null 2>&1 || true
-        rm -rf "${HOME}/.local/share/weft" 2>/dev/null || true
-      fi
-      # Both attempts can fail (root-owned entries with docker itself
-      # unavailable); only claim success when the directory is gone.
-      if [[ -d "${HOME}/.local/share/weft" ]]; then
-        warn "could not remove ${C_DIM}~/.local/share/weft/${C_RESET}; remove it manually: sudo rm -rf ~/.local/share/weft"
-      else
+    # 4. Daemon-local state, every install's database among it.
+    if [[ -d "${weft_state_dir}" ]]; then
+      if weft_remove_state_dir; then
         ok "removed ${C_DIM}~/.local/share/weft/${C_RESET}"
         # The run journal lived in the directory we just purged.
         # Recreating it to append the exit line would undo the clean
         # slate, so the journal ends here for this run.
         run_log=/dev/null
+      else
+        warn "could not remove ${C_DIM}~/.local/share/weft/${C_RESET}; remove it manually: sudo rm -rf ~/.local/share/weft"
       fi
     fi
 
@@ -1523,6 +1390,37 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
   printf '\n%s%s%s %sDone.%s\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
   exit 0
+fi
+
+# ---- an older weft (every install that touches docker) -----------------
+#
+# The weft that ran on a local Kubernetes cluster cannot be upgraded in
+# place: its database starts a new schema history and the runtime
+# refuses to boot beside it. So an install that finds one offers to wipe
+# it first (scripts/scrub-old-install.sh), then carries on as a fresh
+# install. A machine with nothing to wipe sees none of this.
+if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && weft_old_install_present; then
+  section "An older weft"
+  warn "an older weft (the one that ran on a local Kubernetes cluster) is on this machine,"
+  warn "and this version cannot carry it forward. It is going to be wiped: the projects on"
+  warn "your disk are not touched, but their run history, versions and stored connections are."
+  named_installs="$(weft_named_installs)"
+  if [[ -n "${named_installs}" ]]; then
+    warn "These named installs go too, with their databases: ${named_installs}."
+  fi
+  if [[ ! -t 0 ]]; then
+    fail "no terminal to ask on; wipe it with ${C_BOLD}scripts/scrub-old-install.sh --yes${C_RESET}, then run ./setup.sh again"
+    exit 1
+  fi
+  # End of input (Ctrl-D) is a no: under set -e a failed read would
+  # otherwise end the run without a word.
+  read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
+  if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
+    hint "nothing wiped and nothing installed; run ./setup.sh again when you are ready"
+    exit 1
+  fi
+  "${here}/scripts/scrub-old-install.sh" --yes || { fail "the wipe did not finish; see above, then run ./setup.sh again"; exit 1; }
+  ok "the older weft is gone; installing this one"
 fi
 
 # ---- disk hygiene (every install) --------------------------------------
@@ -1640,6 +1538,8 @@ if [[ $build_cli -eq 1 ]]; then
   # the image layers in use too, which it can never free, so on a busy
   # machine it went on to take every reclaimable record, the compile
   # caches every build of the day had just used included.
+  # SYNC: 20GB and until=24h <-> crates/weft-platform-local/src/images.rs
+  #       (BUILD_CACHE_CAP, BUILD_CACHE_SPARE)
   if docker_reachable; then
     spin "bound BuildKit cache to 20GB (LRU, sparing what was used in the last day)" \
       docker builder prune --force --max-used-space 20GB --filter until=24h
@@ -1657,7 +1557,8 @@ if [[ $build_cli -eq 1 ]]; then
     # recorded repo location must refresh even when the bytes are
     # already right, since this checkout may be a different clone than
     # the one that downloaded them).
-    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${installed_bin}" 0755; then
+    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${installed_bin}" 0755 \
+      || ! acquire_prebuilt "${runtime_asset}" "${runtime_sha256}" "${installed_runtime}" 0755; then
       use_prebuilt_cli=0
       if command -v cargo >/dev/null 2>&1; then
         warn "prebuilt CLI download failed; building locally instead"
@@ -1684,7 +1585,7 @@ if [[ $build_cli -eq 1 ]]; then
       hint "fix the ownership (docker can leave root-owned entries there): ${C_BOLD}sudo chown -R \"\$(id -u):\$(id -g)\" ~/.local/share/weft${C_RESET}${C_DIM}, then re-run${C_RESET}"
       exit 1
     fi
-    chmod 0755 "${installed_bin}"
+    chmod 0755 "${installed_bin}" "${installed_runtime}"
     ln -sfn "${installed_bin}" "${weft_bin}"
     ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
@@ -1707,13 +1608,13 @@ if [[ $build_cli -eq 1 ]]; then
     # pretending the install is current.
     for build_pass in 1 2 3; do
       if [[ "${profile}" == "release" ]]; then
-        spin_passthrough "cargo build --release -p weft-cli" \
-          cargo build --release -p weft-cli
+        spin_passthrough "cargo build --release -p weft-cli -p weft-runtime" \
+          cargo build --release -p weft-cli -p weft-runtime
       else
-        spin_passthrough "cargo build -p weft-cli" cargo build -p weft-cli
+        spin_passthrough "cargo build -p weft-cli -p weft-runtime" cargo build -p weft-cli -p weft-runtime
       fi
-      if [[ ! -x "${src}" ]]; then
-        fail "build output missing: ${src}"
+      if [[ ! -x "${src}" || ! -x "${target_dir}/weft-runtime" ]]; then
+        fail "build output missing: ${src} or ${target_dir}/weft-runtime"
         exit 1
       fi
       # cargo's own freshness check is the authority on whether the
@@ -1728,7 +1629,7 @@ if [[ $build_cli -eq 1 ]]; then
       # cargo's), with the captured output shown instead of discarded.
       recheck_release_flag=""
       [[ "${profile}" == "release" ]] && recheck_release_flag="--release"
-      recheck_out="$(cargo build ${recheck_release_flag} -p weft-cli 2>&1)" || {
+      recheck_out="$(cargo build ${recheck_release_flag} -p weft-cli -p weft-runtime 2>&1)" || {
         fail "the freshness recheck build failed (a source edit landed mid-build?)"
         printf '%s\n' "${recheck_out}" >&2
         exit 1
@@ -1761,6 +1662,13 @@ if [[ $build_cli -eq 1 ]]; then
     cp_err="$(cp "${src}" "${installed_tmp}" 2>&1 >/dev/null && chmod 0755 "${installed_tmp}" && mv -f "${installed_tmp}" "${installed_bin}" 2>&1 >/dev/null)" || {
       rm -f "${installed_tmp}"
       fail "could not install the built binary to ${installed_bin}"
+      printf '%s\n' "${cp_err}" >&2
+      exit 1
+    }
+    runtime_tmp="${installed_runtime}.$$.build"
+    cp_err="$(cp "${target_dir}/weft-runtime" "${runtime_tmp}" 2>&1 >/dev/null && chmod 0755 "${runtime_tmp}" && mv -f "${runtime_tmp}" "${installed_runtime}" 2>&1 >/dev/null)" || {
+      rm -f "${runtime_tmp}"
+      fail "could not install the built runtime to ${installed_runtime}"
       printf '%s\n' "${cp_err}" >&2
       exit 1
     }
@@ -1859,15 +1767,9 @@ fi
 
 # ---- daemon refresh / start ------------------------------------------
 #
-# Two cases share this block:
-#   1. Daemon already up: rebuild dispatcher/listener images and roll
-#      the pod so it picks up the new code.
-#   2. Daemon not up: start it. The CLI's `daemon start` builds the
-#      fresh images itself, so a separate --rebuild isn't needed.
-#
-# Either way the user ends up with a running daemon on the latest
-# source. Pre-setup.sh behavior was to skip when the daemon was down,
-# which forced a manual `weft daemon start` afterwards.
+# One verb whether weft is running or not: `weft daemon start` brings the
+# local install up (or refreshes it) and restarts weft's runtime on the
+# binary this run just installed.
 
 if [[ $refresh_daemon -eq 1 ]]; then
   section "Daemon"
@@ -1875,36 +1777,25 @@ if [[ $refresh_daemon -eq 1 ]]; then
     warn "no weft binary at ${weft_bin}; skipping"
   elif ! command -v docker >/dev/null 2>&1; then
     warn "docker not on PATH; skipping"
-  elif ! command -v kubectl >/dev/null 2>&1; then
-    warn "kubectl not on PATH; skipping"
   else
-    dispatcher_url="${WEFT_DISPATCHER_URL:-http://127.0.0.1:9999}"
-    if curl --silent --max-time 2 "${dispatcher_url}/health" >/dev/null 2>&1; then
-      hint "daemon running at ${C_DIM}${dispatcher_url}${C_RESET}; refreshing (no-op if nothing changed)"
-    else
-      hint "daemon not running; first install pulls images and creates the kind cluster (~2-3 min)"
-    fi
-    # One verb either way: `daemon start` is an idempotent reconcile
-    # (boot and refresh are the same operation; `restart` is its alias).
     spin_passthrough "weft daemon start" \
-      env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
+      env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${public_url_flag}
 
     # Reclaim what the update stranded, now that the refreshed daemon
     # can answer for what is still in use: `weft clean --images --all`
     # keeps exactly the dispatcher's referenced set (running projects'
-    # current worker images, draining pods', live tasks', every
+    # current worker images, draining workers', live tasks', every
     # project's infra image tags, every live infra unit's recorded
     # image refs) and removes everything else of
     # weft's: unreferenced worker images, stale `weft-infra-*` tags,
-    # old builder bases, on host docker AND the kind node. Stale
-    # system images were already reclaimed by the daemon start itself.
+    # old builder bases and runtimes.
     # This is the "old version gone, running things untouched" pass:
     # a project the user has not resynced yet KEEPS its old-engine
     # image (it is still its running pointer) and the reclaim catches
     # it on a later install once the resync moves the pointer.
     # No health re-probe before it: `weft daemon start` returning 0
-    # already implies the dispatcher answered /health (the CLI probes
-    # it as reconcile's last step), and a failed start exits this
+    # already implies the runtime answered (the CLI waits for it as
+    # the start's last step), and a failed start exits this
     # script under set -e. The clean itself fails loudly if the daemon
     # became unreachable in between, and the warn below is the recovery
     # hint. Warn-only either way: hygiene must not fail the install.
@@ -1915,9 +1806,11 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # Passthrough (not spin): the reclaim names what it removes, and
     # "kept the running project's images, dropped the dead ones" is
     # exactly the output a user updating weft wants to see.
+    # No address passed: the CLI reads the port the start above just
+    # saved in ports.json (a WEFT_DISPATCHER_URL the user exported still
+    # reaches it through the environment).
     if spin_passthrough "weft clean --images --all" \
-      env WEFT_REPO_ROOT="${here}" WEFT_DISPATCHER_URL="${dispatcher_url}" \
-        "${weft_bin}" clean --images --all; then
+      env WEFT_REPO_ROOT="${here}" "${weft_bin}" clean --images --all; then
       :
     else
       warn "the image reclaim failed; re-run ${C_BOLD}weft clean --images --all${C_RESET} by hand once the daemon is settled"
@@ -2408,19 +2301,18 @@ if [[ $build_cli -eq 1 ]]; then
     printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
 
     printf '%s%sRunning:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    # SYNC: weft-system <-> crates/weft-core/src/infra/instance.rs (the default install's system_namespace)
-    printf '  %s%s%s dispatcher  %s%s%s  %s(kind cluster, weft-system ns)%s\n' \
+    printf '  %s%s%s weft        %s%s%s  %s(weft-runtime, kept running by your service manager)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
-      "${C_DIM}" "http://127.0.0.1:9999" "${C_RESET}" \
+      "${C_DIM}" "$(weft_local_url)" "${C_RESET}" \
       "${C_DIM}" "${C_RESET}"
-    printf '  %s%s%s postgres    %sin-cluster, durable across daemon restarts%s\n' \
+    printf '  %s%s%s postgres    %sthe weft-postgres container, its files in ~/.local/share/weft/postgres-data%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
     printf '  %s%s%s VS Code     %sinstalled (reload your window if it is open)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
     if [[ -n "${public_url}" ]]; then
       printf '  %s%s%s public URL  %s%s%s\n' \
         "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${public_url}" "${C_RESET}"
-      printf '              %sevent pushes + signal fire links ONLY; everything else 404s%s\n' \
+      printf '              %sthe doors outside callers use ONLY; the management API is never on it%s\n' \
         "${C_DIM}" "${C_RESET}"
       printf '              %sgive providers %s%s/events/<service>/<topic>%s%s; it changes if the tunnel restarts%s\n' \
         "${C_DIM}" "${C_RESET}${C_BOLD}" "${public_url}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
@@ -2433,8 +2325,8 @@ if [[ $build_cli -eq 1 ]]; then
       "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
     printf '  %s%s%s scaffold + run     %sweft new my-first-weave && cd my-first-weave && weft run%s\n' \
       "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %s%s%s open dashboard     %shttp://127.0.0.1:9999%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+    printf '  %s%s%s open dashboard     %s%s%s\n' \
+      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "$(weft_local_url)" "${C_RESET}"
 
     printf '\n%s%sBrowser extension%s %s(HumanQuery / in-page weaves)%s\n' \
       "${C_BOLD}" "${C_BLUE}" "${C_RESET}" "${C_DIM}" "${C_RESET}"

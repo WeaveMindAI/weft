@@ -1,18 +1,28 @@
-//! Pooled listener service. Kind-aware processor for signals, running
-//! in the control-plane namespace; each pod holds signals from many
-//! tenants, placed per signal by the dispatcher.
+//! The listener role: the kind-aware processor for signals.
 //!
-//! Endpoints (network-trusted; only reachable from `weft-system`):
-//!   POST /register, /unregister, /process, /match_push, /wake_by_hand,
-//!   /render, /live, /rehydrate; GET /signals, /load, /health.
-//! Held-connection loops per stateful kind (Timer, SSE) enqueue a
-//! `FireSignal` task through the broker when their event fires; the
-//! dispatcher's task picker then runs the same `dispatch_listener_outcome`
-//! a stateless fire would.
+//! One logical service: a module of the machine's process, or a service
+//! of its own that scales to zero. The durable `signal` table (read
+//! through the broker) is the truth about which signals exist; the
+//! listener keeps what it has seen in memory and loads a signal it has
+//! not seen yet on first use, so any copy of it answers for any signal.
+//!
+//! What a kind needs between fires decides where it can run
+//! ([`kinds::BetweenFires`]): a kind the outside calls in to needs
+//! nothing, a kind that wakes at times hands each next wake to the
+//! platform's [`weft_platform_traits::Alarm`], and a kind that holds a
+//! connection open needs the listener placed on the machine.
+//!
+//! Endpoints (internal, platform identity required):
+//!   POST /prepare, /start, /unregister, /process, /match_push,
+//!   /wake_by_hand, /live, /rehydrate, /wake; GET /signals, /health.
+//! A fire the listener raises itself (a timer's tick, an event on a held
+//! connection) is enqueued as a `FireSignal` task through the broker; the
+//! dispatcher runs it back through `/process` like any other fire.
 
 pub mod config;
 pub mod event_context;
 pub mod fire_sink;
+pub mod infra_address;
 pub mod kinds;
 pub mod listener_access;
 pub mod registry;
@@ -25,10 +35,8 @@ pub use router::router;
 
 use std::sync::Arc;
 
-use weft_broker_client::TokenSource;
-use weft_platform_traits::mem_pressure::{
-    is_saturated, CgroupMemPressure, MemPressure, SATURATION_MEM_FRACTION,
-};
+use weft_broker_client::{BrokerSignalClient, TokenSource};
+use weft_platform_traits::Alarm;
 use weft_task_store::TaskStoreClient;
 
 use crate::fire_sink::FireSignalSink;
@@ -38,63 +46,35 @@ use crate::registry::Registry;
 pub struct ListenerState {
     pub config: Arc<ListenerConfig>,
     pub registry: Arc<Registry>,
-    /// Sink wrapping the broker task client; held-event kinds call
-    /// this when their event fires.
+    /// Where held-event kinds send their fires.
     pub fire_sink: FireSignalSink,
-    /// Broker task client + token source, kept on state so the
-    /// `/rehydrate` HTTP handler can re-run the boot-time rebuild
-    /// without main.rs having to wire a closure through axum.
-    pub tasks: Arc<dyn TaskStoreClient>,
-    pub token_source: TokenSource,
-    /// Reads this pod's real memory pressure. Saturation is decided from
-    /// THIS (not a held-connection count), so the listener and the
-    /// supervisor use one consistent load metric and a pod sheds load
-    /// based on how close it actually is to its memory limit.
-    pub mem_pressure: Arc<dyn MemPressure>,
+    /// The durable signal rows: loading one, listing the held ones,
+    /// writing a kind's state.
+    pub signals: Arc<BrokerSignalClient>,
     /// The broker's event-serving surface: connection resolution and
     /// provider subscriptions for the kinds that act as a connection.
     pub events_broker: Arc<weft_broker_client::BrokerEventsClient>,
+    /// Wakes the listener at a time: every `Wakes` kind's next moment.
+    pub alarm: Arc<dyn Alarm>,
 }
 
 impl ListenerState {
-    /// The pod's current load. `saturated` is decided from REAL memory
-    /// pressure (usage/limit) at the shared `SATURATION_MEM_FRACTION`
-    /// threshold, not a work-item count: a count is a dishonest proxy
-    /// (5 live sockets are not 500 idle timers). The dispatcher treats
-    /// `saturated` as authoritative and stops placing new signals here
-    /// once it is true; `mem_pressure` rides along for the scale-down
-    /// planner's headroom math + observability. `signals` /
-    /// `held_connections` remain for observability only.
-    pub fn load_report(&self) -> weft_core::signal::listener_protocol::LoadReport {
-        let fraction = self.mem_pressure.fraction();
-        weft_core::signal::listener_protocol::LoadReport {
-            saturated: is_saturated(fraction, SATURATION_MEM_FRACTION),
-            mem_pressure: fraction,
-            signals: self.registry.len() as u32,
-            held_connections: self.registry.held_connection_count() as u32,
-        }
-    }
-}
-
-impl ListenerState {
-    pub async fn new(
+    pub fn new(
         config: ListenerConfig,
         tasks: Arc<dyn TaskStoreClient>,
         token_source: TokenSource,
-    ) -> anyhow::Result<Self> {
-        let fire_sink = FireSignalSink::new(tasks.clone());
-        let events_broker = weft_broker_client::BrokerEventsClient::new(
-            config.broker_url.clone(),
-            token_source.clone(),
-        );
-        Ok(Self {
+        alarm: Arc<dyn Alarm>,
+    ) -> Self {
+        let signals = BrokerSignalClient::new(config.broker_url.clone(), token_source.clone());
+        let fire_sink = FireSignalSink::new(tasks, signals.clone());
+        let events_broker = weft_broker_client::BrokerEventsClient::new(config.broker_url.clone(), token_source);
+        Self {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),
             fire_sink,
-            tasks,
-            token_source,
-            mem_pressure: CgroupMemPressure::new(),
+            signals,
             events_broker,
-        })
+            alarm,
+        }
     }
 }

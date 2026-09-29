@@ -49,7 +49,7 @@ pub(crate) fn grant_gone(grant_id: &str) -> Result<()> {
 }
 
 /// Every grant the ledger still holds: what failed tests kept. Read
-/// only by the sweep, which reaches the cluster, so `e2e` only.
+/// only by the sweep, which reaches the install, so `e2e` only.
 #[cfg(feature = "e2e")]
 pub(crate) fn kept_grants() -> Result<Vec<String>> {
     let dir = grants_dir()?;

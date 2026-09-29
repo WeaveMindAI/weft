@@ -39,25 +39,34 @@ async fn http_endpoint_echoes_request_body() -> anyhow::Result<()> {
         "the route did not deliver the body key on its declared port: {body}"
     );
 
-    // A browser page on another origin: the gateway hop the 307 lands on
+    // A browser page on another origin: the live door the 307 lands on
     // answers the preflight itself and stamps the reply with CORS headers,
     // else the browser refuses what the worker sent. The policy allows
-    // every origin, which Envoy answers by echoing the one that asked
-    // (a browser accepts that and `*` alike), so the check is against
-    // the page's own origin.
+    // every origin, answered as `*` or as the origin that asked, which a
+    // browser accepts alike.
     let origin = "http://postcards.example";
     let call = live::browser_post_json(&disp, &path, origin, &sent).await?;
-    let allowed = |headers: &reqwest::header::HeaderMap| {
-        headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()).map(str::to_string)
+    let allows_page = |headers: &reqwest::header::HeaderMap| {
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "*" || v == origin)
     };
     assert!(call.preflight_status.is_success(), "preflight -> HTTP {}", call.preflight_status);
-    assert_eq!(allowed(&call.preflight_headers).as_deref(), Some(origin), "{:?}", call.preflight_headers);
+    assert!(allows_page(&call.preflight_headers), "{:?}", call.preflight_headers);
     assert!(
-        call.preflight_headers.get("access-control-allow-methods").and_then(|v| v.to_str().ok()).is_some_and(|m| m.contains("POST")),
+        call.preflight_headers
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m == "*" || m.contains("POST")),
         "{:?}", call.preflight_headers
     );
     assert!(call.status.is_success(), "browser POST -> HTTP {}: {}", call.status, String::from_utf8_lossy(&call.body));
-    assert_eq!(allowed(&call.headers).as_deref(), Some(origin), "{:?}", call.headers);
+    assert!(allows_page(&call.headers), "{:?}", call.headers);
+    assert!(
+        call.headers.get("access-control-expose-headers").is_some(),
+        "the page may read the headers the program set: {:?}", call.headers
+    );
     assert!(String::from_utf8_lossy(&call.body).contains("\"stage\":\"done\""));
 
     // ---- The trigger's display, through both doors onto it ----

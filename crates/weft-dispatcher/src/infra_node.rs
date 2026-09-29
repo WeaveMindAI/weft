@@ -9,7 +9,7 @@
 //! twice holds two instances, one row each, and the spelling is what
 //! tells them apart; it is also what every reader prints and every
 //! verb takes, so nothing translates on the way in or out. The
-//! compiled id behind a place is never stored here. The supervisor pod
+//! compiled id behind a place is never stored here. The supervisor
 //! writes status transitions as it executes a claimed
 //! `infra_lifecycle_command`, and writes runtime events (Flaky /
 //! Recovered) and may flip status as part of that execution.
@@ -39,11 +39,9 @@ pub struct InfraNodeRow {
     pub node_id: String,
     /// Whose copy: `None` for the shared one, else the member's.
     pub member: Option<weft_core::member::MemberId>,
-    /// Stable per-apply id (Deployment name etc). Empty string when
-    /// status is `Failed` and the apply never produced one.
+    /// Stable per-copy id the host names the copy's units by. Empty
+    /// string when status is `Failed` and the apply never produced one.
     pub instance_id: String,
-    /// Project namespace (`wft-project-<tenant>-<project>`).
-    pub namespace: String,
     pub status: InfraNodeStatus,
     pub failure_stage: Option<FailureStage>,
     pub failure_message: Option<String>,
@@ -52,21 +50,28 @@ pub struct InfraNodeRow {
     /// apply attempt to decide skip-vs-roll.
     pub applied_spec_hash: Option<String>,
     pub applied_at_unix: Option<i64>,
-    /// Endpoint name → cluster-internal URL. `BTreeMap`: callers
-    /// resolve endpoints by name, and a deterministic order keeps any
-    /// "first" semantics stable.
+    /// Endpoint name → where the project's workers reach it (a URL, or
+    /// `tcp://host:port`). `BTreeMap`: callers resolve endpoints by
+    /// name, and a deterministic order keeps any "first" semantics
+    /// stable.
     pub endpoints: BTreeMap<String, String>,
-    /// Endpoint name → the path a `TenantPublic` endpoint answers at on
-    /// the front door (`/infra/<namespace>/<instance>/<declared path>`),
-    /// for that kind of endpoint only. A path, not a URL: the front
-    /// door's address is the install's, joined on read.
+    /// Endpoint name → the path a `Public` endpoint answers at on the
+    /// front door (`/infra/<project>/<instance>/<declared path>`), for
+    /// that kind of endpoint only. A path, not a URL: the front door's
+    /// address is the install's, joined on read.
     pub public_paths: BTreeMap<String, String>,
-    /// PVC names to KEEP on terminate. Carried from
-    /// `InfraSpec.lifecycle.on_terminate.preserve_pvcs` at apply
-    /// time so the supervisor can honor it at terminate time
-    /// (terminate has no access to the spec; the worker that
-    /// applied the spec is long gone).
-    pub preserve_pvcs: Vec<String>,
+    /// Endpoint name → `host:port` a `SameNetwork` endpoint answers at
+    /// on the install's network, as its host gave it at apply.
+    pub doors: BTreeMap<String, String>,
+    /// Endpoint name → where weft's own roles reach it (the front door,
+    /// the dispatcher reading a unit's `/live`).
+    pub install_endpoints: BTreeMap<String, String>,
+    /// Disks (volume names) to KEEP on terminate. Carried from
+    /// `InfraSpec.keep_on_terminate` at apply time so the supervisor can
+    /// honor it at terminate time (terminate has no access to the spec;
+    /// the worker that applied the spec is long gone). Stored in the
+    /// `preserve_pvcs_json` column.
+    pub keep_disks: Vec<String>,
     /// Per-unit runtime (status + resolved health windows +
     /// stop_behavior), keyed by unit name. The `status` column above
     /// is a rollup over these. Stamped at apply from the spec's units;
@@ -82,18 +87,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id          UUID NOT NULL,
             node_id             TEXT NOT NULL,
             instance_id         TEXT NOT NULL DEFAULT '',
-            namespace           TEXT NOT NULL,
             status              TEXT NOT NULL,
             failure_stage       TEXT,
             failure_message     TEXT,
             applied_spec_hash   TEXT,
             applied_at_unix     BIGINT,
             endpoints_json      JSONB NOT NULL DEFAULT '{}'::jsonb,
-            -- Endpoint name to its front-door path, for TenantPublic
+            -- Endpoint name to its front-door path, for Public
             -- endpoints only. Stamped at apply.
             public_paths_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
-            -- PVC names to preserve on terminate. JSON array;
-            -- empty means "delete all matching PVCs."
+            -- Disk names to keep on terminate. JSON array; empty means
+            -- "delete every disk the copy owns".
             preserve_pvcs_json  JSONB NOT NULL DEFAULT '[]'::jsonb,
             -- Per-unit runtime (status + resolved health windows +
             -- stop_behavior) keyed by unit name. The `status` column
@@ -101,12 +105,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             units_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
             -- Whose copy: NULL for the program's shared one, else the
             -- member whose copy of a `@per_member` node this is.
-            member_id           TEXT
+            member_id           TEXT,
+            -- Endpoint name to the `host:port` a SameNetwork endpoint
+            -- answers at on the install's network. Stamped at apply.
+            doors_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- Endpoint name to where weft's own roles reach it (the
+            -- workers' address unless they sit on a network weft's
+            -- roles are not on). Stamped at apply.
+            install_endpoints_json JSONB NOT NULL DEFAULT '{}'::jsonb
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, member_id) NULLS NOT DISTINCT"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_infra_node_namespace ON infra_node(namespace)"#,
     ],
     seed: &[],
 };
@@ -135,9 +145,9 @@ pub async fn set_status(
 }
 
 /// The columns every read decodes (`parse_row`).
-const ROW_COLUMNS: &str = "project_id, node_id, member_id, instance_id, namespace, status, \
+const ROW_COLUMNS: &str = "project_id, node_id, member_id, instance_id, status, \
      failure_stage, failure_message, applied_spec_hash, \
-     applied_at_unix, endpoints_json, public_paths_json, preserve_pvcs_json, units_json";
+     applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, preserve_pvcs_json, units_json";
 
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
@@ -174,21 +184,6 @@ pub async fn list_for_project(
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(parse_row).collect()
-}
-
-/// Whether ANY infra_node row exists for the project (regardless of
-/// status). The "live infra state exists" fact worker placement keys
-/// on: a project whose infra was never provisioned (or fully
-/// terminated) has no rows, so its worker (including the InfraSetup
-/// provisioning execution) runs in the shared pool; the first apply
-/// writes a row and subsequent workers land in the project namespace.
-pub async fn any_for_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
-    let (exists,): (bool,) =
-        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM infra_node WHERE project_id = $1)")
-            .bind(project_id)
-            .fetch_one(pool)
-            .await?;
-    Ok(exists)
 }
 
 /// Delete one copy's row. Idempotent. Called after a successful
@@ -250,7 +245,7 @@ pub struct PendingOp {
     /// The setup run behind a start, when a setup run is what it is (a
     /// stop of the copy cancels it, so its applies never land after the
     /// stop).
-    pub setup: Option<weft_core::Color>,
+    pub setup: Option<weft_core::ExecutionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,16 +294,16 @@ impl PendingOps {
     }
 
     /// The setup runs bringing this copy up.
-    pub fn setups_starting(&self, node: &str, member: Option<&weft_core::member::MemberId>) -> Vec<weft_core::Color> {
-        let mut colors: Vec<weft_core::Color> = self
+    pub fn setups_starting(&self, node: &str, member: Option<&weft_core::member::MemberId>) -> Vec<weft_core::ExecutionId> {
+        let mut execution_ids: Vec<weft_core::ExecutionId> = self
             .ops
             .iter()
             .filter(|op| op.node.as_deref() == Some(node) && op.copies.admits(member))
             .filter_map(|op| op.setup)
             .collect();
-        colors.sort();
-        colors.dedup();
-        colors
+        execution_ids.sort();
+        execution_ids.dedup();
+        execution_ids
     }
 
     /// Every copy with no row that a start is bringing up, as
@@ -422,33 +417,33 @@ pub async fn pending_ops(
     // task left) starts nothing, and the next start ends it.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
     let setups: Vec<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT ec.color, ec.member_id, e.payload_json FROM execution_color ec \
-         JOIN exec_event e ON e.color = ec.color AND e.kind = 'execution_started' \
+        "SELECT ec.execution_id, ec.member_id, e.payload_json FROM execution ec \
+         JOIN exec_event e ON e.execution_id = ec.execution_id AND e.kind = 'execution_started' \
          WHERE ec.project_id = $1 AND ec.phase = 'infra_setup' \
            AND NOT EXISTS ( \
-             SELECT 1 FROM exec_event t WHERE t.color = ec.color \
+             SELECT 1 FROM exec_event t WHERE t.execution_id = ec.execution_id \
                AND t.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
            )",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (color, member, payload) in setups {
-        let color: weft_core::Color = color.parse().map_err(|e| anyhow::anyhow!("infra setup color '{color}': {e}"))?;
-        if !crate::api::execution::execution_is_being_worked_on(pool, color).await? {
+    for (execution_id, member, payload) in setups {
+        let execution_id: weft_core::ExecutionId = execution_id.parse().map_err(|e| anyhow::anyhow!("infra setup execution '{execution_id}': {e}"))?;
+        if !crate::api::execution::execution_is_being_worked_on(pool, execution_id).await? {
             continue;
         }
         let member = member
             .map(weft_core::member::MemberId::new)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("infra setup {color} member: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("infra setup {execution_id} member: {e}"))?;
         let weft_journal::ExecEvent::ExecutionStarted { subgraph, .. } =
-            weft_journal::decode_event(color, &payload).map_err(anyhow::Error::msg)?
+            weft_journal::decode_event(execution_id, &payload).map_err(anyhow::Error::msg)?
         else {
-            anyhow::bail!("infra setup {color}: its execution_started row holds another event");
+            anyhow::bail!("infra setup {execution_id}: its execution_started row holds another event");
         };
         let Some(subgraph) = subgraph else {
-            anyhow::bail!("infra setup {color} was born without its selection; it cannot say what it brings up");
+            anyhow::bail!("infra setup {execution_id} was born without its selection; it cannot say what it brings up");
         };
         for place in &subgraph.nodes {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
@@ -458,7 +453,7 @@ pub async fn pending_ops(
                     node: Some(spelled),
                     copies: weft_core::member::Copies::of(member.clone()),
                     order: i64::MAX,
-                    setup: Some(color),
+                    setup: Some(execution_id),
                 });
             }
         }
@@ -481,7 +476,6 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("infra_node.member_id for project={project_id} node={node_id}: {e}"))?;
     let instance_id: String = row.try_get("instance_id")?;
-    let namespace: String = row.try_get("namespace")?;
     let status_str: String = row.try_get("status")?;
     let status = InfraNodeStatus::parse(&status_str).ok_or_else(|| {
         anyhow::anyhow!(
@@ -518,8 +512,22 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
+    let doors_json: Value = row.try_get("doors_json")?;
+    let doors: BTreeMap<String, String> = serde_json::from_value(doors_json)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "infra_node.doors_json for project={project_id} node={node_id} \
+                 is not a string-to-string map: {e}"
+            )
+        })?;
+    let install_endpoints_json: Value = row.try_get("install_endpoints_json")?;
+    let install_endpoints: BTreeMap<String, String> = serde_json::from_value(install_endpoints_json).map_err(|e| {
+        anyhow::anyhow!(
+            "infra_node.install_endpoints_json for project={project_id} node={node_id} is not a string-to-string map: {e}"
+        )
+    })?;
     let preserve_pvcs_json: Value = row.try_get("preserve_pvcs_json")?;
-    let preserve_pvcs: Vec<String> = serde_json::from_value(preserve_pvcs_json)
+    let keep_disks: Vec<String> = serde_json::from_value(preserve_pvcs_json)
         .map_err(|e| {
             anyhow::anyhow!(
                 "infra_node.preserve_pvcs_json for project={project_id} node={node_id} \
@@ -533,7 +541,6 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         node_id,
         member,
         instance_id,
-        namespace,
         status,
         failure_stage,
         failure_message,
@@ -541,7 +548,9 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         applied_at_unix,
         endpoints,
         public_paths,
-        preserve_pvcs,
+        doors,
+        install_endpoints,
+        keep_disks,
         units,
     })
 }

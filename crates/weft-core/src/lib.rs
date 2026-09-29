@@ -23,10 +23,14 @@ pub mod frames;
 #[cfg(feature = "runtime")]
 pub mod generator;
 #[cfg(feature = "runtime")]
+pub mod images;
 pub mod in_flight;
 pub mod infra;
+pub mod install;
 pub mod live;
 pub mod member;
+pub mod picks;
+pub mod ports;
 pub mod member_door;
 #[cfg(feature = "runtime")]
 pub mod liveness;
@@ -41,6 +45,7 @@ pub mod project;
 pub mod pulse;
 pub mod route;
 pub mod rules;
+pub mod run_class;
 pub mod run_spec;
 pub mod running_policy;
 #[cfg(feature = "runtime")]
@@ -55,8 +60,6 @@ pub mod signal;
 pub mod signal_token;
 #[cfg(feature = "runtime")]
 pub mod signed_token;
-// The resolver settings every pod weft creates carries.
-pub mod pod_dns;
 // Mostly pure (key grammar, wire types, marker builders: the compiler needs
 // them, so the WASM parse build compiles them too); only its byte-stream
 // aliases are runtime-gated, inside the module.
@@ -164,12 +167,9 @@ pub use access::spec::{AccessSpec, AppRegistration};
 pub use access::{Access, CredentialOwner};
 pub use error::{node_error, NodeErrExt, WeftError, WeftResult};
 pub use infra::{
-    AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
-    Container, ContainerPort, ContainerSecurityContext, EgressRule, Endpoint, EnvEntry, Expose,
-    HttpHeader, Image, IngressRule, InfraProvisionContext, InfraSpec, Lifecycle,
-    Mount, NetworkAccess, PodOptions, PodSecurityContext, PreStopHook, Probe, ProbeKind, Protocol,
-    ProvisionContextError, Resources, ScalingPolicy, StopBehavior, TerminateBehavior, Toleration,
-    Unit, UnitHealth, UnitKind, UpgradeBehavior, Volume, VolumeKind,
+    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Gpu, Image,
+    InfraProvisionContext, InfraSpec, Limits, MachineShape, Mount, Probe, ProbeKind, Protocol,
+    ProvisionContextError, StopBehavior, Unit, UnitHealth, Volume, VolumeKind,
 };
 pub use frames::{Frame, LoopFrames};
 pub use node::{
@@ -212,16 +212,16 @@ pub use tag::StopSelf;
 pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};
 
-/// The identity of ONE execution. A color IS an execution: every
-/// execution is minted exactly one color at `ExecutionStarted`, every
+/// The identity of ONE execution. An execution IS an execution: every
+/// execution is minted exactly one execution at `ExecutionStarted`, every
 /// journal event / pulse / node firing carries it, and when the
-/// execution terminates the color is spent forever (a re-run is a new
-/// execution with a NEW color). So "per color" always means "per
+/// execution terminates the execution is spent forever (a re-run is a new
+/// execution with a NEW execution). So "per execution" always means "per
 /// execution", never "per project" or "per anything reused across
-/// runs". At most one worker drives a given color at a time (the
-/// one-worker-per-color invariant keeps that color's journal a single
-/// coherent stream); there is nothing to retry "across colors".
-pub type Color = uuid::Uuid;
+/// runs". At most one worker drives a given execution at a time (the
+/// one-worker-per-execution invariant keeps that execution's journal a single
+/// coherent stream); there is nothing to retry "across executions".
+pub type ExecutionId = uuid::Uuid;
 
 #[cfg(test)]
 mod helper_tests {

@@ -1,7 +1,7 @@
 //! Infra node lifecycle: provision, wait-to-running, read outputs, terminate.
 //!
-//! Infra nodes are long-running backing services the platform provisions on
-//! k8s. The rig drives them through the real CLI (`weft infra start|terminate`,
+//! Infra nodes are long-running backing services the platform provisions
+//! (Docker containers on a local install). The rig drives them through the real CLI (`weft infra start|terminate`,
 //! the user's path) and observes status through the dispatcher API
 //! (`GET /projects/{id}/infra/status` -> `{ nodes: [{ node, status,
 //! endpoint_url, ... }] }`, `node` being the instance's PLACE spelled
@@ -20,7 +20,7 @@ use crate::client::{poll_until, Dispatcher};
 use crate::project::Project;
 
 /// How long to wait for an infra node to become `running`. Provisioning pulls /
-/// builds an image, applies manifests, and waits for the pod's readiness probe,
+/// builds an image, starts the unit's containers, and waits for its readiness probe,
 /// so this is generous. It is an internal transition the rig controls, so a
 /// bound is correct.
 const INFRA_RUNNING_DEADLINE: Duration = Duration::from_secs(300);
@@ -103,10 +103,8 @@ pub async fn wait_running(project: &Project, node: &str) -> Result<String> {
 
 /// Call an HTTP route on an infra endpoint URL (e.g. `/outputs`, `/health`, a
 /// node's `/action`). Returns the raw bytes. The endpoint URL is the
-/// cluster-internal service URL the dispatcher resolved; the rig reaches it
-/// through the same gateway/ingress the dispatcher exposes for it. Endpoints
-/// not exposed outside the cluster cannot be hit directly; in that case assert
-/// via the run's `/outputs`-fed node output ports instead.
+/// address the install shows for it: on a local install, the unit's port
+/// published on this machine's loopback, which the rig reaches directly.
 pub async fn call_endpoint(disp: &Dispatcher, endpoint_url: &str, path: &str) -> Result<Vec<u8>> {
     let url = format!("{}/{}", endpoint_url.trim_end_matches('/'), path.trim_start_matches('/'));
     let (status, bytes) = disp.get_abs_raw(&url).await?;

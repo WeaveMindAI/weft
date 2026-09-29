@@ -38,15 +38,13 @@ use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
 use weft_e2e::{ensure, human, infra, run, Project, SettledRun};
 
-/// Source flips the infra concern on and off: a no-infra project runs in the
-/// shared pool and offers no infra verbs; adding MiniService to source and
-/// starting infra moves the worker into the project namespace and lights the
+/// Source flips the infra concern on and off: a no-infra project offers no
+/// infra verbs; adding MiniService to source and starting infra lights the
 /// infra controls; removing it from source orphans the LIVE infra (visible,
 /// non-gating, still stoppable) until the user terminates it.
 #[tokio::test]
 async fn source_flips_infra_and_orphan_lifecycle() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let platform = weft_e2e::Platform::connect(&disp).await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
 
@@ -61,12 +59,6 @@ async fn source_flips_infra_and_orphan_lifecycle() -> anyhow::Result<()> {
     let s = status::fetch(&disp, &pid).await?;
     anyhow::ensure!(!s.has_infra() && !s.orphaned_infra(), "no-infra project reports infra");
     s.assert_actions_exactly(&["run"])?;
-    // And the worker lives in the shared pool.
-    let pods = platform.worker_pods_for_project(&pid).await?;
-    anyhow::ensure!(
-        pods.iter().any(|p| p.namespace == "wft-shared-workers"),
-        "no-infra worker must be in the shared pool; rows: {pods:?}"
-    );
 
     // Source gains infra: import the node, rewrite main, start infra.
     project.add_node_from_fixture("infra_min", "mini_service")?;
@@ -77,18 +69,9 @@ async fn source_flips_infra_and_orphan_lifecycle() -> anyhow::Result<()> {
     anyhow::ensure!(s.has_infra(), "registered definition must declare infra now");
     s.assert_actions_exactly(&["run", "infra_stop", "infra_terminate"])?;
 
-    // A run against running infra works and the worker sits in the project
-    // namespace (every alive pod: provisioning included, per the network
-    // wall around infra).
+    // A run against running infra works.
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
-    let pods = platform.worker_pods_for_project(&pid).await?;
-    for p in pods.iter().filter(|p| p.status == "alive" || p.status == "spawning") {
-        anyhow::ensure!(
-            p.namespace.starts_with("wft-project-"),
-            "infra project's live worker must be in the project namespace; got {p:?}"
-        );
-    }
 
     // Source LOSES infra while it is live: the next verb re-registers the
     // no-infra shape; the live infra becomes an ORPHAN: visible, offered
@@ -145,7 +128,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     status::fetch(&disp, &pid)
         .await?
         .assert_actions_exactly(&["run", "infra_stop", "infra_terminate"])?;
-    let color = run::start(&mut project).await?;
+    let execution_id = run::start(&mut project).await?;
     status::wait_until(&disp, &pid, "run to be live", STATUS_DEADLINE, |s| {
         s.running_count() >= 1
     })
@@ -173,7 +156,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     .await?;
     assert_run_rejected(&project, "infra stop draining", LIFECYCLE_GATE).await?;
     anyhow::ensure!(
-        exec_status(&disp, color).await? == "running",
+        exec_status(&disp, execution_id).await? == "running",
         "the Wait drain must not kill the running execution"
     );
 
@@ -186,7 +169,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     })
     .await?;
     anyhow::ensure!(
-        exec_status(&disp, color).await? == "running",
+        exec_status(&disp, execution_id).await? == "running",
         "infra cancel must not touch the running execution"
     );
     let stop_out = stop.await??;
@@ -198,7 +181,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
 
     // Release: the held execution completes untouched by all of the above.
     gate.set_body(RELEASE).await;
-    SettledRun::observe(&disp, color)
+    SettledRun::observe(&disp, execution_id)
         .await?
         .completed()?
         .assert_input("out", "data", &json!("released"))?;
@@ -231,8 +214,8 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     assert_verb_rejected(&disp, &format!("/projects/{pid}/activate"), "already active").await?;
 
     // Fire: the execution holds.
-    let before = run::execution_colors(&disp, &pid).await?;
-    let color = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
+    let before = run::executions(&disp, &pid).await?;
+    let execution_id = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
 
     // Deactivate with Wait: the drain holds the verb open. The window offers
     // exactly give-up (cancel_running) and change-your-mind (resume_active).
@@ -261,7 +244,7 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
     let _ = deact.await??; // the resumed deactivate returns; its exit is the CLI's report of the resume
     anyhow::ensure!(
-        exec_status(&disp, color).await? == "running",
+        exec_status(&disp, execution_id).await? == "running",
         "resume_active must leave the running execution alone"
     );
 
@@ -292,7 +275,7 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
         "deactivate must complete once the drain is cancelled; stderr: {}",
         deact_out.stderr
     );
-    let settled = SettledRun::observe(&disp, color).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     anyhow::ensure!(
         settled.status == "cancelled",
         "cancel_running must cancel the held execution; got {}",
@@ -310,9 +293,9 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
 
     gate.set_body(RELEASE).await;
-    let before = run::execution_colors(&disp, &pid).await?;
-    let color = fire_until_execution(&feed, &disp, &pid, "go2", &before).await?;
-    SettledRun::observe(&disp, color)
+    let before = run::executions(&disp, &pid).await?;
+    let execution_id = fire_until_execution(&feed, &disp, &pid, "go2", &before).await?;
+    SettledRun::observe(&disp, execution_id)
         .await?
         .completed()?
         .assert_input("out", "data", &json!("released"))?;
@@ -366,9 +349,9 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
         .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
 
     // The revived deployment actually fires end to end.
-    let before = run::execution_colors(&disp, &pid).await?;
-    let color = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
-    SettledRun::observe(&disp, color)
+    let before = run::executions(&disp, &pid).await?;
+    let execution_id = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
+    SettledRun::observe(&disp, execution_id)
         .await?
         .completed()?
         .assert_input("out", "data", &json!("released"))?;
@@ -399,10 +382,10 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
     project.activate().await?;
 
     // Fire and run to the HumanQuery suspension.
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
     feed.wait_for_subscriber(Duration::from_secs(60)).await?;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let color =
+    let execution_id =
         run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
 
@@ -418,7 +401,7 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
         "preserved suspension must offer reactivate, got {:?}",
         s.available_actions()
     );
-    let status = exec_status(&disp, color).await?;
+    let status = exec_status(&disp, execution_id).await?;
     anyhow::ensure!(
         status == "waiting_for_input",
         "deactivate must not touch a suspended execution \
@@ -434,7 +417,7 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
         .await?;
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
-    SettledRun::observe(&disp, color)
+    SettledRun::observe(&disp, execution_id)
         .await?
         .completed()?
         .assert_input("out", "data", &json!(true))?;

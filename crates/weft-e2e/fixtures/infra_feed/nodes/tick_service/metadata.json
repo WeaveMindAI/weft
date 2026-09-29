@@ -1,0 +1,22 @@
+{
+  "type": "TickService",
+  "label": "Tick Service",
+  "description": "An infra node streaming a `tick` Server-Sent Event every second at `/events`. Used by the e2e rig to prove the listener reaches a program's own infrastructure.",
+  "tags": [
+    "infra",
+    "e2e"
+  ],
+  "icon": "Radio",
+  "color": "#22c55e",
+  "outputs": [
+    {
+      "name": "eventsUrl",
+      "type": "String"
+    }
+  ],
+  "requires_infra": true,
+  "images": [
+    "images/tick_service"
+  ],
+  "features": {}
+}

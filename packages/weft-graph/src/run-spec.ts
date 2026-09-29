@@ -50,6 +50,8 @@ export interface RunSpec {
   /// Who the run is for: one member of the program. Needed only when the
   /// run reaches something that exists once per member.
   member?: string;
+  /// How long the run may run (`weft run --long`); absent means `short`.
+  run_class?: 'short' | 'long';
 }
 
 /// A member id: the grammar of one storage key segment.
@@ -86,8 +88,11 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'member'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'member', 'run_class'], 'spec');
   string(spec.name, 'name');
+  if (spec.run_class != null && spec.run_class !== 'short' && spec.run_class !== 'long') {
+    throw new Error(`run_class: '${String(spec.run_class)}' is not a run class; use 'short' or 'long'`);
+  }
   if (spec.member != null) {
     string(spec.member, 'member');
     if (!MEMBER_ID_PATTERN.test(spec.member as string)) throw new Error(`member: '${spec.member}' is not a valid member id`);
@@ -119,8 +124,8 @@ export function parseRunSpec(value: unknown): RunSpec {
   if (spec.caller !== undefined) array(spec.caller, 'caller');
   if (spec.frozen_from != null) {
     const origin = object(spec.frozen_from, 'frozen_from');
-    fields(origin, ['version', 'color', 'definition_hash'], 'frozen_from');
-    for (const key of ['version', 'color', 'definition_hash']) string(origin[key], `frozen_from.${key}`);
+    fields(origin, ['version', 'execution_id', 'definition_hash'], 'frozen_from');
+    for (const key of ['version', 'execution_id', 'definition_hash']) string(origin[key], `frozen_from.${key}`);
   }
   if (spec.expected != null) {
     const expected = object(spec.expected, 'expected');
@@ -153,7 +158,7 @@ export interface Answer {
 
 export interface FrozenFrom {
   version: string;
-  color: string;
+  execution_id: string;
   definition_hash: string;
 }
 
@@ -188,7 +193,7 @@ export interface ProgramIdentity {
 export interface BakeSummary {
   program: ProgramIdentity;
   captured: string[];
-  color: string;
+  execution_id: string;
   at_unix: number;
 }
 

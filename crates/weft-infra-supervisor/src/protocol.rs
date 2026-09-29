@@ -35,7 +35,7 @@ pub struct HealthProtocol {
     pub timeout_seconds: u32,
 }
 
-/// Default action timeout (30 min). A hung broker/kube call inside a
+/// Default action timeout (30 min). A hung broker/host call inside a
 /// HealthProtocol action is bounded by this; the action fails loud
 /// and the slot frees. There is no "unbounded" option by design.
 fn default_action_timeout_seconds() -> u32 {
@@ -48,10 +48,10 @@ fn wildcard() -> String {
     "*".into()
 }
 
-/// A condition on units reads only the units whose workload the health
-/// loop has seen: a unit whose workload has not appeared yet is unknown,
-/// and no condition on units is true of it (it is neither ready nor
-/// broken). One that was seen and then vanished reads as zero ready.
+/// A condition on units reads only the units the host has reported: a
+/// unit it has not reported yet is unknown, and no condition on units is
+/// true of it (it is neither ready nor broken). One that was reported and
+/// then vanished reads as not ready.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HealthCondition {
@@ -64,21 +64,13 @@ pub enum HealthCondition {
         #[serde(default = "wildcard")]
         unit: String,
     },
-    NodeReadyRatioBelow {
-        node_id: String,
-        /// Unit selector. `"*"` (default) scans every unit of the
-        /// matched node(s). Health is per-unit, so a condition can
-        /// target one unit to match the unit-aware actions.
-        #[serde(default = "wildcard")]
-        unit: String,
-        ratio: f32,
-    },
-    NodeReadyReplicas {
+    /// Some matched unit is not ready right now, whatever its latch
+    /// says: the instant reading, for a protocol that must not wait the
+    /// flaky window.
+    NodeNotReady {
         node_id: String,
         #[serde(default = "wildcard")]
         unit: String,
-        op: CompareOp,
-        value: u32,
     },
     /// Match against the project's current lifecycle status. Used
     /// to express "this protocol applies only when the project is
@@ -114,17 +106,6 @@ pub enum HealthCondition {
     Not { cond: Vec<HealthCondition> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompareOp {
-    Eq,
-    Ne,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProtocolAction {
@@ -141,16 +122,10 @@ pub enum ProtocolAction {
     /// broken holds back only its own readers.
     AutoRecover,
     Notify { channel: String },
-    /// Scale `unit` of the copies of `node_id` owned by whoever owns a
+    /// Restart `unit` of the copies of `node_id` owned by whoever owns a
     /// copy the condition finds broken: the shared copy for a broken
-    /// shared one, ada's for a broken copy of ada's.
-    Scale {
-        node_id: String,
-        unit: String,
-        replicas: u32,
-    },
-    /// Delete the Pods of `unit` in the same copies `Scale` reaches.
-    BouncePods {
+    /// shared one, ada's for a broken copy of ada's. Its disks are kept.
+    RestartUnit {
         node_id: String,
         unit: String,
     },
@@ -158,8 +133,8 @@ pub enum ProtocolAction {
 
 impl ProtocolAction {
     /// Whether this action acts on the copies its condition finds broken
-    /// ([`broken_copies`]): it takes their readers down, or scales or
-    /// bounces their owners' copies. When its condition names no infra
+    /// ([`broken_copies`]): it takes their readers down, or restarts
+    /// their owners' copies. When its condition names no infra
     /// ([`names_infra`]), see [`ProtocolAction::unowned_scope`].
     pub fn aims_at_broken_copies(&self) -> bool {
         matches!(
@@ -167,18 +142,17 @@ impl ProtocolAction {
             Self::ParkTriggers
                 | Self::HibernateTriggers { .. }
                 | Self::WipeTriggers
-                | Self::Scale { .. }
-                | Self::BouncePods { .. }
+                | Self::RestartUnit { .. }
         )
     }
 
     /// Where an action on broken copies lands when its condition names
-    /// no infra, so nothing says which copies are broken: a scale or a
-    /// bounce on the named node's shared copy, a take-down on the whole
-    /// project (the empty set).
+    /// no infra, so nothing says which copies are broken: a restart of
+    /// the named node's shared copy, a take-down on the whole project
+    /// (the empty set).
     pub fn unowned_scope(&self) -> BTreeSet<InfraCopy> {
         match self {
-            Self::Scale { node_id, .. } | Self::BouncePods { node_id, .. } => {
+            Self::RestartUnit { node_id, .. } => {
                 BTreeSet::from([InfraCopy { node_id: node_id.clone(), member: None }])
             }
             _ => BTreeSet::new(),
@@ -189,13 +163,11 @@ impl ProtocolAction {
 /// Whether `cond` holds a condition on units in a positive place (not
 /// under a `not`): the leaves [`broken_copies`] reads. A protocol acting
 /// on broken copies whose condition names none acts where it did before
-/// copies had owners: a take-down on the whole project, a scale or a
-/// bounce on the named node's shared copy.
+/// copies had owners: a take-down on the whole project, a restart of the
+/// named node's shared copy.
 pub(crate) fn names_infra(cond: &HealthCondition) -> bool {
     match cond {
-        HealthCondition::NodeFlaky { .. }
-        | HealthCondition::NodeReadyRatioBelow { .. }
-        | HealthCondition::NodeReadyReplicas { .. } => true,
+        HealthCondition::NodeFlaky { .. } | HealthCondition::NodeNotReady { .. } => true,
         HealthCondition::All { conds } | HealthCondition::Any { conds } => conds.iter().any(names_infra),
         HealthCondition::Not { .. } | HealthCondition::ProjectStatusEq { .. } | HealthCondition::HealthParked => false,
     }
@@ -261,18 +233,17 @@ pub fn default_protocols() -> HealthProtocols {
     }
 }
 
-/// One unit of one deployed copy, as this look saw it. Only units whose
-/// workload the loop has seen are here (see [`HealthCondition`]), and
-/// only units expected to run now (running or flaky).
+/// One unit of one deployed copy, as this look saw it. Only units the
+/// host has reported are here (see [`HealthCondition`]), and only units
+/// expected to run now (running or flaky).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnitView {
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
     pub member: Option<weft_core::member::MemberId>,
     pub unit: String,
-    /// Ready over desired, clamped to [0, 1]; 1.0 when none is desired.
-    pub ready_ratio: f32,
-    pub ready: u32,
+    /// The host reports it running and every readiness check passing.
+    pub ready: bool,
     /// The unit's latched health (`evaluate_node_health`).
     pub flaky: bool,
 }
@@ -286,9 +257,9 @@ impl UnitView {
     /// when `cond` is not a condition on units.
     fn satisfies(&self, cond: &HealthCondition) -> Option<bool> {
         let (node_id, unit) = match cond {
-            HealthCondition::NodeFlaky { node_id, unit }
-            | HealthCondition::NodeReadyRatioBelow { node_id, unit, .. }
-            | HealthCondition::NodeReadyReplicas { node_id, unit, .. } => (node_id, unit),
+            HealthCondition::NodeFlaky { node_id, unit } | HealthCondition::NodeNotReady { node_id, unit } => {
+                (node_id, unit)
+            }
             _ => return None,
         };
         if !selector_matches(node_id, unit, &self.node_id, &self.unit) {
@@ -296,23 +267,9 @@ impl UnitView {
         }
         Some(match cond {
             HealthCondition::NodeFlaky { .. } => self.flaky,
-            HealthCondition::NodeReadyRatioBelow { ratio, .. } => self.ready_ratio < *ratio,
-            HealthCondition::NodeReadyReplicas { op, value, .. } => op.holds(self.ready, *value),
+            HealthCondition::NodeNotReady { .. } => !self.ready,
             _ => unreachable!("matched a condition on units above"),
         })
-    }
-}
-
-impl CompareOp {
-    fn holds(self, n: u32, value: u32) -> bool {
-        match self {
-            CompareOp::Eq => n == value,
-            CompareOp::Ne => n != value,
-            CompareOp::Lt => n < value,
-            CompareOp::Lte => n <= value,
-            CompareOp::Gt => n > value,
-            CompareOp::Gte => n >= value,
-        }
     }
 }
 
@@ -340,9 +297,7 @@ pub fn evaluate_condition(cond: &HealthCondition, ctx: &ConditionContext<'_>) ->
         // A condition on units holds when some seen unit satisfies it;
         // over no seen unit it is false (an unknown unit is neither
         // ready nor broken).
-        HealthCondition::NodeFlaky { .. }
-        | HealthCondition::NodeReadyRatioBelow { .. }
-        | HealthCondition::NodeReadyReplicas { .. } => {
+        HealthCondition::NodeFlaky { .. } | HealthCondition::NodeNotReady { .. } => {
             ctx.units.iter().any(|u| u.satisfies(cond) == Some(true))
         }
         HealthCondition::ProjectStatusEq { status } => ctx.project_status == *status,
@@ -362,8 +317,8 @@ pub fn evaluate_condition(cond: &HealthCondition, ctx: &ConditionContext<'_>) ->
 /// units: what an auto-recover keeps the readers of down. A condition on
 /// units reads only that copy's; a condition on the project (its status,
 /// whether the health loop parked something) reads the same for every
-/// copy. Only seen copies are candidates: a copy whose workload is
-/// unknown is neither broken nor recovered, so it holds back nobody.
+/// copy. Only seen copies are candidates: a copy the host has not
+/// reported is neither broken nor recovered, so it holds back nobody.
 pub fn still_broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> BTreeSet<InfraCopy> {
     let copies: BTreeSet<InfraCopy> = ctx.units.iter().map(UnitView::copy).collect();
     copies
@@ -380,9 +335,7 @@ pub fn still_broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -
 /// `not`). What a take-down action aims at: the triggers reading these.
 pub fn broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> BTreeSet<InfraCopy> {
     match cond {
-        HealthCondition::NodeFlaky { .. }
-        | HealthCondition::NodeReadyRatioBelow { .. }
-        | HealthCondition::NodeReadyReplicas { .. } => ctx
+        HealthCondition::NodeFlaky { .. } | HealthCondition::NodeNotReady { .. } => ctx
             .units
             .iter()
             .filter(|u| u.satisfies(cond) == Some(true))
@@ -404,8 +357,8 @@ mod tests {
     use weft_core::member::MemberId;
 
     /// One seen unit of the shared copy of `node` (unit named after it).
-    fn unit(node: &str, ratio: f32, ready: u32, flaky: bool) -> UnitView {
-        UnitView { node_id: node.into(), member: None, unit: node.into(), ready_ratio: ratio, ready, flaky }
+    fn unit(node: &str, ready: bool, flaky: bool) -> UnitView {
+        UnitView { node_id: node.into(), member: None, unit: node.into(), ready, flaky }
     }
 
     fn ctx(units: &[UnitView]) -> ConditionContext<'_> {
@@ -416,61 +369,33 @@ mod tests {
         evaluate_condition(cond, &ctx(units))
     }
 
-    fn ratio_below(node: &str, ratio: f32) -> HealthCondition {
-        HealthCondition::NodeReadyRatioBelow { node_id: node.into(), unit: "*".into(), ratio }
-    }
-
-    fn replicas(node: &str, op: CompareOp, value: u32) -> HealthCondition {
-        HealthCondition::NodeReadyReplicas { node_id: node.into(), unit: "*".into(), op, value }
+    fn not_ready(node: &str) -> HealthCondition {
+        HealthCondition::NodeNotReady { node_id: node.into(), unit: "*".into() }
     }
 
     fn flaky(node: &str) -> HealthCondition {
         HealthCondition::NodeFlaky { node_id: node.into(), unit: "*".into() }
     }
 
-    // ---------- evaluate_condition: NodeReadyRatioBelow ----------
+    // ---------- evaluate_condition: NodeNotReady ----------
 
     #[test]
-    fn ratio_below_strict_for_named_node() {
-        assert!(ev(&ratio_below("n1", 1.0), &[unit("n1", 0.5, 1, false)]));
-        assert!(!ev(&ratio_below("n1", 1.0), &[unit("n1", 1.0, 1, false)]), "at the threshold is not below");
+    fn not_ready_reads_the_instant_for_the_named_node_or_all() {
+        assert!(ev(&not_ready("n1"), &[unit("n1", false, false)]));
+        assert!(!ev(&not_ready("n1"), &[unit("n1", true, false)]));
+        assert!(!ev(&not_ready("n1"), &[unit("n2", false, false)]));
+        assert!(ev(&not_ready("*"), &[unit("a", true, false), unit("b", false, false)]));
     }
 
-    #[test]
-    fn ratio_wildcard_scans_all_nodes() {
-        assert!(ev(&ratio_below("*", 1.0), &[unit("a", 1.0, 1, false), unit("b", 0.3, 0, false)]));
-        assert!(!ev(&ratio_below("*", 1.0), &[unit("a", 1.0, 1, false), unit("b", 1.0, 1, false)]));
-    }
-
-    // ---------- evaluate_condition: NodeReadyReplicas ----------
-
-    #[test]
-    fn replicas_compare_ops() {
-        let m = [unit("n", 1.0, 3, false)];
-        assert!(ev(&replicas("n", CompareOp::Eq, 3), &m));
-        assert!(!ev(&replicas("n", CompareOp::Eq, 2), &m));
-        assert!(ev(&replicas("n", CompareOp::Ne, 2), &m));
-        assert!(!ev(&replicas("n", CompareOp::Ne, 3), &m));
-        assert!(ev(&replicas("n", CompareOp::Lt, 5), &m));
-        assert!(!ev(&replicas("n", CompareOp::Lt, 3), &m));
-        assert!(ev(&replicas("n", CompareOp::Lte, 3), &m));
-        assert!(ev(&replicas("n", CompareOp::Gt, 1), &m));
-        assert!(!ev(&replicas("n", CompareOp::Gt, 3), &m));
-        assert!(ev(&replicas("n", CompareOp::Gte, 3), &m));
-    }
-
-    /// A unit whose workload has not been seen is not in the look at all,
-    /// and no condition on units is true of it: not "zero ready", not
-    /// "below ratio", not flaky, named or wildcard. This is what keeps a
-    /// copy that was just applied, before its workload reached the
-    /// watch, from reading as broken.
+    /// A unit the host has not reported is not in the look at all, and no
+    /// condition on units is true of it: not "not ready", not flaky, named
+    /// or wildcard. This is what keeps a copy that was just applied,
+    /// before the host reports it, from reading as broken.
     #[test]
     fn an_unseen_unit_satisfies_no_condition_on_units() {
         for cond in [
-            replicas("ghost", CompareOp::Eq, 0),
-            replicas("*", CompareOp::Eq, 0),
-            ratio_below("ghost", 1.0),
-            ratio_below("*", 1.0),
+            not_ready("ghost"),
+            not_ready("*"),
             flaky("ghost"),
             flaky("*"),
         ] {
@@ -483,15 +408,15 @@ mod tests {
 
     // ---------- evaluate_condition: NodeFlaky ----------
 
-    /// `node_flaky` reads the latch, never the instantaneous count: a
-    /// unit at zero ready that is not (yet) declared flaky does not
+    /// `node_flaky` reads the latch, never the instant reading: a unit
+    /// not ready that is not (yet) declared flaky does not
     /// satisfy it, and one declared flaky does even while momentarily
     /// ready inside its recovery window.
     #[test]
     fn flaky_reads_the_latch_not_the_reading() {
-        assert!(!ev(&flaky("*"), &[unit("n", 0.0, 0, false)]));
-        assert!(ev(&flaky("*"), &[unit("n", 1.0, 1, true)]));
-        assert!(!ev(&flaky("other"), &[unit("n", 0.0, 0, true)]));
+        assert!(!ev(&flaky("*"), &[unit("n", false, false)]));
+        assert!(ev(&flaky("*"), &[unit("n", true, true)]));
+        assert!(!ev(&flaky("other"), &[unit("n", false, true)]));
     }
 
     // ---------- broken_copies ----------
@@ -503,9 +428,9 @@ mod tests {
     fn broken_copies_name_whose_copy_is_broken() {
         let ada = MemberId::new("ada").unwrap();
         let units = [
-            UnitView { member: Some(ada.clone()), ..unit("svc", 0.0, 0, true) },
-            UnitView { member: Some(MemberId::new("bob").unwrap()), ..unit("svc", 1.0, 1, false) },
-            unit("db", 1.0, 1, false),
+            UnitView { member: Some(ada.clone()), ..unit("svc", false, true) },
+            UnitView { member: Some(MemberId::new("bob").unwrap()), ..unit("svc", true, false) },
+            unit("db", true, false),
         ];
         let park = &default_protocols().protocols[0].when;
         assert!(ev(park, &units));
@@ -513,7 +438,7 @@ mod tests {
             broken_copies(park, &ctx(&units)),
             BTreeSet::from([InfraCopy { node_id: "svc".into(), member: Some(ada) }])
         );
-        let negated = HealthCondition::Not { cond: vec![replicas("*", CompareOp::Eq, 1)] };
+        let negated = HealthCondition::Not { cond: vec![not_ready("*")] };
         assert!(broken_copies(&negated, &ctx(&units)).is_empty());
     }
 
@@ -524,9 +449,9 @@ mod tests {
     fn still_broken_copies_are_read_copy_by_copy() {
         let bob = MemberId::new("bob").unwrap();
         let units = [
-            UnitView { member: Some(MemberId::new("ada").unwrap()), ..unit("svc", 1.0, 1, false) },
-            UnitView { member: Some(bob.clone()), ..unit("svc", 0.0, 0, true) },
-            unit("db", 1.0, 1, false),
+            UnitView { member: Some(MemberId::new("ada").unwrap()), ..unit("svc", true, false) },
+            UnitView { member: Some(bob.clone()), ..unit("svc", false, true) },
+            unit("db", true, false),
         ];
         let recover = &default_protocols().protocols[1].when;
         let parked = ConditionContext { health_parked: true, ..ctx(&units) };
@@ -597,12 +522,7 @@ mod tests {
         // Wire-shape test: a hand-authored `Not` survives the
         // serialize → deserialize path the broker uses.
         let original = HealthCondition::Not {
-            cond: vec![HealthCondition::NodeReadyReplicas {
-                node_id: "n1".into(),
-                unit: "*".into(),
-                op: CompareOp::Eq,
-                value: 0,
-            }],
+            cond: vec![HealthCondition::NodeNotReady { node_id: "n1".into(), unit: "*".into() }],
         };
         let s = serde_json::to_string(&original).expect("serialize");
         let back: HealthCondition = serde_json::from_str(&s).expect("deserialize");
@@ -650,8 +570,8 @@ mod tests {
         // action-hang wedge. This locks the snake_case key.
         let json = r#"{
             "name": "p",
-            "when": { "kind": "node_ready_replicas", "node_id": "n", "op": "eq", "value": 0 },
-            "action": { "kind": "bounce_pods", "node_id": "n", "unit": "u" },
+            "when": { "kind": "node_not_ready", "node_id": "n" },
+            "action": { "kind": "restart_unit", "node_id": "n", "unit": "u" },
             "timeout_seconds": 42
         }"#;
         let proto: HealthProtocol = serde_json::from_str(json).expect("deserialize");
@@ -665,8 +585,8 @@ mod tests {
         // "Unbounded" is not expressible (the field is non-optional).
         let json = r#"{
             "name": "p",
-            "when": { "kind": "node_ready_replicas", "node_id": "n", "op": "eq", "value": 0 },
-            "action": { "kind": "bounce_pods", "node_id": "n", "unit": "u" }
+            "when": { "kind": "node_not_ready", "node_id": "n" },
+            "action": { "kind": "restart_unit", "node_id": "n", "unit": "u" }
         }"#;
         let proto: HealthProtocol = serde_json::from_str(json).expect("deserialize");
         assert_eq!(

@@ -36,7 +36,7 @@ async fn one_file_two_fetches_and_a_run_that_reads_back() -> Result<()> {
 
     let mut project = Project::prepare("fetch_once", disp.clone()).await?;
     let pid = project.id();
-    set_account(&project, "bot", "account", conn.handle())?;
+    set_account(&project, "bot", conn.handle()).await?;
     project.set_node_config("send", "chatId", &format!("{chat:?}"))?;
     // The bot's own getMe answer is the file: a URL the run already has
     // the right to fetch, and no third host to depend on.
@@ -71,13 +71,13 @@ async fn one_file_two_fetches_and_a_run_that_reads_back() -> Result<()> {
 
     // The summary carries its phase, the listing filters by it, and the
     // activate left a setup run behind.
-    let color = settled.color;
-    let one: Value = disp.get_json(&format!("/executions/{color}")).await?;
+    let execution_id = settled.execution_id;
+    let one: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
     anyhow::ensure!(one["phase"] == "fire", "the manual run is a fire: {one}");
     let fires: Value =
         disp.get_json(&format!("/executions?project_id={pid}&phase=fire&limit=50")).await?;
     anyhow::ensure!(
-        fires["executions"].as_array().is_some_and(|rows| rows.iter().any(|r| r["color"] == color.to_string())),
+        fires["executions"].as_array().is_some_and(|rows| rows.iter().any(|r| r["execution_id"] == execution_id.to_string())),
         "the fire listing holds the run: {fires}"
     );
     let setups: Value =
@@ -88,7 +88,7 @@ async fn one_file_two_fetches_and_a_run_that_reads_back() -> Result<()> {
     // The worker hands each line over as a task that a dispatcher writes
     // into the journal when it gets to it, so a line can land after the
     // run already reads as finished: wait for it rather than read once.
-    let path = format!("/executions/{color}/logs");
+    let path = format!("/executions/{execution_id}/logs");
     let seen = std::sync::Mutex::new(Value::Null);
     weft_e2e::poll_until_describing(
         "the Debug node's log line, naming it",

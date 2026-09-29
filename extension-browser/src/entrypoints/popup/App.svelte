@@ -2,6 +2,12 @@
   import { onMount } from 'svelte';
   import { fetchPendingTasks, skipTask, cancelRun, clearAll, getTokens, addToken, removeToken, hostPermissionPattern, isTrigger, releaseHostIfUnused, GRANT_DECLINED_MESSAGE, type PendingTask, type ApiToken } from '../../lib/api';
   import { getSettings, saveSettings } from '../../lib/settings';
+
+  // Where the default install answers; a bare token goes there.
+  // SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC), setup.sh,
+  // deploy/terraform/gcp/network.tf,
+  // extension-vscode/src/localInstall.ts
+  const LOCAL_INSTALL_URL = 'http://127.0.0.1:14111';
   import { singleFlight } from '../../lib/single-flight';
 
   let allItems = $state<PendingTask[]>([]);
@@ -201,7 +207,7 @@
     for (const t of tokens) {
       try {
         const counts = await clearAll(t);
-        cancelled += counts.colorsCancelled;
+        cancelled += counts.executionsCancelled;
         triggersDropped += counts.entrySignalsDropped;
       } catch (e) {
         console.warn('[weft] clearAll failed for', t.name, e);
@@ -236,7 +242,7 @@
       // Accepted formats (the address the website / `weft token mint` copies):
       //   http://host:port/signal-token/TOKEN          (server-qualified address)
       //   http://host:port/signal-token/TOKEN/signals  (with the /signals suffix)
-      //   TOKEN                                        (uses http://localhost:9999)
+      //   TOKEN                                        (uses LOCAL_INSTALL_URL)
       let token: string;
       let dispatcherUrl: string;
 
@@ -248,11 +254,11 @@
         if (idx >= 0 && pathParts[idx + 1]) {
           token = pathParts[idx + 1];
         } else {
-          throw new Error('Invalid URL format. Expected: http://localhost:9999/signal-token/TOKEN');
+          throw new Error(`Invalid URL format. Expected: ${LOCAL_INSTALL_URL}/signal-token/TOKEN`);
         }
       } else {
         token = newTokenUrl.trim();
-        dispatcherUrl = 'http://localhost:9999';
+        dispatcherUrl = LOCAL_INSTALL_URL;
       }
 
       // Ask the browser for access to this runtime's host. The manifest

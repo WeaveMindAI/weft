@@ -16,11 +16,11 @@
 //! the file. Any unrecoverable failure aborts the upload (`upload/abort`, freeing
 //! the quota reservation) and surfaces loud. A get is simpler: `download-url`
 //! returns the metadata + a presigned GET URL, and the worker reads the bytes
-//! DIRECTLY from the bucket. Presigned URLs are signed for the worker's in-cluster
+//! DIRECTLY from the bucket. Presigned URLs are signed for the worker's internal
 //! endpoint.
 //!
 //! There is no "ensure the storage exists" handshake and no retry-on-
-//! unreachable dance: the broker is a long-lived cluster service, always up
+//! unreachable dance: the broker is a long-lived install service, always up
 //! like the journal, so an unreachable broker is a real failure surfaced to
 //! the node, not a transient to paper over.
 
@@ -36,13 +36,13 @@ use weft_core::storage::{
     UploadPartsResponse, UploadResumeResponse,
 };
 use weft_core::error::{WeftError, WeftResult};
-use weft_core::Color;
+use weft_core::ExecutionId;
 
-/// The color claim header the worker stamps on every storage call.
-// SYNC: HDR_COLOR <-> crates/weft-broker/src/runtime_storage.rs (HDR_COLOR)
-const HDR_COLOR: &str = "x-weft-color";
+/// The execution claim header the worker stamps on every storage call.
+// SYNC: HDR_EXECUTION_ID <-> crates/weft-broker/src/runtime_storage.rs (HDR_EXECUTION_ID)
+const HDR_EXECUTION_ID: &str = "x-weft-execution-id";
 
-/// Color-parameterized storage surface the `ContextHandle` storage methods
+/// Execution-parameterized storage surface the `ContextHandle` storage methods
 /// delegate to. One impl per worker process; Layer-3 tests inject a fake.
 #[async_trait]
 pub trait WorkerStorageOps: Send + Sync {
@@ -51,7 +51,7 @@ pub trait WorkerStorageOps: Send + Sync {
     /// and moves no bytes (see `StorageHandle::identified`).
     async fn put(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         scope: &StorageScope,
         identity: Option<&str>,
         mime_type: &str,
@@ -62,22 +62,22 @@ pub trait WorkerStorageOps: Send + Sync {
     ) -> WeftResult<Value>;
     async fn get(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         key: &str,
         range: Option<ByteRange>,
     ) -> WeftResult<(StoredFileMeta, ByteStream)>;
-    async fn delete(&self, color: Color, key: &str) -> WeftResult<()>;
-    async fn list(&self, color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>;
+    async fn delete(&self, execution_id: ExecutionId, key: &str) -> WeftResult<()>;
+    async fn list(&self, execution_id: ExecutionId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>;
     /// The file already stored under `identity` in `scope`, if any.
-    async fn find(&self, color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>>;
-    async fn keep(&self, color: Color, key: &str, ttl: KeepTtl) -> WeftResult<()>;
+    async fn find(&self, execution_id: ExecutionId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>>;
+    async fn keep(&self, execution_id: ExecutionId, key: &str, ttl: KeepTtl) -> WeftResult<()>;
     /// A temporary link to `key`: internet-reachable when the install
-    /// serves one, else signed for the cluster's own address.
-    async fn presign(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
+    /// serves one, else signed for the install's own address.
+    async fn presign(&self, execution_id: ExecutionId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
     /// A temporary URL for `key` that `reach` can open, or `None` when
     /// the deployment cannot serve one (an internet asker falls back to
     /// inline bytes).
-    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>>;
+    async fn public_link(&self, execution_id: ExecutionId, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>>;
 }
 
 /// Map a broker HTTP failure to a node-facing error. A transport failure
@@ -102,7 +102,7 @@ async fn status_err(context: &str, resp: reqwest::Response) -> WeftError {
 /// The worker's broker runtime-file client.
 pub struct WorkerStorage {
     broker_url: String,
-    token_path: std::path::PathBuf,
+    token: weft_broker_client::TokenSource,
     http: reqwest::Client,
 }
 
@@ -112,50 +112,45 @@ pub struct WorkerStorage {
 // share one definition.
 
 impl WorkerStorage {
-    /// `broker_url` is the in-cluster broker the worker already talks to;
-    /// `token_path` is the worker's projected SA token (re-read every call so
-    /// kubelet rotation propagates). `_tenant_id` is no longer needed (the
-    /// broker resolves the tenant from the token), but kept off the signature.
-    pub fn new(broker_url: String, token_path: std::path::PathBuf) -> Arc<Self> {
-        Arc::new(Self { broker_url, token_path, http: reqwest::Client::new() })
+    /// `broker_url` is the broker the worker already talks to; `token` is
+    /// the worker's identity for it (the broker resolves the tenant and
+    /// project from it).
+    pub fn new(broker_url: String, token: weft_broker_client::TokenSource) -> Arc<Self> {
+        Arc::new(Self { broker_url, token, http: reqwest::Client::new() })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.broker_url.trim_end_matches('/'), path)
     }
 
-    /// The worker's bearer (its projected SA token), re-read every call.
-    async fn bearer(&self) -> WeftResult<String> {
-        let bytes = tokio::fs::read(&self.token_path).await.map_err(|e| {
-            WeftError::NodeExecution(format!(
-                "read SA token at {}: {e}",
-                self.token_path.display()
-            ))
-        })?;
-        Ok(String::from_utf8(bytes)
-            .map_err(|_| WeftError::NodeExecution("SA token not utf8".into()))?
-            .trim()
-            .to_string())
-    }
-
-    /// A request builder with the worker's bearer + the color claim header.
+    /// A request builder with the worker's identity + the execution claim
+    /// header.
     async fn authed(
         &self,
         req: reqwest::RequestBuilder,
-        color: Color,
+        execution_id: ExecutionId,
     ) -> WeftResult<reqwest::RequestBuilder> {
-        Ok(req.bearer_auth(self.bearer().await?).header(HDR_COLOR, color.to_string()))
+        let bearer = self
+            .token
+            .read(self.broker_url.trim_end_matches('/'))
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("get an identity token for the broker: {e:#}")))?;
+        let mut req = req.bearer_auth(bearer).header(HDR_EXECUTION_ID, execution_id.to_string());
+        for (name, value) in self.token.headers() {
+            req = req.header(name, value);
+        }
+        Ok(req)
     }
 
     /// GET a broker storage endpoint and deserialize the JSON response.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
-        color: Color,
+        execution_id: ExecutionId,
         what: &str,
     ) -> WeftResult<T> {
         let resp = self
-            .authed(self.http.get(self.url(path)), color)
+            .authed(self.http.get(self.url(path)), execution_id)
             .await?
             .send()
             .await
@@ -171,12 +166,12 @@ impl WorkerStorage {
     async fn post_json<B: serde::Serialize + ?Sized, T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
-        color: Color,
+        execution_id: ExecutionId,
         body: &B,
         what: &str,
     ) -> WeftResult<T> {
         let resp = self
-            .authed(self.http.post(self.url(path)), color)
+            .authed(self.http.post(self.url(path)), execution_id)
             .await?
             .json(body)
             .send()
@@ -193,12 +188,12 @@ impl WorkerStorage {
     async fn post_no_content<B: serde::Serialize + ?Sized>(
         &self,
         path: &str,
-        color: Color,
+        execution_id: ExecutionId,
         body: &B,
         what: &str,
     ) -> WeftResult<()> {
         let resp = self
-            .authed(self.http.post(self.url(path)), color)
+            .authed(self.http.post(self.url(path)), execution_id)
             .await?
             .json(body)
             .send()
@@ -215,7 +210,7 @@ impl WorkerStorage {
     /// etag, then complete. Bounded memory: at most one part is buffered.
     async fn drive_upload(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         key: &str,
         part_size: u64,
         mut data: ByteStream,
@@ -235,7 +230,7 @@ impl WorkerStorage {
             while buf.len() >= part_size {
                 let rest = buf.split_off(part_size);
                 let part = bytes::Bytes::from(std::mem::replace(&mut buf, rest));
-                self.upload_one_part(color, key, part_number, part).await?;
+                self.upload_one_part(execution_id, key, part_number, part).await?;
                 part_number += 1;
             }
         }
@@ -245,12 +240,12 @@ impl WorkerStorage {
         // multipart part, which S3 cannot represent; `complete` writes it as a
         // plain empty object).
         if !buf.is_empty() {
-            self.upload_one_part(color, key, part_number, bytes::Bytes::from(buf)).await?;
+            self.upload_one_part(execution_id, key, part_number, bytes::Bytes::from(buf)).await?;
         }
         let value: Value = self
             .post_json(
                 "/v1/storage/upload/complete",
-                color,
+                execution_id,
                 &weft_core::storage::UploadCompleteRequest { key: key.to_string() },
                 "upload complete",
             )
@@ -264,7 +259,7 @@ impl WorkerStorage {
     /// PUT it, and record its etag.
     async fn upload_one_part(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         key: &str,
         part_number: i32,
         bytes: bytes::Bytes,
@@ -272,7 +267,7 @@ impl WorkerStorage {
         let UploadPartsResponse { parts } = self
             .post_json(
                 "/v1/storage/upload/parts",
-                color,
+                execution_id,
                 &weft_core::storage::UploadPartsRequest {
                     key: key.to_string(),
                     parts: vec![weft_core::storage::PartAsk {
@@ -286,7 +281,7 @@ impl WorkerStorage {
         let part = parts.into_iter().next().ok_or_else(|| {
             WeftError::NodeExecution("storage: part reservation returned no part".into())
         })?;
-        self.put_part(color, key, part, bytes).await
+        self.put_part(execution_id, key, part, bytes).await
     }
 
     /// PUT one reserved part to its signed URL with a bounded retry: a failed
@@ -296,7 +291,7 @@ impl WorkerStorage {
     /// worker's own buffered bytes; nothing external is re-consumed.
     async fn put_part(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         key: &str,
         mut part: PresignedPart,
         bytes: bytes::Bytes,
@@ -308,7 +303,7 @@ impl WorkerStorage {
                 let UploadResumeResponse { missing, .. } = self
                     .post_json(
                         "/v1/storage/upload/resume",
-                        color,
+                        execution_id,
                         &weft_core::storage::UploadResumeRequest { key: key.to_string() },
                         "resume upload",
                     )
@@ -324,7 +319,7 @@ impl WorkerStorage {
                 Ok(etag) => {
                     self.post_no_content(
                         "/v1/storage/upload/part-done",
-                        color,
+                        execution_id,
                         &weft_core::storage::PartDoneRequest {
                             key: key.to_string(),
                             part_number: part.part_number,
@@ -379,7 +374,7 @@ impl WorkerStorage {
 impl WorkerStorageOps for WorkerStorage {
     async fn put(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         scope: &StorageScope,
         identity: Option<&str>,
         mime_type: &str,
@@ -398,7 +393,7 @@ impl WorkerStorageOps for WorkerStorage {
         let UploadBeginResponse { key, part_size, already_stored, resume: _ } = self
             .post_json(
                 "/v1/storage/upload/begin",
-                color,
+                execution_id,
                 &weft_core::storage::UploadBeginRequest {
                     scope: scope.clone(),
                     mime_type: mime_type.to_string(),
@@ -414,7 +409,7 @@ impl WorkerStorageOps for WorkerStorage {
         // the broker answered the file it has, nothing to upload. The
         // stream is dropped unread (a URL fetch never pulls its body).
         if already_stored {
-            let meta: StoredFileMeta = self.get_json(&format!("/v1/storage/meta/{key}"), color, "meta").await?;
+            let meta: StoredFileMeta = self.get_json(&format!("/v1/storage/meta/{key}"), execution_id, "meta").await?;
             return Ok(StoredFile {
                 key: meta.key,
                 mime_type: meta.mime_type,
@@ -426,13 +421,13 @@ impl WorkerStorageOps for WorkerStorage {
         // Drive the parts + completion; on ANY failure past begin, abort the
         // upload so its quota reservation is freed (idempotent: a quota
         // rejection already aborted broker-side), then surface the failure.
-        match self.drive_upload(color, &key, part_size, data).await {
+        match self.drive_upload(execution_id, &key, part_size, data).await {
             Ok(value) => Ok(value),
             Err(e) => {
                 if let Err(abort) = self
                     .post_no_content(
                         "/v1/storage/upload/abort",
-                        color,
+                        execution_id,
                         &weft_core::storage::UploadAbortRequest { key: key.clone() },
                         "abort upload",
                     )
@@ -451,14 +446,14 @@ impl WorkerStorageOps for WorkerStorage {
 
     async fn get(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         key: &str,
         range: Option<ByteRange>,
     ) -> WeftResult<(StoredFileMeta, ByteStream)> {
         // 1. Ask the broker for the metadata + a presigned GET URL (bumps a kept
         //    file's expiry, 404s a missing file). No bytes through the broker.
         let resp = self
-            .authed(self.http.get(self.url(&format!("/v1/storage/download-url/{key}"))), color)
+            .authed(self.http.get(self.url(&format!("/v1/storage/download-url/{key}"))), execution_id)
             .await?
             .send()
             .await
@@ -503,9 +498,9 @@ impl WorkerStorageOps for WorkerStorage {
         Ok((meta, stream))
     }
 
-    async fn delete(&self, color: Color, key: &str) -> WeftResult<()> {
+    async fn delete(&self, execution_id: ExecutionId, key: &str) -> WeftResult<()> {
         let resp = self
-            .authed(self.http.delete(self.url(&format!("/v1/storage/files/{key}"))), color)
+            .authed(self.http.delete(self.url(&format!("/v1/storage/files/{key}"))), execution_id)
             .await?
             .send()
             .await
@@ -516,11 +511,11 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(())
     }
 
-    async fn find(&self, color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
+    async fn find(&self, execution_id: ExecutionId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
         let out: weft_core::storage::IdentityLookupResponse = self
             .post_json(
                 "/v1/storage/identity",
-                color,
+                execution_id,
                 &weft_core::storage::IdentityLookupRequest {
                     scope: scope.clone(),
                     identity: identity.to_string(),
@@ -531,9 +526,9 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(out.file)
     }
 
-    async fn list(&self, color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
+    async fn list(&self, execution_id: ExecutionId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
         let resp = self
-            .authed(self.http.get(self.url("/v1/storage/list")), color)
+            .authed(self.http.get(self.url("/v1/storage/list")), execution_id)
             .await?
             .query(&[("scope", serde_json::to_string(scope).expect("scope serializes"))])
             .send()
@@ -546,9 +541,9 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(out.files)
     }
 
-    async fn keep(&self, color: Color, key: &str, ttl: KeepTtl) -> WeftResult<()> {
+    async fn keep(&self, execution_id: ExecutionId, key: &str, ttl: KeepTtl) -> WeftResult<()> {
         let resp = self
-            .authed(self.http.post(self.url("/v1/storage/keep")), color)
+            .authed(self.http.post(self.url("/v1/storage/keep")), execution_id)
             .await?
             .json(&weft_core::storage::KeepRequest { key: key.to_string(), ttl })
             .send()
@@ -560,9 +555,9 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(())
     }
 
-    async fn presign(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
+    async fn presign(&self, execution_id: ExecutionId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
         let resp = self
-            .authed(self.http.post(self.url("/v1/storage/presign")), color)
+            .authed(self.http.post(self.url("/v1/storage/presign")), execution_id)
             .await?
             .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs, reach: weft_core::storage::LinkReach::Internet })
             .send()
@@ -575,9 +570,9 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(out.url)
     }
 
-    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
+    async fn public_link(&self, execution_id: ExecutionId, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
         let resp = self
-            .authed(self.http.post(self.url("/v1/storage/public-link")), color)
+            .authed(self.http.post(self.url("/v1/storage/public-link")), execution_id)
             .await?
             .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs, reach })
             .send()
@@ -611,7 +606,7 @@ mod fake {
 
     pub struct FakeWorkerStorage {
         /// The seeded caller identity the wall checks against (tenant t1,
-        /// project p1, color c1), mirroring the broker's verdict.
+        /// project p1, execution c1), mirroring the broker's verdict.
         identity: CallerAuth,
         files: Mutex<BTreeMap<String, (StoredFileMeta, bytes::Bytes)>>,
         /// `(scope, identity)` of every identified put, to the key it
@@ -625,13 +620,13 @@ mod fake {
     }
 
     impl FakeWorkerStorage {
-        /// A fake bound to (tenant t1, project p1, color c1).
+        /// A fake bound to (tenant t1, project p1, execution c1).
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
                 identity: CallerAuth::Worker {
                     tenant: "t1".into(),
                     project_id: "p1".into(),
-                    color: Some("c1".into()),
+                    execution_id: Some("c1".into()),
                     member: None,
                 },
                 files: Mutex::new(BTreeMap::new()),
@@ -653,7 +648,7 @@ mod fake {
     impl WorkerStorageOps for FakeWorkerStorage {
         async fn put(
             &self,
-            _color: Color,
+            _execution_id: ExecutionId,
             scope: &StorageScope,
             identity: Option<&str>,
             mime_type: &str,
@@ -713,14 +708,14 @@ mod fake {
             Ok(file.to_value())
         }
 
-        async fn find(&self, _color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
+        async fn find(&self, _execution_id: ExecutionId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
             let key = self.identities.lock().get(&(format!("{scope:?}"), identity.to_string())).cloned();
             Ok(key.and_then(|k| self.files.lock().get(&k).map(|(meta, _)| meta.clone())))
         }
 
         async fn get(
             &self,
-            _color: Color,
+            _execution_id: ExecutionId,
             key: &str,
             range: Option<ByteRange>,
         ) -> WeftResult<(StoredFileMeta, ByteStream)> {
@@ -756,7 +751,7 @@ mod fake {
             Ok((meta, weft_core::storage::bytes_stream(bytes)))
         }
 
-        async fn delete(&self, _color: Color, key: &str) -> WeftResult<()> {
+        async fn delete(&self, _execution_id: ExecutionId, key: &str) -> WeftResult<()> {
             self.enforce_wall(key)?;
             self.files
                 .lock()
@@ -765,7 +760,7 @@ mod fake {
                 .ok_or_else(|| WeftError::NodeExecution(format!("storage file not found: {key}")))
         }
 
-        async fn list(&self, _color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
+        async fn list(&self, _execution_id: ExecutionId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
             let prefix = key::prefix_for_list(&self.identity, scope)
                 .map_err(|e| WeftError::NodeExecution(format!("storage denied: {e}")))?;
             Ok(self
@@ -777,7 +772,7 @@ mod fake {
                 .collect())
         }
 
-        async fn keep(&self, _color: Color, key: &str, ttl: KeepTtl) -> WeftResult<()> {
+        async fn keep(&self, _execution_id: ExecutionId, key: &str, ttl: KeepTtl) -> WeftResult<()> {
             self.enforce_wall(key)?;
             let mut files = self.files.lock();
             let (meta, _) = files
@@ -792,7 +787,7 @@ mod fake {
             Ok(())
         }
 
-        async fn presign(&self, _color: Color, key: &str, _ttl_secs: Option<u64>) -> WeftResult<String> {
+        async fn presign(&self, _execution_id: ExecutionId, key: &str, _ttl_secs: Option<u64>) -> WeftResult<String> {
             self.enforce_wall(key)?;
             if !self.files.lock().contains_key(key) {
                 return Err(WeftError::NodeExecution(format!("storage file not found: {key}")));
@@ -800,7 +795,7 @@ mod fake {
             Ok(format!("https://fake-bucket/runtime/{key}?sig=fake"))
         }
 
-        async fn public_link(&self, _color: Color, key: &str, _ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
+        async fn public_link(&self, _execution_id: ExecutionId, key: &str, _ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
             self.enforce_wall(key)?;
             if !self.files.lock().contains_key(key) {
                 return Err(WeftError::NodeExecution(format!("storage file not found: {key}")));

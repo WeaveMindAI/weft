@@ -40,7 +40,7 @@ async fn a_project_defined_provider_meters_a_real_call() -> anyhow::Result<()> {
     // read off the fixture's own access-node metadata.
     let spec = service_spec_of(&project.dir().join("nodes/ask/metadata.json"))?;
     let conn = connect_direct(&disp, spec, "own", serde_json::json!({ "key": key })).await?;
-    set_account(&project, "ask", "connection", conn.handle())?;
+    set_account(&project, "ask", conn.handle()).await?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

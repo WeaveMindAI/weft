@@ -4,7 +4,7 @@
 # run's terminate sweep so the rig can download it back and assert its contents.
 #
 # __E2E_FAKE_URL__ is substituted by the test with the fake server's
-# cluster-reachable URL before building.
+# reachable URL before building.
 
 src = Text { value: "__E2E_FAKE_URL__" }
 

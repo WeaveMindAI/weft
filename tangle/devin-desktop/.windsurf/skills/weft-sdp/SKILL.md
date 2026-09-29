@@ -9,7 +9,7 @@ You build one stage against a real input, run it, and read the result
 before growing the next stage. You judge a result by what the program is meant to do:
 completion alone says nothing. If you catch yourself calling a run good
 because it completed, stop and write: "Wait. Read the result." Then
-inspect `weft events <color> --node <id>` and `weft logs <color>`.
+inspect `weft events <execution-id> --node <id>` and `weft logs <execution-id>`.
 
 The terms below:
 
@@ -31,7 +31,7 @@ The terms below:
 
 `weft run` builds the current code and starts one execution. You pass
 `--detach`, then read `weft executions --json`,
-`weft events <color> --node <id>` and `weft logs <color>`: failures and
+`weft events <execution-id> --node <id>` and `weft logs <execution-id>`: failures and
 waiting states as well as outputs. You keep the user's graph intact while
 trying a stage:
 
@@ -162,7 +162,7 @@ when the work in flight has to survive, and say it deliberately.
 `weft run --seed --detach` takes eligible results from [head]'s run. If
 [head] is a version without a run, it finds a finished run on that
 version or its nearest ancestor. To choose an older run, you run
-`weft branch <color>` first; that also restores its code, so you
+`weft branch <execution-id>` first; that also restores its code, so you
 checkpoint edits you want to keep.
 
 - `--seed --seed-before classify` reuses earlier compatible work and runs
@@ -198,13 +198,13 @@ omit it when reviewing how the current program answers the saved use case.
 
 ```bash
 weft run invoice --detach
-weft events <color> --full
-weft freeze invoice <color> --expect reply
+weft events <execution-id> --full
+weft freeze invoice <execution-id> --expect reply
 # After editing the program:
 weft run invoice --detach
-weft diff example:invoice <new-color>
+weft diff example:invoice <new-execution-id>
 # After inspecting and accepting the new result:
-weft freeze invoice <new-color> --expect reply
+weft freeze invoice <new-execution-id> --expect reply
 ```
 
 `freeze` preserves that completed run's starting parameters and accepted
@@ -258,7 +258,7 @@ authority, and keep inspecting that same run. For live connections, you
 send the recorded messages through a new connection and review the new
 responses.
 
-`weft wake <color> <node>` resolves a pure time wait. A wait requiring a
+`weft wake <execution-id> <node>` resolves a pure time wait. A wait requiring a
 value must receive that value instead. Logs and inherited markers identify
 which earlier run supplied reused history; historical costs are not new
 charges.
@@ -266,7 +266,7 @@ charges.
 ## Keep a reviewable trail
 
 `weft checkpoint [label]` saves a source version without executing.
-`weft tree` shows versions and runs; `weft branch <version|label|color>`
+`weft tree` shows versions and runs; `weft branch <version|label|execution-id>`
 restores a point in that tree. [head] is shared per project. A dirty
 branch refusal names the files: you checkpoint them before switching.
 Discarding edits and pruning history require the user's authority.
@@ -279,4 +279,4 @@ pruned versions go too.
 
 After an edit, you run the relevant saved use cases, inspect their diffs,
 and report what actually ran, what changed, why a result is acceptable or
-still wrong, and the run colors.
+still wrong, and the execution ids.

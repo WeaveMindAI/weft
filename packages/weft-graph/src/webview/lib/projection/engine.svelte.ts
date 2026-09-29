@@ -96,6 +96,8 @@ export class ProjectionEngine {
 	codeEditLockUntil = $state<number | null>(null);
 	lockGraphLogic = $state(false);
 	lockReason = $state<string | undefined>(undefined);
+	// Gate 3: the graph shows another install's program (see LockState).
+	installReadOnly = $state<string | undefined>(undefined);
 
 	// ── Internals ────────────────────────────────────────────────────────
 	private readonly host: EngineHost;
@@ -280,11 +282,20 @@ export class ProjectionEngine {
 	}
 
 	private lock(): LockState {
-		return { codeEditLockUntil: this.codeEditLockUntil, lockGraphLogic: this.lockGraphLogic, lockReason: this.lockReason };
+		return {
+			codeEditLockUntil: this.codeEditLockUntil,
+			lockGraphLogic: this.lockGraphLogic,
+			lockReason: this.lockReason,
+			installReadOnly: this.installReadOnly,
+		};
 	}
 
 	setCodeEditTouched(): void {
 		this.codeEditLockUntil = this.host.now() + 1000;
+	}
+
+	setInstallReadOnly(install: string | undefined): void {
+		this.installReadOnly = install;
 	}
 
 	setGraphLogicLock(locked: boolean, reason?: string): void {

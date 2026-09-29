@@ -38,7 +38,7 @@ async fn wait_copy(disp: &Dispatcher, project: Uuid, node: &str, member: &str, w
     .await
 }
 
-/// The colors of the project's fired runs for `member` (its infra
+/// The executions of the project's fired runs for `member` (its infra
 /// setups are runs for the member too, and are left out).
 async fn runs_for(disp: &Dispatcher, project: Uuid, member: &str) -> anyhow::Result<Vec<String>> {
     let listed: Value = disp.get_json(&format!("/executions?project_id={project}&member={member}&limit=100")).await?;
@@ -48,7 +48,7 @@ async fn runs_for(disp: &Dispatcher, project: Uuid, member: &str) -> anyhow::Res
         .unwrap_or_default()
         .iter()
         .filter(|row| row["phase"] == json!("fire"))
-        .filter_map(|row| row["color"].as_str().map(str::to_string))
+        .filter_map(|row| row["execution_id"].as_str().map(str::to_string))
         .collect())
 }
 
@@ -76,16 +76,16 @@ fn minted(stdout: &str) -> anyhow::Result<String> {
     v["token"].as_str().map(str::to_string).ok_or_else(|| anyhow::anyhow!("no token in {stdout}"))
 }
 
-/// The color a `weft run --json` started.
-fn color_of(stdout: &str) -> anyhow::Result<Uuid> {
+/// The execution a `weft run --json` started.
+fn execution_id_of(stdout: &str) -> anyhow::Result<Uuid> {
     for line in stdout.lines() {
         if let Ok(ev) = serde_json::from_str::<Value>(line.trim()) {
-            if let Some(color) = ev["detail"]["color"].as_str() {
-                return Ok(color.parse()?);
+            if let Some(execution_id) = ev["detail"]["execution_id"].as_str() {
+                return Ok(execution_id.parse()?);
             }
         }
     }
-    anyhow::bail!("no color in {stdout}")
+    anyhow::bail!("no execution in {stdout}")
 }
 
 /// A node marked `@per_member` exists once per member: a run must say
@@ -115,11 +115,11 @@ async fn a_per_member_infra_node_runs_one_copy_per_member() -> anyhow::Result<()
     let status = project.weft(&["status"]).await?;
     anyhow::ensure!(status.contains("member copies:") && status.contains("ada"), "{status}");
 
-    let color = color_of(&project.weft(&["run", "--json", "--member", "ada"]).await?)?;
-    let settled = SettledRun::observe(&disp, color).await?;
+    let execution_id = execution_id_of(&project.weft(&["run", "--json", "--member", "ada"]).await?)?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!("ready"))?;
-    anyhow::ensure!(runs_for(&disp, pid, "ada").await? == vec![color.to_string()], "the run is ada's");
+    anyhow::ensure!(runs_for(&disp, pid, "ada").await? == vec![execution_id.to_string()], "the run is ada's");
     anyhow::ensure!(runs_for(&disp, pid, "bob").await?.is_empty());
     let refused = project.weft_refused(&["run", "--member", "bob"]).await?;
     anyhow::ensure!(refused.contains("svc (member 'bob')"), "bob's copy is not ada's: {refused}");
@@ -176,7 +176,7 @@ async fn a_member_picks_their_connection_and_runs_as_themselves() -> anyhow::Res
     let mut project = Project::prepare("members", disp.clone()).await?;
     let base = project.unique_live_path()?;
     let keys = connect_direct(&disp, catalog_spec("api", "api_key_auth")?, "own", json!({ "keys": "k-backend" })).await?;
-    set_account(&project, "keys", "account", keys.handle())?;
+    set_account(&project, "keys", keys.handle()).await?;
     project.activate().await?;
 
     let hook = format!("{base}/hook");
@@ -278,18 +278,11 @@ async fn a_member_picks_their_connection_and_runs_as_themselves() -> anyhow::Res
     let (status, _) = call(vec![("Weft-Member", "bob".into())]).await?;
     anyhow::ensure!(status == 200, "bob's pick is his own: {status}");
 
-    // The author's own connection as the fallback: a member who connected
-    // nothing runs on it, one who did keeps theirs. Only the source can
-    // say so; no member can pick the author's connection themselves.
+    // A connection written as a member's fallback is the old way: its id
+    // means nothing on another install, so the compiler refuses it.
     project.set_node_config("theirs", "account", &format!("@member_filled({})", keys.handle()))?;
-    project.weft(&["resync", "--mode", "wipe"]).await?;
-    let (status, body) = call(vec![("Weft-Member", "carol".into())]).await?;
-    anyhow::ensure!(status == 200, "carol falls back on the author's key set: {status}: {body}");
-    let answer: Value = serde_json::from_str(&body)?;
-    anyhow::ensure!(answer["key"]["__weft_access__"]["accessId"] == keys.handle()["id"], "{answer}");
-    let (status, body) = call(vec![("Weft-Member", "bob".into())]).await?;
-    let answer: Value = serde_json::from_str(&body)?;
-    anyhow::ensure!(status == 200 && answer["key"]["__weft_access__"]["accessId"] != keys.handle()["id"], "bob keeps his own: {answer}");
+    let refused = project.weft_refused(&["resync", "--mode", "wipe"]).await?;
+    anyhow::ensure!(refused.contains("falls back to a connection written in the source"), "{refused}");
 
     keys.finish().await?;
     project.finish().await
@@ -371,8 +364,8 @@ wipeReply.body = gone.done
         Ok((serde_json::from_slice::<Value>(&body)? == json!("running")).then_some(()))
     })
     .await?;
-    let color = color_of(&project.weft(&["run", "--json", "--member", "ada"]).await?)?;
-    SettledRun::observe(&disp, color).await?.completed()?.assert_input("out", "data", &json!("ready"))?;
+    let execution_id = execution_id_of(&project.weft(&["run", "--json", "--member", "ada"]).await?)?;
+    SettledRun::observe(&disp, execution_id).await?.completed()?.assert_input("out", "data", &json!("ready"))?;
 
     let token = ask("mint").await?.as_str().map(str::to_string).expect("a token");
     let (status, body) = member_door(&disp, Method::GET, "fields", &token, None).await?;

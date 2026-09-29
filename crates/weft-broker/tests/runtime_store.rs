@@ -29,7 +29,7 @@ use weft_platform_traits::object_store::fake::FakeObjectStore;
 use weft_platform_traits::{ObjectStore, PresignAudience};
 
 /// Every contract test here drives the WORKER upload path, whose part URLs are
-/// presigned for the in-cluster (Internal) endpoint. Named once so the many
+/// presigned for the internal (Internal) endpoint. Named once so the many
 /// One part asked for by number and size. A part number IS the part's
 /// position in the file, so a test that reserves the first part says 1.
 fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
@@ -41,12 +41,12 @@ fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
 /// in `weft-e2e/tests/config_media.rs`.)
 const WORKER: PresignAudience = PresignAudience::Internal;
 
-/// A worker caller in (tenant t1, project p1, color c1).
-fn worker(tenant: &str, project: &str, color: Option<&str>) -> CallerAuth {
+/// A worker caller in (tenant t1, project p1, execution c1).
+fn worker(tenant: &str, project: &str, execution_id: Option<&str>) -> CallerAuth {
     CallerAuth::Worker {
         tenant: tenant.into(),
         project_id: project.into(),
-        color: color.map(String::from),
+        execution_id: execution_id.map(String::from),
         member: None,
     }
 }
@@ -366,17 +366,17 @@ async fn a_multi_part_upload_assembles_in_order(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn wall_denies_cross_color_get(pool: PgPool) {
+async fn wall_denies_cross_execution_id_get(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
     let w1 = worker("t1", "p1", Some("c1"));
     let meta = put_via(&s, &bucket, &w1, &StorageScope::Execution, "text/plain", "f", None, &big(), body(b"x"))
         .await
         .unwrap();
-    // The key is under color c1; a parsed key for ANOTHER color under the same
+    // The key is under execution c1; a parsed key for ANOTHER execution under the same
     // tenant must be denied by the wall (the store applies check_key_access via
-    // the route, but here we assert the key the put minted is color-scoped).
+    // the route, but here we assert the key the put minted is execution-scoped).
     assert!(meta.key.contains("/exec/c1/"));
-    // A worker with a different color cannot mint a key for c1's file: the put
+    // A worker with a different execution cannot mint a key for c1's file: the put
     // wall already proved that; here confirm the access check directly.
     let parsed = weft_core::storage::key::parse_key(&meta.key).unwrap();
     let w2 = worker("t1", "p1", Some("c2"));
@@ -1144,7 +1144,7 @@ async fn progress_defers_the_abandoned_reap(pool: PgPool) {
 #[sqlx::test]
 async fn terminate_sweep_reaps_an_abandoned_exec_upload(pool: PgPool) {
     // The common case: an exec-scoped upload crashes mid-flight. The terminate
-    // sweep for that color aborts the multipart and frees everything
+    // sweep for that execution aborts the multipart and frees everything
     // immediately (no grace).
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
@@ -1200,9 +1200,9 @@ async fn a_completed_file_is_immutable(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn wipe_prefix_does_not_touch_a_sibling_color_prefix(pool: PgPool) {
-    // The trailing-slash invariant the wall rests on: sweeping color `c1` must
-    // never match a sibling color whose name merely starts with `c1`.
+async fn wipe_prefix_does_not_touch_a_sibling_execution_id_prefix(pool: PgPool) {
+    // The trailing-slash invariant the wall rests on: sweeping execution `c1` must
+    // never match a sibling execution whose name merely starts with `c1`.
     let (s, bucket, _clock) = store(&pool).await;
     let scope = StorageScope::Execution;
     let w_short = worker("t1", "p1", Some("c1"));
@@ -1217,7 +1217,7 @@ async fn wipe_prefix_does_not_touch_a_sibling_color_prefix(pool: PgPool) {
     assert_eq!((swept, lingering), (0, 1), "only c1's file is stamped to linger");
     // The sibling's row is untouched: no linger deadline landed on it.
     let sibling = weft_core::storage::key::parse_key(&kept.key).unwrap();
-    assert_eq!(s.meta(&sibling).await.unwrap().expires_at_unix, None, "sibling color c1x untouched");
+    assert_eq!(s.meta(&sibling).await.unwrap().expires_at_unix, None, "sibling execution c1x untouched");
 }
 
 #[sqlx::test]

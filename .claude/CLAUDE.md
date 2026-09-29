@@ -60,7 +60,7 @@ Never outside it: no whole-workspace run, no runner invoked bare, no re-running 
 
 **An agent you dispatch obeys the [test scope] too, and a narrower one.** Every agent in this checkout builds into the same `target/`, and cargo runs one build there at a time, so agents started side by side spend most of their time waiting on each other's builds; the ones that went workspace-wide once turned an hour of fixes into several. So every brief for an agent that edits code names its crates and says: `cargo check -p <those crates>` while editing, then `cargo nextest run -p <those crates>` and clippy on the same list once, at the end; nothing `--workspace`, no database, node-test or e2e runner. You run those yourself, once, after the last agent reports. Split parallel edits by crate, so no two agents build the same crate at once. A reviewing agent reads; it builds nothing unless one probe test must settle a finding.
 
-The database and end-to-end tests have the same scope, and it is the one you most often break: ONLY the tests you added and the tests that exercise the exact behavior you changed, each named (`scripts/run-db-tests.sh <crate> <test-name-filter>`, `scripts/run-e2e.sh <file::test>`), never a whole crate's db suite, never a whole e2e file when one test in it covers the change, never the whole e2e suite, even at the very end of a session. One test that goes through the changed path is enough; a second that goes through the same path adds nothing. Some e2e tests spend real money, which is why a wider run is the [user]'s call alone. A failure in the local rig (docker, kind, the machine's load) is rerun alone once and, if it passes, it is done. The install steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
+The database and end-to-end tests have the same scope, and it is the one you most often break: ONLY the tests you added and the tests that exercise the exact behavior you changed, each named (`scripts/run-db-tests.sh <crate> <test-name-filter>`, `scripts/run-e2e.sh <file::test>`), never a whole crate's db suite, never a whole e2e file when one test in it covers the change, never the whole e2e suite, even at the very end of a session. One test that goes through the changed path is enough; a second that goes through the same path adds nothing. Some e2e tests spend real money, which is why a wider run is the [user]'s call alone. A failure in the local rig (docker, the machine's load) is rerun alone once and, if it passes, it is done. The install steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
 
 **Every brief you write for an agent that runs tests carries this rule in its own words**, naming the exact tests it may run, because an agent does not read this file on its own.
 
@@ -72,7 +72,7 @@ Builds and tests are most of the time a session loses, and every extra round of 
 
 ## Never wait on a long command
 
-Tests, builds, installs and cluster work here run for minutes, sometimes far longer. You start every one of them in the background (`run_in_background`), then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. Narrow the tests AND background them; the [test scope] says which tests, this says how you run them.
+Tests, builds, installs and container work here run for minutes, sometimes far longer. You start every one of them in the background (`run_in_background`), then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. Narrow the tests AND background them; the [test scope] says which tests, this says how you run them.
 
 Blocking is the last resort, allowed only when the turn has nothing else in it and you have said so. If you catch yourself thinking "this one is quick, I'll just wait", write verbatim "Wait, that blocks the [user]'s time. Backgrounding it and picking up <next piece of work>." and do that.
 
@@ -107,7 +107,7 @@ Applies to every architecture, refactor, and code-quality discussion, in any mod
 **Push for the better design.** See a better design than what's there or what's proposed: say so, explain it carefully, push. Don't defer, don't soften with "this is taste-level", don't bury it under "worth revisiting later". Draw the current shape and the alternative, explain what the better design buys and what the worse one costs (even when the cost is just "shape that hides a category of future problems"). If the [user] says no with a real reason (architectural constraint, a milestone, a property you missed), stop. If they say no without a reason, keep pushing; it is cheaper to argue and lose than to ship the wrong thing and revert. The asymmetry is intentional.
 
 **The decision tree**, in order:
-1. Does it scale cleanly (1M+ users, multi-tenant, multi-Pod)?
+1. Does it scale cleanly (1M+ users, multi-tenant, many runtime instances)?
 2. Is it DRY, with responsibility cleanly separated?
 3. Is the API honest about what it does?
 4. Does it compose with future features without forcing awkward shapes?

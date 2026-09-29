@@ -5,7 +5,7 @@
 //! print JSON to stdout. This is where the editor's live graph and
 //! Problems-panel feedback comes from. It runs locally, on the CLI,
 //! because the catalog lives in the project's `nodes/` folder: the
-//! dispatcher (a remote pod) has no access to it.
+//! dispatcher (a remote process) has no access to it.
 //!
 //! `parse` is lenient (unknown node types become placeholders so the
 //! graph keeps rendering mid-edit); `validate` is the full strict
@@ -215,13 +215,17 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
     // signals via `reload_catalog`.
     let mut catalogs: HashMap<PathBuf, FsCatalog> = HashMap::new();
 
+    // No client here: the server runs for the whole editor session, most
+    // requests never reach an install, and the one that does resolves its
+    // own (see `Ctx::fresh_client`), so an install that is down, unnamed
+    // or starts later never costs the editor its parsing.
     for line in stdin.lock().lines() {
         let line = line.context("read request line")?;
         if line.trim().is_empty() {
             continue;
         }
         let resp = match serde_json::from_str::<ServerRequest>(&line) {
-            Ok(req) => handle_request(req, &mut catalogs, &ctx.client()).await,
+            Ok(req) => handle_request(req, &mut catalogs, &ctx).await,
             // A request we can't parse into the typed shape may still be
             // valid JSON carrying an `id` (a stale editor talking to a
             // newer server): recover it so the host matches the reply to
@@ -248,7 +252,7 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
 /// pipeline. Project discovery walks up from the file's directory (the server
 /// has no fixed cwd project, unlike the one-shot commands). Parse is lenient
 /// and works without a project (nil id, empty catalog); validate requires one.
-async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, client: &crate::client::DispatcherClient) -> ServerResponse {
+async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, ctx: &Ctx) -> ServerResponse {
     let id = req.id;
     // Three-way: no project (lenient), a project, or a BROKEN manifest. A broken
     // `weft.toml` must surface loudly on every kind, not silently degrade to the
@@ -280,7 +284,11 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                 Ok(mut definition) => {
                     if spec.fire.is_some() {
                         let root = &project.as_ref().expect("resolution requires a project").root;
-                        if let Err(error) = super::assets::resolve_project_assets(client, root, &mut definition, None, false).await {
+                        let verified = match ctx.fresh_client(project.as_ref()) {
+                            Ok(client) => super::assets::resolve_project_assets(&client, root, &mut definition, false).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = verified {
                             return envelope(id, &ResolveSpecResponse {
                                 resolved: None, refusal: Some(weft_core::run_spec::Refusal::error(format!("cannot verify trigger assets: {error:#}"))),
                             });
@@ -681,7 +689,7 @@ mod tests {
             serde_json::from_str(r#"{"id":2,"kind":"validate","source":""}"#).unwrap();
         assert_eq!(req.mode, None);
         // And the handler refuses it before touching any project state.
-        let resp = handle_request(req, &mut Default::default(), &crate::client::DispatcherClient::new("http://unused")).await;
+        let resp = handle_request(req, &mut Default::default(), &crate::commands::Ctx::new(None, None, false).unwrap()).await;
         assert_eq!(
             resp.error.as_deref(),
             Some("validate requires a mode (\"structural\" or \"runtime\")")

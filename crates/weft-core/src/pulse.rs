@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::LoopFrames;
-use crate::Color;
+use crate::ExecutionId;
 
 /// A unit of data flowing between nodes in an execution. Pulses carry
-/// their own execution identity (color) and a frame stack (`frames`)
+/// their own execution identity (execution) and a frame stack (`frames`)
 /// identifying which iteration of which (nested) loop the pulse belongs
 /// to. Nodes fire when all required inputs have a pulse with matching
-/// `(color, frames)` at the exact same frame stack.
+/// `(execution_id, frames)` at the exact same frame stack.
 ///
 /// Pulses do NOT carry execution metadata; that lives in
 /// `NodeExecution` records. This split is load-bearing: the scheduler
@@ -38,7 +38,7 @@ use crate::Color;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pulse {
     pub id: uuid::Uuid,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub frames: LoopFrames,
     /// The destination node id.
     pub target_node: String,
@@ -68,7 +68,7 @@ pub struct Pulse {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<Color>,
+    pub inherited_from: Option<ExecutionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ impl Pulse {
     /// wire the same emission reached.
     pub fn new(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
@@ -116,7 +116,7 @@ impl Pulse {
     ) -> Self {
         Self {
             id,
-            color,
+            execution_id,
             frames,
             target_node: target_node.into(),
             target_port: target_port.into(),
@@ -137,12 +137,12 @@ impl Pulse {
     /// closure -> consumer fires with the port missing.
     pub fn closure(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
     ) -> Self {
-        Self::closure_with_error(id, color, frames, target_node, target_port, None)
+        Self::closure_with_error(id, execution_id, frames, target_node, target_port, None)
     }
 
     /// Closure carrying WHY the upstream ended, for generator ports:
@@ -150,7 +150,7 @@ impl Pulse {
     /// gets the error), `None` a clean finish.
     pub fn closure_with_error(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
@@ -158,7 +158,7 @@ impl Pulse {
     ) -> Self {
         Self {
             id,
-            color,
+            execution_id,
             frames,
             target_node: target_node.into(),
             target_port: target_port.into(),
@@ -183,14 +183,14 @@ impl Pulse {
 #[derive(Debug, Clone, Default)]
 pub struct PulseTable {
     buckets: BTreeMap<String, Vec<Pulse>>,
-    consumed_streams: HashSet<(Color, crate::frames::FiringLocation, String)>,
+    consumed_streams: HashSet<(ExecutionId, crate::frames::FiringLocation, String)>,
 }
 
 impl PulseTable {
     pub fn new() -> Self { Self::default() }
 
-    pub fn stream_was_consumed(&self, color: Color, node: &str, port: &str, frames: &LoopFrames) -> bool {
-        self.consumed_streams.contains(&(color, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
+    pub fn stream_was_consumed(&self, execution_id: ExecutionId, node: &str, port: &str, frames: &LoopFrames) -> bool {
+        self.consumed_streams.contains(&(execution_id, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
     }
 
     /// Call only after validating that every id belongs to this bucket.
@@ -198,7 +198,7 @@ impl PulseTable {
     pub fn remove_consumed(&mut self, node: &str, ids: &[uuid::Uuid]) {
         let bucket = self.buckets.get_mut(node).expect("consumed pulse bucket exists");
         for pulse in bucket.iter().filter(|p| ids.contains(&p.id)) {
-            self.consumed_streams.insert((pulse.color,
+            self.consumed_streams.insert((pulse.execution_id,
                 crate::frames::FiringLocation::new(node, pulse.frames.clone()), pulse.target_port.clone()));
         }
         bucket.retain(|p| !ids.contains(&p.id));

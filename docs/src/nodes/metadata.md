@@ -66,7 +66,9 @@ which is what downstream reads.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one |
+| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one. Weft gives it `callsPerMinute` and `callsAtOnce`, and unless it is a `liveConnection` trigger a `longRuns` input, so do not declare those |
+| `liveConnection` | Boolean | `false` | On a trigger whose run answers a caller holding the connection open (a route, a socket). It also gets `callsPerMinutePerCaller`, and does not get `longRuns` |
+| `calledFromOutside` | Boolean | `false` | On a trigger somebody outside calls whose call ends there (a form somebody submits). It also gets `callsPerMinutePerCaller`. A `liveConnection` trigger is called from outside already, so it never sets this; a trigger that picks its events up itself (a schedule, a feed, a provider's push) has no caller and does not either |
 | `oneOfRequired` | List[List[String]] | `[]` | Each inner list is a group where at least one port must arrive, or the node skips |
 | `canAddInputPorts` | Boolean | `false` | Source may declare extra inputs on it |
 | `canAddOutputPorts` | Boolean | `false` | Source may declare extra outputs |

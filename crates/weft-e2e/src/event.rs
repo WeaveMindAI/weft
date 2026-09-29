@@ -1,6 +1,6 @@
 //! The execution event stream, as the rig reads it.
 //!
-//! `GET /executions/{color}/replay` returns a JSON array of the dispatcher's
+//! `GET /executions/{execution_id}/replay` returns a JSON array of the dispatcher's
 //! `DispatcherEvent` (a `{ "kind": "...", ... }` tagged union; see
 //! `crates/weft-dispatcher/src/events.rs`). The rig does NOT re-declare that
 //! 35-variant enum: doing so would fork the concept and create a large SYNC
@@ -83,7 +83,7 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// Parse the JSON array returned by `/executions/{color}/replay`.
+    /// Parse the JSON array returned by `/executions/{execution_id}/replay`.
     pub fn from_array(raw: Vec<Value>) -> Self {
         Self {
             events: raw.into_iter().map(Event).collect(),

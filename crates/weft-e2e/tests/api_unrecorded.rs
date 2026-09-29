@@ -54,9 +54,9 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
         !rows.iter().any(|row| row["entry_node"] == "status"),
         "a successful unrecorded run is never listed: {rows:?}"
     );
-    let color = failed["color"].as_str().unwrap_or_default();
+    let execution_id = failed["execution_id"].as_str().unwrap_or_default();
     let cli = project.weft(&["executions", "--project", &pid.to_string()]).await?;
-    assert!(cli.contains(&color[..8.min(color.len())]), "`weft executions` lists the failed run {color}: {cli}");
+    assert!(cli.contains(&execution_id[..8.min(execution_id.len())]), "`weft executions` lists the failed run {execution_id}: {cli}");
 
     project.finish().await
 }

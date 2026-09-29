@@ -54,12 +54,14 @@ pub fn custom_outputs<'a>(node: &NodeDefinition, declared: impl IntoIterator<Ite
 /// What a field holds, as a rule sees it.
 enum Written<'a> {
     Known(Option<&'a Value>),
-    /// `@member_filled` with no fallback: there, with a value nobody knows.
+    /// `@member_filled` with no fallback, or a connection picked on the
+    /// install (`crate::picks`): there, with a value nobody knows.
     Unknown,
 }
 
 fn written<'a>(node: &'a NodeDefinition, field: &str) -> Written<'a> {
     match node.written_value(field) {
+        Some(value) if crate::picks::is_install_picked(value) => Written::Unknown,
         Some(value) => match crate::member::as_member_filled(value) {
             Some(filled) => match filled.fallback {
                 Some(fallback) => Written::Known(Some(fallback)),

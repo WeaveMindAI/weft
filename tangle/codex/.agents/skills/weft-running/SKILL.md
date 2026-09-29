@@ -7,16 +7,20 @@ description: "Read when running, activating or debugging a program: the CLI comm
 
 The `weft` CLI is a thin client of [the daemon] plus the front end for
 building. [the daemon] is the dispatcher process that owns projects,
-executions, triggers, and infra, and listens on `http://localhost:9999`
-(override: `--dispatcher <url>`, `WEFT_DISPATCHER_URL`, or `[dispatcher] url`
-in `weft.toml`). The user's install (`setup.sh`) starts it, once per machine.
+executions, triggers, and infra. It listens on `http://127.0.0.1:14111`
+unless the user started it on another port, and the port it really runs
+on is the `public` field of `~/.local/share/weft/ports.json`.
+Every command talks to that one unless it is given `--on <target>`, a cloud
+install named in `weft.toml`, which only the `deployer` does (the
+`weft-deploying` skill). The user's install (`setup.sh`) starts it, once per
+machine.
 `weft daemon start`, `stop` and `restart` re-run that install, and a restart
 from a project has wiped shared keys before, so you never run them. A `.env`
 near the project auto-loads.
 
-A [color] is one execution: a UUID minted when a run starts. Everything in it
+Each run is one execution, with its own id (a UUID minted when it starts). Everything in it
 is journaled, node by node, with the values on the wires. Every command that
-takes a [color] also takes its first characters (`weft events 3f2a`), at
+takes an execution id also takes its first characters (`weft events 3f2a`), at
 least four, as long as they name a single run.
 
 ## How you run a command
@@ -66,7 +70,7 @@ and a run that is longer than its shape says is something you report.
 
 If you want to wait on something long (a build, [the daemon] coming up, a run
 settling), start it detached and check its state between other steps instead
-of writing a loop: `weft run --detach` hands you the [color], then `weft
+of writing a loop: `weft run --detach` hands you the execution id, then `weft
 executions --json` for a run and `weft status --json` for a build or [the
 daemon].
 
@@ -97,7 +101,7 @@ to kill anyway.
 `--json` is a global flag with two meanings. The long commands (`build`,
 `bake`, `run`, `activate`, `deactivate`, `resync`, `infra`, `rm`, the
 cancels) stream progress as one JSON object per line. The readers (`status`,
-`ps`, `executions`, `events`, `logs`, `files`, `listener inspect`, `token`,
+`ps`, `executions`, `events`, `logs`, `files`, `token`,
 `stop`, `connect`, `tree`, `examples`, `diff`, `checkpoint`, `branch`,
 `freeze`, `prune`, `wake`) print what [the daemon] answered, which you read
 with `jq` instead of parsing the human columns; `test-node` prints its
@@ -129,22 +133,23 @@ status` and the graph print back.
 |---|---|
 | `weft build` | compile, resolve assets, build the worker image (content-addressed) and register the project with [the daemon]. Starts nothing. You never need it while building a program: `weft run`, `weft activate` and `weft resync` build on their own, so running `weft build` before them only builds twice. Its one use is the final deployment, `weft build --referenced`, which ships only the node types the program uses. Also the repair when [the daemon] no longer holds the code a past run ran: registering records the compiled program under its own hash, the one the run names, so unchanged files make the run readable again. Adds nothing to the version tree; `weft checkpoint` does that |
 | `weft validate --file src/main.weft < src/main.weft` | strict compile + validate, diagnostics as JSON, nothing runs |
-| `weft run [<example>] [--referenced] [--seed] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--fire <trigger>=<wake-json>] [--save <name>]` | build and start one execution; `--detach` returns its [color]. `--from` supplies backup inputs at a start, `--emit` supplies outputs without executing that node. Real producers take precedence over backups, and under `--seed` the earlier run's result IS a real producer: a `--from` value at a node history already feeds goes unused (the run warns). To hand a new value in, run without `--seed`, or `--emit` the upstream output. `--target` includes the endpoint; `--before` excludes it. `--group` selects a whole group or included file, with its input payload. `--fire` runs exactly one trigger using a matching bake. Ordinary groups can be cut precisely; loops stay whole. `--seed-before` / `--seed-until` bound compatible reuse. A named example supplies saved starting parameters; current code runs. Clear and replacement rules are in `weft-sdp` |
+| `weft run [<example>] [--referenced] [--seed] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--fire <trigger>=<wake-json>] [--save <name>] [--long]` | build and start one execution; `--detach` returns its execution id. `--long` runs it as a job of its own, which may run for days (a plain run is cut at an hour on a cloud install); a trigger's firings ask for the same with its `longRuns` setting. `--from` supplies backup inputs at a start, `--emit` supplies outputs without executing that node. Real producers take precedence over backups, and under `--seed` the earlier run's result IS a real producer: a `--from` value at a node history already feeds goes unused (the run warns). To hand a new value in, run without `--seed`, or `--emit` the upstream output. `--target` includes the endpoint; `--before` excludes it. `--group` selects a whole group or included file, with its input payload. `--fire` runs exactly one trigger using a matching bake. Ordinary groups can be cut precisely; loops stay whole. `--seed-before` / `--seed-until` bound compatible reuse. A named example supplies saved starting parameters; current code runs. Clear and replacement rules are in `weft-sdp` |
 | `weft checkpoint [<label>]` | record the files as a version under head, no run, no build; `already at <id>` when identical |
-| `weft branch <version\|label\|color>` | restore that version's files and move head (a checkpoint label names its version; a [color] makes that run the next seed). Refuses on a dirty tree naming the files; `--discard` overrides |
+| `weft branch <version\|label\|execution-id>` | restore that version's files and move head (a checkpoint label names its version; an execution id makes that run the next seed). Refuses on a dirty tree naming the files; `--discard` overrides |
 | `weft tree` | the version tree: versions with what changed, their runs beneath, head marked (`--json` adds `disk_version`) |
-| `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is a [color], its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
+| `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is an execution id, its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
 | `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
 | `weft examples` | list saved parameters and frozen examples; inspect them, rerun one with `weft run <name>`, then compare with `weft diff` |
 | `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming. Takes `--running-policy` like `activate` (the setup runs on a worker, and a stale one is replaced first) |
-| `weft wake <color> <node>` | resolve a pure time wait now; refused for a wait expecting a value, naming its kind |
+| `weft wake <execution-id> <node>` | resolve a pure time wait now; refused for a wait expecting a value, naming its kind |
 | `weft prune <version>` | delete a version, everything under it, and their runs; asks first, `--yes` for scripts. Refuses on head's version, under a frozen example's origin, and while a run in the subtree is running |
-| `weft stop <color>` | cancel an execution |
+| `weft stop <execution-id>` | cancel an execution |
+| `weft workers [set --min-instances N ...\| reset [lever]...]` | the project's own worker levers (copies kept warm, the most copies, runs per copy, CPU, memory); what it leaves unset follows the install, and a change applies at once |
 | `weft status` | registration, build state, listener, infra, drift |
 | `weft ps` | every registered project |
 | `weft executions [--limit N] [--project <id>] [--phase fire]` | past executions, newest first (see Reading a run) |
-| `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
-| `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
+| `weft events <execution-id> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
+| `weft logs [execution-id]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
 | `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project needs `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes). Both take `--running-policy <cancel\|wait>`, default `cancel`: on `activate` it says what happens to a worker still up from an older build (cancel what it runs and replace it now, or `wait` for its executions to land, up to `--drain-timeout` seconds); on `deactivate` the same for the project's running executions |
 | `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only while some trigger is on, the program's or a member's (with none on it refuses: `weft activate` first), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
@@ -160,7 +165,7 @@ status` and the graph print back.
 | `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect`; `--member <id>` does the same as one member of the program on a node whose connection is `@member_filled`, the way their settings page would |
 | `weft member-values --member <id> [--set node.field=value]... [--clear node.field]...` | what the program asks that member to fill and what they gave; with `--set` / `--clear`, changes it in one go (their live triggers reading a changed value are set up again). Through a member token it mints and revokes |
 | `weft rm [--journal] [--local] [--all] --yes` | unregister the project, terminate [infra], reclaim data. `--journal` also drops its run history, `--local` its build artifacts, `--all` implies every flag. Asks first; pass `--yes`, and only after the user confirmed |
-| `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: a [color] takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. `--images` and `--build-cache` touch no journal rows. Deleting runs asks first; pass `--yes`, and only after the user confirmed |
+| `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: an execution id takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. `--images` and `--build-cache` touch no journal rows. Deleting runs asks first; pass `--yes`, and only after the user confirmed |
 
 How a run picks which nodes execute is in the `weft-language` skill. A
 trigger fires on its own event only once the project is activated; to try a
@@ -314,7 +319,7 @@ node needs [infra]. A start or stop on its way reads `provisioning` or
 `stopping` in every reader at once, before the containers move.
 `weft infra logs <node>` (or no node, for all) prints what the containers
 wrote, `--tail N` and `-f` as for a run: a failure inside a service is read
-there, with no kubectl.
+there.
 
 ## Reading a run
 
@@ -325,12 +330,12 @@ node and the wrong value.
 
 - **If you want to know what ran, or whether your trigger fired since the
   change**: `weft executions --limit 10 --phase fire`. One line per run:
-  [color], status (`running`, `completed`, `failed`, `cancelled`), phase, the
+  execution id, status (`running`, `completed`, `failed`, `cancelled`), phase, the
   local start time, the entry node (the trigger that fired), the tags. An
   activate, a resync or an infra start creates setup runs, phases
   `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project
   <id>` narrows to one project.
-- **If a run failed and you want the reason**: `weft logs <color>`. It
+- **If a run failed and you want the reason**: `weft logs <execution-id>`. It
   prints what the run's nodes wrote and every failure the journal recorded,
   as `error` and `warn` lines. A line about one node names it (and the loop
   iteration, `llm#3:`); a line about the run itself (the run failing, a
@@ -340,7 +345,7 @@ node and the wrong value.
   that up to 20000, higher is refused. For most failures this is enough and
   you never open the events. `(no logs: ...)` means the run wrote nothing
   and recorded no failure: it did not fail, so you check its status.
-- **If you want the values on the wires**: `weft events <color>`. One line
+- **If you want the values on the wires**: `weft events <execution-id>`. One line
   per event: local time, kind, node, then everything the row carries as
   `key=value`, each cut to a screen's width (`input=` on `node_started`,
   `output=` on `node_completed`, `error=` on `node_failed`, `reason=` on a
@@ -349,7 +354,7 @@ node and the wrong value.
   catches `node_failed` and `execution_failed`), `--kind node_skipped` for
   what did not run and why, `--node <id>` for every event on one node.
 - **If a value on one of those lines is cut off**: it was cut to fit the
-  screen, not stored short. `weft events <color> --node <id> --full` prints
+  screen, not stored short. `weft events <execution-id> --node <id> --full` prints
   it whole, and `--json` gives you the replay rows for `grep` or `jq`. No
   value a run recorded is unreadable, so you never report one as unreadable.
 - **If a node did not run**: its `node_skipped` line carries the reason.
@@ -364,7 +369,7 @@ node and the wrong value.
   read it, and they carry their own reason.)
 - **If a `Debug` shows `output=` empty**: correct, a `Debug` has no
   outputs. Its value is on its `node_started` line as `input=`, or `weft
-  events <color> --node <debug id>`.
+  events <execution-id> --node <debug id>`.
 - **If a past run shows no values at all**: a run's rows say what happened,
   not what it meant; the editor works out every input and output by
   replaying those rows against the code the run ran, so a run whose code
@@ -373,7 +378,7 @@ node and the wrong value.
   not a viewer bug. The code is kept as long as any run points at it, so
   this is rare. If the files are still on disk, `weft build` puts the
   program back under the hash the run names and the run reads as it did. If
-  not, the run is readable only as its shape, and `weft clean <color>`
+  not, the run is readable only as its shape, and `weft clean <execution-id>`
   removes it.
 - In VS Code with the weft extension: the Executions view, "View in Graph"
   replays the run in the graph, values on every wire; `Debug` nodes render
@@ -389,8 +394,8 @@ node and the wrong value.
    catalog (an enrichment error, an unknown field, "a stale base_catalog
    copy") means the stdlib copy lags the installed weft: `weft catalog
    update`, then re-check, before anything else.
-2. **A run failed.** `weft logs <color>` names the node and the error. If
-   that is not enough, `weft events <color> --node <that node>` shows the
+2. **A run failed.** `weft logs <execution-id>` names the node and the error. If
+   that is not enough, `weft events <execution-id> --node <that node>` shows the
    values that reached it, on its `node_started` line. For the compiler
    error slugs, go and read the `weft-language` skill. A node's own error
    text is written by the node's author. A node error saying it has no
@@ -411,14 +416,14 @@ node and the wrong value.
    into the person.
 5. **Cancelled.** Read the reason on `execution_cancelled`. `Cancelled by
    user` is a person: the Stop button, `weft stop`, a project deactivate or
-   wipe, or a cancel through a signal token. `Stopped by execution <color>
+   wipe, or a cancel through a signal token. `Stopped by execution <execution-id>
    (tag <tag>)` means another run asked the engine to stop everything
    carrying that tag: look at **that** run, and if no sibling was supposed
    to stop this one, the bug is in whichever node tagged and stopped it
    (`weft executions` shows each run's tags, so you
    see which runs shared it). `Caller disconnected` means the live caller
    this run was answering dropped its connection. Anything else is the
-   runtime's own reason, printed as words (a worker pod shutting down).
+   runtime's own reason, printed as words (a worker shutting down).
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
    bug (a wire the compiler could not catch). The `execution_failed` line
    names every firing left holding a pulse and the wired ports it never

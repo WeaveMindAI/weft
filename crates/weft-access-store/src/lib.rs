@@ -17,6 +17,7 @@
 
 mod crypt;
 mod flows;
+mod picks;
 mod resolve;
 mod subscriptions;
 
@@ -24,12 +25,13 @@ pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
     begin_oauth, begin_picker, own_connection_gate, change_member_values, complete_oauth, connection_handle, connect_direct, delete_grant,
-    delete_published_grants, finish_picker, forget_member_grants, forget_project_members, list_grants, load_picker,
+    delete_published_grants, finish_picker, forget_member_grants, forget_project_access, list_grants, load_picker,
     member_connection_counts, member_value_counts, member_values, publish_grant, published_connection, sweep_expired_connects,
     ConnectionValue, MemberValueWrite,
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
     PublishAccess,
 };
+pub use picks::{change_install_picks, install_picks, PickWrite};
 pub use subscriptions::{
     drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,
@@ -107,6 +109,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &[
         "access_grant",
         "member_value",
+        "install_pick",
         "access_connect",
         "access_picker",
         "access_connect_result",
@@ -224,6 +227,21 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             PRIMARY KEY (project_id, member_id, step, field)
         );
         CREATE INDEX IF NOT EXISTS member_value_grant ON member_value (grant_id) WHERE grant_id IS NOT NULL;
+        -- The connection each of a program's access nodes uses on this
+        -- install (`weft_core::picks`): picked here, never written in the
+        -- source, since a connection's id means nothing on another
+        -- install. One of the author's own connections (no member's),
+        -- and removing the connection removes the pick with it.
+        CREATE TABLE IF NOT EXISTS install_pick (
+            tenant_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            step TEXT NOT NULL,
+            field TEXT NOT NULL,
+            grant_id UUID NOT NULL REFERENCES access_grant(id) ON DELETE CASCADE,
+            set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (project_id, step, field)
+        );
+        CREATE INDEX IF NOT EXISTS install_pick_grant ON install_pick (grant_id);
         -- The inbound-event lookup: an incoming push names a service
         -- and an account, and must find every connection to it
         -- without knowing a tenant (which is the point: the push
@@ -231,13 +249,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE INDEX IF NOT EXISTS access_grant_service_account
             ON access_grant (service, provider_account);
         -- One in-flight OAuth connect per state nonce. Postgres-backed so
-        -- the callback may land on any dispatcher pod.
+        -- the callback may land on any dispatcher instance.
         CREATE TABLE IF NOT EXISTS access_connect (
             state TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             service TEXT NOT NULL,
             -- The resolved app credentials for the code exchange, carried
-            -- from begin to callback (any dispatcher pod completes it).
+            -- from begin to callback (any dispatcher instance completes it).
             -- SEALED (crypt.rs).
             registration_sealed TEXT NOT NULL,
             project_id UUID,

@@ -1,11 +1,11 @@
-//! `task` table: durable work queue. Producers `enqueue`; one Pod
+//! `task` table: durable work queue. Producers `enqueue`; one process
 //! claims a row via `claim_one` (FOR UPDATE SKIP LOCKED), runs the
 //! work, then `complete` or `fail`. Heartbeat extends the claim's
 //! lease so a slow op doesn't lose the row to the stale-recovery
 //! filter.
 //!
 //! Idempotency: every executor MUST be safe to re-run on partial
-//! success. A row can be run again after a Pod crash (the lease
+//! success. A row can be run again after a process crash (the lease
 //! expires and `claim_one` rescues it) or after a surrender (the
 //! claimer could not renew its lease and `requeue`d the row). Cluster
 //! ops should treat "already exists" as success; executors with a
@@ -24,14 +24,14 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
-/// How long a claim is valid before another Pod can steal it, at this
+/// How long a claim is valid before another process can steal it, at this
 /// install's pace (`weft_core::time_scale`): 60 seconds in real time.
-/// Pods heartbeat the claim while they work.
+/// processes heartbeat the claim while they work.
 pub fn claim_duration_secs() -> i64 {
     weft_core::time_scale::scaled_secs(60)
 }
 
-/// How often a working Pod renews its claim: a quarter of
+/// How often a working process renews its claim: a quarter of
 /// [`claim_duration_secs`] (15 seconds in real time), so a slow op
 /// doesn't lose its claim to a transient hiccup.
 pub fn claim_heartbeat_interval() -> std::time::Duration {
@@ -97,7 +97,7 @@ pub struct Task {
     pub kind: String,
     pub status: TaskStatus,
     pub project_id: Option<Uuid>,
-    pub color: Option<String>,
+    pub execution_id: Option<String>,
     /// The tenant the task belongs to: every task has one, and the dedup
     /// uniqueness is scoped by it.
     pub tenant_id: String,
@@ -126,41 +126,40 @@ pub struct NewTask {
     pub target: TaskTarget,
     pub project_id: Option<Uuid>,
     pub dedup_key: Option<String>,
-    pub color: Option<String>,
+    pub execution_id: Option<String>,
     /// The tenant the task belongs to: required, because the dedup
     /// uniqueness is scoped by it (a NULL tenant would never dedup) and
     /// every task is somebody's.
     pub tenant_id: String,
-    /// If set, only the named pod can claim this task. Used by
-    /// `cancel_execution` so a multi-pod project pool routes the
-    /// cancel to the pod that owns the running color, not whoever
-    /// claims first. NULL means any pod in the (target, project)
-    /// scope can claim.
-    pub target_pod_name: Option<String>,
-    /// The worker IMAGE this task must run on: the project's
-    /// `running_binary_hash` at enqueue time. An UNPINNED worker task
-    /// is only claimable by a pod whose baked `worker_pod.binary_hash`
-    /// matches, so new work never lands on a stale-image worker (which
-    /// would run a binary missing the current graph's node impls); the
-    /// cold-start sweep sees a project whose only pods are stale as
-    /// having NO admittable pod and spawns a fresh one, and the stale
-    /// pods idle-exit on their own. Pinned tasks bypass the check (a
-    /// cancel/resume addressed to the color's owner must reach THAT
-    /// pod regardless of its image). NULL = any pod (dispatcher-target
-    /// tasks, and worker tasks with no image requirement).
+    /// If set, only the named process instance can claim this task. A
+    /// live execution is pinned to the worker instance its caller's
+    /// connection reached (`admit_live_execution_in`), since the caller
+    /// is on THAT instance's socket. NULL means whoever the task is
+    /// delivered to may claim it.
+    pub target_instance: Option<String>,
+    /// The worker IMAGE this task runs on: the project's
+    /// `running_binary_hash` at enqueue time. A worker task is delivered
+    /// to workers running exactly this image (`take_deliveries`), so new
+    /// work never lands on a worker whose binary lacks the current
+    /// graph's node impls. Required on every execute and resume; NULL
+    /// on dispatcher tasks.
     #[serde(default)]
     pub binary_hash: Option<String>,
     pub payload: Value,
 }
 
-/// Filter on which kinds of tasks the caller wants to claim.
-/// Internally-tagged serde shape so the wire form is
-/// `{"kind": "dispatcher"}` or `{"kind": "worker", "project_id": "..."}`.
+/// Which task the caller wants to claim. Internally-tagged serde shape
+/// so the wire form is `{"kind": "dispatcher"}` or
+/// `{"kind": "execution_id", "project_id": "...", "execution_id": "..."}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClaimFilter {
+    /// Any dispatcher task.
     Dispatcher,
-    Worker { project_id: Uuid },
+    /// The execute or resume task of one execution: what a worker that
+    /// was handed that execution claims. A worker is never handed "some
+    /// work of the project"; it is called for one execution.
+    ExecutionId { project_id: Uuid, execution_id: String },
 }
 
 impl ClaimFilter {
@@ -169,7 +168,7 @@ impl ClaimFilter {
     pub fn ready_payload(&self) -> String {
         match self {
             Self::Dispatcher => ready_payload(TaskTarget::Dispatcher, None),
-            Self::Worker { project_id } => ready_payload(TaskTarget::Worker, Some(*project_id)),
+            Self::ExecutionId { project_id, .. } => ready_payload(TaskTarget::Worker, Some(*project_id)),
         }
     }
 }
@@ -183,7 +182,7 @@ pub const TASK_READY_CHANNEL: &str = "weft_task_ready";
 
 /// A [`TASK_READY_CHANNEL`] payload: `dispatcher` for a dispatcher task,
 /// `worker:<project_id>` for a worker one, since only that project's
-/// pods can claim it.
+/// workers can claim it (and the delivery sweep wakes on it).
 /// SYNC: ready_payload <-> the `task_ready_notify` function in `GROUP`.
 pub fn ready_payload(target: TaskTarget, project_id: Option<Uuid>) -> String {
     match target {
@@ -203,21 +202,13 @@ pub fn ready_payload(target: TaskTarget, project_id: Option<Uuid>) -> String {
 pub enum DedupOutcome {
     Inserted(Uuid),
     AlreadyLive(Uuid),
-    /// The enqueue was fenced by the placement-generation check (a stale
-    /// held-event fire from a pod drained during a scale-down move). No
-    /// task was created; the caller treats it as a successful no-op.
-    /// Only the broker-backed FireSignal path can produce this; the
-    /// local Postgres `enqueue_dedup` never fences (it has no generation
-    /// context), so its callers never see it.
-    Fenced,
 }
 
 impl DedupOutcome {
-    /// The created task id, or `None` when the enqueue was fenced.
-    pub fn id(&self) -> Option<Uuid> {
+    /// The task's id: the new one, or the live one it collapsed onto.
+    pub fn id(&self) -> Uuid {
         match self {
-            Self::Inserted(id) | Self::AlreadyLive(id) => Some(*id),
-            Self::Fenced => None,
+            Self::Inserted(id) | Self::AlreadyLive(id) => *id,
         }
     }
 }
@@ -234,9 +225,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             target TEXT NOT NULL,
             project_id UUID,
             dedup_key TEXT,
-            color TEXT,
+            execution_id TEXT,
             tenant_id TEXT NOT NULL,
-            target_pod_name TEXT,
+            target_instance TEXT,
             binary_hash TEXT,
             payload JSONB NOT NULL,
             claimed_by TEXT,
@@ -250,7 +241,12 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- claimant may already be past the point where it would
             -- have seen why, so finishing puts the row back to pending
             -- instead of ending it.
-            rerun_requested BOOLEAN NOT NULL DEFAULT FALSE
+            rerun_requested BOOLEAN NOT NULL DEFAULT FALSE,
+            -- Until when a worker task counts as handed to a worker that
+            -- has not claimed it yet (`take_deliveries`): no second
+            -- delivery is made before then, so a worker still starting
+            -- up is not handed the same execution again.
+            delivered_until_unix BIGINT
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_pending_dispatcher
             ON task(created_at_unix)
@@ -269,9 +265,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup_live
             ON task(tenant_id, kind, dedup_key)
             WHERE dedup_key IS NOT NULL AND status IN ('pending', 'claimed')"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_task_color
-            ON task(color)
-            WHERE color IS NOT NULL"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_task_execution_id
+            ON task(execution_id)
+            WHERE execution_id IS NOT NULL"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_tenant ON task(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_project
             ON task(project_id)
@@ -308,6 +304,61 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             FOR EACH ROW
             WHEN (NEW.status = 'pending' AND OLD.status IS DISTINCT FROM 'pending')
             EXECUTE FUNCTION task_ready_notify()"#,
+        // Ownership-follows-claim: whenever a worker claims a task that
+        // carries an execution, that process becomes the execution's owner. Done as
+        // an AFTER-UPDATE trigger so it commits in the SAME transaction
+        // as the claim itself (`tasks::claim_one`'s UPDATE), making
+        // "claimed by process X" and "owned by process X" atomically
+        // inseparable. Without this (a separate UPDATE after the claim
+        // commits) a crash between the two leaves a task claimed by a
+        // process that does not own its execution, so every journal write from
+        // that process is fenced until the lease expires. "Latest claim
+        // wins" is exactly what a resume handoff needs: the fresh process
+        // that reclaims a dead owner's resume takes ownership here. The
+        // task table's claim semantics already enforce one active process
+        // per task, so there is never an overlap where two processes own one
+        // execution. `execution` is seeded at ExecutionStarted (well
+        // before any task is claimed), so the row always exists; if it
+        // somehow does not the UPDATE matches zero rows and the
+        // broker's journal-write owner check then refuses the process
+        // loudly (no silent mis-bind).
+        // SYNC: execution.owner_instance has exactly two writers,
+        // this trigger and `bind_execution_id_owner` below (the appointed-driver
+        // path for processes that never claim a task); the readers are
+        // crates/weft-broker/src/handlers.rs journal_record and
+        // crates/weft-broker/src/auth.rs resolve_storage_caller.
+        r#"CREATE OR REPLACE FUNCTION weft_bind_execution_id_owner() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.execution_id IS NOT NULL AND NEW.claimed_by IS NOT NULL THEN
+                    UPDATE execution
+                    SET owner_instance = NEW.claimed_by
+                    WHERE execution_id = NEW.execution_id;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS task_claim_binds_execution_id_owner ON task"#,
+        // Fire only on:
+        //   - the pending/claimed-lapsed -> claimed transition
+        //     (claimed_by goes from NULL/other to a process), not on every
+        //     task UPDATE (complete, heartbeat-renew, requeue), so the
+        //     hot path stamps ownership exactly once per claim; AND
+        //   - tasks that actually DRIVE the execution: 'execute' and
+        //     'resume'. A side-channel task that merely carries an execution
+        //     (a 'cancel_execution' addressed to the owner) must NOT
+        //     restamp ownership: ownership follows the driver. (cancel is
+        //     pinned to the owner anyway, so even if it did fire the
+        //     stamp would be owner->owner, but scoping by kind makes a
+        //     future execution-bearing task kind unable to steal ownership by
+        //     accident, which is the property we want to hold by
+        //     construction, not by every caller remembering to pin.)
+        r#"CREATE TRIGGER task_claim_binds_execution_id_owner
+            AFTER UPDATE OF claimed_by ON task
+            FOR EACH ROW
+            WHEN (NEW.status = 'claimed' AND NEW.claimed_by IS NOT NULL
+                  AND NEW.claimed_by IS DISTINCT FROM OLD.claimed_by
+                  AND NEW.kind IN ('execute', 'resume'))
+            EXECUTE FUNCTION weft_bind_execution_id_owner()"#,
     ],
     seed: &[],
 };
@@ -319,8 +370,8 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO task (
-            id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, binary_hash, payload, attempts, created_at_unix
+            id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
+            target_instance, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
@@ -328,9 +379,9 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(spec.target.as_str())
     .bind(spec.project_id)
     .bind(spec.dedup_key.as_deref())
-    .bind(spec.color.as_deref())
+    .bind(spec.execution_id.as_deref())
     .bind(spec.tenant_id.as_str())
-    .bind(spec.target_pod_name.as_deref())
+    .bind(spec.target_instance.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
@@ -401,8 +452,8 @@ pub async fn enqueue_dedup_in(
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO task (
-            id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, binary_hash, payload, attempts, created_at_unix
+            id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
+            target_instance, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
@@ -410,9 +461,9 @@ pub async fn enqueue_dedup_in(
     .bind(spec.target.as_str())
     .bind(spec.project_id)
     .bind(dedup)
-    .bind(spec.color.as_deref())
+    .bind(spec.execution_id.as_deref())
     .bind(spec.tenant_id.as_str())
-    .bind(spec.target_pod_name.as_deref())
+    .bind(spec.target_instance.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
@@ -464,154 +515,91 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
     Ok(outcome)
 }
 
-/// The pod a live execution was admitted to (its k8s name + namespace),
-/// returned by [`admit_live_execution`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedPod {
-    pub pod_name: String,
-    pub namespace: String,
-}
-
-/// [`admit_live_execution_in`]'s outcome. `Admitted` = THIS call inserted the
-/// pinned task (the caller's transaction now owns a fresh admission and should
-/// write whatever must commit atomically with it). `AlreadyAdmitted` = an
-/// earlier call for the same color already inserted it (idempotent retry;
-/// nothing new to commit). `Saturated` = every worker is at capacity, nothing
-/// was written.
+/// [`admit_live_execution_in`]'s outcome. `Admitted` = THIS call inserted
+/// the pinned task (the caller's transaction now owns a fresh admission and
+/// should write whatever must commit atomically with it).
+/// `AlreadyAdmitted` = an earlier call for the same execution already inserted
+/// it, pinned to `instance` (an idempotent retry when that is the asker; a
+/// second copy of the caller's request on another worker otherwise).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveAdmitOutcome {
-    Admitted(AdmittedPod),
-    AlreadyAdmitted(AdmittedPod),
-    Saturated,
+    Admitted,
+    AlreadyAdmitted { instance: String },
 }
 
-/// ATOMICALLY admit a live execution: pick the least-PRESSURED admittable
-/// worker for the project (alive, not draining, memory pressure below
-/// `saturation`) and insert the pinned execute task for the spec's color on
-/// it, under a per-project advisory lock. `Saturated` when every worker is
-/// saturated / draining or none is alive (the caller then spawns a fresh pod
-/// and retries).
+/// ATOMICALLY admit a live execution onto the worker instance its caller's
+/// connection reached: insert the execute task for the spec's execution,
+/// pinned to `spec.target_instance` (that instance), unless one is already
+/// live for the execution.
 ///
-/// MUST run inside a caller-owned transaction: the advisory lock is
-/// xact-scoped, and the caller writes the execution's journal birth in the
-/// same transaction so "admitted" and "journaled" can never disagree.
-/// Admission IS the task insert, so "admitted" and "has a task row" can never
-/// disagree either. Capacity is governed by MEMORY pressure (the same metric
-/// placement and scale-down use), NOT a connection count: a worker takes live
-/// executions until its memory crosses the saturation threshold, then the
-/// next one spawns. The advisory lock serializes admissions for the project
-/// so a burst of concurrent handshakes (across sibling dispatcher Pods)
-/// doesn't all pile onto the same least-pressured pod before its next
-/// heartbeat updates the pressure reading.
-///
-/// The spec's `dedup_key` (`{color}:execute`) collapses a crash-retry of the
-/// same handshake; the spec's `binary_hash` is the project's current
-/// `running_binary_hash` (only a pod baked from that image is admittable; a
-/// stale-image pod would run a binary missing the current graph's node impls).
-/// The spec's `target_pod_name` must be `None`: the pin IS what this picks.
-pub async fn admit_live_execution_in(
-    conn: &mut sqlx::PgConnection,
-    spec: &NewTask,
-    saturation: f64,
-) -> Result<LiveAdmitOutcome> {
-    let project_id = spec
-        .project_id
-        .ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
-    let color = spec
-        .color
+/// MUST run inside a caller-owned transaction: the caller writes the
+/// execution's journal birth in the same transaction, so "admitted" and
+/// "journaled" can never disagree. Admission IS the task insert, so
+/// "admitted" and "has a task row" can never disagree either. The spec's
+/// `dedup_key` (`{execution_id}:execute`) collapses a crash-retry of the same
+/// arrival.
+pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTask) -> Result<LiveAdmitOutcome> {
+    let project_id = spec.project_id.ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
+    let execution_id = spec.execution_id.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires execution"))?;
+    let dedup = spec.dedup_key.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires dedup_key"))?;
+    let instance = spec
+        .target_instance
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("live admission requires color"))?;
-    let dedup = spec
-        .dedup_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("live admission requires dedup_key"))?;
-    // Serialize admissions for this project so a burst of concurrent
-    // handshakes reads a consistent pressure ordering and doesn't stampede
-    // one pod (same discipline as `enqueue_dedup`'s per-dedup lock, here
-    // per-project).
-    let lock_input = format!("live-admit|{project_id}");
+        .ok_or_else(|| anyhow::anyhow!("live admission requires the worker instance the caller reached"))?;
+    // Serialize admissions of one execution, so two copies of the same
+    // arrival never both insert.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(&lock_input)
+        .bind(format!("live-admit|{}|{dedup}", spec.tenant_id))
         .execute(&mut *conn)
         .await?;
-
-    // A retry of the same handshake finds its task already live; return the
-    // SAME pod it was admitted to, never insert a second task for the color.
-    // LEFT JOIN so a task whose pod row was already GC'd is STILL found (an
-    // inner join would miss it and let us insert a duplicate). `t.target_pod_name`
-    // is the durable pin; `wp.namespace` is NULL only if that pod row is gone.
-    let existing: Option<(String, Option<String>)> = sqlx::query_as(
-        r#"SELECT t.target_pod_name, wp.namespace
-           FROM task t LEFT JOIN worker_pod wp ON wp.pod_name = t.target_pod_name
-           WHERE t.tenant_id IS NOT DISTINCT FROM $1
-             AND t.kind = 'execute' AND t.dedup_key = $2
-             AND t.status IN ('pending', 'claimed')
+    let existing: Option<(Option<String>,)> = sqlx::query_as(
+        r#"SELECT target_instance FROM task
+           WHERE tenant_id = $1 AND kind = 'execute' AND dedup_key = $2
+             AND status IN ('pending', 'claimed')
            LIMIT 1"#,
     )
     .bind(spec.tenant_id.as_str())
     .bind(dedup)
     .fetch_optional(&mut *conn)
     .await?;
-    if let Some((pod_name, namespace)) = existing {
-        return match namespace {
-            // Already admitted on a live pod: idempotent success on that pod.
-            Some(namespace) => Ok(LiveAdmitOutcome::AlreadyAdmitted(AdmittedPod { pod_name, namespace })),
-            // The original pod's row is gone (it died and was GC'd): the task
-            // is now an orphan the sweep will cancel. Fail loud rather than
-            // insert a SECOND task for the color on a fresh pod (which would
-            // leave two execute tasks for one color). The caller surfaces the
-            // error; the orphan sweep cancels the dead-pod task.
-            None => Err(anyhow::anyhow!(
-                "live execution for color {color} was admitted to pod '{pod_name}' which is gone; \
-                 the orphan sweep will cancel it"
-            )),
-        };
+    if let Some((pinned,)) = existing {
+        let pinned = pinned.ok_or_else(|| {
+            anyhow::anyhow!("live execution {execution_id} has an execute task pinned to no worker; it was not admitted as a live run")
+        })?;
+        return Ok(LiveAdmitOutcome::AlreadyAdmitted { instance: pinned });
     }
-
-    // A spec that names its pod (the caller is already standing at it)
-    // is admitted there or not at all; an unpinned one goes to the
-    // least-loaded pod with headroom.
-    let chosen = crate::worker_pod::admittable_pod_for_project(
-        &mut *conn, project_id, saturation, spec.binary_hash.as_deref(), spec.target_pod_name.as_deref(),
-    ).await?;
-    let Some((pod_name, namespace)) = chosen else {
-        return Ok(LiveAdmitOutcome::Saturated);
-    };
-
     let id = Uuid::new_v4();
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO task (
-            id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, binary_hash, payload, attempts, created_at_unix
+            id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
+            target_instance, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, $8, 0, $9)"#,
     )
     .bind(id)
     .bind(project_id)
     .bind(dedup)
-    .bind(color)
+    .bind(execution_id)
     .bind(spec.tenant_id.as_str())
-    .bind(&pod_name)
+    .bind(instance)
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
     .execute(&mut *conn)
     .await?;
-    Ok(LiveAdmitOutcome::Admitted(AdmittedPod { pod_name, namespace }))
+    Ok(LiveAdmitOutcome::Admitted)
 }
 
-/// Atomically claim one task for `pod_id`. Picks oldest pending
-/// first; also rescues claims whose lease expired (Pod died mid-work).
+/// Atomically claim one task for `instance` (the claiming process
+/// instance). Picks oldest pending first; also rescues claims whose lease
+/// expired (the claimant died mid-work).
 ///
 /// One statement: the pick locks its row (`FOR UPDATE SKIP LOCKED`, so
-/// sibling pickers skip it rather than queue behind it) and the claim
-/// updates it, with no round trip between. Each target has its own
-/// query, so the pick reads the target's partial index for pending rows
-/// and the expired-claim index together (a bitmap OR of the two)
-/// instead of scanning the table.
+/// sibling claimants skip it rather than queue behind it) and the claim
+/// updates it, with no round trip between.
 pub async fn claim_one(
     pool: &PgPool,
-    pod_id: &str,
+    instance: &str,
     filter: &ClaimFilter,
 ) -> Result<Option<Task>> {
     let now = unix_now();
@@ -619,18 +607,19 @@ pub async fn claim_one(
     let row = match filter {
         ClaimFilter::Dispatcher => {
             sqlx::query(&claim_sql(DISPATCHER_PICK))
-                .bind(pod_id)
+                .bind(instance)
                 .bind(now)
                 .bind(claim_until)
                 .fetch_optional(pool)
                 .await?
         }
-        ClaimFilter::Worker { project_id } => {
-            sqlx::query(&claim_sql(WORKER_PICK))
-                .bind(pod_id)
+        ClaimFilter::ExecutionId { project_id, execution_id } => {
+            sqlx::query(&claim_sql(EXECUTION_ID_PICK))
+                .bind(instance)
                 .bind(now)
                 .bind(claim_until)
                 .bind(*project_id)
+                .bind(execution_id.as_str())
                 .fetch_optional(pool)
                 .await?
         }
@@ -638,85 +627,284 @@ pub async fn claim_one(
     row.map(row_to_task).transpose()
 }
 
-/// The claim around a pick: `$1` the claiming pod, `$2` now, `$3` the
-/// lease's end. `RETURNING` hands back the row as claimed, so
-/// `attempts` counts the claim the caller now holds. A new claim is the
-/// run that sees everything asked before it, so it clears
-/// `rerun_requested`: an ask left over from a claim that ended without
-/// finishing (a requeue, a reclaim, a lapsed lease) is already served.
+/// The claim around a pick: `$1` the claimant, `$2` now, `$3` the lease's
+/// end. `RETURNING` hands back the row as claimed, so `attempts` counts the
+/// claim the caller now holds. A new claim is the run that sees everything
+/// asked before it, so it clears `rerun_requested`, and it is the delivery
+/// the task was waiting for, so it clears `delivered_until_unix`.
 fn claim_sql(pick: &str) -> String {
     format!(
         "UPDATE task \
          SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1, \
-             rerun_requested = FALSE \
+             rerun_requested = FALSE, delivered_until_unix = NULL \
          WHERE id = ({pick}) \
-         RETURNING id, kind, status, project_id, color, tenant_id, binary_hash, attempts, payload"
+         RETURNING id, kind, status, project_id, execution_id, tenant_id, binary_hash, attempts, payload"
     )
 }
 
 /// The oldest dispatcher task that is pending or whose claim lapsed.
-/// Dispatcher pods have no `worker_pod` row, so nothing else gates it.
 const DISPATCHER_PICK: &str = r#"SELECT id FROM task
     WHERE target = 'dispatcher'
       AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
-      AND (target_pod_name IS NULL OR target_pod_name = $1)
+      AND (target_instance IS NULL OR target_instance = $1)
     ORDER BY created_at_unix ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1"#;
 
-/// The oldest worker task of project `$4` that is pending or whose
-/// claim lapsed, and that pod `$1` may run.
-///
-/// `target_pod_name IS NULL OR target_pod_name = $pod` lets cancel /
-/// resume tasks be addressed to one specific pod in a multi-pod pool.
-/// Tasks without an address are claimable by any pod of the project.
-///
-/// The picking pod must still be alive in `worker_pod`. Without this, a
-/// pod that's been marked dead (e.g. by reconcile_worker during a sync
-/// that bumped the binary_hash) keeps claiming tasks for the up-to-10s
-/// window until its own heartbeat detects the dead row. Those claims
-/// then fail when the fencing trigger rejects the resulting journal
-/// writes. The DB has the source of truth; let it enforce.
-///
-/// DRAINING pods: a worker being scaled down must stop taking NEW,
-/// unaddressed work (else the drain never empties it), but must still
-/// run work ADDRESSED to it (a resume pinned to it because it still
-/// owns the color, or a cancel). So a draining pod may claim a task
-/// pinned to itself but not an unpinned one. Expressed as: the task is
-/// pinned to THIS pod, OR (it is unpinned AND this pod is not
-/// draining). Aliveness is required either way.
-///
-/// STALE-IMAGE pods: an unpinned task stamped with a `binary_hash` is
-/// only claimable by a pod baked from THAT image. Without this, a
-/// still-alive worker built for the previous source claims a run for
-/// the new source and fails at runtime with "unknown node type" (its
-/// binary lacks the new node impls). The cold-start sweep applies the
-/// same predicate, so a project whose only pods are stale gets a fresh
-/// spawn; the stale pods stop receiving work and idle-exit. Pinned
-/// tasks bypass (they must reach their addressed pod).
-const WORKER_PICK: &str = r#"SELECT id FROM task
+/// The execute or resume task of execution `$5` of project `$4`, pending
+/// or with a lapsed claim, that instance `$1` may run: unpinned, or
+/// pinned to it (a live run is pinned to the instance its caller's
+/// connection reached), and only while no OTHER task of the execution is
+/// being driven (see [`NOT_DRIVEN_ELSEWHERE`]). The order is a tie-break:
+/// the oldest first.
+const EXECUTION_ID_PICK: &str = concat!(
+    r#"SELECT id FROM task
     WHERE target = 'worker'
       AND project_id = $4
+      AND execution_id = $5
+      AND kind IN ('execute', 'resume')
       AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
-      AND (target_pod_name IS NULL OR target_pod_name = $1)
-      AND EXISTS (
-          SELECT 1 FROM worker_pod wp
-          WHERE wp.pod_name = $1
-            AND wp.status IN ('spawning', 'alive')
-            AND wp.role = 'worker'
-            AND (task.target_pod_name = $1
-                 OR (NOT wp.draining
-                     AND (task.binary_hash IS NULL
-                          OR task.binary_hash = wp.binary_hash)))
-      )
+      AND (target_instance IS NULL OR target_instance = $1)
+      AND "#,
+    not_driven_elsewhere!(),
+    r#"
     ORDER BY created_at_unix ASC
     FOR UPDATE SKIP LOCKED
-    LIMIT 1"#;
+    LIMIT 1"#
+);
+
+/// One execution is driven by one claim at a time. A resume can be asked for
+/// while its execution is still being driven (a person answers a form
+/// between the node registering its wait and the drive noticing it
+/// suspended); run then, it would fold the journal a second time and run
+/// the parked node again beside the live drive, so every side effect
+/// below it would happen twice. It waits instead: the live drive resumes
+/// the answer in place, and the resume, claimed once that drive ended,
+/// folds a journal that already holds it. A lapsed claim does not count
+/// (its driver is gone). `task` is the candidate row, `$2` now.
+// SYNC: not_driven_elsewhere <-> take_deliveries (the same rule, inlined)
+macro_rules! not_driven_elsewhere {
+    () => {
+        "NOT EXISTS (SELECT 1 FROM task other \
+             WHERE other.execution_id = task.execution_id AND other.id <> task.id \
+               AND other.kind IN ('execute', 'resume') \
+               AND other.status = 'claimed' AND other.claimed_until_unix >= $2)"
+    };
+}
+use not_driven_elsewhere;
+
+/// One execution to hand to the project's workers: what
+/// [`take_deliveries`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    pub tenant_id: String,
+    pub execution_id: String,
+    /// The worker image the execution runs on.
+    pub binary_hash: String,
+    pub run_class: weft_core::run_class::RunClass,
+}
+
+/// How long a delivery holds its task before another may be made: time
+/// for a worker to start and claim, at this install's pace. A worker
+/// that took the delivery claims long before; one that never does
+/// (it could not start) is handed the execution again after this.
+pub fn delivery_lease_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(120)
+}
+
+/// What one [`take_deliveries`] pass took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Taken {
+    pub deliveries: Vec<Delivery>,
+    /// Rows that can never be delivered (no image, no run class), for
+    /// the caller to end: the task store cannot write the journal, so
+    /// the execution's terminal is the dispatcher's to write, then
+    /// [`fail_undeliverable`] fails the task. Each stays taken (its
+    /// delivery lease) meanwhile, and one the caller never ended is
+    /// taken again once the lease runs out.
+    pub undeliverable: Vec<Undeliverable>,
+}
+
+impl Taken {
+    /// How many rows the pass took, deliverable or not.
+    pub fn len(&self) -> usize {
+        self.deliveries.len() + self.undeliverable.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A worker task [`take_deliveries`] took but cannot deliver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undeliverable {
+    pub task_id: Uuid,
+    /// The execution the task drives, when the row names one that
+    /// parses; `None` leaves only the task to fail.
+    pub execution_id: Option<weft_core::ExecutionId>,
+    pub reason: String,
+}
+
+/// Take up to `limit` executions that need a worker, and mark each as
+/// delivered until [`delivery_lease_secs`] from now so no sibling (and no
+/// later sweep) delivers it again meanwhile.
+///
+/// An execution needs a worker when its execute or resume task is pending
+/// or its claim lapsed (the worker that had it died), no delivery of it is
+/// outstanding, and no other task of its execution is being driven (the one
+/// execution, one claim rule of `EXECUTION_ID_PICK`; the sweep that follows the
+/// driving task's end delivers it). A task pinned to an instance is never delivered: it
+/// is a live run, driven inside its caller's own connection. A worker task
+/// that cannot be delivered (no image, no run class) comes back in
+/// [`Taken::undeliverable`] with its reason rather than delivered to a
+/// guess, and never holds back the good rows taken beside it.
+pub async fn take_deliveries(pool: &PgPool, limit: i64) -> Result<Taken> {
+    let now = unix_now();
+    let rows = sqlx::query(
+        r#"UPDATE task SET delivered_until_unix = $2
+           WHERE id IN (
+               SELECT id FROM task
+               WHERE target = 'worker'
+                 AND kind IN ('execute', 'resume')
+                 AND target_instance IS NULL
+                 AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $1))
+                 AND (delivered_until_unix IS NULL OR delivered_until_unix < $1)
+                 AND NOT EXISTS (SELECT 1 FROM task other
+                     WHERE other.execution_id = task.execution_id AND other.id <> task.id
+                       AND other.kind IN ('execute', 'resume')
+                       AND other.status = 'claimed' AND other.claimed_until_unix >= $1)
+               ORDER BY created_at_unix ASC
+               FOR UPDATE SKIP LOCKED
+               LIMIT $3
+           )
+           RETURNING id, project_id, tenant_id, execution_id, binary_hash, payload ->> 'run_class' AS run_class"#,
+    )
+    .bind(now)
+    .bind(now + delivery_lease_secs())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut taken = Taken::default();
+    for row in rows {
+        let task_id: Uuid = row.try_get("id")?;
+        match delivery_of(task_id, &row) {
+            Ok(delivery) => taken.deliveries.push(delivery),
+            Err(reason) => {
+                let execution_id: Option<String> = row.try_get("execution_id")?;
+                taken.undeliverable.push(Undeliverable {
+                    task_id,
+                    execution_id: execution_id.and_then(|c| c.parse().ok()),
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// Read one taken row as a [`Delivery`], or the reason it cannot be one.
+fn delivery_of(task_id: Uuid, row: &sqlx::postgres::PgRow) -> std::result::Result<Delivery, String> {
+    let get = |e: sqlx::Error| format!("worker task {task_id}: {e}");
+    let project_id: Option<Uuid> = row.try_get("project_id").map_err(get)?;
+    let execution_id: Option<String> = row.try_get("execution_id").map_err(get)?;
+    let binary_hash: Option<String> = row.try_get("binary_hash").map_err(get)?;
+    // Every execute and resume is built by one spec that always writes
+    // its class (`kinds::ExecutionPayload::run_class`), so a missing one
+    // is a corrupt row, never "short".
+    let run_class: Option<String> = row.try_get("run_class").map_err(get)?;
+    let run_class = weft_core::run_class::RunClass::parse(
+        &run_class.ok_or_else(|| format!("worker task {task_id} names no run class"))?,
+    )
+    .map_err(|e| format!("worker task {task_id}: {e}"))?;
+    Ok(Delivery {
+        task_id,
+        project_id: project_id.ok_or_else(|| format!("worker task {task_id} names no project"))?,
+        tenant_id: row.try_get("tenant_id").map_err(get)?,
+        execution_id: execution_id.ok_or_else(|| format!("worker task {task_id} names no execution"))?,
+        binary_hash: binary_hash.ok_or_else(|| format!("worker task {task_id} names no worker image to run on"))?,
+        run_class,
+    })
+}
+
+/// Fail a task [`take_deliveries`] took but cannot deliver: pending, or
+/// claimed with a lapsed claim (no live driver), as the delivery found it.
+/// A no-op on a task another dispatcher already failed, so two copies
+/// ending the same row agree.
+pub async fn fail_undeliverable(pool: &PgPool, task_id: Uuid, error: &str) -> Result<()> {
+    let now = unix_now();
+    sqlx::query(&notify_terminal(
+        r#"UPDATE task
+           SET status = 'failed', error = $1, completed_at_unix = $2,
+               claimed_until_unix = NULL
+           WHERE id = $3
+             AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))"#,
+    ))
+    .bind(error)
+    .bind(now)
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(())
+}
+
+/// Give a delivery back: the worker could not be reached, so the next
+/// sweep may deliver the task at once instead of waiting out the lease.
+pub async fn release_delivery(pool: &PgPool, task_id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE task SET delivered_until_unix = NULL WHERE id = $1 AND status = 'pending'")
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A cancel waiting for the worker that drives its execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAsked {
+    pub execution_id: String,
+    pub cause: weft_core::exec::CancelCause,
+}
+
+/// Take the pending `cancel_execution` tasks of `project_id` for any of
+/// `execution_ids` (the executions the asking worker drives), completing each as
+/// it is taken: the worker fires the execution's flag the moment it hears.
+pub async fn take_cancels(pool: &PgPool, project_id: Uuid, execution_ids: &[String]) -> Result<Vec<CancelAsked>> {
+    if execution_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = unix_now();
+    // Taken and announced finished in one statement: a canceller waiting
+    // on the task hears it the moment the worker has it.
+    let rows = sqlx::query(&format!(
+        "WITH taken AS ( \
+             UPDATE task SET status = 'complete', completed_at_unix = $1, result = 'null'::jsonb \
+             WHERE target = 'worker' AND kind = 'cancel_execution' AND status = 'pending' \
+               AND project_id = $2 AND execution_id = ANY($3) \
+             RETURNING id, execution_id, payload) \
+         SELECT execution_id, payload, pg_notify('{}', id::text) FROM taken",
+        crate::terminal::TERMINAL_CHANNEL
+    ))
+    .bind(now)
+    .bind(project_id)
+    .bind(execution_ids)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = row.try_get("payload")?;
+            let p: crate::kinds::CancelExecutionPayload = serde_json::from_value(payload)?;
+            let execution_id: Option<String> = row.try_get("execution_id")?;
+            Ok(CancelAsked { execution_id: execution_id.unwrap_or(p.execution_id), cause: p.cause })
+        })
+        .collect()
+}
 
 /// Renew the claim's lease. Returns false if the row no longer
 /// belongs to us (lease lost, manually transitioned, deleted).
 /// The caller should abandon work and let the next claim recover.
-pub async fn heartbeat(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<bool> {
+pub async fn heartbeat(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<bool> {
     let now = unix_now();
     let claim_until = now + claim_duration_secs();
     let rows = sqlx::query(
@@ -726,29 +914,29 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<boo
     )
     .bind(claim_until)
     .bind(task_id)
-    .bind(pod_id)
+    .bind(instance)
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
 }
 
 /// Surrender a claim: put the row back to `pending` with no claimant
-/// so any matching pod can claim it. Used by the picker when it can
+/// so any matching process can claim it. Used by the picker when it can
 /// no longer renew its lease (DB unreachable past the lease window)
 /// but the work itself did not fail: terminalizing there would turn a
 /// transient outage into a permanent failure. Guarded on
-/// `claimed_by = $pod`, so a thief that already re-claimed the row is
+/// `claimed_by = $process`, so a thief that already re-claimed the row is
 /// never clobbered; returns false in that case (the thief owns the
-/// task) and true when the requeue landed. Keeps `target_pod_name`
-/// (a pinned task stays addressed; surrender is not pod death).
-pub async fn requeue(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<bool> {
+/// task) and true when the requeue landed. Keeps `target_instance`
+/// (a pinned task stays addressed; surrender is not process death).
+pub async fn requeue(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<bool> {
     let rows = sqlx::query(
         r#"UPDATE task
            SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
            WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
     )
     .bind(task_id)
-    .bind(pod_id)
+    .bind(instance)
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
@@ -758,13 +946,13 @@ pub async fn requeue(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<bool>
 /// it. For executors whose work has a non-re-runnable side effect: the
 /// harvested outcome is persisted here first, so a later claim of the
 /// same task returns it instead of redoing the side effect. Guarded on
-/// `claimed_by = $pod`; a zero-row UPDATE (lease lost, row moved on)
+/// `claimed_by = $process`; a zero-row UPDATE (lease lost, row moved on)
 /// fails loudly so the caller never believes an unrecorded result is
 /// durable.
 pub async fn store_result_partial(
     pool: &PgPool,
     task_id: Uuid,
-    pod_id: &str,
+    instance: &str,
     result: &Value,
 ) -> Result<()> {
     let updated = sqlx::query(
@@ -774,12 +962,12 @@ pub async fn store_result_partial(
     )
     .bind(result)
     .bind(task_id)
-    .bind(pod_id)
+    .bind(instance)
     .execute(pool)
     .await?;
     if updated.rows_affected() == 0 {
         anyhow::bail!(
-            "store_result_partial: task {task_id} no longer claimed by {pod_id}; \
+            "store_result_partial: task {task_id} no longer claimed by {instance}; \
              the result was NOT recorded"
         );
     }
@@ -832,7 +1020,7 @@ fn end_claim_as(status: &str) -> String {
 pub async fn complete(
     pool: &PgPool,
     task_id: Uuid,
-    pod_id: &str,
+    instance: &str,
     result: Value,
 ) -> Result<()> {
     let now = unix_now();
@@ -846,18 +1034,18 @@ pub async fn complete(
     .bind(&result)
     .bind(now)
     .bind(task_id)
-    .bind(pod_id)
+    .bind(instance)
     .fetch_all(pool)
     .await?;
     if updated.is_empty() {
-        anyhow::bail!("complete: task {task_id} no longer claimed by {pod_id}");
+        anyhow::bail!("complete: task {task_id} no longer claimed by {instance}");
     }
     Ok(())
 }
 
 /// Fail a task that is still PENDING (never claimed): the sweep-side
 /// terminal for work that can no longer run at all, e.g. a task stamped
-/// with a superseded image once no pod of that image remains (nothing
+/// with a superseded image once no process of that image remains (nothing
 /// will ever claim it; leaving it pending is an invisible forever-wait).
 /// Returns false if the task moved on (claimed / completed) in the
 /// meantime: someone IS handling it, so the caller backs off.
@@ -882,7 +1070,7 @@ pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<b
 pub async fn fail(
     pool: &PgPool,
     task_id: Uuid,
-    pod_id: &str,
+    instance: &str,
     error: String,
 ) -> Result<()> {
     let now = unix_now();
@@ -896,11 +1084,11 @@ pub async fn fail(
     .bind(&error)
     .bind(now)
     .bind(task_id)
-    .bind(pod_id)
+    .bind(instance)
     .fetch_all(pool)
     .await?;
     if updated.is_empty() {
-        anyhow::bail!("fail: task {task_id} no longer claimed by {pod_id}");
+        anyhow::bail!("fail: task {task_id} no longer claimed by {instance}");
     }
     Ok(())
 }
@@ -987,129 +1175,75 @@ pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
     Ok(rows.rows_affected())
 }
 
-/// A live-caller execution that was orphaned when its pinned worker pod
-/// died before (or while) running it. The caller was gateway-routed to that
-/// exact dead pod, so the execution cannot be re-run elsewhere (the caller
-/// is gone); the dispatcher records a terminal `ExecutionCancelled` for the
-/// color so the journal does not keep a started-but-unrunnable execution.
+/// Delete the cancels nobody will take: pending for longer than a claim's
+/// duration while nothing drives their execution any more (the drive ended,
+/// or its worker went away, before the worker's cancel wait took them).
+/// The execution's own terminal row is the cancel's record; the task was
+/// only its delivery. Returns how many.
+pub async fn drop_stale_cancels(pool: &PgPool) -> Result<u64> {
+    let now = unix_now();
+    Ok(sqlx::query(
+        r#"DELETE FROM task c
+           WHERE c.kind = 'cancel_execution' AND c.status = 'pending'
+             AND c.created_at_unix < $1 - $2
+             AND NOT EXISTS (SELECT 1 FROM task d
+                 WHERE d.execution_id = c.execution_id AND d.kind IN ('execute', 'resume')
+                   AND d.status = 'claimed' AND d.claimed_until_unix >= $1)"#,
+    )
+    .bind(now)
+    .bind(claim_duration_secs())
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// A live execution whose worker instance went away. The caller was on
+/// THAT instance's connection, so the run cannot be re-run anywhere else
+/// (the caller is gone with it); the dispatcher records a terminal
+/// `ExecutionCancelled` for the execution so the journal does not keep a
+/// started-but-unrunnable execution.
 ///
-/// The `task_id` is carried so the reaper can delete the orphan's task ONLY
-/// AFTER it has recorded the cancel: the task row is the durable marker that
-/// this color still needs cancelling. If the cancel-record fails, the task
-/// survives and the next sweep re-finds it, so a color is never stranded
-/// un-cancelled (the delete and the cancel are NOT one transaction; the task
-/// outlives the cancel attempt as the retry handle).
+/// The `task_id` is carried so the reaper deletes the orphan's task ONLY
+/// AFTER it recorded the cancel: the task row is the durable marker that
+/// this execution still needs cancelling, so a failed cancel-record leaves it
+/// for the next sweep.
 pub struct OrphanedLiveExecution {
     pub task_id: Uuid,
-    pub color: String,
+    pub execution_id: String,
     pub project_id: Option<Uuid>,
 }
 
-/// Recover EVERY task stranded on a worker pod that is no longer routable
-/// (its `worker_pod` row is absent, `dead`, or `done`), so no work and no
-/// journal junk is left behind. TASK-DRIVEN (scans the task table, not a
-/// specific pod), so it is self-healing: it runs on a timer and re-finds any
-/// still-stranded task regardless of which code path marked the pod dead
-/// (the stale-heartbeat reaper, the stale-image replacement, anything) and
-/// regardless of how many times it has run before. This is the durable retry
-/// surface: a task pinned to a non-routable pod IS the evidence that it still
-/// needs recovery, and it stays until recovered.
+/// Every live execution whose instance is gone: its pinned execute task's
+/// claim lapsed (the instance stopped renewing it), or it was admitted and
+/// never claimed within a claim's duration (the instance died between the
+/// birth and the claim, which it makes in the same breath).
 ///
-/// In one transaction:
-///   1. LIVE EXECUTE orphans (`kind='execute'` with a non-null
-///      `live_connection`, pinned to a non-routable pod): the caller was
-///      gateway-routed to that exact dead pod, so the run is unrecoverable.
-///      SELECT (do NOT delete) them and return (task_id, color); the
-///      dispatcher records `ExecutionCancelled` then deletes each via
-///      [`delete_task`], so a cancel-record failure leaves the task in place
-///      and the NEXT sweep retries (the cancel is recorded under a dedup key,
-///      so a re-record is a no-op).
-///   2. EVERY OTHER stranded task (ordinary execute/resume/cancel pinned to,
-///      or claimed by, a non-routable pod): clear the pin and requeue to
-///      `pending` so any live pod can claim it. The live-execute orphans from
-///      (1) are EXCLUDED (they are terminal, not re-runnable).
-///
-/// "Non-routable pod" = no `worker_pod` row with `status IN
-/// ('spawning','alive')` for that pod name. A task with `target_pod_name`
-/// NULL and no `claimed_by` is normal pending work, untouched.
-///
-/// WORKER-target tasks only: worker pods are the only claimants with
-/// `worker_pod` rows. A dispatcher-target task is claimed by a
-/// dispatcher pod, which never has one, so this predicate would yank
-/// every in-flight dispatcher task back to pending mid-run (a second
-/// claim then races the first); a dead dispatcher pod's tasks are
-/// recovered by lease expiry instead (`claim_one` rescues a lapsed
-/// claim).
-///
-/// Idempotent across sibling reaper Pods: (1) is a read (a second pass
-/// re-finds the same not-yet-deleted orphans; the cancel dedups), and (2) is
-/// a conditional UPDATE.
-pub async fn reclaim_orphaned_tasks(pool: &PgPool) -> Result<Vec<OrphanedLiveExecution>> {
-    // A pinned/claimed pod name is "routable" iff a spawning/alive row exists.
-    // `pinned_dead` / `claimed_dead` CTEs express "references a pod that is
-    // not routable" (the EXISTS is false: row absent OR terminal).
-    let mut tx = pool.begin().await?;
-    // 1. Live-execute orphans pinned to a non-routable pod: SELECT + report.
-    let orphans = sqlx::query(
-        r#"SELECT t.id, t.color, t.project_id
-           FROM task t
-           WHERE t.kind = 'execute'
-             AND t.status IN ('pending', 'claimed')
-             AND t.target_pod_name IS NOT NULL
-             AND t.payload -> 'live_connection' IS NOT NULL
-             AND t.payload -> 'live_connection' != 'null'::jsonb
-             AND NOT EXISTS (
-                 SELECT 1 FROM worker_pod wp
-                 WHERE wp.pod_name = t.target_pod_name
-                   AND wp.status IN ('spawning', 'alive')
-             )"#,
+/// A read: the reaper cancels then deletes each, and a sweep that runs
+/// twice re-finds the same not-yet-deleted rows (the cancel dedups).
+pub async fn orphaned_live_executions(pool: &PgPool) -> Result<Vec<OrphanedLiveExecution>> {
+    let now = unix_now();
+    let rows = sqlx::query(
+        r#"SELECT id, execution_id, project_id FROM task
+           WHERE kind = 'execute'
+             AND target_instance IS NOT NULL
+             AND payload -> 'live_connection' IS NOT NULL
+             AND payload -> 'live_connection' != 'null'::jsonb
+             AND ((status = 'claimed' AND claimed_until_unix < $1)
+                  OR (status = 'pending' AND created_at_unix < $1 - $2))"#,
     )
-    .fetch_all(&mut *tx)
+    .bind(now)
+    .bind(claim_duration_secs())
+    .fetch_all(pool)
     .await?;
-    let mut orphaned = Vec::with_capacity(orphans.len());
-    for r in orphans {
-        // A decode failure is schema drift: fail loud, never silently skip a
-        // row (that would leave a started execution un-cancelled). A live
-        // execute always carries a color, so a NULL here is itself corruption.
-        let task_id: Uuid = r.try_get("id")?;
-        let color: Option<String> = r.try_get("color")?;
-        let project_id: Option<Uuid> = r.try_get("project_id")?;
-        let Some(color) = color else {
-            anyhow::bail!("live execute orphan task {task_id} has NULL color");
-        };
-        orphaned.push(OrphanedLiveExecution { task_id, color, project_id });
-    }
-    // 2. Requeue every OTHER stranded task: pinned to OR claimed by a
-    //    non-routable pod, excluding the live-execute orphans from (1).
-    sqlx::query(
-        r#"UPDATE task t
-           SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL,
-               target_pod_name = NULL
-           WHERE t.status IN ('pending', 'claimed')
-             AND t.target = 'worker'
-             AND (
-                 (t.target_pod_name IS NOT NULL AND NOT EXISTS (
-                     SELECT 1 FROM worker_pod wp
-                     WHERE wp.pod_name = t.target_pod_name
-                       AND wp.status IN ('spawning', 'alive')
-                 ))
-                 OR
-                 (t.claimed_by IS NOT NULL AND NOT EXISTS (
-                     SELECT 1 FROM worker_pod wp
-                     WHERE wp.pod_name = t.claimed_by
-                       AND wp.status IN ('spawning', 'alive')
-                 ))
-             )
-             AND NOT (
-                 t.kind = 'execute'
-                 AND t.payload -> 'live_connection' IS NOT NULL
-                 AND t.payload -> 'live_connection' != 'null'::jsonb
-             )"#,
-    )
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(orphaned)
+    rows.into_iter()
+        .map(|r| {
+            let task_id: Uuid = r.try_get("id")?;
+            let execution_id: Option<String> = r.try_get("execution_id")?;
+            let project_id: Option<Uuid> = r.try_get("project_id")?;
+            let execution_id = execution_id.ok_or_else(|| anyhow::anyhow!("live execute task {task_id} has NULL execution"))?;
+            Ok(OrphanedLiveExecution { task_id, execution_id, project_id })
+        })
+        .collect()
 }
 
 /// Delete a single task row by id. Used by the reaper to retire an orphaned
@@ -1136,7 +1270,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     let status = TaskStatus::parse(&status_str)
         .ok_or_else(|| anyhow::anyhow!("unknown task status '{status_str}'"))?;
     let project_id: Option<Uuid> = row.try_get("project_id")?;
-    let color: Option<String> = row.try_get("color")?;
+    let execution_id: Option<String> = row.try_get("execution_id")?;
     let tenant_id: String = row.try_get("tenant_id")?;
     let binary_hash: Option<String> = row.try_get("binary_hash")?;
     let attempts: i32 = row.try_get("attempts")?;
@@ -1146,7 +1280,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         kind,
         status,
         project_id,
-        color,
+        execution_id,
         tenant_id,
         binary_hash,
         attempts,
@@ -1159,6 +1293,32 @@ pub(crate) fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock past UNIX_EPOCH")
         .as_secs() as i64
+}
+
+/// Appoint `instance` (a process instance) as the driver of `execution_id`.
+/// Ownership normally follows the task claim (the
+/// `task_claim_binds_execution_id_owner` trigger), but a process that never
+/// claims a task (a node test: the dispatcher holds the task and calls the
+/// test process directly) gets its driver appointed here.
+/// Idempotent: a lease-loss re-claim re-stamps the same process name. A
+/// missing execution row matches zero rows and fails loudly (the execution is
+/// always seeded at ExecutionStarted first).
+/// SYNC: writer of execution.owner_instance, see the
+/// `task_claim_binds_execution_id_owner` trigger in [`GROUP`]
+/// for the full writer/reader chain.
+pub async fn bind_execution_id_owner(pool: &PgPool, execution_id: &str, instance: &str) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE execution SET owner_instance = $2 WHERE execution_id = $1",
+    )
+    .bind(execution_id)
+    .bind(instance)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        anyhow::bail!("execution {execution_id} has no execution row to bind an owner onto");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1177,9 +1337,9 @@ mod wire_tests {
             target: TaskTarget::Worker,
             project_id: Some(Uuid::from_u128(1)),
             dedup_key: Some("d1".to_string()),
-            color: Some("c1".to_string()),
+            execution_id: Some("c1".to_string()),
             tenant_id: "t1".to_string(),
-            target_pod_name: Some("pod-0".to_string()),
+            target_instance: Some("instance-0".to_string()),
             binary_hash: Some("abc123".to_string()),
             payload: serde_json::json!({ "a": 1, "nested": [true, null] }),
         };
@@ -1189,9 +1349,9 @@ mod wire_tests {
         assert_eq!(back.target, original.target);
         assert_eq!(back.project_id, original.project_id);
         assert_eq!(back.dedup_key, original.dedup_key);
-        assert_eq!(back.color, original.color);
+        assert_eq!(back.execution_id, original.execution_id);
         assert_eq!(back.tenant_id, original.tenant_id);
-        assert_eq!(back.target_pod_name, original.target_pod_name);
+        assert_eq!(back.target_instance, original.target_instance);
         assert_eq!(back.binary_hash, original.binary_hash);
         assert_eq!(back.payload, original.payload);
         // The kind travels as a raw string, not a tagged enum.
@@ -1211,9 +1371,9 @@ mod wire_tests {
             "target": "dispatcher",
             "project_id": null,
             "dedup_key": null,
-            "color": null,
+            "execution": null,
             "tenant_id": "t",
-            "target_pod_name": null,
+            "target_instance": null,
             "payload": {}
         }"#;
         let back: NewTask = serde_json::from_str(json).unwrap();
@@ -1227,7 +1387,7 @@ mod wire_tests {
             kind: "register_signal".to_string(),
             status: TaskStatus::Pending,
             project_id: None,
-            color: None,
+            execution_id: None,
             tenant_id: "t".into(),
             binary_hash: Some("original-image".into()),
             attempts: 2,
@@ -1239,7 +1399,7 @@ mod wire_tests {
         assert_eq!(back.kind, original.kind);
         assert_eq!(back.status, original.status);
         assert_eq!(back.project_id, original.project_id);
-        assert_eq!(back.color, original.color);
+        assert_eq!(back.execution_id, original.execution_id);
         assert_eq!(back.tenant_id, original.tenant_id);
         assert_eq!(back.binary_hash, original.binary_hash);
         assert_eq!(back.attempts, original.attempts);
@@ -1256,9 +1416,9 @@ mod wire_tests {
             "target": "dispatcher",
             "project_id": null,
             "dedup_key": null,
-            "color": null,
+            "execution": null,
             "tenant_id": null,
-            "target_pod_name": null,
+            "target_instance": null,
             "payload": {}
         }"#;
         assert!(serde_json::from_str::<NewTask>(json).is_err());
@@ -1274,7 +1434,7 @@ mod wire_tests {
             "kind": "execute",
             "status": "pending",
             "project_id": null,
-            "color": null,
+            "execution": null,
             "tenant_id": "t",
             "payload": {}
         }"#;

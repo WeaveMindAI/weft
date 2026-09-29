@@ -70,7 +70,7 @@ async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "prov", "connection", conn.handle())?;
+    set_account(&project, "prov", conn.handle()).await?;
     assert_metered(&mut project, "platform").await?;
     project.finish().await?;
     conn.finish().await
@@ -102,7 +102,7 @@ async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Resul
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "prov", "connection", conn.handle())?;
+    set_account(&project, "prov", conn.handle()).await?;
     assert_metered(&mut project, "author").await?;
     project.finish().await?;
     conn.finish().await

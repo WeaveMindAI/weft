@@ -1804,7 +1804,7 @@ pub struct PublishAccess {
 /// (authored node metadata, validated at load) this one arrives from a
 /// worker, which runs tenant code. A recipe carrying provider events
 /// or a connect-time call would later have the CONTROL PLANE make an
-/// HTTP request the tenant chose, from inside the cluster; refusing
+/// HTTP request the tenant chose, from inside the install; refusing
 /// those shapes is what makes that unreachable rather than unlikely.
 ///
 /// Always the user's own credential: nothing published can resolve to
@@ -2089,20 +2089,29 @@ pub fn connection_handle(id: uuid::Uuid, identity: Option<&str>) -> Value {
     }
 }
 
-/// Forget every member's connections in `project_id`, their picks with
-/// them: what removing the project does, since nobody could reach a
-/// member's connection to a project that is gone (the author's list
-/// never shows a member's). Answers how many went.
-pub async fn forget_project_members(
-    conn: &mut sqlx::PgConnection,
-    project_id: uuid::Uuid,
-) -> anyhow::Result<u64> {
+/// Forget the access removing `project_id` strands: every member's
+/// connections (the values naming them go with them) and the install's
+/// picks for the project. Nobody could reach either once the project is
+/// gone (the author's list never shows a member's connection). A
+/// connection the author made is theirs and stays.
+///
+/// A member's consent or pick still in flight goes too: finishing after
+/// the removal would write a grant nobody can reach. The author's own
+/// stay, for the same reason their connections do.
+pub async fn forget_project_access(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<()> {
+    for table in ["access_connect", "access_picker"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1 AND member_id IS NOT NULL"))
+            .bind(project_id)
+            .execute(&mut *conn)
+            .await?;
+    }
     sqlx::query("DELETE FROM member_value WHERE project_id = $1").bind(project_id).execute(&mut *conn).await?;
-    Ok(sqlx::query("DELETE FROM access_grant WHERE project_id = $1 AND member_id IS NOT NULL")
+    sqlx::query("DELETE FROM install_pick WHERE project_id = $1").bind(project_id).execute(&mut *conn).await?;
+    sqlx::query("DELETE FROM access_grant WHERE project_id = $1 AND member_id IS NOT NULL")
         .bind(project_id)
         .execute(&mut *conn)
-        .await?
-        .rows_affected())
+        .await?;
+    Ok(())
 }
 
 /// Forget every connection of member `member` of `project_id` (the

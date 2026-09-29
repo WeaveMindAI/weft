@@ -1,6 +1,6 @@
 //! `weft follow <project>`: subscribe to the dispatcher's SSE stream
 //! for a project and render live events. The single-execution stream
-//! is reached via `weft run`'s internal call to `follow_color` after
+//! is reached via `weft run`'s internal call to `follow_execution_id` after
 //! it kicks off a run; users don't address it directly.
 
 use anyhow::Context;
@@ -21,7 +21,7 @@ impl FollowTarget<'_> {
     fn path(self) -> String {
         match self {
             Self::Project(id) => format!("/events/project/{id}"),
-            Self::Execution(color) => format!("/events/execution/{color}"),
+            Self::Execution(execution_id) => format!("/events/execution/{execution_id}"),
         }
     }
 
@@ -31,15 +31,15 @@ impl FollowTarget<'_> {
 }
 
 pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     follow_sse(&client, FollowTarget::Project(&project), print_event).await
 }
 
 /// Follow one run to its end, each event printed the way the program
 /// reads (`one.strip`, `gate`) when the project's definition is at
 /// hand; ids otherwise.
-pub async fn follow_color(client: &crate::client::DispatcherClient, color: &str, definition: Option<&weft_core::ProjectDefinition>) -> anyhow::Result<()> {
-    follow_sse(client, FollowTarget::Execution(color), |event| match definition {
+pub async fn follow_execution_id(client: &crate::client::DispatcherClient, execution_id: &str, definition: Option<&weft_core::ProjectDefinition>) -> anyhow::Result<()> {
+    follow_sse(client, FollowTarget::Execution(execution_id), |event| match definition {
         Some(definition) => if let Some(spelled) = super::executions::spell_node(event.clone(), definition) { print_event(&spelled) },
         None => print_event(event),
     }).await
@@ -54,9 +54,8 @@ async fn follow_sse(
     target: FollowTarget<'_>,
     mut emit: impl FnMut(&Value),
 ) -> anyhow::Result<()> {
-    let url = format!("{}{}", client.base(), target.path());
-    let es = eventsource_client::ClientBuilder::for_url(&url)
-        .context("build sse client")?
+    let es = client
+        .event_stream(&target.path())?
         // Reconnecting without recovering history would hide lost updates.
         // A disconnected follower must tell the user it stopped watching.
         .reconnect(eventsource_client::ReconnectOptions::reconnect(false).build())
@@ -66,7 +65,7 @@ async fn follow_sse(
     // a seen-event cache for the lifetime of a potentially unbounded run.
     let mut history_ids = HashSet::new();
     while let Some(ev) = stream.next().await {
-        match ev.context("live updates interrupted; the run may still be running. Inspect it with `weft executions` and `weft events <color>`")? {
+        match ev.context("live updates interrupted; the run may still be running. Inspect it with `weft executions` and `weft events <execution_id>`")? {
             eventsource_client::SSE::Event(event) => {
                 let event: Value = serde_json::from_str(&event.data).context("decode execution event")?;
                 if history_ids.contains(event_identity(&event)?) { continue; }
@@ -80,9 +79,9 @@ async fn follow_sse(
                 // The server is listening now. Recover everything that ran
                 // before attachment, including an already-finished run.
                 // New events remain buffered on the open stream meanwhile.
-                if let FollowTarget::Execution(color) = target {
+                if let FollowTarget::Execution(execution_id) = target {
                     let history: Vec<serde_json::Value> = serde_json::from_value(
-                        client.get_json(&format!("/executions/{color}/replay")).await?
+                        client.get_json(&format!("/executions/{execution_id}/replay")).await?
                     ).context("read execution history")?;
                     for event in history {
                         if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
@@ -95,7 +94,7 @@ async fn follow_sse(
             }
         }
     }
-    anyhow::bail!("live updates ended before following was finished; inspect the run with `weft executions` and `weft events <color>`")
+    anyhow::bail!("live updates ended before following was finished; inspect the run with `weft executions` and `weft events <execution_id>`")
 }
 
 fn event_identity(event: &Value) -> anyhow::Result<&str> {
@@ -107,8 +106,8 @@ fn format_event(value: &Value) -> String {
     let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
     match kind {
         "execution_started" => format!(
-            "→ started color={} entry={}",
-            short(value.get("color")),
+            "→ started execution={} entry={}",
+            short(value.get("execution_id")),
             value.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         "node_suspended" => format!(
@@ -116,17 +115,17 @@ fn format_event(value: &Value) -> String {
             value.get("node").and_then(|v| v.as_str()).unwrap_or("?"),
             short(value.get("token"))
         ),
-        "execution_completed" => format!("✓ completed color={}", short(value.get("color"))),
+        "execution_completed" => format!("✓ completed execution={}", short(value.get("execution_id"))),
         "execution_failed" => format!(
-            "✗ failed color={}: {}",
-            short(value.get("color")),
+            "✗ failed execution={}: {}",
+            short(value.get("execution_id")),
             value.get("error").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         // The reason says who stopped it: a person, or a sibling run's
         // `ctx.stop_tagged` naming the run and the tag.
         "execution_cancelled" => format!(
-            "■ cancelled color={}: {}",
-            short(value.get("color")),
+            "■ cancelled execution={}: {}",
+            short(value.get("execution_id")),
             value.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         "cost_reported" => {
@@ -197,13 +196,13 @@ mod tests {
                     Sse::new(ready.chain(events).chain(tail))
                 }
             }))
-            .route("/executions/{color}/replay", get(move || {
+            .route("/executions/{execution_id}/replay", get(move || {
                 history_requests.lock().unwrap().push("history");
                 let history = history.clone();
                 async move { Json(history) }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = DispatcherClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = DispatcherClient::new(format!("http://{}", listener.local_addr().unwrap()), None);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         Server { client, requests, task }
     }
@@ -213,7 +212,7 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "color": "a" });
+            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "execution_id": "a" });
             let server = server(vec![terminal.clone()], vec![], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
@@ -229,8 +228,8 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let started = json!({ "event_id": "start", "kind": "execution_started", "color": "a" });
-            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "color": "a" });
+            let started = json!({ "event_id": "start", "kind": "execution_started", "execution_id": "a" });
+            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "execution_id": "a" });
             let server = server(vec![started.clone()], vec![terminal.clone()], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
@@ -246,8 +245,8 @@ mod tests {
         worker_threads: 4,
         async fn body() {
             let events = vec![
-                json!({ "event_id": "done:a", "kind": "execution_completed", "color": "a" }),
-                json!({ "event_id": "done:b", "kind": "execution_cancelled", "color": "b" }),
+                json!({ "event_id": "done:a", "kind": "execution_completed", "execution_id": "a" }),
+                json!({ "event_id": "done:b", "kind": "execution_cancelled", "execution_id": "b" }),
             ];
             let server = server(vec![], events.clone(), false).await;
             let mut seen = Vec::new();
@@ -265,9 +264,9 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let first = json!({ "event_id": "row:1", "kind": "node_started", "node": "n", "color": "a" });
-            let second = json!({ "event_id": "row:2", "kind": "node_started", "node": "n", "color": "a" });
-            let terminal = json!({ "event_id": "row:3", "kind": "execution_completed", "color": "a" });
+            let first = json!({ "event_id": "row:1", "kind": "node_started", "node": "n", "execution_id": "a" });
+            let second = json!({ "event_id": "row:2", "kind": "node_started", "node": "n", "execution_id": "a" });
+            let terminal = json!({ "event_id": "row:3", "kind": "execution_completed", "execution_id": "a" });
             let server = server(vec![first.clone()], vec![first.clone(), second.clone(), terminal.clone()], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(

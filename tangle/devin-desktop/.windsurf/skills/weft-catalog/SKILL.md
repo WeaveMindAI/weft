@@ -43,7 +43,7 @@ Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs
 
 An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` / `requiresValues`. An output entry: `name`, `type`, `description`.
 
-`accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `history`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` and the access picker are compiler-read: an inline typed value only, never a wire, never a marker. Exactly one driver per port.
+`accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `history`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
 
 `widget` is the editor's control, an object naming its kind:
 `"widget": { "kind": "textarea" }`. The kinds are `text`, `textarea`,

@@ -3,15 +3,15 @@
 //!
 //! A node's display (an infra node's container on its `/live`, or the
 //! listener kind holding a trigger's signal) has no event of its own:
-//! somebody has to go and look. So this pod looks, every
+//! somebody has to go and look. So this process looks, every
 //! [`LOOK_EVERY`], but only at the nodes a connected editor is showing,
 //! only while one is connected, and once per node however many editors
 //! show it. A look that finds what the last one found sends nothing.
 //!
-//! RAM on this pod is the right home for it: a feed exists only for the
-//! editors connected to this pod, and dies with their connections. A
-//! sibling pod serving another editor runs its own. So a press that
-//! changes a display is announced on [`LOOK_NOW_CHANNEL`], and every pod
+//! RAM on this process is the right home for it: a feed exists only for the
+//! editors connected to this process, and dies with their connections. A
+//! sibling process serving another editor runs its own. So a press that
+//! changes a display is announced on [`LOOK_NOW_CHANNEL`], and every process
 //! (the one that took the press included) looks again at once if it
 //! runs that node's feed.
 
@@ -25,7 +25,7 @@ use tokio::sync::{watch, Notify};
 use weft_task_store::pg_signal::{Heard, PgSignalWatch, Subscription};
 
 /// The channel a press announces "look at this display now" on, to every
-/// pod. The payload is the [`DisplayKey`] as JSON.
+/// process. The payload is the [`DisplayKey`] as JSON.
 pub const LOOK_NOW_CHANNEL: &str = "weft_display_look_now";
 
 /// How often a watched node's display is looked at.
@@ -82,7 +82,7 @@ pub trait DisplayReader: Send + Sync + 'static {
     async fn read(&self, key: &DisplayKey) -> NodeFeed;
 }
 
-/// The feeds this pod is running, one per node some connection watches.
+/// The feeds this process is running, one per node some connection watches.
 #[derive(Default)]
 pub struct DisplayFeeds {
     feeds: Mutex<HashMap<DisplayKey, Weak<Feed>>>,
@@ -116,7 +116,7 @@ impl Feed {
 }
 
 impl DisplayFeeds {
-    /// The feeds of a pod that hears every pod's presses on `signals`
+    /// The feeds of a process that hears every process's presses on `signals`
     /// (which must listen on [`LOOK_NOW_CHANNEL`]).
     pub fn with_look_now(signals: &PgSignalWatch) -> anyhow::Result<Arc<Self>> {
         signals.require(LOOK_NOW_CHANNEL)?;
@@ -125,7 +125,7 @@ impl DisplayFeeds {
         Ok(feeds)
     }
 
-    /// Tell every pod, this one included, that `key`'s display just
+    /// Tell every process, this one included, that `key`'s display just
     /// changed. A failed announce leaves each feed to its next tick, at
     /// most [`LOOK_EVERY`] later, so it is logged rather than failing the
     /// press that already happened.
@@ -168,10 +168,10 @@ impl DisplayFeeds {
     }
 }
 
-/// Look again at every display a pod announced a press on. A recheck
+/// Look again at every display a process announced a press on. A recheck
 /// (notifications possibly lost) looks at nothing: each feed's own tick
 /// catches up within [`LOOK_EVERY`]. Returns only when the signal watch
-/// stops, which crashes the pod through its supervisor.
+/// stops, which crashes the process through its supervisor.
 async fn relay_look_now(mut heard: Subscription, feeds: Arc<DisplayFeeds>) {
     loop {
         match heard.next().await {
@@ -187,7 +187,7 @@ async fn relay_look_now(mut heard: Subscription, feeds: Arc<DisplayFeeds>) {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::error!(target: "weft_dispatcher::display_feeds", error = %e, "cross-pod look-now stopped");
+                tracing::error!(target: "weft_dispatcher::display_feeds", error = %e, "cross-instance look-now stopped");
                 return;
             }
         }
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_press_announced_by_a_sibling_pod_looks_again_here() {
+    async fn a_press_announced_by_a_sibling_instance_looks_again_here() {
         let feeds = Arc::new(DisplayFeeds::default());
         let reader = Arc::new(CountingReader::default());
         let _feed = feeds.watch(key("db"), reader.clone());

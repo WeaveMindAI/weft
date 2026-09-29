@@ -642,6 +642,60 @@ pub fn enrich_collecting(
             }
         }
         normalize_port_literals(node);
+        // An access node's connection is picked on each install, never
+        // written in the source (`weft_core::picks`): a field neither
+        // wired nor `@member_filled` is marked picked on the install, and
+        // a connection written there (a member's fallback included) is
+        // the old way, refused naming the fix, since its id means nothing
+        // on any other install.
+        if let Some(input) = meta.access_input() {
+            let wired = incoming_wires
+                .get(&node.id)
+                .is_some_and(|wires| wires.iter().any(|w| w.target_port == input.name));
+            match node.port_literals.get(&input.name) {
+                None if !wired => {
+                    node.port_literals.insert(input.name.clone(), weft_core::picks::install_picked_literal());
+                }
+                // A member's fallback is a connection written in the
+                // source too, with the same id that means nothing elsewhere.
+                Some(value)
+                    if weft_core::member::as_member_filled(value).is_some_and(|filled| filled.fallback.is_some()) =>
+                {
+                    let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
+                    errors.push(EnrichError {
+                        span,
+                        file: node.source_file.clone(),
+                        message: format!(
+                            "'{id}.{field}' falls back to a connection written in the source. That was the \
+                             old way: a connection lives in one install, so its id means nothing on any \
+                             other. Write `@member_filled` alone; a member who connected none is refused, \
+                             naming the field. See {doc}",
+                            id = node.id,
+                            field = input.name,
+                            doc = weft_core::picks::PICKS_DOC,
+                        ),
+                    });
+                }
+                Some(value) if !weft_core::picks::fills_later(value) => {
+                    let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
+                    errors.push(EnrichError {
+                        span,
+                        file: node.source_file.clone(),
+                        message: format!(
+                            "'{id}.{field}' holds a connection written in the source. That was the old way \
+                             of connecting a node: a connection lives in one install, so its id means \
+                             nothing on any other. Erase this line and connect again with `weft connect \
+                             --node {id}` (or the node's Connect button); the pick is kept by the install. \
+                             See {doc}",
+                            id = node.id,
+                            field = input.name,
+                            doc = weft_core::picks::PICKS_DOC,
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
         // A node with a `@member_filled` field carries what checking a
         // member's value needs (its rules) and, when the field is its
         // connection, what the member's connect page needs (the

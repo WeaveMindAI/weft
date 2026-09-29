@@ -29,17 +29,17 @@
             self.rows.lock().unwrap().push(event.clone());
             Ok(())
         }
-        async fn raw_rows_after(&self, _: Color, _: i64, _: std::time::Duration) -> anyhow::Result<Vec<RawJournalRow>> {
+        async fn raw_rows_after(&self, _: ExecutionId, _: i64, _: std::time::Duration) -> anyhow::Result<Vec<RawJournalRow>> {
             Ok(Vec::new())
         }
-        async fn has_terminal_event(&self, _: Color) -> anyhow::Result<bool> {
+        async fn has_terminal_event(&self, _: ExecutionId) -> anyhow::Result<bool> {
             Ok(false)
         }
         async fn record_retroactively(&self, events: &[ExecEvent], _: Option<&str>) -> anyhow::Result<()> {
             *self.recorded.lock().unwrap() = Some(events.to_vec());
             Ok(())
         }
-        async fn forget_unrecorded(&self, _: Color, _: Option<&str>) -> anyhow::Result<()> {
+        async fn forget_unrecorded(&self, _: ExecutionId, _: Option<&str>) -> anyhow::Result<()> {
             *self.forgotten.lock().unwrap() = true;
             Ok(())
         }
@@ -89,10 +89,10 @@
     /// does. Answers the outcome, the rows the run held, and the durable side.
     async fn drive_unrecorded(node: Box<dyn Node>) -> (ExecutionOutcome, Vec<ExecEvent>, Arc<Durable>) {
         let project = project();
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let birth = vec![
             ExecEvent::ExecutionStarted {
-                color,
+                execution_id,
                 project_id: project.id,
                 entry_node: "answer".into(),
                 phase: weft_core::context::Phase::Fire,
@@ -104,13 +104,14 @@
                 seed: None,
                 member: None,
                 fired_trigger: None,
-                member_values: Default::default(),
+                member_values: Default::default(), picks: Default::default(),
                 at_unix: 0,
+                run_class: weft_core::run_class::RunClass::Short,
             },
-            ExecEvent::NodeKicked { color, node_id: "answer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeKicked { execution_id, node_id: "answer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
         ];
         let durable = Arc::new(Durable::default());
-        let journal = UnrecordedJournal::seeded(color, birth, durable.clone()).unwrap();
+        let journal = UnrecordedJournal::seeded(execution_id, birth, durable.clone()).unwrap();
         let mut run_clients = clients(Arc::new(MemJournal::default()));
         run_clients.journal = journal.clone();
         let outcome = tokio::time::timeout(
@@ -118,11 +119,10 @@
             run_one_execution(
                 Arc::new(project),
                 catalog(vec![("Answer", node)]),
-                color,
+                execution_id,
                 run_clients,
-                "pod-test".into(),
+                "instance-test".into(),
                 "tenant-test".into(),
-                "ns-test".into(),
                 CancellationFlag::new_arc(),
                 None,
             ),
@@ -130,7 +130,7 @@
         .await
         .expect("the drive hung")
         .expect("the drive ends");
-        journal.settle(Some("pod-test")).await.expect("settle");
+        journal.settle(Some("instance-test")).await.expect("settle");
         (outcome, journal.events(), durable)
     }
 

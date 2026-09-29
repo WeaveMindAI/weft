@@ -46,7 +46,8 @@ impl Node for RouteNode {
     }
 
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?).map_err(weft::node_error)?;
+        let fields = ctx.inputs.object()?;
+        let common = LiveConnectionConfig::from_node_fields(fields).map_err(weft::node_error)?;
         ctx.register_signal(Route { common }).await
     }
 

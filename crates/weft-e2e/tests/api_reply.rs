@@ -114,7 +114,7 @@ async fn routes_answer_with_status_headers_and_bodies() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// The fast loop: a route answered with NO cluster reachable from
+/// The fast loop: a route answered with NO install reachable from
 /// outside, no activation and no listener armed.
 ///
 /// `--fire` serves the request itself. The trigger reads the body off
@@ -144,7 +144,7 @@ async fn a_fired_route_runs_its_whole_program_and_answers() -> anyhow::Result<()
             r#"hello={"method":"POST","path":"hello","headers":[["user-agent","weft-e2e"]],"body":{"name":"ada"}}"#,
         ])
         .await?;
-    let settled = SettledRun::observe(project.dispatcher(), common::color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), common::execution_id_of(&stdout)?).await?;
     settled.completed()?;
 
     // The author's own nodes ran on the body, which is the whole point:
@@ -199,7 +199,7 @@ async fn firing_a_get_route_needs_no_body() -> anyhow::Result<()> {
             r#"user={"method":"GET","path":"users/42","params":{"id":"42"},"query":{"verbose":"1"}}"#,
         ])
         .await?;
-    let settled = SettledRun::observe(project.dispatcher(), common::color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), common::execution_id_of(&stdout)?).await?;
     settled.completed()?;
 
     // The author's node saw the capture and the query, so the request

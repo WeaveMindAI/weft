@@ -148,6 +148,7 @@
   },
   "features": {
     "isTrigger": true,
+    "liveConnection": true,
     "canAddOutputPorts": true
   },
   "validate": [

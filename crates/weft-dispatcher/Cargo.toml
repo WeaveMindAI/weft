@@ -5,21 +5,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "weft-dispatcher"
-path = "src/main.rs"
-
 [dependencies]
 weft-core = { workspace = true }
-# When the `build` feature is enabled and a registry is configured, the
-# dispatcher acts as the COMPILE SITE for image builds: the `/projects/create`
-# door compiles the uploaded source itself (computes the definition + the three
-# hashes + stages the docker build context), then submits the image build. It
-# then needs the full `build` feature (codegen + worker_image + the hash path),
-# and the compile site needs a weft workspace on disk, resolved through
-# `weft_catalog::weft_repo_root` (WEFT_REPO_ROOT in a built image). DIRECT path dep, NOT
+# The dispatcher is the compile site of every version build: it compiles
+# the uploaded source itself (the definition, the hashes, the staged docker
+# build context) and hands the image builds to the platform. That needs the
+# full `build` feature (codegen, worker_image, the hash path) and a weft
+# workspace on disk, resolved through `weft_catalog::weft_repo_root`
+# (WEFT_REPO_ROOT in a built image). DIRECT path dep, NOT
 # `workspace = true`, to keep feature control explicit.
 weft-compiler = { path = "../weft-compiler", features = ["build"] }
+# The catalog a version compiles against (`build::source`).
+weft-catalog = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-access-store = { workspace = true }
@@ -27,7 +24,6 @@ weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -35,24 +31,18 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-clap = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { workspace = true }
-dashmap = "6"
-cron = "0.12"
 sha2 = { workspace = true }
 # The events receiver forwards raw push bodies to the broker base64'd
 # (signatures hash the exact bytes; the wrapper stays JSON).
 base64 = { workspace = true }
 hex = "0.4"
-url = { workspace = true }
 # Materialize uploaded source rows to a temp dir for the compile + stage
 # (the dispatcher is a compile site for image builds).
 tempfile = { workspace = true }
@@ -60,7 +50,7 @@ tempfile = { workspace = true }
 [features]
 test-helpers = []
 # Layer-3 tests that hit a REAL Postgres via `#[sqlx::test]` + $DATABASE_URL
-# (the StoragePool placement/reservation/reap logic lives in SQL). OFF by
+# (the dispatcher's own SQL: births, lifecycle writes, the ledger). OFF by
 # default so a plain `cargo test --workspace` needs no Postgres; CI runs
 # `cargo test -p weft-dispatcher --features db-tests` with a Postgres up.
 db-tests = ["weft-task-store/db-tests"]

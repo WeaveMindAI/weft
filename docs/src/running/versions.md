@@ -12,9 +12,9 @@ A snapshot of your project's files, taken whenever you run, activate, or type
 |---|---|
 | Every `.weft` file, at any depth | Anything hidden at the top: `.git`, `.env`, `.weft` |
 | `weft.toml` | `layouts/`, because dragging a box is not a change to your program |
-| `nodes/**` | `nodes/base_catalog/`, which belongs to the installed weft. A version records which weft that was instead |
+| `src/**` and `nodes/**`, including a node that sits beside your code | `nodes/base_catalog/`, which belongs to the installed weft. A version records which weft that was instead |
 | `assets/**`, `prompts/**`, `scripts/**`, `sql/**` | `target/` at the root, and `node_modules` anywhere |
-| `examples/**`, so going back restores the examples that existed then | |
+| `examples/**`, so going back restores the examples that existed then | `front/`, which ships through your project's CI |
 
 A file identical to one an earlier version held costs nothing to store.
 
@@ -28,7 +28,7 @@ run a `--seed` inherits from.
 | `weft tree` | The whole tree: every version with what changed against its parent, its runs beneath it, head marked |
 | `weft checkpoint [<label>]` | Records the files as a version. No run, no build |
 | `weft branch <version>` | Puts those files back and moves head |
-| `weft branch <color>` | The same, and points head's run at that one, so the next seed inherits from it |
+| `weft branch <execution-id>` | The same, and points head's run at that one, so the next seed inherits from it |
 
 `weft branch` refuses on a dirty tree and names the files, rather than throwing
 your work away:
@@ -98,7 +98,7 @@ Then, after a change:
 
 ```bash
 weft run angry-customer
-weft diff <new-color> example:angry-customer
+weft diff <new-execution-id> example:angry-customer
 ```
 
 `diff` shows what moved on the wires. You, or Tangle, judge whether the change
@@ -110,8 +110,8 @@ them rather than burying them.
 | Command | What it does |
 |---|---|
 | `weft examples` | What is saved, which are frozen, and each one's latest run |
-| `weft freeze <name> [<color>]` | Freeze a run. Without a color, head's run |
-| `weft diff <left> <right>` | Compare two runs. A side is a color or `example:<name>` |
+| `weft freeze <name> [<execution-id>]` | Freeze a run. Without an execution id, head's run |
+| `weft diff <left> <right>` | Compare two runs. A side is an execution id or `example:<name>` |
 | `weft run <name>` | Run the current code with that example's parameters |
 
 A freeze **replaces** the example whole, and says so. Only a completed run can

@@ -1,6 +1,6 @@
 //! `weft tree`: the version tree, one line per version (id prefix,
 //! label, what changed against its parent) with its runs beneath
-//! (color prefix, status, seed, scope, example). Head is marked.
+//! (execution prefix, status, seed, scope, example). Head is marked.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use super::Ctx;
 
 pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let (tree, mut raw) = fetch_tree_raw(&client, &project.id().to_string()).await?;
     if ctx.json() {
         // The tree as the dispatcher answered it, plus the one fact only
@@ -123,8 +123,8 @@ fn render_version<'a>(
     };
     out.push(format!("{indent}{} {}{label}{change}{mark}", short(&v.id), when(v.created_at)));
     for r in runs.get(v.id.as_str()).cloned().unwrap_or_default() {
-        let head = if tree.head.head_run.as_deref() == Some(r.color.as_str()) { " <- HEAD run" } else { "" };
-        let seed = r.seed_color.as_deref().map(|s| format!(" seed {} ({} stale)", short(s), r.stale.len())).unwrap_or_default();
+        let head = if tree.head.head_run.as_deref() == Some(r.execution_id.as_str()) { " <- HEAD run" } else { "" };
+        let seed = r.seed_execution_id.as_deref().map(|s| format!(" seed {} ({} stale)", short(s), r.stale.len())).unwrap_or_default();
         let scope = r.spec.as_ref().map(|s| format!(" spec {}", s.name)).unwrap_or_default();
         let example = r.example.as_deref().map(|e| format!(" example {e}")).unwrap_or_default();
         let ended = r.completed_at.map(|t| format!(" -> {}", when(t))).unwrap_or_default();
@@ -146,7 +146,7 @@ fn render_version<'a>(
         } else {
             String::new()
         };
-        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.color), when(r.started_at), r.status));
+        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.execution_id), when(r.started_at), r.status));
     }
     for child in children.get(&Some(v.id.as_str())).cloned().unwrap_or_default() {
         render_version(tree, child, depth + 1, children, runs, when, shown, out);
@@ -169,12 +169,12 @@ mod tests {
         }
     }
 
-    fn run(color: &str, version: &str, seed: Option<&str>, status: &str) -> RunSummary {
+    fn run(execution_id: &str, version: &str, seed: Option<&str>, status: &str) -> RunSummary {
         RunSummary {
-            color: format!("{color}00000000"),
+            execution_id: format!("{execution_id}00000000"),
             version_id: format!("{version}00000000"),
             definition_hash: "d".into(),
-            seed_color: seed.map(|s| format!("{s}00000000")),
+            seed_execution_id: seed.map(|s| format!("{s}00000000")),
             stale: vec!["b".into()],
             spec: None,
             example: None,

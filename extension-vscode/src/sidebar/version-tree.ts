@@ -26,10 +26,10 @@ export interface VersionSummary {
 }
 
 export interface RunSummary {
-  color: string;
+  execution_id: string;
   version_id: string;
   definition_hash: string;
-  seed_color: string | null;
+  seed_execution_id: string | null;
   stale: string[];
   spec: RunSpec | null;
   example: string | null;
@@ -181,10 +181,10 @@ export function versionMarks(node: VersionTreeNode): string[] {
 /** A run's description: status, seed, scope, example. */
 export function runDescription(run: RunSummary, headRun: string | null): string {
   const parts = [describeOutcome(run.status, run.cancel_cause, run.skipped_nodes)];
-  if (run.seed_color) parts.push(`seed ${shortId(run.seed_color)} (${run.stale.length} stale)`);
+  if (run.seed_execution_id) parts.push(`seed ${shortId(run.seed_execution_id)} (${run.stale.length} stale)`);
   if (run.spec) parts.push(`spec ${run.spec.name}`);
   if (run.example) parts.push(`example ${run.example}`);
-  if (headRun === run.color) parts.push('HEAD run');
+  if (headRun === run.execution_id) parts.push('HEAD run');
   return parts.join('  ·  ');
 }
 

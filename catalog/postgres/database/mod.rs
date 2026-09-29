@@ -1,7 +1,7 @@
 //! PostgresDatabase: a Postgres the project runs itself, handed out as
 //! an ordinary connection.
 //!
-//! Three pieces make one Pod:
+//! Three pieces make one unit:
 //!   - an init container that writes a password to the shared volume
 //!     the first time and never again, so the spec carries no
 //!     credential and stays identical on every start;
@@ -26,9 +26,8 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 
 use weft::infra::{
-    AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Mount,
-    PodOptions, PodSecurityContext, Probe, Protocol, Resources, Unit, UpgradeBehavior, Volume,
-    VolumeKind,
+    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, Limits, Mount, Probe,
+    Protocol, Unit, Volume, VolumeKind,
 };
 use weft::node::NodeOutput;
 use weft::{
@@ -54,7 +53,7 @@ const ADMIN_USER: &str = "weft";
 /// can read it without the file being readable to everything. 70 is
 /// the postgres user's uid and gid in the alpine images: a different
 /// base image means a different number.
-const POSTGRES_GID: i64 = 70;
+const POSTGRES_GID: u32 = 70;
 // SYNC: credential routes <-> catalog/postgres/database/images/credential/bootstrap.py
 //       CREDENTIAL_PATH / CREDENTIAL_STORED_PATH / HEALTH_PATH (the container's
 //       /live and /action are the dispatcher's, named by features.liveEndpoint)
@@ -72,16 +71,11 @@ mod tests;
 /// it together so a restore can never bring back one without the
 /// other.
 ///
-/// Whole rather than a `sub_path` per half, because only the volume
-/// root is guaranteed to carry the Pod's shared group: a directory
-/// the kubelet creates to satisfy a `sub_path` can land owned by root
-/// and lock out the very container that has to write it.
+/// Whole rather than a `sub_path` per half: the volume root is what
+/// carries the unit's shared group, and the init container makes the
+/// halves inside it.
 fn store_mount() -> Mount {
-    Mount {
-        volume: "store".into(),
-        path: STORE_PATH.into(),
-        ..Default::default()
-    }
+    Mount::new("store", STORE_PATH)
 }
 
 /// The password directory alone, for the one container that listens
@@ -89,16 +83,10 @@ fn store_mount() -> Mount {
 /// blast radius of a flaw in something reachable over the network is
 /// worth the narrower mount.
 ///
-/// Safe as a `sub_path` where the whole-disk mount is not, because
-/// the init container makes this directory on every boot before any
-/// other container starts, so the kubelet never has to create it.
+/// The init container makes this directory on every boot before any
+/// other container starts, so it is there to mount.
 fn secret_mount() -> Mount {
-    Mount {
-        volume: "store".into(),
-        path: SECRET_PATH.into(),
-        sub_path: Some("secret".into()),
-        ..Default::default()
-    }
+    Mount { sub_path: Some("secret".into()), ..Mount::new("store", SECRET_PATH) }
 }
 
 /// Where the credential container reads its settings from, so the
@@ -107,15 +95,12 @@ fn secret_mount() -> Mount {
 /// card shows beside the password: the three a client signs in with.
 fn credential_env(database: &str) -> Vec<EnvEntry> {
     vec![
-        EnvEntry::Literal { name: "WEFT_DATABASE".into(), value: database.into() },
-        EnvEntry::Literal { name: "WEFT_SECRET_DIR".into(), value: SECRET_PATH.into() },
-        EnvEntry::Literal { name: "WEFT_PASSWORD_FILE".into(), value: password_file() },
-        EnvEntry::Literal {
-            name: "WEFT_CREDENTIAL_PORT".into(),
-            value: CREDENTIAL_PORT.to_string(),
-        },
-        EnvEntry::Literal { name: "WEFT_SOCKET_DIR".into(), value: SOCKET_PATH.into() },
-        EnvEntry::Literal { name: "WEFT_ADMIN_USER".into(), value: ADMIN_USER.into() },
+        EnvEntry::new("WEFT_DATABASE", database),
+        EnvEntry::new("WEFT_SECRET_DIR", SECRET_PATH),
+        EnvEntry::new("WEFT_PASSWORD_FILE", password_file()),
+        EnvEntry::new("WEFT_CREDENTIAL_PORT", CREDENTIAL_PORT.to_string()),
+        EnvEntry::new("WEFT_SOCKET_DIR", SOCKET_PATH),
+        EnvEntry::new("WEFT_ADMIN_USER", ADMIN_USER),
     ]
 }
 
@@ -125,11 +110,7 @@ fn credential_env(database: &str) -> Vec<EnvEntry> {
 /// for one), and it is how a password nobody holds any more gets
 /// replaced from the graph instead of by hand on the disk.
 fn socket_mount() -> Mount {
-    Mount {
-        volume: "socket".into(),
-        path: SOCKET_PATH.into(),
-        ..Default::default()
-    }
+    Mount::new("socket", SOCKET_PATH)
 }
 
 /// The file the password lives in. Named HERE and handed to both the
@@ -164,11 +145,10 @@ impl Node for PostgresDatabaseNode {
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
             units: vec![Unit {
+                // One copy: two Postgres processes on one data directory
+                // would corrupt it, and a unit never runs beside its own
+                // next version.
                 name: "db".into(),
-                // Two Postgres processes on one data directory would
-                // corrupt it, so a new version must fully replace the
-                // old one rather than run beside it.
-                on_upgrade: UpgradeBehavior::Recreate,
                 init_containers: vec![Container::new("mint", credential.clone())
                     .with_args(vec!["mint".into()])
                     .with_env(credential_env(&database))
@@ -178,40 +158,22 @@ impl Node for PostgresDatabaseNode {
                         reference: format!("postgres:{version}-alpine"),
                     })
                     .with_env(vec![
-                        EnvEntry::Literal {
-                            name: "POSTGRES_USER".into(),
-                            value: ADMIN_USER.into(),
-                        },
-                        EnvEntry::Literal {
-                            name: "POSTGRES_DB".into(),
-                            value: database.clone(),
-                        },
+                        EnvEntry::new("POSTGRES_USER", ADMIN_USER),
+                        EnvEntry::new("POSTGRES_DB", database.clone()),
                         // The file, never the value: the password is
                         // not in this spec and never will be.
-                        EnvEntry::Literal {
-                            name: "POSTGRES_PASSWORD_FILE".into(),
-                            value: password_file(),
-                        },
+                        EnvEntry::new("POSTGRES_PASSWORD_FILE", password_file()),
                         // Postgres refuses a data directory that is a
                         // mount point with lost+found in it, so it
                         // gets a subdirectory of the mount.
-                        EnvEntry::Literal {
-                            name: "PGDATA".into(),
-                            value: DATA_PATH.into(),
-                        },
+                        EnvEntry::new("PGDATA", DATA_PATH),
                     ])
                     .with_ports(vec![ContainerPort {
                         name: "sql".into(),
                         port: SQL_PORT,
                         protocol: Protocol::Tcp,
                     }])
-                    .with_resources(Resources {
-                        cpu_request: Some("100m".into()),
-                        memory_request: Some("256Mi".into()),
-                        cpu_limit: Some("2".into()),
-                        memory_limit: Some("2Gi".into()),
-                        ..Default::default()
-                    })
+                    .with_limits(Limits { cpu: Some("2".into()), memory: Some("2Gi".into()) })
                     .with_mounts(vec![store_mount(), socket_mount()])
                     // Postgres accepts TCP while it is still starting up
                     // and refuses every connection, so the port being
@@ -239,38 +201,19 @@ impl Node for PostgresDatabaseNode {
                             port: CREDENTIAL_PORT,
                             protocol: Protocol::Tcp,
                         }])
-                        .with_resources(Resources {
-                            cpu_request: Some("10m".into()),
-                            memory_request: Some("32Mi".into()),
-                            cpu_limit: Some("100m".into()),
-                            memory_limit: Some("64Mi".into()),
-                            ..Default::default()
-                        })
+                        .with_limits(Limits { cpu: Some("0.1".into()), memory: Some("64Mi".into()) })
                         .with_mounts(vec![secret_mount(), socket_mount()])
                         .with_readiness(
                             Probe::http(HEALTH_PATH, CREDENTIAL_PORT).with_initial_delay(2),
                         ),
                 ],
-                pod_options: PodOptions {
-                    security_context: Some(PodSecurityContext {
-                        fs_group: Some(POSTGRES_GID),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
+                fs_group: Some(POSTGRES_GID),
                 ..Default::default()
             }],
             volumes: vec![
-                Volume {
-                    name: "store".into(),
-                    kind: VolumeKind::Persistent {
-                        size: storage,
-                        storage_class: None,
-                        access_modes: vec![AccessMode::ReadWriteOnce],
-                    },
-                },
-                // The socket lives and dies with the pod.
-                Volume { name: "socket".into(), kind: VolumeKind::EmptyDir { size_limit: None } },
+                Volume { name: "store".into(), kind: VolumeKind::Disk { size: storage, class: None } },
+                // The socket lives and dies with the unit.
+                Volume { name: "socket".into(), kind: VolumeKind::Scratch { size_limit: None } },
             ],
             // `sql` is the only endpoint that may ever be reachable,
             // and only when the author asked: reaching Postgres there
@@ -282,30 +225,22 @@ impl Node for PostgresDatabaseNode {
             // `credential` never is, and the difference is the whole
             // rule for an infra node: that endpoint HANDS OUT the
             // password, so reaching it would give the database away to
-            // anything that could reach the port. It stays
-            // cluster-internal whatever anybody asks for, which is why
+            // anything that could reach the port. It stays the
+            // project's own whatever anybody asks for, which is why
             // `reachable` cannot touch it.
             endpoints: vec![
                 Endpoint {
                     name: "sql".into(),
-                    unit: "db".into(),
-                    container: "postgres".into(),
-                    port: "sql".into(),
-                    expose: if reachable {
-                        Expose::SameNetwork
-                    } else {
-                        Expose::ClusterInternal
-                    },
+                    target: EndpointTarget::Unit { unit: "db".into(), container: "postgres".into(), port: "sql".into() },
+                    expose: if reachable { Expose::SameNetwork } else { Expose::Project },
                 },
                 Endpoint {
                     name: "credential".into(),
-                    unit: "db".into(),
-                    container: "credential".into(),
-                    port: "http".into(),
-                    expose: Expose::ClusterInternal,
+                    target: EndpointTarget::Unit { unit: "db".into(), container: "credential".into(), port: "http".into() },
+                    expose: Expose::Project,
                 },
             ],
-            ..Default::default()
+            keep_on_terminate: Vec::new(),
         })
     }
 

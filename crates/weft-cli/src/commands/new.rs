@@ -6,7 +6,8 @@
 //! remembered, so later `weft new` calls install the same
 //! assistants without repeating the flag; `--assistant none`
 //! clears it, and `--assistant agents` is the fallback for an
-//! assistant weft has no template for.
+//! assistant weft has no template for. With `--ci <cloud>`, also the
+//! deploy workflow `weft ci add` writes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -237,7 +238,12 @@ fn write_recorded_assistants(installed: &[&AssistantSpec]) -> anyhow::Result<()>
     Ok(())
 }
 
-pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Result<()> {
+pub async fn run(
+    _ctx: Ctx,
+    name: String,
+    assistants: Vec<String>,
+    ci: Option<super::ci::Cloud>,
+) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("project name cannot be empty");
     }
@@ -259,30 +265,45 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
         recorded_assistants()
     };
 
-    let project = weft_compiler::project::Project::init(&root, &name)
-        .map_err(|e| anyhow::anyhow!("init: {e}"))?;
+    // Every file of the new project is written into a staging directory
+    // beside the target, and the target appears only once all of it
+    // worked: a failure halfway (the stdlib seed, a Tangle template)
+    // used to leave a folder with a `weft.toml` and no catalog, which
+    // later failed as "unknown node type" on the first run.
+    let project = assemble_atomically(&root, |staging| {
+        let project = weft_compiler::project::Project::init(staging, &name)
+            .map_err(|e| anyhow::anyhow!("init: {e}"))?;
 
-    // Tangle is copied in, so its files are ordinary project files and
-    // belong in the repo: clone the project on another machine and the
-    // persona is there, with no weft checkout to point at.
-    // `.env` auto-loads next to a project and is where a key the
-    // project MINTS lands (`weft connect --set-env`), so it holds
-    // secrets by the time anybody would commit it.
-    let gitignore = String::from("target/\n.weft/\nnode_modules/\n.env\n");
+        // Tangle is copied in, so its files are ordinary project files and
+        // belong in the repo: clone the project on another machine and the
+        // persona is there, with no weft checkout to point at.
+        // `.env` auto-loads next to a project and is where a key the
+        // project MINTS lands (`weft connect --set-env`), so it holds
+        // secrets by the time anybody would commit it.
+        let gitignore = String::from("target/\n.weft/\nnode_modules/\n.env\n");
 
-    // Initialize git. Best-effort: skip quietly if git is missing.
-    let git_init = Command::new("git").arg("init").current_dir(&root).status();
-    match git_init {
-        Ok(status) if status.success() => {
-            std::fs::write(root.join(".gitignore"), gitignore).context("write .gitignore")?;
+        // Initialize git. Best-effort: skip quietly if git is missing.
+        let git_init = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(staging)
+            .status();
+        match git_init {
+            Ok(status) if status.success() => {
+                std::fs::write(staging.join(".gitignore"), gitignore).context("write .gitignore")?;
+            }
+            Ok(_) | Err(_) => {
+                // git missing or `git init` failed. Not fatal: user can
+                // opt into git later.
+            }
         }
-        Ok(_) | Err(_) => {
-            // git missing or `git init` failed. Not fatal: user can
-            // opt into git later.
-        }
-    }
 
-    install_tangle(&root, &installed)?;
+        install_tangle(staging, &installed)?;
+        if let Some(cloud) = ci {
+            super::ci::write_workflow(staging, &name, cloud)?;
+        }
+        Ok(project)
+    })?;
 
     if explicit {
         write_recorded_assistants(&installed)?;
@@ -328,6 +349,43 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
     }
     println!("next: cd {name} && weft daemon start && weft run");
     Ok(())
+}
+
+/// Build a new directory at `root` all at once: `build` fills a staging
+/// directory created beside `root` (same parent, so the final move is a
+/// rename on one filesystem, never a copy), and the staging directory
+/// becomes `root` only when `build` succeeded. On failure the staging
+/// directory is removed and `root` is left exactly as it was.
+fn assemble_atomically<T>(
+    root: &Path,
+    build: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let parent = match root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+    // Dropped on any early return, which deletes it with everything
+    // `build` wrote.
+    let staging = tempfile::Builder::new()
+        .prefix(".weft-new-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("create a staging directory in {}", parent.display()))?;
+    let value = build(staging.path())?;
+    // Checked again right before the move: on Linux a rename onto an
+    // EMPTY directory replaces it silently, so a folder somebody made
+    // while this ran would be swallowed rather than refused.
+    if root.exists() {
+        anyhow::bail!("{} appeared while the project was being created; nothing was written to it", root.display());
+    }
+    let staged = staging.keep();
+    std::fs::rename(&staged, root).with_context(|| {
+        // The rename failing leaves the staging directory as the only
+        // copy of the work; it is removed so nothing half-named stays.
+        let _ = std::fs::remove_dir_all(&staged);
+        format!("move the new project into {}", root.display())
+    })?;
+    Ok(value)
 }
 
 /// The one file every Tangle template puts inside the assistant's own
@@ -468,7 +526,7 @@ fn replace_with_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
         Err(error) => return Err(error).with_context(|| format!("inspect {}", dest.display())),
     }
     if source.is_dir() {
-        weft_compiler::build::copy_dir_filtered(source, dest, TEMPLATE_EXCLUDE)
+        weft_compiler::build::copy_dir_filtered(source, dest, &|name| TEMPLATE_EXCLUDE.contains(&name))
             .map_err(|e| anyhow::anyhow!("copy {} into {}: {e}", source.display(), dest.display()))
     } else {
         std::fs::copy(source, dest)
@@ -479,7 +537,7 @@ fn replace_with_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_template, resolve_assistants, tangle_installed, ASSISTANTS, FALLBACK, WITNESS};
+    use super::{assemble_atomically, merge_template, resolve_assistants, tangle_installed, ASSISTANTS, FALLBACK, WITNESS};
 
     #[test]
     fn resolves_kilo_code_and_its_shorthand() {
@@ -631,5 +689,56 @@ mod tests {
         std::fs::create_dir_all(temp.path().join(".kilo").join(WITNESS).parent().unwrap()).unwrap();
         std::fs::write(temp.path().join(".kilo").join(WITNESS), "skill").unwrap();
         assert!(tangle_installed(temp.path(), kilo));
+    }
+
+    #[test]
+    fn a_failed_step_leaves_no_project_and_no_staging_behind() {
+        // The seed failing after the scaffold was written is the case
+        // that used to strand a project with a weft.toml and no catalog.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("probe");
+        let error = assemble_atomically::<()>(&root, |staging| {
+            std::fs::write(staging.join("weft.toml"), "[package]").unwrap();
+            std::fs::create_dir_all(staging.join("nodes")).unwrap();
+            anyhow::bail!("cannot locate the weft checkout")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("weft checkout"), "{error}");
+        assert!(!root.exists(), "the target stays absent");
+        let left: Vec<_> = std::fs::read_dir(temp.path()).unwrap().collect();
+        assert!(left.is_empty(), "the staging directory is removed: {left:?}");
+    }
+
+    #[test]
+    fn a_successful_build_appears_whole_at_the_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("nested/probe");
+        let answer = assemble_atomically(&root, |staging| {
+            std::fs::create_dir_all(staging.join("src")).unwrap();
+            std::fs::write(staging.join("src/main.weft"), "x").unwrap();
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(answer, 7);
+        assert_eq!(std::fs::read_to_string(root.join("src/main.weft")).unwrap(), "x");
+        let left: Vec<_> = std::fs::read_dir(temp.path().join("nested"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("probe")], "no staging directory left");
+    }
+
+    #[test]
+    fn a_target_that_appears_meanwhile_is_left_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("probe");
+        let error = assemble_atomically(&root, |_| {
+            std::fs::create_dir_all(&root).unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("appeared"), "{error}");
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none(), "the target is not written");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1, "staging removed");
     }
 }

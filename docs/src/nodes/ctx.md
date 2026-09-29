@@ -36,7 +36,7 @@ error rather than a trigger that quietly never fires.
 
 | Field | Type | What it is |
 |---|---|---|
-| `color` | `Color` (a UUID) | This run's id |
+| `execution_id` | `ExecutionId` (a UUID) | This run's id |
 | `project_id` | `Uuid` | The project it belongs to |
 | `node_id` | `String` | This node's id in the graph |
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
@@ -223,7 +223,8 @@ member's copy instead of the shared one; `values()`, `connections()` and
 |---|---|
 | `infra("bridge").start().await` | Brings the shared copy up. Returns once it runs, parking the run between looks; fails with the reason if it does not come up, or if somebody stops it while this waits |
 | `infra("bridge").stop(spec, stop_self).await` | Scales the copy down, keeping its disk |
-| `infra("bridge").terminate(spec, stop_self).await` | Deletes the copy and its disk |
+| `infra("bridge").terminate(spec, stop_self).await` | Deletes the copy and its disks, except the ones listed in `keepOnTerminate` |
+| `infra("bridge").member(id).wipe(spec, stop_self).await` | Deletes the member's copy and every one of its disks, the kept ones too, even if the copy was already terminated |
 | `infra("bridge").status().await` | The copy's state, `None` when there is none. A start or stop on its way reads `provisioning` or `stopping` at once, the same answer `weft status` gives |
 | `infra("bridge").copies().await` | Every copy: the shared one and each member's |
 | `trigger("receive").activate().await` | Turns one trigger on |

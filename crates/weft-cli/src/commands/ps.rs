@@ -1,7 +1,7 @@
 use super::Ctx;
 
 pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let projects: serde_json::Value = client.get_json("/projects").await?;
     if ctx.json_out(&projects)? {
         return Ok(());

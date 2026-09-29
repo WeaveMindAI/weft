@@ -206,7 +206,7 @@ async fn run_inner(
         prompt_trigger_deactivation(ctx.json(), flags.mode.as_deref(), flags.grace, running_policy, drain_timeout)?;
 
     let (client, id, name) = match project {
-        Some(id) => (ctx.client(), id.clone(), id),
+        Some(id) => (ctx.client()?, id.clone(), id),
         None => super::resolve_project(ctx)?,
     };
 

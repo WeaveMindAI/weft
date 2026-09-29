@@ -88,7 +88,7 @@ weft will not invent one, because a question that expires on its own leaves you
 with a run that ended for a reason nobody wrote down.
 
 So ending it is a decision somebody makes. The person looking at the card can
-press **Cancel run**, and you can run `weft stop <color>`. To find the ones
+press **Cancel run**, and you can run `weft stop <execution-id>`. To find the ones
 still sitting there:
 
 ```bash

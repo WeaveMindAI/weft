@@ -243,8 +243,8 @@ pub const DEFAULT_INBOUND_WINDOW: usize = 64;
 /// that may be suspended outlives the caller, so it keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectAction {
-    /// Cancel THIS execution (via the per-execution cancel-by-color
-    /// path). Never the pod, which multiplexes many runs.
+    /// Cancel THIS execution (via the per-execution cancel-by-execution
+    /// path). Never the process, which multiplexes many runs.
     CancelExecution,
     /// Keep running to completion; further sends to the caller go into
     /// the void.
@@ -446,7 +446,7 @@ pub trait CallerConnection: Send + Sync {
     /// `keep-running` an `Ok(())` into the void).
     ///
     /// The bounded wait for a caller to show up happens once, earlier:
-    /// `run_pod::attach_live_caller` waits on `wait_for_attach` for
+    /// `run_instance::attach_live_caller` waits on `wait_for_attach` for
     /// `connect_timeout_secs` before the run starts. A no-show leaves
     /// the run with no caller at all, and `ctx.caller()` fails.
     async fn ensure_connected(&self) -> Result<(), CallerError>;

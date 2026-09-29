@@ -39,7 +39,7 @@ use crate::project::{
     NodeDefinition, ProjectDefinition,
 };
 use crate::pulse::{Pulse, PulseStatus, PulseTable};
-use crate::Color;
+use crate::ExecutionId;
 
 /// The compiler's node type for a group boundary.
 pub const PASSTHROUGH: &str = crate::project::boundary_types::PASSTHROUGH;
@@ -112,7 +112,7 @@ pub fn scope_permission(
 pub struct BoundaryDispatch {
     pub node_id: String,
     pub frames: LoopFrames,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     /// Every pulse this dispatch consumed (the stream-gate settling
     /// the live engine does per absorbed pulse reads these).
     pub absorbed: Vec<Uuid>,
@@ -171,7 +171,7 @@ pub fn settle_table(
     edge_idx: &EdgeIndex,
     phase: Phase,
     dispatchable: Option<&HashSet<Located>>,
-    color: Color,
+    execution_id: ExecutionId,
     now: u64,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
@@ -180,8 +180,8 @@ pub fn settle_table(
     let mut boundaries = Vec::new();
     loop {
         let mut changed = settle_supplied_gates(project, edge_idx, pulses, executions);
-        changed |= settle_input_streams(project, edge_idx, color, pulses, executions, kicked);
-        let fired = fire_ready_passthroughs(project, edge_idx, dispatchable, color, now, pulses, executions, kicked);
+        changed |= settle_input_streams(project, edge_idx, execution_id, pulses, executions, kicked);
+        let fired = fire_ready_passthroughs(project, edge_idx, dispatchable, execution_id, now, pulses, executions, kicked);
         let settled = fired.is_empty();
         boundaries.extend(fired);
         if settled && !changed { break; }
@@ -196,7 +196,7 @@ pub fn settle_table(
 fn settle_input_streams(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
-    color: Color,
+    execution_id: ExecutionId,
     pulses: &mut PulseTable,
     executions: &NodeExecutionTable,
     kicked: &HashMap<FiringLocation, KickedNode>,
@@ -207,7 +207,7 @@ fn settle_input_streams(
         let ports = crate::exec::ready::generator_inputs(node);
         if ports.is_empty() { continue; }
         let mut frames: HashSet<LoopFrames> = pulses.get(&node.id).into_iter().flatten()
-            .filter(|p| p.color == color).map(|p| p.frames.clone()).collect();
+            .filter(|p| p.execution_id == execution_id).map(|p| p.frames.clone()).collect();
         frames.extend(kicked.keys().filter(|loc| loc.node_id == node.id).map(|loc| loc.frames.clone()));
         // A node under no loop fires once per place it is at, whether or
         // not anything has reached it there yet.
@@ -219,10 +219,10 @@ fn settle_input_streams(
             if !selection.nodes.contains(&at) { continue; }
             if scope_permission(project, node, &frames, executions) != ScopePermission::Allowed { continue; }
             for port in &ports {
-                if pulses.stream_was_consumed(color, &node.id, port, &frames) { continue; }
+                if pulses.stream_was_consumed(execution_id, &node.id, port, &frames) { continue; }
                 let bucket = pulses.entry(node.id.clone()).or_default();
                 let history: Vec<_> = bucket.iter().filter(|p|
-                    p.color == color && p.frames == frames && p.target_port == *port).collect();
+                    p.execution_id == execution_id && p.frames == frames && p.target_port == *port).collect();
                 if history.iter().any(|p| p.backup || !p.closed || p.close_error.is_some()) { continue; }
                 let ended = history.iter().any(|p| p.closed);
                 if !ended && selection.has_supplier(project, &at, port) { continue; }
@@ -230,24 +230,24 @@ fn settle_input_streams(
                 let origin = selection.input_origins.get(&at).and_then(|ports| ports.get(*port)).copied();
                 if ended && backup.is_none() { continue; }
                 let identity = serde_json::to_vec(&(&node.id, port, &frames)).expect("stream location serializes");
-                let base = Uuid::new_v5(&color, &identity);
+                let base = Uuid::new_v5(&execution_id, &identity);
                 let end_id = Uuid::new_v5(&base, b"backup-end");
                 if history.iter().any(|p| p.id == end_id) { continue; }
                 for pulse in bucket.iter_mut().filter(|p|
-                    p.color == color && p.frames == frames && p.target_port == *port && p.closed)
+                    p.execution_id == execution_id && p.frames == frames && p.target_port == *port && p.closed)
                 { pulse.absorb(); }
                 if let Some(value) = backup {
                     let items = value.as_array().expect("resolved generator backup is an item list");
                     for (index, value) in items.iter().enumerate() {
                         let id = Uuid::new_v5(&base, &(index as u64).to_be_bytes());
-                        let mut pulse = Pulse::new(id, color, frames.clone(), &node.id, *port, Arc::new(value.clone()));
+                        let mut pulse = Pulse::new(id, execution_id, frames.clone(), &node.id, *port, Arc::new(value.clone()));
                         pulse.provided = true;
                         pulse.backup = true;
                         pulse.inherited_from = origin;
                         bucket.push(pulse);
                     }
                 }
-                let mut end = Pulse::closure(end_id, color, frames.clone(), &node.id, *port);
+                let mut end = Pulse::closure(end_id, execution_id, frames.clone(), &node.id, *port);
                 end.provided = backup.is_some();
                 end.backup = backup.is_some();
                 end.inherited_from = origin;
@@ -299,7 +299,7 @@ pub fn fire_ready_passthroughs(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     dispatchable: Option<&HashSet<Located>>,
-    color: Color,
+    execution_id: ExecutionId,
     now: u64,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
@@ -324,7 +324,7 @@ pub fn fire_ready_passthroughs(
             find_ready_among(project, boundaries.values().copied(), pulses, edge_idx, dispatchable);
         let mut covered: HashSet<FiringLocation> = HashSet::new();
         // Every group readiness forms is dispatched here, whatever its
-        // color: a pulse table holds one execution, and a group this
+        // execution: a pulse table holds one execution, and a group this
         // pass declined would reach the ordinary dispatch loop, which
         // must never see a boundary.
         for (def, mut group) in pulse_driven {
@@ -356,7 +356,7 @@ pub fn fire_ready_passthroughs(
             if covered.contains(&loc) {
                 continue;
             }
-            ready.push((def, kicked_group(def, info, &loc.frames, color, project, edge_idx)));
+            ready.push((def, kicked_group(def, info, &loc.frames, execution_id, project, edge_idx)));
         }
         if ready.is_empty() {
             return fired;
@@ -394,7 +394,7 @@ fn dispatch_passthrough(
     kicked: &mut HashMap<FiringLocation, KickedNode>,
 ) -> BoundaryDispatch {
     let node_id = node_def.id.clone();
-    let color = group.color;
+    let execution_id = group.execution_id;
     let frames = group.frames.clone();
     // A boundary absorbs its whole group. It has no live feed, so
     // there is no generator port to leave pending (the compiler
@@ -416,14 +416,14 @@ fn dispatch_passthrough(
         return BoundaryDispatch {
             node_id,
             frames,
-            color,
+            execution_id,
             absorbed,
             emissions: Vec::new(),
             outcome: BoundaryOutcome::OutOfScope,
         };
     }
 
-    let ordinal = next_firing_ordinal(executions, &node_id, color, &frames);
+    let ordinal = next_firing_ordinal(executions, &node_id, execution_id, &frames);
     let emission_id = boundary_emission(&node_id, &frames, ordinal);
     let record_id = Uuid::new_v4();
     executions.entry(node_id.clone()).or_default().push(NodeExecution {
@@ -442,7 +442,7 @@ fn dispatch_passthrough(
         logs: Vec::new(),
         mentioned_ports: Default::default(),
         closed_output_ports: Default::default(),
-        color,
+        execution_id,
         frames: frames.clone(),
         inherited_from: None,
     });
@@ -458,7 +458,7 @@ fn dispatch_passthrough(
     let status = if let Some(reason) = &group.skip {
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, Some(reason),
+                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, Some(reason),
                 reason.inherited_failure(),
             ));
         }
@@ -466,7 +466,7 @@ fn dispatch_passthrough(
     } else if let Some(err) = &group.error {
         // A pre-dispatch failure (a port refused its value): nothing
         // was forwarded, so every output closes.
-        sweep_all_outputs(&node_id, emission_id, color, &frames, project, edge_idx, pulses, &mut emissions, err);
+        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, err);
         // And the scope never starts, which the INSIDE has to be told
         // as well. Closing only the In boundary's own outputs left
         // every scope root (a member no wire feeds) never started,
@@ -476,7 +476,7 @@ fn dispatch_passthrough(
         // gated-off path does; only the reason differs.
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, None, Some(err),
+                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(err),
             ));
         }
         NodeExecutionStatus::Failed
@@ -488,7 +488,7 @@ fn dispatch_passthrough(
         forwarded.remove(SHOULD_FLOW_PORT);
         forwarded.remove(crate::exec::skip::SHOULD_NOT_FLOW_PORT);
         match postprocess_output(
-            &node_id, &forwarded, emission_id, color, &frames, project, pulses, edge_idx,
+            &node_id, &forwarded, emission_id, execution_id, &frames, project, pulses, edge_idx,
             &mut emissions,
         ) {
             Ok(mentioned) => {
@@ -500,7 +500,7 @@ fn dispatch_passthrough(
                 // never laundering it into a plain "nothing came" that a
                 // `_should_not_flow` outside the scope would run on.
                 if let Err(e) = close_failed_then_unmentioned_downstream(
-                    &node_id, &group.received.closed_with_error, &mentioned, emission_id, color,
+                    &node_id, &group.received.closed_with_error, &mentioned, emission_id, execution_id,
                     &frames, project, pulses, edge_idx, &mut emissions,
                 ) {
                     tracing::error!(
@@ -529,10 +529,10 @@ fn dispatch_passthrough(
                 // told, or its roots wait for ever and the run ends
                 // Stuck (the pre-dispatch branch above says why).
                 let err = e.to_string();
-                sweep_all_outputs(&node_id, emission_id, color, &frames, project, edge_idx, pulses, &mut emissions, &err);
+                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &err);
                 if let Some(group_id) = &in_scope {
                     emissions.extend(tear_down_scope(
-                        project, edge_idx, pulses, kicked, emission_id, color, group_id, &frames, None, Some(&err),
+                        project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&err),
                     ));
                 }
                 error = Some(err);
@@ -560,7 +560,7 @@ fn dispatch_passthrough(
     BoundaryDispatch {
         node_id,
         frames,
-        color,
+        execution_id,
         absorbed,
         emissions,
         outcome: BoundaryOutcome::Fired {
@@ -580,7 +580,7 @@ fn dispatch_passthrough(
 fn sweep_all_outputs(
     node_id: &str,
     emission_id: Uuid,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
@@ -589,7 +589,7 @@ fn sweep_all_outputs(
     err: &str,
 ) {
     if let Err(e) = close_unmentioned_downstream(
-        node_id, &HashSet::new(), emission_id, color, frames, project, pulses, edge_idx, emissions,
+        node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
         Some(err), &HashSet::new(),
     ) {
         tracing::error!(
@@ -619,7 +619,7 @@ pub fn tear_down_scope(
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, KickedNode>,
     emission_id: Uuid,
-    color: Color,
+    execution_id: ExecutionId,
     group_id: &str,
     frames: &LoopFrames,
     reason: Option<&SkipReason>,
@@ -635,7 +635,7 @@ pub fn tear_down_scope(
     // telling below, its outward closures do not.
     let taken_down_above = matches!(reason, Some(SkipReason::ScopeSkipped { .. }));
     let mut emissions = if taken_down_above { Vec::new() } else {
-        close_scope_outward(project, edge_idx, pulses, emission_id, color, group_id, frames, failure)
+        close_scope_outward(project, edge_idx, pulses, emission_id, execution_id, group_id, frames, failure)
     };
     let RefusedScope { scope, frames, members, .. } = refused;
     let frames = &frames;
@@ -659,7 +659,7 @@ pub fn tear_down_scope(
     // that took the scope down, or plainly when it was gated off.
     for member in &members {
         if let Err(error) = close_unmentioned_downstream(member, &HashSet::new(), emission_id,
-            color, frames, project, pulses, &exit_index, &mut emissions, failure, &HashSet::new())
+            execution_id, frames, project, pulses, &exit_index, &mut emissions, failure, &HashSet::new())
         {
             tracing::error!(node = %member, %error, "scope member closure failed");
         }
@@ -763,7 +763,7 @@ pub fn close_scope_outward(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     emission_id: Uuid,
-    color: Color,
+    execution_id: ExecutionId,
     group_id: &str,
     frames: &LoopFrames,
     failure: Option<&str>,
@@ -784,7 +784,7 @@ pub fn close_scope_outward(
         // declared outputs), but teardown cannot propagate, so log
         // loud rather than unwrap.
         if let Err(e) = emit_port_closure(
-            &out_id, &port.name, emission_id, color, frames, project, pulses, edge_idx,
+            &out_id, &port.name, emission_id, execution_id, frames, project, pulses, edge_idx,
             &mut emissions, failure,
         ) {
             tracing::error!(
@@ -1297,7 +1297,7 @@ mod tests {
             status: NodeExecutionStatus::Completed, pulses_absorbed: vec![], ordinal: 0, error: None,
             callback_id: None, started_at: 0, completed_at: Some(1), cost_usd: 0.0, logs: vec![],
             mentioned_ports: Default::default(), closed_output_ports: Default::default(),
-            color: Uuid::nil(), frames: vec![outer, call], inherited_from: None,
+            execution_id: Uuid::nil(), frames: vec![outer, call], inherited_from: None,
         });
         assert_eq!(scope_permission(&project, member, &frames, &executions), ScopePermission::Allowed);
         let other_call = vec![Frame::Loop { index: 0 }, Frame::Call { site: "L1.other".into() }, Frame::Loop { index: 1 }];

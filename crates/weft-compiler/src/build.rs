@@ -98,6 +98,24 @@ impl StockProject {
     }
 }
 
+/// The binary hash of the standard worker: the worker a project whose
+/// nodes are all base catalog nodes builds to (`NodeSet::Full`, the
+/// default; its hash names no project). The install keeps that image
+/// ready so such a project's first run compiles nothing, and never
+/// reclaims it. Computed once per process: asking compiles the stock
+/// program and walks the whole catalog.
+pub fn standard_worker_hash() -> CompileResult<String> {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(known) = HASH.get() {
+        return Ok(known.clone());
+    }
+    let stock = StockProject::materialize()?;
+    let root = resolve_weft_root()?;
+    let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, codegen::NodeSet::Full)
+        .map_err(|e| CompileError::Build(format!("compute the standard worker's hash: {e}")))?;
+    Ok(HASH.get_or_init(|| hash).clone())
+}
+
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
 /// 1. Validate the (resolved) definition, abort on any error.
@@ -119,7 +137,7 @@ impl StockProject {
 /// definition, not the raw source. `Structural` (not `Runtime`): a project
 /// may build without every secret filled; runtime-rule gaps surface at run.
 ///
-/// `builder_base_ref` is the shared builder-base image ref the CLI
+/// `bases.builder` is the shared builder-base image ref the caller
 /// computed + ensured. When it kicks in (debian-family runtime, no
 /// custom template), the build context omits `weft/` because the
 /// engine workspace already lives inside the base image at `/weft/`.
@@ -127,7 +145,7 @@ pub fn build_project(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
-    builder_base_ref: &str,
+    bases: &worker_image::BaseImages,
     node_set: codegen::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
@@ -150,7 +168,7 @@ pub fn build_project(
         catalog,
         &referenced_nodes,
         &binary_name,
-        builder_base_ref,
+        bases,
         &StockProject::materialize()?.builder_stage()?,
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
@@ -232,7 +250,7 @@ fn stage_build_context(
     // `build/` = generated cargo crate. Copy target excluded; it
     // doesn't exist on the host anymore (no host cargo build), but
     // belt-and-suspenders.
-    copy_dir_filtered(crate_root, &ctx.join("build"), &["target"])?;
+    copy_dir_filtered(crate_root, &ctx.join("build"), &|name| name == "target")?;
 
     // `weft/` = the language runtime workspace (crates + manifest).
     // Staged into the build context only when the project Dockerfile
@@ -274,14 +292,14 @@ fn stage_project_nodes(
         // over), so staging and hashing agree on a node's byte-content:
         // a file the build copies but the hash skips (or vice versa)
         // is how a stale worker image gets served.
-        copy_dir_filtered(&root, &dest.join(rel), weft_catalog::NODE_TREE_EXCLUDE)?;
+        copy_dir_filtered(&root, &dest.join(rel), &weft_catalog::is_node_tree_excluded)?;
     }
     Ok(())
 }
 
 /// The bare content-addressed node-test image tag,
 /// `weft-node-tests:<test_hash>`. Single source of truth shared by the
-/// CLI (build + load) and whoever spawns the test pod, like
+/// CLI (build + load) and whoever spawns the test process, like
 /// [`worker_image_tag`].
 pub const NODE_TEST_IMAGE_REPO: &str = "weft-node-tests";
 
@@ -300,7 +318,7 @@ pub fn build_test_artifact(
     project: &Project,
     catalog: &FsCatalog,
     package_name: &str,
-    builder_base_ref: &str,
+    bases: &worker_image::BaseImages,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     let weft_root = resolve_weft_root()?;
@@ -329,7 +347,7 @@ pub fn build_test_artifact(
         catalog,
         &referenced,
         &test_crate.binary_name,
-        builder_base_ref,
+        bases,
         &StockProject::materialize()?.builder_stage()?,
     )?;
     let dockerfile_path = project_root
@@ -413,7 +431,7 @@ fn package_root(catalog: &FsCatalog, package_name: &str) -> CompileResult<PathBu
         .find(|p| p.name == package_name)
         .map(|p| p.root.clone())
         .ok_or_else(|| {
-            CompileError::Build(format!("no package named '{package_name}' in this project's nodes/"))
+            CompileError::Build(format!("no package named '{package_name}' in this project (nodes/ or src/)"))
         })
 }
 
@@ -473,7 +491,7 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
         {
             let to = crate_dest.join(&entry_name);
             if entry_path.is_dir() {
-                copy_dir_filtered(&entry_path, &to, weft_catalog::NODE_TREE_EXCLUDE)?;
+                copy_dir_filtered(&entry_path, &to, &weft_catalog::is_node_tree_excluded)?;
             } else if entry_path.is_file() {
                 std::fs::copy(&entry_path, &to).map_err(CompileError::Io)?;
                 mirror_mtime(&entry_path, &to);
@@ -597,7 +615,7 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// shared ones, so a base that had compiled only the engine's dependencies
 /// left every first build on a host recompiling the engine, most of the
 /// dependency tree and every package crate (measured at 1m07 on a warm
-/// machine). Compiling the same crate the standard worker image is built
+/// machine). Compiling the same crate a stock project's worker is built
 /// from, at the same paths (`/work`, `/weft/project-nodes`), makes every
 /// package crate an untouched project links fingerprint-fresh in the seeded
 /// compile cache; a project compiles only the packages it edited or added
@@ -711,7 +729,8 @@ fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
 /// host mtime keeps unchanged sources looking unchanged inside the
 /// container, so cargo only rebuilds the package whose node source
 /// genuinely changed (plus the worker relink).
-pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
+/// `exclude` names the entries left out, at any depth.
+pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> CompileResult<()> {
     copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
 }
 
@@ -722,7 +741,7 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileRes
 fn copy_dir_filtered_inner(
     src: &Path,
     dst: &Path,
-    exclude: &[&str],
+    exclude: &dyn Fn(&str) -> bool,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
@@ -735,7 +754,7 @@ fn copy_dir_filtered_inner(
 fn copy_dir_filtered_entries(
     src: &Path,
     dst: &Path,
-    exclude: &[&str],
+    exclude: &dyn Fn(&str) -> bool,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
@@ -743,7 +762,7 @@ fn copy_dir_filtered_entries(
         let entry = entry.map_err(CompileError::Io)?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if exclude.iter().any(|e| *e == name_str) {
+        if exclude(&name_str) {
             continue;
         }
         let from = entry.path();

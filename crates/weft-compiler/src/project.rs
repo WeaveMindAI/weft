@@ -1,6 +1,7 @@
 //! Project loader. Reads `weft.toml`, resolves paths, walks the
 //! project directory.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -11,10 +12,20 @@ use crate::error::{CompileError, CompileResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifest {
     pub package: PackageSection,
-    #[serde(default)]
-    pub dispatcher: DispatcherSection,
+    /// The weft installs this project deploys to, by name
+    /// (`[targets.prod] url = "https://..."`). Shared by the team, so
+    /// committed; the credential for each lives in the person's own
+    /// `~/.config/weft/credentials.toml`, never here. `local` is always
+    /// a target (the machine's own install) and may be overridden here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, TargetSection>,
     #[serde(default)]
     pub build: BuildSection,
+    /// The one-target spelling `[targets]` replaced. Read only to refuse
+    /// it by name at load: ignored, a `url` in it would silently send
+    /// every command to the local install instead.
+    #[serde(default, skip_serializing)]
+    dispatcher: Option<toml::Table>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,11 +41,35 @@ pub struct PackageSection {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DispatcherSection {
-    /// URL of the dispatcher this project talks to. Defaults to
-    /// `http://localhost:9999` if unset.
-    pub url: Option<String>,
+/// One `[targets.<name>]` entry: where that install's dispatcher answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetSection {
+    pub url: String,
+}
+
+/// The target every command acts on when `--on` is not given: the
+/// machine's own install. There is deliberately no setting that makes a
+/// remote target the default, so a command that forgets to name one
+/// lands on the laptop, never on a shared install.
+// SYNC: LOCAL_TARGET <-> packages/weft-graph/src/protocol.ts LOCAL_INSTALL
+pub const LOCAL_TARGET: &str = "local";
+
+/// The one spelling of an install's base address: an http or https URL,
+/// its scheme and host lowercased (the parser does that), with no query,
+/// no fragment and no trailing slash, so `HTTPS://Weft.Example.com/` and
+/// `https://weft.example.com` are the same install everywhere one is
+/// compared or stored (a target's url, a stored key's entry). Anything
+/// else is refused with the reason.
+pub fn normalize_install_url(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw).map_err(|e| format!("'{raw}' is not a URL ({e})"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("'{raw}' must be an http or https address"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!("'{raw}' must be the install's base address, with no query or fragment"));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 /// Optional `[build]` block in weft.toml. Controls how the
@@ -83,6 +118,24 @@ impl Project {
             .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
         let manifest: ProjectManifest = toml::from_str(&raw)
             .map_err(|e| CompileError::Project(format!("weft.toml parse: {e}")))?;
+        if manifest.dispatcher.is_some() {
+            return Err(CompileError::Project(format!(
+                "{} has a [dispatcher] section, which weft no longer reads: the installs a \
+                 project talks to are named targets now. Delete the section; if it set a \
+                 url, write it as `[targets.local]\nurl = \"...\"` for this machine's \
+                 install, or under a name of its own (`[targets.prod]`) and pass \
+                 `--on prod` to act there.",
+                manifest_path.display()
+            )));
+        }
+        // Every target's address is checked here, so a bad one is refused
+        // naming its target the moment the project loads, not on the first
+        // command that happens to act there.
+        for (name, target) in &manifest.targets {
+            normalize_install_url(&target.url).map_err(|e| {
+                CompileError::Project(format!("{}: target '{name}': {e}", manifest_path.display()))
+            })?;
+        }
         let project = Self { root: root.to_path_buf(), manifest };
         // The program lives in `src/` (see `main_weft`). A project written
         // before that held it at the root; it is refused here, at load,
@@ -146,12 +199,31 @@ impl Project {
         self.manifest.package.id
     }
 
-    pub fn dispatcher_url(&self) -> String {
-        self.manifest
-            .dispatcher
-            .url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:9999".into())
+    /// The dispatcher URL of the target called `name`: its
+    /// `[targets.<name>]` entry, or for `local` the machine's own install
+    /// (the port it saved, see `weft_core::ports::local_public_url`) when
+    /// the project does not override it. An unknown name is an
+    /// error naming every target the project has.
+    pub fn target_url(&self, name: &str) -> CompileResult<String> {
+        if let Some(target) = self.manifest.targets.get(name) {
+            return normalize_install_url(&target.url).map_err(|e| {
+                CompileError::Project(format!("target '{name}' in {}: {e}", self.root.join("weft.toml").display()))
+            });
+        }
+        if name == LOCAL_TARGET {
+            return weft_core::ports::local_public_url().map_err(CompileError::Project);
+        }
+        let mut known: Vec<&str> = self.manifest.targets.keys().map(String::as_str).collect();
+        if !known.contains(&LOCAL_TARGET) {
+            known.push(LOCAL_TARGET);
+        }
+        known.sort_unstable();
+        Err(CompileError::Project(format!(
+            "no target '{name}' in {}; its targets are: {}. Add one with \
+             `weft target add {name} <url>`",
+            self.root.join("weft.toml").display(),
+            known.join(", ")
+        )))
     }
 
     /// The program's entry file, `src/main.weft`. Source lives under
@@ -252,8 +324,84 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
     crate::build::copy_dir_filtered(
         &weft_catalog::stdlib_root().map_err(CompileError::Build)?,
         &dest,
-        weft_catalog::NODE_TREE_EXCLUDE,
+        &weft_catalog::is_node_tree_excluded,
     )
+}
+
+/// The manifest's pseudo-entry for the installed weft a project was
+/// built against: `weft:<version>:<catalog hash>`. It names the
+/// seeded base catalog instead of listing its files (it is the installed
+/// weft's, never the project's), so the CLI that records a version and
+/// the dispatcher that builds one compute it the same way, and a
+/// dispatcher whose own catalog is another one refuses the build.
+#[cfg(feature = "build")]
+pub fn weft_entry(project_root: &Path) -> CompileResult<String> {
+    Ok(format!(
+        "{}{}:{}",
+        weft_core::project::hash::WEFT_ENTRY_PREFIX,
+        env!("CARGO_PKG_VERSION"),
+        base_catalog_hash(project_root)?
+    ))
+}
+
+/// The content hash of the seeded base catalog: every file under
+/// `nodes/base_catalog/`, path and bytes, sorted.
+#[cfg(feature = "build")]
+pub fn base_catalog_hash(project_root: &Path) -> CompileResult<String> {
+    use sha2::Digest;
+    let dir = base_catalog_dir(project_root);
+    let mut files: Vec<PathBuf> = Vec::new();
+    if dir.is_dir() {
+        collect_catalog_files(&dir, &mut files)?;
+    }
+    files.sort();
+    let mut hasher = sha2::Sha256::new();
+    for f in files {
+        let rel = f.strip_prefix(&dir).expect("under the catalog").to_string_lossy().replace('\\', "/");
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(std::fs::read(&f).map_err(CompileError::Io)?);
+        hasher.update(b"\n");
+    }
+    Ok(weft_core::project::hash::hex(&hasher.finalize()))
+}
+
+#[cfg(feature = "build")]
+fn collect_catalog_files(dir: &Path, out: &mut Vec<PathBuf>) -> CompileResult<()> {
+    for entry in std::fs::read_dir(dir).map_err(CompileError::Io)? {
+        let entry = entry.map_err(CompileError::Io)?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Installed dependencies and build output are not part of what
+        // weft is: they differ per machine and per install, and this hash
+        // ends up inside the manifest, which IS the version id (the
+        // catalog ships a pnpm package, and one `pnpm install` in there
+        // once folded thousands of local files into it). The SAME list
+        // the seed copies through (`weft_catalog::is_node_tree_excluded`), so
+        // the hash describes exactly the files the build stages.
+        if weft_catalog::is_node_tree_excluded(&name) {
+            continue;
+        }
+        // A symlink is refused rather than skipped: skipped, a catalog
+        // differing only by a link would hash like one without it, and
+        // followed, it would read something that is not a file of the
+        // catalog. The catalog is weft's own copy, so a link is weft's
+        // to fix.
+        if entry.file_type().map_err(CompileError::Io)?.is_symlink() {
+            return Err(CompileError::Project(format!(
+                "{} is a symlink, and the catalog's hash is taken over real files only, so \
+                 this project cannot be hashed. The catalog comes from the installed weft: \
+                 report this, and `weft catalog update` once it ships without the link",
+                path.display()
+            )));
+        }
+        if path.is_dir() {
+            collect_catalog_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// The source folder and the entry file inside it (`src/main.weft`).
@@ -272,6 +420,7 @@ pub const NODES_DIR: &str = "nodes";
 /// and the catalog finds it by the same two marks it uses everywhere,
 /// a `metadata.json` (a node) or a `package.toml` (a package). Both
 /// trees form ONE catalog, so a type name is unique across them.
+// SYNC: node_roots <-> extension-vscode/src/diagnostics.ts (NODE_GLOBS)
 pub fn node_roots(project_root: &Path) -> [PathBuf; 2] {
     [project_root.join(NODES_DIR), project_root.join(SRC_DIR)]
 }
@@ -291,8 +440,9 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
             version: Some("0.1.0".into()),
             description: None,
         },
-        dispatcher: DispatcherSection::default(),
+        targets: BTreeMap::new(),
         build: BuildSection::default(),
+        dispatcher: None,
     };
     let toml = toml::to_string_pretty(&manifest)
         .map_err(|e| CompileError::Project(format!("serialize manifest: {e}")))?;
@@ -320,7 +470,7 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
 /// out-of-folder (the same path the CLI runs).
 ///
 /// Reuses `seed_base_catalog` verbatim by materializing to a temp dir; the read-back
-/// skips `NODE_TREE_EXCLUDE` names so a seed source never drags build/cache dirs in.
+/// skips `is_node_tree_excluded` names so a seed source never drags build/cache dirs in.
 #[cfg(feature = "build")]
 pub fn seed_catalog_into_upload(
     upload: &[(String, Vec<u8>)],
@@ -341,7 +491,7 @@ pub fn seed_catalog_into_upload(
 }
 
 /// Recursively read every regular file under `dir` into `out` keyed by its path
-/// relative to `root` (`/`-separated), skipping `NODE_TREE_EXCLUDE` names and
+/// relative to `root` (`/`-separated), skipping `is_node_tree_excluded` names and
 /// following symlinks (their target bytes are packed, so a symlinked
 /// `nodes/base_catalog` uploads as real files), so the packed map matches what
 /// the build reads. A symlink cycle fails loudly via the descent chain.
@@ -391,6 +541,75 @@ fn read_folder_entries_into_map(
 #[cfg(test)]
 mod find_tests {
     use super::*;
+
+    fn project_with(extra: &str) -> (tempfile::TempDir, CompileResult<Project>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.weft"), "").unwrap();
+        std::fs::write(
+            dir.path().join("weft.toml"),
+            format!("[package]\nname = \"p\"\nid = \"00000000-0000-0000-0000-000000000000\"\n{extra}"),
+        )
+        .unwrap();
+        let loaded = Project::load(dir.path());
+        (dir, loaded)
+    }
+
+    #[test]
+    fn local_is_always_a_target_and_a_project_may_override_it() {
+        let (_d, bare) = project_with("");
+        assert_eq!(bare.unwrap().target_url(LOCAL_TARGET).unwrap(), weft_core::ports::local_public_url().unwrap());
+        let (_d, overridden) = project_with("[targets.local]\nurl = \"http://127.0.0.1:19999/\"\n");
+        assert_eq!(
+            overridden.unwrap().target_url(LOCAL_TARGET).unwrap(),
+            "http://127.0.0.1:19999",
+            "a trailing slash is dropped so paths join cleanly"
+        );
+    }
+
+    #[test]
+    fn a_target_url_has_one_spelling() {
+        assert_eq!(normalize_install_url("HTTPS://Weft.Example.COM/").unwrap(), "https://weft.example.com");
+        assert_eq!(normalize_install_url("http://h:8080/base/").unwrap(), "http://h:8080/base");
+        assert!(normalize_install_url("ftp://x").is_err());
+        assert!(normalize_install_url("https://x/?a=1").is_err());
+        assert!(normalize_install_url("https://x/#f").is_err());
+        assert!(normalize_install_url("weft.example.com").is_err());
+    }
+
+    #[test]
+    fn a_bad_target_url_is_refused_at_load_naming_the_target() {
+        let (_d, p) = project_with("[targets.prod]\nurl = \"weft.example.com\"\n");
+        let error = p.unwrap_err().to_string();
+        assert!(error.contains("target 'prod'"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_target_names_every_known_one() {
+        let (_d, p) = project_with("[targets.prod]\nurl = \"https://weft.example.com\"\n");
+        let p = p.unwrap();
+        assert_eq!(p.target_url("prod").unwrap(), "https://weft.example.com");
+        let error = p.target_url("staging").unwrap_err().to_string();
+        assert!(error.contains("no target 'staging'"), "{error}");
+        assert!(error.contains("local, prod"), "{error}");
+    }
+
+    #[test]
+    fn the_old_dispatcher_section_is_refused_with_the_move_spelled_out() {
+        // Ignored, its url would quietly send every command to the local
+        // install; an empty one is refused too, so there is one spelling.
+        for section in ["[dispatcher]\n", "[dispatcher]\nurl = \"https://x\"\n"] {
+            let (_d, p) = project_with(section);
+            let error = p.unwrap_err().to_string();
+            assert!(error.contains("[targets.local]"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_target_with_a_misspelled_key_is_refused() {
+        let (_d, p) = project_with("[targets.prod]\nulr = \"https://x\"\n");
+        assert!(p.is_err(), "a typo must not leave the target without a url");
+    }
 
     /// `Project::find` is three-way: a valid manifest loads, a missing manifest is
     /// `Ok(None)` (lenient), and a MALFORMED manifest is a loud `Err` (never

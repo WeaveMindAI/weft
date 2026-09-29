@@ -1,6 +1,6 @@
 ---
 name: weft-frontend
-description: "Read when the user wants a page, app or site for the program, and before dispatching the frontend-builder: the verified scaffold commands, the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes and signal doors, one shared PostgreSQL, where the api token lives, pictures as links, the build, and the shape for a site whose people each bring their own accounts or settings (members: the manager routes, the member header and token, their settings page)."
+description: "Read when the user wants a page, app or site for the program, and before dispatching the frontend-builder: the verified scaffold commands, the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes and signal doors, the three variables that say where the program is, one shared PostgreSQL, where the api token lives, pictures as links, the build and its Dockerfile, and the shape for a site whose people each bring their own accounts or settings (members: the manager routes, the member header and token, their settings page)."
 ---
 
 
@@ -285,7 +285,7 @@ is, written in the node that runs it, so it is the orchestrator's to change and
 never yours. Say which infrastructure you need and why, and the orchestrator
 either makes it reachable or builds what was missing and dispatches you again.
 
-You never go round it. If you catch yourself running `kubectl`, reading a
+You never go round it. If you catch yourself running `docker`, reading a
 node's source for a password, or opening a shell in a container, stop and write
 verbatim "Wait. A door is listed or it does not exist." Then report and work on
 something else meanwhile.
@@ -381,6 +381,23 @@ The api token lives server side: you keep it in SvelteKit's server-only
 environment, call the doors from a `+page.server.ts` or a `+server.ts`, and
 never ship it to the browser. A program route that needs the token is called
 server side too.
+
+The server finds [the program] in three environment variables, and never in
+an address written into the code, because the same frontend runs on this
+machine and on a cloud install:
+
+| Variable | What it is | On this machine |
+|---|---|---|
+| `WEFT_DISPATCHER_URL` | where the server calls routes and doors | `http://127.0.0.1:14111` |
+| `WEFT_TOKEN` | the api token | a token from `weft token mint` |
+| `WEFT_PUBLIC_URL` | the start of any link a browser follows | `http://127.0.0.1:14111` |
+
+On this machine, 14111 is the default port; if the install was started on
+another one, `~/.local/share/weft/ports.json` has it (`public`).
+
+On this machine they live in `front/.env`; on a cloud install the deploy
+workflow sets them (the `weft-deploying` skill). You read them with
+`$env/dynamic/private`, so a deployed build picks them up when it starts.
 
 A page never calls a service [the program] does not. If a page needs a
 capability [the program] exposes as neither a route nor a signal, that is a
@@ -490,7 +507,7 @@ The shape, unless the user asks for another:
   ```
 
   `WEFT_DISPATCHER_URL` (the address `weft token mint` printed before
-  `/signal-token/`, `http://127.0.0.1:9999` on a local install) goes in the
+  `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/member/`, `/signal/`, `/signal-token/` and the program's
   own routes (`/connect/<tenant>/<path>`, following the route's redirect to
@@ -545,6 +562,10 @@ carry the header.
   source tree, and never point a weft `@file` marker into `front/`.
 - The build is `pnpm install` then `pnpm run build`; the dev server is
   `pnpm run dev`. You hand the user those exact commands in the report.
+- `front/Dockerfile` builds the frontend into a server that listens on
+  `$PORT`: that is what the deploy workflow runs on the cloud. For SvelteKit
+  that means `@sveltejs/adapter-node` in `svelte.config.js`, and the image
+  runs `node build`.
 - A picture [the program] answers with arrives as `{ url, mimeType,
   filename, sizeBytes }`: you put the `url` in an `<img>`. A picture the page
   sends goes in the JSON body as a `data:` URL on the key the route declares

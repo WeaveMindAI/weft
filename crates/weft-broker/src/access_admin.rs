@@ -3,7 +3,7 @@
 //! spec's test call, an OAuth token exchange, a `remote_select`
 //! lookup, an app mint). They run on the broker, whose network egress
 //! is locked to "public internet only", so a crafted URL pointing
-//! inside the cluster dies at the network layer. The dispatcher stays
+//! inside the install dies at the network layer. The dispatcher stays
 //! the editor's authenticated front door and forwards here with its SA
 //! token, exactly like the runtime-file admin verbs.
 //!

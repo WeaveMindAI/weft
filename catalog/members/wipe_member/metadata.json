@@ -1,7 +1,7 @@
 {
   "type": "WipeMember",
   "label": "Wipe member",
-  "description": "Remove everything a member has in this program: their triggers (wiped, their runs cancelled), the copies of the infra nodes listed in `infra` (terminated with their disks), the values they gave for the `@member_filled` fields, their connections, their tokens, their files (`StorageScope::Member`), and their runs. The member id then has nothing attached; run it again to finish a wipe that stopped part way.",
+  "description": "Remove everything a member has in this program: their triggers (wiped, their runs cancelled), the copies of the infra nodes listed in `infra` (terminated with every disk, the ones listed in `keepOnTerminate` too), the values they gave for the `@member_filled` fields, their connections, their tokens, their files (`StorageScope::Member`), and their runs. The member id then has nothing attached; run it again to finish a wipe that stopped part way.",
   "tags": [
     "members",
     "wipe",

@@ -2,7 +2,7 @@
 //!
 //! Node code is user code, and user code panics: an unwrap on an empty
 //! option, an index past the end. The worker has to treat that as a
-//! failed execution rather than a dead pod, and it has to release what
+//! failed execution rather than a dead worker, and it has to release what
 //! the execution registered even though an unwind skips the ordinary
 //! path. Nothing else in the rig can produce a real panic inside a
 //! node, so this fixture is the only way to prove either.

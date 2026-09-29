@@ -5,7 +5,6 @@
 use anyhow::Context;
 
 use super::{local_time, Ctx};
-use crate::commands::daemon::ClusterBackend;
 
 /// A value put into a query string. A node id is the author's own
 /// spelling, so it can hold anything they typed; only the handful of
@@ -93,7 +92,7 @@ pub struct ListFilter {
 }
 
 pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let (arr, total) = executions_page(&client, &filter).await?;
     if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
         return Ok(());
@@ -104,10 +103,10 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
     }
     println!(
         "{:<36}  {:<9}  {:<13}  {:<19}  {:<36}  entry_node  tags",
-        "color", "status", "phase", "started", "project_id"
+        "execution_id", "status", "phase", "started", "project_id"
     );
     for row in &arr {
-        let color = row.get("color").and_then(|v| v.as_str()).unwrap_or("?");
+        let execution_id = row.get("execution_id").and_then(|v| v.as_str()).unwrap_or("?");
         let project = row.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
         let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let phase = row.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
@@ -128,7 +127,7 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
             .map(|m| format!("  (member {m})"))
             .unwrap_or_default();
         println!(
-            "{color:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{member}",
+            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{member}",
             local_time(started)
         );
     }
@@ -219,8 +218,8 @@ const SUMMARY_CHARS: usize = 120;
 
 /// The columns every line prints in its own place, plus the two every
 /// row of one run repeats (they name the run, which you already have:
-/// you asked for it by color). Nothing here reaches the generic tail.
-const COLUMNS: &[&str] = &["kind", "node", "node_id", "at_unix", "color", "project_id"];
+/// you asked for it by execution). Nothing here reaches the generic tail.
+const COLUMNS: &[&str] = &["kind", "node", "node_id", "at_unix", "execution_id", "project_id"];
 
 /// The node a replay row is about. Most rows name it `node`; the two
 /// that come off a pulse rather than a journal row (`cost_reported`,
@@ -340,9 +339,9 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
     format!("{cut}...")
 }
 
-pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow::Result<()> {
-    let color = super::resolve_color(&ctx, &color).await?;
-    let client = ctx.client();
+pub async fn events(ctx: Ctx, execution_id: String, mut filter: EventsFilter) -> anyhow::Result<()> {
+    let execution_id = super::resolve_execution_id(&ctx, &execution_id).await?;
+    let client = ctx.client()?;
     // `--node` is spelled through the call sites, the way the program
     // reads; the project's compiled definition says which id and which
     // call path that is, and the rows print their node the same way.
@@ -363,23 +362,23 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
     });
     let definition = match loaded {
         Ok(Some((project, definition))) => {
-            let summary: serde_json::Value = client.get_json(&format!("/executions/{color}")).await?;
+            let summary: serde_json::Value = client.get_json(&format!("/executions/{execution_id}")).await?;
             let run_project = summary
                 .get("project_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("/executions/{color} named no project_id: {summary}"))?;
+                .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id} named no project_id: {summary}"))?;
             if run_project == definition.id.to_string() {
                 filter.resolve_node(project, &definition)?;
                 Some(definition)
             } else if filter.node.is_some() {
                 anyhow::bail!(
-                    "run {color} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
+                    "run {execution_id} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
                      through this folder's program, so run `weft events` from that project's folder",
                     definition.id
                 );
             } else {
                 eprintln!(
-                    "warning: nodes show as ids, because run {color} belongs to project {run_project}, not to this folder's project {}",
+                    "warning: nodes show as ids, because run {execution_id} belongs to project {run_project}, not to this folder's project {}",
                     definition.id
                 );
                 None
@@ -395,11 +394,11 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
         }
     };
     let resp: serde_json::Value = client
-        .get_json(&format!("/executions/{color}/replay"))
+        .get_json(&format!("/executions/{execution_id}/replay"))
         .await?;
     let arr = resp
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
+        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/replay returned no array: {resp}"))?;
     let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
         .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
         .collect();
@@ -521,7 +520,7 @@ pub struct CleanNarrowing {
 
 pub async fn clean(
     ctx: Ctx,
-    color: Option<String>,
+    execution_id: Option<String>,
     keep_days: Option<u32>,
     all: bool,
     images: bool,
@@ -555,14 +554,14 @@ pub async fn clean(
         Ok(ok)
     };
 
-    let client = ctx.client();
-    if let Some(c) = color {
+    let client = ctx.client()?;
+    if let Some(c) = execution_id {
         anyhow::ensure!(
             project.is_none(),
-            "a color names ONE execution, so --project cannot narrow it further: \
+            "an execution names ONE execution, so --project cannot narrow it further: \
              drop one of them"
         );
-        let c = super::resolve_color(&ctx, &c).await?;
+        let c = super::resolve_execution_id(&ctx, &c).await?;
         if !confirm(format!("execution {c}"))? {
             return Ok(());
         }
@@ -570,7 +569,7 @@ pub async fn clean(
         println!("deleted {c}");
         // The sweep of whatever version this run left bare happens on the
         // dispatcher, inside the delete: the run's own project is the one
-        // to sweep, and a color can be cleaned from anywhere, so no
+        // to sweep, and an execution can be cleaned from anywhere, so no
         // client is in a position to know it. This just reports it.
         let swept = deleted.get("swept").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
         if swept > 0 {
@@ -579,7 +578,7 @@ pub async fn clean(
         return Ok(());
     }
 
-    // Bulk clean. Naming a SUBJECT means you mean all of it (a color
+    // Bulk clean. Naming a SUBJECT means you mean all of it (an execution
     // deletes outright; a project, a member or a tag takes every run it
     // names), so the 30-day default guards only the sweep that names
     // nothing. `--keep-days` still narrows any of them when asked for.
@@ -648,83 +647,45 @@ pub async fn clean(
 }
 
 
-/// Reclaim the images a build produces (worker images, infra images,
-/// old builder bases under `--all`) that nothing runs any more. Five
-/// layers of junk, each its own sweep, none gating another (a layer
-/// that fails is reported at the end, after every other layer ran):
+/// Reclaim the images builds produce that nothing runs any more (worker
+/// and infra images, node-test leftovers, and under `--all` old builder
+/// bases, runtimes and compile caches). Each layer is its own sweep, none
+/// gating another (a layer that fails is reported at the end, after every
+/// other layer ran):
 ///
-///   1. TAGGED `weft-worker:<binary_hash>` images on host docker whose
-///      hash the dispatcher's `GET /images/referenced` set does not
-///      cover (a rebuilt project leaves its old tag behind; a deleted
-///      project leaves all of them; a draining pod's image stays covered
-///      until the pod is terminal). The daemon must be up; failing that
-///      is a loud error before any layer runs, never a guess (guessing
-///      "nothing is referenced" would nuke live images).
-///   2. Dangling (untagged) leftovers, under the same project scope as
-///      layer 1 (the `weft.dev/project` label value, or any value with
-///      `--all`).
-///   3. With `--all` only: host `weft-infra-<name>:<hash>` images whose
-///      full ref the referenced set's `infraRefs` does not cover (every
-///      project's complete tag map plus every recorded unit ref; one
-///      image per infra-node content change, nothing else evicts them).
-///      The supervisor's repo is excluded: `gc_stale_system_images`
-///      (daemon start) owns its stale tags. `--all` only because infra
-///      images are content-addressed and deduped ACROSS projects, so a
-///      cwd-project scope over them is a fiction.
-///   4. With `--all` only, kind backend only: the kind node's own cached
-///      worker AND infra images outside the referenced set, in one pass
-///      over the node's OWN image list (the node can hold tags the host
-///      already dropped, so mirroring the host's stale set would miss
-///      them). `--all` only because crictl cannot see docker build
-///      labels, so the node sweep is inherently global.
-///   5. With `--all` only: builder-base tags other than the current one
-///      (each engine bump mints a fresh ~1.4GB base; only the current ref
-///      is ever FROMed, and the base is shared across every project, so
-///      reclaiming it is inherently global). Needs the weft repo root to
-///      compute the current ref.
-///
-/// Without `--all`, the host side is scoped to the cwd project's images
-/// (label filter).
-///
-/// An image docker or containerd refuses to drop because something
-/// still runs it is not an error: it is reported as kept, and the next
-/// clean gets it once nothing runs it. That is expected traffic here,
-/// not only a race: a unit stamped before image refs were recorded
-/// contributes nothing to the keep-set while it keeps running its
-/// image.
-///
-/// Not concurrent-safe with an in-flight `weft build`/`run` on this host: a
-/// freshly built image is referenced by nothing until its register lands,
-/// so a clean racing that window deletes it and that run fails loudly
-/// (rebuild heals). Run cleans between builds, not during.
+///   1. The images the install built: it deletes each one its keep-set
+///      does not cover (`POST /images/prune`), the cwd project's or, with
+///      `--all`, every project's. The install is the only one that
+///      deletes them: every build claims the images it relies on until
+///      they are registered, so a prune never takes an image a build just
+///      found or made (it reports it in use), and it forgets what it
+///      deleted from its ledger.
+///   2. Dangling (untagged) leftovers of the node-test images this host
+///      built (`weft test-node`), which the install never saw: those
+///      carrying the cwd project's `weft.dev/project` label, or any value
+///      with `--all`.
+///   3. With `--all` only: builder-base and runtime tags other than the
+///      current ones (each engine change mints fresh ones, and both are
+///      shared across every project). Needs the weft repo root to compute
+///      the current refs.
+///   4. With `--all` only: compile caches under a retired key.
 async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
-    // Referenced set: the dispatcher's authoritative answer (see
-    // `images::referenced_images`: worker hashes + infra refs). Loud
-    // error if the daemon is down; guessing "nothing is referenced"
-    // would nuke live images.
-    let mut referenced = crate::images::referenced_images(&ctx.client()).await?;
-    // The host scope, settled BEFORE any layer runs: a scoped clean
-    // that cannot name its project must delete nothing, not run the
-    // global layers and report the error afterwards.
+    // The scope, settled BEFORE any layer runs: a scoped clean that cannot
+    // name its project must delete nothing, not run the global layers and
+    // report the error afterwards.
     let scope = if all {
-        // The full-library worker carries no project label, so only the
-        // unscoped sweep can meet it; it is every stock project's image
-        // and stays whether or not a project references it right now.
-        let standard = crate::images::standard_worker_ref()?;
-        let (_, hash) = crate::images::ref_repo_tag(&standard)?;
-        referenced.worker_hashes.insert(hash.to_string());
-        println!("reclaiming worker images no live project references");
-        HostScope::All
+        println!("reclaiming the images no live project references");
+        Scope::All
     } else {
         let project = ctx.project().map_err(|e| {
             anyhow::anyhow!("{e}; pass --all to clean every project's images")
         })?;
         println!(
-            "reclaiming worker images for project {} ({})",
+            "reclaiming the images of project {} ({}) nothing references",
             project.manifest.package.name,
             project.id()
         );
-        HostScope::Project(project.id().to_string())
+        Scope::Project(project.id())
     };
 
     let mut failures: Vec<anyhow::Error> = Vec::new();
@@ -733,12 +694,11 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
             failures.push(e.context(name.to_string()));
         }
     };
-    layer("worker images", host_worker_sweep(&referenced, &scope).await);
-    layer("dangling build leftovers", dangling_prune(&scope).await);
+    layer("built images", registry_prune(ctx, &scope).await);
+    layer("dangling node-test leftovers", dangling_prune(&scope).await);
     if all {
-        layer("infra images", host_infra_sweep(&referenced).await);
-        layer("kind node images", node_sweep(&referenced).await);
-        layer("builder-base images", builder_base_sweep().await);
+        layer("builder-base images", current_only_sweep(crate::images::builder_base_ref()?, "builder-base").await);
+        layer("runtime images", current_only_sweep(crate::images::runtime_image_ref()?, "runtime").await);
         layer("retired compile caches", retired_compile_cache_sweep().await);
     }
     // The compile cache every worker build shares is not an image, but it
@@ -757,54 +717,52 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     anyhow::bail!("{msg}");
 }
 
-/// Which host images layers 1 and 2 may touch: every project's, or
-/// one project's through the `weft.dev/project` label every build
-/// stamps.
-enum HostScope {
-    All,
-    Project(String),
-}
-
-impl HostScope {
-    /// The `docker` label filter for this scope: the label with its
-    /// value for one project, the label's presence for all.
-    fn label_filter(&self) -> String {
-        match self {
-            HostScope::All => "label=weft.dev/project".to_string(),
-            HostScope::Project(id) => format!("label=weft.dev/project={id}"),
-        }
-    }
-}
-
-/// Layer 1: host `weft-worker` tags outside the referenced set, within
-/// the scope's label filter, through the one host matcher.
-async fn host_worker_sweep(
-    referenced: &crate::images::ReferencedImages,
-    scope: &HostScope,
-) -> anyhow::Result<()> {
-    let repo = weft_compiler::build::WORKER_IMAGE_REPO;
-    let listing = match scope {
-        HostScope::All => host_image_listing(&[]).await?,
-        HostScope::Project(_) => host_image_listing(&["--filter", &scope.label_filter()]).await?,
+/// Layer 1: the install deletes the images it built that nothing references.
+async fn registry_prune(ctx: &Ctx, scope: &Scope) -> anyhow::Result<()> {
+    let request = weft_core::images::PruneRequest {
+        project: match scope {
+            Scope::All => None,
+            Scope::Project(id) => Some(*id),
+        },
     };
-    let stale = crate::images::host_images_matching(
-        &listing,
-        |r, t| r == repo && !referenced.is_referenced(r, t),
-    );
-    if stale.is_empty() {
-        println!("no unreferenced worker images");
-        return Ok(());
+    let body = serde_json::to_value(&request).context("encode the prune request")?;
+    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.post_json("/images/prune", &body).await?)
+        .context("read the install's prune report")?;
+    for image in &report.removed {
+        println!("  removed {image}");
     }
-    println!("{}", reclaim_host_images(&stale).await?.report("unreferenced worker image(s)"));
+    for image in &report.in_use {
+        println!("  kept {image}: a container still runs from it, or a build is about to register it; a later clean takes it");
+    }
+    if report.removed.is_empty() && report.in_use.is_empty() && report.failed.is_empty() {
+        println!("no unreferenced built images");
+    }
+    anyhow::ensure!(
+        report.failed.is_empty(),
+        "{} image(s) could not be deleted:\n  {}",
+        report.failed.len(),
+        report.failed.iter().map(|(image, why)| format!("{image}: {why}")).collect::<Vec<_>>().join("\n  ")
+    );
     Ok(())
 }
 
-/// Layer 2: dangling (untagged) leftovers from rebuilds under the same
-/// tag, within the scope's label filter.
-async fn dangling_prune(scope: &HostScope) -> anyhow::Result<()> {
+/// Every project's images, or one project's.
+enum Scope {
+    All,
+    Project(uuid::Uuid),
+}
+
+/// Layer 2: dangling (untagged) leftovers of this host's node-test builds,
+/// through the `weft.dev/project` label `weft test-node` stamps on them.
+async fn dangling_prune(scope: &Scope) -> anyhow::Result<()> {
+    // SYNC: the label <-> crates/weft-cli/src/commands/test_node/mod.rs (the node-test image labels)
+    let filter = match scope {
+        Scope::All => "label=weft.dev/project".to_string(),
+        Scope::Project(id) => format!("label=weft.dev/project={id}"),
+    };
     let status = crate::images::docker()
         .args(["image", "prune", "--force", "--filter", "dangling=true", "--filter"])
-        .arg(scope.label_filter())
+        .arg(filter)
         .status()
         .await?;
     if !status.success() {
@@ -813,90 +771,27 @@ async fn dangling_prune(scope: &HostScope) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer 3: host `weft-infra-<name>:<hash>` images outside the
-/// referenced set (see `clean_build_images` for why `--all`-only and
-/// why the supervisor's repo is excluded).
-async fn host_infra_sweep(referenced: &crate::images::ReferencedImages) -> anyhow::Result<()> {
-    let stale = crate::images::host_images_matching(&host_image_listing(&[]).await?, |r, t| {
-        crate::images::is_infra_node_repo(r) && !referenced.is_referenced(r, t)
-    });
+/// Layer 3: old builder bases and runtime images. Each engine or
+/// toolchain change mints a fresh `weft-builder-base:<hash>` (about
+/// 1.4GB) and `weft-runtime:<hash>`, and nothing evicts the previous one
+/// implicitly (an implicit sweep would race a build FROMing it or a unit
+/// agent running it), so this explicit clean is where they go. Everything
+/// but `current` (the ref this checkout uses) is dead.
+async fn current_only_sweep(current: String, what: &str) -> anyhow::Result<()> {
+    let stale = crate::images::host_images_matching(&host_image_listing().await?, crate::images::outside_current(&current)?);
     if stale.is_empty() {
-        println!("no stale infra images");
+        println!("no stale {what} images");
         return Ok(());
     }
-    println!("{}", reclaim_host_images(&stale).await?.report("stale infra image(s)"));
+    println!("{}", reclaim_host_images(&stale).await?.report(&format!("stale {what} image(s)")));
     Ok(())
 }
 
-/// Layer 4: the kind node's own cached worker and infra images outside
-/// the referenced set, computed from the node's OWN image list through
-/// the one node matcher (per IMAGE, never per tag: a group mixing a
-/// kept and a stale tag of the same content survives whole; digest-only
-/// groups never match). Only worker and infra-node refs are ever
-/// touched. Never a blanket `crictl rmi --prune`: "unused right now"
-/// includes the system images (listener pods spawn on demand, so
-/// between spawns nothing uses the listener image), and pruning those
-/// leaves the next on-demand pod in ImagePullBackOff (the exact
-/// incident that shaped this). Kind backend only: a k8s backend has no
-/// local node cache to clean, so it skips quietly; on kind a failure
-/// here is a real error (leftover node images are exactly what this
-/// verb exists to reclaim).
-async fn node_sweep(referenced: &crate::images::ReferencedImages) -> anyhow::Result<()> {
-    let cfg = crate::commands::daemon::cluster_config();
-    if cfg.backend != ClusterBackend::Kind {
-        return Ok(());
-    }
-    let node_stale = crate::images::node_images_matching(
-        &crate::images::kind_node_image_tag_groups(&cfg.cluster_name).await?,
-        |r, t| {
-            (r == weft_compiler::build::WORKER_IMAGE_REPO || crate::images::is_infra_node_repo(r))
-                && !referenced.is_referenced(r, t)
-        },
-    );
-    if node_stale.is_empty() {
-        println!("no stale worker or infra images on the kind node");
-        return Ok(());
-    }
-    let node = format!("{}-control-plane", cfg.cluster_name);
-    println!(
-        "{}",
-        crictl_rmi_refs(&node, &node_stale)
-            .await?
-            .report(&format!("stale worker/infra image(s) from the {node} node"))
-    );
-    Ok(())
-}
-
-/// Layer 5: old builder bases. Each engine/toolchain bump mints a
-/// fresh ~1.4GB `weft-builder-base:<hash>` and nothing evicts the
-/// previous one implicitly (an implicit GC would race an in-flight
-/// build FROMing it), so this explicit clean is where they go.
-/// Everything except the CURRENT ref (the one the next build FROMs) is
-/// dead. Host docker on any backend (a k8s backend still builds bases
-/// here).
-async fn builder_base_sweep() -> anyhow::Result<()> {
-    let current_base = crate::images::builder_base_ref()?;
-    let stale_bases = crate::images::host_images_matching(
-        &host_image_listing(&[]).await?,
-        crate::images::outside_current(&current_base)?,
-    );
-    if stale_bases.is_empty() {
-        println!("no stale builder-base images");
-        return Ok(());
-    }
-    println!(
-        "{}",
-        reclaim_host_images(&stale_bases).await?.report("stale builder-base image(s)")
-    );
-    Ok(())
-}
-
-/// Every host image (narrowed by `filters`, e.g. a label filter) as one
-/// `repo:tag` line, the listing the host-side matcher reads.
-async fn host_image_listing(filters: &[&str]) -> anyhow::Result<String> {
+/// Every host image as one `repo:tag` line, the listing the host-side
+/// matcher reads.
+async fn host_image_listing() -> anyhow::Result<String> {
     let listing = crate::images::docker()
         .args(["images"])
-        .args(filters)
         .args(["--format", "{{.Repository}}:{{.Tag}}"])
         .output()
         .await?;
@@ -921,8 +816,8 @@ struct Reclaimed {
 }
 
 impl Reclaimed {
-    /// The one report line every sweep prints, so the five report
-    /// sites cannot drift in wording: "removed N <what>", then only the
+    /// The one report line every host sweep prints, so the report sites
+    /// cannot drift in wording: "removed N <what>", then only the
     /// tails that happened.
     fn report(&self, what: &str) -> String {
         let mut line = format!("removed {} {what}", self.removed);
@@ -936,64 +831,7 @@ impl Reclaimed {
     }
 }
 
-/// Remove images on the kind node through `crictl rmi`, per-ref so one
-/// refused tag cannot abort the others. A refusal is classified by
-/// OBSERVING presence (`crictl inspecti`), never by parsing error
-/// prose: still present means containerd refused because a pod runs
-/// it (kept, with the refusal printed so a permission problem is not
-/// invisible); absent means a concurrent cleaner already reclaimed it,
-/// which only counts while the node's runtime itself still answers.
-/// The liveness probe is `crictl info`, which CONTACTS containerd: a
-/// wedged runtime inside a live node fails rmi and inspecti through
-/// the socket but still answers `--version` (a client-only print), so
-/// a version probe would read as "node up" and report a live image as
-/// already reclaimed. A node failing all three through the same
-/// transport must not read as success.
-async fn crictl_rmi_refs(node: &str, images: &[String]) -> anyhow::Result<Reclaimed> {
-    let mut done = Reclaimed::default();
-    for image in images {
-        let out = crate::images::docker()
-            .args(["exec", node, "crictl", "rmi", image])
-            .output()
-            .await?;
-        if out.status.success() {
-            done.removed += 1;
-            continue;
-        }
-        let present = crate::images::docker()
-            .args(["exec", node, "crictl", "inspecti", image])
-            .output()
-            .await?
-            .status
-            .success();
-        if present {
-            println!(
-                "kept {image} on {node}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            done.in_use += 1;
-            continue;
-        }
-        let node_up = crate::images::docker()
-            .args(["exec", node, "crictl", "info"])
-            .output()
-            .await?
-            .status
-            .success();
-        if node_up {
-            done.already_gone += 1;
-            continue;
-        }
-        anyhow::bail!(
-            "the {node} node stopped answering while removing {image}; check \
-             the kind cluster and rerun `weft clean --images`"
-        );
-    }
-    Ok(done)
-}
-
-/// Remove host docker images one by one, the host twin of
-/// `crictl_rmi_refs`: a tag a concurrent clean already reclaimed is a
+/// Remove host docker images one by one: a tag a concurrent clean already reclaimed is a
 /// success, and a tag docker refuses to drop because a container still
 /// uses it is kept, both detected by observing presence rather than
 /// parsing error prose. No `-f`: force would untag a live container's
@@ -1055,8 +893,10 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     }
     let sizes: Vec<String> = caches.iter().map(|cache| {
         let mut line = if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) };
-        if let Some(suffix) = &cache.unreadable_lane {
-            line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id));
+        match cache.unreadable_lane.as_deref() {
+            Some("") => line.push_str(&format!(" (record {} has no lane number)", cache.id)),
+            Some(suffix) => line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id)),
+            None => {}
         }
         line
     }).collect();

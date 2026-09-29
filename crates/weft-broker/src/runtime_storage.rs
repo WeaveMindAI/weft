@@ -1,7 +1,7 @@
 //! The broker's runtime-file HTTP surface (`ctx.storage`).
 //!
-//! Worker data path (bearer = the worker's projected SA token, resolved
-//! in-process to `Worker { tenant, project, color }`). BYTES never transit the
+//! Worker data path (bearer = the worker's platform identity token, resolved
+//! in-process to `Worker { tenant, project, execution_id }`). BYTES never transit the
 //! broker: it mints presigned URLs and the worker moves bytes direct to/from the
 //! bucket.
 //!   POST   /v1/storage/upload/begin      mint the key, charge a known size, open the upload
@@ -24,7 +24,7 @@
 //!   DELETE /v1/storage/admin/files/{*key}   delete one file
 //!   POST   /v1/storage/admin/presign        presign one file
 //!   POST   /v1/storage/admin/wipe-prefix    weft rm / weft clean
-//!   POST   /v1/storage/admin/sweep-exec     terminate sweep for one color
+//!   POST   /v1/storage/admin/sweep-exec     terminate sweep for one execution
 //!
 //! The broker is the single gatekeeper: it verifies the caller, runs the pure
 //! `key` wall, enforces quota, records metadata, and is the ONLY thing that signs
@@ -56,11 +56,11 @@ use crate::auth::control_plane;
 use crate::runtime_store::{RuntimeStore, RuntimeStoreError};
 use crate::state::BrokerState;
 
-/// The color claim a worker stamps on every storage call, so the broker scopes
+/// The execution claim a worker stamps on every storage call, so the broker scopes
 /// the op to that execution. (The file's scope / mime / filename / keep travel
 /// in the JSON body of upload/begin, not headers.)
-// SYNC: HDR_COLOR <-> crates/weft-engine/src/storage.rs (HDR_COLOR)
-pub const HDR_COLOR: &str = "x-weft-color";
+// SYNC: HDR_EXECUTION_ID <-> crates/weft-engine/src/storage.rs (HDR_EXECUTION_ID)
+pub const HDR_EXECUTION_ID: &str = "x-weft-execution-id";
 
 type ApiError = (StatusCode, String);
 
@@ -114,7 +114,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
 
 // The generic body returned for an internal (500) storage error. The full detail is
 // logged by the broker; it is NOT echoed to the caller because the runtime-storage
-// data path is reached by UNTRUSTED worker pods (user node code runs there), and the
+// data path is reached by UNTRUSTED workers (user node code runs there), and the
 // `Other`/anyhow chain carries internal detail (SQL text, driver messages, table
 // names) that must not be disclosed to attacker-controlled code. The typed 4xx
 // variants below are safe and actionable, so they keep their specific messages.
@@ -166,26 +166,14 @@ fn map_anyhow(e: anyhow::Error) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string())
 }
 
-/// The runtime store, or a loud 500 when the deploy configured no slot. The
-/// runtime-file plane is a hard dependency; a cluster without a bucket fails
-/// the request rather than silently dropping bytes.
-fn store(state: &BrokerState) -> Result<&Arc<RuntimeStore>, ApiError> {
-    state.runtime_store.as_ref().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "no object-store slot configured; runtime storage is unavailable. Set \
-         WEFT_OBJECT_STORE_ENDPOINT (+ bucket/creds) on the broker."
-            .into(),
-    ))
-}
-
 // ---------- caller resolution ----------
 
-/// Resolve the worker caller for a data-path request (the `x-weft-color`
-/// header carries the optional execution color claim). Rejects a
+/// Resolve the worker caller for a data-path request (the `x-weft-execution_id`
+/// header carries the optional execution claim). Rejects a
 /// control-plane caller on the data path (it uses the admin surface).
 async fn worker_caller(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<CallerAuth, ApiError> {
-    let color = headers.get(HDR_COLOR).and_then(|v| v.to_str().ok());
-    let caller = crate::auth::resolve_storage_caller(state, headers, color).await?;
+    let execution_id = headers.get(HDR_EXECUTION_ID).and_then(|v| v.to_str().ok());
+    let caller = crate::auth::resolve_storage_caller(state, headers, execution_id).await?;
     match &caller {
         CallerAuth::Worker { .. } => Ok(caller),
         CallerAuth::ControlPlane => Err((
@@ -226,7 +214,7 @@ async fn upload_begin(
     Json(req): Json<UploadBeginRequest>,
 ) -> Result<Json<UploadBeginResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     // Assets are sync-managed derived state (content-hash ids minted by the
     // pre-build sync through the control-plane surface); node code writing
     // into the asset scope would fork that ownership, so refuse it loudly.
@@ -295,7 +283,7 @@ async fn upload_parts(
     Json(req): Json<UploadPartsRequest>,
 ) -> Result<Json<UploadPartsResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parts = store
         .reserve_parts(
             &caller,
@@ -316,7 +304,7 @@ async fn upload_part_done(
     Json(req): Json<PartDoneRequest>,
 ) -> Result<Response, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     store.record_part(&caller, &req.key, req.part_number, &req.etag).await.map_err(map_err)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -329,7 +317,7 @@ async fn upload_complete(
     Json(req): Json<UploadCompleteRequest>,
 ) -> Result<Response, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let meta = store.complete_upload(&caller, &req.key).await.map_err(map_err)?;
     let file = crate::runtime_store::meta_to_stored_file(&meta);
     Ok(Json(file.to_value()).into_response())
@@ -342,7 +330,7 @@ async fn upload_resume(
     Json(req): Json<UploadResumeRequest>,
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let (part_size, missing, reserved_bytes) = store
         .resume_upload(&caller, &req.key, state.entitlements.as_ref(), PresignAudience::Internal)
         .await
@@ -358,7 +346,7 @@ async fn upload_abort(
     Json(req): Json<UploadAbortRequest>,
 ) -> Result<Response, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     store.abort_upload(&caller, &req.key).await.map_err(map_err)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -374,7 +362,7 @@ async fn download_url(
     axum::extract::Query(q): axum::extract::Query<DownloadUrlQuery>,
 ) -> Result<Json<DownloadUrlResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &key)?;
     let (meta, url) = store
         .download_url(&parsed, PresignAudience::Internal, q.ttl_secs)
@@ -395,7 +383,7 @@ async fn get_meta(
     headers: HeaderMap,
 ) -> Result<Json<StoredFileMeta>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &key)?;
     Ok(Json(store.meta(&parsed).await.map_err(map_err)?))
 }
@@ -407,7 +395,7 @@ async fn admin_meta(
 ) -> Result<Json<StoredFileMeta>, ApiError> {
     control_plane(&state, &headers).await?;
     let parsed = key::parse_key(&key).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    Ok(Json(store(&state)?.meta(&parsed).await.map_err(map_err)?))
+    Ok(Json(state.runtime_store.meta(&parsed).await.map_err(map_err)?))
 }
 
 async fn delete_file(
@@ -416,7 +404,7 @@ async fn delete_file(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &key)?;
     store.delete(&parsed).await.map_err(map_err)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -435,7 +423,7 @@ async fn list_files(
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<ListFilesResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let scope: StorageScope = serde_json::from_str(&q.scope)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad scope: {e}")))?;
     let prefix = key::prefix_for_list(&caller, &scope).map_err(|e| (StatusCode::FORBIDDEN, e))?;
@@ -452,7 +440,7 @@ async fn find_identity(
     Json(req): Json<weft_core::storage::IdentityLookupRequest>,
 ) -> Result<Json<weft_core::storage::IdentityLookupResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let file = store.find_identity(&caller, &req.scope, &req.identity).await.map_err(map_err)?;
     Ok(Json(weft_core::storage::IdentityLookupResponse { file }))
 }
@@ -463,7 +451,7 @@ async fn keep_file(
     Json(req): Json<weft_core::storage::KeepRequest>,
 ) -> Result<Json<StoredFileMeta>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &req.key)?;
     Ok(Json(store.keep(&parsed, req.ttl).await.map_err(map_err)?))
 }
@@ -471,7 +459,7 @@ async fn keep_file(
 /// `POST /v1/storage/presign`: the link a node body hands out for a stored
 /// file, and the `url` the runtime puts on every file marker before a body
 /// runs. The internet-reachable link when the install serves one (so a
-/// provider can fetch it too), else a URL signed for the cluster's own
+/// provider can fetch it too), else a URL signed for the install's own
 /// address: the node body can fetch that one, nothing outside can.
 async fn presign(
     State(state): State<Arc<BrokerState>>,
@@ -479,7 +467,7 @@ async fn presign(
     Json(req): Json<weft_core::storage::PresignRequest>,
 ) -> Result<Json<PresignResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &req.key)?;
     let url = match public_link_url(&state, store, &parsed, req.ttl_secs, weft_core::storage::LinkReach::Internet).await? {
         Some(url) => url,
@@ -503,7 +491,7 @@ async fn public_link(
     Json(req): Json<weft_core::storage::PresignRequest>,
 ) -> Result<Json<weft_core::storage::PublicLinkResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = wall(&caller, &req.key)?;
     let url = public_link_url(&state, store, &parsed, req.ttl_secs, req.reach).await?;
     Ok(Json(weft_core::storage::PublicLinkResponse { url }))
@@ -531,7 +519,7 @@ async fn public_link_url(
             let token = store.mint_public_link(parsed, ttl_secs).await.map_err(map_err)?;
             Some(format!("{}/public/files/{token}", base.trim_end_matches('/')))
         }
-        LinkRoute::ClusterOnly => None,
+        LinkRoute::InstallOnly => None,
     })
 }
 
@@ -546,9 +534,9 @@ enum LinkRoute<'a> {
     /// A relay link under the internet base.
     Relay(&'a str),
     /// No internet-reachable link exists: a node body gets a link signed
-    /// for the cluster's own address, and an outside consumer gets the
+    /// for the install's own address, and an outside consumer gets the
     /// bytes inline.
-    ClusterOnly,
+    InstallOnly,
 }
 
 /// The base a relay link is minted under for `reach`: the internet
@@ -559,7 +547,7 @@ enum LinkRoute<'a> {
 fn relay_base(state: &BrokerState, reach: weft_core::storage::LinkReach) -> Option<&str> {
     match reach {
         weft_core::storage::LinkReach::Internet => state.internet_base(),
-        weft_core::storage::LinkReach::Caller => state.internet_base().or(state.public_base_url.as_deref()),
+        weft_core::storage::LinkReach::Caller => state.internet_base().or(Some(state.public_base_url.as_str())),
     }
 }
 
@@ -569,7 +557,7 @@ fn link_route(bucket_internet: bool, internet_base: Option<&str>) -> LinkRoute<'
     } else if let Some(base) = internet_base {
         LinkRoute::Relay(base)
     } else {
-        LinkRoute::ClusterOnly
+        LinkRoute::InstallOnly
     }
 }
 
@@ -591,13 +579,13 @@ fn wall(caller: &CallerAuth, key: &str) -> Result<key::ParsedKey, ApiError> {
 // URLs' audience (External: the editor's browser PUTs to the bucket directly).
 
 /// The store-level identity for an editor upload: the dispatcher-vouched
-/// tenant + project, with no execution color (so exec-scoped keys are
+/// tenant + project, with no execution (so exec-scoped keys are
 /// unreachable by construction).
 fn editor_caller(tenant: &str, project: &str) -> CallerAuth {
     CallerAuth::Worker {
         tenant: tenant.to_string(),
         project_id: project.to_string(),
-        color: None,
+        execution_id: None,
         member: None,
     }
 }
@@ -629,7 +617,7 @@ async fn admin_upload_begin(
     Json(req): Json<AdminUploadBeginRequest>,
 ) -> Result<Json<UploadBeginResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     validate_serveable(&req.mime_type, &req.filename)?;
     let caller = editor_caller(&req.tenant, &req.project);
     let begun = store
@@ -667,7 +655,7 @@ async fn admin_asset_references(
     Json(req): Json<Tenanted<weft_core::storage::AssetReferencesRequest>>,
 ) -> Result<Json<weft_core::storage::AssetReferencesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let missing = store(&state)?
+    let missing = state.runtime_store
         .set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys, &req.inner.kept)
         .await.map_err(map_err)?;
     Ok(Json(weft_core::storage::AssetReferencesResponse { missing }))
@@ -679,7 +667,7 @@ async fn admin_upload_parts(
     Json(req): Json<Tenanted<UploadPartsRequest>>,
 ) -> Result<Json<UploadPartsResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
     let parts = store
         .reserve_parts(
@@ -700,7 +688,7 @@ async fn admin_upload_part_done(
     Json(req): Json<Tenanted<PartDoneRequest>>,
 ) -> Result<Response, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
     store
         .record_part(&caller, &req.inner.key, req.inner.part_number, &req.inner.etag)
@@ -715,7 +703,7 @@ async fn admin_upload_complete(
     Json(req): Json<Tenanted<UploadCompleteRequest>>,
 ) -> Result<Response, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
     let meta = store.complete_upload(&caller, &req.inner.key).await.map_err(map_err)?;
     let file = crate::runtime_store::meta_to_stored_file(&meta);
@@ -728,7 +716,7 @@ async fn admin_upload_resume(
     Json(req): Json<Tenanted<UploadResumeRequest>>,
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
     let (part_size, missing, reserved_bytes) = store
         .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), PresignAudience::External)
@@ -743,7 +731,7 @@ async fn admin_upload_abort(
     Json(req): Json<Tenanted<UploadAbortRequest>>,
 ) -> Result<Response, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
     store.abort_upload(&caller, &req.inner.key).await.map_err(map_err)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -760,7 +748,7 @@ async fn admin_tenant_list(
     Json(req): Json<TenantScopeRequest>,
 ) -> Result<Json<ListFilesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let prefix = key::ParsedKey::tenant_prefix(&req.tenant)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let files = store.list(&prefix).await.map_err(map_anyhow)?;
@@ -776,7 +764,7 @@ async fn admin_list_prefix(
     Json(req): Json<ListPrefixRequest>,
 ) -> Result<Json<ListFilesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     key::validate_wipe_prefix(&req.prefix).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let files = store.list(&req.prefix).await.map_err(map_anyhow)?;
     Ok(Json(ListFilesResponse { files }))
@@ -788,7 +776,7 @@ async fn admin_tenant_usage(
     Json(req): Json<TenantScopeRequest>,
 ) -> Result<Json<TenantUsage>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let (file_count, stored_bytes) = store.tenant_usage(&req.tenant).await.map_err(map_anyhow)?;
     Ok(Json(TenantUsage { stored_bytes, file_count }))
 }
@@ -799,7 +787,7 @@ async fn admin_delete_file(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     // The store takes a ParsedKey, so the control-plane's key passes the
     // wall's grammar here too (a key reaching the store is always a real one).
     let parsed = key::parse_key(&key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -812,14 +800,14 @@ async fn admin_delete_file(
 /// forwards here because its egress is locked to the control plane;
 /// the broker is the one service with bucket reach, so it resolves the
 /// token (missing and expired are an identical 404) and streams the
-/// presigned in-cluster fetch through.
+/// presigned internal fetch through.
 async fn admin_relay(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let Some(link) = store
         .resolve_public_link(&token)
         .await
@@ -864,7 +852,7 @@ async fn admin_presign(
     Json(req): Json<weft_core::storage::PresignRequest>,
 ) -> Result<Json<PresignResult>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Read the meta first (name + size) so a missing file is a clean 404 before
     // minting, then presign (which also bumps a kept file's TTL).
@@ -883,7 +871,7 @@ async fn admin_download_link(
     Json(req): Json<weft_core::storage::PresignRequest>,
 ) -> Result<Json<weft_core::storage::DownloadLinkResult>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     let parsed = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Meta first (name + size) so a missing file is a clean 404 before
     // minting, mirroring admin_presign.
@@ -902,7 +890,7 @@ async fn admin_wipe_prefix(
     Json(req): Json<WipePrefixRequest>,
 ) -> Result<Json<WipePrefixResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
+    let store = &state.runtime_store;
     // The wipe prefix must be a scope/tenant boundary (the wall's grammar):
     // never a bare `starts_with` that could reach across tenants or owners.
     key::validate_wipe_prefix(&req.prefix).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -916,8 +904,8 @@ async fn admin_sweep_exec(
     Json(req): Json<SweepExecRequest>,
 ) -> Result<Json<SweepExecResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = store(&state)?;
-    let (swept, lingering) = store.sweep_exec(&req.tenant, &req.color).await.map_err(map_anyhow)?;
+    let store = &state.runtime_store;
+    let (swept, lingering) = store.sweep_exec(&req.tenant, &req.execution_id).await.map_err(map_anyhow)?;
     Ok(Json(SweepExecResponse { swept, lingering }))
 }
 
@@ -947,7 +935,7 @@ mod link_route_tests {
 
     #[test]
     fn unavailable_generated_file_does_not_claim_a_fixed_thirty_day_lifetime() {
-        let (_, message) = map_err(RuntimeStoreError::NotFound("tenant/exec/color/file".into()));
+        let (_, message) = map_err(RuntimeStoreError::NotFound("tenant/exec/execution_id/file".into()));
         assert!(message.contains("keep duration"), "{message}");
         assert!(!message.contains("30 days"), "{message}");
     }
@@ -960,8 +948,8 @@ mod link_route_tests {
         assert_eq!(link_route(true, Some("https://x.example")), LinkRoute::DirectPresign);
         // Private bucket + internet base: relay under the base.
         assert_eq!(link_route(false, Some("https://x.example")), LinkRoute::Relay("https://x.example"));
-        // Neither: no internet link; a node body gets the cluster
+        // Neither: no internet link; a node body gets the install
         // address, an outside consumer the bytes.
-        assert_eq!(link_route(false, None), LinkRoute::ClusterOnly);
+        assert_eq!(link_route(false, None), LinkRoute::InstallOnly);
     }
 }

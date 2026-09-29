@@ -1,59 +1,302 @@
 //! Layer-3 integration tests for the supervisor's ownership loop.
 //!
 //! The ownership loop is the single site that claims + renews this
-//! pod's exclusive project leases. These tests exercise the loop's
-//! broker contract against the in-memory `FakeBroker`:
-//!   - the tick calls `sync_ownership` with THIS pod's name + its
-//!     reported memory pressure (so the broker claims under the right
-//!     identity and gates claiming on real load), and
-//!   - the work loops read the owned set via `owned_projects`.
+//! supervisor's exclusive project leases, and sweeps what the host still
+//! runs for projects that are gone. These tests exercise the loop's
+//! broker and host contract against the in-memory fakes:
+//!   - the tick calls `sync_ownership` with THIS supervisor's instance
+//!     (so the broker claims under the right identity),
+//!   - the work loops read the owned set via `owned_projects`, and
+//!   - a copy whose project is gone is terminated, one whose project
+//!     lives is left alone, and
+//!   - a project's copies are judged and deleted only under its lease:
+//!     one nobody leases is claimed first, and a lease that moves
+//!     mid-sweep stops the deletion.
 //!
-//! The SQL-level exclusivity (two pods never claim one project) lives
-//! in the broker's transactional claim and is exercised by the layer-4
-//! e2e suite against a real Postgres; here we pin the loop's call shape.
+//! The SQL-level exclusivity (two supervisors never claim one project)
+//! lives in the broker's transactional claim and is exercised by its
+//! database suite; here we pin the loop's call shape.
 
 use weft_infra_supervisor::broker_ops::BrokerCall;
 use weft_infra_supervisor::testing::SupervisorTestRig;
-
+use weft_platform_traits::HostCall;
 
 const P1: uuid::Uuid = uuid::Uuid::from_u128(1);
+const GONE: uuid::Uuid = uuid::Uuid::from_u128(9);
 
 #[tokio::test]
-async fn ownership_tick_syncs_under_this_pods_identity_and_pressure() {
+async fn ownership_tick_syncs_under_this_supervisors_identity() {
     let rig = SupervisorTestRig::with_tenant("alice");
-    rig.broker.add_project(P1, "wft-project-alice-p1");
-    rig.mem.set(0.3);
+    rig.broker.add_project(P1);
 
     rig.tick_ownership().await.unwrap();
 
-    // The tick must call sync_ownership with the pod's own name and its
-    // current memory pressure, so the broker claims under the identity
-    // the dispatcher placed (the `supervisor_pod` key) and gates claiming
-    // on real load.
-    let synced = rig.broker.calls().iter().any(|c| matches!(
-        c,
-        BrokerCall::SyncOwnership { pod_name, mem_pressure }
-            if pod_name == "test-pod" && (*mem_pressure - 0.3).abs() < 1e-9
-    ));
-    assert!(synced, "ownership tick must sync_ownership(test-pod, 0.3)");
+    let synced = rig
+        .broker
+        .calls()
+        .iter()
+        .any(|c| matches!(c, BrokerCall::SyncOwnership { instance, .. } if instance == "test-supervisor"));
+    assert!(synced, "ownership tick must sync_ownership(test-supervisor)");
 }
 
 #[tokio::test]
 async fn work_loops_read_owned_projects_not_a_global_list() {
     // Both work loops must scope their work to the owned set (via
-    // owned_projects), never a global all-projects read. Pin that the
-    // health tick goes through owned_projects for THIS pod.
+    // owned_projects), never a global all-projects read.
     let rig = SupervisorTestRig::with_tenant("alice");
-    rig.broker.add_project(P1, "wft-project-alice-p1");
+    rig.broker.add_project(P1);
 
     rig.tick_health().await.unwrap();
 
-    let read_owned = rig.broker.calls().iter().any(|c| matches!(
-        c,
-        BrokerCall::OwnedProjects { pod_name } if pod_name == "test-pod"
-    ));
+    let read_owned = rig
+        .broker
+        .calls()
+        .iter()
+        .any(|c| matches!(c, BrokerCall::OwnedProjects { instance } if instance == "test-supervisor"));
+    assert!(read_owned, "health tick must read owned_projects(test-supervisor), not a global project list");
+}
+
+/// A project removed without waiting for its terminate leaves its copy
+/// running on the host with no row to find it by: the ownership tick
+/// terminates it. A copy of a project that still exists is left alone.
+#[tokio::test]
+async fn a_copy_of_a_gone_project_is_terminated() {
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_project(P1);
+    let copy = |project, instance: &str| weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project,
+        node: "db".into(),
+        instance: instance.into(),
+    };
+    rig.host.set_state(&copy(P1, "live"), "db", weft_platform_traits::UnitRunState::Ready);
+    rig.host.set_state(&copy(GONE, "orphan"), "db", weft_platform_traits::UnitRunState::Ready);
+
+    rig.tick_ownership().await.unwrap();
+
+    let terminated: Vec<String> = rig
+        .host
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            HostCall::Terminate { instance, .. } => Some(instance),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminated, vec!["orphan".to_string()]);
+}
+
+/// A copy terminated with disks its node keeps holds only those disks
+/// and no row. Once the program no longer declares it, it is gone for
+/// good and the tick deletes everything, kept disks included. A kept
+/// copy the program still declares waits for its next start, a copy
+/// still holding a row is the reap's, and another supervisor's project
+/// is not judged here.
+#[tokio::test]
+async fn a_kept_copy_the_program_no_longer_declares_loses_its_kept_disks() {
+    const OTHER: uuid::Uuid = uuid::Uuid::from_u128(2);
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_project(P1);
+    rig.broker.add_project(OTHER);
+    rig.broker.set_project_owned(OTHER, false);
+    let copy = |project, node: &str, instance: &str| weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project,
+        node: node.into(),
+        instance: instance.into(),
+    };
+    for c in [copy(P1, "removed", "i-removed"), copy(P1, "db", "i-db"), copy(OTHER, "removed", "i-other")] {
+        rig.host.set_state(&c, "main", weft_platform_traits::UnitRunState::Ready);
+        weft_platform_traits::InfraHost::terminate(rig.host.as_ref(), &c, &["data".to_string()]).await.unwrap();
+    }
+    rig.host.set_state(&copy(P1, "orphan", "i-orphan"), "main", weft_platform_traits::UnitRunState::Ready);
+    rig.broker.add_infra_node(P1, "orphan", "i-orphan", weft_broker_client::protocol::InfraNodeStatus::Running);
+    rig.broker.undeclare(P1, "removed");
+    rig.broker.undeclare(P1, "orphan");
+    rig.broker.undeclare(OTHER, "removed");
+    let before = rig.host.calls().len();
+
+    rig.tick_ownership().await.unwrap();
+
+    let terminated: Vec<HostCall> = rig.host.calls().into_iter().skip(before).collect();
+    assert_eq!(terminated, vec![HostCall::Terminate { instance: "i-removed".into(), keep: vec![] }]);
+    assert!(rig.host.kept_disks("i-removed").is_empty());
+    assert_eq!(rig.host.kept_disks("i-db"), ["data"], "a declared copy keeps its disks for its next start");
+}
+
+/// One gone copy failing to delete does not stop the sweep: the next
+/// gone copy is still deleted, and the failed one is tried again on the
+/// next tick.
+#[tokio::test]
+async fn a_failed_deletion_does_not_stop_the_sweep() {
+    let rig = SupervisorTestRig::with_tenant("alice");
+    let copy = |instance: &str| weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project: GONE,
+        node: "db".into(),
+        instance: instance.into(),
+    };
+    for instance in ["a-stuck", "b-orphan"] {
+        rig.host.set_state(&copy(instance), "db", weft_platform_traits::UnitRunState::Ready);
+    }
+    rig.host.fail_terminates_of("a-stuck");
+
+    rig.tick_ownership().await.unwrap();
+
+    let held: Vec<String> = weft_platform_traits::InfraHost::copies(rig.host.as_ref())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.instance)
+        .collect();
+    assert_eq!(held, vec!["a-stuck".to_string()], "the orphan is deleted even though the stuck copy failed first");
+}
+
+/// A project a lifecycle command holds is not swept: its apply may be
+/// adopting the very copy the sweep judged gone. The next tick after the
+/// command lets go deletes it.
+#[tokio::test]
+async fn a_project_a_command_holds_is_swept_only_after_it_lets_go() {
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_project(P1);
+    let removed = weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project: P1,
+        node: "removed".into(),
+        instance: "i-removed".into(),
+    };
+    rig.host.set_state(&removed, "main", weft_platform_traits::UnitRunState::Ready);
+    rig.broker.undeclare(P1, "removed");
+
+    let command = rig.state.project_locks.lock(P1).await;
+    rig.tick_ownership().await.unwrap();
     assert!(
-        read_owned,
-        "health tick must read owned_projects(test-pod), not a global project list"
+        !rig.host.calls().iter().any(|c| matches!(c, HostCall::Terminate { .. })),
+        "nothing is judged or deleted while a command holds the project"
+    );
+    drop(command);
+    rig.tick_ownership().await.unwrap();
+
+    assert!(rig.host.calls().contains(&HostCall::Terminate { instance: "i-removed".into(), keep: vec![] }));
+}
+
+/// A project that still exists but declares no infra and has no row left
+/// has no work to own, yet its kept disks sit on the host. The tick
+/// claims its lease because the host holds its copy, and then sweeps
+/// under that lease; before the claim, nothing judges it.
+#[tokio::test]
+async fn an_unleased_projects_copy_is_claimed_then_swept() {
+    const IDLE: uuid::Uuid = uuid::Uuid::from_u128(3);
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_infraless_project(IDLE);
+    let kept = weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project: IDLE,
+        node: "db".into(),
+        instance: "i-kept".into(),
+    };
+    rig.host.set_state(&kept, "main", weft_platform_traits::UnitRunState::Ready);
+    weft_platform_traits::InfraHost::terminate(rig.host.as_ref(), &kept, &["data".to_string()]).await.unwrap();
+
+    let change = rig.tick_ownership().await.unwrap();
+
+    let calls = rig.broker.calls();
+    let synced = calls
+        .iter()
+        .position(|c| matches!(c, BrokerCall::SyncOwnership { held_projects, .. } if held_projects == &vec![IDLE]))
+        .expect("the tick asks for the lease of the project the host holds");
+    let judged = calls
+        .iter()
+        .position(|c| matches!(c, BrokerCall::GoneCopies { project, .. } if *project == IDLE))
+        .expect("the project is judged once leased");
+    assert!(synced < judged, "the lease is claimed before the judgment");
+    assert!(rig.host.calls().contains(&HostCall::Terminate { instance: "i-kept".into(), keep: vec![] }));
+    assert!(rig.host.kept_disks("i-kept").is_empty());
+    assert_eq!(
+        change,
+        Some(weft_infra_supervisor::ownership::OwnershipChange { claimed: vec![IDLE], lost: vec![] }),
+        "the lease over the held project is taken on"
+    );
+    let change = rig.tick_ownership().await.unwrap();
+    assert_eq!(
+        change,
+        Some(weft_infra_supervisor::ownership::OwnershipChange { claimed: vec![], lost: vec![IDLE] }),
+        "with nothing left on the host, the lease is not renewed and the project is lost"
+    );
+}
+
+/// A stop of every copy of `project`, cancelling whatever runs.
+fn stop_of(id: i64, project: uuid::Uuid) -> weft_broker_client::protocol::SupervisorCommandRow {
+    weft_broker_client::protocol::SupervisorCommandRow {
+        id,
+        project_id: project,
+        node_id: None,
+        verb: weft_broker_client::protocol::InfraLifecycleVerb::Stop,
+        running_policy: Some(weft_broker_client::protocol::RunningPolicy::Cancel),
+        spec_json: None,
+        force: false,
+        drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+        copies: weft_core::member::Copies::Shared,
+    }
+}
+
+/// A command waiting on a project is enough to own it: its lease is
+/// never reported lost while the command is pending (the orphan reap's
+/// Terminate removes the last `infra_node` row before it completes), and
+/// once the command completes, the lease lapses.
+#[tokio::test]
+async fn a_project_is_never_lost_while_its_command_is_pending() {
+    const IDLE: uuid::Uuid = uuid::Uuid::from_u128(3);
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_infraless_project(IDLE);
+    rig.broker.enqueue_command(stop_of(1, IDLE));
+    let change = rig.tick_ownership().await.unwrap().expect("the tick takes the project on");
+    assert_eq!(change.claimed, vec![IDLE]);
+
+    assert_eq!(rig.tick_ownership().await.unwrap(), None, "a pending command keeps the lease");
+
+    assert!(rig.tick_lifecycle().await.unwrap(), "the owner runs the command");
+    let change = rig.tick_ownership().await.unwrap().expect("the lease lapses once the command completed");
+    assert_eq!(change.lost, vec![IDLE]);
+}
+
+/// A command on a project with no infra and nothing on the host still
+/// finds an owner, which runs and completes it.
+#[tokio::test]
+async fn a_pending_command_on_a_project_with_nothing_is_claimed_and_run() {
+    const IDLE: uuid::Uuid = uuid::Uuid::from_u128(3);
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_infraless_project(IDLE);
+    rig.broker.enqueue_command(stop_of(1, IDLE));
+
+    rig.tick_ownership().await.unwrap();
+    assert!(rig.tick_lifecycle().await.unwrap(), "the command is claimed and run");
+
+    let completed: Vec<i64> = rig.broker.completed_commands().iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(completed, vec![1]);
+}
+
+/// Another supervisor taking the lease between the judgment and the
+/// deletion (it could be applying the re-added node, adopting the very
+/// disks judged gone) stops the sweep: nothing is deleted.
+#[tokio::test]
+async fn a_sweep_whose_lease_moved_after_judging_deletes_nothing() {
+    let rig = SupervisorTestRig::with_tenant("alice");
+    rig.broker.add_project(P1);
+    let removed = weft_core::infra::NodeRef {
+        tenant: "alice".into(),
+        project: P1,
+        node: "removed".into(),
+        instance: "i-removed".into(),
+    };
+    rig.host.set_state(&removed, "main", weft_platform_traits::UnitRunState::Ready);
+    rig.broker.undeclare(P1, "removed");
+    rig.broker.displace_on_judgment(P1);
+
+    rig.tick_ownership().await.unwrap();
+
+    assert!(
+        !rig.host.calls().iter().any(|c| matches!(c, HostCall::Terminate { .. })),
+        "a copy is deleted only while this supervisor still holds the project's lease"
     );
 }

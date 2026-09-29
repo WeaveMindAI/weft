@@ -62,7 +62,7 @@ We sort tests into four layers, and a test's place tells you which one it is.
    of its I/O. The fakes are hand-rolled, named `Fake*`, and sit behind the
    crate's `test-helpers` feature. We do not use mock libraries, because a
    generated mock hides what the test actually checks.
-4. **End to end.** Real binaries on a real cluster with a real Postgres,
+4. **End to end.** Real binaries on a real install with a real Postgres,
    through `scripts/run-e2e.sh` below.
 
 If you are not sure, the lowest layer that can see the bug is the right one.
@@ -104,8 +104,8 @@ it is picked up automatically; otherwise, for pasted keys, the runner reads
 named, and the other ways to hand a test an account, go and read
 [Live tests](https://weavemindai.github.io/weft/nodes/testing.html#live-tests).
 
-When an end-to-end test fails, its project and any pods it made are left in
-the cluster on purpose so you can debug what happened.
+When an end-to-end test fails, its project and any containers it made are
+left on your install on purpose so you can debug what happened.
 
 If you are setting up the end-to-end suite, the only variables you have to set
 are for the outside services. They are `WEFT_E2E_*`, and they are listed in
@@ -257,7 +257,7 @@ the drafts into the one migration that goes in the PR:
 ./setup.sh --migration add_owner --release
 ```
 
-Releasing also needs your cluster up, since it has to reach the database you
+Releasing also needs your install up, since it has to reach the database you
 have been developing against.
 
 That collapses every draft into one released migration per table group. For
@@ -310,17 +310,23 @@ commit builds, signs and publishes to the stores, recording each store's
 version tag. The full store rules are in the releasing skill
 (`.claude/skills/releasing/SKILL.md`).
 
-## Working on the cluster
+## Working on your install
 
-If the cluster looks wrong, the bug is in the code, a manifest, `setup.sh`, or
-the test toolkit. So never `kubectl apply/delete/edit/scale`, never `DROP` or
-`ALTER` the live database, and never hand-roll a port-forward; if you do, accept that you are risking your local cluster.
+If your install looks wrong, fix the cause in the code, in `setup.sh` or in the
+test toolkit. A `docker rm` or `docker restart` on weft's containers, or a
+`DROP` or `ALTER` on the live database, hides the bug and can break your
+install, so only reach for one if you accept that risk.
 
 Fix the source instead, then check with a plain `./setup.sh`. If that does not
 pick your change up, that is a change-detection bug in the script: fix the
 script until a fresh run gets there on its own.
 
-As a last resort, you can `./setup.sh --uninstall --purge` and `./setup.sh` to fully reinstall but know that it will wipe your listeners, infra, and running workers. Before you submit a PR you must install the previous version of weft that you are merging into and make sure that running your `./setup.sh` correctly upgrades the version without any issues.
+As a last resort, `./setup.sh --uninstall --purge` followed by `./setup.sh`
+reinstalls from scratch, but it deletes everything the install held: your
+projects, their infrastructure and data, your stored connections, and every
+image weft built, so the next install builds everything again.
+
+Before you submit a PR you must install the previous version of weft that you are merging into and make sure that running your `./setup.sh` correctly upgrades the version without any issues.
 
 ## Documentation
 

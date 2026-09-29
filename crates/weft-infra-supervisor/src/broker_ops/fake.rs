@@ -28,34 +28,33 @@ use weft_broker_client::protocol::{
 
 use super::BrokerSupervisorOps;
 
-/// A `UnitRuntime` at the given status with default windows +
-/// ScaleToZero. Seeds the fake's per-unit roster in tests.
+/// A `UnitRuntime` at the given status with default windows + Stop. Seeds the fake's per-unit roster in tests.
 fn unit_runtime(
     status: weft_broker_client::protocol::InfraNodeStatus,
 ) -> weft_broker_client::protocol::UnitRuntime {
     weft_broker_client::protocol::UnitRuntime {
         status,
-        stop_behavior: weft_core::StopBehavior::ScaleToZero,
+        stop_behavior: weft_core::StopBehavior::Stop,
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
         image_refs: Default::default(),
-        watched: true,
-        scaled_to: None,
     }
 }
 
 /// One recorded broker call. Used for ordering / argument
 /// assertions in tests.
-// No `Eq`: `SyncOwnership` carries an `f64` mem_pressure (f64 is not
-// `Eq`). `PartialEq` is enough for the `matches!`/`==` the tests use.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrokerCall {
     SyncOwnership {
-        pod_name: String,
-        mem_pressure: f64,
+        instance: String,
+        held_projects: Vec<uuid::Uuid>,
     },
     OwnedProjects {
-        pod_name: String,
+        instance: String,
+    },
+    GoneCopies {
+        project: uuid::Uuid,
+        instances: Vec<String>,
     },
     InfraNodes {
         project_id: uuid::Uuid,
@@ -64,7 +63,7 @@ pub enum BrokerCall {
         project_id: uuid::Uuid,
     },
     ClaimCommand {
-        claimer_pod: String,
+        claimer: String,
         busy_projects: Vec<uuid::Uuid>,
     },
     EventRecord {
@@ -83,13 +82,6 @@ pub enum BrokerCall {
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<String>,
-    },
-    SetScaled {
-        project_id: uuid::Uuid,
-        node_id: String,
-        member: Option<weft_core::member::MemberId>,
-        unit: String,
-        replicas: u32,
     },
     RemoveNode {
         project_id: uuid::Uuid,
@@ -118,8 +110,7 @@ pub enum BrokerCall {
         node_id: String,
         member: Option<weft_core::member::MemberId>,
         instance_id: String,
-        namespace: String,
-        preserve_pvcs: Vec<String>,
+        keep_disks: Vec<String>,
     },
     SetApplied {
         command_id: i64,
@@ -129,8 +120,7 @@ pub enum BrokerCall {
         instance_id: String,
         applied_spec_hash: String,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
-        namespace: String,
-        preserve_pvcs: Vec<String>,
+        keep_disks: Vec<String>,
     },
     ProjectImageTags {
         project_id: uuid::Uuid,
@@ -218,13 +208,27 @@ struct Inner {
     /// the project's commands.
     owners: HashMap<uuid::Uuid, Owner>,
 
-    /// Projects whose lease moves to another pod the moment one of
+    /// Projects whose lease moves to another supervisor the moment one of
     /// their commands is claimed: models ownership moving mid-command.
     displaced_on_claim: std::collections::HashSet<uuid::Uuid>,
+
+    /// Projects whose lease moves to another supervisor right after a
+    /// `gone_copies` judges them for this one: models ownership moving
+    /// between the sweep's judgment and its deletion.
+    displaced_on_judgment: std::collections::HashSet<uuid::Uuid>,
+
+    /// Projects that exist but have no infra to manage and no
+    /// `infra_node` row: `ownable_project` only while the host holds
+    /// their copies or a command waits on them.
+    infraless: std::collections::HashSet<uuid::Uuid>,
 
     /// Projects whose `running_count` answers only once the gate opens,
     /// so a test can hold a `wait`-policy command mid-drain.
     running_count_gates: HashMap<uuid::Uuid, Arc<tokio::sync::Semaphore>>,
+
+    /// Places (project, node) the program no longer declares, any copy
+    /// of them. Absent = declared (the seeded default).
+    undeclared: std::collections::HashSet<(uuid::Uuid, String)>,
 
     calls: Vec<BrokerCall>,
 }
@@ -234,7 +238,7 @@ struct Inner {
 enum Owner {
     /// This supervisor.
     Us,
-    /// Another supervisor pod.
+    /// Another supervisor.
     Other,
     /// Nobody: never claimed, or the lease lapsed. The next ownership
     /// tick takes it.
@@ -259,6 +263,15 @@ impl Inner {
             .iter()
             .find(|c| !self.completed(c.id) && self.owns(c.project_id) && !busy.contains(&c.project_id))
             .cloned()
+    }
+
+    /// Whether a supervisor may own `project_id`, as the broker's
+    /// `ownable_project` answers it: infra to manage, copies on the host
+    /// (`held`), or an uncompleted command waiting on it.
+    fn ownable(&self, project_id: uuid::Uuid, held: &[uuid::Uuid]) -> bool {
+        !self.infraless.contains(&project_id)
+            || held.contains(&project_id)
+            || self.commands.iter().any(|c| c.project_id == project_id && !self.completed(c.id))
     }
 
     /// Whether an uncompleted command waits on a project nobody holds.
@@ -289,12 +302,8 @@ impl FakeBroker {
 
     // ---------- seeding ----------
 
-    pub fn add_project(&self, project_id: uuid::Uuid, project_namespace: &str) {
-        self.add_project_with_status(
-            project_id,
-            project_namespace,
-            weft_broker_client::protocol::ProjectStatus::Active,
-        )
+    pub fn add_project(&self, project_id: uuid::Uuid) {
+        self.add_project_with_status(project_id, weft_broker_client::protocol::ProjectStatus::Active)
     }
 
     /// Same as `add_project` but with an explicit status. Used by
@@ -302,7 +311,6 @@ impl FakeBroker {
     pub fn add_project_with_status(
         &self,
         project_id: uuid::Uuid,
-        project_namespace: &str,
         status: weft_broker_client::protocol::ProjectStatus,
     ) {
         let mut inner = self.inner.lock();
@@ -312,11 +320,26 @@ impl FakeBroker {
             SupervisorProject {
                 project_id,
                 tenant_id,
-                project_namespace: project_namespace.to_string(),
                 status,
                 health_parked: false,
             },
         );
+    }
+
+    /// Seed a project whose program declares no infra and that has no
+    /// `infra_node` row left, owned by nobody: only a host holding its
+    /// copies, or a command waiting on it, gets it claimed.
+    pub fn add_infraless_project(&self, project_id: uuid::Uuid) {
+        self.add_project_with_status(project_id, weft_broker_client::protocol::ProjectStatus::Inactive);
+        let mut inner = self.inner.lock();
+        inner.infraless.insert(project_id);
+        inner.owners.insert(project_id, Owner::Nobody);
+    }
+
+    /// Move `project_id`'s lease to another supervisor right after the
+    /// next `gone_copies` judges it for this one.
+    pub fn displace_on_judgment(&self, project_id: uuid::Uuid) {
+        self.inner.lock().displaced_on_judgment.insert(project_id);
     }
 
     /// Flip `health_parked` on a seeded project. Lets a test
@@ -398,8 +421,13 @@ impl FakeBroker {
                 status,
                 applied_spec_hash,
                 applied_at_unix: None,
-                addresses: weft_broker_client::protocol::AppliedEndpoints { urls: endpoints, public_paths: BTreeMap::new() },
-                preserve_pvcs: Vec::new(),
+                addresses: weft_broker_client::protocol::AppliedEndpoints {
+                    install_urls: endpoints.clone(),
+                    urls: endpoints,
+                    public_paths: BTreeMap::new(),
+                    doors: BTreeMap::new(),
+                },
+                keep_disks: Vec::new(),
                 units,
                 member: None,
             },
@@ -427,28 +455,35 @@ impl FakeBroker {
                 applied_spec_hash: None,
                 applied_at_unix: None,
                 addresses: Default::default(),
-                preserve_pvcs: Vec::new(),
+                keep_disks: Vec::new(),
                 units,
                 member: Some(member.clone()),
             },
         );
     }
 
-    /// The PVC list a seeded copy recorded at its apply (what terminate,
-    /// and a Fresh apply finishing a failed terminate, honor).
-    pub fn set_preserve_pvcs(
+    /// The program no longer declares `node` of `project` (it was
+    /// removed from the source): what `gone_copies` judges row-less
+    /// copies against.
+    pub fn undeclare(&self, project_id: uuid::Uuid, node_id: &str) {
+        self.inner.lock().undeclared.insert((project_id, node_id.to_string()));
+    }
+
+    /// The disks a seeded copy recorded at its apply (what terminate,
+    /// and a Fresh apply finishing a failed terminate, keep).
+    pub fn set_keep_disks(
         &self,
         project_id: uuid::Uuid,
         node_id: &str,
         member: Option<&weft_core::member::MemberId>,
-        preserve_pvcs: Vec<String>,
+        keep_disks: Vec<String>,
     ) {
         let mut inner = self.inner.lock();
         let node = inner
             .infra_nodes
             .get_mut(&copy_key(project_id, node_id, member))
-            .expect("set_preserve_pvcs on a seeded row");
-        node.preserve_pvcs = preserve_pvcs;
+            .expect("set_keep_disks on a seeded row");
+        node.keep_disks = keep_disks;
     }
 
     pub fn set_health_protocols(&self, project_id: uuid::Uuid, protocols: serde_json::Value) {
@@ -465,7 +500,7 @@ impl FakeBroker {
         self.issued.notify_waiters();
     }
 
-    /// Simulate ownership of `project_id` moving to another pod (`false`)
+    /// Simulate ownership of `project_id` moving to another supervisor (`false`)
     /// or back to this supervisor (`true`). With `false`, every
     /// ownership-gated write for the project returns `Displaced`,
     /// mirroring the broker's `infra_owner` gate, and none of its
@@ -483,7 +518,7 @@ impl FakeBroker {
         self.inner.lock().owners.insert(project_id, Owner::Nobody);
     }
 
-    /// Move `project_id`'s lease to another pod the moment one of its
+    /// Move `project_id`'s lease to another supervisor the moment one of its
     /// commands is claimed: ownership moving mid-command.
     pub fn displace_on_claim(&self, project_id: uuid::Uuid) {
         self.inner.lock().displaced_on_claim.insert(project_id);
@@ -521,18 +556,6 @@ impl FakeBroker {
         commands: Vec<weft_broker_client::protocol::InFlightCommand>,
     ) {
         self.inner.lock().infra_commands_in_flight.insert(project_id, commands);
-    }
-
-    pub fn set_image_tags(
-        &self,
-        project_id: uuid::Uuid,
-        node_id: &str,
-        tags: HashMap<String, String>,
-    ) {
-        self.inner
-            .lock()
-            .image_tags
-            .insert((project_id, node_id.to_string()), tags);
     }
 
     // ---------- introspection ----------
@@ -658,41 +681,84 @@ impl Default for FakeBroker {
 
 #[async_trait]
 impl BrokerSupervisorOps for FakeBroker {
-    async fn sync_ownership(
-        &self,
-        pod_name: &str,
-        mem_pressure: f64,
-    ) -> Result<SupervisorSyncOwnershipResponse> {
-        // A single supervisor: it takes every project nobody holds and
-        // keeps what it owns (multi-pod partitioning and the saturation
-        // gate are covered by the broker's SQL-level tests).
+    async fn sync_ownership(&self, instance: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
+        // A single supervisor: it takes every project nobody holds that
+        // it may own (`ownable`) and renews what it owns while it may
+        // still own it; a lease it stops renewing lapses (at once here,
+        // after the lease time on the broker). Partitioning between
+        // supervisors is covered by the broker's SQL-level tests. The
+        // owned set is every lease it holds, as the broker's is.
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::SyncOwnership {
-            pod_name: pod_name.to_string(),
-            mem_pressure,
+            instance: instance.to_string(),
+            held_projects: held_projects.to_vec(),
         });
-        let mut claimed: Vec<uuid::Uuid> = inner
+        let lapsed: Vec<uuid::Uuid> = inner
+            .projects
+            .keys()
+            .filter(|id| inner.owns(**id) && !inner.ownable(**id, held_projects))
+            .copied()
+            .collect();
+        for id in lapsed {
+            inner.owners.insert(id, Owner::Nobody);
+        }
+        let mut taken: Vec<uuid::Uuid> = inner
             .owners
             .iter()
-            .filter(|(_, owner)| **owner == Owner::Nobody)
+            .filter(|(id, owner)| **owner == Owner::Nobody && inner.ownable(**id, held_projects))
             .map(|(id, _)| *id)
             .collect();
-        claimed.sort_unstable();
-        for id in &claimed {
+        taken.sort_unstable();
+        for id in &taken {
             inner.owners.insert(*id, Owner::Us);
         }
+        let claimed = taken.into_iter().filter(|id| inner.projects.contains_key(id)).collect();
         let owned = inner.projects.values().filter(|p| inner.owns(p.project_id)).cloned().collect();
         Ok(SupervisorSyncOwnershipResponse { owned, claimed })
     }
 
-    async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>> {
+    async fn owned_projects(&self, instance: &str) -> Result<Vec<SupervisorProject>> {
         let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::OwnedProjects {
-            pod_name: pod_name.to_string(),
-        });
+        inner.calls.push(BrokerCall::OwnedProjects { instance: instance.to_string() });
         // A project whose ownership moved away is no longer this
-        // pod's, which is what the broker's lease query answers too.
+        // supervisor's, which is what the broker's lease query answers too.
         Ok(inner.projects.values().filter(|p| inner.owns(p.project_id)).cloned().collect())
+    }
+
+    async fn gone_copies(
+        &self,
+        _instance: &str,
+        project: uuid::Uuid,
+        copies: &[weft_core::infra::NodeRef],
+    ) -> Result<Option<Vec<String>>> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(BrokerCall::GoneCopies {
+            project,
+            instances: copies.iter().map(|c| c.instance.clone()).collect(),
+        });
+        assert!(copies.iter().all(|c| c.project == project), "gone_copies is asked about one project at a time");
+        // The broker's judgment: a removed project's copies are all gone;
+        // an existing project's are judged only for its owner (None
+        // otherwise, the broker's 410), and gone when no row holds the
+        // copy and the program no longer declares its place.
+        if !inner.projects.contains_key(&project) {
+            return Ok(Some(copies.iter().map(|c| c.instance.clone()).collect()));
+        }
+        if !inner.owns(project) {
+            return Ok(None);
+        }
+        let gone = copies
+            .iter()
+            .filter(|c| {
+                !inner.infra_nodes.values().any(|n| n.instance_id == c.instance)
+                    && (inner.infraless.contains(&project) || inner.undeclared.contains(&(project, c.node.clone())))
+            })
+            .map(|c| c.instance.clone())
+            .collect();
+        if inner.displaced_on_judgment.remove(&project) {
+            inner.owners.insert(project, Owner::Other);
+        }
+        Ok(Some(gone))
     }
 
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
@@ -725,16 +791,16 @@ impl BrokerSupervisorOps for FakeBroker {
 
     /// The broker's held claim: the next command, else a hold (on the
     /// tokio clock) until one is issued or `wait` ends. A wake that
-    /// finds nothing for this pod answers `UnownedWork` when a command
+    /// finds nothing for this supervisor answers `UnownedWork` when a command
     /// waits on a project nobody holds, as the broker does after a wake.
     async fn claim_command(
         &self,
-        claimer_pod: &str,
+        claimer: &str,
         busy_projects: &[uuid::Uuid],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim> {
         self.inner.lock().calls.push(BrokerCall::ClaimCommand {
-            claimer_pod: claimer_pod.to_string(),
+            claimer: claimer.to_string(),
             busy_projects: busy_projects.to_vec(),
         });
         let deadline = tokio::time::Instant::now() + wait;
@@ -787,7 +853,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_status(
         &self,
-        _pod_name: &str,
+        _instance: &str,
         command_id: Option<i64>,
         project_id: uuid::Uuid,
         node_id: &str,
@@ -822,7 +888,7 @@ impl BrokerSupervisorOps for FakeBroker {
             // status to the value directly (so a unit-less roster still
             // takes a Failed / Terminating stamp). A per-unit stamp for
             // a unit NOT in the roster is Gone, exactly like prod's
-            // fence (`units_json ? $1` matches no row while the pod
+            // fence (`units_json ? $1` matches no row while the supervisor
             // still owns the project): the old silent no-op here let a
             // caller bug pass tests.
             match unit {
@@ -851,43 +917,9 @@ impl BrokerSupervisorOps for FakeBroker {
         }
     }
 
-    async fn set_scaled(
-        &self,
-        _pod_name: &str,
-        project_id: uuid::Uuid,
-        node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        unit: &str,
-        replicas: u32,
-    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetScaledResponse>> {
-        let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::SetScaled {
-            project_id,
-            node_id: node_id.to_string(),
-            member: member.cloned(),
-            unit: unit.to_string(),
-            replicas,
-        });
-        if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Displaced);
-        }
-        // Like prod's fence: no row, or a unit outside its roster, is Gone.
-        let Some(runtime) = inner
-            .infra_nodes
-            .get_mut(&copy_key(project_id, node_id, member))
-            .and_then(|node| node.units.get_mut(unit))
-        else {
-            return Ok(weft_broker_client::WriteOutcome::Gone);
-        };
-        runtime.scaled_to = Some(replicas);
-        Ok(weft_broker_client::WriteOutcome::Applied(
-            weft_broker_client::protocol::SupervisorSetScaledResponse {},
-        ))
-    }
-
     async fn remove_node(
         &self,
-        _pod_name: &str,
+        _instance: &str,
         project_id: uuid::Uuid,
         node_id: &str,
         member: Option<&weft_core::member::MemberId>,
@@ -917,7 +949,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn command_complete(
         &self,
-        _pod_name: &str,
+        _instance: &str,
         command_id: i64,
         error: Option<&str>,
         cancelled: bool,
@@ -928,7 +960,7 @@ impl BrokerSupervisorOps for FakeBroker {
             error: error.map(|s| s.to_string()),
             cancelled,
         });
-        // Ownership-gated, like the broker: if this pod lost ownership of
+        // Ownership-gated, like the broker: if this supervisor lost ownership of
         // the command's project, completion is Displaced and the command
         // stays uncompleted for the new owner to finish.
         if let Some(project_id) = inner.claimed_command_project.get(&command_id).cloned() {
@@ -986,14 +1018,13 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_provisioning(
         &self,
-        _pod_name: &str,
+        _instance: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
         member: Option<&weft_core::member::MemberId>,
         instance_id: &str,
-        namespace: &str,
-        preserve_pvcs: Vec<String>,
+        keep_disks: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>> {
         let mut inner = self.inner.lock();
@@ -1003,8 +1034,7 @@ impl BrokerSupervisorOps for FakeBroker {
             node_id: node_id.to_string(),
             member: member.cloned(),
             instance_id: instance_id.to_string(),
-            namespace: namespace.to_string(),
-            preserve_pvcs: preserve_pvcs.clone(),
+            keep_disks: keep_disks.clone(),
         });
         if !inner.owns(project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
@@ -1026,7 +1056,7 @@ impl BrokerSupervisorOps for FakeBroker {
                 applied_spec_hash: None,
                 applied_at_unix: None,
                 addresses: Default::default(),
-                preserve_pvcs,
+                keep_disks,
                 units,
                 member: member.cloned(),
             },
@@ -1038,7 +1068,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_applied(
         &self,
-        _pod_name: &str,
+        _instance: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
@@ -1046,8 +1076,7 @@ impl BrokerSupervisorOps for FakeBroker {
         instance_id: &str,
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
-        namespace: &str,
-        preserve_pvcs: Vec<String>,
+        keep_disks: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>> {
         let mut inner = self.inner.lock();
@@ -1059,8 +1088,7 @@ impl BrokerSupervisorOps for FakeBroker {
             instance_id: instance_id.to_string(),
             applied_spec_hash: applied_spec_hash.to_string(),
             addresses: addresses.clone(),
-            namespace: namespace.to_string(),
-            preserve_pvcs: preserve_pvcs.clone(),
+            keep_disks: keep_disks.clone(),
         });
         if !inner.owns(project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
@@ -1084,7 +1112,7 @@ impl BrokerSupervisorOps for FakeBroker {
                 // settled copy seeds one.
                 applied_at_unix: None,
                 addresses,
-                preserve_pvcs,
+                keep_disks,
                 units,
                 member: member.cloned(),
             },
@@ -1134,26 +1162,21 @@ mod tests {
     #[tokio::test]
     async fn owned_projects_returns_seeded() {
         let b = FakeBroker::new("alice");
-        b.add_project(P1, "ns1");
-        let projects = b.owned_projects("sup-pod-1").await.unwrap();
+        b.add_project(P1);
+        let projects = b.owned_projects("sup-1").await.unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].project_id, P1);
         assert_eq!(projects[0].tenant_id, "alice");
-        assert_eq!(projects[0].project_namespace, "ns1");
     }
 
     #[tokio::test]
     async fn sync_ownership_records_call_and_returns_seeded() {
         let b = FakeBroker::new("alice");
-        b.add_project(P1, "ns1");
-        let synced = b.sync_ownership("sup-pod-1", 0.42).await.unwrap();
+        b.add_project(P1);
+        let synced = b.sync_ownership("sup-1", &[]).await.unwrap();
         assert_eq!(synced.owned.len(), 1);
         assert!(synced.claimed.is_empty(), "a seeded project is already owned");
-        assert!(b.calls().iter().any(|c| matches!(
-            c,
-            BrokerCall::SyncOwnership { pod_name, mem_pressure }
-                if pod_name == "sup-pod-1" && (*mem_pressure - 0.42).abs() < 1e-9
-        )));
+        assert!(b.calls().iter().any(|c| matches!(c, BrokerCall::SyncOwnership { instance, .. } if instance == "sup-1")));
     }
 
     #[tokio::test]
@@ -1166,7 +1189,7 @@ mod tests {
             weft_broker_client::protocol::InfraNodeStatus::Provisioning,
         );
         b.set_status(
-            "sup-pod-1",
+            "sup-1",
             None,
             P1,
             "n1",
@@ -1194,7 +1217,7 @@ mod tests {
             "inst1",
             weft_broker_client::protocol::InfraNodeStatus::Running,
         );
-        let outcome = b.remove_node("sup-pod-1", P1, "n1", None, 1).await.unwrap();
+        let outcome = b.remove_node("sup-1", P1, "n1", None, 1).await.unwrap();
         assert!(matches!(
             outcome,
             weft_broker_client::WriteOutcome::Applied(
@@ -1219,7 +1242,7 @@ mod tests {
     }
 
     async fn claim(b: &FakeBroker, busy: &[uuid::Uuid]) -> SupervisorClaim {
-        b.claim_command("pod1", busy, std::time::Duration::ZERO).await.unwrap()
+        b.claim_command("sup-1", busy, std::time::Duration::ZERO).await.unwrap()
     }
 
     #[tokio::test]
@@ -1229,7 +1252,7 @@ mod tests {
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Command(c) if c.id == 1));
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Command(c) if c.id == 1));
         assert!(matches!(claim(&b, &[P1]).await, SupervisorClaim::Nothing), "a busy project's command waits");
-        b.command_complete("pod1", 1, None, false).await.unwrap();
+        b.command_complete("sup-1", 1, None, false).await.unwrap();
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Nothing));
     }
 
@@ -1246,14 +1269,14 @@ mod tests {
         let b = FakeBroker::new("alice");
         b.set_project_unowned(P1);
         let wait = std::time::Duration::from_secs(25);
-        let held = b.claim_command("pod1", &[], wait);
+        let held = b.claim_command("sup-1", &[], wait);
         tokio::pin!(held);
         assert!(futures::poll!(held.as_mut()).is_pending(), "nothing to hand out: the claim holds");
         b.enqueue_command(stop(1, P1));
         assert!(matches!(held.await.unwrap(), SupervisorClaim::UnownedWork));
         // Without a wake the hold ends on its own, answering Nothing.
         assert!(matches!(
-            b.claim_command("pod1", &[], wait).await.unwrap(),
+            b.claim_command("sup-1", &[], wait).await.unwrap(),
             SupervisorClaim::Nothing
         ));
     }
@@ -1266,11 +1289,7 @@ mod tests {
             Some("n1"),
             None,
             weft_broker_client::protocol::InfraEvent::Flaky(
-                weft_broker_client::protocol::FlakyPayload {
-                    desired: 1,
-                    ready: 0,
-                    reason: None,
-                },
+                weft_broker_client::protocol::FlakyPayload { reason: "unit 'a' is not ready: exit 1".into() },
             ),
         )
         .await

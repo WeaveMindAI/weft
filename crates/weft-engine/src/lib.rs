@@ -1,8 +1,9 @@
-//! Weft execution engine, linked into each compiled project binary.
-//! Connects to the broker, folds the journal, drives one execution
-//! to completion, writes journal events through the broker. Its
-//! control-plane round-trips (`await_signal`, `register_signal`)
-//! flow through the dispatcher's task queue (also via the broker).
+//! Weft execution engine, linked into each compiled project binary. The
+//! binary serves HTTP (`worker`): weft calls it per execution, and it folds
+//! the journal, drives the execution to its end, and writes journal events
+//! through the broker. Its control-plane round-trips (`await_signal`,
+//! `register_signal`) flow through the dispatcher's task queue (also via
+//! the broker).
 
 pub(crate) mod caller_conn;
 pub(crate) mod context;
@@ -12,7 +13,7 @@ pub(crate) mod metering;
 pub(crate) mod socket;
 pub(crate) mod stream_runtime;
 pub(crate) mod wait_tracker;
-pub mod run_pod;
+pub mod worker;
 pub mod storage;
 // The node-test rig + runner. Feature-gated so ONLY the emitted
 // per-package test crate compiles them; a worker binary carries no
@@ -23,7 +24,8 @@ pub mod test_rig;
 pub mod test_runner;
 
 pub use context::EngineClients;
-pub use run_pod::run_pod;
+pub use weft_platform_traits::identity::mint_instance_id;
+pub use worker::{identity_from_env, run_long, serve, RunAnswer, WorkerConfig, WorkerDoor};
 pub use storage::{WorkerStorage, WorkerStorageOps};
 
 /// Wall-clock seconds since the UNIX epoch, for `at_unix` event

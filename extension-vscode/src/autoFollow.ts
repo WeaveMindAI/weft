@@ -50,7 +50,7 @@ const memoryKey = (projectId: string) => `weft.follow.jumpsToNewRuns.${projectId
 
 export class AutoFollowController {
   private mode: FollowMode = 'following';
-  private color: string | undefined;
+  private executionId: string | undefined;
   private projectId: string | undefined;
   // Runs that started while not following; newest last so catching up
   // can take the most recent. The pending COUNT shown in the chip is
@@ -74,18 +74,18 @@ export class AutoFollowController {
   setProject(projectId: string): void {
     this.projectId = projectId;
     this.mode = this.memory.get(memoryKey(projectId)) === false ? 'off' : 'following';
-    this.color = undefined;
+    this.executionId = undefined;
     this.pendingQueue = [];
     this.follower.stop();
     this.emitStatus();
   }
 
   /** The execution the graph is currently streaming, if any. The ONE
-   *  place that answers "which color is on screen": consumers (e.g.
+   *  place that answers "which execution is on screen": consumers (e.g.
    *  the sidebar's delete action) read it here instead of shadowing
    *  it, since every follow path updates it. */
-  currentColor(): string | undefined {
-    return this.color;
+  currentExecutionId(): string | undefined {
+    return this.executionId;
   }
 
   /** The person picked a mode on the toggle, or clicked the "new runs"
@@ -107,7 +107,7 @@ export class AutoFollowController {
       case 'locked':
         // Locking holds the run on screen; with none there is nothing
         // to hold (the toggle disables the choice).
-        if (!this.color) return;
+        if (!this.executionId) return;
         this.enter('locked');
         break;
       case 'off':
@@ -119,26 +119,26 @@ export class AutoFollowController {
   }
 
   /** The person started something from the editor: Run, Activate, or
-   *  Infra Start. We know the color the dispatcher handed back (Run)
-   *  or we don't (Activate spawns an internal exec whose color we
+   *  Infra Start. We know the execution the dispatcher handed back (Run)
+   *  or we don't (Activate spawns an internal exec whose execution we
    *  learn via SSE). In the latter case the caller passes `undefined`
    *  and we pick up the next ExecutionStarted. */
-  followStartedByUser(color: string | undefined): void {
-    console.log(`[weft/autoFollow] followStartedByUser(${color}): mode=${this.mode} color=${this.color}`);
+  followStartedByUser(executionId: string | undefined): void {
+    console.log(`[weft/autoFollow] followStartedByUser(${executionId}): mode=${this.mode} executionId=${this.executionId}`);
     this.enter('following');
     // Race window: the dispatcher's /run response arrives on the CLI's
     // HTTP path AND the same ExecutionStarted is broadcast on the
     // project SSE. Whichever arrives first starts the replay; two
     // concurrent replays would double-deliver journaled events to the
     // webview as the journal fills mid-execution.
-    if (color && this.color !== color) this.show(color);
+    if (executionId && this.executionId !== executionId) this.show(executionId);
     this.emitStatus();
   }
 
   /** "View in Graph" on a past run: lock onto it. */
-  lockTo(color: string): void {
+  lockTo(executionId: string): void {
     this.enter('locked');
-    this.show(color);
+    this.show(executionId);
     this.emitStatus();
   }
 
@@ -155,9 +155,9 @@ export class AutoFollowController {
    *  down are gone, so the extension hands us the freshly fetched
    *  newest RUNNING execution (if any) to catch up on. It is treated
    *  exactly as if its ExecutionStarted had arrived live. */
-  handleReconnect(runningColor: string | undefined): void {
-    console.log(`[weft/autoFollow] reconnect resync: running=${runningColor} mode=${this.mode} color=${this.color}`);
-    if (runningColor) this.runStarted(runningColor);
+  handleReconnect(runningExecutionId: string | undefined): void {
+    console.log(`[weft/autoFollow] reconnect resync: running=${runningExecutionId} mode=${this.mode} executionId=${this.executionId}`);
+    if (runningExecutionId) this.runStarted(runningExecutionId);
   }
 
   /** Every parsed event from the shared project stream. */
@@ -196,24 +196,24 @@ export class AutoFollowController {
     }
 
     if (ev.kind !== 'execution_started') return;
-    console.log(`[weft/autoFollow] execution_started ${ev.color}: mode=${this.mode} color=${this.color}`);
-    this.runStarted(ev.color);
+    console.log(`[weft/autoFollow] execution_started ${ev.execution_id}: mode=${this.mode} executionId=${this.executionId}`);
+    this.runStarted(ev.execution_id);
   }
 
   /** A run started (live, or found running on reconnect). Following
    *  shows it; locked and off count it. */
-  private runStarted(color: string): void {
+  private runStarted(executionId: string): void {
     // Already on screen: the run command followed it from its own
     // reply and the stream is echoing the same start. A second replay
     // would re-apply the journal so far and double-render pulses.
-    if (this.color === color) return;
+    if (this.executionId === executionId) return;
     if (this.mode === 'following') {
-      this.show(color);
+      this.show(executionId);
       this.emitStatus();
-    } else if (!this.pendingQueue.includes(color)) {
+    } else if (!this.pendingQueue.includes(executionId)) {
       // Deduplicated, so a reconnect resync and the backlog's own
       // execution_started for the same run never count twice.
-      this.pendingQueue.push(color);
+      this.pendingQueue.push(executionId);
       this.emitStatus();
     }
   }
@@ -227,16 +227,16 @@ export class AutoFollowController {
     if (this.projectId) void this.memory.update(memoryKey(this.projectId), mode === 'following');
   }
 
-  /** Put `color` on the canvas. Replay, not follow: the run may have
+  /** Put `executionId` on the canvas. Replay, not follow: the run may have
    *  emitted frames already or finished, and replay paints the
    *  journaled events before continuing live. */
-  private show(color: string): void {
-    this.color = color;
-    void this.follower.replay(color);
+  private show(executionId: string): void {
+    this.executionId = executionId;
+    void this.follower.replay(executionId);
   }
 
   private clearCanvas(): void {
-    this.color = undefined;
+    this.executionId = undefined;
     this.follower.stop();
     this.post({ kind: 'execCleared' });
   }
@@ -247,7 +247,7 @@ export class AutoFollowController {
   emitStatus(): void {
     const status: FollowStatus = {
       mode: this.mode,
-      color: this.color,
+      executionId: this.executionId,
       pendingCount: this.pendingQueue.length,
     };
     this.post({ kind: 'followStatus', status });

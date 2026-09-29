@@ -9,8 +9,8 @@ Two jobs, one script, chosen by argv:
          password it was created with.
 
   serve  Run beside Postgres. Answers the password to whoever asks
-         over the cluster-internal network, then stops answering once
-         the asker proves it stored it, by sending the password back.
+         over the network, then stops answering once the asker
+         proves it stored it, by sending the password back.
          Proof, not a bare say-so: otherwise anything able to reach
          this port could retire a password nobody holds, and the
          database would be locked away with no way back.
@@ -68,9 +68,9 @@ def mint() -> None:
     # Made on EVERY boot, before any other container starts, because
     # the container that serves the password is given this directory
     # alone rather than the whole disk. A directory that already
-    # exists is handed over as it is; one the kubelet has to create
-    # can land owned by root, locking out the container that must
-    # write in it.
+    # exists is handed over as it is; one the container runtime has to
+    # create can land owned by root, locking out the container that
+    # must write in it.
     os.makedirs(SECRET_DIR, mode=0o750, exist_ok=True)
     if os.path.exists(PASSWORD_FILE):
         return
@@ -93,8 +93,8 @@ def write_password(password: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     # Group-readable, because Postgres runs as a different user in the
-    # same Pod and reads this file to set its own password. The group
-    # is the Pod's fsGroup, which only its own containers are in.
+    # same infra unit and reads this file to set its own password. The group
+    # is the unit's fsGroup, which only its own containers are in.
     os.chmod(tmp, 0o640)
     os.replace(tmp, PASSWORD_FILE)
     dir_fd = os.open(SECRET_DIR, os.O_RDONLY)

@@ -48,7 +48,7 @@ const FORWARDED_PREFIX = 'x-forwarded-prefix';
 
 export interface PassThroughOptions {
 	/** The dispatcher's address as the site's SERVER reaches it (for a local
-	 *  install `http://127.0.0.1:9999`), read on every call, so a function
+	 *  install `http://127.0.0.1:14111`), read on every call, so a function
 	 *  reading the environment is fine. */
 	dispatcher: string | (() => string | undefined);
 	/** Defaults to the global `fetch`. */

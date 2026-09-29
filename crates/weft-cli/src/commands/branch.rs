@@ -1,5 +1,5 @@
-//! `weft branch <version|color>`: restore that version's files (a color
-//! means its version) and move head. A color sets head's run, so the
+//! `weft branch <version|execution_id>`: restore that version's files (an execution
+//! means its version) and move head. An execution sets head's run, so the
 //! next `--seed` inherits from it; a version clears it. Refuses on a
 //! dirty tree naming the files; `--discard` overrides.
 
@@ -10,7 +10,7 @@ use super::Ctx;
 
 pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<()> {
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let id = project.id().to_string();
     let tree = fetch_tree(&client, &id).await?;
 
@@ -30,9 +30,9 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
         }
     }
 
-    // A color means its version and becomes head's run.
+    // An execution means its version and becomes head's run.
     let (body, version_id) = match resolve_run(&tree, &reference) {
-        Ok(run) => (serde_json::json!({ "run": run.color }), run.version_id.clone()),
+        Ok(run) => (serde_json::json!({ "run": run.execution_id }), run.version_id.clone()),
         Err(_) => {
             let version = resolve_version(&tree, &reference)?;
             (serde_json::json!({ "version": version.id.clone() }), version.id.clone())
@@ -71,7 +71,7 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
             format!(
                 "the files on disk ARE version {} now, but head could not be moved there. \
                  `weft branch {reference} --discard` finishes the job, and it names {reference} \
-                 again rather than the version, because that is what you asked for and a color \
+                 again rather than the version, because that is what you asked for and an execution \
                  also sets head's run. Plain `weft branch {reference}` will refuse, because head \
                  is still the old version and reads the restored files as your own uncommitted \
                  changes; `--discard` overwrites the files with this version, which is what they \
@@ -122,7 +122,6 @@ pub fn dirty_files(head: &Manifest, local: &Manifest) -> Vec<String> {
 /// differ, remove every covered file the manifest does not name.
 async fn restore(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project, manifest: &Manifest) -> anyhow::Result<()> {
     let local = local_manifest(project)?;
-    let project_id = Some(project.id().to_string());
     // Every path is checked BEFORE anything is written, so a bad entry
     // halfway down the manifest cannot leave the tree half restored.
     //
@@ -140,15 +139,7 @@ async fn restore(client: &crate::client::DispatcherClient, project: &weft_compil
     // entry weft had legitimately stored but that today's coverage rule
     // would not record turned a branch into a total refusal whose message
     // claimed weft would never have recorded it.
-    let bad: Vec<&String> = manifest_files(manifest)
-        .filter(|(path, _)| {
-            path.is_empty()
-                || path.starts_with('/')
-                || path.contains('\\')
-                || path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
-        })
-        .map(|(path, _)| path)
-        .collect();
+    let bad = unrecordable_paths(manifest);
     if !bad.is_empty() {
         bail!(
             "this version lists {}, which weft would never record as a project file; nothing was \
@@ -160,27 +151,7 @@ async fn restore(client: &crate::client::DispatcherClient, project: &weft_compil
     // Download before changing the working tree. Deleting obsolete files first
     // then permits a path to change between a file and a directory.
     let staged = tempfile::tempdir()?;
-    for (path, hash) in manifest_files(manifest) {
-        if local.get(path) == Some(hash) {
-            continue;
-        }
-        // Through the key grammar's own constructor: the hash comes
-        // off a manifest the dispatcher sent, so it is not this side's
-        // to trust. Named by PATH, which is the file the person can
-        // actually look at.
-        let scope = weft_core::storage::key::KeyScope::Asset { project_id: project.id().to_string() };
-        let key = weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
-            anyhow::anyhow!("this version lists '{path}' as '{hash}', which is not a storable address ({e})")
-        })?;
-        let bytes = super::files::download_bytes(client, &key, &project_id)
-            .await
-            .with_context(|| format!("download {path} ({hash})"))?;
-        let full = staged.path().join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&full, bytes).with_context(|| format!("write {}", full.display()))?;
-    }
+    download_into(client, &project.id().to_string(), manifest, &local, staged.path()).await?;
     // From here the working tree changes. Nothing above touched it, so a
     // failure above leaves the person exactly where they were; a failure
     // below may leave a mixture of two versions, and says which.
@@ -193,6 +164,56 @@ async fn restore(client: &crate::client::DispatcherClient, project: &weft_compil
             "nothing was restored; the working tree is as it was"
         }
     })
+}
+
+/// Download every file of `manifest` that `have` does not already hold
+/// byte for byte into `dest`, at its path. The paths were checked by the
+/// caller; the hashes are checked here, through the key grammar.
+pub(crate) async fn download_into(
+    client: &crate::client::DispatcherClient,
+    project_id: &str,
+    manifest: &Manifest,
+    have: &Manifest,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    let scope_project = Some(project_id.to_string());
+    for (path, hash) in manifest_files(manifest) {
+        if have.get(path) == Some(hash) {
+            continue;
+        }
+        // Through the key grammar's own constructor: the hash comes
+        // off a manifest the dispatcher sent, so it is not this side's
+        // to trust. Named by PATH, which is the file the person can
+        // actually look at.
+        let scope = weft_core::storage::key::KeyScope::Asset { project_id: project_id.to_string() };
+        let key = weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
+            anyhow::anyhow!("this version lists '{path}' as '{hash}', which is not a storable address ({e})")
+        })?;
+        let bytes = super::files::download_bytes(client, &key, &scope_project)
+            .await
+            .with_context(|| format!("download {path} ({hash})"))?;
+        let full = dest.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&full, bytes).with_context(|| format!("write {}", full.display()))?;
+    }
+    Ok(())
+}
+
+/// The manifest paths weft would never record as a project file (empty,
+/// absolute, a backslash, or a `.`/`..`/empty segment): a path off the
+/// wire that would write outside the folder it is restored into.
+pub(crate) fn unrecordable_paths(manifest: &Manifest) -> Vec<&String> {
+    manifest_files(manifest)
+        .filter(|(path, _)| {
+            path.is_empty()
+                || path.starts_with('/')
+                || path.contains('\\')
+                || path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        })
+        .map(|(path, _)| path)
+        .collect()
 }
 
 fn validate_destinations(root: &std::path::Path, manifest: &Manifest) -> anyhow::Result<()> {

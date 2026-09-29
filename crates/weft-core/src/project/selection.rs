@@ -38,7 +38,7 @@ pub struct RunSelection {
     /// Authored backups for selected receiving ports, recorded at birth.
     pub input: BTreeMap<Located, BTreeMap<String, serde_json::Value>>,
     /// Origins only for inherited backups. Authored backups belong to this run.
-    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::Color>>,
+    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::ExecutionId>>,
 }
 
 #[derive(Debug, Clone, Default)]

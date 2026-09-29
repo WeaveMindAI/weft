@@ -205,10 +205,10 @@ fi
 
 # ---------- Live prerequisites ----------
 if [ "$LIVE" = 1 ]; then
-  # Live tests run as pods in the cluster; bring it up if absent.
-  # SYNC: weft-db <-> crates/weft-core/src/infra/instance.rs (the default install's db_namespace)
-  if ! kubectl get namespace weft-db >/dev/null 2>&1; then
-    echo "cluster not up; running weft daemon start first"
+  # Live tests run on the install's workers; bring it up if it does not
+  # answer.
+  if ! weft daemon status 2>/dev/null | grep -q '^weft: running'; then
+    echo "weft is not running; running weft daemon start first"
     weft daemon start || exit 1
   fi
   # The dispatcher only runs node tests for a registered project; a

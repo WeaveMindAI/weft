@@ -1571,7 +1571,7 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
 // packages/weft-syntax/highlight-weft.js,
 // crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_TYPE_KEYWORDS: &[&str] =
-    &["Group", "Passthrough", "Loop", "LoopIn", "LoopOut"];
+    &["Group", weft_core::project::boundary_types::PASSTHROUGH, "Loop", weft_core::project::boundary_types::LOOP_IN, weft_core::project::boundary_types::LOOP_OUT];
 
 /// True iff `name` is one of the language's reserved type keywords.
 pub fn is_reserved_type_keyword(name: &str) -> bool {
@@ -1827,7 +1827,7 @@ fn lower_node(
     if !reject_reserved_local(&local_id, header_span, errors) {
         return None;
     }
-    if node_type == "Passthrough" {
+    if node_type == weft_core::project::boundary_types::PASSTHROUGH {
         errors.push(CompileError::at(header_span, "'Passthrough' is a compiler-internal node type and cannot be used directly. Passthrough nodes are emitted automatically when a group is flattened."));
         return None;
     }
@@ -2058,7 +2058,7 @@ fn lower_inline_expr(
         errors.push(CompileError::at(span, "Groups cannot be inlined"));
         return;
     }
-    if node_type == "Passthrough" {
+    if node_type == weft_core::project::boundary_types::PASSTHROUGH {
         errors.push(CompileError::at(span, "'Passthrough' is a compiler-internal node type and cannot be used directly."));
         return;
     }

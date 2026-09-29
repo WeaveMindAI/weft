@@ -26,7 +26,7 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
         json!({ "keys": "k-one, k-two" }),
     )
     .await?;
-    set_account(&project, "keys", "account", keys.handle())?;
+    set_account(&project, "keys", keys.handle()).await?;
     let secret = connect_direct(
         &disp,
         catalog_spec("api", "hmac_auth")?,
@@ -34,7 +34,7 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
         json!({ "signing_secret": "s3cret-e2e" }),
     )
     .await?;
-    set_account(&project, "secret", "account", secret.handle())?;
+    set_account(&project, "secret", secret.handle()).await?;
     project.activate().await?;
 
     // The key set: no key and a wrong key are refused before any run

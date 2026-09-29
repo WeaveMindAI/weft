@@ -1,9 +1,11 @@
-//! Signal-token management. A signal token grants scoped access to
-//! the dispatcher's signal enumeration + reply surface (`GET
-//! /signal-token/signals`, Bearer-authenticated): a client uses it to
-//! LISTEN for a project's waiting nodes and REPLY to them, and to
-//! reach what a node is SHOWING (`GET /signal-token/displays`): read
-//! its panel and press the buttons its items carry.
+//! Token management: operator keys (`--operator`, an install's admin
+//! credential, the one `weft login` stores) and signal tokens. A signal
+//! token grants scoped access to the dispatcher's signal enumeration +
+//! reply surface (`GET /signal-token/signals`, Bearer-authenticated): a
+//! client uses it to LISTEN for a project's waiting nodes and REPLY to
+//! them, and to reach what a node is SHOWING (`GET
+//! /signal-token/displays`): read its panel and press the buttons its
+//! items carry.
 //!
 //! Three scope dimensions, and one of them reads differently from the
 //! other two. `--projects` and `--tags` are empty-means-any. Displays
@@ -36,6 +38,7 @@ use super::Ctx;
 #[derive(Deserialize)]
 struct Minted {
     id: String,
+    kind: String,
     token: String,
     name: Option<String>,
     url: String,
@@ -58,6 +61,7 @@ struct Minted {
 #[derive(Deserialize)]
 struct Listed {
     id: String,
+    kind: String,
     recognizer: String,
     name: Option<String>,
     #[serde(rename = "allowedProjects")]
@@ -86,6 +90,8 @@ pub enum TokenAction {
         /// A member token for this member of the project in the folder.
         member: Option<weft_core::member::MemberId>,
         expires_in_secs: Option<u64>,
+        /// An operator key rather than a caller token (`--operator`).
+        operator: bool,
     },
     Ls,
     Revoke {
@@ -94,9 +100,9 @@ pub enum TokenAction {
 }
 
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     match action {
-        TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires_in_secs } => {
+        TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires_in_secs, operator } => {
             let displays = grants_for(&ctx, &displays)?;
             let projects = member_projects(&ctx, member.as_ref(), projects)?;
             let body = serde_json::json!({
@@ -107,11 +113,24 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 "allDisplays": all_displays,
                 "member": member,
                 "expiresInSecs": expires_in_secs,
+                "kind": if operator { "operator" } else { "caller" },
             });
             let resp: serde_json::Value = client.post_json("/signal-tokens", &body).await?;
             let minted: Minted = serde_json::from_value(resp.clone())
                 .map_err(|e| anyhow::anyhow!("unexpected /signal-tokens mint response shape: {e}"))?;
             if ctx.json_out(&resp)? {
+                return Ok(());
+            }
+            if minted.kind == "operator" {
+                // An operator key is a credential for the CLI, not a
+                // connect string: the bare key is all there is to copy.
+                println!("{}", minted.token);
+                eprintln!("Copy it now: the server stores only a hash and cannot show it again.");
+                eprintln!("Id: {} (use this to revoke)", minted.id);
+                eprintln!(
+                    "Hand it to `weft login <target>`, or to CI as WEFT_OPERATOR_KEY. It \
+                     administers the whole install: never put it in a frontend."
+                );
                 return Ok(());
             }
             // The ONE time the full token is visible. The connect string is
@@ -152,6 +171,10 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 let name = t.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("(unnamed)");
                 println!("{}  {name}", t.recognizer);
                 println!("  id: {}", t.id);
+                if t.kind == "operator" {
+                    println!("  operator key: administers the whole install");
+                    continue;
+                }
                 print_scope_summary(
                     &t.allowed_projects,
                     &t.allowed_tags,
@@ -323,7 +346,7 @@ mod grant_tests {
         // Otherwise the daemon refuses `<uuid>/` and quotes the whole
         // thing back, which is a project id the person never had and a
         // shape they never typed.
-        let ctx = crate::commands::Ctx::new(Some("http://localhost:9999".into()), false);
+        let ctx = crate::commands::Ctx::new(Some(crate::commands::Dispatcher::Flag("http://127.0.0.1:14111".into())), None, false).unwrap();
         let why = format!("{:#}", super::grants_for(&ctx, &["  ".to_string()]).unwrap_err());
         assert!(why.contains("--display takes a node"), "{why}");
         assert!(!why.contains('/'), "no grant shape leaks into it: {why}");

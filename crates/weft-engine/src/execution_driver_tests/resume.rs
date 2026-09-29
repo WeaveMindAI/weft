@@ -4,7 +4,7 @@
     use weft_core::signal::{to_spec, Form, FormSchema};
     use weft_journal::ExecEvent;
 
-    fn color() -> Color {
+    fn execution_id() -> ExecutionId {
         uuid::Uuid::nil()
     }
 
@@ -20,7 +20,7 @@
 
     fn registered(token: &str, call_index: u32) -> ExecEvent {
         ExecEvent::SuspensionRegistered {
-            color: color(),
+            execution_id: execution_id(),
             node_id: "n".into(),
             frames: vec![],
             token: token.into(),
@@ -32,7 +32,7 @@
 
     fn suspended(token: &str) -> ExecEvent {
         ExecEvent::NodeSuspended {
-            color: color(),
+            execution_id: execution_id(),
             node_id: "n".into(),
             frames: vec![],
             token: token.into(),
@@ -45,7 +45,7 @@
     /// `apply_snapshot` must NOT mark the node for re-dispatch: the
     /// suspension it is currently parked on is unresolved. The old
     /// "any resolved entry in the sequence" check re-dispatched here,
-    /// which livelocked every worker boot of such a color (replay,
+    /// which livelocked every worker boot of such an execution (replay,
     /// re-suspend, two fresh journal rows, refetch sees new rows,
     /// repeat until the wall-clock deadline).
     fn two_await_events() -> (String, Vec<ExecEvent>) {
@@ -54,7 +54,7 @@
         let events = vec![
             started("src"),
             ExecEvent::PortEmitted {
-                color: color(),
+                execution_id: execution_id(),
                 emission_id: emission,
                 node_id: "src".into(),
                 frames: vec![],
@@ -67,13 +67,13 @@
             registered("t0", 0),
             suspended("t0"),
             ExecEvent::SuspensionResolved {
-                color: color(),
+                execution_id: execution_id(),
                 token: "t0".into(),
                 value: json!("v0"),
                 at_unix: 0,
             },
             ExecEvent::NodeResumed {
-                color: color(),
+                execution_id: execution_id(),
                 node_id: "n".into(),
                 frames: vec![],
                 token: Some("t0".into()),
@@ -86,7 +86,7 @@
     }
 
     fn started(node: &str) -> ExecEvent {
-        ExecEvent::NodeStarted { color: color(), node_id: node.into(), frames: vec![], at_unix: 0 }
+        ExecEvent::NodeStarted { execution_id: execution_id(), node_id: node.into(), frames: vec![], at_unix: 0 }
     }
 
     /// `src.out` feeds `n.in`; neither consumes a stream, so no
@@ -120,7 +120,7 @@
 
     fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
         let project = await_project();
-        let snap = weft_journal::fold_to_snapshot(color(), project.clone(), events);
+        let snap = weft_journal::fold_to_snapshot(execution_id(), project.clone(), events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
@@ -189,7 +189,7 @@
 
     fn apply_stream(events: &[ExecEvent]) -> Vec<FiringLocation> {
         let project = stream_project();
-        let snap = weft_journal::fold_to_snapshot(color(), project.clone(), events);
+        let snap = weft_journal::fold_to_snapshot(execution_id(), project.clone(), events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
@@ -211,7 +211,7 @@
     async fn a_journal_that_will_not_fold_fails_the_run_with_a_terminal() {
         let rows = vec![
             ExecEvent::ExecutionStarted {
-                color: color(),
+                execution_id: execution_id(),
                 project_id: uuid::Uuid::nil(),
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
@@ -219,15 +219,16 @@
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                run_class: weft_core::run_class::RunClass::Short,
             },
             // A resume of a firing the journal never opened.
-            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 0 },
+            ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 0 },
         ];
         let (outcome, events) = drive_journal(
             (*await_project()).clone(),
             catalog(vec![]),
-            color(),
+            execution_id(),
             rows,
             CancellationFlag::new_arc(),
         )
@@ -284,7 +285,7 @@
     fn resolved_current_await_redispatches() {
         let (pid, mut events) = two_await_events();
         events.push(ExecEvent::SuspensionResolved {
-            color: color(),
+            execution_id: execution_id(),
             token: "t1".into(),
             value: json!("v1"),
             at_unix: 0,
@@ -300,7 +301,7 @@
     fn kick_events() -> Vec<ExecEvent> {
         vec![
             ExecEvent::NodeKicked {
-                color: color(),
+                execution_id: execution_id(),
                 node_id: "n".into(), frames: vec![],
                 firing: true,
                 payload: Some(json!({"body": 1})),
@@ -327,7 +328,7 @@
     fn completed_kicked_node_stays_dispatched() {
         let mut events = kick_events();
         events.push(ExecEvent::NodeCompleted {
-            color: color(),
+            execution_id: execution_id(),
             node_id: "n".into(),
             frames: vec![],
             at_unix: 0,
@@ -351,7 +352,7 @@
             "pending suspension: no re-dispatch churn"
         );
         events.push(ExecEvent::SuspensionResolved {
-            color: color(),
+            execution_id: execution_id(),
             token: "tk".into(),
             value: json!("answer"),
             at_unix: 0,

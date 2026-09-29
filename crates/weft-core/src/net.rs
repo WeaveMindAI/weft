@@ -42,7 +42,7 @@ pub fn is_loopback_url(url: &str) -> bool {
 }
 
 /// Install ring as the process-level rustls crypto provider, once.
-/// Called at every binary's startup (and the worker's pod entry): the
+/// Called at every binary's startup (and the worker's process entry): the
 /// dependency graph carries TWO providers (ring everywhere, aws-lc-rs
 /// via the S3 stack), and rustls refuses to guess between them, so any
 /// library that builds TLS from the process default (a WebSocket
@@ -249,8 +249,8 @@ mod request_base_url_tests {
     #[test]
     fn the_base_is_the_host_the_caller_used() {
         assert_eq!(
-            request_base_url(&headers(&[("host", "127.0.0.1:9998")])).as_deref(),
-            Some("http://127.0.0.1:9998")
+            request_base_url(&headers(&[("host", "127.0.0.1:14112")])).as_deref(),
+            Some("http://127.0.0.1:14112")
         );
         assert_eq!(
             request_base_url(&headers(&[
@@ -324,7 +324,7 @@ mod request_base_url_tests {
     fn a_forwarding_proxy_names_the_host_scheme_and_mount() {
         assert_eq!(
             request_base_url(&headers(&[
-                ("host", "10.0.0.7:9999"),
+                ("host", "10.0.0.7:14111"),
                 ("x-forwarded-host", "app.example.com, 10.0.0.2"),
                 ("x-forwarded-proto", "https"),
                 ("x-forwarded-prefix", "/weft/"),
@@ -374,7 +374,7 @@ mod tests {
         for local in [
             "http://localhost:8080",
             "http://LOCALHOST/x",
-            "http://127.0.0.1:9999",
+            "http://127.0.0.1:14111",
             "https://[::1]/events",
             "not a url",
             "",

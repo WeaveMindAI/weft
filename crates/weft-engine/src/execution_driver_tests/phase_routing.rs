@@ -144,7 +144,7 @@
         .expect("routing project")
     }
 
-    async fn seed(journal: &MemJournal, project: &ProjectDefinition, color: Color, phase: weft_core::context::Phase, kicks: &[&str]) {
+    async fn seed(journal: &MemJournal, project: &ProjectDefinition, execution_id: ExecutionId, phase: weft_core::context::Phase, kicks: &[&str]) {
         // Mirror the dispatcher's birth row: a setup phase carries the
         // selection that bounds it (its triggers' or infra nodes'
         // dependencies), and the engine refuses a setup row without one.
@@ -162,7 +162,7 @@
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
-                    color,
+                    execution_id,
                     project_id: project.id,
                     entry_node: kicks[0].to_string(),
                     phase,
@@ -170,7 +170,8 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                    member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
             )
@@ -184,7 +185,7 @@
             journal
                 .record_event(
                     &ExecEvent::NodeKicked {
-                        color,
+                        execution_id,
                         node_id: node.to_string(), frames: vec![],
                         firing,
                         payload: firing.then(|| json!({"fired": true})),
@@ -209,11 +210,11 @@
             trig: Box::leak(Box::new(Trig { calls: calls.clone() })),
             forgot: Box::leak(Box::new(ForgotSetup)),
         });
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, &project, color, phase, kicks).await;
+        seed(&journal, &project, execution_id, phase, kicks).await;
         let outcome = run_checked(
-            Arc::new(project), catalog, color, journal.clone(), clients(journal.clone()),
+            Arc::new(project), catalog, execution_id, journal.clone(), clients(journal.clone()),
             CancellationFlag::new_arc(), None,
         )
         .await
@@ -428,12 +429,12 @@
             "groups": []
         }))
         .unwrap();
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
-                    color,
+                    execution_id,
                     project_id: project.id,
                     entry_node: "trig".into(),
                     phase: weft_core::context::Phase::Fire,
@@ -441,7 +442,8 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                    member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
             )
@@ -450,7 +452,7 @@
         journal
             .record_event(
                 &ExecEvent::NodeKicked {
-                    color,
+                    execution_id,
                     node_id: "trig".into(), frames: vec![],
                     firing: true,
                     payload: Some(json!({ "messageId": "m-7" })),
@@ -462,7 +464,7 @@
             .await
             .unwrap();
         let outcome = run_checked(
-            Arc::new(project), catalog, color, journal.clone(), clients(journal),
+            Arc::new(project), catalog, execution_id, journal.clone(), clients(journal),
             CancellationFlag::new_arc(), None,
         )
         .await

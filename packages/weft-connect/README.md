@@ -38,7 +38,7 @@ it from `$lib/weft-connect`, `$lib/weft-connect/svelte` and
 
 If you are mounting it in SvelteKit, the pass-through is one route, and the
 dispatcher's address lives only in the server's environment
-(`WEFT_DISPATCHER_URL=http://127.0.0.1:9999` for a local install):
+(`WEFT_DISPATCHER_URL=http://127.0.0.1:14111` for a local install):
 
 ```ts
 // front/src/routes/weft/[...path]/+server.ts

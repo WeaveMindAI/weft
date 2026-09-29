@@ -31,7 +31,7 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
     )
     .await?;
     let mut project = Project::prepare("openrouter_chat", disp.clone()).await?;
-    set_account(&project, "prov", "connection", conn.handle())?;
+    set_account(&project, "prov", conn.handle()).await?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -43,7 +43,7 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
     // shows the link path actually engaged.
     let links = weft_e2e::platform::Platform::connect(&disp)
         .await?
-        .public_file_link_count_for(&settled.color, &project.id())
+        .public_file_link_count_for(&settled.execution_id, &project.id())
         .await?;
     if links > 0 {
         eprintln!("media path: PUBLIC RELAY LINK ({links} live link(s) minted)");

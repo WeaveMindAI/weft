@@ -152,7 +152,7 @@ For what `@per_member` and `@member_filled` do, go and read [Programs with membe
 | Slug | What it found | What to do |
 |---|---|---|
 | `rule-structural` | A rule the node's own author wrote, checked on every build | Whatever its message says |
-| `rule-runtime` | The same, but only checked by `weft validate` and just before you run. Mostly this is "you have not picked a connection yet" | Pick the connection, or fill the credential the message names |
+| `rule-runtime` | The same, but only checked by `weft validate` and just before you run | Fill what the message names. A step with no connection picked is not one of these: the install refuses that run when it starts, naming `weft connect` |
 
 Both take their severity from the rule, so either can be an error, a warning, a
 note or a hint.

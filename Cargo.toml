@@ -16,6 +16,9 @@ members = [
     "crates/weft-broker-client",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
+    "crates/weft-platform-local",
+    "crates/weft-platform-gcp",
+    "crates/weft-runtime",
     "crates/weft-assets",
     "crates/weft-providers",
     "crates/weft-e2e",
@@ -45,14 +48,15 @@ too_many_arguments = "allow"
 [profile.dev]
 debug = "line-tables-only"
 
-# The system images (`deploy/docker/system-images.Dockerfile`) and the
-# CLI build `--release`, locally after every runtime edit. By default a
+# The runtime (`deploy/docker/runtime.Dockerfile`, and the host binary
+# `setup.sh` installs) and the CLI build `--release`, locally after every
+# runtime edit. By default a
 # release build recompiles each edited crate, and everything depending on
 # it, whole: a one-line change to weft-core took about 80 seconds.
 # Incremental builds with many codegen units recompile only what the edit
 # touched, and the image's cache mount keeps that state between builds.
 # The cost is a slightly slower binary than 16 units would give, which
-# none of these services notice.
+# none of these binaries notice.
 [profile.release]
 incremental = true
 codegen-units = 256
@@ -93,20 +97,17 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "r
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-types = "1"
 
-# Kubernetes API, in process: one client per process, and watches
-# rather than repeated lists. `runtime` for the watcher (a dropped watch
-# is relisted and resumed); rustls with ring, like every other TLS
-# client here.
-kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "runtime"] }
-# SYNC: the `v1_35` feature <-> the Kubernetes version kind builds (the
-#       node image of the `kind` the CLI finds; `kubectl version`)
-k8s-openapi = { version = "0.28", features = ["v1_35"] }
-
 # serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.8"
-serde_yaml = "0.9"
+# Editing a committed weft.toml in place, comments and order kept
+# (`weft target add`).
+toml_edit = "0.22"
+# A build context uploaded for Cloud Build as one gzipped tarball
+# (weft-platform-gcp `images`).
+tar = "0.4"
+flate2 = "1"
 
 # lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip)
 rowan = "0.16"
@@ -153,7 +154,6 @@ ed25519-dalek = "2"
 p256 = "0.13"
 tempfile = "3"
 parking_lot = "0.12"
-ipnet = "2"
 filetime = "0.2"
 base64 = "0.22"
 
@@ -166,5 +166,7 @@ weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
 weft-access-store = { path = "crates/weft-access-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
+weft-platform-local = { path = "crates/weft-platform-local" }
+weft-platform-gcp = { path = "crates/weft-platform-gcp" }
 weft-assets = { path = "crates/weft-assets" }
 weft-providers = { path = "crates/weft-providers" }

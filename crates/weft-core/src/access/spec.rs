@@ -29,6 +29,26 @@ use serde_json::Value;
 /// The recipe for one service's personal accesses: how a grant is
 /// acquired, how a request through it is authenticated, and how grants
 /// coexist across projects.
+/// What a provider accepts as its OAuth callback address
+/// ([`AccessSpec::callback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackAddress {
+    /// Any address, plain http on a loopback included.
+    #[default]
+    Any,
+    /// An https address.
+    Https,
+    /// An https address whose host is a domain name, never an IP.
+    Domain,
+}
+
+impl CallbackAddress {
+    fn is_any(&self) -> bool {
+        *self == Self::Any
+    }
+}
+
 // SYNC: AccessSpec <-> packages/weft-connect/src/core/wire.ts AccessSpecWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,12 +101,14 @@ pub struct AccessSpec {
     /// credential, and offering `shared` is a deliberate declaration.
     #[serde(default = "default_doors", skip_serializing_if = "is_default_doors")]
     pub doors: Vec<Door>,
-    /// The provider refuses plain-http OAuth callback URLs (Slack
-    /// does; Google takes a loopback). Declaring it makes every
-    /// consent for this service use an https address, failing loudly
-    /// when this weft has none.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub callback_https: bool,
+    /// What address the provider accepts for its OAuth callback. Most
+    /// take any; some refuse plain http (Slack), and some refuse a bare
+    /// IP address (Google's console only takes a name ending in a public
+    /// top-level domain). Every consent for this service uses an address
+    /// that qualifies, failing loudly, with the fix, when this weft has
+    /// none.
+    #[serde(default, skip_serializing_if = "CallbackAddress::is_any")]
+    pub callback: CallbackAddress,
     /// What the "Your own" door renders beyond the paste fields (which
     /// are derived from the acquisition, see [`Self::own_fields`]): an
     /// optional create-it-for-me mint, and an optional generated guide.
@@ -366,8 +388,8 @@ impl VerificationCost {
 /// when a project declares no app of its own. Named here because both
 /// the runtime that reads the file and the tooling that installs it key
 /// off the same variable.
-// SYNC: APPS_FILE_ENV <-> deploy/k8s/broker.yaml (WEFT_ACCESS_APPS_FILE env +
-//       the access-apps volume it points into)
+// SYNC: APPS_FILE_ENV <-> crates/weft-cli/src/commands/daemon.rs (secrets),
+//       deploy/terraform/gcp/machine.yaml.tftpl, deploy/terraform/gcp/serverless.tf
 pub const APPS_FILE_ENV: &str = "WEFT_ACCESS_APPS_FILE";
 
 /// The credentials of a service's OAuth app: the client id, the secret

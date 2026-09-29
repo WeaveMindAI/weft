@@ -45,7 +45,7 @@ export interface RawStatusPayload {
   preservation?: { parked?: number; suspended?: number };
   executions?: {
     last_status?: string;
-    last_color?: string;
+    last_execution_id?: string;
     /** Every execution running right now, oldest first, with what it
      *  is for; the editor replaces its running set with this on each
      *  refresh. */
@@ -159,7 +159,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
 /// One execution running right now, and what it is for.
 // SYNC: RunningExecution <-> crates/weft-dispatcher/src/api/project.rs RunningExecution
 export interface RunningExecution {
-  color: string;
+  execution_id: string;
   phase: ExecutionPhase;
 }
 
@@ -169,10 +169,10 @@ export interface RunningExecution {
 export function parseRunning(raw: RawStatusPayload): RunningExecution[] {
   const running = raw.executions?.running ?? [];
   return running.map((entry) => {
-    if (typeof entry?.color !== 'string' || !EXECUTION_PHASES.includes(entry.phase)) {
+    if (typeof entry?.execution_id !== 'string' || !EXECUTION_PHASES.includes(entry.phase)) {
       throw new Error(`status names a running execution the editor cannot read: ${JSON.stringify(entry)}`);
     }
-    return { color: entry.color, phase: entry.phase };
+    return { execution_id: entry.execution_id, phase: entry.phase };
   });
 }
 

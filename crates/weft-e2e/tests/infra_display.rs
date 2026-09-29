@@ -26,7 +26,7 @@ async fn a_token_reads_an_infra_display_and_presses_its_button() -> anyhow::Resu
     );
 
     // It reads what the container serves, and presses its button. A
-    // Service answers a moment after its pod reports ready, and the read
+    // unit's port answers a moment after it reports ready, and the read
     // door answers 502 in that gap (a panel polls, so its next look
     // lands), so the first read waits for the door to answer.
     poll_until("the panel's first answer", Duration::from_secs(30), Duration::from_millis(500), || async {

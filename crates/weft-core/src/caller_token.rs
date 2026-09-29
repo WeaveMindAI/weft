@@ -1,10 +1,11 @@
 //! Signed routing token for a live caller connection. The dispatcher
-//! mints one at the control handshake (after auth + ensuring the worker
-//! is up); the gateway forwards it to the worker; the worker verifies it
+//! mints one at the control handshake (after the caller's gate); the
+//! caller brings it back through the install's live door, which forwards
+//! the connection to one of the project's workers; the worker verifies it
 //! before asking for the execution and attaching the connection to it. A
 //! worker rejects any connection whose token is missing, expired, forged,
-//! or addressed to a different pod, so a worker that stays cluster-private
-//! only ever serves connections the dispatcher signed.
+//! or addressed to another project, so a worker only ever serves
+//! connections the dispatcher signed.
 //!
 //! The token is also the handshake's memory: nothing is born at the
 //! handshake (a caller who never follows the redirect leaves nothing
@@ -26,26 +27,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::signed_token::{self, SignedClaims};
-use crate::Color;
+use crate::ExecutionId;
 
 /// Caller-safe noun for this token's error strings (no secret leak).
 const NOUN: &str = "routing token";
 
-/// What a routing token grants: the right to have execution `color` of
-/// `project_id` born on the worker pod `pod_name` and to attach ONE live
-/// connection to it, until `exp` (unix seconds).
+/// What a routing token grants: the right to have execution `execution_id` of
+/// `project_id` born on whichever of the project's workers the caller's
+/// connection reaches, and to attach ONE live connection to it, until
+/// `exp` (unix seconds).
 ///
-/// `pod_name` is the pin: a held connection lives on exactly one pod for
-/// its life, and the worker rejects a token addressed to a different pod.
-/// `color` binds the connection to the one execution so `ctx.caller()`
+/// The execution is pinned to that worker once born (the caller is on its
+/// connection); the worker rejects a token for another project. `execution_id`
+/// binds the connection to the one execution so `ctx.caller()`
 /// resolves to the right run. `signal`, `path`, `params` and `caller`
 /// are what the handshake established and the birth reads back when the
 /// caller arrives (see the module doc).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerTokenClaims {
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub project_id: uuid::Uuid,
-    pub pod_name: String,
+    /// The program the handshake armed the run with: the live door
+    /// forwards the caller to the workers running this image, and the
+    /// birth refuses a route re-armed with another program since.
+    pub binary_hash: String,
     /// The signal token of the route the handshake matched: the row the
     /// birth reads the trigger, its spec and its armed program from.
     pub signal: String,
@@ -121,7 +126,7 @@ impl SignedClaims for CallerTokenClaims {
     }
 }
 
-/// Mint a signed routing token. `secret` is the cluster's dispatcher
+/// Mint a signed routing token. `secret` is the install's dispatcher
 /// signing key (same provisioning path as the broker / storage HMAC
 /// secrets).
 pub fn mint(secret: &[u8], claims: &CallerTokenClaims) -> String {
@@ -130,11 +135,23 @@ pub fn mint(secret: &[u8], claims: &CallerTokenClaims) -> String {
 
 /// Validate a routing token and return its claims. Rejects on format,
 /// signature, and expiry; reasons are caller-safe (no secret leak). The
-/// worker additionally checks `claims.pod_name == own_pod` and
-/// `claims.color` resolves to a live execution; those are policy checks
+/// worker additionally checks `claims.project_id` is its own and
+/// `claims.execution_id` resolves to a live execution; those are policy checks
 /// on top of this cryptographic validation, not part of it.
 pub fn validate(secret: &[u8], token: &str, now_unix: i64) -> Result<CallerTokenClaims, String> {
     signed_token::validate(secret, token, now_unix, NOUN)
+}
+
+/// What a caller is told when their ticket is no good, for any reason
+/// `validate` gives. Every reason has the same remedy, so the answer leads
+/// with it and names the reason after. The one that actually happens to
+/// people is expiry: a ticket is good for a couple of minutes.
+pub fn refusal(why: &str) -> String {
+    format!(
+        "this connection ticket is no good ({why}). Ask for a new one at the \
+         address you called first and follow where it points: a ticket lasts \
+         a couple of minutes and opens one connection."
+    )
 }
 
 #[cfg(test)]
@@ -144,15 +161,15 @@ mod tests {
 
     const SECRET: &[u8] = b"test-secret-32-bytes-aaaaaaaaaaa";
 
-    fn color() -> Color {
+    fn execution_id() -> ExecutionId {
         Uuid::from_u128(0x1234)
     }
 
-    fn claims(pod_name: &str, exp: i64) -> CallerTokenClaims {
+    fn claims(exp: i64) -> CallerTokenClaims {
         CallerTokenClaims {
-            color: color(),
+            execution_id: execution_id(),
             project_id: uuid::Uuid::nil(),
-            pod_name: pod_name.into(),
+            binary_hash: "bin-1".into(),
             signal: "sig-9".into(),
             path: "chat/room7".into(),
             params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
@@ -188,18 +205,18 @@ mod tests {
 
     #[test]
     fn mint_validate_round_trip() {
-        let tok = mint(SECRET, &claims("pod-7", 1_000));
+        let tok = mint(SECRET, &claims(1_000));
         let back = validate(SECRET, &tok, 999).unwrap();
-        assert_eq!(back, claims("pod-7", 1_000));
+        assert_eq!(back, claims(1_000));
         // An open route on a bare path carries no captures, no caller, no
         // member and no approved request.
-        let bare = CallerTokenClaims { params: BTreeMap::new(), caller: None, member: None, approved: None, ..claims("pod-7", 1_000) };
+        let bare = CallerTokenClaims { params: BTreeMap::new(), caller: None, member: None, approved: None, ..claims(1_000) };
         assert_eq!(validate(SECRET, &mint(SECRET, &bare), 0).unwrap(), bare);
     }
 
     #[test]
     fn rejects_expired() {
-        let tok = mint(SECRET, &claims("pod", 1_000));
+        let tok = mint(SECRET, &claims(1_000));
         assert_eq!(
             validate(SECRET, &tok, 1_000).unwrap_err(),
             "routing token expired"
@@ -209,19 +226,20 @@ mod tests {
 
     #[test]
     fn rejects_wrong_secret_and_tampering() {
-        let tok = mint(SECRET, &claims("pod-7", 1_000));
+        let tok = mint(SECRET, &claims(1_000));
         assert!(validate(b"other-secret-bbbbbbbbbbbbbbbbbbbb", &tok, 0).is_err());
-        // Tamper: re-mint with a different pod under a DIFFERENT secret, then
+        // Tamper: re-mint for another project under a DIFFERENT secret, then
         // splice that forged payload onto the real token's signature. The sig
         // was computed over the original payload, so it cannot validate the
         // re-pointed one.
-        let forged_full = mint(b"attacker-secret-cccccccccccccccc", &claims("attacker-pod", 1_000));
+        let elsewhere = CallerTokenClaims { project_id: uuid::Uuid::from_u128(0xbad), ..claims(1_000) };
+        let forged_full = mint(b"attacker-secret-cccccccccccccccc", &elsewhere);
         let forged_payload = forged_full.split('.').nth(1).unwrap();
         let real_sig = tok.split('.').nth(2).unwrap();
         let forged = format!("v1.{forged_payload}.{real_sig}");
         assert!(
             validate(SECRET, &forged, 0).is_err(),
-            "a token re-pointed to another pod must fail signature check"
+            "a token re-pointed to another project must fail signature check"
         );
     }
 

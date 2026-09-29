@@ -17,7 +17,7 @@ const site = 'https://site.example/weft';
 describe('the pass-through', () => {
 	it("forwards a member door call with the member's token and the query", async () => {
 		const { fetcher, seen } = fakeDispatcher(() => new Response('[]', { headers: { 'content-type': 'application/json' } }));
-		const pass = weftPassThrough({ dispatcher: 'http://127.0.0.1:9999/', fetcher });
+		const pass = weftPassThrough({ dispatcher: 'http://127.0.0.1:14111/', fetcher });
 		const res = await pass(
 			new Request(`${site}/member/connections?service=slack`, {
 				headers: { Authorization: 'Bearer wft-m', Cookie: 'session=secret', 'Weft-Member': 'someone-else' },
@@ -27,7 +27,7 @@ describe('the pass-through', () => {
 		expect(res.status).toBe(200);
 		expect(res.headers.get('content-type')).toBe('application/json');
 		expect(await res.text()).toBe('[]');
-		expect(seen[0].url).toBe('http://127.0.0.1:9999/member/connections?service=slack');
+		expect(seen[0].url).toBe('http://127.0.0.1:14111/member/connections?service=slack');
 		expect(seen[0].headers.get('authorization')).toBe('Bearer wft-m');
 		// The site's cookies and the server-only member header stay behind.
 		expect(seen[0].headers.get('cookie')).toBeNull();
@@ -142,11 +142,11 @@ describe('the pass-through', () => {
 		const fetcher = (async () => {
 			throw new TypeError('fetch failed');
 		}) as unknown as typeof fetch;
-		const res = await weftPassThrough({ dispatcher: 'http://127.0.0.1:9999', fetcher })(
+		const res = await weftPassThrough({ dispatcher: 'http://127.0.0.1:14111', fetcher })(
 			new Request(`${site}/member/fields`),
 			'member/fields',
 		);
 		expect(res.status).toBe(502);
-		expect(await res.text()).toContain('http://127.0.0.1:9999');
+		expect(await res.text()).toContain('http://127.0.0.1:14111');
 	});
 });

@@ -1,9 +1,9 @@
-//! Drives one execution (one color) from boot to a terminal
+//! Drives one execution (one execution) from boot to a terminal
 //! outcome: completion, failure, stall, or stuck. The pulse loop
 //! lives here.
 //!
 //! Shape:
-//! - Boot: fold the journal for this color to recover pulses,
+//! - Boot: fold the journal for this execution to recover pulses,
 //!   executions, kicked roots, and pending deliveries. If the
 //!   journal is empty we wait briefly for the producer to write
 //!   `ExecutionStarted` + `NodeKicked`, then re-fold.
@@ -57,7 +57,7 @@ use weft_core::primitive::ExecutionSnapshot;
 use weft_core::project::EdgeIndex;
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
-use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
+use weft_core::{ExecutionId, ExecutionContext, NodeCatalog, ProjectDefinition};
 
 use weft_journal::JournalClient;
 
@@ -116,7 +116,7 @@ pub enum ExecutionOutcome {
     /// never received, which is what the terminal row prints.
     Stuck { report: weft_core::exec::StuckReport },
     /// The journal already held a terminal event when the worker
-    /// booted: the color was cancelled, or ran to its end, before this
+    /// booted: the execution was cancelled, or ran to its end, before this
     /// task was claimed (a dispatcher re-run enqueued a second execute
     /// for it, or a cancel landed in the route window). Nothing was
     /// driven and nothing is journaled; running the bodies again would
@@ -130,32 +130,29 @@ pub enum ExecutionOutcome {
 /// "no new rows since the last fetch": at that point another drive()
 /// would see the same snapshot and reach the same conclusion. No
 /// magic iteration cap; the absent-new-rows invariant is sharper.
-/// `pod_name` stamps every journal write so the fencing trigger can
-/// reject writes from a Pod whose row is no longer alive.
+/// `instance` stamps every journal write with this worker's instance
+/// id; the broker takes a write only from the claim's owner.
 ///
 /// An error out of the drive (the journal will not read or fold, an
 /// engine invariant broke, a journal write poisoned the drive) is
 /// journaled as the run's `ExecutionFailed` terminal before it is
 /// handed back: the execute task fails with it and nothing respawns
-/// the color (the task store does not retry, and the reaper only
-/// sweeps the runs of a dead pod), so without the terminal the run
+/// the execution (the task store does not retry, and the reaper only
+/// sweeps the runs of a dead process), so without the terminal the run
 /// would read as running forever. The birth row exists at every such
 /// exit: the dispatcher commits it in the same transaction as the
 /// execute task this worker claimed.
 pub async fn run_one_execution(
     project: Arc<ProjectDefinition>,
     catalog: Arc<dyn NodeCatalog>,
-    color: Color,
+    execution_id: ExecutionId,
     clients: EngineClients,
-    pod_name: String,
+    instance: String,
     tenant_id: String,
-    namespace: String,
     cancellation: Arc<CancellationFlag>,
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
 ) -> anyhow::Result<ExecutionOutcome> {
-    run_one_execution_observed(
-        project, catalog, color, clients, pod_name, tenant_id, namespace, cancellation, caller,
-    )
+    run_one_execution_observed(project, catalog, execution_id, clients, instance, tenant_id, cancellation, caller)
     .await
     .map(|drove| drove.outcome)
 }
@@ -179,11 +176,10 @@ pub(crate) struct Drove {
 pub(crate) async fn run_one_execution_observed(
     project: Arc<ProjectDefinition>,
     catalog: Arc<dyn NodeCatalog>,
-    color: Color,
+    execution_id: ExecutionId,
     clients: EngineClients,
-    pod_name: String,
+    instance: String,
     tenant_id: String,
-    namespace: String,
     cancellation: Arc<CancellationFlag>,
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
 ) -> anyhow::Result<Drove> {
@@ -213,7 +209,7 @@ pub(crate) async fn run_one_execution_observed(
     // primary exit signal.
     //
     // The pump takes the UNwrapped journal client: bus-row failures
-    // degrade per-bus without poisoning the drive (`drive_color` wraps
+    // degrade per-bus without poisoning the drive (`drive_execution_id` wraps
     // its own copy). Both live here, around the drive, so the shutdown
     // below runs whether the drive returned an outcome or an error: a
     // run that bailed out must not leave its buses open or its pump
@@ -224,22 +220,21 @@ pub(crate) async fn run_one_execution_observed(
     let bus_coordinator = crate::context::BusCoordinator::new(waits.clone());
     let bus_journal_task = tokio::spawn(crate::context::run_bus_journal_task(
         Arc::downgrade(&bus_coordinator),
-        color,
+        execution_id,
         journal.clone(),
-        pod_name.clone(),
+        instance.clone(),
     ));
     // A panic inside the drive (an engine invariant checked with a
     // panic, a bug) is an error out of the drive like any other: caught
     // here so the run still gets its Failed terminal below, instead of
     // unwinding past it and reading as running forever.
-    let drove = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(drive_color(
+    let drove = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(drive_execution_id(
         project,
         catalog,
-        color,
+        execution_id,
         clients,
-        pod_name.clone(),
+        instance.clone(),
         tenant_id,
-        namespace,
         cancellation,
         caller,
         waits,
@@ -249,12 +244,12 @@ pub(crate) async fn run_one_execution_observed(
     {
         Ok(drove) => drove,
         Err(panic) => Err(anyhow::anyhow!(
-            "the drive of color {color} panicked: {}",
+            "the drive of execution {execution_id} panicked: {}",
             panic_message(panic.as_ref())
         )),
     };
     // The run's terminal is written BEFORE the pump shuts down, on
-    // every path: `drive_color` wrote it on the way out, and an error
+    // every path: `drive_execution_id` wrote it on the way out, and an error
     // gets its Failed terminal here. The shutdown can only end in a
     // drained pump or a panic (a deadline miss on a wedged journal),
     // and a panic must not stand between the run and its end row.
@@ -264,7 +259,7 @@ pub(crate) async fn run_one_execution_observed(
         // the terminal: writing `Failed` in its place would misname a
         // run that completed, so the error goes back as it is.
         Err(e) if e.is::<TerminalUnwritten>() => Err(e),
-        Err(e) => Err(fail_before_terminal(journal.as_ref(), clock.as_ref(), color, &pod_name, e).await),
+        Err(e) => Err(fail_before_terminal(journal.as_ref(), clock.as_ref(), execution_id, &instance, e).await),
     };
     // Shut down the bus-journal pump. Append `Closed` to every live
     // bus, wait (notify-driven) for the pump to drain, drop the
@@ -279,7 +274,7 @@ pub(crate) async fn run_one_execution_observed(
     if let Err(e) = bus_journal_task.await {
         tracing::error!(
             target: "weft_engine::execution_driver",
-            color = %color,
+            execution_id = %execution_id,
             error = %e,
             "bus journal task ended abnormally; bus replay for this execution is degraded"
         );
@@ -319,17 +314,13 @@ impl std::error::Error for TerminalUnwritten {}
 /// every `?` in here ends the run, and the wrapper journals that end
 /// and closes the buses.
 #[allow(clippy::too_many_arguments)]
-async fn drive_color(
+async fn drive_execution_id(
     project: Arc<ProjectDefinition>,
     catalog: Arc<dyn NodeCatalog>,
-    color: Color,
+    execution_id: ExecutionId,
     clients: EngineClients,
-    pod_name: String,
+    instance: String,
     tenant_id: String,
-    // namespace: project namespace this worker pod runs in. Used to
-    // build the InfraProvisionContext passed to infra nodes during
-    // InfraSetup.
-    namespace: String,
     cancellation: Arc<CancellationFlag>,
     // The live caller connection for this execution, if any. `Some` only
     // on the worker that received a `live_connection` request; threaded
@@ -377,7 +368,7 @@ async fn drive_color(
     // landing mid-wait breaks us out instead of forcing the worker to
     // sit idle.
     let rows = tokio::select! {
-        rows = journal.rows_after(color, 0, FIRST_ROWS_WAIT) => rows?,
+        rows = journal.rows_after(execution_id, 0, FIRST_ROWS_WAIT) => rows?,
         _ = cancellation.cancelled() => {
             return Ok(Drove {
                 outcome: ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) },
@@ -397,24 +388,24 @@ async fn drive_color(
     // TriggerSetup execution).
     if events.is_empty() {
         anyhow::bail!(
-            "worker booted for color {color} but no ExecutionStarted \
+            "worker booted for execution {execution_id} but no ExecutionStarted \
              arrived within {}s; the dispatcher contract is broken",
             FIRST_ROWS_WAIT.as_secs()
         );
     }
-    // A terminal already in the journal means this color is finished:
+    // A terminal already in the journal means this execution is finished:
     // cancelled during the dispatcher's route window, or run to its end
     // by an earlier task. Refuse to drive it. This is the worker-side
     // half of the guard the dispatcher applies before it enqueues: the
     // enqueue can race a cancel, and an execute task's dedup key frees
     // once the first task completes, so a late re-run can enqueue a
-    // second execute for a color that already ran. Driving it would
+    // second execute for an execution that already ran. Driving it would
     // repeat every node body's side effects.
     if events.iter().any(weft_journal::ExecEvent::is_execution_terminal) {
         tracing::info!(
             target: "weft_engine::execution_driver",
-            color = %color,
-            "journal already holds a terminal for this color; not driving it"
+            execution_id = %execution_id,
+            "journal already holds a terminal for this execution; not driving it"
         );
         return Ok(Drove {
             outcome: ExecutionOutcome::AlreadySettled,
@@ -427,16 +418,16 @@ async fn drive_color(
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
     // ExecutionStarted, the journal is malformed and we fail loud.
-    let (phase, run_subgraph, member, member_values, run_kind) = events
+    let (phase, run_subgraph, member, member_values, picks, run_kind) = events
         .iter()
         .find_map(|e| match e {
-            weft_journal::ExecEvent::ExecutionStarted { phase, subgraph, member, member_values, run_kind, .. } => {
-                Some((*phase, subgraph.clone(), member.clone(), member_values.clone(), *run_kind))
+            weft_journal::ExecEvent::ExecutionStarted { phase, subgraph, member, member_values, picks, run_kind, .. } => {
+                Some((*phase, subgraph.clone(), member.clone(), member_values.clone(), picks.clone(), *run_kind))
             }
             _ => None,
         })
         .ok_or_else(|| anyhow::anyhow!(
-            "color {color} has journal events but no ExecutionStarted; \
+            "execution {execution_id} has journal events but no ExecutionStarted; \
              journal is malformed"
         ))?;
     // A setup phase is bounded by construction (the dispatcher
@@ -446,7 +437,7 @@ async fn drive_color(
     // skipped, so it is refused instead of run.
     if phase != weft_core::context::Phase::Fire && run_subgraph.is_none() {
         anyhow::bail!(
-            "color {color} is a {} run whose ExecutionStarted carries no subgraph; \
+            "execution {execution_id} is a {} run whose ExecutionStarted carries no subgraph; \
              the dispatcher contract is broken",
             phase.as_str()
         );
@@ -475,23 +466,23 @@ async fn drive_color(
     // One chain for the whole drive: the ancestors are terminal and
     // their rows never change.
     let projects = &clients.project;
-    let seed_chain = weft_journal::seed_chain(&events, |seed| journal.events_for_color(seed), |id, hash| async move {
+    let seed_chain = weft_journal::seed_chain(&events, |seed| journal.events_for_execution_id(seed), |id, hash| async move {
         projects.fetch_definition(id, &hash).await?
             .map(Arc::new).ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {id}"))
     }).await?;
     // The run's fold, kept for the whole drive and fed only the rows
     // that land after it (`LiveFold`).
-    let mut live = weft_journal::LiveFold::start(color, project_arc.clone(), &seed_chain, &rows)?;
+    let mut live = weft_journal::LiveFold::start(execution_id, project_arc.clone(), &seed_chain, &rows)?;
     drop(events);
-    let snap = checked_snapshot(color, &live)?;
+    let snap = checked_snapshot(execution_id, &live)?;
     let mut loop_runtime = LoopRuntime::new();
     let doomed = apply_snapshot(
         project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
         &mut loop_runtime,
     );
     fail_unresumable_stream_consumers(
-        doomed, color, project, &edge_idx, &mut pulses, &mut executions,
-        journal.as_ref(), &pod_name,
+        doomed, execution_id, project, &edge_idx, &mut pulses, &mut executions,
+        journal.as_ref(), &instance,
     )
     .await;
 
@@ -510,10 +501,10 @@ async fn drive_color(
     //
     // A wall-clock safety net guards against a pathological producer
     // (a buggy node that keeps emitting indefinitely, an external
-    // writer flooding the color despite pod fencing): if the refetch
+    // writer flooding the execution despite process fencing): if the refetch
     // loop has been spinning for more than this deadline without
     // reaching a terminal outcome, exit Stuck and surface the
-    // pathology rather than pin the pod's CPU forever. The deadline
+    // pathology rather than pin the process's CPU forever. The deadline
     // is generous so a legitimate burst of deliveries (say, a 10s
     // wave of webhook fires) completes naturally.
     const REFETCH_WALL_CLOCK_DEADLINE_SECS: u64 = 60;
@@ -526,12 +517,11 @@ async fn drive_color(
             &project_arc,
             &edge_idx,
             catalog.as_ref(),
-            color,
+            execution_id,
             &clients,
             &journal_poisoned,
-            &pod_name,
+            &instance,
             &tenant_id,
-            &namespace,
             &cancellation,
             &waits,
             &bus_coordinator,
@@ -544,6 +534,7 @@ async fn drive_color(
             phase,
             member.as_ref(),
             &member_values,
+            &picks,
             run_kind,
             dispatchable.as_ref(),
             &mut live,
@@ -586,11 +577,11 @@ async fn drive_color(
             if caller_warm {
                 // Tied run, hold expired with the caller still attached and
                 // no resolving signal: it cannot make progress and must not
-                // become a background job. Kill it (cancel the color); the
+                // become a background job. Kill it (cancel the execution); the
                 // connection layer surfaces the clear disconnect message.
                 tracing::warn!(
                     target: "weft_engine::resume",
-                    color = %color,
+                    execution_id = %execution_id,
                     hold_secs = effective_deadline.as_secs(),
                     "caller-tied run held past its hold time with no resolving signal; \
                      cancelling (a tied run cannot degrade into a background job)"
@@ -608,7 +599,7 @@ async fn drive_color(
             // dispatcher respawns on the next fire). Don't relabel.
             tracing::warn!(
                 target: "weft_engine::resume",
-                color = %color,
+                execution_id = %execution_id,
                 deadline_secs = effective_deadline.as_secs(),
                 outcome = ?outcome,
                 "refetch loop hit deadline; exiting with last drive outcome"
@@ -627,7 +618,7 @@ async fn drive_color(
             std::time::Duration::ZERO
         };
         let fresh = tokio::select! {
-            fresh = journal.rows_after(color, live.last_id(), hold) => fresh?,
+            fresh = journal.rows_after(execution_id, live.last_id(), hold) => fresh?,
             // A cancel while parked: nothing is running, so the cancel
             // walk below closes what is open and journals the terminal.
             _ = cancellation.cancelled() => {
@@ -646,19 +637,19 @@ async fn drive_color(
             break;
         }
         live.apply(&fresh)?;
-        let snap = checked_snapshot(color, &live)?;
+        let snap = checked_snapshot(execution_id, &live)?;
         let doomed = apply_snapshot(
             project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
             &mut loop_runtime,
         );
         fail_unresumable_stream_consumers(
-            doomed, color, project, &edge_idx, &mut pulses, &mut executions,
-            journal.as_ref(), &pod_name,
+            doomed, execution_id, project, &edge_idx, &mut pulses, &mut executions,
+            journal.as_ref(), &instance,
         )
         .await;
         tracing::info!(
             target: "weft_engine::resume",
-            color = %color,
+            execution_id = %execution_id,
             "read the journal's new rows after stall/stuck; re-driving"
         );
     }
@@ -669,7 +660,7 @@ async fn drive_color(
     // tracing without corrupting the terminal payload (the round-1
     // override of outcome made cancellation+pump_abort write a
     // Failed{"pump aborted"} terminal after NodeCancelled events, a
-    // self-contradictory journal). The caller (run_pod) discards the
+    // self-contradictory journal). The caller (run_instance) discards the
     // outcome variant via `.map(|_| ())`, so there is no return-value
     // path that needs the override either.
     let terminal = match &outcome {
@@ -683,12 +674,12 @@ async fn drive_color(
         // dispatcher) wrote its terminal first.
         ExecutionOutcome::Cancelled { cause } => {
             cancel_open_firings(
-                &mut executions, &mut pulses, &mut kicked, &mut loop_runtime, color, &project_arc,
-                &edge_idx, journal.as_ref(), &pod_name, &cause.to_string(), phase,
+                &mut executions, &mut pulses, &mut kicked, &mut loop_runtime, execution_id, &project_arc,
+                &edge_idx, journal.as_ref(), &instance, &cause.to_string(), phase,
                 dispatchable.as_ref(),
             )
             .await;
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), execution_id, &instance, &outcome).await
         }
         ExecutionOutcome::Completed | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
             // No worker-side storage cleanup here: the dispatcher's durable
@@ -697,7 +688,7 @@ async fn drive_color(
             // linger (so the user can still download a run's output), then
             // the broker's expiry sweep deletes them. A worker-side eager
             // delete would defeat that linger.
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), execution_id, &instance, &outcome).await
         }
         // Returned before the drive loop; unreachable here, and there
         // is nothing to journal for it anyway.
@@ -727,7 +718,7 @@ async fn drive_color(
 /// so the inherited nodes sit Completed in the table and only the stale
 /// ones dispatch. After that, each wake folds only the rows that landed
 /// since the last one.
-fn checked_snapshot(color: Color, live: &weft_journal::LiveFold) -> anyhow::Result<ExecutionSnapshot> {
+fn checked_snapshot(execution_id: ExecutionId, live: &weft_journal::LiveFold) -> anyhow::Result<ExecutionSnapshot> {
     let snap = live.snapshot();
     if snap.corruptions.is_empty() {
         return Ok(snap);
@@ -738,8 +729,8 @@ fn checked_snapshot(color: Color, live: &weft_journal::LiveFold) -> anyhow::Resu
         .map(|c| format!("{:?}: {}", c.site, c.reason))
         .collect();
     anyhow::bail!(
-        "the journal of color {color} cannot be folded over its program ({} row(s) rejected: \
-         {}); the execution cannot resume. `weft clean {color}` removes it.",
+        "the journal of execution {execution_id} cannot be folded over its program ({} row(s) rejected: \
+         {}); the execution cannot resume. `weft clean {execution_id}` removes it.",
         reasons.len(),
         reasons.join("; "),
     )
@@ -772,7 +763,7 @@ fn note_task_joined(
     joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
     task_firings: &mut HashMap<tokio::task::Id, FiringLocation>,
     task_tx: &mpsc::UnboundedSender<TaskMsg>,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> bool {
     match joined {
         Ok((task_id, ())) => task_firings.remove(&task_id).is_some(),
@@ -783,7 +774,7 @@ fn note_task_joined(
                     let err = format!("node task panicked: {join_err}");
                     tracing::error!(
                         target: "weft_engine::execution_driver",
-                        color = %color,
+                        execution_id = %execution_id,
                         node = %loc.node_id,
                         frames = ?loc.frames,
                         error = %err,
@@ -802,7 +793,7 @@ fn note_task_joined(
                     // edge).
                     let _ = task_tx.send(TaskMsg::Terminal {
                         loc,
-                        color,
+                        execution_id,
                         outcome: NodeTaskOutcome::Failed(err),
                     });
                     true
@@ -813,7 +804,7 @@ fn note_task_joined(
                     // silently drop it.
                     tracing::error!(
                         target: "weft_engine::execution_driver",
-                        color = %color,
+                        execution_id = %execution_id,
                         error = %join_err,
                         "in-flight task panicked with no recorded firing; engine invariant violated"
                     );
@@ -955,12 +946,13 @@ fn apply_snapshot(
     // Crashed-worker recovery: a `Running` firing with no terminal in
     // the journal is assumed to belong to a worker that DIED mid-node;
     // we un-absorb its pulses and re-run it. This is only safe because
-    // at most ONE worker exists per color at a time: the dispatcher's
-    // spawn path dedups (enqueue-dedup key + the partial unique index
-    // on worker_pod + a NOT-EXISTS-live-pod check in cold_start), so a
-    // fresh worker can't re-fold and re-run a node body while the prior
-    // worker is still alive and about to ship its own NodeCompleted. If
-    // that one-worker-per-color invariant ever broke, this re-run would
+    // at most ONE worker drives an execution at a time: its execute or
+    // resume task is claimed by one instance under a lease, the claim
+    // makes that instance the execution's owner (`execution.owner_instance`),
+    // and the broker refuses journal writes from anyone else. So a prior
+    // worker whose claim lapsed cannot ship its own NodeCompleted after a
+    // fresh one re-folds and re-runs the node body. If that
+    // one-worker-per-execution invariant ever broke, this re-run would
     // double-execute the node (double LLM spend / double side-effects).
     // This crashed-Running set is unique to the boot-time path: mid-
     // drive (`resume_resolved_suspensions_in_place`) a Running exec is a
@@ -1009,13 +1001,13 @@ fn apply_snapshot(
 #[allow(clippy::too_many_arguments)]
 async fn fail_unresumable_stream_consumers(
     doomed: Vec<FiringLocation>,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
 ) {
     for loc in doomed {
         let err = format!(
@@ -1027,10 +1019,10 @@ async fn fail_unresumable_stream_consumers(
         // The record came out of the refold with the ports the firing
         // had already emitted on; those keep their values, as on the
         // fold's reading of the NodeFailed row.
-        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
+        let mentioned = mentioned_ports(executions, &loc.node_id, execution_id, &loc.frames);
         handle_node_failure(
-            &loc.node_id, &mentioned, color, &loc.frames, &err, project, edge_idx, pulses,
-            executions, journal, pod_name,
+            &loc.node_id, &mentioned, execution_id, &loc.frames, &err, project, edge_idx, pulses,
+            executions, journal, instance,
         )
         .await;
     }
@@ -1052,14 +1044,14 @@ async fn fail_unresumable_stream_consumers(
 /// crashed-Running half is deliberately omitted: mid-flight a Running
 /// exec is a live task, not a dead one).
 fn resume_resolved_suspensions_in_place(
-    color: Color,
+    execution_id: ExecutionId,
     live: &weft_journal::LiveFold,
     executions: &NodeExecutionTable,
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> anyhow::Result<usize> {
-    let snap = checked_snapshot(color, live)?;
+    let snap = checked_snapshot(execution_id, live)?;
 
     // Which parked nodes have their CURRENT suspension resolved now?
     // Computed against the FRESHLY-FOLDED sequences (the live map is
@@ -1095,14 +1087,11 @@ async fn drive(
     project_arc: &Arc<ProjectDefinition>,
     edge_idx: &EdgeIndex,
     catalog: &dyn NodeCatalog,
-    color: Color,
+    execution_id: ExecutionId,
     clients: &EngineClients,
     journal_poisoned: &std::sync::atomic::AtomicBool,
-    pod_name: &str,
+    instance: &str,
     tenant_id: &str,
-    // namespace: project namespace this worker is running in. Used
-    // to populate InfraProvisionContext when dispatching infra nodes.
-    namespace: &str,
     cancellation: &Arc<CancellationFlag>,
     waits: &Arc<crate::wait_tracker::WaitTracker>,
     bus_coordinator: &Arc<crate::context::BusCoordinator>,
@@ -1119,6 +1108,10 @@ async fn drive(
     // What that member provides, as the run was born with it (its
     // `ExecutionStarted`): every `@member_filled` field reads these.
     member_values: &weft_core::member::MemberValues,
+    // The install's picks, as the run was born with them (its
+    // `ExecutionStarted`): every connection picked on the install reads
+    // these.
+    picks: &weft_core::picks::Picks,
     // What the run is, from its `ExecutionStarted`: an unrecorded run's
     // firings refuse to wait.
     run_kind: weft_core::exec::RunKind,
@@ -1172,7 +1165,7 @@ async fn drive(
     // ends NOW; loops with items still pending re-delivery settle
     // later through the normal stream_push / LoopOut chain.
     settle_rehydrated_stream_ends(
-        project, edge_idx, pulses, executions, journal, pod_name, color,
+        project, edge_idx, pulses, executions, journal, instance, execution_id,
         loop_runtime, &mut stream_rt,
     )
     .await;
@@ -1210,10 +1203,10 @@ async fn drive(
         // divergence (every later refold rebuilds a different world).
         // Stop here: the error becomes the run's Failed terminal
         // (`run_one_execution`), which is the only end this run gets,
-        // since nothing respawns a color whose task failed.
+        // since nothing respawns an execution whose task failed.
         if journal_poisoned.load(std::sync::atomic::Ordering::Acquire) {
             anyhow::bail!(
-                "a journal write failed mid-drive for color {color}; the journal no longer \
+                "a journal write failed mid-drive for execution {execution_id}; the journal no longer \
                  holds what the worker did, so the run cannot go on"
             );
         }
@@ -1237,7 +1230,7 @@ async fn drive(
         if cancellation.is_cancelled() {
             tracing::info!(
                 target: "weft_engine::execution_driver",
-                color = %color,
+                execution_id = %execution_id,
                 in_flight = in_flight.len(),
                 "cancellation observed at loop top; draining in-flight tasks"
             );
@@ -1246,12 +1239,12 @@ async fn drive(
                 &mut task_rx,
                 &mut waiting,
                 executions,
-                color,
+                execution_id,
                 project,
                 edge_idx,
                 pulses,
                 journal,
-                pod_name,
+                instance,
                 loop_runtime,
                 kicked,
                 &mut stream_rt,
@@ -1275,7 +1268,7 @@ async fn drive(
         // yield_downstream'ed into any of those is parked on the
         // pulses; its wait fails loudly instead of hanging.
         let pass = settle_table(
-            project, edge_idx, phase, dispatchable, color, now_unix(), pulses, executions, kicked,
+            project, edge_idx, phase, dispatchable, execution_id, now_unix(), pulses, executions, kicked,
         );
         let boundaries = pass.boundaries;
         for b in &boundaries {
@@ -1337,7 +1330,7 @@ async fn drive(
         // consumer sees an end. Routing still precedes readiness so a running
         // consumer cannot dispatch a second time over its queued items.
         let acted = route_stream_pulses(
-            color, project, edge_idx, pulses, executions, journal, pod_name,
+            execution_id, project, edge_idx, pulses, executions, journal, instance,
             &mut stream_rt, loop_runtime, kicked,
         ).await;
         if acted > 0 { idled_since_progress = false; }
@@ -1487,7 +1480,7 @@ async fn drive(
                 // outputs supply a source without running its body.
                 ready.push((
                     loc.node_id.clone(),
-                    weft_core::exec::ready::kicked_group(def, info, &loc.frames, color, project, edge_idx),
+                    weft_core::exec::ready::kicked_group(def, info, &loc.frames, execution_id, project, edge_idx),
                 ));
             }
             info.dispatched = true;
@@ -1496,7 +1489,7 @@ async fn drive(
             let ids: Vec<&str> = ready.iter().map(|(id, _)| id.as_str()).collect();
             tracing::info!(
                 target: "weft_engine::execution_driver",
-                color = %color,
+                execution_id = %execution_id,
                 ready_ids = ?ids,
                 "ready batch"
             );
@@ -1516,7 +1509,7 @@ async fn drive(
             tracing::info!(
                 target: "weft_engine::execution_driver",
                 node = %node_id,
-                color = %group.color,
+                execution_id = %group.execution_id,
                 frames = ?group.frames,
                 "dispatching ready group"
             );
@@ -1671,7 +1664,7 @@ async fn drive(
                     node_id: node_id.clone(),
                     status: NodeExecutionStatus::Running,
                     pulses_absorbed: absorbed_now.clone(),
-                    ordinal: next_firing_ordinal(executions, &node_id, group.color, &group.frames),
+                    ordinal: next_firing_ordinal(executions, &node_id, group.execution_id, &group.frames),
                     error: group.error.clone(),
                     callback_id: None,
                     started_at: now_unix(),
@@ -1680,7 +1673,7 @@ async fn drive(
                     logs: Vec::new(),
                     mentioned_ports: Default::default(),
                     closed_output_ports: Default::default(),
-                    color: group.color,
+                    execution_id: group.execution_id,
                     frames: group.frames.clone(),
                     inherited_from: None,
                 };
@@ -1701,14 +1694,14 @@ async fn drive(
             // on every respawn. A skipped/failed firing is still a firing
             // the fold must reconstruct.
             ship_node_lifecycle(
-                journal, pod_name, color, &node_id, &group.frames,
+                journal, instance, execution_id, &node_id, &group.frames,
                 parked_token.as_deref(), is_resume,
             ).await;
 
             if let Some(reason) = &group.skip {
                 handle_node_skip(
-                    &node_id, group.color, &group.frames, reason,
-                    project, edge_idx, pulses, executions, kicked, journal, pod_name,
+                    &node_id, group.execution_id, &group.frames, reason,
+                    project, edge_idx, pulses, executions, kicked, journal, instance,
                 )
                 .await;
                 continue;
@@ -1720,8 +1713,8 @@ async fn drive(
                 // declared output port.
                 let mentioned = std::collections::HashSet::new();
                 handle_node_failure(
-                    &node_id, &mentioned, group.color, &group.frames, err,
-                    project, edge_idx, pulses, executions, journal, pod_name,
+                    &node_id, &mentioned, group.execution_id, &group.frames, err,
+                    project, edge_idx, pulses, executions, journal, instance,
                 )
                 .await;
                 continue;
@@ -1736,7 +1729,7 @@ async fn drive(
             // by the common path above; these ship NodeCompleted here
             // after the inline handler returns, and run synchronously
             // (there is no async body to spawn).
-            if matches!(node_def.node_type.as_str(), "LoopIn" | "LoopOut") {
+            if matches!(node_def.node_type.as_str(), weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT) {
                 let outcome = handle_loop_boundary_firing(
                     node_def,
                     &group,
@@ -1744,7 +1737,7 @@ async fn drive(
                     edge_idx,
                     pulses,
                     journal,
-                    pod_name,
+                    instance,
                     loop_runtime,
                     &mut stream_rt,
                     kicked,
@@ -1752,15 +1745,15 @@ async fn drive(
                 .await;
                 match outcome {
                     Ok(()) => {
-                        mark_completed(executions, &node_id, color, &group.frames);
+                        mark_completed(executions, &node_id, execution_id, &group.frames);
                         // Loop boundary: closures are the loop machinery's
                         // job, not the generic sweep.
-                        ship_node_completed(journal, pod_name, color, &node_id, &group.frames).await;
+                        ship_node_completed(journal, instance, execution_id, &node_id, &group.frames).await;
                     }
                     Err(err) => {
                         handle_loop_boundary_failure(
-                            node_def, color, &group.frames, &err,
-                            project, edge_idx, pulses, executions, journal, pod_name,
+                            node_def, execution_id, &group.frames, &err,
+                            project, edge_idx, pulses, executions, journal, instance,
                             loop_runtime,
                         )
                         .await;
@@ -1775,8 +1768,8 @@ async fn drive(
                     let err = format!("unknown node type: {}", node_def.node_type);
                     let mentioned = std::collections::HashSet::new();
                     handle_node_failure(
-                        &node_id, &mentioned, group.color, &group.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name,
+                        &node_id, &mentioned, group.execution_id, &group.frames, &err,
+                        project, edge_idx, pulses, executions, journal, instance,
                     )
                     .await;
                     continue;
@@ -1838,13 +1831,13 @@ async fn drive(
                 // orphan.
                 if let Some(err) = feed_error {
                     retire_consumer_streams(
-                        project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                        project, &loc, group.execution_id, pulses, journal, instance, &mut stream_rt,
                     )
                     .await;
                     handle_node_failure(
-                        &node_id, &std::collections::HashSet::new(), group.color,
+                        &node_id, &std::collections::HashSet::new(), group.execution_id,
                         &group.frames, &err, project, edge_idx, pulses, executions,
-                        journal, pod_name,
+                        journal, instance,
                     )
                     .await;
                     continue;
@@ -1866,9 +1859,13 @@ async fn drive(
             };
             //
             // A `@member_filled` field takes what the run's member
-            // provides at this place, as the run was born with it, in the
-            // place a value written in the source would sit.
-            let delivered = with_member_values(node_def, &place, member, member_values, owned_bag(&group.received.input));
+            // provides at this place, and a connection picked on the
+            // install takes the install's pick, both as the run was born
+            // with them, in the place a value written in the source
+            // would sit.
+            let mut bag = owned_bag(&group.received.input);
+            weft_core::picks::fill_picks(node_def, &mut bag, picks.get(&place));
+            let delivered = with_member_values(node_def, &place, member, member_values, bag);
             let inputs = match delivered.and_then(|delivered| {
                 weft_core::context::node_input_bag(node_def, delivered, &group.received.closed_ports)
             }) {
@@ -1883,14 +1880,14 @@ async fn drive(
                     if !generator_ports.is_empty() {
                         let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                         retire_consumer_streams(
-                            project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                            project, &loc, group.execution_id, pulses, journal, instance, &mut stream_rt,
                         )
                         .await;
                     }
                     let mentioned = std::collections::HashSet::new();
                     handle_node_failure(
-                        &node_id, &mentioned, group.color, &group.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name,
+                        &node_id, &mentioned, group.execution_id, &group.frames, &err,
+                        project, edge_idx, pulses, executions, journal, instance,
                     )
                     .await;
                     continue;
@@ -1921,14 +1918,14 @@ async fn drive(
             let wake_payload = kick_payloads.remove(&FiringLocation::new(node_id.clone(), group.frames.clone()));
             let mut runner = RunnerHandle::new(
                 project.id,
-                group.color,
+                group.execution_id,
                 node_id.clone(),
                 place.clone(),
                 node_def.node_type.clone(),
                 group.frames.clone(),
                 clients.clone(),
                 node_def.published_service.clone(),
-                pod_name.to_string(),
+                instance.to_string(),
                 tenant_id.to_string(),
                 cancellation.clone(),
                 waits.clone(),
@@ -1978,7 +1975,7 @@ async fn drive(
                 node_id.clone(),
                 node_def.node_type.clone(),
                 node_def.label.clone(),
-                group.color,
+                group.execution_id,
                 group.frames.clone(),
                 member.cloned(),
                 inputs,
@@ -2004,14 +2001,14 @@ async fn drive(
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(
-                        project, &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                        project, &loc, group.execution_id, pulses, journal, instance, &mut stream_rt,
                     )
                     .await;
                 }
                 let mentioned = std::collections::HashSet::new();
                 handle_node_failure(
-                    &node_id, &mentioned, group.color, &group.frames, &err,
-                    project, edge_idx, pulses, executions, journal, pod_name,
+                    &node_id, &mentioned, group.execution_id, &group.frames, &err,
+                    project, edge_idx, pulses, executions, journal, instance,
                 )
                 .await;
                 continue;
@@ -2031,7 +2028,7 @@ async fn drive(
             //      The supervisor that owns the project claims it,
             //      compiles and hashes the spec, picks skip / fresh /
             //      replace against the prior applied state, and applies
-            //      through the Kubernetes API. Failure here = node
+            //      through the platform's infra host. Failure here = node
             //      fails with stage "apply".
             //   3. `node_impl.run(ctx)` runs as usual, with
             //      `ctx.endpoint(name)` now resolving against the
@@ -2052,7 +2049,7 @@ async fn drive(
             let body = node_body_for(phase, node_def.features.is_trigger, has_wake);
             let tx = task_tx.clone();
             let loc_task = FiringLocation::new(node_id.clone(), group.frames.clone());
-            let color_task = group.color;
+            let execution_id_task = group.execution_id;
             // node_impl is &'static dyn Node (see NodeCatalog::lookup
             // contract). No allocation or unsafe needed.
             let is_infra_setup_provision =
@@ -2061,7 +2058,6 @@ async fn drive(
             let provision_project = project.id;
             let provision_place = place;
             let provision_tenant_id = tenant_id.to_string();
-            let provision_namespace = namespace.to_string();
             let provision_clients = clients.clone();
             let provision_copy =
                 weft_core::member::copy_owner(node_def.per_member, member).cloned();
@@ -2071,7 +2067,6 @@ async fn drive(
                     let infra_ctx = weft_core::infra::InfraProvisionContext::new(
                         provision_project_id,
                         provision_place.clone(),
-                        provision_namespace.clone(),
                         provision_tenant_id.clone(),
                     );
                     let spec = match node_impl.provision_infra(infra_ctx, provision_input).await {
@@ -2079,7 +2074,7 @@ async fn drive(
                         Err(e) => {
                             let _ = tx.send(TaskMsg::Terminal {
                                 loc: loc_task,
-                                color: color_task,
+                                execution_id: execution_id_task,
                                 outcome: NodeTaskOutcome::Failed(format!("provision: {e}")),
                             });
                             return;
@@ -2120,7 +2115,7 @@ async fn drive(
                     {
                         let _ = tx.send(TaskMsg::Terminal {
                             loc: loc_task,
-                            color: color_task,
+                            execution_id: execution_id_task,
                             outcome: NodeTaskOutcome::Failed(format!("apply: {e}")),
                         });
                         return;
@@ -2158,7 +2153,7 @@ async fn drive(
                 };
                 let _ = tx.send(TaskMsg::Terminal {
                     loc: loc_task,
-                    color: color_task,
+                    execution_id: execution_id_task,
                     outcome,
                 });
             });
@@ -2176,7 +2171,7 @@ async fn drive(
         // read free with a record still Running.
         let mut freed_a_location = false;
         while let Some(joined) = in_flight.try_join_next_with_id() {
-            freed_a_location |= note_task_joined(joined, &mut task_firings, &task_tx, color);
+            freed_a_location |= note_task_joined(joined, &mut task_firings, &task_tx, execution_id);
         }
 
         // Drain the task channel in FIFO order: each `Emission`
@@ -2191,13 +2186,13 @@ async fn drive(
         // keep dispatching newly-ready nodes next iteration.
         let progress = apply_task_msgs(
             &mut task_rx,
-            color,
+            execution_id,
             project,
             edge_idx,
             pulses,
             executions,
             journal,
-            pod_name,
+            instance,
             &mut waiting,
             &mut stream_rt,
             /* is_cancel = */ false,
@@ -2349,7 +2344,7 @@ async fn drive(
             if bus_coordinator.has_live_buses() {
                 tracing::warn!(
                     target: "weft_engine::execution_driver",
-                    color = %color,
+                    execution_id = %execution_id,
                     in_flight = in_flight.len(),
                     parked_nodes = waits.parked_nodes_count(),
                     "every in-flight task is parked with no unconsumed \
@@ -2365,7 +2360,7 @@ async fn drive(
                 // tasks unwind; the next iterations drain them.
                 tracing::warn!(
                     target: "weft_engine::execution_driver",
-                    color = %color,
+                    execution_id = %execution_id,
                     in_flight = in_flight.len(),
                     parked_nodes = waits.parked_nodes_count(),
                     "every in-flight task is parked on a stream pull or an \
@@ -2410,7 +2405,7 @@ async fn drive(
         // reads the journal here.
         if bus_coordinator.has_live_buses() && waiting_count(executions) > 0 {
             if resume_wait.is_none() {
-                resume_wait = Some(journal.rows_after(color, live.last_id(), weft_task_store::pg_signal::MAX_HOLD));
+                resume_wait = Some(journal.rows_after(execution_id, live.last_id(), weft_task_store::pg_signal::MAX_HOLD));
             }
         } else {
             resume_wait = None;
@@ -2445,12 +2440,12 @@ async fn drive(
                 if !fresh.is_empty() {
                     live.apply(&fresh)?;
                     let resumed = resume_resolved_suspensions_in_place(
-                        color, live, executions, pulses, kicked, &mut awaited_sequences,
+                        execution_id, live, executions, pulses, kicked, &mut awaited_sequences,
                     )?;
                     if resumed > 0 {
                         tracing::info!(
                             target: "weft_engine::resume",
-                            color = %color,
+                            execution_id = %execution_id,
                             resumed,
                             "bus-held worker resumed suspension(s) in process; bus untouched"
                         );
@@ -2465,7 +2460,7 @@ async fn drive(
                 if let Some(joined) = joined {
                     // The next turn rescans regardless, so the freed
                     // flag is not needed here.
-                    note_task_joined(joined, &mut task_firings, &task_tx, color);
+                    note_task_joined(joined, &mut task_firings, &task_tx, execution_id);
                 }
             }
             task_msg = task_rx.recv() => {
@@ -2476,7 +2471,7 @@ async fn drive(
                 // emission journals NodeFailed.
                 if let Some(msg) = task_msg {
                     apply_one_task_msg(
-                        msg, color, project, edge_idx, pulses, executions, journal, pod_name,
+                        msg, execution_id, project, edge_idx, pulses, executions, journal, instance,
                         &mut waiting,
                         &mut stream_rt,
                         /* is_cancel = */ false,
@@ -2491,7 +2486,7 @@ async fn drive(
             _ = cancellation.cancelled() => {
                 tracing::info!(
                     target: "weft_engine::execution_driver",
-                    color = %color,
+                    execution_id = %execution_id,
                     "cancellation observed at idle wait; exiting Cancelled"
                 );
                 cancel_cleanup(
@@ -2499,12 +2494,12 @@ async fn drive(
                     &mut task_rx,
                     &mut waiting,
                     executions,
-                        color,
+                        execution_id,
                     project,
                     edge_idx,
                     pulses,
                     journal,
-                    pod_name,
+                    instance,
                     loop_runtime,
                     kicked,
                     &mut stream_rt,
@@ -2533,7 +2528,7 @@ async fn drive(
 /// (`terminal_sweep_emission`, keyed on the firing's ordinal at its
 /// location), so the closures it puts on the wires are these.
 #[allow(clippy::too_many_arguments)]
-/// The ordinal of the firing being ENDED at `(node, color, frames)`,
+/// The ordinal of the firing being ENDED at `(node, execution_id, frames)`,
 /// which keys its termination sweep. Every ending path (a completion,
 /// a failure, a skip, a cancel) follows the dispatch that opened the
 /// record, so no record is an engine invariant broken: a sweep under
@@ -2569,10 +2564,10 @@ fn with_member_values(
 fn ended_firing_ordinal(
     executions: &NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
 ) -> usize {
-    latest_firing(executions, node_id, color, frames)
+    latest_firing(executions, node_id, execution_id, frames)
         .unwrap_or_else(|| panic!("ending a firing of '{node_id}' at {frames:?} that has no record"))
         .ordinal
 }
@@ -2580,7 +2575,7 @@ fn ended_firing_ordinal(
 fn build_unmentioned_closures(
     node_id: &str,
     mentioned: &std::collections::HashSet<String>,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
@@ -2604,7 +2599,7 @@ fn build_unmentioned_closures(
         return Vec::new();
     }
     let emission_id =
-        terminal_sweep_emission(node_id, frames, ended_firing_ordinal(executions, node_id, color, frames));
+        terminal_sweep_emission(node_id, frames, ended_firing_ordinal(executions, node_id, execution_id, frames));
     let mut emissions = Vec::new();
     // Teardown cannot propagate (this is the shared tail of failure /
     // skip / completion paths), so a sweep error (node or port missing
@@ -2612,8 +2607,8 @@ fn build_unmentioned_closures(
     // level here, the single chokepoint. Partial emissions still land
     // so whatever closed before the error reaches downstream.
     if let Err(e) = close_unmentioned_downstream(
-        node_id, mentioned, emission_id, color, frames, project, pulses, edge_idx, &mut emissions,
-        failure, &latest_firing(executions, node_id, color, frames).map(|record| record.closed_output_ports.clone()).unwrap_or_default(),
+        node_id, mentioned, emission_id, execution_id, frames, project, pulses, edge_idx, &mut emissions,
+        failure, &latest_firing(executions, node_id, execution_id, frames).map(|record| record.closed_output_ports.clone()).unwrap_or_default(),
     ) {
         tracing::error!(
             target: "weft_engine::execution_driver",
@@ -2634,7 +2629,7 @@ fn is_loop_boundary_node(project: &ProjectDefinition, node_id: &str) -> bool {
         .nodes
         .iter()
         .find(|n| n.id == node_id)
-        .map(|n| n.node_type == "LoopIn" || n.node_type == "LoopOut")
+        .map(|n| n.node_type == weft_core::project::boundary_types::LOOP_IN || n.node_type == weft_core::project::boundary_types::LOOP_OUT)
         .unwrap_or(false)
 }
 
@@ -2656,14 +2651,14 @@ pub(crate) async fn handle_loop_boundary_firing(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
     use weft_core::primitive::LoopTerminationReason;
 
-    let key = loops::instance_key(node_def, &group.frames, group.color)?;
+    let key = loops::instance_key(node_def, &group.frames, group.execution_id)?;
     let group_id = key.group_id.clone();
 
     // A boundary firing over an instance that already terminated FAILED
@@ -2690,18 +2685,18 @@ pub(crate) async fn handle_loop_boundary_firing(
         ));
     }
 
-    if node_def.node_type == "LoopIn" {
-        let firing = instantiate(loop_runtime, node_def, project, &group.received, &group.frames, group.color)?;
+    if node_def.node_type == weft_core::project::boundary_types::LOOP_IN {
+        let firing = instantiate(loop_runtime, node_def, project, &group.received, &group.frames, group.execution_id)?;
         if firing.first_instantiation {
-            crate::context::record_from_pod(
+            crate::context::record_from_instance(
                 journal,
                 weft_journal::ExecEvent::LoopInstantiated {
-                    color: group.color,
+                    execution_id: group.execution_id,
                     group_id: group_id.clone(),
                     parent_frames: group.frames.clone(),
                     at_unix: now_unix(),
                 },
-                pod_name,
+                instance,
             )
             .await;
         }
@@ -2762,7 +2757,7 @@ pub(crate) async fn handle_loop_boundary_firing(
             match loop_runtime.emit_outward(&key, reason)? {
                 LoopAdvance::EmitOutward { reason, gather, carry } => {
                     emit_loop_outward(
-                        project, edge_idx, pulses, journal, pod_name, &key, gather, carry, reason,
+                        project, edge_idx, pulses, journal, instance, &key, gather, carry, reason,
                         loop_runtime,
                     )
                     .await?;
@@ -2784,7 +2779,7 @@ pub(crate) async fn handle_loop_boundary_firing(
         } else {
             for index in to_launch {
                 launch_iteration(
-                    project, edge_idx, pulses, journal, pod_name, &key, index, None, loop_runtime,
+                    project, edge_idx, pulses, journal, instance, &key, index, None, loop_runtime,
                     kicked,
                 )
                 .await?;
@@ -2819,16 +2814,16 @@ pub(crate) async fn handle_loop_boundary_firing(
         // already holds (crash-resume replay) would diverge the
         // rehydrated instance from the live one.
         if loop_runtime.loop_out_is_new(&key, index)? {
-            crate::context::record_from_pod(
+            crate::context::record_from_instance(
                 journal,
                 weft_journal::ExecEvent::LoopOutFired {
-                    color: group.color,
+                    execution_id: group.execution_id,
                     group_id: group_id.clone(),
                     parent_frames: key.parent_frames.clone(),
                     index,
                     at_unix: now_unix(),
                 },
-                pod_name,
+                instance,
             )
             .await;
         }
@@ -2840,21 +2835,21 @@ pub(crate) async fn handle_loop_boundary_firing(
             LoopAdvance::Idle => Ok(()),
             LoopAdvance::LaunchNext { index: next, stream_item: Some(item) } => {
                 launch_stream_iteration(
-                    project, edge_idx, pulses, journal, pod_name, &key, next, item, loop_runtime,
+                    project, edge_idx, pulses, journal, instance, &key, next, item, loop_runtime,
                     stream_rt, kicked,
                 )
                 .await
             }
             LoopAdvance::LaunchNext { index: next, stream_item: None } => {
                 launch_iteration(
-                    project, edge_idx, pulses, journal, pod_name, &key, next, None, loop_runtime,
+                    project, edge_idx, pulses, journal, instance, &key, next, None, loop_runtime,
                     kicked,
                 )
                 .await
             }
             LoopAdvance::EmitOutward { reason, gather, carry } => {
                 emit_loop_outward(
-                    project, edge_idx, pulses, journal, pod_name, &key, gather, carry, reason,
+                    project, edge_idx, pulses, journal, instance, &key, gather, carry, reason,
                     loop_runtime,
                 )
                 .await?;
@@ -2863,7 +2858,7 @@ pub(crate) async fn handle_loop_boundary_firing(
                 // can never launch, so drop them durably.
                 let loop_in_id = weft_core::project::boundary_in_id(&group_id);
                 drop_loop_stream_leftovers(
-                    &key, &loop_in_id, group.color, pulses, journal, pod_name,
+                    &key, &loop_in_id, group.execution_id, pulses, journal, instance,
                     loop_runtime, stream_rt,
                 )
                 .await;
@@ -2886,7 +2881,7 @@ pub(crate) async fn launch_iteration(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     key: &weft_core::primitive::LoopInstanceKey,
     index: u32,
     stream_item: Option<LoopStreamItem>,
@@ -2897,17 +2892,17 @@ pub(crate) async fn launch_iteration(
     let launch = loops::launch_iteration(
         loop_runtime, key, index, stream_item, project, edge_idx, pulses,
     )?;
-    crate::context::record_from_pod(
+    crate::context::record_from_instance(
         journal,
         weft_journal::ExecEvent::LoopIterationLaunched {
-            color: key.color,
+            execution_id: key.execution_id,
             group_id: key.group_id.clone(),
             parent_frames: key.parent_frames.clone(),
             index,
             stream_pulse,
             at_unix: now_unix(),
         },
-        pod_name,
+        instance,
     )
     .await;
     kick_scope(kicked, &launch.roots, &launch.body_frames, None);
@@ -2934,7 +2929,7 @@ pub(crate) async fn emit_loop_outward(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     key: &weft_core::primitive::LoopInstanceKey,
     gather: HashMap<String, Vec<Option<Arc<serde_json::Value>>>>,
     carry: HashMap<String, Arc<serde_json::Value>>,
@@ -2943,7 +2938,7 @@ pub(crate) async fn emit_loop_outward(
 ) -> Result<(), String> {
     match loops::emit_loop_outward(key, gather, carry, project, edge_idx, pulses) {
         Ok((_output, _emissions)) => {
-            journal_loop_terminated(journal, pod_name, key, reason).await;
+            journal_loop_terminated(journal, instance, key, reason).await;
             Ok(())
         }
         Err(e) => {
@@ -2956,7 +2951,7 @@ pub(crate) async fn emit_loop_outward(
                 inst.terminated = Some(failed);
             }
             close_loop_outward(key, project, edge_idx, pulses, failed);
-            journal_loop_terminated(journal, pod_name, key, failed).await;
+            journal_loop_terminated(journal, instance, key, failed).await;
             Err(e)
         }
     }
@@ -2964,20 +2959,20 @@ pub(crate) async fn emit_loop_outward(
 
 async fn journal_loop_terminated(
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     key: &weft_core::primitive::LoopInstanceKey,
     reason: weft_core::primitive::LoopTerminationReason,
 ) {
-    crate::context::record_from_pod(
+    crate::context::record_from_instance(
         journal,
         weft_journal::ExecEvent::LoopTerminated {
-            color: key.color,
+            execution_id: key.execution_id,
             group_id: key.group_id.clone(),
             parent_frames: key.parent_frames.clone(),
             reason,
             at_unix: now_unix(),
         },
-        pod_name,
+        instance,
     )
     .await;
 }
@@ -3005,7 +3000,7 @@ async fn journal_loop_terminated(
 #[allow(clippy::too_many_arguments)]
 async fn handle_loop_boundary_failure(
     node_def: &weft_core::project::NodeDefinition,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     err: &str,
     project: &ProjectDefinition,
@@ -3013,12 +3008,12 @@ async fn handle_loop_boundary_failure(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     loop_runtime: &mut LoopRuntime,
 ) {
     use weft_core::primitive::LoopTerminationReason;
 
-    let key = match loops::instance_key(node_def, frames, color) {
+    let key = match loops::instance_key(node_def, frames, execution_id) {
         Ok(key) => key,
         Err(e) => {
             // Unreachable for LoopIn/LoopOut (the compiler always sets
@@ -3032,8 +3027,8 @@ async fn handle_loop_boundary_failure(
             );
             let mentioned = std::collections::HashSet::new();
             handle_node_failure(
-                &node_def.id, &mentioned, color, frames, err,
-                project, edge_idx, pulses, executions, journal, pod_name,
+                &node_def.id, &mentioned, execution_id, frames, err,
+                project, edge_idx, pulses, executions, journal, instance,
             )
             .await;
             return;
@@ -3047,7 +3042,7 @@ async fn handle_loop_boundary_failure(
                 .terminate(&key, LoopTerminationReason::Failed)
                 .expect("the instance was found live just above");
             close_loop_outward(&key, project, edge_idx, pulses, LoopTerminationReason::Failed);
-            journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Failed).await;
+            journal_loop_terminated(journal, instance, &key, LoopTerminationReason::Failed).await;
         }
         // ALREADY terminated: the prior LoopTerminated closed the
         // outward surface.
@@ -3064,8 +3059,8 @@ async fn handle_loop_boundary_failure(
     // boundary anyway).
     let mentioned = std::collections::HashSet::new();
     handle_node_failure(
-        &node_def.id, &mentioned, color, frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name,
+        &node_def.id, &mentioned, execution_id, frames, err, project, edge_idx, pulses, executions,
+        journal, instance,
     )
     .await;
 }
@@ -3081,7 +3076,7 @@ async fn handle_loop_boundary_failure(
 async fn handle_node_failure(
     node_id: &str,
     mentioned: &std::collections::HashSet<String>,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     err: &str,
     project: &ProjectDefinition,
@@ -3089,16 +3084,16 @@ async fn handle_node_failure(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
 ) {
-    mark_failed(executions, node_id, color, frames, err);
+    mark_failed(executions, node_id, execution_id, frames, err);
     // The closures on every unmentioned port go on the wires in RAM;
     // the NodeFailed row is the fact the fold sweeps the same ports
     // from.
     build_unmentioned_closures(
-        node_id, mentioned, color, frames, project, edge_idx, pulses, executions, Some(err),
+        node_id, mentioned, execution_id, frames, project, edge_idx, pulses, executions, Some(err),
     );
-    ship_node_failed(journal, pod_name, color, node_id, frames, err).await;
+    ship_node_failed(journal, instance, execution_id, node_id, frames, err).await;
 }
 
 /// The output ports a firing has put on a wire or closed, off its
@@ -3106,10 +3101,10 @@ async fn handle_node_failure(
 fn mentioned_ports(
     executions: &NodeExecutionTable,
     node_id: &str,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     frames: &weft_core::frames::LoopFrames,
 ) -> std::collections::HashSet<String> {
-    latest_firing(executions, node_id, color, frames).map(|e| e.mentioned_ports.clone()).unwrap_or_default()
+    latest_firing(executions, node_id, execution_id, frames).map(|e| e.mentioned_ports.clone()).unwrap_or_default()
 }
 
 /// An emission the engine refused (over the stream cap, a bad-shape
@@ -3125,13 +3120,13 @@ async fn refuse_emission(
     err: String,
     delivery: Option<&DeliveryGate>,
     is_cancel: bool,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
 ) {
     if let Some(gate) = delivery {
         gate.fail(err.clone());
@@ -3139,15 +3134,15 @@ async fn refuse_emission(
     if is_cancel {
         tracing::warn!(
             target: "weft_engine::execution_driver",
-            %color, node = %loc.node_id, frames = ?loc.frames, error = %err,
+            %execution_id, node = %loc.node_id, frames = ?loc.frames, error = %err,
             "an emission was refused while the run was being cancelled; the firing ends Cancelled"
         );
         return;
     }
-    let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
+    let mentioned = mentioned_ports(executions, &loc.node_id, execution_id, &loc.frames);
     handle_node_failure(
-        &loc.node_id, &mentioned, color, &loc.frames, &err, project, edge_idx, pulses,
-        executions, journal, pod_name,
+        &loc.node_id, &mentioned, execution_id, &loc.frames, &err, project, edge_idx, pulses,
+        executions, journal, instance,
     )
     .await;
 }
@@ -3159,7 +3154,7 @@ async fn refuse_emission(
 #[allow(clippy::too_many_arguments)]
 async fn handle_node_skip(
     node_id: &str,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     reason: &weft_core::exec::skip::SkipReason,
     project: &ProjectDefinition,
@@ -3168,16 +3163,16 @@ async fn handle_node_skip(
     executions: &mut NodeExecutionTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
 ) {
-    mark_skipped(executions, node_id, color, frames);
+    mark_skipped(executions, node_id, execution_id, frames);
     // A node inside a gated scope carries NO closures: every member of
     // that scope gets its own `ScopeSkipped` row from the scope's
     // sweep (nested scopes included), and the scope's outward closures
     // rode its In boundary's skip row. A cascade here would only
     // manufacture a second firing for nodes the sweep already settled.
     if matches!(reason, weft_core::exec::skip::SkipReason::ScopeSkipped { .. }) {
-        ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
+        ship_node_skipped(journal, instance, execution_id, node_id, frames, reason).await;
         return;
     }
     // A skipped scope (its In boundary said no: a LoopIn here, a
@@ -3197,12 +3192,12 @@ async fn handle_node_skip(
         .map(|gb| gb.group_id.clone());
     if let Some(group_id) = skipped_scope {
         let emission_id =
-            terminal_sweep_emission(node_id, frames, ended_firing_ordinal(executions, node_id, color, frames));
+            terminal_sweep_emission(node_id, frames, ended_firing_ordinal(executions, node_id, execution_id, frames));
         tear_down_scope(
-            project, edge_idx, pulses, kicked, emission_id, color, &group_id, frames, Some(reason),
+            project, edge_idx, pulses, kicked, emission_id, execution_id, &group_id, frames, Some(reason),
             reason.inherited_failure(),
         );
-        ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
+        ship_node_skipped(journal, instance, execution_id, node_id, frames, reason).await;
         return;
     }
     // A skipped node's body never runs, so it never emitted on ANY
@@ -3212,10 +3207,10 @@ async fn handle_node_skip(
     // failure, so the next node down still reads a failure.
     let mentioned = std::collections::HashSet::new();
     build_unmentioned_closures(
-        node_id, &mentioned, color, frames, project, edge_idx, pulses, executions,
+        node_id, &mentioned, execution_id, frames, project, edge_idx, pulses, executions,
         reason.inherited_failure(),
     );
-    ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
+    ship_node_skipped(journal, instance, execution_id, node_id, frames, reason).await;
 }
 
 /// Gives a firing's runtime-granted provider accesses back on every exit
@@ -3277,12 +3272,12 @@ async fn cancel_cleanup(
     task_rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
     waiting: &mut HashMap<String, FiringLocation>,
     executions: &mut NodeExecutionTable,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     stream_rt: &mut StreamRuntime,
@@ -3295,13 +3290,13 @@ async fn cancel_cleanup(
     // An in-flight node's future is aborted immediately; it needs no window
     // to wrap up first. A paid call's cost is measured by the metering tap
     // BELOW the node's future, which finalizes on drop and resolves the
-    // figure detached (tracked by the pod's pending-cost records), so an
+    // figure detached (tracked by the process's pending-cost records), so an
     // aborted node body never loses money bookkeeping.
     // 1. Drive every spawned task to its abort point.
     in_flight.shutdown().await;
     // 2. Drain the task channel in one FIFO pass (see the doc above).
     drain_task_msgs_for_cancel(
-        task_rx, color, project, edge_idx, pulses, executions, journal, pod_name,
+        task_rx, execution_id, project, edge_idx, pulses, executions, journal, instance,
         waiting, stream_rt,
     )
     .await;
@@ -3312,13 +3307,13 @@ async fn cancel_cleanup(
     stream_rt.fail_all_gates("the execution was cancelled");
     // 3. The cancel walk.
     cancel_open_firings(
-        executions, pulses, kicked, loop_runtime, color, project, edge_idx, journal, pod_name,
+        executions, pulses, kicked, loop_runtime, execution_id, project, edge_idx, journal, instance,
         reason, phase, dispatchable,
     )
     .await;
 }
 
-/// The cancel walk: every firing of `color` still open ends Cancelled,
+/// The cancel walk: every firing of `execution_id` still open ends Cancelled,
 /// in RAM (as the fold ends it from the row) and in the journal (one
 /// `NodeCancelled` per firing, carrying `reason`), and every output
 /// port it never mentioned closes with the reason as the stream end a
@@ -3332,11 +3327,11 @@ async fn cancel_open_firings(
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     loop_runtime: &mut LoopRuntime,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     reason: &str,
     phase: weft_core::context::Phase,
     dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
@@ -3346,25 +3341,25 @@ async fn cancel_open_firings(
         .flat_map(|(node_id, execs)| {
             execs
                 .iter()
-                .filter(|e| e.color == color && !e.status.is_terminal())
+                .filter(|e| e.execution_id == execution_id && !e.status.is_terminal())
                 .map(move |e| FiringLocation::new(node_id.clone(), e.frames.clone()))
         })
         .collect();
     for loc in open {
-        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
-        mark_cancelled(executions, &loc.node_id, color, &loc.frames, reason);
+        let mentioned = mentioned_ports(executions, &loc.node_id, execution_id, &loc.frames);
+        mark_cancelled(executions, &loc.node_id, execution_id, &loc.frames, reason);
         build_unmentioned_closures(
-            &loc.node_id, &mentioned, color, &loc.frames, project, edge_idx, pulses, executions,
+            &loc.node_id, &mentioned, execution_id, &loc.frames, project, edge_idx, pulses, executions,
             Some(reason),
         );
         let event = weft_journal::ExecEvent::NodeCancelled {
-            color,
+            execution_id,
             node_id: loc.node_id.clone(),
             frames: loc.frames.clone(),
             reason: reason.to_string(),
             at_unix: now_unix(),
         };
-        if let Err(err) = journal.record_event(&event, Some(pod_name)).await {
+        if let Err(err) = journal.record_event(&event, Some(instance)).await {
             tracing::warn!(
                 target: "weft_engine",
                 error = %err,
@@ -3378,38 +3373,38 @@ async fn cancel_open_firings(
     // LoopOut's outward ports close, at the instance's own
     // parent_frames, so inner instances inside the cancelled scope
     // close at the right level too.
-    cancel_loop_instances(loop_runtime, color, project, edge_idx, pulses, journal, pod_name).await;
+    cancel_loop_instances(loop_runtime, execution_id, project, edge_idx, pulses, journal, instance).await;
     // The closures just put on the wires get the pass any turn's would
     // (the fold runs it after every row it closes from): a boundary
     // they made ready fires, and what the run never dispatches settles.
     // No waiter is parked on any of it: the gates all failed above, or
     // never existed on the refetch-kill path.
-    settle_table(project, edge_idx, phase, dispatchable, color, now_unix(), pulses, executions, kicked);
+    settle_table(project, edge_idx, phase, dispatchable, execution_id, now_unix(), pulses, executions, kicked);
 }
 
 /// On cancellation, walk every non-terminated `LoopInstance` for this
-/// color, mark it cancelled, and emit closures on every outward output
+/// execution, mark it cancelled, and emit closures on every outward output
 /// port of its LoopOut at `parent_frames`. Idempotent: an instance
 /// already terminated is skipped and gets no second row.
 pub(crate) async fn cancel_loop_instances(
     loop_runtime: &mut LoopRuntime,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
 ) {
     use weft_core::primitive::LoopTerminationReason;
     // Only what this call cancelled: an instance cancelled by an earlier
     // walk already has its row, and a second one would be noise.
-    for key in loop_runtime.cancel_inside(&Vec::new(), color) {
+    for key in loop_runtime.cancel_inside(&Vec::new(), execution_id) {
         // Journaling the cancellation is what makes it durable across
         // resume: a refold without it rebuilds the instance as live
         // (terminated=None) and the engine drives it again. The fold
         // closes the outward surface from the row, as this does in RAM.
         close_loop_outward(&key, project, edge_idx, pulses, LoopTerminationReason::Cancelled);
-        journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Cancelled).await;
+        journal_loop_terminated(journal, instance, &key, LoopTerminationReason::Cancelled).await;
     }
 }
 
@@ -3449,13 +3444,13 @@ enum RouteAction {
 /// counts any of that as drive progress.
 #[allow(clippy::too_many_arguments)]
 async fn route_stream_pulses(
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     stream_rt: &mut StreamRuntime,
     loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
@@ -3468,9 +3463,9 @@ async fn route_stream_pulses(
             continue;
         }
         let Some(bucket) = pulses.get(&node.id) else { continue };
-        let is_loop_in = node.node_type == "LoopIn";
+        let is_loop_in = node.node_type == weft_core::project::boundary_types::LOOP_IN;
         for p in bucket.iter() {
-            if p.color != color
+            if p.execution_id != execution_id
                 || p.status != PulseStatus::Pending
                 || !generator_ports.contains(&p.target_port.as_str())
             {
@@ -3482,7 +3477,7 @@ async fn route_stream_pulses(
                 let key = weft_core::primitive::LoopInstanceKey {
                     group_id: gb.group_id.clone(),
                     parent_frames: p.frames.clone(),
-                    color,
+                    execution_id,
                 };
                 match loop_runtime.get(&key) {
                     None => continue, // LoopIn not fired yet: the pulse dispatches it.
@@ -3515,7 +3510,7 @@ async fn route_stream_pulses(
                 // truth. Terminal -> drop; live feed -> route; neither
                 // -> the pulse is what dispatches the consumer, leave
                 // it Pending.
-                if firing_already_terminal(executions, &node.id, color, &p.frames) {
+                if firing_already_terminal(executions, &node.id, execution_id, &p.frames) {
                     actions.push(RouteAction::Drop { loc, pulse: p.id, closed: p.closed });
                 } else if stream_rt.feed_for(&loc, &p.target_port).is_some() {
                     if p.closed {
@@ -3553,7 +3548,7 @@ async fn route_stream_pulses(
                     // never be taken.
                     let reason = consumer_gone_reason(project, &loc);
                     consume_stream_pulses(
-                        &[pulse], &loc, color, pulses, journal, pod_name, stream_rt,
+                        &[pulse], &loc, execution_id, pulses, journal, instance, stream_rt,
                         AbsorbKind::Skipped { reason: &reason },
                     )
                     .await;
@@ -3575,7 +3570,7 @@ async fn route_stream_pulses(
                             loc.node_id
                         );
                         consume_stream_pulses(
-                            &[pulse], &loc, color, pulses, journal, pod_name,
+                            &[pulse], &loc, execution_id, pulses, journal, instance,
                             stream_rt, AbsorbKind::Skipped { reason: &err },
                         )
                         .await;
@@ -3586,13 +3581,13 @@ async fn route_stream_pulses(
                         // resolver fires with a generic message) and
                         // unregisters the markers.
                         retire_consumer_streams(
-                            project, &loc, color, pulses, journal, pod_name, stream_rt,
+                            project, &loc, execution_id, pulses, journal, instance, stream_rt,
                         )
                         .await;
-                        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
+                        let mentioned = mentioned_ports(executions, &loc.node_id, execution_id, &loc.frames);
                         handle_node_failure(
-                            &loc.node_id, &mentioned, color, &loc.frames, &err,
-                            project, edge_idx, pulses, executions, journal, pod_name,
+                            &loc.node_id, &mentioned, execution_id, &loc.frames, &err,
+                            project, edge_idx, pulses, executions, journal, instance,
                         )
                         .await;
                     }
@@ -3606,7 +3601,7 @@ async fn route_stream_pulses(
                 // "takes" a close), whether or not the feed was still
                 // live; absorb it durably now.
                 consume_stream_pulses(
-                    &[pulse], &loc, color, pulses, journal, pod_name, stream_rt,
+                    &[pulse], &loc, execution_id, pulses, journal, instance, stream_rt,
                     AbsorbKind::Taken,
                 )
                 .await;
@@ -3623,8 +3618,8 @@ async fn route_stream_pulses(
                 match loop_runtime.get(&key) {
                     None => {
                         fail_loop_from_stream(
-                            project, edge_idx, pulses, executions, journal, pod_name,
-                            color, &key, &loop_in,
+                            project, edge_idx, pulses, executions, journal, instance,
+                            execution_id, &key, &loop_in,
                             &format!(
                                 "stream item routed to loop '{}' with no LoopInstance; \
                                  engine bug",
@@ -3642,7 +3637,7 @@ async fn route_stream_pulses(
                             key.group_id
                         );
                         consume_stream_pulses(
-                            &[pulse], &loc, color, pulses, journal, pod_name, stream_rt,
+                            &[pulse], &loc, execution_id, pulses, journal, instance, stream_rt,
                             AbsorbKind::Skipped { reason: &reason },
                         )
                         .await;
@@ -3657,14 +3652,14 @@ async fn route_stream_pulses(
                         // same routing every other boundary failure
                         // takes; it must not kill the whole drive.
                         if let Err(e) = launch_stream_iteration(
-                            project, edge_idx, pulses, journal, pod_name,
+                            project, edge_idx, pulses, journal, instance,
                             &key, index, item, loop_runtime, stream_rt, kicked,
                         )
                         .await
                         {
                             fail_loop_from_stream(
-                                project, edge_idx, pulses, executions, journal, pod_name,
-                                color, &key, &loop_in, &e, loop_runtime,
+                                project, edge_idx, pulses, executions, journal, instance,
+                                execution_id, &key, &loop_in, &e, loop_runtime,
                                 stream_rt,
                             )
                             .await;
@@ -3679,8 +3674,8 @@ async fn route_stream_pulses(
                         // the whole drive (no stream-routing condition
                         // takes the execution down).
                         fail_loop_from_stream(
-                            project, edge_idx, pulses, executions, journal, pod_name,
-                            color, &key, &loop_in,
+                            project, edge_idx, pulses, executions, journal, instance,
+                            execution_id, &key, &loop_in,
                             &format!(
                                 "stream_push returned an impossible advance {other:?} for \
                                  loop '{}'",
@@ -3692,8 +3687,8 @@ async fn route_stream_pulses(
                     }
                     Err(e) => {
                         fail_loop_from_stream(
-                            project, edge_idx, pulses, executions, journal, pod_name,
-                            color, &key, &loop_in, &e, loop_runtime, stream_rt,
+                            project, edge_idx, pulses, executions, journal, instance,
+                            execution_id, &key, &loop_in, &e, loop_runtime, stream_rt,
                         )
                         .await;
                     }
@@ -3706,16 +3701,16 @@ async fn route_stream_pulses(
                 // side that still knows the stream ended (a resumed
                 // loop would otherwise wait forever for a close that
                 // can never arrive again).
-                crate::context::record_from_pod(
+                crate::context::record_from_instance(
                     journal,
                     weft_journal::ExecEvent::LoopStreamEnded {
-                        color,
+                        execution_id,
                         group_id: key.group_id.clone(),
                         parent_frames: key.parent_frames.clone(),
                         end: end.clone(),
                         at_unix: now_unix(),
                     },
-                    pod_name,
+                    instance,
                 )
                 .await;
                 // The close is consumed by the routing (loops never
@@ -3724,13 +3719,13 @@ async fn route_stream_pulses(
                 // close (instance already terminated in this batch)
                 // still absorbs.
                 consume_stream_pulses(
-                    &[pulse], &loc_of(&loop_in, &key.parent_frames), color, pulses,
-                    journal, pod_name, stream_rt, AbsorbKind::Taken,
+                    &[pulse], &loc_of(&loop_in, &key.parent_frames), execution_id, pulses,
+                    journal, instance, stream_rt, AbsorbKind::Taken,
                 )
                 .await;
                 if loop_runtime.get(&key).is_some_and(|inst| inst.terminated.is_none()) {
                     apply_loop_stream_close(
-                        project, edge_idx, pulses, executions, journal, pod_name, color,
+                        project, edge_idx, pulses, executions, journal, instance, execution_id,
                         &key, &loop_in, end, loop_runtime, stream_rt,
                     )
                     .await;
@@ -3756,7 +3751,7 @@ async fn route_stream_pulses(
                     AbsorbKind::Skipped { reason: &reason }
                 };
                 consume_stream_pulses(
-                    &[pulse], &loc, color, pulses, journal, pod_name, stream_rt, kind,
+                    &[pulse], &loc, execution_id, pulses, journal, instance, stream_rt, kind,
                 )
                 .await;
             }
@@ -3824,10 +3819,10 @@ fn set_pulse_status(
 async fn consume_stream_pulses(
     ids: &[uuid::Uuid],
     loc: &FiringLocation,
-    color: Color,
+    execution_id: ExecutionId,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     stream_rt: &mut StreamRuntime,
     kind: AbsorbKind<'_>,
 ) {
@@ -3835,16 +3830,16 @@ async fn consume_stream_pulses(
         return;
     }
     drop_consumed_pulses(pulses, &loc.node_id, ids);
-    crate::context::record_from_pod(
+    crate::context::record_from_instance(
         journal,
         weft_journal::ExecEvent::PulsesConsumed {
-            color,
+            execution_id,
             node_id: loc.node_id.clone(),
             frames: loc.frames.clone(),
             pulse_ids: ids.iter().map(|u| u.to_string()).collect(),
             at_unix: now_unix(),
         },
-        pod_name,
+        instance,
     )
     .await;
     stream_rt.on_pulses_absorbed(ids, kind);
@@ -3874,14 +3869,14 @@ fn drop_consumed_pulses(pulses: &mut PulseTable, node_id: &str, ids: &[uuid::Uui
 async fn apply_stream_item_taken(
     loc: &FiringLocation,
     pulse_id: uuid::Uuid,
-    color: Color,
+    execution_id: ExecutionId,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     stream_rt: &mut StreamRuntime,
 ) {
     consume_stream_pulses(
-        &[pulse_id], loc, color, pulses, journal, pod_name, stream_rt, AbsorbKind::Taken,
+        &[pulse_id], loc, execution_id, pulses, journal, instance, stream_rt, AbsorbKind::Taken,
     )
     .await;
 }
@@ -3893,10 +3888,10 @@ async fn apply_stream_item_taken(
 async fn retire_consumer_streams(
     project: &ProjectDefinition,
     loc: &FiringLocation,
-    color: Color,
+    execution_id: ExecutionId,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     stream_rt: &mut StreamRuntime,
 ) {
     let leftover = stream_rt.retire(loc);
@@ -3905,7 +3900,7 @@ async fn retire_consumer_streams(
     }
     let reason = consumer_gone_reason(project, loc);
     consume_stream_pulses(
-        &leftover, loc, color, pulses, journal, pod_name, stream_rt,
+        &leftover, loc, execution_id, pulses, journal, instance, stream_rt,
         AbsorbKind::Skipped { reason: &reason },
     )
     .await;
@@ -3919,7 +3914,7 @@ async fn launch_stream_iteration(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     key: &weft_core::primitive::LoopInstanceKey,
     index: u32,
     item: LoopStreamItem,
@@ -3929,7 +3924,7 @@ async fn launch_stream_iteration(
 ) -> Result<(), String> {
     let pulse = item.pulse;
     launch_iteration(
-        project, edge_idx, pulses, journal, pod_name, key, index, Some(item), loop_runtime, kicked,
+        project, edge_idx, pulses, journal, instance, key, index, Some(item), loop_runtime, kicked,
     )
     .await?;
     // The launch row (with `stream_pulse`) is the take's durability;
@@ -3951,8 +3946,8 @@ async fn apply_loop_stream_close(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
-    color: Color,
+    instance: &str,
+    execution_id: ExecutionId,
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     end: StreamEnd,
@@ -3961,7 +3956,7 @@ async fn apply_loop_stream_close(
 ) {
     let advance = loop_runtime.stream_close(key, end);
     apply_loop_stream_advance(
-        advance, project, edge_idx, pulses, executions, journal, pod_name, color, key,
+        advance, project, edge_idx, pulses, executions, journal, instance, execution_id, key,
         loop_in_id, loop_runtime, stream_rt,
     )
     .await;
@@ -3986,8 +3981,8 @@ async fn settle_rehydrated_stream_ends(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
-    color: Color,
+    instance: &str,
+    execution_id: ExecutionId,
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -3999,7 +3994,7 @@ async fn settle_rehydrated_stream_ends(
         if matches!(end, StreamEnd::Finished) {
             let items_pending = pulses.get(&loop_in_id).is_some_and(|bucket| {
                 bucket.iter().any(|p| {
-                    p.color == color
+                    p.execution_id == execution_id
                         && p.frames == key.parent_frames
                         && p.target_port == port
                         && p.status.in_flight()
@@ -4011,7 +4006,7 @@ async fn settle_rehydrated_stream_ends(
         }
         let advance = loop_runtime.settle_stream_end(&key);
         apply_loop_stream_advance(
-            advance, project, edge_idx, pulses, executions, journal, pod_name, color, &key,
+            advance, project, edge_idx, pulses, executions, journal, instance, execution_id, &key,
             &loop_in_id, loop_runtime, stream_rt,
         )
         .await;
@@ -4028,8 +4023,8 @@ async fn apply_loop_stream_advance(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
-    color: Color,
+    instance: &str,
+    execution_id: ExecutionId,
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     loop_runtime: &mut LoopRuntime,
@@ -4038,27 +4033,27 @@ async fn apply_loop_stream_advance(
     match advance {
         Ok(LoopAdvance::EmitOutward { reason, gather, carry }) => {
             if let Err(e) = emit_loop_outward(
-                project, edge_idx, pulses, journal, pod_name, key, gather, carry, reason,
+                project, edge_idx, pulses, journal, instance, key, gather, carry, reason,
                 loop_runtime,
             )
             .await
             {
                 fail_loop_from_stream(
-                    project, edge_idx, pulses, executions, journal, pod_name, color, key,
+                    project, edge_idx, pulses, executions, journal, instance, execution_id, key,
                     loop_in_id, &e, loop_runtime, stream_rt,
                 )
                 .await;
                 return;
             }
             drop_loop_stream_leftovers(
-                key, loop_in_id, color, pulses, journal, pod_name, loop_runtime, stream_rt,
+                key, loop_in_id, execution_id, pulses, journal, instance, loop_runtime, stream_rt,
             )
             .await;
         }
         Ok(_) => {}
         Err(e) => {
             fail_loop_from_stream(
-                project, edge_idx, pulses, executions, journal, pod_name, color, key,
+                project, edge_idx, pulses, executions, journal, instance, execution_id, key,
                 loop_in_id, &e, loop_runtime, stream_rt,
             )
             .await;
@@ -4076,8 +4071,8 @@ async fn fail_loop_from_stream(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
-    color: Color,
+    instance: &str,
+    execution_id: ExecutionId,
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     err: &str,
@@ -4093,12 +4088,12 @@ async fn fail_loop_from_stream(
         return;
     };
     handle_loop_boundary_failure(
-        node_def, color, &key.parent_frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, loop_runtime,
+        node_def, execution_id, &key.parent_frames, err, project, edge_idx, pulses, executions,
+        journal, instance, loop_runtime,
     )
     .await;
     drop_loop_stream_leftovers(
-        key, loop_in_id, color, pulses, journal, pod_name, loop_runtime, stream_rt,
+        key, loop_in_id, execution_id, pulses, journal, instance, loop_runtime, stream_rt,
     )
     .await;
 }
@@ -4109,10 +4104,10 @@ async fn fail_loop_from_stream(
 async fn drop_loop_stream_leftovers(
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -4137,7 +4132,7 @@ async fn drop_loop_stream_leftovers(
         key.group_id
     );
     consume_stream_pulses(
-        &leftover, &loc, color, pulses, journal, pod_name, stream_rt,
+        &leftover, &loc, execution_id, pulses, journal, instance, stream_rt,
         AbsorbKind::Skipped { reason: &reason },
     )
     .await;
@@ -4156,7 +4151,7 @@ fn check_generator_buffer_cap(
     node_id: &str,
     output: &NodeOutput,
     stream_caps: &HashMap<String, usize>,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     pulses: &PulseTable,
 ) -> Result<(), String> {
@@ -4174,7 +4169,7 @@ fn check_generator_buffer_cap(
                     b.iter()
                         .filter(|p| {
                             p.status.in_flight()
-                                && p.color == color
+                                && p.execution_id == execution_id
                                 && &p.frames == frames
                                 && p.target_port == handle
                                 && !p.closed
@@ -4203,13 +4198,13 @@ fn check_generator_buffer_cap(
 #[allow(clippy::too_many_arguments)]
 async fn apply_one_emission(
     msg: crate::context::EmitMsg,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) {
@@ -4221,7 +4216,7 @@ async fn apply_one_emission(
     // downstream of a NodeFailed record, and re-running the failure
     // per queued emission would spam one NodeFailed row per item.
     // Drop them; a delivery wait on one fails loudly.
-    if firing_already_terminal(executions, &msg.loc.node_id, color, &msg.loc.frames) {
+    if firing_already_terminal(executions, &msg.loc.node_id, execution_id, &msg.loc.frames) {
         if let Some(gate) = &delivery {
             gate.fail(format!("the firing of '{}' already failed", place_of(project, &msg.loc)));
         }
@@ -4238,12 +4233,12 @@ async fn apply_one_emission(
             // generator edge past its un-taken cap fails the producer
             // loudly BEFORE any pulse is committed.
             if let Err(err) = check_generator_buffer_cap(
-                project, edge_idx, &msg.loc.node_id, &output, &msg.stream_caps, color,
+                project, edge_idx, &msg.loc.node_id, &output, &msg.stream_caps, execution_id,
                 &msg.loc.frames, pulses,
             ) {
                 refuse_emission(
-                    &msg.loc, err, delivery.as_deref(), is_cancel, color, project, edge_idx,
-                    pulses, executions, journal, pod_name,
+                    &msg.loc, err, delivery.as_deref(), is_cancel, execution_id, project, edge_idx,
+                    pulses, executions, journal, instance,
                 )
                 .await;
                 return;
@@ -4266,7 +4261,7 @@ async fn apply_one_emission(
                 &msg.loc.node_id,
                 &bag,
                 emission_id,
-                color,
+                execution_id,
                 &msg.loc.frames,
                 project,
                 pulses,
@@ -4275,7 +4270,7 @@ async fn apply_one_emission(
             ) {
                 Ok(set) => {
                     ship_port_emissions(
-                        journal, pod_name, color, emission_id, &msg.loc.node_id, &msg.loc.frames,
+                        journal, instance, execution_id, emission_id, &msg.loc.node_id, &msg.loc.frames,
                         &bag,
                     )
                     .await;
@@ -4293,8 +4288,8 @@ async fn apply_one_emission(
                     // emission gets the same error back instead of
                     // hanging on pulses that were never created.
                     refuse_emission(
-                        &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, color, project,
-                        edge_idx, pulses, executions, journal, pod_name,
+                        &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, execution_id, project,
+                        edge_idx, pulses, executions, journal, instance,
                     )
                     .await;
                     return;
@@ -4309,7 +4304,7 @@ async fn apply_one_emission(
                 &msg.loc.node_id,
                 &port_name,
                 emission_id,
-                color,
+                execution_id,
                 &msg.loc.frames,
                 project,
                 pulses,
@@ -4318,18 +4313,18 @@ async fn apply_one_emission(
                 None,
             ) {
                 refuse_emission(
-                    &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, color, project,
-                    edge_idx, pulses, executions, journal, pod_name,
+                    &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, execution_id, project,
+                    edge_idx, pulses, executions, journal, instance,
                 )
                 .await;
                 return;
             }
             ship_port_closed(
-                journal, pod_name, color, emission_id, &msg.loc.node_id, &msg.loc.frames,
+                journal, instance, execution_id, emission_id, &msg.loc.node_id, &msg.loc.frames,
                 &port_name,
             )
             .await;
-            latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
+            latest_firing_mut(executions, &msg.loc.node_id, execution_id, &msg.loc.frames)
                 .expect("a closing emission has a firing record")
                 .closed_output_ports.insert(port_name.clone());
             std::iter::once(port_name).collect()
@@ -4339,7 +4334,7 @@ async fn apply_one_emission(
     // Union into the firing's mentioned set (on its record, as the
     // fold keeps it) so termination knows which ports were already
     // touched, whether by value or by closure.
-    latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
+    latest_firing_mut(executions, &msg.loc.node_id, execution_id, &msg.loc.frames)
         .expect("an emission comes from a firing with a record (checked non-terminal above)")
         .mentioned_ports
         .extend(just_mentioned);
@@ -4370,13 +4365,13 @@ async fn apply_one_emission(
 #[allow(clippy::too_many_arguments)]
 async fn apply_task_msgs(
     rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
@@ -4385,7 +4380,7 @@ async fn apply_task_msgs(
     while let Ok(msg) = rx.try_recv() {
         any = true;
         apply_one_task_msg(
-            msg, color, project, edge_idx, pulses, executions, journal, pod_name,
+            msg, execution_id, project, edge_idx, pulses, executions, journal, instance,
             waiting, stream_rt, is_cancel,
         )
         .await;
@@ -4399,13 +4394,13 @@ async fn apply_task_msgs(
 #[allow(clippy::too_many_arguments)]
 async fn apply_one_task_msg(
     msg: TaskMsg,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
@@ -4413,18 +4408,18 @@ async fn apply_one_task_msg(
     match msg {
         TaskMsg::Emission(emit) => {
             apply_one_emission(
-                emit, color, project, edge_idx, pulses, executions, journal, pod_name,
+                emit, execution_id, project, edge_idx, pulses, executions, journal, instance,
                 stream_rt, is_cancel,
             )
             .await;
         }
         TaskMsg::StreamItemTaken { loc, pulse_id } => {
-            apply_stream_item_taken(&loc, pulse_id, color, pulses, journal, pod_name, stream_rt)
+            apply_stream_item_taken(&loc, pulse_id, execution_id, pulses, journal, instance, stream_rt)
                 .await;
         }
-        TaskMsg::Terminal { loc, color: tcolor, outcome } => match outcome {
+        TaskMsg::Terminal { loc, execution_id: task_execution_id, outcome } => match outcome {
             NodeTaskOutcome::Completed => {
-                retire_consumer_streams(project, &loc, tcolor, pulses, journal, pod_name, stream_rt)
+                retire_consumer_streams(project, &loc, task_execution_id, pulses, journal, instance, stream_rt)
                     .await;
                 // The engine may have already TERMINATED this firing
                 // mid-flight (a bad-shape or buffer-overrun emission
@@ -4432,7 +4427,7 @@ async fn apply_one_task_msg(
                 // own later terminal is then stale. Marking Completed
                 // over the Failed record would flip the fold's
                 // last-write-wins and hide the failure entirely.
-                if firing_already_terminal(executions, &loc.node_id, tcolor, &loc.frames) {
+                if firing_already_terminal(executions, &loc.node_id, task_execution_id, &loc.frames) {
                     return;
                 }
                 // Emissions already happened via `pulse_downstream` and
@@ -4444,36 +4439,36 @@ async fn apply_one_task_msg(
                 // mentioned ports keep their emitted values; a node that
                 // emits A then B has both A and B as real values
                 // downstream.
-                mark_completed(executions, &loc.node_id, tcolor, &loc.frames);
-                let mentioned = mentioned_ports(executions, &loc.node_id, tcolor, &loc.frames);
+                mark_completed(executions, &loc.node_id, task_execution_id, &loc.frames);
+                let mentioned = mentioned_ports(executions, &loc.node_id, task_execution_id, &loc.frames);
                 // The unmentioned-port closures go on the wires in RAM;
                 // the NodeCompleted row is the fact the fold sweeps the
                 // same ports from.
                 build_unmentioned_closures(
-                    &loc.node_id, &mentioned, tcolor, &loc.frames,
+                    &loc.node_id, &mentioned, task_execution_id, &loc.frames,
                     project, edge_idx, pulses, executions, None,
                 );
-                ship_node_completed(journal, pod_name, tcolor, &loc.node_id, &loc.frames).await;
+                ship_node_completed(journal, instance, task_execution_id, &loc.node_id, &loc.frames).await;
             }
             NodeTaskOutcome::Failed(err) => {
-                retire_consumer_streams(project, &loc, tcolor, pulses, journal, pod_name, stream_rt)
+                retire_consumer_streams(project, &loc, task_execution_id, pulses, journal, instance, stream_rt)
                     .await;
                 // Same stale-terminal guard as the Completed arm: the
                 // engine's mid-flight failure already terminated the
                 // record and swept its ports.
-                if firing_already_terminal(executions, &loc.node_id, tcolor, &loc.frames) {
+                if firing_already_terminal(executions, &loc.node_id, task_execution_id, &loc.frames) {
                     return;
                 }
-                let mentioned = mentioned_ports(executions, &loc.node_id, tcolor, &loc.frames);
+                let mentioned = mentioned_ports(executions, &loc.node_id, task_execution_id, &loc.frames);
                 handle_node_failure(
-                    &loc.node_id, &mentioned, tcolor, &loc.frames, &err,
-                    project, edge_idx, pulses, executions, journal, pod_name,
+                    &loc.node_id, &mentioned, task_execution_id, &loc.frames, &err,
+                    project, edge_idx, pulses, executions, journal, instance,
                 )
                 .await;
             }
             NodeTaskOutcome::Waiting(token) => {
-                mark_waiting(executions, &loc.node_id, tcolor, &loc.frames, &token);
-                ship_node_suspended(journal, pod_name, tcolor, &loc.node_id, &loc.frames, &token)
+                mark_waiting(executions, &loc.node_id, task_execution_id, &loc.frames, &token);
+                ship_node_suspended(journal, instance, task_execution_id, &loc.node_id, &loc.frames, &token)
                     .await;
                 waiting.insert(token, loc);
             }
@@ -4491,13 +4486,13 @@ async fn apply_one_task_msg(
 #[allow(clippy::too_many_arguments)]
 async fn drain_task_msgs_for_cancel(
     rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
-    pod_name: &str,
+    instance: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -4508,7 +4503,7 @@ async fn drain_task_msgs_for_cancel(
             // emissions are applied before its terminal below.
             TaskMsg::Emission(emit) => {
                 apply_one_emission(
-                    emit, color, project, edge_idx, pulses, executions, journal, pod_name,
+                    emit, execution_id, project, edge_idx, pulses, executions, journal, instance,
                     stream_rt, /* is_cancel = */ true,
                 )
                 .await;
@@ -4518,20 +4513,20 @@ async fn drain_task_msgs_for_cancel(
             // race the dispatcher's NodeCancelled).
             TaskMsg::StreamItemTaken { loc, pulse_id } => {
                 apply_stream_item_taken(
-                    &loc, pulse_id, color, pulses, journal, pod_name, stream_rt,
+                    &loc, pulse_id, execution_id, pulses, journal, instance, stream_rt,
                 )
                 .await;
             }
-            TaskMsg::Terminal { loc, color: tcolor, outcome } => match outcome {
+            TaskMsg::Terminal { loc, execution_id: task_execution_id, outcome } => match outcome {
                 NodeTaskOutcome::Completed | NodeTaskOutcome::Failed(_) => {
                     tracing::debug!(
                         target: "weft_engine::execution_driver",
-                        color = %tcolor, node = %loc.node_id, frames = ?loc.frames,
+                        execution_id = %task_execution_id, node = %loc.node_id, frames = ?loc.frames,
                         "a firing ended during the cancel window; it ends Cancelled with the run"
                     );
                 }
                 NodeTaskOutcome::Waiting(token) => {
-                    mark_waiting(executions, &loc.node_id, tcolor, &loc.frames, &token);
+                    mark_waiting(executions, &loc.node_id, task_execution_id, &loc.frames, &token);
                     waiting.insert(token, loc);
                 }
             },
@@ -4539,7 +4534,7 @@ async fn drain_task_msgs_for_cancel(
     }
 }
 
-/// Whether the latest record at `(node, color, frames)` is already
+/// Whether the latest record at `(node, execution_id, frames)` is already
 /// terminal. The stale-terminal guard in `apply_one_task_msg` reads
 /// this: an engine-side mid-flight failure (bad-shape emission, buffer
 /// overrun) terminates the record while the body still runs, and the
@@ -4547,20 +4542,20 @@ async fn drain_task_msgs_for_cancel(
 fn firing_already_terminal(
     executions: &NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
 ) -> bool {
-    latest_firing(executions, node_id, color, frames).is_some_and(|e| e.status.is_terminal())
+    latest_firing(executions, node_id, execution_id, frames).is_some_and(|e| e.status.is_terminal())
 }
 
 fn mark_waiting(
     executions: &mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     token: &str,
 ) {
-    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+    if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::WaitingForInput;
         e.callback_id = Some(token.to_string());
     }
@@ -4642,10 +4637,10 @@ fn first_failure(project: &ProjectDefinition, executions: &NodeExecutionTable) -
 fn mark_completed(
     executions: &mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
 ) {
-    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+    if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Completed;
         e.completed_at = Some(now_unix());
     }
@@ -4654,11 +4649,11 @@ fn mark_completed(
 fn mark_failed(
     executions: &mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     err: &str,
 ) {
-    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+    if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Failed;
         e.completed_at = Some(now_unix());
         e.error = Some(err.to_string());
@@ -4668,10 +4663,10 @@ fn mark_failed(
 fn mark_skipped(
     executions: &mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
 ) {
-    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+    if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Skipped;
         e.completed_at = Some(now_unix());
         // A skip is the firing's whole outcome: the body never ran, so
@@ -4687,11 +4682,11 @@ fn mark_skipped(
 fn mark_cancelled(
     executions: &mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
     reason: &str,
 ) {
-    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+    if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Cancelled;
         e.completed_at = Some(now_unix());
         e.error = Some(reason.to_string());
@@ -4759,18 +4754,18 @@ fn recorded_cancel_cause(cancellation: &CancellationFlag) -> weft_core::exec::Ca
 async fn fail_before_terminal(
     journal: &dyn JournalClient,
     clock: &dyn weft_platform_traits::Clock,
-    color: Color,
-    pod_name: &str,
+    execution_id: ExecutionId,
+    instance: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
     let outcome = ExecutionOutcome::Failed { error: format!("{error:#}") };
-    match journal_terminal(journal, clock, color, pod_name, &outcome).await {
+    match journal_terminal(journal, clock, execution_id, instance, &outcome).await {
         Ok(()) => error,
         Err(write) => error.context(format!("and the run has no terminal: {write:#}")),
     }
 }
 
-/// Journal the terminal event for this execution's color. Pure
+/// Journal the terminal event for this execution. Pure
 /// translation from `ExecutionOutcome` to the matching `ExecEvent`
 /// variant: `Completed`/`Failed`/`Stuck` map; `Stalled` is a
 /// caller-side no-op so this function isn't called for it. `Err`
@@ -4780,11 +4775,11 @@ async fn fail_before_terminal(
 async fn journal_terminal(
     journal: &dyn JournalClient,
     clock: &dyn weft_platform_traits::Clock,
-    color: Color,
-    pod_name: &str,
+    execution_id: ExecutionId,
+    instance: &str,
     outcome: &ExecutionOutcome,
 ) -> anyhow::Result<()> {
-    // Idempotent: if a terminal event already exists for this color
+    // Idempotent: if a terminal event already exists for this execution
     // (e.g. the dispatcher's cancel path wrote ExecutionCancelled
     // before the worker's loop driver observed cancellation), skip
     // the write. Avoids the bridge double-publishing. There is NO
@@ -4798,22 +4793,22 @@ async fn journal_terminal(
         // Returned before anything ran; there is no terminal of ours to
         // write, the journal already holds one.
         ExecutionOutcome::AlreadySettled => return Ok(()),
-        ExecutionOutcome::Completed => weft_journal::ExecEvent::ExecutionCompleted { color, at_unix },
+        ExecutionOutcome::Completed => weft_journal::ExecEvent::ExecutionCompleted { execution_id, at_unix },
         // A cancel maps to the proper ExecutionCancelled terminal so the
         // UI renders the cancel affordance instead of a generic failure.
         ExecutionOutcome::Cancelled { cause } => weft_journal::ExecEvent::ExecutionCancelled {
-            color,
+            execution_id,
             reason: cause.to_string(),
             cause: Some(cause.clone()),
             at_unix,
         },
         ExecutionOutcome::Failed { error } => weft_journal::ExecEvent::ExecutionFailed {
-            color,
+            execution_id,
             error: error.clone(),
             at_unix,
         },
         ExecutionOutcome::Stuck { report } => weft_journal::ExecEvent::ExecutionFailed {
-            color,
+            execution_id,
             error: report.to_string(),
             at_unix,
         },
@@ -4828,20 +4823,20 @@ async fn journal_terminal(
     // write share one bounded backoff, so a blip on either side gets
     // the same attempts; past that the terminal is given up as an
     // error (the task executor catches a panic and fails the task
-    // just the same, and nothing restarts the pod for it).
+    // just the same, and nothing restarts the process for it).
     let mut delay_ms = 100u64;
     let mut attempt = 0u32;
     const MAX_ATTEMPTS: u32 = 5;
     loop {
-        let written = match journal.has_terminal_event(color).await {
+        let written = match journal.has_terminal_event(execution_id).await {
             Ok(true) => Ok(()),
-            Ok(false) => journal.record_event(&event, Some(pod_name)).await,
-            Err(e) => Err(anyhow::anyhow!("cannot tell whether the color already holds a terminal: {e}")),
+            Ok(false) => journal.record_event(&event, Some(instance)).await,
+            Err(e) => Err(anyhow::anyhow!("cannot tell whether the execution already holds a terminal: {e}")),
         };
         let Err(e) = written else { return Ok(()) };
         attempt += 1;
         if attempt >= MAX_ATTEMPTS {
-            anyhow::bail!("failed to journal the terminal of color {color} after {MAX_ATTEMPTS} attempts: {e}");
+            anyhow::bail!("failed to journal the terminal of execution {execution_id} after {MAX_ATTEMPTS} attempts: {e}");
         }
         tracing::warn!(
             target: "weft_engine",
@@ -4870,7 +4865,7 @@ mod resume_tests;
 /// projects, and assertions; the rig is only the dumb plumbing.
 #[cfg(test)]
 #[path = "execution_driver_tests/rig.rs"]
-mod engine_test_rig;
+pub(crate) mod engine_test_rig;
 
 #[cfg(test)]
 #[path = "execution_driver_tests/phase_routing.rs"]

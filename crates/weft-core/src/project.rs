@@ -312,10 +312,9 @@ pub struct NodeDefinition {
     // SYNC: per_member <-> packages/weft-graph/src/protocol.ts NodeDefinition.perMember
     #[serde(default, rename = "perMember", skip_serializing_if = "Option::is_none")]
     pub per_member: Option<crate::member::PerMember>,
-    /// Image source dirs the CLI builds for this node. Mirrored from
-    /// NodeMetadata.images at enrich time. The CLI walks this to know
-    /// which Dockerfiles to build before sending imageHashes to
-    /// the dispatcher.
+    /// Image source dirs built for this node. Mirrored from
+    /// NodeMetadata.images at enrich time. A version build walks this to
+    /// know which Dockerfiles to build (`weft-dispatcher::build`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// What this TRIGGER wakes with: field name to weft type, mirrored
@@ -817,12 +816,10 @@ impl EdgeIndex {
 }
 
 /// Whether this project declares ANY infrastructure: true iff at least
-/// one node has `requires_infra`. The single project-level fact that
-/// decides namespace placement: an infra project gets its own k8s
-/// namespace (its worker must sit next to its infra pods), a no-infra
-/// project's worker runs in the shared worker namespace. Pure walk over
-/// the node list; the one copy of this predicate so the dispatcher and
-/// any other consumer can't drift on what "has infra" means.
+/// one node has `requires_infra`: what a project's status reports and its
+/// infra verbs are offered on. Pure walk over the node list; the one copy
+/// of this predicate so the dispatcher and any other consumer can't drift
+/// on what "has infra" means.
 pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
 }
@@ -1210,6 +1207,42 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
         .collect()
 }
 
+/// Which copies of its infra the program declares: each place (spelled
+/// as [`infra_place_spellings`] spells it) and whether it has one copy
+/// per member or one shared copy. A copy it does not declare is gone
+/// from the program for good: the node was removed, or it changed sides
+/// (a node no longer per member leaves its members' copies behind, a
+/// node now per member leaves its shared one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredInfra {
+    /// Place -> whether it is per member.
+    places: std::collections::BTreeMap<String, bool>,
+}
+
+impl DeclaredInfra {
+    pub fn of(project: &ProjectDefinition) -> Self {
+        let places = infra_place_spellings(project)
+            .into_iter()
+            .map(|spelled| {
+                let (id, _) = resolve_address(project, &spelled);
+                let per_member = is_per_member(project, &id);
+                (spelled, per_member)
+            })
+            .collect();
+        Self { places }
+    }
+
+    /// Whether the program has a copy of `spelled` of this kind: a
+    /// member's (`member_copy`) or the shared one.
+    pub fn declares(&self, spelled: &str, member_copy: bool) -> bool {
+        self.places.get(spelled) == Some(&member_copy)
+    }
+
+    /// Whether the program still declares the copy a host names.
+    pub fn declares_copy(&self, copy: &crate::infra::NodeRef) -> bool {
+        self.declares(&copy.node, copy.is_member_copy())
+    }
+}
 
 /// Every node `seeds` depend on by following wires backward, seeds
 /// included, over the whole program (no run selection, so the frames
@@ -1776,6 +1809,32 @@ mod project_wire_tests {
             node_with_infra("c", true),
         ]);
         assert!(has_infra(&with_infra), "one infra node flips it true");
+    }
+
+    #[test]
+    fn declared_infra_names_each_place_and_its_side() {
+        let mut per_member = node_with_infra("mine", true);
+        per_member.per_member = Some(crate::member::PerMember::Marked);
+        let project = project_with_nodes(vec![node_with_infra("db", true), per_member, node_with_infra("plain", false)]);
+        let declared = DeclaredInfra::of(&project);
+        assert!(declared.declares("db", false));
+        assert!(!declared.declares("db", true), "a shared node has no member copies");
+        assert!(declared.declares("mine", true));
+        assert!(!declared.declares("mine", false), "a per-member node has no shared copy");
+        assert!(!declared.declares("plain", false), "a node without infra has no copy");
+        assert!(!declared.declares("gone", false));
+
+        let alice = crate::member::MemberId::new("alice").unwrap();
+        let copy = |node: &str, member: Option<&crate::member::MemberId>| crate::infra::NodeRef {
+            tenant: "t".into(),
+            project: project.id,
+            node: node.into(),
+            instance: crate::infra::NodeRef::copy_instance_id(project.id, node, member),
+        };
+        assert!(declared.declares_copy(&copy("db", None)));
+        assert!(!declared.declares_copy(&copy("db", Some(&alice))));
+        assert!(declared.declares_copy(&copy("mine", Some(&alice))));
+        assert!(!declared.declares_copy(&copy("mine", None)));
     }
 }
 

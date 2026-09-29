@@ -101,7 +101,7 @@ pub fn plan_build_from(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
-    builder_base_image: &str,
+    bases: &crate::worker_image::BaseImages,
     tags: &dyn TagPolicy,
     node_set: crate::codegen::NodeSet,
 ) -> CompileResult<BuildPlan> {
@@ -121,7 +121,7 @@ pub fn plan_build_from(
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
     let staged =
-        crate::build::build_project(project, definition, catalog, builder_base_image, node_set)?;
+        crate::build::build_project(project, definition, catalog, bases, node_set)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {

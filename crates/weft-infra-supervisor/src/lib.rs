@@ -1,24 +1,26 @@
-//! Library surface for the pooled infra supervisor.
+//! The supervisor role: the one owner of each project's infrastructure.
 //!
-//! A supervisor pod is tenant-agnostic: it owns the infrastructure of
-//! a SET of projects (the exclusive `infra_owner` lease, claimed +
-//! renewed by the ownership loop) and reconciles only those. The
-//! dispatcher's `SupervisorPool` scales the number of supervisor pods
-//! up and down by load.
+//! A supervisor is tenant-agnostic: it owns the infrastructure of a SET
+//! of projects (the exclusive `infra_owner` lease, claimed and renewed by
+//! the ownership loop) and reconciles only those, through the platform's
+//! [`weft_platform_traits::InfraHost`]: containers on the local Docker
+//! daemon, or machines of their own on a cloud. It never talks to
+//! Postgres; the broker is its door.
 //!
-//! The binary entry point (`main.rs`) is a thin wrapper that parses
-//! args, constructs a `SupervisorState` against production
-//! dependencies, and spawns the three loops (ownership, lifecycle,
-//! health). Everything else lives here so integration tests under
-//! `tests/` can wire the same loops against fakes from
-//! `weft-platform-traits` + this crate's own `FakeBroker`.
+//! Three loops: ownership (claim and renew), lifecycle (run the
+//! `infra_lifecycle_command` rows: apply, stop, terminate) and health
+//! (flaky / recovered, and the project's health protocols). On the
+//! machine they run for as long as the process does ([`run_loops`]); a
+//! supervisor that scales to zero runs one pass of each per tick
+//! ([`tick`]). Everything here is library code, so integration tests wire
+//! the same loops against fakes from `weft-platform-traits` and this
+//! crate's own `FakeBroker`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use weft_platform_traits::clock::Clock;
-use weft_platform_traits::kube::KubeClient;
-use weft_platform_traits::mem_pressure::MemPressure;
+use weft_platform_traits::InfraHost;
 
 pub mod broker_ops;
 pub mod health;
@@ -30,42 +32,102 @@ pub mod protocol;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod testing;
 
-/// Cloneable per-pod state threaded through the two loops.
+/// Cloneable state threaded through the loops.
 ///
-/// All external dependencies are behind trait objects so tests can
-/// swap them for fakes. Production wires `BrokerSupervisorClient`,
-/// `KubeApiClient`, and `SystemClock`.
+/// All external dependencies are behind trait objects so tests can swap
+/// them for fakes.
 #[derive(Clone)]
 pub struct SupervisorState {
     pub broker: Arc<dyn broker_ops::BrokerSupervisorOps>,
-    /// This pooled supervisor pod's name (`WEFT_POD_NAME` = the
-    /// Deployment name). Identifies its command claims AND keys its
-    /// `infra_owner` lease; sent on every broker write so the broker's
-    /// ownership gate compares the lease against THIS, not the auth
-    /// token's (suffixed) pod name. A pooled supervisor has no tenant of
-    /// its own; it reconciles all tenants' namespaced projects, taking
-    /// each project's tenant from the project row.
-    // SYNC: supervisor pod_name <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.pod_name), crates/weft-dispatcher/src/supervisor_pool.rs (render_supervisor_manifest WEFT_POD_NAME env), crates/weft-broker-client/src/lifecycle_command.rs (owns_project_predicate)
-    pub pod_name: String,
-    pub kube: Arc<dyn KubeClient>,
+    /// This supervisor instance's id: it identifies its command claims
+    /// AND keys its `infra_owner` leases, sent on every broker write so
+    /// the broker's ownership gate compares the lease against THIS.
+    pub instance: String,
+    /// Where the infrastructure runs.
+    pub host: Arc<dyn InfraHost>,
     pub clock: Arc<dyn Clock>,
-    /// How often the ownership loop renews this pod's project leases
-    /// and claims more: a third of `infra_owner_lease_secs`, so one
-    /// slow tick never lets a lease this pod still wants lapse.
+    /// How often the ownership loop renews this supervisor's project
+    /// leases and claims more: a third of `infra_owner_lease_secs`, so one
+    /// slow tick never lets a lease it still wants lapse.
     pub ownership_interval: Duration,
     /// How often the health loop looks at every owned project.
     pub health_interval: Duration,
     pub health: Arc<tokio::sync::Mutex<health::HealthRegistry>>,
-    /// Reads this pod's real memory pressure, reported to the broker on
-    /// each ownership tick. Saturation (the claim gate) and the
-    /// dispatcher's placement both key on it, the SAME metric the
-    /// listener uses.
-    pub mem_pressure: Arc<dyn MemPressure>,
     /// Raised by the lifecycle loop when the broker says a command waits
     /// on a project nobody owns: the ownership loop ticks at once rather
     /// than at the end of its interval.
     pub ownership_wanted: Arc<tokio::sync::Notify>,
-    /// The install this supervisor serves, read from `WEFT_INSTANCE` at
-    /// startup. Compile refuses what only the default install serves.
-    pub install: weft_core::infra::Instance,
+    /// Who is changing a project's copies on the host right now: a
+    /// lifecycle command holds its project's lock for its whole run, and
+    /// the ownership loop's sweep deletes a gone copy only while holding
+    /// it. See [`ProjectLocks`].
+    pub project_locks: Arc<ProjectLocks>,
+}
+
+/// One lock per project, so this process's sweep deletion and apply of
+/// the same project never interleave on the host.
+///
+/// A copy's id is derived from (project, node, member), so a node removed
+/// and then added back names the very same copy. Without this, the sweep
+/// could judge the copy gone, an apply of the re-added node could adopt
+/// its kept disks, and the sweep's delete would then take the disks and
+/// the fresh containers with it. The lock covers this process only:
+/// other supervisors are kept off by the project's `infra_owner` lease,
+/// which the sweep holds and re-checks through its judgment and deletion
+/// (`ownership::sweep_gone_copies`) exactly as an apply does, and commands
+/// of one project already run one at a time in this process (the
+/// lifecycle loop's busy set).
+#[derive(Default)]
+pub struct ProjectLocks(std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>>);
+
+impl ProjectLocks {
+    fn entry(&self, project: uuid::Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A lock nobody holds or waits on is dropped, so the map stays
+        // the size of what is in flight. Safe under the map's own lock:
+        // every holder or waiter has a clone, so its count is above one.
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+        locks.entry(project).or_default().clone()
+    }
+
+    /// Wait for the project's lock (a lifecycle command).
+    pub async fn lock(&self, project: uuid::Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.entry(project).lock_owned().await
+    }
+
+    /// The project's lock if nobody holds it (the sweep, which must never
+    /// wait: an apply can hold a project for minutes, and the ownership
+    /// tick that sweeps also renews every lease).
+    pub fn try_lock(&self, project: uuid::Uuid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.entry(project).try_lock_owned().ok()
+    }
+}
+
+/// Run the three loops for as long as the process lives. Returns only
+/// when one of them ends, which is abnormal (each is a `loop`), with what
+/// ended it.
+pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
+    let (lifecycle_changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
+    let (health_changes, health_ownership_changed) = tokio::sync::mpsc::unbounded_channel();
+    tokio::select! {
+        r = ownership::run_loop(state.clone(), vec![lifecycle_changes, health_changes]) => {
+            r.and(Err(anyhow::anyhow!("the supervisor's ownership loop ended")))
+        }
+        r = lifecycle::run_loop(state.clone(), ownership_changed) => {
+            r.and(Err(anyhow::anyhow!("the supervisor's lifecycle loop ended")))
+        }
+        r = health::run_loop(state.clone(), health_ownership_changed) => {
+            r.and(Err(anyhow::anyhow!("the supervisor's health loop ended")))
+        }
+    }
+}
+
+/// One pass of every loop, for a supervisor that scales to zero: renew
+/// and claim, run every waiting command of what it owns, look at their
+/// health. Each command runs to its end inside the pass.
+pub async fn tick(state: &SupervisorState) -> anyhow::Result<()> {
+    let mut owned = std::collections::HashSet::new();
+    ownership::tick(state, &mut owned).await?;
+    while lifecycle::tick(state, Duration::ZERO).await? {}
+    health::tick(state).await
 }

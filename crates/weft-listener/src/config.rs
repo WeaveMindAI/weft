@@ -1,28 +1,19 @@
-//! Configuration passed to a listener instance at startup.
-//! Populated from env vars (production) or directly (tests).
+//! What a listener is started with.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerConfig {
-    /// This listener pod's name. MUST be the literal Deployment name the
-    /// dispatcher minted (injected as a plain `WEFT_POD_NAME` env value,
-    /// NOT a downward-API `fieldRef: metadata.name`, which would resolve
-    /// to the auto-generated pod name and make rehydrate find zero
-    /// signals: see the listener manifest in the dispatcher). A pooled
-    /// listener is identified by its pod, not a tenant: placement rows in
-    /// the `signal` table point at `listener_pod`, and boot-time
-    /// rehydrate rebuilds the registry from `WHERE listener_pod = this
-    /// pod`. The listener holds signals from many tenants, so there is no
-    /// per-listener tenant; each signal carries its own tenant (see
-    /// `RegisteredSignal.tenant_id`).
-    pub pod_name: String,
-    /// Port the HTTP server binds. The dispatcher calls into
-    /// `/register`, `/unregister`, `/process`, `/render`; tenant
-    /// pods cannot reach this port (NetworkPolicy denies).
-    pub http_port: u16,
-    /// Broker base URL. Listener uses it for the rehydrate-time
-    /// signal lookup AND to enqueue `FireSignal` tasks when held
-    /// events fire (timer expiry, SSE event arrival).
+    /// This process instance's id: what its broker calls are made as, and
+    /// what keeps its shared provider sockets apart from another
+    /// in-process listener's (tests).
+    pub instance: String,
+    /// Broker base URL: the listener's only door to the durable `signal`
+    /// table (loading a signal, writing its kind state) and to the task
+    /// queue its fires ride.
     pub broker_url: String,
+    /// Where the listener runs. On the machine it holds connections open
+    /// between fires; placed serverless it cannot, and refuses a signal
+    /// that needs one.
+    pub placement: weft_platform_traits::Placement,
 }

@@ -139,10 +139,9 @@ fn ensure_tenant_key(tenant: &TenantId, key: &str) -> Result<String, ApiError> {
 
 /// GET /public/files/{token}: the PUBLIC RELAY for a minted file link.
 /// A pure pass-through to the broker's `/v1/storage/admin/relay`
-/// (authenticated with the dispatcher's SA token): the dispatcher's
-/// egress is deliberately locked to the control plane, so the broker,
-/// the one service with bucket reach, resolves the token and streams
-/// the bytes; this route only carries them out the public door. The
+/// (authenticated with the dispatcher's identity): the broker, the one
+/// service holding the bucket's credentials, resolves the token and
+/// streams the bytes; this route only carries them out the public door. The
 /// token IS the credential (unguessable, expiring); the broker's 404
 /// for missing and expired links passes through unchanged, and broker
 /// transport failures answer 502 with the detail logged.
@@ -154,16 +153,11 @@ pub async fn public_file(
         tracing::error!(target: "weft_dispatcher::storage", "public file relay: {detail}");
         (StatusCode::BAD_GATEWAY, "file fetch failed".to_string())
     };
-    let sa_token = crate::broker_admin::read_token(&state)
-        .await
-        .map_err(|e| bad_gateway(format!("{e:#}")))?;
     let upstream = state
-        .http
-        .get(crate::broker_admin::admin_url(
-            &state,
-            &format!("/v1/storage/admin/relay/{token}"),
-        ))
-        .bearer_auth(sa_token)
+        .broker
+        .request(reqwest::Method::GET, &format!("/v1/storage/admin/relay/{token}"))
+        .await
+        .map_err(|e| bad_gateway(format!("{e:#}")))?
         .send()
         .await
         .map_err(|e| bad_gateway(e.to_string()))?;
@@ -381,7 +375,7 @@ pub async fn upload_abort(
 #[derive(Debug, Deserialize)]
 pub struct RemoveRequest {
     /// Exactly one of `key` (one file) or `prefix` (a whole space, e.g.
-    /// `shared/team/` or `exec/<color>/`).
+    /// `shared/team/` or `exec/<execution_id>/`).
     pub key: Option<String>,
     pub prefix: Option<String>,
 }

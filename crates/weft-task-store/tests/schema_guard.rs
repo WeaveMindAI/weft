@@ -643,3 +643,16 @@ async fn a_group_the_database_never_built_is_unborn_to_a_release(pool: PgPool) {
     let rest = weft_task_store::schema_guard::unborn_groups(&mut conn, &[&GUARDED, &OTHER]).await.unwrap();
     assert_eq!(rest, vec!["guard_other"]);
 }
+
+/// A database built before the migration history restarted has no record
+/// of where the history starts, and is refused with the way out; one built
+/// since carries it and boots again.
+#[sqlx::test]
+async fn a_database_from_before_the_history_is_refused(pool: PgPool) {
+    apply(&pool, &[&GUARDED], NONE).await.expect("fresh apply");
+    apply(&pool, &[&GUARDED], NONE).await.expect("a database built since boots again");
+
+    sqlx::query("DELETE FROM weft_migration WHERE group_name = '_history'").execute(&pool).await.unwrap();
+    let refused = apply(&pool, &[&GUARDED], NONE).await.expect_err("an older database is refused").to_string();
+    assert!(refused.contains("scripts/scrub-old-install.sh"), "{refused}");
+}

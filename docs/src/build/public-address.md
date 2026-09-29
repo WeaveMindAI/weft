@@ -8,8 +8,9 @@ and has no address they can reach, so weft opens one for you:
 ./setup.sh --public-url
 ```
 
-That builds an outbound tunnel from your machine onto a door that lets through
-a short list of paths and nothing else. The choice sticks, so later installs
+That starts a tunnel from your machine to a separate port (14112) where weft
+serves a short list of paths and nothing else. The choice sticks, so later
+installs
 keep it open until you say otherwise.
 
 ## What it exposes, and what it does not
@@ -29,22 +30,23 @@ These paths, and nothing else. Everything else on that address answers 404.
 | `GET /signal-token/displays` | That client listing what your nodes are showing (a QR code, say) |
 | `GET /signal-token/displays/<project>/<node>` | That client reading one node's display |
 | `POST /signal-token/displays/<project>/<node>/action` | That client pressing a button on it |
+| `/member/...` | A member of one of your programs, with their member token: their fields, their connections, their runs |
 | `GET /public/files/<token>` | Somebody fetching a file link your program handed out |
+| `/connect/<tenant>/<path>`, `/live/<project>/...` | A caller of one of your routes or sockets |
+| `/infra/<project>/<instance>/...` | A caller of an infrastructure endpoint your node opened to the public |
 | `GET /access/oauth/callback` | A provider sending you back after you approve a connection |
+| `/access/picker/<state>` | The page where you pick files for a connection, and its answer |
+| `POST /<path>` | A trigger of yours that fires on a plain POST to its own path |
 | `/`, `/index.html`, `/logo.png` | A small page saying this address is a weft install |
 
 Every `/signal-token/...` request carries the signal token in its
 `Authorization: Bearer` header, never in the path, so it stays out of proxy
-logs. The door lets any method through on the `/signal/` and `/signal-token/`
-paths and leaves it to the dispatcher to answer the ones above.
-
-Before matching, the door resolves `..` and merges doubled slashes, so
-`/signal/../projects` becomes `/projects`, which is not on the list. A path
-with an escaped slash (`%2F`) is refused outright.
+logs.
 
 Your dispatcher's real API, your projects, your journal and your runs are not
-on that address at all. They stay on `127.0.0.1:9999`, which has no
-authentication of its own, so keep it on an interface you control.
+on that port at all, so nothing arriving through the tunnel can reach them.
+They stay on `127.0.0.1:14111`, which has no authentication of its own and
+listens on your machine only.
 
 ## Find your address
 
@@ -53,8 +55,8 @@ weft daemon status
 ```
 
 ```text
-daemon: running (cluster 'weft', system ns 'weft-system'); 1 project(s)
-public trigger surface: https://something.example/ (the public trigger routes only; ./setup.sh --no-public-url closes it)
+weft: running at http://127.0.0.1:14111 (install 'default'); 1 project(s)
+public address: https://something.example (./setup.sh --no-public-url closes it)
 ```
 
 The installer prints it too, when it is open.
@@ -82,14 +84,9 @@ own. You need a Cloudflare account with that domain on it.
 1. In the Cloudflare dashboard, create a tunnel (Zero Trust, then Networks,
    then Tunnels) and copy its token.
 2. Add a public hostname to that tunnel, say `weft.example.com`, and set its
-   service to exactly this:
-
-   ```
-   http://weft-public-door.envoy-gateway-system.svc.cluster.local:8080
-   ```
-
-   That is weft's public door inside your cluster. The tunnel runs there, so
-   it reaches it by that name.
+   service to the port weft serves those paths on: on Linux,
+   `http://127.0.0.1:14112`, because the tunnel shares your machine's
+   network; on macOS, `http://host.docker.internal:14112`.
 3. Install with both set:
 
    ```bash

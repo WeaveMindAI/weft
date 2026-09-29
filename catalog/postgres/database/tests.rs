@@ -17,7 +17,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("declares_a_database_that_reads_its_password_from_a_file", declares),
         NodeTest::fake("describes_itself_identically_every_time", stable),
-        NodeTest::fake("keeps_the_credential_endpoint_inside_the_cluster", internal),
+        NodeTest::fake("keeps_the_credential_endpoint_to_the_project", internal),
         NodeTest::fake("waits_for_postgres_to_answer_for_itself", ready),
         NodeTest::fake("the_first_run_reads_the_password_and_retires_it", first_run),
         NodeTest::fake("a_later_run_never_asks_the_database_again", later_run),
@@ -40,8 +40,8 @@ fn reachable_config() -> serde_json::Value {
 /// The two addresses the node's own infrastructure answers on. The
 /// SQL one is only ever split into host and port, never dialled here.
 fn endpoints(rig: &FakeRig) {
-    rig.declare_endpoint("sql", "http://db-sql.ns.svc.cluster.local:5432");
-    rig.declare_endpoint("credential", "http://db-credential.ns.svc.cluster.local:8099");
+    rig.declare_endpoint("sql", "http://wi-db-sql:5432");
+    rig.declare_endpoint("credential", "http://wi-db-credential:8099");
 }
 
 /// The password the node ends up publishing, whichever way it got it.
@@ -74,17 +74,17 @@ async fn declares(rig: FakeRig) -> WeftResult<()> {
     let postgres = &unit.containers[0];
     assert!(
         postgres.env.iter().any(|e| matches!(e,
-            weft::infra::EnvEntry::Literal { name, .. } if name == "POSTGRES_PASSWORD_FILE")),
+            weft::infra::EnvEntry { name, .. } if name == "POSTGRES_PASSWORD_FILE")),
         "Postgres reads the password from the shared volume"
     );
     assert!(
         !postgres.env.iter().any(|e| matches!(e,
-            weft::infra::EnvEntry::Literal { name, .. } if name == "POSTGRES_PASSWORD")),
+            weft::infra::EnvEntry { name, .. } if name == "POSTGRES_PASSWORD")),
         "and never from a value carried in the spec"
     );
-    assert_eq!(spec.volumes.len(), 2, "one disk for data and password, one pod-local socket dir");
+    assert_eq!(spec.volumes.len(), 2, "one disk for data and password, one scratch dir for the socket");
     assert!(
-        matches!(spec.volumes[1].kind, weft::infra::VolumeKind::EmptyDir { .. }),
+        matches!(spec.volumes[1].kind, weft::infra::VolumeKind::Scratch { .. }),
         "the socket never lands on the disk"
     );
     let socket_dir = "/var/run/postgresql";
@@ -99,7 +99,7 @@ async fn declares(rig: FakeRig) -> WeftResult<()> {
     for name in ["WEFT_SOCKET_DIR", "WEFT_ADMIN_USER"] {
         assert!(
             credential.env.iter().any(|e| matches!(e,
-                weft::infra::EnvEntry::Literal { name: n, .. } if n == name)),
+                weft::infra::EnvEntry { name: n, .. } if n == name)),
             "the credential server is told {name} by the node"
         );
     }
@@ -122,8 +122,8 @@ async fn stable(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// The rule every infra node lives by, on the node that has one of
-/// each: an endpoint that HANDS OUT a credential never leaves the
-/// cluster, whatever anybody asks for.
+/// each: an endpoint that HANDS OUT a credential is never open beyond the
+/// project's own workers, whatever anybody asks for.
 ///
 /// `sql` may be opened, because reaching Postgres there still costs a
 /// password, and that is what lets a frontend on this machine use the
@@ -138,7 +138,7 @@ async fn internal(rig: FakeRig) -> WeftResult<()> {
     let closed = rig.run_provision_infra(&PostgresDatabaseNode, config()).await.ok()?;
     for endpoint in &closed.infra_spec()?.endpoints {
         assert!(
-            matches!(endpoint.expose, weft::infra::Expose::ClusterInternal),
+            matches!(endpoint.expose, weft::infra::Expose::Project),
             "'{}' is reachable on a database nobody asked to reach",
             endpoint.name
         );
@@ -191,7 +191,7 @@ async fn first_run(rig: FakeRig) -> WeftResult<()> {
     assert!(asked_for_the_password(&rig), "the first run has nowhere else to get it");
     assert_eq!(published_password(&rig).as_deref(), Some("minted"));
     let values = rig.published_values(SERVICE).expect("a connection was published");
-    assert_eq!(values.get("host").map(String::as_str), Some("db-sql.ns.svc.cluster.local"));
+    assert_eq!(values.get("host").map(String::as_str), Some("wi-db-sql"));
     assert_eq!(values.get("port").map(String::as_str), Some("5432"));
     assert_eq!(values.get("user").map(String::as_str), Some("weft"));
     assert_eq!(retired(&rig), vec!["minted".to_string()], "retired once, after publishing");
@@ -212,7 +212,7 @@ async fn first_run(rig: FakeRig) -> WeftResult<()> {
 async fn later_run(rig: FakeRig) -> WeftResult<()> {
     endpoints(&rig);
     rig.published_connection(SERVICE, &[
-        ("host", "db-sql.ns.svc.cluster.local"),
+        ("host", "wi-db-sql"),
         ("port", "5432"),
         ("database", "app"),
         ("user", "weft"),
@@ -237,7 +237,7 @@ async fn later_run(rig: FakeRig) -> WeftResult<()> {
 async fn replaced_disk(rig: FakeRig) -> WeftResult<()> {
     endpoints(&rig);
     rig.published_connection(SERVICE, &[
-        ("host", "db-sql.ns.svc.cluster.local"),
+        ("host", "wi-db-sql"),
         ("port", "5432"),
         ("database", "app"),
         ("user", "weft"),

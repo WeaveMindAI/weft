@@ -21,16 +21,16 @@ storage, the only way bytes travel a wire.
 
 ## The URL is known before anything runs
 
-A [route] answers at `<dispatcher base>/connect/<tenant>/<path>`, and every
-piece is fixed by the install, not minted at activation: on a local install
-the base is `http://127.0.0.1:9999` and the tenant is `local`, so
-`hello = Route { path: "hello" }` answers at
-`http://127.0.0.1:9999/connect/local/hello`, and a socket at the same
-address with `ws://`. You write those URLs into the frontend-builder's
+A [route] answers at `<install>/connect/local/<path>`, and every piece is
+fixed by the install, not minted at activation. On this machine the install
+is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
+`http://127.0.0.1:14111/connect/local/hello`, and a socket at the same
+address with `ws://`. On a cloud install it is the target's `url` in
+`weft.toml` (`https://weft.example.com/connect/local/hello`, and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` prints the same URLs afterwards and only turns them on.
 
-`127.0.0.1:9999` answers only on this machine. When the install has a public
+`127.0.0.1:14111` answers only on this machine. When the install has a public
 address (a tunnel), `weft activate` and `weft token mint` print URLs on that
 address instead, and both reach the same dispatcher. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
@@ -465,7 +465,7 @@ You reach for `ctx` only when the graph cannot say it.
 ## Trying it
 
 ```bash
-weft activate                      # prints the live URL (/connect/<tenant>/<path>)
+weft activate                      # prints the live URL (/connect/local/<path>)
 curl -L -X POST "<url>/hello" -H 'content-type: application/json' -d '{"name":"ada"}'
 curl -L -i "<url>/users/42?verbose=1"
 curl -L -N "<url>/feed"            # a Stream route: -N shows each frame as it lands
@@ -474,7 +474,7 @@ weft follow <project>              # one execution per request, live
 ```
 
 Always `curl -L`. The live URL answers a `307` that points the caller at the
-pod serving the run, so a first call without `-L` comes back a redirect and
+live door serving the run, so a first call without `-L` comes back a redirect and
 looks like total failure. The body says so, and `-L` follows it.
 
 A connection held open is the one thing `--fire` below cannot show you:

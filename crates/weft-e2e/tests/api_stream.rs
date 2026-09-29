@@ -47,14 +47,14 @@ async fn a_caller_leaving_a_quiet_stream_ends_its_run() -> anyhow::Result<()> {
     let mut project = Project::prepare("api_stream", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = weft_e2e::run::execution_colors(&disp, &project.id()).await?;
+    let before = weft_e2e::run::executions(&disp, &project.id()).await?;
 
     let first = live::stream_first_chunk_then_hang_up(&disp, &format!("{base}/quiet")).await?;
     assert_eq!(String::from_utf8_lossy(&first), "data: first\n\n");
 
     // The caller is gone and the program has nothing more to say. The run
     // must end anyway, and end as the caller's doing.
-    let colors = weft_e2e::run::wait_for_triggered_executions(
+    let execution_ids = weft_e2e::run::wait_for_triggered_executions(
         &disp,
         &project.id(),
         &before,
@@ -64,7 +64,7 @@ async fn a_caller_leaving_a_quiet_stream_ends_its_run() -> anyhow::Result<()> {
     .await?;
     let settled = weft_e2e::run::SettledRun::observe_within(
         &disp,
-        colors[0],
+        execution_ids[0],
         std::time::Duration::from_secs(120),
     )
     .await?;
@@ -100,7 +100,7 @@ async fn a_caller_that_stops_reading_does_not_break_the_exchange() -> anyhow::Re
     let mut project = Project::prepare("api_stream", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = weft_e2e::run::execution_colors(&disp, &project.id()).await?;
+    let before = weft_e2e::run::executions(&disp, &project.id()).await?;
 
     {
         // Held, then dropped: while held the caller is present and
@@ -109,7 +109,7 @@ async fn a_caller_that_stops_reading_does_not_break_the_exchange() -> anyhow::Re
             live::stream_first_chunk_then_stop_reading(&disp, &format!("{base}/quiet")).await?;
     }
 
-    let colors = weft_e2e::run::wait_for_triggered_executions(
+    let execution_ids = weft_e2e::run::wait_for_triggered_executions(
         &disp,
         &project.id(),
         &before,
@@ -119,7 +119,7 @@ async fn a_caller_that_stops_reading_does_not_break_the_exchange() -> anyhow::Re
     .await?;
     let settled = weft_e2e::run::SettledRun::observe_within(
         &disp,
-        colors[0],
+        execution_ids[0],
         std::time::Duration::from_secs(120),
     )
     .await?;
@@ -144,7 +144,7 @@ async fn abandoned_streams_do_not_pile_up() -> anyhow::Result<()> {
     let mut project = Project::prepare("api_stream", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = weft_e2e::run::execution_colors(&disp, &project.id()).await?;
+    let before = weft_e2e::run::executions(&disp, &project.id()).await?;
 
     const CALLERS: usize = 4;
     for _ in 0..CALLERS {
@@ -153,7 +153,7 @@ async fn abandoned_streams_do_not_pile_up() -> anyhow::Result<()> {
         anyhow::ensure!(!first.is_empty(), "each caller got its first event");
     }
 
-    let colors = weft_e2e::run::wait_for_triggered_executions(
+    let execution_ids = weft_e2e::run::wait_for_triggered_executions(
         &disp,
         &project.id(),
         &before,
@@ -161,16 +161,16 @@ async fn abandoned_streams_do_not_pile_up() -> anyhow::Result<()> {
         std::time::Duration::from_secs(120),
     )
     .await?;
-    for color in colors {
+    for execution_id in execution_ids {
         let settled = weft_e2e::run::SettledRun::observe_within(
             &disp,
-            color,
+            execution_id,
             std::time::Duration::from_secs(120),
         )
         .await?;
         anyhow::ensure!(
             settled.status == "cancelled",
-            "every abandoned stream must end, {color} is {} ({:?})",
+            "every abandoned stream must end, {execution_id} is {} ({:?})",
             settled.status,
             settled.cancel_reason()
         );

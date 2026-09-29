@@ -36,7 +36,7 @@ pub struct ActivationLifecycle {
     /// The trigger-setup run of the activation in flight, reserved before
     /// setup is queued; every write the activation makes is guarded by it.
     /// `None` outside Activating.
-    pub activating_color: Option<uuid::Uuid>,
+    pub activating_execution_id: Option<uuid::Uuid>,
 }
 
 impl ActivationLifecycle {
@@ -54,18 +54,18 @@ impl ActivationLifecycle {
             fires_deadline_unix: None,
             drain_deadline_unix: None,
             deactivated_by_health: false,
-            activating_color: None,
+            activating_execution_id: None,
         }
     }
 
     /// While setup runs: fires park (the listener may not have every
     /// signal yet) and consumers see nothing; the drain at the end of the
     /// activation replays what parked.
-    pub fn activating(color: uuid::Uuid) -> Self {
+    pub fn activating(execution_id: uuid::Uuid) -> Self {
         Self {
             status: ProjectStatus::Activating,
             fires_visible_to_consumers: false,
-            activating_color: Some(color),
+            activating_execution_id: Some(execution_id),
             ..Self::active()
         }
     }
@@ -102,7 +102,7 @@ impl ActivationLifecycle {
         Self {
             status: ProjectStatus::Deactivating,
             drain_deadline_unix: Some(drain_deadline_unix),
-            activating_color: None,
+            activating_execution_id: None,
             ..target
         }
     }
@@ -152,7 +152,7 @@ pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycl
             fires_deadline_unix: draining.iter().filter_map(|l| l.fires_deadline_unix).max(),
             drain_deadline_unix: draining.iter().filter_map(|l| l.drain_deadline_unix).max(),
             deactivated_by_health: draining.iter().all(|l| l.deactivated_by_health),
-            activating_color: None,
+            activating_execution_id: None,
         };
     }
     if with(ProjectStatus::Active).next().is_some() {
@@ -169,7 +169,7 @@ pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycl
         fires_deadline_unix: inactive.iter().filter_map(|l| l.fires_deadline_unix).max(),
         drain_deadline_unix: None,
         deactivated_by_health: inactive.iter().all(|l| l.deactivated_by_health),
-        activating_color: None,
+        activating_execution_id: None,
     }
 }
 
@@ -184,9 +184,9 @@ mod tests {
 
     #[test]
     fn a_transition_wins_the_aggregate() {
-        let color = uuid::Uuid::new_v4();
-        let all = [ActivationLifecycle::active(), ActivationLifecycle::activating(color), ActivationLifecycle::parked()];
-        assert_eq!(aggregate(&all).activating_color, Some(color));
+        let execution_id = uuid::Uuid::new_v4();
+        let all = [ActivationLifecycle::active(), ActivationLifecycle::activating(execution_id), ActivationLifecycle::parked()];
+        assert_eq!(aggregate(&all).activating_execution_id, Some(execution_id));
         let draining = ActivationLifecycle::deactivating_to(ActivationLifecycle::parked(), 50);
         let all = [ActivationLifecycle::active(), draining.clone()];
         let agg = aggregate(&all);

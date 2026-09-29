@@ -6,7 +6,7 @@
     //! stale nodes. A from start records backup inputs on its selection
     //! and runs without the upstream source. Both
     //! are facts about the driver: what it re-dispatches, what reaches
-    //! the nodes that run, and what it writes under its own color.
+    //! the nodes that run, and what it writes under its own execution.
 
     use super::*;
     use super::engine_test_rig::{catalog, drive, drive_seeded, test_manifest};
@@ -120,7 +120,7 @@
         .expect("program")
     }
 
-    fn birth(color: Color, project: &ProjectDefinition, subgraph: Option<&[&str]>, seed: Option<Seed>) -> ExecEvent {
+    fn birth(execution_id: ExecutionId, project: &ProjectDefinition, subgraph: Option<&[&str]>, seed: Option<Seed>) -> ExecEvent {
         let mut selection = match subgraph {
             Some(nodes) => weft_core::project::selection::RunSelection::restricted(project, nodes.iter().map(|node| weft_core::frames::Located::top(*node)).collect()).unwrap(),
             None => weft_core::project::selection::RunSelection::whole(project),
@@ -130,7 +130,7 @@
             selection.suppliers.extend(seed.origins.keys().cloned());
         }
         ExecEvent::ExecutionStarted {
-            color,
+            execution_id,
             project_id: project.id,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
@@ -138,15 +138,16 @@
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: Some(selection),
             seed,
-            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         }
     }
 
-    fn kick(color: Color, node: &str, payload: Option<serde_json::Value>) -> ExecEvent {
-        ExecEvent::NodeKicked { color, node_id: node.into(), frames: vec![], firing: false, payload, port_snapshot: None, at_unix: 0 }
+    fn kick(execution_id: ExecutionId, node: &str, payload: Option<serde_json::Value>) -> ExecEvent {
+        ExecEvent::NodeKicked { execution_id, node_id: node.into(), frames: vec![], firing: false, payload, port_snapshot: None, at_unix: 0 }
     }
 
-    fn seed(parent: Color, kept: &[&str]) -> Seed {
+    fn seed(parent: ExecutionId, kept: &[&str]) -> Seed {
         Seed { parent, origins: kept.iter().map(|node| (weft_core::frames::Located::top(*node), parent)).collect() }
     }
 
@@ -178,7 +179,7 @@
 
     /// The parent ran `a -> b -> c`; the child, seeded with `b` and `c`
     /// stale, never dispatches `a` (its body does not run, no row about
-    /// it lands under the child's color), while `b` sees `a`'s old value
+    /// it lands under the child's execution), while `b` sees `a`'s old value
     /// and `c` sees `b`'s new one.
     #[tokio::test]
     async fn a_seeded_run_inherits_the_unchanged_upstream_and_reruns_the_stale() {
@@ -187,7 +188,7 @@
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, parent_rows) = drive(program.clone(), cat(&ran, &seen), &["a"]).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         ran.lock().unwrap().clear();
         seen.lock().unwrap().clear();
 
@@ -198,7 +199,7 @@
         assert_eq!(ran_of(&ran), vec!["echo", "echo"], "a's body never ran again");
         assert_eq!(*seen.lock().unwrap(), vec!["A", "A+echo"], "b read the inherited value, c read b's new one");
         assert_eq!(started_nodes(&child_rows), vec!["b", "c"], "only the stale nodes have rows under the child");
-        assert!(child_rows.iter().all(|e| e.color() == child));
+        assert!(child_rows.iter().all(|e| e.execution_id() == child));
     }
 
     /// A grandchild seeded from the child with only `c` stale takes `a`
@@ -209,7 +210,7 @@
         let ran: Ran = Default::default();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let (_, parent_rows) = drive(program.clone(), cat(&ran, &seen), &["a"]).await;
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         let child = uuid::Uuid::new_v4();
         let (_, child_rows) = drive_seeded(
             program.clone(),
@@ -251,7 +252,7 @@
         let ran: Ran = Default::default();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let (_, parent_rows) = drive(parent_program.clone(), cat(&ran, &seen), &["a"]).await;
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         ran.lock().unwrap().clear();
         seen.lock().unwrap().clear();
 
@@ -281,7 +282,7 @@
         let ran: Ran = Default::default();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let (_, parent_rows) = drive(program.clone(), cat(&ran, &seen), &["a"]).await;
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         ran.lock().unwrap().clear();
 
         let child = uuid::Uuid::new_v4();
@@ -304,7 +305,7 @@
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, parent_rows) = drive(broken.clone(), cat(&ran, &seen), &["a"]).await;
         assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         ran.lock().unwrap().clear();
 
         let fixed = chain(["Source", "Echo", "Echo"], &[("a", "b"), ("b", "c")]);
@@ -380,7 +381,7 @@
         let (outcome, parent_rows) = drive(program.clone(), nodes(), &["producer"]).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(*took.lock().unwrap(), vec![0, 1, 2, 3, 4]);
-        let parent = parent_rows[0].color();
+        let parent = parent_rows[0].execution_id();
         ran.lock().unwrap().clear();
         took.lock().unwrap().clear();
 

@@ -191,7 +191,7 @@ mod fs_hashes {
     ///
     /// An unreferenced node can't change the worker binary, so it does
     /// not flip this hash. The same node walked through `weft_catalog`'s
-    /// `NODE_TREE_EXCLUDE` policy that `stage_build_context` uses, so
+    /// `is_node_tree_excluded` policy that `stage_build_context` uses, so
     /// what the binary sees and what we hash agree byte-for-byte.
     pub fn compute_binary_hash(
         definition: &ProjectDefinition,
@@ -443,7 +443,7 @@ mod fs_hashes {
         // and the closure slice sees all of that. NOT the raw main.weft:
         // hashing the whole file lit the Upgrade button for every edit to
         // the rest of the graph (an LLM prompt tweak has no bearing on the
-        // running bridge pod). Same canonical form as the definition hash:
+        // running bridge process). Same canonical form as the definition hash:
         // spans / positions / file-ref paths stripped, nodes and edges
         // sorted, so a comment or a canvas drag cannot flip it either.
         let closure = upstream_closure(project, &EdgeIndex::build(project), &infra_ids(project));
@@ -519,7 +519,7 @@ mod fs_hashes {
 
     /// Recursive directory walk that returns every regular file under
     /// `root`, skipping the shared node-tree exclude set
-    /// (`weft_catalog::NODE_TREE_EXCLUDE`). Symlinked directories are
+    /// (`weft_catalog::is_node_tree_excluded`). Symlinked directories are
     /// followed (a cycle fails loudly via the descent chain), so a
     /// linked shared catalog is hashed at every path it appears at,
     /// matching what the stage copy materializes.
@@ -528,17 +528,22 @@ mod fs_hashes {
     /// silently de/over-syncs the worker-image hash. The paths come back
     /// sorted, so a hash over them is the same on every machine.
     pub fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
-        walk_dir_skipping(root, &[])
+        walk_dir_skipping(root, &|_, _| false)
     }
 
-    /// [`walk_dir`], with whole top-level directories of `root` left
-    /// out. For an input whose consumer reads only part of a directory
-    /// (the system images compile a crate's binaries, so its `tests/`
-    /// has no bearing on what comes out).
-    pub fn walk_dir_skipping(root: &Path, skip_top_level: &[&str]) -> Result<Vec<PathBuf>> {
+    /// Which entries a skipping walk leaves out: asked with an entry's
+    /// name and whether it sits directly under the walk's root, for
+    /// every file and directory below it.
+    pub type LeftOut<'a> = &'a dyn Fn(&str, bool) -> bool;
+
+    /// [`walk_dir`], with every entry `left_out` names left out (a
+    /// directory whole). For an input whose consumer reads only part of
+    /// a directory (the system images compile a crate's binaries, so its
+    /// `tests/` has no bearing on what comes out).
+    pub fn walk_dir_skipping(root: &Path, left_out: LeftOut<'_>) -> Result<Vec<PathBuf>> {
         let mut out = Vec::new();
         let mut chain = Vec::new();
-        walk_into(root, skip_top_level, &mut out, &mut chain)?;
+        walk_into(root, left_out, &mut out, &mut chain)?;
         // `read_dir` order is the filesystem's, and it differs between
         // machines: two release runners walked the stdlib in different
         // orders and minted two builder-base hashes for one commit.
@@ -554,7 +559,7 @@ mod fs_hashes {
     // a loud error instead of an infinite walk.
     fn walk_into(
         dir: &Path,
-        skip_top_level: &[&str],
+        left_out: LeftOut<'_>,
         out: &mut Vec<PathBuf>,
         chain: &mut Vec<PathBuf>,
     ) -> Result<()> {
@@ -568,9 +573,7 @@ mod fs_hashes {
             {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if is_node_tree_excluded(&name)
-                    || (at_top && skip_top_level.contains(&name.as_str()))
-                {
+                if is_node_tree_excluded(&name) || left_out(&name, at_top) {
                     continue;
                 }
                 let path = entry.path();
@@ -578,7 +581,7 @@ mod fs_hashes {
                     .with_context(|| format!("stat {}", path.display()))?
                 {
                     weft_catalog::NodeTreeEntryKind::Dir => {
-                        walk_into(&path, skip_top_level, out, chain)?
+                        walk_into(&path, left_out, out, chain)?
                     }
                     weft_catalog::NodeTreeEntryKind::File => out.push(path),
                 }
@@ -589,7 +592,7 @@ mod fs_hashes {
         result
     }
 
-    /// [`hash_path`], with whole top-level directories of `path` left out.
+    /// [`hash_path`], with every entry `left_out` names left out.
     ///
     /// For an input whose consumer reads only part of a directory. The system
     /// images compile a crate's binaries, so its `tests/` has no bearing on
@@ -599,7 +602,7 @@ mod fs_hashes {
         hasher: &mut Sha256,
         label: &str,
         path: &Path,
-        skip: &[&str],
+        left_out: LeftOut<'_>,
     ) -> Result<()> {
         if !path.exists() {
             // Hash the absence so a future appearance invalidates.
@@ -611,7 +614,7 @@ mod fs_hashes {
         if path.is_file() {
             hash_file(hasher, label, path)
         } else if path.is_dir() {
-            hash_dir(hasher, label, path, skip)
+            hash_dir(hasher, label, path, left_out)
         } else {
             Ok(())
         }
@@ -626,7 +629,7 @@ mod fs_hashes {
     /// share the exact same framing rules (no
     /// two-different-hash-functions-for-the-same-job drift).
     pub fn hash_path(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
-        hash_path_skipping(hasher, label, path, &[])
+        hash_path_skipping(hasher, label, path, &|_, _| false)
     }
 
     fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
@@ -640,11 +643,11 @@ mod fs_hashes {
         Ok(())
     }
 
-    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path, skip: &[&str]) -> Result<()> {
+    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path, left_out: LeftOut<'_>) -> Result<()> {
         hasher.update(b"dir:");
         hasher.update(label.as_bytes());
         hasher.update(b"\n");
-        for entry in walk_dir_skipping(dir, skip)? {
+        for entry in walk_dir_skipping(dir, left_out)? {
             let rel = entry
                 .strip_prefix(dir)
                 .unwrap_or(&entry)

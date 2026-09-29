@@ -1,4 +1,4 @@
-//! `weft logs [color]`: print an execution's log: the lines its nodes
+//! `weft logs [execution_id]`: print an execution's log: the lines its nodes
 //! wrote, and every failure the journal recorded about it (a node
 //! failing, a port refusing a value, the run failing or being
 //! cancelled), in the order they were written. The first place to look when a run
@@ -7,7 +7,7 @@
 //!
 //! - No argument: resolve the cwd project, fetch its most recent
 //!   execution, show those logs.
-//! - UUID argument: treat as color, show those logs.
+//! - UUID argument: treat as execution, show those logs.
 
 use super::{local_time, resolve_project_id, Ctx};
 
@@ -16,15 +16,15 @@ use super::{local_time, resolve_project_id, Ctx};
 /// is the project. What `weft logs` prints for a run that wrote
 /// nothing, so the reader learns why nothing happened without a second
 /// command.
-async fn skipped_nodes(ctx: &Ctx, color: &str) -> anyhow::Result<Vec<(String, String)>> {
+async fn skipped_nodes(ctx: &Ctx, execution_id: &str) -> anyhow::Result<Vec<(String, String)>> {
     let definition = ctx.project().ok()
         .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
         .map(|(definition, _)| definition);
     let replay: serde_json::Value =
-        ctx.client().get_json(&format!("/executions/{color}/replay")).await?;
+        ctx.client()?.get_json(&format!("/executions/{execution_id}/replay")).await?;
     let rows = replay
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {replay}"))?;
+        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/replay returned no array: {replay}"))?;
     let mut skipped = Vec::new();
     for row in rows {
         if row.get("kind").and_then(|v| v.as_str()) != Some("node_skipped") {
@@ -72,35 +72,35 @@ fn frames_suffix(entry: &serde_json::Value) -> String {
 }
 
 pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow::Result<()> {
-    let color = match target {
-        Some(raw) => super::resolve_color(&ctx, &raw).await?,
+    let execution_id = match target {
+        Some(raw) => super::resolve_execution_id(&ctx, &raw).await?,
         None => {
             let project_id = resolve_project_id(&ctx, None)?;
             let resp: serde_json::Value = ctx
-                .client()
+                .client()?
                 .get_json(&format!("/projects/{project_id}/executions/latest"))
                 .await
                 .map_err(|e| anyhow::anyhow!("no executions for project {project_id}: {e}"))?;
-            resp.get("color")
+            resp.get("execution_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color"))?
+                .ok_or_else(|| anyhow::anyhow!("dispatcher response missing execution"))?
                 .to_string()
         }
     };
 
     let query = limit.map(|n| format!("?limit={n}")).unwrap_or_default();
     let mut logs: serde_json::Value =
-        ctx.client().get_json(&format!("/executions/{color}/logs{query}")).await?;
+        ctx.client()?.get_json(&format!("/executions/{execution_id}/logs{query}")).await?;
     let arr = logs["lines"]
         .as_array()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/logs returned no lines: {logs}"))?;
+        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/logs returned no lines: {logs}"))?;
     // The limit that cut the tail comes back with it, so the notice
     // below is right whether the reader chose one or the dispatcher's
     // default applied.
     let limit = logs["limit"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/logs returned no limit: {logs}"))?;
+        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/logs returned no limit: {logs}"))?;
     // A run that wrote nothing usually did nothing, and the reason is
     // a skip: a required input closed, a gate said no. The skip is a
     // lifecycle event, not a log line, so it is fetched here rather
@@ -109,7 +109,7 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     // replay that cannot be read fails this command whole instead of
     // after a line that read as an answer; and `--json` carries the
     // same list under `skipped`, since an agent reads that shape.
-    let skipped = if arr.is_empty() { skipped_nodes(&ctx, &color).await? } else { Vec::new() };
+    let skipped = if arr.is_empty() { skipped_nodes(&ctx, &execution_id).await? } else { Vec::new() };
     if arr.is_empty() {
         logs["skipped"] = skipped
             .iter()
@@ -140,7 +140,7 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
             .map(|n| format!(" {n}{}:", frames_suffix(entry)))
             .unwrap_or_default();
         let inherited = entry.get("inherited_from").and_then(|v| v.as_str())
-            .map(|color| format!(" [inherited from {}]", super::versions::short(color)))
+            .map(|execution_id| format!(" [inherited from {}]", super::versions::short(execution_id)))
             .unwrap_or_default();
         println!("[{}] {level:>5}{node}{inherited} {msg}", local_time(at));
     }

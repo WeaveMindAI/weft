@@ -81,6 +81,7 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
     let values = weft_access_store::member_values(&state.pg_pool, &caller.tenant, caller.project, &caller.member)
         .await
         .map_err(access_err)?;
+    let picks = crate::api::project::stored_picks(&state, caller.project).await?;
     let mut out = Vec::new();
     for (step, node) in weft_core::project::member_filled_places(&project) {
         let (id, path) = weft_core::project::resolve_address(&project, &step);
@@ -92,7 +93,7 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
             let is_connection = matches!(input.widget, Some(weft_core::node::Widget::Access { .. }));
             let connection = match input.widget {
                 Some(weft_core::node::Widget::RemoteSelect { .. }) => {
-                    weft_core::member::lookup_connection(&project, &at, &input.name, &values)
+                    weft_core::member::lookup_connection(&project, &at, &input.name, &values, &picks)
                         .map_err(|why| (StatusCode::CONFLICT, why))?
                         .whose()
                 }
@@ -211,7 +212,7 @@ pub async fn connect_begin(
     Json(mut req): Json<SharedDoorPick<BeginOAuth>>,
 ) -> Result<Json<StartedOAuth>, ApiError> {
     let caller = member_caller(&state, &headers).await?;
-    req.inner.redirect_uri = crate::api::access::redirect_uri(&state, &req.inner.spec)?;
+    req.inner.redirect_uri = crate::api::access::redirect_uri(&state, &req.inner.spec).await?;
     req.inner.project_id = Some(caller.project);
     req.inner.member = Some(caller.member);
     crate::broker_admin::forward_json(
@@ -402,8 +403,9 @@ async fn field_source(
     let values = weft_access_store::member_values(&state.pg_pool, &caller.tenant, caller.project, &caller.member)
         .await
         .map_err(access_err)?;
+    let picks = crate::api::project::stored_picks(state, caller.project).await?;
     let (id, path) = weft_core::project::resolve_address(&project, step);
-    let connection = weft_core::member::lookup_connection(&project, &weft_core::frames::Located::new(id, path), field, &values)
+    let connection = weft_core::member::lookup_connection(&project, &weft_core::frames::Located::new(id, path), field, &values, &picks)
         .and_then(weft_core::member::LookupConnection::signing)
         .map_err(|why| (StatusCode::CONFLICT, why))?;
     Ok((source, connection))

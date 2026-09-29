@@ -1,6 +1,6 @@
 //! Scheduled fire. The listener spawns a tokio task that enqueues
 //! a FireSignal broker task when the timer fires; a dispatcher
-//! Pod claims it and runs the same dispatch path a stateless fire
+//! process claims it and runs the same dispatch path a stateless fire
 //! takes. `After` and `At` are single-shot; `Cron` recurs until
 //! torn down.
 

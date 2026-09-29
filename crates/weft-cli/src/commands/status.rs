@@ -40,10 +40,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         match weft_compiler::hash::load_enriched_project(project) {
             Ok((mut def, catalog)) => {
                 let resolved = crate::commands::assets::resolve_project_assets(
-                    &ctx.client(),
+                    &ctx.client()?,
                     &project.root,
                     &mut def,
-                    None,
                     true,
                 )
                 .await;
@@ -100,7 +99,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // it is the state every project starts in, and the answer is the
     // command that leaves it. The marked 404 is how the dispatcher says
     // "no project I know under this id" (as opposed to a missing route).
-    let Some(data) = ctx.client().get_json_if_found(&path).await? else {
+    let Some(data) = ctx.client()?.get_json_if_found(&path).await? else {
         if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
             println!(
                 "project: {} ({project_id})\n  not registered with the dispatcher yet: \
@@ -208,20 +207,35 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if let Some(execs) = data.get("executions") {
         let total = execs.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
         println!("  executions: {total} total");
-        if let (Some(color), Some(status)) = (
-            execs.get("last_color").and_then(|v| v.as_str()),
+        if let (Some(execution_id), Some(status)) = (
+            execs.get("last_execution_id").and_then(|v| v.as_str()),
             execs.get("last_status").and_then(|v| v.as_str()),
         ) {
             match execs.get("last_completed_at").and_then(|v| v.as_u64()) {
                 Some(ts) => {
                     let age = unix_now().saturating_sub(ts);
-                    println!("    last: {color} ({status}, completed {age}s ago)");
+                    println!("    last: {execution_id} ({status}, completed {age}s ago)");
                 }
-                None => println!("    last: {color} ({status}, in flight)"),
+                None => println!("    last: {execution_id} ({status}, in flight)"),
             }
         }
     }
     print_drift(&data);
+    // A public entry turning callers away, so the author knows a limit
+    // is acting and which one (each is a setting on the trigger).
+    if let Some(limited) = data.get("limited").and_then(|v| v.as_array()) {
+        if !limited.is_empty() {
+            println!("  refused calls (last two minutes):");
+            for entry in limited {
+                println!(
+                    "    {}: {} by {}",
+                    entry["node"].as_str().unwrap_or(""),
+                    entry["refused"].as_u64().unwrap_or(0),
+                    entry["limit"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
     // The same verb list the editor's action bar offers, so a terminal
     // reader sees what the project accepts right now (and that `resync`
     // is on the table when the listeners lag behind the code).

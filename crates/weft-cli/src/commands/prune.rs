@@ -11,7 +11,7 @@ use super::Ctx;
 
 pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project_id = project.id().to_string();
     let tree = fetch_tree(&client, &project_id).await?;
     let version = resolve_version(&tree, &reference)?.id.clone();
@@ -55,7 +55,7 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     // and that promise is false.
     let (mut definition, _) = weft_compiler::hash::load_enriched_project(project)
         .context("the versions were pruned, but the project does not load, so the freed blobs were not released; fix the project and run `weft build`")?;
-    for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, None, true).await? {
+    for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, true).await? {
         eprintln!("warning: {warning}");
     }
     if ctx.json_out(&done)? {

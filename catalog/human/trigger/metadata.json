@@ -42,7 +42,8 @@
   "outputs": [],
   "requires_infra": false,
   "features": {
-    "isTrigger": true
+    "isTrigger": true,
+    "calledFromOutside": true
   },
   "validate": [
     {

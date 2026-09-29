@@ -25,7 +25,7 @@ async fn a_python_snippet_reads_a_file_through_its_minted_link() -> anyhow::Resu
     let mut project = Project::prepare("python_file", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = run::execution_colors(&disp, &project.id()).await?;
+    let before = run::executions(&disp, &project.id()).await?;
 
     let data_url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(PNG));
     let (status, _, body) =
@@ -38,8 +38,8 @@ async fn a_python_snippet_reads_a_file_through_its_minted_link() -> anyhow::Resu
 
     // The picture went back out on the file port as a stored-file marker
     // with no link on it: the journal never carries one.
-    let colors = run::wait_for_triggered_executions(&disp, &project.id(), &before, 1, std::time::Duration::from_secs(60)).await?;
-    let settled = project.settled(colors[0]).await?;
+    let execution_ids = run::wait_for_triggered_executions(&disp, &project.id(), &before, 1, std::time::Duration::from_secs(60)).await?;
+    let settled = project.settled(execution_ids[0]).await?;
     settled.completed()?;
     let same = settled.completed_outputs()["inspect"]["same"].clone();
     anyhow::ensure!(same.get("__weft_image__").is_some(), "the marker is wrapped again on the way out: {same}");

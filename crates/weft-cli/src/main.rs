@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand};
 
 mod client;
+mod credentials;
 mod commands;
 pub mod images;
 pub mod progress;
@@ -17,17 +18,27 @@ struct Cli {
     #[command(subcommand)]
     command: Cmd,
 
-    /// Override the dispatcher URL. Defaults to the value in
-    /// `weft.toml` or `http://localhost:9999`.
-    #[arg(long, env = "WEFT_DISPATCHER_URL", global = true)]
+    /// Act on the install at this raw address instead of a named
+    /// target (for tooling; people use `--on`). Unset, a non-empty
+    /// WEFT_DISPATCHER_URL stands in for it; read in `run`, not through
+    /// clap's `env`, because the verbs bound to this machine refuse the
+    /// flag but ignore the variable.
+    #[arg(long, global = true)]
     dispatcher: Option<String>,
+
+    /// Act on the named target of this project (`[targets.<name>]` in
+    /// weft.toml, e.g. `--on prod`). Without it every command acts on
+    /// the local install: no setting makes a remote target the default,
+    /// so a shared install is only ever touched when named.
+    #[arg(long = "on", value_name = "TARGET", global = true)]
+    on: Option<String>,
 
     /// Machine-readable output instead of human text. The long
     /// commands (build, run, activate, deactivate, resync, infra, rm,
     /// the cancels) stream progress as one {"phase", "detail"} object
     /// per line, which is how the VS Code extension drives its action
     /// bar; the readers (status, ps, executions, events, logs, files,
-    /// listener inspect, token, stop, connect) print what the
+    /// token, stop, connect) print what the
     /// dispatcher answered; test-node prints its reports as one JSON
     /// array. The rest (new, follow, daemon, catalog, tangle, clean)
     /// ignore it; describe-nodes, parse and validate are JSON already.
@@ -53,9 +64,14 @@ enum Cmd {
         /// remembered as the default for future projects; `none` opts out.
         #[arg(long = "assistant", value_name = "NAME")]
         assistants: Vec<String>,
+        /// Also write the GitHub Actions workflow that deploys the
+        /// project to its install on this cloud (same as `weft ci add`).
+        #[arg(long, value_name = "CLOUD")]
+        ci: Option<commands::ci::Cloud>,
     },
-    /// Compile the current project into its worker image and register it
-    /// with the dispatcher, without running anything. Also how you put
+    /// Have the install build the current project (compiled there, its
+    /// images built by the install's BuildKit) and register it, without
+    /// running anything. Also how you put
     /// back code the dispatcher no longer has: registering records the
     /// compiled program under its own hash, which is the hash a past run
     /// names, so unchanged files make that run readable again. It adds
@@ -65,15 +81,6 @@ enum Cmd {
         /// node is compiled, so adding an unchanged node needs no rebuild.
         #[arg(long)]
         referenced: bool,
-    },
-    /// Build (if stale) the shared worker builder-base image and print its
-    /// content-addressed tag. The base bakes the precompiled engine + deps that
-    /// every per-project worker build reuses; this is the same base-ensure a
-    /// `weft build` runs, exposed so a cluster setup can build + load it into its
-    /// registry. `--quiet` prints ONLY the tag (for scripting).
-    BuildBase {
-        #[arg(long)]
-        quiet: bool,
     },
     /// Make every shared image exist locally: the four system images
     /// (dispatcher, listener, broker, infra-supervisor) plus the worker
@@ -129,10 +136,10 @@ enum Cmd {
     },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
-    /// cluster needed). With a package name or node type: just that
+    /// install needed). With a package name or node type: just that
     /// scope. `--tier live` adds the live tier: real credentials
-    /// through the production access path, as a test pod in the
-    /// cluster; it can spend money, so it confirms first (persist
+    /// through the production access path, as a test run in the
+    /// install; it can spend money, so it confirms first (persist
     /// "don't ask again" when prompted, or pass --yes).
     #[command(name = "test-node")]
     TestNode {
@@ -160,7 +167,7 @@ enum Cmd {
         yes: bool,
         /// Run tests concurrently: bare `--parallel` runs everything at
         /// once, `--parallel N` caps in-flight tests at N. Applies to
-        /// the local tiers and to live pod runs alike.
+        /// the local tiers and to live runs alike.
         #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
         parallel: Option<usize>,
     },
@@ -254,9 +261,14 @@ enum Cmd {
         #[arg(long, value_name = "name")]
         save: Option<String>,
         /// Clear a saved setting before applying explicit flags: from,
-        /// emit, target, before, group, feed, fire, or member. Repeatable.
+        /// emit, target, before, group, feed, fire, member, or long.
+        /// Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
+        /// Run as a job of its own, which may run for days, instead of one
+        /// request to the project's workers (cut at an hour on a cloud).
+        #[arg(long)]
+        long: bool,
     },
     /// Record the project's files as a version under head, with no run
     /// and no build: a point to branch back to.
@@ -266,19 +278,26 @@ enum Cmd {
         #[arg(long)]
         root: bool,
     },
-    /// Restore a version's files (a color means its version) and move
-    /// head there. A color sets the run the next `--seed` inherits from.
+    /// Restore a version's files and move head there. Given an execution,
+    /// the version it ran, and that run becomes the one the next `--seed`
+    /// inherits from.
     Branch {
-        /// A version id or a run color, or the start of one.
+        /// A version id or an execution id, or the start of either.
         reference: String,
         /// Throw away uncommitted changes instead of refusing.
         #[arg(long)]
         discard: bool,
     },
+    /// Write the files of the program the install holds (its last build)
+    /// into a new folder; `--on <target>` reads another install's.
+    RunningSource {
+        /// The folder to create.
+        dir: std::path::PathBuf,
+    },
     /// The project's version tree: every version with what changed
     /// against its parent, its runs beneath, head marked.
     Tree,
-    /// Compare what two runs put on their wires. A ref is a color (or
+    /// Compare what two runs put on their wires. A ref is an execution (or
     /// the start of one) or `example:<name>`.
     Diff {
         left: String,
@@ -292,7 +311,7 @@ enum Cmd {
     /// accepted for review. Replaces an existing example in full.
     Freeze {
         name: String,
-        color: Option<String>,
+        execution_id: Option<String>,
         /// Emphasize these output nodes in later diffs. Repeat for several nodes.
         #[arg(long = "expect")]
         expect: Vec<String>,
@@ -309,13 +328,27 @@ enum Cmd {
     /// Resolve a pure time wait now. A wait that expects a value is
     /// refused, naming its kind.
     Wake {
-        color: String,
+        execution_id: String,
         node: String,
+    },
+    /// The project's own worker levers: copies kept warm, the most copies,
+    /// runs per copy, CPU and memory. What the project leaves unset follows
+    /// the install; a change applies to the running workers at once.
+    Workers {
+        #[command(subcommand)]
+        action: Option<WorkersAction>,
+    },
+    /// The domains the install answers at: its own, or a project's
+    /// frontend or API. Adding one prints the DNS record to set and waits
+    /// until it points at the install, which then gets its certificate.
+    Domain {
+        #[command(subcommand)]
+        action: DomainAction,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
-    /// Cancel an execution by color.
-    Stop { color: String },
+    /// Cancel a running execution, named by its id or the start of it.
+    Stop { execution_id: String },
     /// Prepare and save trigger settings without listening for events.
     Bake {
         project: Option<String>,
@@ -374,10 +407,10 @@ enum Cmd {
         #[arg(long = "all-members", conflicts_with = "member")]
         all_members: bool,
     },
-    /// Cancel an in-flight `activate` (status=Activating). Wipes
-    /// every signal row registered so far, cancels the
-    /// TriggerSetup color, flips the project to Inactive. 412 if
-    /// the project isn't Activating.
+    /// Cancel an in-flight `activate`: cancels the setup run of each
+    /// trigger still activating, wipes every signal it registered so
+    /// far, and leaves those triggers inactive. 412 if none of them is
+    /// activating.
     #[command(name = "cancel-activate")]
     CancelActivate {
         project: Option<String>,
@@ -385,9 +418,8 @@ enum Cmd {
         scope: ScopeOpts,
     },
     /// Cancel an in-flight build (transition=building).
-    /// The dispatcher pod driving the build interrupts the builder
-    /// job; the verb that was building errs "cancelled". 412 if no
-    /// build is in flight.
+    /// The dispatcher driving the build stops it; the verb that was
+    /// building errs "cancelled". 412 if no build is in flight.
     #[command(name = "cancel-build")]
     CancelBuild {
         project: Option<String>,
@@ -423,7 +455,7 @@ enum Cmd {
     Ps,
     /// Remove a project at the level you ask for. No flags → the
     /// cwd project is unregistered: the dispatcher deactivates it,
-    /// terminates its infra pods, and reclaims its stored data.
+    /// terminates its infrastructure, and reclaims its stored data.
     /// Add flags to escalate: `--journal` drops execution history,
     /// `--local` wipes this project's build artifacts, `--all`
     /// implies every flag. An explicit project id overrides the
@@ -438,7 +470,7 @@ enum Cmd {
         #[arg(long)]
         all: bool,
         /// Skip the supervisor terminate-wait window. Use when the
-        /// supervisor pod is wedged or the cluster is unreachable
+        /// supervisor is wedged or the install is unreachable
         /// and the user wants the project gone NOW.
         #[arg(long)]
         force: bool,
@@ -452,7 +484,7 @@ enum Cmd {
     /// Tail logs. No arg → latest execution of the cwd project.
     /// UUID arg → that specific execution.
     Logs {
-        #[arg(value_name = "color")]
+        #[arg(value_name = "execution-id")]
         target: Option<String>,
         /// How many lines, counted from the END of the log: a run that
         /// wrote more than this shows its last lines, and says so.
@@ -463,10 +495,9 @@ enum Cmd {
     /// Print a summary of the cwd project's current state.
     /// Registration, listener, infra per-node, recent executions.
     Status,
-    /// Manage the local dispatcher daemon (start, stop, status,
-    /// restart, logs). The dispatcher is the long-lived process that
-    /// owns projects, executions, and infra; `weft run` and the
-    /// VS Code extension talk to it over HTTP.
+    /// Manage this machine's install (start, stop, status, restart,
+    /// logs): the runtime that owns projects, executions, and infra;
+    /// `weft run` and the VS Code extension talk to it over HTTP.
     #[command(visible_alias = "d")]
     Daemon {
         #[command(subcommand)]
@@ -572,6 +603,32 @@ enum Cmd {
         #[arg(long, value_name = "dir")]
         into: Option<std::path::PathBuf>,
     },
+    /// The installs this project deploys to (`[targets.<name>]` in
+    /// weft.toml). Every command acts on one with `--on <name>`; without
+    /// it, on the local install.
+    Target {
+        #[command(subcommand)]
+        action: TargetCmd,
+    },
+    /// The GitHub Actions workflow that deploys this project.
+    Ci {
+        #[command(subcommand)]
+        action: CiCmd,
+    },
+    /// Store your operator key for a target, after checking the install
+    /// accepts it. Kept in ~/.config/weft/credentials.toml (only you can
+    /// read it), never in the project. CI passes WEFT_OPERATOR_KEY instead.
+    Login {
+        /// The target's name, as in `[targets.<name>]`.
+        target: String,
+        /// Read the key from stdin instead of a hidden prompt.
+        #[arg(long)]
+        key_stdin: bool,
+    },
+    /// Forget your stored operator key for a target.
+    Logout {
+        target: String,
+    },
     /// Manage the project's Tangle persona: the AI assistant prompts,
     /// skills and commands copied in by `weft new --assistant`.
     Tangle {
@@ -633,7 +690,7 @@ enum Cmd {
     /// and `--kind` narrow it, `--full` opens the values, and `--json`
     /// prints the replay rows the graph view reads.
     Events {
-        color: String,
+        execution_id: String,
         /// Only events of this node, spelled the way the source reads:
         /// `auth.check` is the node `check` of the file the site `auth`
         /// includes, and only that use of it.
@@ -649,14 +706,6 @@ enum Cmd {
         /// under `--json`, which always carries the whole row.
         #[arg(long)]
         full: bool,
-    },
-    /// Inspect every live listener pod: how many signals the
-    /// dispatcher placed on it alongside what the pod holds in RAM.
-    /// Drift between the two means cleanup went wrong. Operator
-    /// command for diagnosing stuck listeners.
-    Listener {
-        #[command(subcommand)]
-        action: ListenerAction,
     },
     /// Browse + manage stored files (the tenant's runtime storage):
     /// project files, shared spaces, past-execution survivors.
@@ -684,8 +733,8 @@ enum Cmd {
     #[command(verbatim_doc_comment)]
     Clean {
         /// Single execution UUID to delete. Mutually exclusive with --images / --build-cache.
-        #[arg(value_name = "color")]
-        color: Option<String>,
+        #[arg(value_name = "execution-id")]
+        execution_id: Option<String>,
         /// Age cutoff in days for a sweep that names no subject
         /// (default 30). Naming a subject means you mean all of it, so
         /// this only applies to `--project` when you ask for it.
@@ -750,6 +799,50 @@ enum CatalogAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum TargetCmd {
+    /// Name an install: `weft target add prod https://weft.example.com`.
+    /// Replaces the url when the name exists.
+    Add { name: String, url: String },
+    /// List the targets, and whether you are logged in to each.
+    #[command(alias = "ls")]
+    List,
+    /// Remove a target from weft.toml.
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// For tooling (the editor's install switch): the address and the
+    /// operator key a request carries with the same `--on`, as JSON.
+    #[command(hide = true)]
+    Key,
+    /// Hand this project's GitHub repository what its deploy workflow
+    /// needs to reach a cloud install: sets the repository variables and
+    /// secrets with `gh`, minting a CI operator key and a frontend caller
+    /// token on the install. Without `--github`, prints them instead.
+    Export {
+        name: String,
+        /// Set them on the repository with `gh` (logged in, run inside
+        /// the repository).
+        #[arg(long)]
+        github: bool,
+        /// The frontend server's own environment, a dotenv file (what
+        /// `weft infra env --on <target> --into <file>` writes, plus any
+        /// secret of the site's own), sent as the WEFT_FRONT_ENV secret.
+        #[arg(long, value_name = "file")]
+        front_env: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CiCmd {
+    /// Write .github/workflows/deploy.yml for a cloud. Running it again
+    /// replaces a file weft wrote and nobody edited, and refuses one that
+    /// was edited.
+    Add {
+        #[arg(long, value_name = "CLOUD")]
+        cloud: commands::ci::Cloud,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TangleAction {
     /// Re-copy this project's Tangle files from the installed weft.
     /// Every file the template owns is replaced, so edits you made to
@@ -809,6 +902,12 @@ enum TokenAction {
         /// --member; without it a token works until revoked.
         #[arg(long, value_name = "duration", value_parser = parse_duration_secs)]
         expires: Option<u64>,
+        /// Mint an operator key instead: full admin of the install
+        /// (every CLI and editor verb), for a teammate or CI
+        /// (`WEFT_OPERATOR_KEY`). Takes no scope and acts as no member.
+        /// Never put one in a frontend: its server holds a caller token.
+        #[arg(long, conflicts_with_all = ["projects", "tags", "displays", "all_displays", "member"])]
+        operator: bool,
     },
     /// List existing signal tokens (metadata + recognizer; the full
     /// value is shown only once, at mint).
@@ -820,7 +919,7 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires } => {
+            TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires, operator } => {
                 commands::token::TokenAction::Mint {
                     name,
                     projects,
@@ -829,6 +928,7 @@ impl From<TokenAction> for commands::token::TokenAction {
                     all_displays,
                     member,
                     expires_in_secs: expires,
+                    operator,
                 }
             }
             TokenAction::Ls => commands::token::TokenAction::Ls,
@@ -1024,7 +1124,7 @@ enum InfraAction {
     /// Print the current lifecycle state of each infra node.
     Status,
     /// Cancel in-flight infra work: halt claimed lifecycle commands
-    /// (the supervisor stops between cluster calls), cancel unclaimed
+    /// (the supervisor stops between platform calls), cancel unclaimed
     /// ones outright, interrupt the provisioning execution. HALT, not
     /// rollback: per-node partial state stays visible; terminate or
     /// retry per-node from where it stopped. 412 if nothing is in
@@ -1036,8 +1136,8 @@ enum InfraAction {
         member: Option<weft_core::member::MemberId>,
     },
     /// Print what the project's infra containers wrote: every unit of
-    /// every infra node, or one node's. Lines are prefixed with the pod
-    /// and container they came from.
+    /// every infra node, or one node's. Each block is headed by the node
+    /// (and whose copy), the unit and the container that wrote it.
     Logs {
         /// The infra instance to read, named as `weft infra status` lists
         /// it (`db`, or `one.db` for the `db` inside the file the site
@@ -1093,14 +1193,6 @@ enum InfraAction {
 }
 
 #[derive(Debug, Subcommand)]
-enum ListenerAction {
-    /// Print every live listener pod: placed signal count and the
-    /// pod's registry. Drift highlights where cleanup went wrong.
-    /// `--json` prints the rows as the dispatcher returns them.
-    Inspect,
-}
-
-#[derive(Debug, Subcommand)]
 enum FilesAction {
     /// List stored files, organized by space (project files, shared
     /// spaces, past-execution survivors). Optional prefix filter.
@@ -1134,57 +1226,44 @@ enum FilesAction {
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
-    /// Bring the daemon to the desired state: ensure the kind cluster
-    /// (with its loopback port mappings, so the CLI talks to the
-    /// dispatcher on localhost), ingress, images and dispatcher exist,
-    /// and roll whatever changed. Idempotent, so it is both the first
-    /// boot and the refresh; `restart` is an alias for the same
-    /// reconcile.
+    /// Bring the local install up: its database, its object store, the
+    /// images it runs, and weft's runtime under the machine's service
+    /// manager. Idempotent, so it is both the first boot and the
+    /// refresh; `restart` is an alias for the same reconcile.
     #[command(visible_alias = "restart")]
     Start {
-        /// Force-rebuild every shared image (the four system images
-        /// and the worker builder base and full-library worker), skipping the
-        /// present-and-pull check. For when a local image is corrupt
-        /// or hand-modified.
+        /// Rebuild the shared images (the runtime and the worker builder
+        /// base) even when present. For when a local image is corrupt or
+        /// hand-modified.
         #[arg(long)]
         rebuild: bool,
-        /// Rebuild the kind NODE even when its shape did not change (a
-        /// shape change, a config or kind-version change, rebuilds on
-        /// its own). The system database survives (its files live on
-        /// the host); every project's own database (a PostgresDatabase
-        /// infra node's volume) lives inside the node and is destroyed
-        /// with it.
-        #[arg(long)]
-        rebuild_cluster: bool,
-        /// Expose the PUBLIC TRIGGER SURFACE (/events/..., /signal/...)
-        /// to the internet through an outbound tunnel + filtering
-        /// proxy, so providers can deliver event pushes to this local
-        /// install. Persisted until --no-public-url.
+        /// Open a public address for the doors outside callers use
+        /// (provider event pushes, fire links, shared file links, live
+        /// routes, the OAuth callback) through an outbound tunnel. The
+        /// management API is never on it. Kept until --no-public-url.
         #[arg(long, overrides_with = "no_public_url")]
         public_url: bool,
-        /// Close the public trigger surface (tear the tunnel down).
+        /// Close the public address (stop the tunnel).
         #[arg(long)]
         no_public_url: bool,
-        /// Empty the shared-credentials secret when the checkout has
-        /// no `access-apps.json`. Without this flag an absent file
-        /// keeps whatever keys the cluster already holds.
-        #[arg(long)]
-        clear_access_apps: bool,
     },
-    /// Stop the running daemon. Scales the dispatcher to 0. The kind
-    /// cluster and persistent state stay intact.
+    /// Stop weft's runtime and the workers it started. The database and
+    /// the infra keep running.
     Stop,
-    /// Take a NAMED install (`WEFT_INSTANCE`) off the cluster, leaving
-    /// nothing of it: its namespaces and every project in them, its
-    /// database, its bucket. A named install is one that lives beside
-    /// the default install in the same cluster, like a test cell;
+    /// Take a NAMED install (`WEFT_INSTANCE`) off this machine, leaving
+    /// nothing of it: its projects, its workers and infra, its database,
+    /// its bucket. A named install lives beside the default one with
+    /// ports and files of its own, like a test cell;
     /// `WEFT_INSTANCE=<name> weft daemon start` brings one up (add
     /// `WEFT_TIME_SCALE` to run its own timers faster). Refused for the
     /// default install, which `./setup.sh --uninstall` removes.
     Remove,
-    /// Report whether the daemon is reachable.
+    /// Report whether this machine's runtime is reachable (the install
+    /// WEFT_INSTANCE names). `--on` and `--dispatcher` are refused;
+    /// WEFT_DISPATCHER_URL is ignored, it does not change which install
+    /// this reports on.
     Status,
-    /// Tail the daemon's stderr log.
+    /// Tail the runtime's log.
     Logs {
         /// Number of lines to print.
         #[arg(long, default_value_t = 100)]
@@ -1193,6 +1272,90 @@ enum DaemonAction {
         #[arg(long, short = 'f', default_value_t = false)]
         follow: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkersAction {
+    /// Set levers for this project (the others keep what they have).
+    Set {
+        /// Copies kept running when idle: 0 scales to zero (a cold start
+        /// after a quiet stretch), 1 or more never waits for one.
+        #[arg(long)]
+        min_instances: Option<u32>,
+        /// The most copies at once.
+        #[arg(long)]
+        max_instances: Option<u32>,
+        /// Executions one copy serves at once.
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// CPUs per copy (`1`, `2`, `0.5`).
+        #[arg(long)]
+        cpu: Option<String>,
+        /// Memory per copy (`512Mi`, `2Gi`).
+        #[arg(long)]
+        memory: Option<String>,
+        /// Extra CPU while a copy starts, where the platform offers it.
+        #[arg(long)]
+        startup_boost: Option<bool>,
+        /// Keep CPU on a copy between calls (billed while it is up), for
+        /// a program that keeps working after it answered a live caller.
+        #[arg(long)]
+        cpu_always_allocated: Option<bool>,
+    },
+    /// Put levers back on the install's: the named ones, or every one.
+    Reset { levers: Vec<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainAction {
+    /// Answer at a domain (`app.example.com`) you own.
+    Add {
+        name: String,
+        /// What the domain serves: the install itself, or this project's
+        /// frontend or API.
+        #[arg(long = "for", value_enum, default_value = "install")]
+        serves: commands::domain::Serves,
+        /// Where a frontend runs (its https address), for `--for frontend`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Print the DNS record and return, instead of waiting until it
+        /// is in place.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Every domain, with the DNS record each needs.
+    List,
+    /// Stop answering at a domain.
+    Rm { name: String },
+}
+
+impl From<DomainAction> for commands::domain::DomainAction {
+    fn from(value: DomainAction) -> Self {
+        match value {
+            DomainAction::Add { name, serves, to, no_wait } => Self::Add { name, serves, to, no_wait },
+            DomainAction::List => Self::List,
+            DomainAction::Rm { name } => Self::Rm { name },
+        }
+    }
+}
+
+impl From<WorkersAction> for commands::workers::WorkersAction {
+    fn from(value: WorkersAction) -> Self {
+        match value {
+            WorkersAction::Set { min_instances, max_instances, concurrency, cpu, memory, startup_boost, cpu_always_allocated } => {
+                Self::Set(commands::workers::WorkerLevers {
+                    min_instances,
+                    max_instances,
+                    concurrency,
+                    cpu,
+                    memory,
+                    startup_boost,
+                    cpu_always_allocated,
+                })
+            }
+            WorkersAction::Reset { levers } => Self::Reset(levers),
+        }
+    }
 }
 
 /// What an `infra` verb asks for: a lifecycle request to the
@@ -1295,14 +1458,10 @@ fn public_url_choice(on: bool, off: bool) -> Option<bool> {
 impl From<DaemonAction> for commands::daemon::DaemonAction {
     fn from(value: DaemonAction) -> Self {
         match value {
-            DaemonAction::Start { rebuild, rebuild_cluster, public_url, no_public_url, clear_access_apps } => {
-                commands::daemon::DaemonAction::Start {
-                    rebuild,
-                    rebuild_cluster,
-                    public_url: public_url_choice(public_url, no_public_url),
-                    clear_access_apps,
-                }
-            }
+            DaemonAction::Start { rebuild, public_url, no_public_url } => commands::daemon::DaemonAction::Start {
+                rebuild,
+                public_url: public_url_choice(public_url, no_public_url),
+            },
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Remove => commands::daemon::DaemonAction::Remove,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
@@ -1427,12 +1586,12 @@ fn prelude() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let ctx = commands::Ctx::new(cli.dispatcher, cli.json);
+    let ctx = commands::Ctx::new(commands::Dispatcher::from_flag_or_env(cli.dispatcher), cli.on, cli.json)?;
 
     match cli.command {
-        Cmd::New { name, assistants } => commands::new::run(ctx, name, assistants).await,
+        Cmd::New { name, assistants, ci } => commands::new::run(ctx, name, assistants, ci).await,
+        Cmd::Ci { action: CiCmd::Add { cloud } } => commands::ci::add(ctx, cloud).await,
         Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
-        Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
         Cmd::BuildImages { push, push_suffix, print } => {
             commands::build::run_build_images(push, push_suffix, print).await
         }
@@ -1456,7 +1615,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, member, save, clear } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, member, save, clear, long } => {
             commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -1467,7 +1626,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     seed_until,
                     seed_before,
                     root,
-                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, member, clear },
+                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, member, clear, long },
                     save,
                 },
             )
@@ -1475,14 +1634,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Checkpoint { label, root } => commands::checkpoint::run(ctx, label, root).await,
         Cmd::Branch { reference, discard } => commands::branch::run(ctx, reference, discard).await,
+        Cmd::RunningSource { dir } => commands::running_source::run(ctx, dir).await,
         Cmd::Tree => commands::tree::run(ctx).await,
         Cmd::Diff { left, right, full } => commands::diff::run(ctx, left, right, full).await,
-        Cmd::Freeze { name, color, expect } => commands::freeze::run(ctx, name, color, expect).await,
+        Cmd::Freeze { name, execution_id, expect } => commands::freeze::run(ctx, name, execution_id, expect).await,
         Cmd::Examples => commands::examples::run(ctx).await,
         Cmd::Prune { version, yes } => commands::prune::run(ctx, version, yes).await,
-        Cmd::Wake { color, node } => commands::wake::run(ctx, color, node).await,
+        Cmd::Wake { execution_id, node } => commands::wake::run(ctx, execution_id, node).await,
+        Cmd::Domain { action } => commands::domain::run(ctx, action.into()).await,
+        Cmd::Workers { action } => commands::workers::run(ctx, action.map(Into::into).unwrap_or(commands::workers::WorkersAction::Show)).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
-        Cmd::Stop { color } => commands::stop::run(ctx, color).await,
+        Cmd::Stop { execution_id } => commands::stop::run(ctx, execution_id).await,
         Cmd::Bake { project, referenced, running, scope } => {
             commands::bake::run(
                 ctx,
@@ -1546,6 +1708,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Tangle { action } => match action {
             TangleAction::Update { assistants } => commands::tangle::update(ctx, assistants).await,
         },
+        Cmd::Target { action } => {
+            let action = match action {
+                TargetCmd::Add { name, url } => commands::target::TargetAction::Add { name, url },
+                TargetCmd::List => commands::target::TargetAction::List,
+                TargetCmd::Remove { name } => commands::target::TargetAction::Remove { name },
+                TargetCmd::Key => {
+                    return commands::target::key(&ctx);
+                }
+                TargetCmd::Export { name, github, front_env } => commands::target::TargetAction::Export { name, github, front_env },
+            };
+            commands::target::run(ctx, action).await
+        }
+        Cmd::Login { target, key_stdin } => commands::target::login(ctx, target, key_stdin).await,
+        Cmd::Logout { target } => commands::target::logout(ctx, target).await,
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
         Cmd::Executions { limit, project, phase, node, since, offset, status, member, tag } => {
             commands::executions::list(
@@ -1556,17 +1732,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
-        Cmd::Events { color, node, kind, full } => {
+        Cmd::Events { execution_id, node, kind, full } => {
             commands::executions::events(
                 ctx,
-                color,
+                execution_id,
                 commands::executions::EventsFilter { node, call_path: Vec::new(), kind, full },
             )
             .await
         }
-        Cmd::Listener { action } => match action {
-            ListenerAction::Inspect => commands::listener::inspect(ctx).await,
-        },
         Cmd::Files { action } => match action {
             FilesAction::Ls { prefix } => commands::files::ls(ctx, prefix).await,
             FilesAction::Inspect { key } => commands::files::inspect(ctx, key).await,
@@ -1577,11 +1750,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
         Cmd::Clean {
-            color, keep_days, all, images, build_cache, project, member, status, node, tag, cancel_running, yes,
+            execution_id, keep_days, all, images, build_cache, project, member, status, node, tag, cancel_running, yes,
         } => {
             let narrow = commands::executions::CleanNarrowing { member, status, node, tag, cancel_running };
             commands::executions::clean(
-                ctx, color, keep_days, all, images, build_cache, project, narrow, yes,
+                ctx, execution_id, keep_days, all, images, build_cache, project, narrow, yes,
             )
             .await
         }

@@ -84,7 +84,7 @@ pub struct NodeTestInfo {
 // ----- The runner's wire shapes ---------------------------------------
 //
 // One definition serves every consumer of the test binary's stdout
-// (the engine runner writes them, the CLI and the dispatcher's pod
+// (the engine runner writes them, the CLI and the dispatcher's process
 // harvester read them), so the protocol cannot fork.
 
 /// One node's `list` entry: its declared tests.
@@ -113,11 +113,11 @@ pub struct TestReport {
     pub passed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Live only: the execution colors the run's cost is recorded
-    /// under (the pinned pre-registered color when one was supplied,
+    /// Live only: the executions the run's cost is recorded
+    /// under (the pinned pre-registered execution when one was supplied,
     /// throwaways otherwise).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub colors: Vec<String>,
+    pub execution_ids: Vec<String>,
 }
 
 /// The `run-all` subcommand's whole output.
@@ -130,7 +130,7 @@ pub struct RunAllReport {
 /// The marker the runner prints in front of its JSON report line, so
 /// readers find the report by identity instead of by position.
 // A position-based protocol ("last non-empty line") broke whenever a
-// log line landed after the report: pod logs merge stdout and stderr
+// log line landed after the report: process logs merge stdout and stderr
 // into one stream, so a late tracing line from the runner's own
 // teardown could shadow a report that was printed correctly.
 pub const REPORT_SENTINEL: &str = "WEFT-TEST-REPORT ";
@@ -1270,7 +1270,6 @@ impl FakeRig {
         let ictx = crate::infra::InfraProvisionContext::new(
             uuid::Uuid::new_v4(),
             NODE_UNDER_TEST_ID.to_string(),
-            "wft-project-node-test".to_string(),
             "node-test".to_string(),
         );
         match node.provision_infra(ictx, bag).await {
@@ -1294,7 +1293,7 @@ impl FakeRig {
     }
 
     /// The journal a body of `node` replays and records: what
-    /// production keys by (color, node, frames), here one sequence per
+    /// production keys by (execution, node, frames), here one sequence per
     /// node TYPE and body kind, because a rig runs one instance of a
     /// type at a time (`NODE_UNDER_TEST_ID` is every node's id here).
     /// Two structs returning one manifest are one node to the rig.
@@ -1692,7 +1691,7 @@ fn test_context(
         NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
-        crate::Color::new_v4(),
+        crate::ExecutionId::new_v4(),
         LoopFrames::default(),
         member,
         inputs,
@@ -2679,12 +2678,14 @@ pub type LiveHandleFactory = Arc<
 pub struct LiveRig {
     factory: LiveHandleFactory,
     access: Access,
+    /// The `WEFT_NODE_TEST_*` values the run was handed, by full name.
+    fixtures: std::collections::BTreeMap<String, String>,
 }
 
 impl LiveRig {
     /// Composed by the runtime's test runner, never by test code.
-    pub fn new(factory: LiveHandleFactory, access: Access) -> Self {
-        Self { factory, access }
+    pub fn new(factory: LiveHandleFactory, access: Access, fixtures: std::collections::BTreeMap<String, String>) -> Self {
+        Self { factory, access, fixtures }
     }
 
     /// The connection marker for the test's declared service, to place
@@ -2708,14 +2709,14 @@ impl LiveRig {
 
     /// A live fixture: a value the test cannot self-provision in the
     /// connected account (a chat id the tester's bot may message, a
-    /// mailbox address). Reads `WEFT_NODE_TEST_<name>` from the
-    /// runner's environment (the CLI forwards every such variable
-    /// into the test run); a missing variable fails the test naming
+    /// mailbox address). Answers `WEFT_NODE_TEST_<name>` as the run was
+    /// handed it (the CLI forwards every such variable of its own
+    /// environment with the test); a missing one fails the test naming
     /// exactly what to set.
     pub fn fixture(&self, name: &str) -> WeftResult<String> {
         let var = format!("WEFT_NODE_TEST_{name}");
-        match std::env::var(&var) {
-            Ok(v) if !v.is_empty() => Ok(v),
+        match self.fixtures.get(&var) {
+            Some(v) if !v.is_empty() => Ok(v.clone()),
             _ => Err(crate::error::node_error(format!(
                 "live fixture {var} is not set; add it to the environment (the repo \
                  .env for scripted runs) and re-run"
@@ -3900,6 +3901,7 @@ mod tests {
             .run_live(LiveRig::new(
                 Arc::new(|_, _, _| Err(WeftError::Config("unused".into()))),
                 Access::new("c", "svc", None),
+                Default::default(),
             ))
             .await
             .expect_err("basic is not live")

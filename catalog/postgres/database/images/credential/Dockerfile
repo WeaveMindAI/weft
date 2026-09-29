@@ -12,6 +12,6 @@ RUN apk add --no-cache postgresql17-client
 COPY bootstrap.py /bootstrap.py
 
 # Not root, and not Postgres's user either: this container only needs
-# the shared group the Pod puts every container in.
+# the shared group every container of the infra unit is in.
 USER 999:999
 ENTRYPOINT ["python3", "/bootstrap.py"]

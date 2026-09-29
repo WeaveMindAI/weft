@@ -189,7 +189,7 @@ fn language_construct(name: &str) -> Option<String> {
         "Group" => ("a group, written `name = Group(...) { ... }`", "docs/src/language/groups.md"),
         "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
         "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
-        "Passthrough" | "LoopIn" | "LoopOut" => (
+        weft_core::project::boundary_types::PASSTHROUGH | weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
             "a step the compiler makes out of a group or a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
         ),

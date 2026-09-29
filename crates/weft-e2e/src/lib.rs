@@ -1,7 +1,7 @@
 //! # weft-e2e: the Layer-4 end-to-end test rig
 //!
-//! This crate drives a REAL running weft cluster (dispatcher + listener +
-//! worker pods on kind) and asserts behavior through the dispatcher's public
+//! This crate drives a REAL running weft install (the runtime process and
+//! the worker containers it starts) and asserts behavior through the dispatcher's public
 //! API, exactly as a user or the outside world would. It is the Layer-4 tier
 //! of the testing pyramid: real binaries, real network, real backing services.
 //!
@@ -11,10 +11,10 @@
 //! scripts/run-e2e.sh
 //! ```
 //!
-//! The runner brings the cluster to current code once, then runs the test
+//! The runner brings the install to current code once, then runs the test
 //! files side by side. The `e2e` feature is OFF by default, so
 //! `cargo test --workspace` compiles this crate but runs none of its
-//! cluster-touching tests. How to write a test that runs well beside the
+//! install-touching tests. How to write a test that runs well beside the
 //! others is in the crate's README.
 //!
 //! ## The toolkit (this library)
@@ -71,9 +71,9 @@ pub mod human;
 pub mod infra;
 pub mod kept;
 pub mod live;
-// The platform layer reaches behind the public API (direct Postgres + kubectl)
+// The platform layer reaches behind the public API (direct Postgres + Docker)
 // to observe and drive what the SYSTEM does underneath a program. It needs the
-// cluster's Postgres, so it (and its `sqlx` dep) compile ONLY under `e2e`. None
+// install's Postgres, so it (and its `sqlx` dep) compile ONLY under `e2e`. None
 // of it ships; see the module docs.
 #[cfg(feature = "e2e")]
 pub mod platform;
@@ -87,7 +87,7 @@ pub mod storage;
 // another harness share ONE definition of the policy via this guard.
 pub mod teardown;
 
-pub use client::{cli, cli_ok, poll_until, poll_until_describing, tail, Dispatcher};
+pub use client::{cli, cli_ok, poll_until, poll_until_describing, tail, time_left, Dispatcher, TEST_LIMIT};
 #[cfg(feature = "e2e")]
 pub use platform::Platform;
 pub use cell::Cell;

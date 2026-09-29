@@ -1,7 +1,7 @@
 // Subscribes to the dispatcher's execution SSE stream and forwards
 // node lifecycle events into the graph webview.
 //
-// The dispatcher exposes /events/execution/{color} as SSE. Each
+// The dispatcher exposes /events/execution/{executionId} as SSE. Each
 // event arrives with kind + payload, tagged to match the Rust
 // enum. We translate
 // each event into one `execEvent` (graph state: running /
@@ -11,7 +11,7 @@
 // a node's display, fed by graphView's `/live` pollers, which run
 // independently of execution.
 //
-// A single follower tracks a single color at a time. Switching
+// A single follower tracks a single execution at a time. Switching
 // follows (the user picks a different past execution in the
 // sidebar) disposes the current EventSource and spins a new one.
 
@@ -41,26 +41,26 @@ export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 export type DispatcherEvent = { event_id: string } & (
   // `phase`: a run of the graph (`fire`) or the setup an `infra start`
   // (`infra_setup`) or an activation (`trigger_setup`) runs.
-  | { kind: 'execution_started'; color: string; entry_node: string; phase: ExecutionPhase; subgraph?: string[]; seed?: Seed; project_id: string; at_unix: number }
+  | { kind: 'execution_started'; execution_id: string; entry_node: string; phase: ExecutionPhase; subgraph?: string[]; seed?: Seed; project_id: string; at_unix: number }
   // `inherited_from` is set when the firing was taken from the run this
   // one was seeded from (`weft run --seed`); `provided_ports` names the
   // input ports supplied at a run's `--from` or `--group` start.
   // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
-  | { kind: 'node_started'; color: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_suspended'; color: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_resumed'; color: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_cancelled'; color: string; node: string; frames: Frame[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_completed'; color: string; node: string; frames: Frame[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_failed'; color: string; node: string; frames: Frame[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_skipped'; color: string; node: string; frames: Frame[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown; at_unix: number }
-  | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
-  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
-  | { kind: 'execution_tagged'; color: string; project_id: string; tags: string[]; at_unix: number }
+  | { kind: 'node_started'; execution_id: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_suspended'; execution_id: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; execution_id: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_cancelled'; execution_id: string; node: string; frames: Frame[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_completed'; execution_id: string; node: string; frames: Frame[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_failed'; execution_id: string; node: string; frames: Frame[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_skipped'; execution_id: string; node: string; frames: Frame[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'execution_completed'; execution_id: string; project_id: string; outputs: unknown; at_unix: number }
+  | { kind: 'execution_failed'; execution_id: string; project_id: string; error: string; at_unix: number }
+  | { kind: 'execution_cancelled'; execution_id: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
+  | { kind: 'execution_tagged'; execution_id: string; project_id: string; tags: string[]; at_unix: number }
   // The run was erased (weft clean, a prune, the editor's delete), its
   // journal and the questions it was parked on with it. No at_unix:
   // nothing was journaled, the journal is what went.
-  | { kind: 'execution_deleted'; color: string; project_id: string }
+  | { kind: 'execution_deleted'; execution_id: string; project_id: string }
   // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
   // from supervisor-written rows; drive action-bar refresh so
   // transient `stopping` / `terminating` states show up in the UI.
@@ -89,7 +89,7 @@ export type DispatcherEvent = { event_id: string } & (
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
   // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
-  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: CredentialOwner; at_unix: number }
+  | { kind: 'cost_reported'; execution_id: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: CredentialOwner; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -103,39 +103,39 @@ export type DispatcherEvent = { event_id: string } & (
   // only the `totals` rollup.
   // SYNC: DispatcherEvent 'bus_window' messages <-> crates/weft-core/src/bus.rs WindowedBusMessage, packages/weft-graph/src/protocol.ts BusInspectorEvent 'message'
   // SYNC: DispatcherEvent 'bus_window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals
-  | { kind: 'bus_joined'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
-  | { kind: 'bus_left'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
-  | { kind: 'bus_window'; color: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
-  | { kind: 'bus_closed'; color: string; project_id: string; bus_id: string; offset: number; at_unix: number }
+  | { kind: 'bus_joined'; execution_id: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
+  | { kind: 'bus_left'; execution_id: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
+  | { kind: 'bus_window'; execution_id: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
+  | { kind: 'bus_closed'; execution_id: string; project_id: string; bus_id: string; offset: number; at_unix: number }
   // Live caller connection events. One caller per execution (keyed by
-  // color, no bus_id). The webview replays the caller exchange the same
+  // execution, no bus_id). The webview replays the caller exchange the same
   // way it replays a bus; `payload` is the same tagged WirePayload a
   // bus window's messages carry.
   // SYNC: DispatcherEvent 'caller_window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window'
-  | { kind: 'caller_connected'; color: string; project_id: string; offset: number; protocol: string; at_unix: number }
-  | { kind: 'caller_window'; color: string; project_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; terminal?: boolean; at_unix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; at_unix: number }
-  | { kind: 'caller_errored'; color: string; project_id: string; offset: number; message: string; at_unix: number }
-  | { kind: 'caller_disconnected'; color: string; project_id: string; offset: number; reason: string; at_unix: number }
+  | { kind: 'caller_connected'; execution_id: string; project_id: string; offset: number; protocol: string; at_unix: number }
+  | { kind: 'caller_window'; execution_id: string; project_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; terminal?: boolean; at_unix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; at_unix: number }
+  | { kind: 'caller_errored'; execution_id: string; project_id: string; offset: number; message: string; at_unix: number }
+  | { kind: 'caller_disconnected'; execution_id: string; project_id: string; offset: number; reason: string; at_unix: number }
   // Loop events. Carry the inspector groupId + parent_frames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
   // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
-  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; iter_cap: number | null; parallel: boolean; at_unix: number }
-  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; at_unix: number }
-  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; done_vote?: boolean | null; at_unix: number }
-  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; reason: LoopTerminationReason; at_unix: number }
+  | { kind: 'loop_instantiated'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; iter_cap: number | null; parallel: boolean; at_unix: number }
+  | { kind: 'loop_iteration_launched'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; at_unix: number }
+  | { kind: 'loop_out_fired'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; done_vote?: boolean | null; at_unix: number }
+  | { kind: 'loop_terminated'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; reason: LoopTerminationReason; at_unix: number }
   // Graph-level participation: a node is wired to a bus. Derived
   // dispatcher-side from emitted pulses carrying a bus marker,
   // so source AND target nodes get one BusParticipant edge each.
   // `ephemeral` is sniffed from the marker JSON, so the webview learns
   // mode the same time it learns about the bus and renders the panel
   // header badge without a separate event.
-  | { kind: 'bus_participant'; color: string; project_id: string; bus_id: string; node_id: string; ephemeral: boolean }
+  | { kind: 'bus_participant'; execution_id: string; project_id: string; bus_id: string; node_id: string; ephemeral: boolean }
   // One journal row the dispatcher could not apply during fold.
   // Emitted one-shot at replay time per affected row. The webview
-  // groups by color and renders a muted "N journal rows corrupted"
+  // groups by execution and renders a muted "N journal rows corrupted"
   // collapsed disclosure in the inspector; not a banner, not red.
-  | { kind: 'journal_corruption'; color: string; project_id: string; site: CorruptionSite; reason: string });
+  | { kind: 'journal_corruption'; execution_id: string; project_id: string; site: CorruptionSite; reason: string });
 
 function identifiedEvent(value: unknown): DispatcherEvent {
   if (!value || typeof value !== 'object' || !('event_id' in value)
@@ -161,8 +161,8 @@ export class ExecutionFollower implements vscode.Disposable {
   /** Hydrate a past execution by replaying every journaled event up
    *  front, then keep following so a still-running execution stays
    *  live. Called when the user clicks an execution in the sidebar. */
-  async replay(color: string): Promise<void> {
-    await this.start(color);
+  async replay(executionId: string): Promise<void> {
+    await this.start(executionId);
   }
 
   /** The one follow path. Subscribe-FIRST,
@@ -171,7 +171,7 @@ export class ExecutionFollower implements vscode.Disposable {
    *  "replay GET returned" and "subscribe attached" was dropped
    *  forever. Stable event identities remove the overlap without
    *  comparing payloads or assuming that repeated updates are harmless. */
-  private async start(color: string): Promise<void> {
+  private async start(executionId: string): Promise<void> {
     this.stop();
     const generation = this.generation;
     const historyAbort = new AbortController();
@@ -185,7 +185,7 @@ export class ExecutionFollower implements vscode.Disposable {
     const lost = (reason: 'closed' | 'error') => {
       if (!isCurrent()) return;
       this.stop();
-      this.post({ kind: 'followLost', color, reason });
+      this.post({ kind: 'followLost', executionId, reason });
     };
 
     // Buffer live events until the replay has been applied,
@@ -222,7 +222,7 @@ export class ExecutionFollower implements vscode.Disposable {
       } else applyLive(event);
     };
     this.eventSource = this.client.subscribe(
-      `/events/execution/${color}`,
+      `/events/execution/${executionId}`,
       (ev) => onData(ev.data),
       {
         // Starting fetch is not enough: history must be read only once
@@ -249,7 +249,7 @@ export class ExecutionFollower implements vscode.Disposable {
 
     {
       try {
-        const events = await this.client.get<DispatcherEvent[]>(`/executions/${color}/replay`, historyAbort.signal);
+        const events = await this.client.get<DispatcherEvent[]>(`/executions/${executionId}/replay`, historyAbort.signal);
         // A follow switch may have landed while the GET was in flight.
         if (!isCurrent()) return;
         for (const raw of events) {
@@ -272,7 +272,7 @@ export class ExecutionFollower implements vscode.Disposable {
         this.stop();
         this.post({
           kind: 'followLost',
-          color,
+          executionId,
           reason: 'error',
         });
         return;
@@ -402,7 +402,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'execution_failed':
         this.post({
           kind: 'execTerminal',
-          color: e.color,
+          executionId: e.execution_id,
           state: e.kind === 'execution_completed' ? 'completed' : 'failed',
           atUnix: e.at_unix,
         });
@@ -413,7 +413,7 @@ export class ExecutionFollower implements vscode.Disposable {
         // names the run and the tag).
         this.post({
           kind: 'execTerminal',
-          color: e.color,
+          executionId: e.execution_id,
           state: 'cancelled',
           reason: e.reason,
           cause: e.cause,
@@ -421,7 +421,7 @@ export class ExecutionFollower implements vscode.Disposable {
         });
         break;
       case 'execution_tagged':
-        this.post({ kind: 'execTags', color: e.color, tags: e.tags });
+        this.post({ kind: 'execTags', executionId: e.execution_id, tags: e.tags });
         break;
       case 'execution_deleted':
         // Nothing to paint: the host drops the follow if this was the
@@ -501,7 +501,7 @@ export class ExecutionFollower implements vscode.Disposable {
         });
         break;
       // Live caller connection: forwarded as one `callerEvent` stream
-      // (one caller per execution, keyed by color, so no busId). The
+      // (one caller per execution, keyed by execution, so no busId). The
       // webview replays it like a bus panel.
       case 'caller_connected':
         this.post({
@@ -618,7 +618,7 @@ export class ExecutionFollower implements vscode.Disposable {
       // switch exhaustive so a new variant fails to compile here
       // until a reviewer routes it explicitly.
       case 'execution_started':
-        this.post({ kind: 'execScope', color: e.color, subgraph: e.subgraph ?? null, seed: e.seed ?? null });
+        this.post({ kind: 'execScope', executionId: e.execution_id, subgraph: e.subgraph ?? null, seed: e.seed ?? null });
         break;
       case 'infra_status_changed':
       case 'infra_flaky':

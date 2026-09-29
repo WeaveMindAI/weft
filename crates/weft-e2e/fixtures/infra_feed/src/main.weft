@@ -1,0 +1,12 @@
+# A trigger fed by the program's own infrastructure: TickService is an
+# infra unit streaming Server-Sent Events, and the trigger subscribes to
+# the address the service hands out, which is the address the WORKERS
+# reach it at. The listener is one of weft's own roles and reaches the
+# unit its own way; each tick it hears fires a run carrying the tick's
+# `value` to Debug.
+
+svc = TickService
+feed = TestSseTrigger -> (value: Number) { event_name: "tick" }
+feed.url = svc.eventsUrl
+out = Debug
+out.data = feed.value

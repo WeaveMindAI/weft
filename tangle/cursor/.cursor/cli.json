@@ -4,7 +4,6 @@
       "Shell(weft validate)",
       "Shell(weft parse)",
       "Shell(weft build)",
-      "Shell(weft build-base)",
       "Shell(weft run)",
       "Shell(weft describe-nodes)",
       "Shell(weft executions)",

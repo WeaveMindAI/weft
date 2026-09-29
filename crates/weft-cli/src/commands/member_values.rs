@@ -48,7 +48,7 @@ where
     else {
         bail!("the member token mint answered a shape this CLI cannot read: {minted}");
     };
-    let outcome = work(client.with_bearer(token)?).await;
+    let outcome = work(client.with_bearer(token)).await;
     let revoked = client.delete(&format!("/signal-tokens/{token_id}")).await;
     match (outcome, revoked) {
         (Ok(value), Ok(_)) => Ok(value),
@@ -88,7 +88,7 @@ pub async fn run(ctx: Ctx, member: MemberId, set: Vec<String>, clear: Vec<String
         .map(|raw| field_of(raw).map(|(step, field)| serde_json::json!({ "step": step, "field": field })))
         .collect::<Result<_>>()?;
     let json = ctx.json();
-    let client = ctx.client();
+    let client = ctx.client()?;
     let who = member.clone();
     as_member(&ctx, &client, &who, |door| async move {
         if !set.is_empty() || !clear.is_empty() {

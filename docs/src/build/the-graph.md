@@ -171,6 +171,10 @@ and each row has **View in Graph**, which puts that run back on the canvas with
 its values in place and locks the toggle onto it. A replayed run looks exactly
 like a live one.
 
+If your project deploys to a cloud install, the switch at the top right shows
+the graph as that install runs it. For how it works, go and read
+[Look at prod from the editor](../running/cloud.md#look-at-prod-from-the-editor).
+
 ## Fold a big program down
 
 Every group has **Collapse group** in its header, and **Expand group** when it

@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::color_of;
+use common::execution_id_of;
 
 use serde_json::{json, Value};
 use weft_e2e::{ensure, project::Project};
@@ -22,7 +22,7 @@ async fn a_file_included_three_times_runs_once_per_call() -> anyhow::Result<()> 
     let disp = ensure::up().await?;
     let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json"]).await?;
-    let settled = project.settled(color_of(&stdout)?).await?;
+    let settled = project.settled(execution_id_of(&stdout)?).await?;
     settled.completed()?;
     // The chain: " hello " is trimmed and shouted twice over.
     settled.assert_input("two.strip", "text", &json!("HELLO"))?;
@@ -57,7 +57,7 @@ async fn a_cut_spelled_through_a_site_runs_that_one_call() -> anyhow::Result<()>
     let project = Project::prepare("include_calls", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--from", r#"one.strip={"text":" cut "}"#, "--target", "two.strip"]).await?;
-    let settled = project.settled(color_of(&stdout)?).await?;
+    let settled = project.settled(execution_id_of(&stdout)?).await?;
     settled.completed()?
         .assert_input("one.strip", "text", &json!(" cut "))?
         .assert_completed("one.loud")?
@@ -72,13 +72,13 @@ async fn a_cut_spelled_through_a_site_runs_that_one_call() -> anyhow::Result<()>
     // Up to a node inside a call: the file runs from its site, and the
     // rest of the program does not.
     let stdout = project.weft(&["run", "--json", "--target", "two.strip"]).await?;
-    let settled = project.settled(color_of(&stdout)?).await?;
+    let settled = project.settled(execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("src")?.assert_completed("one.loud")?.assert_completed("two.strip")?
         .assert_untouched("two.loud")?.assert_untouched("out")?.assert_untouched("total")?;
 
     // Before a node inside a call: the call starts, the node does not.
     let stdout = project.weft(&["run", "--json", "--from", r#"one.strip={"text":"x"}"#, "--before", "two.strip"]).await?;
-    let settled = project.settled(color_of(&stdout)?).await?;
+    let settled = project.settled(execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("one.loud")?.assert_untouched("two.strip")?.assert_untouched("two.loud")?;
 
     // A site inside a loop is cut with the loop.
@@ -97,15 +97,15 @@ async fn events_are_addressed_through_the_site() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json"]).await?;
-    let color = color_of(&stdout)?;
-    project.settled(color).await?.completed()?;
-    let rows: Vec<Value> = serde_json::from_str(project.weft(&["events", &color.to_string(), "--node", "one.strip", "--json"]).await?.trim())?;
+    let execution_id = execution_id_of(&stdout)?;
+    project.settled(execution_id).await?.completed()?;
+    let rows: Vec<Value> = serde_json::from_str(project.weft(&["events", &execution_id.to_string(), "--node", "one.strip", "--json"]).await?.trim())?;
     anyhow::ensure!(!rows.is_empty(), "the call's rows");
     anyhow::ensure!(rows.iter().all(|r| r["node"] == json!("one.strip") && r["frames"] == json!([{"site": "one"}])), "{rows:?}");
-    let all: Vec<Value> = serde_json::from_str(project.weft(&["events", &color.to_string(), "--json"]).await?.trim())?;
+    let all: Vec<Value> = serde_json::from_str(project.weft(&["events", &execution_id.to_string(), "--json"]).await?.trim())?;
     let strips: std::collections::BTreeSet<&str> = all.iter().filter_map(|r| r["node"].as_str()).filter(|n| n.ends_with(".strip")).collect();
     anyhow::ensure!(strips == ["one.strip", "outer.call.strip", "two.strip"].into_iter().collect(), "{strips:?}");
-    let refused = project.weft_refused(&["events", &color.to_string(), "--node", "@src:lib:clean.strip"]).await?;
+    let refused = project.weft_refused(&["events", &execution_id.to_string(), "--node", "@src:lib:clean.strip"]).await?;
     anyhow::ensure!(refused.contains("inside an included file"), "{refused}");
     project.finish().await
 }
@@ -117,14 +117,14 @@ async fn a_frozen_cut_inside_an_included_file_replays() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let project = Project::prepare("include_calls", disp).await?;
     let stdout = project.weft(&["run", "--json", "--from", r#"one.strip={"text":" frozen "}"#, "--target", "two.strip"]).await?;
-    let color = color_of(&stdout)?;
-    project.settled(color).await?.completed()?.assert_input("two.strip", "text", &json!("FROZEN"))?;
-    project.weft(&["freeze", "inner", &color.to_string(), "--expect", "two.strip"]).await?;
+    let execution_id = execution_id_of(&stdout)?;
+    project.settled(execution_id).await?.completed()?.assert_input("two.strip", "text", &json!("FROZEN"))?;
+    project.weft(&["freeze", "inner", &execution_id.to_string(), "--expect", "two.strip"]).await?;
     let spec: Value = serde_json::from_str(&std::fs::read_to_string(project.dir().join("examples/inner.json"))?)?;
     anyhow::ensure!(spec["from"]["one.strip"]["text"] == json!(" frozen "), "{spec}");
     anyhow::ensure!(spec["expected"]["focus"] == json!(["two.strip"]), "{spec}");
     let stdout = project.weft(&["run", "inner", "--json"]).await?;
-    let again = project.settled(color_of(&stdout)?).await?;
+    let again = project.settled(execution_id_of(&stdout)?).await?;
     again.completed()?.assert_input("two.strip", "text", &json!("FROZEN"))?.assert_untouched("src")?.assert_untouched("out")?;
     project.finish().await
 }

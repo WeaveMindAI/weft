@@ -1,7 +1,7 @@
 //! WipeMember: remove everything a member has in this program, in the
 //! order that leaves nothing half-attached: their triggers first (wiped,
 //! their runs cancelled), then the listed infra copies (terminated with
-//! their disks), the values they gave, their connections, their tokens,
+//! every disk, the ones the node keeps through a terminate too), the values they gave, their connections, their tokens,
 //! their files, and last their runs. Each step is safe to repeat, so a wipe
 //! that stopped part way finishes when run again.
 
@@ -41,7 +41,7 @@ impl Node for WipeMemberNode {
         // do. Whether it goes at the end is the node's choice.
         ctx.triggers().member(member.clone()).deactivate(wipe.clone(), StopSelf::Keep).await?;
         for node in infra {
-            ctx.infra(node).member(member.clone()).terminate(wipe.clone(), StopSelf::Keep).await?;
+            ctx.infra(node).member(member.clone()).wipe(wipe.clone(), StopSelf::Keep).await?;
         }
         ctx.values().member(member.clone()).forget().await?;
         ctx.connections().member(member.clone()).forget().await?;

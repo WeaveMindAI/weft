@@ -60,12 +60,12 @@ fn version(project: Uuid, m: &BTreeMap<String, String>, parent: Option<&str>, la
     }
 }
 
-fn run(project: Uuid, color: Uuid, version: &str, seed: Option<Uuid>, spec: Option<RunSpec>, at: u64) -> RunRow {
+fn run(project: Uuid, execution_id: Uuid, version: &str, seed: Option<Uuid>, spec: Option<RunSpec>, at: u64) -> RunRow {
     RunRow {
-        color,
+        execution_id,
         project_id: project,
         version_id: version.to_string(),
-        seed_color: seed,
+        seed_execution_id: seed,
         stale: vec!["b".into(), "c".into()],
         spec,
         definition_hash: "def-1".into(),
@@ -100,21 +100,22 @@ async fn retention_keeps_program_references_when_execution_selection_has_changed
     let (journal, projects, _) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let color = Uuid::new_v4();
+    let execution_id = Uuid::new_v4();
     let birth = ExecEvent::ExecutionStarted {
-        color, project_id: project, entry_node: "mid".into(),
+        execution_id, project_id: project, entry_node: "mid".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+        run_class: weft_core::run_class::RunClass::Short,
     };
     journal.record_event(&birth).await.unwrap();
     let mut row = serde_json::to_value(&birth).unwrap();
     row["subgraph"] = json!(["mid"]);
-    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE color = $1 AND kind = 'execution_started'")
-        .bind(color.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE execution_id = $1 AND kind = 'execution_started'")
+        .bind(execution_id.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
     assert_eq!(journal.definition_hashes_in_use(project).await.unwrap(), vec!["def-1"]);
     row["definition_hash"] = json!(42);
-    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE color = $1 AND kind = 'execution_started'")
-        .bind(color.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE execution_id = $1 AND kind = 'execution_started'")
+        .bind(execution_id.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
     assert!(journal.definition_hashes_in_use(project).await.is_err(), "an unreadable reference must block deletion");
 }
 
@@ -135,8 +136,8 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
     versions.insert_run(&run(project, seed, &v.id, None, None, 10)).await.unwrap();
     versions.insert_run(&run(project, child, &v.id, Some(seed), Some(spec.clone()), 5)).await.unwrap();
     let rows = versions.runs(project).await.unwrap();
-    assert_eq!(rows.iter().map(|r| r.color).collect::<Vec<_>>(), vec![seed, child]);
-    assert_eq!(rows[1].seed_color, Some(seed));
+    assert_eq!(rows.iter().map(|r| r.execution_id).collect::<Vec<_>>(), vec![seed, child]);
+    assert_eq!(rows[1].seed_execution_id, Some(seed));
     assert_eq!(rows[1].stale, vec!["b", "c"]);
     assert_eq!(rows[1].spec, Some(spec));
     versions.set_run_example(child, Some("angry")).await.unwrap();
@@ -159,26 +160,26 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     assert_eq!(versions.head(project).await.unwrap(), Default::default());
-    let color = Uuid::new_v4();
-    versions.move_head(project, &Head::default(), Some("v1"), Some(color)).await.unwrap();
+    let execution_id = Uuid::new_v4();
+    versions.move_head(project, &Head::default(), Some("v1"), Some(execution_id)).await.unwrap();
     let activated = weft_core::project::hash::ProgramIdentity {
         binary_hash: "bin-A".into(), definition_hash: "def-1".into(), implementations: Default::default(),
     };
     let activations = PostgresActivationStore::new(pool.clone());
     let keys = [ActivationKey::new("door", Owner::Shared)];
-    let setup_color = Uuid::new_v4();
-    assert!(activations.try_begin_activating(project, &keys, setup_color, None).await.unwrap().is_ok());
-    assert!(activations.record_activation_source(project, setup_color, &activated, "v1").await.unwrap());
-    activations.end_activating(project, setup_color, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
+    let setup_execution_id = Uuid::new_v4();
+    assert!(activations.try_begin_activating(project, &keys, setup_execution_id, None).await.unwrap().is_ok());
+    assert!(activations.record_activation_source(project, setup_execution_id, &activated, "v1").await.unwrap());
+    activations.end_activating(project, setup_execution_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None).await.unwrap();
     let listed = activations.list(project).await.unwrap();
     assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some("v1"));
-    assert_eq!(head.head_run, Some(color));
+    assert_eq!(head.head_run, Some(execution_id));
     assert_eq!(head.activated_versions, vec!["v1".to_string()]);
     versions
-        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(color), activated_versions: vec![] }, Some("v2"), None)
+        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(execution_id), activated_versions: vec![] }, Some("v2"), None)
         .await
         .unwrap();
     activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept).await.unwrap();
@@ -198,7 +199,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     );
 }
 
-/// `weft clean <color>` drops the run's row through the version store
+/// `weft clean <execution_id>` drops the run's row through the version store
 /// (the table is the version store's; the journal owns the journal),
 /// and a head that pointed at the run keeps its version and loses the
 /// run pointer.
@@ -210,10 +211,10 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
-    let color = Uuid::new_v4();
+    let execution_id = Uuid::new_v4();
     journal
         .record_event(&ExecEvent::ExecutionStarted {
-            color,
+            execution_id,
             project_id: project,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
@@ -221,20 +222,21 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         })
         .await
         .unwrap();
-    versions.insert_run(&run(project, color, &v.id, None, None, 5)).await.unwrap();
-    versions.move_head(project, &Head::default(), Some(&v.id), Some(color)).await.unwrap();
+    versions.insert_run(&run(project, execution_id, &v.id, None, None, 5)).await.unwrap();
+    versions.move_head(project, &Head::default(), Some(&v.id), Some(execution_id)).await.unwrap();
     // The order `clean_execution` uses: the tree row first (so a
     // failure leaves the journal reachable and the command retryable),
     // then the journal.
-    versions.delete_run(color).await.unwrap();
-    journal.delete_execution(color).await.unwrap();
-    assert!(versions.run(color).await.unwrap().is_none(), "the run row is gone");
+    versions.delete_run(execution_id).await.unwrap();
+    journal.delete_execution(execution_id).await.unwrap();
+    assert!(versions.run(execution_id).await.unwrap().is_none(), "the run row is gone");
     // Idempotent, which is what makes the retry safe.
-    versions.delete_run(color).await.unwrap();
+    versions.delete_run(execution_id).await.unwrap();
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some(v.id.as_str()));
     assert_eq!(head.head_run, None);

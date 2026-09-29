@@ -1,6 +1,6 @@
 //! `weft cancel-build [project]`. Cancel an in-flight build
 //! (transition=building). Flips the transition to cancelling_build;
-//! the dispatcher pod driving the build interrupts the builder job and
+//! the dispatcher driving the build interrupts the builder job and
 //! the verb that was building errs "cancelled".
 //!
 //! 412 from the dispatcher when no build is in flight (which is the
@@ -24,7 +24,7 @@ async fn run_inner(
     project: Option<String>,
 ) -> anyhow::Result<()> {
     let id = super::resolve_project_id(ctx, project)?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let path = format!("/projects/{id}/cancel-build");
     progress.dispatcher_call_start(&path);
     client.post_empty(&path).await?;

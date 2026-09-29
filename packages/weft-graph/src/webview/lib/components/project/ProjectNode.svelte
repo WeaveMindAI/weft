@@ -27,12 +27,13 @@
 	import FieldStrip from './FieldStrip.svelte';
 	import FileDropField from './FileDropField.svelte';
 	import AccessField from './AccessField.svelte';
+	import { changeInstallPick, effectiveAccessValue } from './install-picks.svelte';
 	import RemoteSelectField from './RemoteSelectField.svelte';
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, memberFilled, memberFilledValue } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, memberFilled, memberFilledValue, installPicked } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -60,6 +61,10 @@
 			/// The unconnected-access pin (view state from buildNodes,
 			/// never a config key): drawn open, collapse disabled.
 			pinnedOpen?: boolean;
+			/// A node's place in the program as this view shows it
+			/// (`addressOf(callPath, id)`): what the install keys a node's
+			/// connection pick by.
+			placeOf?: (nodeId: string) => string;
 			// Resolved state of @file targets, keyed by the marker's relative
 			// path (content or read error). A config field whose value is a
 			// `@file(...)` tag displays fileContents[path]; config itself never
@@ -638,7 +643,7 @@
 
 	/// Hand a field to each member (`@member_filled`), or take it back.
 	/// Nothing written is lost either way: the value the source held
-	/// becomes the fallback a member who gives none gets, and taking the
+	/// (never a connection) becomes the fallback a member who gives none gets, and taking the
 	/// field back writes that fallback as the one value for everyone
 	/// again (or leaves the field unset when there was none).
 	function toggleMemberFilled(field: FieldDefinition) {
@@ -648,7 +653,10 @@
 			return;
 		}
 		const written = ownValue(portLiterals, field.key);
-		updatePortLiteral(field.key, isFilledIn(written) ? memberFilledValue(written) : memberFilledValue());
+		// A connection picked on the install is no written value, so it is
+		// no fallback either (the compiler refuses a connection fallback).
+		const fallback = isFilledIn(written) && !installPicked(written);
+		updatePortLiteral(field.key, fallback ? memberFilledValue(written) : memberFilledValue());
 	}
 
 	/// The `@member_filled` toggle for `key`, or null where the compiler
@@ -896,6 +904,26 @@
 	 *  (the connection is picked on this node itself) rather than
 	 *  an Access-typed port fed by a wire. Drives both the trace below
 	 *  and the dropdown's connect-first wording (pick here vs wire in). */
+	/** Keep `v` as this install's pick for the connection field `key` at
+	 *  the node's place (never in the source), or forget it (`v` null).
+	 *  Picking unlocks the unpicked pin, so the node is persisted as
+	 *  expanded first, so it does not snap shut the instant the pick lands
+	 *  (the pin lives on node data, never in config, so `expanded: true`
+	 *  travels the ordinary layout path and sticks). */
+	async function pickConnection(key: string, v: { id: string; identity?: string } | null | undefined): Promise<void> {
+		const service = typeConfig.service?.service;
+		if (!service) return;
+		if (v != null && !(data.config?.expanded as boolean)) {
+			data.onUpdate?.({ config: { ...data.config, expanded: true } });
+		}
+		try {
+			const rearmed = await changeInstallPick(data.placeOf?.(id) ?? id, key, service, v?.id ?? null);
+			if (rearmed.length > 0) toast.info(`Set up again with the new connection: ${rearmed.join(', ')}`);
+		} catch (e) {
+			toast.error(`Could not keep the pick: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
 	function accessInputIsOwnWidget(accessInput: string | undefined): boolean {
 		if (!accessInput) return false;
 		const ownInputs = inputsOf(data.inputs);
@@ -906,7 +934,7 @@
 		if (accessInputIsOwnWidget(accessInput)) {
 			const service = typeConfig.service?.service;
 			if (!service) return null;
-			const handle = ownValue(portLiterals, accessInput);
+			const handle = effectiveAccessValue(ownValue(portLiterals, accessInput), data.placeOf?.(id) ?? id, accessInput);
 			const grantId =
 				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -928,7 +956,9 @@
 		const srcInputs = inputsOf(srcData.inputs);
 		const connectInput = srcInputs.find((i) => i.widget?.kind === 'access');
 		if (!connectInput) return null;
-		const handle = ownValue(srcData.portLiterals, connectInput.name);
+		// The feeding node's place: a sibling in this view.
+		const srcPlace = data.placeOf?.(src.id) ?? src.id;
+		const handle = effectiveAccessValue(ownValue(srcData.portLiterals, connectInput.name), srcPlace, connectInput.name);
 		const grantId =
 			handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 		return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -2217,14 +2247,8 @@
 									spec={typeConfig.service}
 									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
 									nodeType={data.nodeType}
-									value={declaredValue(field) as { id: string; identity?: string } | undefined}
-									onUpdate={(v) =>
-										// Picking a connection unlocks the pin; persist the node
-										// as expanded IN THE SAME update so it doesn't snap shut
-										// the instant the pick lands. The pin lives on node data,
-										// never in config, so this `expanded: true` travels the
-										// ordinary layout path and sticks.
-										updateFieldValue(field.key, v, field.portDriven, v != null ? { expanded: true } : undefined)}
+									value={effectiveAccessValue(declaredValue(field), data.placeOf?.(id) ?? id, field.key) as { id: string; identity?: string } | undefined}
+									onUpdate={(v) => pickConnection(field.key, v)}
 								/>
 							{:else}
 								<div class="text-[10px] text-red-500">

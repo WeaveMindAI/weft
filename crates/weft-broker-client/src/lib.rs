@@ -3,10 +3,9 @@
 //! workers / listeners use as drop-in replacements for direct
 //! Postgres clients.
 //!
-//! Authentication: the client reads its bearer token from a fixed
-//! filesystem path on every call (the kubelet rotates the projected
-//! token periodically; reading on each call keeps the auth fresh
-//! without any in-process refresh logic).
+//! Authentication: every call carries the caller's platform identity for
+//! the broker's address and the id of the calling process instance (see
+//! `token::TokenSource`).
 
 pub mod activation;
 pub mod client;
@@ -17,6 +16,6 @@ pub mod token;
 pub use client::{
     BrokerAccessClient, BrokerEventsClient, BrokerExecutionClient, BrokerInfraClient,
     BrokerInfraStateClient, BrokerJournalClient, BrokerProjectClient, BrokerSignalClient,
-    BrokerSupervisorClient, BrokerRefused, BrokerTaskStoreClient, BrokerWorkerPodClient, WriteOutcome,
+    BrokerSupervisorClient, BrokerRefused, BrokerTaskStoreClient, WriteOutcome,
 };
 pub use token::TokenSource;

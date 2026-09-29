@@ -101,7 +101,7 @@ impl SettledRun {
         let Some(bus_id) = self.bus_ids().into_iter().next() else {
             bail!(
                 "expected a bus conversation, but no bus_joined events in run {}",
-                self.color
+                self.execution_id
             );
         };
         let parts = self.bus_participants(&bus_id);

@@ -23,9 +23,11 @@ async fn an_untargeted_run_kicks_every_root() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
-    let built = project.weft(&["build", "--json"]).await?;
-    anyhow::ensure!(built.contains("\"phase\":\"build_skip\"") && !built.contains("\"phase\":\"build_start\""),
-        "an unchanged standard-library project must use the prepared worker without compiling: {built}");
+    // The install builds a program's images once: asked again for the
+    // same program, it has nothing left to build.
+    project.weft(&["build", "--json"]).await?;
+    let again = project.weft(&["build", "--json"]).await?;
+    anyhow::ensure!(again.contains("\"built\":[]"), "an unchanged program is not built again: {again}");
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

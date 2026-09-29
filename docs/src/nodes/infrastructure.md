@@ -2,7 +2,8 @@
 
 Some nodes need something running: a database, a model server, a bridge that
 holds a session open. Your node returns a description of it, and the supervisor
-makes the cluster match.
+makes what runs match it: Docker containers on your machine, or a Compute
+Engine machine of its own on a cloud install.
 
 ```json
 "requires_infra": true,
@@ -35,16 +36,21 @@ naming your node, rather than a silent nothing.
 
 | Field | What it holds |
 |---|---|
-| `units` | Pod templates. Most nodes have exactly one |
-| `volumes` | Disks, kept across upgrades by name |
-| `config` | Secrets and configmaps, inline or by name |
-| `endpoints` | Named ports, which is how your node and other nodes reach it |
-| `access` | Network rules on top of the project's default-deny |
-| `lifecycle` | What stop, upgrade and terminate mean for this node |
+| `units` | What runs. Most nodes have exactly one |
+| `volumes` | Disks, kept across stop and upgrade by name, and scratch space emptied at each start |
+| `endpoints` | Named ports your node and the project's other nodes reach it on, and whether anything outside the project may |
+| `keepOnTerminate` | Disks to keep even through a terminate, for the next `weft infra start` to pick up |
 
-Each unit has containers, init containers, pod options, and its own replica
-count. The count is on the unit rather than the node, because one node can want
-a primary at one replica beside three of something else.
+A unit is a group of containers that run side by side, with optional init
+containers that run one after another before them. It also says what machine
+it needs (`machine`: `cpu`, `memory`, and `gpu` with a `kind` and a `count`)
+and what stop does to it (`onStop`: stop it, or keep it running until
+terminate). On a cloud install, weft picks a machine that fits those numbers.
+On your machine it only checks them, and refuses a unit that asks for a GPU
+you do not have.
+
+Each container also takes two probes: `readiness` says when it is up, and `liveness` restarts it after
+`failureThreshold` failures in a row.
 
 ## The spec has to be stable
 
@@ -86,27 +92,42 @@ let (host, port) = endpoint.host_and_port()?;
 
 `ctx.endpoint(name)` resolves one of your declared endpoints and waits until
 something actually answers there, rather than handing you an address the
-moment Kubernetes says the pod is ready.
+moment the container reports ready.
 
 | Call | Gives you |
 |---|---|
 | `url()` | The address, cached, no round trip |
 | `host_and_port()` | The two apart, for a client that wants them that way |
 | `call(method, path, body)` | An HTTP request against it, retried once through a routing gap |
-| `public_url()` | For an endpoint exposed with `TenantPublic`, the address a caller outside the cluster uses; `None` for any other endpoint |
+| `public_url()` | For an endpoint exposed with `Expose::Public`, the address a caller outside the install uses; `None` for any other endpoint |
 
-If you want something outside the cluster to call your node (a provider
-delivering webhooks, say), expose the endpoint with
-`Expose::TenantPublic { path: "/hooks" }` and hand the caller `public_url()`.
-The front door serves every project, so your `/hooks` lives under a prefix of
-its own: `public_url()` is `<front door>/infra/<namespace>/<instance>/hooks`,
-and the door strips the prefix again, so your container still sees `/hooks`.
-`weft infra status` prints the same address under the node. On a local install
-that address is on your own machine (`http://127.0.0.1:<port>/infra/...`), and
-the public tunnel does not carry it, so only a deployed cluster, whose base is
-its internet host, gives an address a provider can reach. A named install
-(`WEFT_INSTANCE`) has no front door for these, so it refuses `TenantPublic` at
-compile time.
+By default (`Expose::Project`), only the project's own workers and
+infrastructure can reach an endpoint. If you want anything else to reach it,
+set `expose`:
+
+- `Expose::SameNetwork` opens it to programs on the install's own network:
+  anything running on your machine locally, the install's private network on
+  a cloud, but never the internet. A frontend uses this to reach a program's
+  database.
+- `Expose::Public { path: "/hooks" }` opens it to the internet, over HTTP, at
+  the install's public address. Hand the caller (a provider delivering
+  webhooks, say) `public_url()`.
+
+The install serves every project at that address, so your `/hooks` lives
+under a prefix of its own: `public_url()` is
+`<address>/infra/<project>/<instance>/hooks`, and the install strips the
+prefix again, so your container still sees `/hooks`.
+`weft infra status` prints the same address under the node. On a cloud
+install it is the install's own address. On your machine it is the tunnel's
+address while the tunnel is open
+([a public address](../build/public-address.md)), and
+`http://127.0.0.1:14111/...` while it is closed, which nothing on the internet
+can reach.
+
+If an endpoint hands out a credential, keep it to the project. The Postgres
+node shows the split: the port Postgres answers on is `SameNetwork`, because
+reaching it still takes a password, but the small server that hands out that
+password stays reachable only by the project.
 
 It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
@@ -134,12 +155,13 @@ That is how a bridge shows the QR code you have to scan. Go and read
 ## What the supervisor does
 
 It takes an exclusive lease on the project, applies your spec, and watches
-whether what it created is healthy. If it dies between changing the cluster and
-recording that it did, the next one works out what to do from what the cluster
-looks like rather than trusting the record.
+whether what it created is healthy. For what happens when a supervisor dies halfway through a change, go and
+read [the supervisor](../running/architecture.md#the-supervisor).
 
-A unit that was healthy and drops below its readiness threshold is marked
-flaky, and the supervisor restarts it with a backoff.
+A unit that was healthy and stays not ready past its flaky window
+(`health.flakyAfterSeconds`, 30 seconds by default) is marked flaky, and one
+that stays ready again past `health.recoveryAfterSeconds` (also 30) is marked
+running again. `weft infra status` shows which.
 
 There is no time limit on coming up, because a model server pulling weights can
 take a long time. Somebody waiting on yours reads `weft infra logs <node>` and
@@ -152,8 +174,23 @@ activation. `weft infra start` is a verb they type, because a container costs
 money and weft will not spend it on a click that did not mention one.
 
 And `weft infra stop` keeps the disk while `weft infra terminate` deletes it.
-If your node has data worth keeping, say so in the `lifecycle` and the volume,
-because that is what decides whether a terminate takes it.
+If your node has data worth keeping even through a terminate, name its disk in
+`keepOnTerminate`. The next `weft infra start` of the same node (the same
+member's copy, for a node marked `@per_member`) finds that disk and mounts it
+again, data and all. If you want a kept disk gone, drop it from
+`keepOnTerminate`, start the node once so the copy knows about it, and
+terminate.
+
+A kept disk is deleted for you once its copy can never come back: when you
+remove the node from your program and run it again, when the node switches
+between shared and `@per_member` (which leaves the old side's copies behind), or
+when you remove the project with `weft rm`. This holds even if the copy was already terminated
+at the time. The supervisor sweeps for such copies on every ownership tick, so
+the disk goes within one tick of the change.
+
+If you wipe a member (the `WipeMember` node, or `ctx.infra(node).member(id).wipe(..)`
+from your own node), the kept disks of that member's copies go right away,
+including those of a copy that was already terminated.
 
 ## Testing one
 

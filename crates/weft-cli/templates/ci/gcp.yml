@@ -1,0 +1,134 @@
+# Deploys this project onto its weft install on GCP: the program first
+# (`weft activate`), then, when the project has one (front/Dockerfile),
+# the frontend in front/ to Cloud Run, which
+# reaches the install privately through Direct VPC egress. Run it by
+# hand from the Actions tab.
+#
+# Its repository variables and secrets come from
+# `weft target export <target> --github`.
+#
+# The frontend contract: front/Dockerfile builds a server that listens on
+# $PORT and reads WEFT_DISPATCHER_URL (the install, private), WEFT_TOKEN (a
+# caller token, never sent to a browser) and WEFT_PUBLIC_URL (for links a
+# browser follows), plus whatever else the WEFT_FRONT_ENV secret holds (the
+# program's database address and credentials, its sign-in secret), in the
+# dotenv form `weft infra env --into` writes. If the frontend is not built
+# that way, only the "build the frontend" step changes.
+name: deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      WEFT_OPERATOR_KEY: ${{ secrets.WEFT_OPERATOR_KEY }}
+      WEFT_REPO_ROOT: ${{ github.workspace }}/.weft
+      # Frontends push to the install's frontend repository
+      # (`<registry>-frontends`), never to the one the runtime pulls from.
+      # SYNC: the frontend repository <-> deploy/terraform/gcp/registry.tf (frontends)
+      FRONT_IMAGE: ${{ vars.GCP_ARTIFACT_REGISTRY }}-frontends/{{SERVICE}}-front:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CLI of the exact weft the install runs: a project compiled by
+      # another weft is refused there.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.WEFT_SOURCE_REPOSITORY }}
+          ref: ${{ vars.WEFT_SOURCE_COMMIT }}
+          path: .weft
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .weft/target
+          key: weft-cli-${{ runner.os }}-${{ vars.WEFT_SOURCE_COMMIT }}
+
+      - name: build the weft CLI
+        working-directory: .weft
+        run: |
+          rustup toolchain install
+          cargo build --release --locked -p weft-cli
+          echo "$WEFT_REPO_ROOT/target/release" >> "$GITHUB_PATH"
+
+      - name: deploy the program
+        run: weft activate --on ${{ vars.WEFT_TARGET }}
+
+      # Everything below is the frontend's, and runs only when the project
+      # has one (front/Dockerfile): a project without a frontend deploys
+      # its program and stops, and needs no GCP access at all.
+      - uses: google-github-actions/auth@v2
+        if: hashFiles('front/Dockerfile') != ''
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        if: hashFiles('front/Dockerfile') != ''
+
+      - name: build the frontend
+        if: hashFiles('front/Dockerfile') != ''
+        run: |
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+          docker build -t "$FRONT_IMAGE" front
+          docker push "$FRONT_IMAGE"
+
+      - name: deploy the frontend
+        if: hashFiles('front/Dockerfile') != ''
+        env:
+          WEFT_FRONT_ENV: ${{ secrets.WEFT_FRONT_ENV }}
+          WEFT_DISPATCHER_URL: ${{ vars.WEFT_INTERNAL_URL }}
+          WEFT_PUBLIC_URL: ${{ vars.WEFT_PUBLIC_URL }}
+          WEFT_TOKEN: ${{ secrets.WEFT_FRONTEND_TOKEN }}
+        run: |
+          # Every variable the server reads, as the YAML Cloud Run takes:
+          # the frontend's own (a dotenv file) first, weft's three last so
+          # they always win.
+          python3 - > "$RUNNER_TEMP/front-env.yaml" <<'PY'
+          import json, os
+          env = {}
+          for line in os.environ.get("WEFT_FRONT_ENV", "").splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              name, value = line.split("=", 1)
+              value = value.strip()
+              if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                  value = value[1:-1]
+              env[name.strip()] = value
+          for name in ("WEFT_DISPATCHER_URL", "WEFT_PUBLIC_URL", "WEFT_TOKEN"):
+              env[name] = os.environ[name]
+          for name, value in env.items():
+              print(f"{name}: {json.dumps(value)}")
+          PY
+          # The install made this repository's own service, already public,
+          # and it is the only one this workflow may change: its name is the
+          # install's name, "-front-", and the first 12 hex of the sha256 of
+          # this repository's owner/name.
+          # SYNC: FRONT_SERVICE <-> deploy/terraform/gcp/identity.tf (local.frontend_services)
+          install="${{ vars.GCP_ARTIFACT_REGISTRY }}"
+          service="${install##*/}-front-$(printf '%s' "$GITHUB_REPOSITORY" | sha256sum | cut -c1-12)"
+          gcloud run deploy "$service" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --image "$FRONT_IMAGE" \
+            --service-account "${{ vars.GCP_FRONTEND_SERVICE_ACCOUNT }}" \
+            --network "${{ vars.GCP_NETWORK }}" \
+            --subnet "${{ vars.GCP_SUBNET }}" \
+            --vpc-egress private-ranges-only \
+            --env-vars-file "$RUNNER_TEMP/front-env.yaml"
+          rm "$RUNNER_TEMP/front-env.yaml"
+          url=$(gcloud run services describe "$service" --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
+          echo "frontend: $url" >> "$GITHUB_STEP_SUMMARY"

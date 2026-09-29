@@ -58,7 +58,7 @@ fn fmt_remaining(secs: i64) -> String {
 /// `weft files ls [PREFIX]`: list, organized by scope (project
 /// spaces / shared spaces / past-execution survivors + scratch).
 pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let resp = client
         .get_json(&format!("/storage/files{}", project_query(&ctx)))
         .await?;
@@ -122,7 +122,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
 
 /// `weft files inspect <KEY>`.
 pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let resp = client
         .get_json(&format!("/storage/files{}", project_query(&ctx)))
         .await?;
@@ -217,7 +217,7 @@ async fn mint_download_url(
 }
 
 pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project = ctx.project().ok().map(|p| p.id().to_string());
     let http = reqwest::Client::new();
 
@@ -450,7 +450,7 @@ fn parse_content_range_start(header: &str) -> Option<u64> {
 /// `weft files rm <KEY-OR-SPACE>`: a full key removes one file; a
 /// trailing `/` removes the whole space (prefix).
 pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project = ctx.project().ok().map(|p| p.id().to_string());
     let is_prefix = target.ends_with('/');
 
@@ -508,7 +508,7 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
 
 /// `weft files usage`.
 pub async fn usage(ctx: Ctx) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let resp = client
         .get_json(&format!("/storage/usage{}", project_query(&ctx)))
         .await?;

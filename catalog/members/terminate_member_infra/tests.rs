@@ -20,8 +20,9 @@ async fn terminates(rig: FakeRig) -> WeftResult<()> {
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraTerminate { node, member, spec }, StopSelf::Keep) => {
+        (ProgramCall::InfraTerminate { node, member, spec, disks }, StopSelf::Keep) => {
             assert_eq!(node, "one.bridge");
+            assert_eq!(*disks, weft::infra::TerminateDisks::KeepListed);
             assert_eq!(member.as_ref().unwrap().as_str(), "ada");
             assert_eq!(spec.mode, DeactivationMode::Wipe);
             assert_eq!(spec.running_policy, RunningPolicy::Cancel);

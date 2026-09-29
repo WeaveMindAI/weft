@@ -46,7 +46,7 @@ if (HISTORY_SYNC_ON_DEMAND === undefined) {
 export async function createBridge(authDir, webhookManager, messageStore) {
   mkdirSync(authDir, { recursive: true });
 
-  // `warn` and up reach the pod log: Baileys swallows a failed media
+  // `warn` and up reach the container log: Baileys swallows a failed media
   // step (a duration or waveform it could not compute) into a warn and
   // sends anyway, and a silent logger made those drops invisible.
   const logger = pino({ level: 'warn' });
@@ -371,7 +371,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
   // the process. The reconnect machinery hangs off those events, so a
   // failure that precedes them has nothing left to retry it, and a
   // bridge that answers `/live` forever while never dialling again is
-  // worse than a pod restart.
+  // worse than a container restart.
   state.status = 'connecting';
   connect().catch((err) => {
     console.error('[bridge] initial connect failed:', err.message);

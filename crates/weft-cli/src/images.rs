@@ -1,10 +1,10 @@
-//! Image naming, build, registry pull/push and kind-load helpers. Owned
-//! by the CLI so the user runs `weft daemon start` / `weft infra up` and
-//! the right images land in the cluster. No external shell scripts.
+//! Image naming, build and registry pull/push helpers. Owned by the CLI
+//! so `weft daemon start` makes the images an install runs exist. No
+//! external shell scripts.
 //!
-//! Every shared image (the four system services, the worker builder
-//! base and the full-library worker every untouched stock project runs
-//! on) is content-addressed: the tag is a hash of everything the
+//! Every shared image (the runtime, the worker builder base, and the
+//! standard worker every project that uses only the base catalog runs on) is
+//! content-addressed: the tag is a hash of everything the
 //! image is built from, so a present tag IS the right content. Ensuring
 //! one is a three-step ladder: already present locally -> done; pull
 //! the same tag from the registry (CI pushes every tag it builds from a
@@ -89,7 +89,7 @@ fn host_docker_platform() -> Option<&'static str> {
 /// stdout is a data stream at two surfaces (`weft build-images` prints
 /// image refs the release workflow captures; `weft build --json`
 /// prints NDJSON the editor extension parses), and tools like docker,
-/// crictl and kind print progress lines to THEIR stdout, so every such
+/// buildx print progress lines to THEIR stdout, so every such
 /// child in this crate goes through here. A caller that `.output()`s
 /// overrides the redirect with a pipe (tokio always pipes for
 /// `output()`), which is equally safe: the bytes land in the result,
@@ -230,7 +230,7 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
             // `build::stage_builder_base_context`.
             let ctx = weft_compiler::build::stage_builder_base_context(&root)
                 .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
-            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], None, &[]).await?;
+            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[]).await?;
         }
     }
     // Builder-base images are large (~1GB+: debian + rustup +
@@ -243,168 +243,69 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
     Ok(())
 }
 
-/// The one Dockerfile every system image builds from: a shared builder stage
-/// compiles all four binaries in ONE cargo invocation (one target cache, one
-/// pass over the workspace instead of four), and each image is a named runtime
-/// stage selected with `docker build --target <stage>`.
-const SYSTEM_IMAGES_DOCKERFILE: &str = "system-images.Dockerfile";
+/// The Dockerfile the runtime image builds from.
+// SYNC: RUNTIME_DOCKERFILE <-> deploy/docker/runtime.Dockerfile
+const RUNTIME_DOCKERFILE: &str = "runtime.Dockerfile";
 
-/// The four long-running system services and everything image-shaped
-/// about each: its repo name, its stage in the shared Dockerfile, the
-/// binary crate whose closure keys its content hash, and the env var
-/// that overrides its ref wholesale (an operator running their own
-/// registry sets the full ref there and this module's naming steps
-/// aside).
-/// SYNC: the binary crate names and the dockerfile_stage names <-> the
-///       `-p ... --bin ...` package list and the `AS <stage>` names in
-///       deploy/docker/system-images.Dockerfile
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemService {
-    Dispatcher,
-    Listener,
-    Broker,
-    Supervisor,
-}
+/// The runtime image's repository.
+pub const RUNTIME_REPO: &str = "weft-runtime";
 
-impl SystemService {
-    pub const ALL: [SystemService; 4] =
-        [Self::Dispatcher, Self::Listener, Self::Broker, Self::Supervisor];
+/// The env var that overrides the runtime image's ref wholesale (an
+/// operator running their own registry sets the full ref there).
+pub const RUNTIME_IMAGE_ENV: &str = "WEFT_RUNTIME_IMAGE";
 
-    pub fn repo(self) -> &'static str {
-        match self {
-            Self::Dispatcher => "weft-dispatcher",
-            Self::Listener => "weft-listener",
-            Self::Broker => "weft-broker",
-            Self::Supervisor => "weft-infra-supervisor",
-        }
-    }
-
-    /// The named runtime stage in `system-images.Dockerfile`.
-    fn dockerfile_stage(self) -> &'static str {
-        match self {
-            Self::Dispatcher => "dispatcher",
-            Self::Listener => "listener",
-            Self::Broker => "broker",
-            Self::Supervisor => "supervisor",
-        }
-    }
-
-    /// The binary crate whose workspace closure keys this image's
-    /// content hash. Same string as the repo today, but the two answer
-    /// different questions.
-    fn binary_crate(self) -> &'static str {
-        self.repo()
-    }
-
-    /// The env var that both OVERRIDES this service's ref (read in
-    /// `system_image_ref`) and CARRIES it into the manifests (the
-    /// substitution var name in `manifest_template_vars`), one name so
-    /// the two can never disagree.
-    /// SYNC: WEFT_*_IMAGE names <-> deploy/k8s/dispatcher.yaml (env block),
-    ///       deploy/k8s/broker.yaml (image line),
-    ///       crates/weft-dispatcher/src/app.rs (listener/supervisor backend reads)
-    pub fn image_env(self) -> &'static str {
-        match self {
-            Self::Dispatcher => "WEFT_DISPATCHER_IMAGE",
-            Self::Listener => "WEFT_LISTENER_IMAGE",
-            Self::Broker => "WEFT_BROKER_IMAGE",
-            Self::Supervisor => "WEFT_SUPERVISOR_IMAGE",
-        }
-    }
-}
-
-/// The resolved image ref of every system service, computed once per
-/// daemon start/restart and threaded everywhere a ref is needed
-/// (ensure, kind load, manifest substitution, pooled-tier reconcile),
-/// so no two consumers can disagree on what "the dispatcher image" is.
-#[derive(Debug, Clone)]
-pub struct SystemImages {
-    pub dispatcher: String,
-    pub listener: String,
-    pub broker: String,
-    pub supervisor: String,
-}
-
-impl SystemImages {
-    pub fn resolve() -> Result<Self> {
-        Ok(Self {
-            dispatcher: system_image_ref(SystemService::Dispatcher)?,
-            listener: system_image_ref(SystemService::Listener)?,
-            broker: system_image_ref(SystemService::Broker)?,
-            supervisor: system_image_ref(SystemService::Supervisor)?,
-        })
-    }
-
-    pub fn get(&self, svc: SystemService) -> &str {
-        match svc {
-            SystemService::Dispatcher => &self.dispatcher,
-            SystemService::Listener => &self.listener,
-            SystemService::Broker => &self.broker,
-            SystemService::Supervisor => &self.supervisor,
-        }
-    }
-}
-
-/// The content-addressed ref for one system service:
-/// `<registry>/<repo>:<hash16>` where the hash covers the binary
-/// crate's workspace closure + workspace manifests + toolchain pin +
-/// the shared Dockerfile + `.dockerignore`. A change
-/// confined to one service moves only that service's ref; a shared
-/// crate is in every closure, so it moves all four. The env override
-/// (`WEFT_<SVC>_IMAGE`) wins verbatim when set.
-pub fn system_image_ref(svc: SystemService) -> Result<String> {
-    if let Ok(v) = std::env::var(svc.image_env()) {
+/// The content-addressed ref of the runtime image:
+/// `<registry>/weft-runtime:<hash16>`, the hash covering the runtime
+/// crate's workspace closure, the workspace manifests, the toolchain pin,
+/// the Dockerfile and `.dockerignore`, and the weft source the image
+/// carries to compile project versions against. `WEFT_RUNTIME_IMAGE`
+/// wins verbatim when set.
+pub fn runtime_image_ref() -> Result<String> {
+    if let Ok(v) = std::env::var(RUNTIME_IMAGE_ENV) {
         let v = v.trim();
         if !v.is_empty() {
-            // The ref lands verbatim in rendered k8s manifests and in
-            // tag comparisons, so reject shapes that would corrupt
-            // either: whitespace/quotes break the YAML, a missing tag
-            // breaks the staleness compare (see `ref_repo_tag`).
             anyhow::ensure!(
                 !v.contains(char::is_whitespace) && !v.contains(['"', '\'']),
-                "{} is '{v}', which is not a well-formed image ref \
-                 (whitespace or quotes)",
-                svc.image_env()
+                "{RUNTIME_IMAGE_ENV} is '{v}', which is not a well-formed image ref (whitespace or quotes)"
             );
-            ref_repo_tag(v).map_err(|e| anyhow::anyhow!("{}: {e}", svc.image_env()))?;
+            ref_repo_tag(v).map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
             return Ok(v.to_string());
         }
     }
-    let root = weft_compiler::build::resolve_weft_root()
-        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let closure =
-        weft_compiler::codegen::workspace_crate_closure(&root, &[svc.binary_crate().to_string()])
-            .map_err(|e| anyhow::anyhow!("system-image crate closure: {e}"))?;
-    let mut inputs: Vec<(String, PathBuf)> = closure
-        .iter()
-        .map(|name| (format!("crates/{name}"), root.join("crates").join(name)))
-        .collect();
+    let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let closure = weft_compiler::codegen::workspace_crate_closure(&root, &[RUNTIME_REPO.to_string()])
+        .map_err(|e| anyhow::anyhow!("runtime image crate closure: {e}"))?;
+    let mut inputs: Vec<(String, PathBuf)> =
+        closure.iter().map(|name| (format!("crates/{name}"), root.join("crates").join(name))).collect();
     for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
         inputs.push((rel.to_string(), root.join(rel)));
     }
-    inputs.push((
-        SYSTEM_IMAGES_DOCKERFILE.to_string(),
-        root.join("deploy/docker").join(SYSTEM_IMAGES_DOCKERFILE),
-    ));
-    // .dockerignore shapes the build context the Dockerfile reads, so
-    // it is an input like the Dockerfile itself; without it two trees
-    // hashing identically could ship different contexts.
+    inputs.push((RUNTIME_DOCKERFILE.to_string(), root.join("deploy/docker").join(RUNTIME_DOCKERFILE)));
+    // .dockerignore shapes the build context the Dockerfile reads.
     inputs.push((".dockerignore".to_string(), root.join(".dockerignore")));
-    Ok(qualified_ref(svc.repo(), &hash_inputs(&inputs)?))
+    let mut hasher = Sha256::new();
+    for (label, path) in &inputs {
+        weft_compiler::hash::hash_path_skipping(&mut hasher, label, path, &|name, at_top| {
+            at_top && NOT_IN_THE_BINARY.contains(&name)
+        })?;
+    }
+    // The weft source a version compiles against, every file of it (the
+    // Dockerfile copies these whole), minus what `.dockerignore` keeps
+    // out, which is the node-tree exclusion every hash walk already
+    // applies (`weft_catalog::is_node_tree_excluded`).
+    for rel in ["crates", "catalog", weft_compiler::hash::BUILDER_BASE_DOCKERFILE, weft_compiler::hash::BUILDER_BASE_SPLIT_SCRIPT] {
+        weft_compiler::hash::hash_path(&mut hasher, &format!("carried:{rel}"), &root.join(rel))?;
+    }
+    Ok(qualified_ref(RUNTIME_REPO, &short_hex(&hasher.finalize())))
 }
 
-/// Make a system service's image exist locally under `image_ref`:
-/// present -> done; pull -> done; build the service's stage of
-/// `deploy/docker/system-images.Dockerfile`. `rebuild` skips straight
-/// to the build, for when a present image is corrupt or hand-modified.
-pub async fn ensure_system_image(
-    svc: SystemService,
-    image_ref: &str,
-    rebuild: bool,
-) -> Result<()> {
+/// Make the runtime image exist locally under `image_ref`: present ->
+/// done; pull -> done; build `deploy/docker/runtime.Dockerfile`.
+/// `rebuild` skips straight to the build, for when a present image is
+/// corrupt or hand-modified.
+pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool) -> Result<()> {
     if !rebuild {
         if image_present(image_ref).await? {
-            // Progress to stderr (data on stdout, progress on stderr).
             eprintln!("image {image_ref} present; skipping");
             return Ok(());
         }
@@ -412,29 +313,21 @@ pub async fn ensure_system_image(
             return Ok(());
         }
     }
-    let root = weft_compiler::build::resolve_weft_root()
-        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let dockerfile = root.join("deploy/docker").join(SYSTEM_IMAGES_DOCKERFILE);
-    docker_build(image_ref, &dockerfile, &root, &[], Some(svc.dockerfile_stage()), &[]).await
+    let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let dockerfile = root.join("deploy/docker").join(RUNTIME_DOCKERFILE);
+    docker_build(image_ref, &dockerfile, &root, &[], &[]).await
 }
 
-/// How `ensure_all_shared_images` treats a builder-base failure. The
-/// base is a pre-warm for future `weft run`s in the daemon's boot
-/// (which re-ensure it with the user present), but the one artifact
-/// the release workflow exists to publish.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BaseFailure {
-    Fatal,
-    Warn,
-}
-
-/// Every shared image one ensure materialized: the four system refs
-/// plus the builder base, `None` when its ensure failed under
-/// `BaseFailure::Warn` (never under `Fatal`, which fails the ensure).
+/// Every shared image one ensure materialized: the runtime, the builder
+/// base every project's worker compiles on, and the standard worker.
 pub struct SharedImages {
-    pub system: SystemImages,
-    pub builder_base: Option<String>,
-    pub worker: Option<String>,
+    pub runtime: String,
+    pub builder_base: String,
+    /// The worker built from the whole base catalog. A project whose
+    /// nodes are all base catalog nodes builds to exactly this image
+    /// (its hash names no project), so its first run finds it ready
+    /// instead of compiling.
+    pub worker: String,
 }
 
 impl SharedImages {
@@ -443,19 +336,7 @@ impl SharedImages {
     ///       ref per line <-> .github/workflows/release.yml (the
     ///       images-manifest job diffs and stitches every line)
     pub fn bare_refs(&self) -> Vec<&str> {
-        let mut refs = vec![
-            self.system.dispatcher.as_str(),
-            self.system.listener.as_str(),
-            self.system.broker.as_str(),
-            self.system.supervisor.as_str(),
-        ];
-        if let Some(base) = &self.builder_base {
-            refs.push(base);
-        }
-        if let Some(worker) = &self.worker {
-            refs.push(worker);
-        }
-        refs
+        vec![self.runtime.as_str(), self.builder_base.as_str(), self.worker.as_str()]
     }
 }
 
@@ -469,183 +350,71 @@ pub fn suffixed_ref(bare: &str, ref_suffix: Option<&str>) -> String {
     }
 }
 
-/// Make every shared image (the four system services + the worker
-/// builder base) exist locally, concurrently (independent input sets,
-/// per-image buildkit cache mounts). Returns the bare
-/// content-addressed refs. With `ref_suffix`, each image is
-/// materialized under `<ref><suffix>` instead of its bare name: the
-/// release workflow's per-architecture halves, checked and pulled by
-/// their OWN names so a bare ref that predates multi-arch can never
-/// satisfy (and then poison) an architecture leg.
+/// Make both shared images exist locally, side by side. Returns the bare
+/// content-addressed refs. With `ref_suffix`, each image is materialized
+/// under `<ref><suffix>` instead of its bare name: the release workflow's
+/// per-architecture halves, checked and pulled by their OWN names.
 ///
-/// `tokio::join!`, NOT `try_join!`: an early bail would drop the
-/// sibling futures while their `docker build` children keep running
-/// detached (orphaned builds churning CPU with nobody reading the
-/// result). join! lets every build finish, then all errors are
-/// aggregated into one loud failure.
-pub async fn ensure_all_shared_images(
-    rebuild: bool,
-    base_failure: BaseFailure,
-    ref_suffix: Option<&str>,
-) -> Result<SharedImages> {
-    let imgs = SystemImages::resolve()?;
-    let base_ref = builder_base_ref()?;
-    let base_target = suffixed_ref(&base_ref, ref_suffix);
-    let base_ensure = async {
-        ensure_builder_base_at(&base_target, rebuild).await.map(|()| base_ref.clone())
-    };
-    let dispatcher_ref = suffixed_ref(&imgs.dispatcher, ref_suffix);
-    let listener_ref = suffixed_ref(&imgs.listener, ref_suffix);
-    let broker_ref = suffixed_ref(&imgs.broker, ref_suffix);
-    let supervisor_ref = suffixed_ref(&imgs.supervisor, ref_suffix);
-    let (dispatcher, listener, broker, supervisor, base) = tokio::join!(
-        ensure_system_image(SystemService::Dispatcher, &dispatcher_ref, rebuild),
-        ensure_system_image(SystemService::Listener, &listener_ref, rebuild),
-        ensure_system_image(SystemService::Broker, &broker_ref, rebuild),
-        ensure_system_image(SystemService::Supervisor, &supervisor_ref, rebuild),
-        base_ensure,
+/// `tokio::join!`, NOT `try_join!`: an early bail would drop the sibling
+/// future while its `docker build` child keeps running detached; join!
+/// lets both finish, then every error is reported together.
+pub async fn ensure_all_shared_images(rebuild: bool, ref_suffix: Option<&str>) -> Result<SharedImages> {
+    let runtime = runtime_image_ref()?;
+    let base = builder_base_ref()?;
+    let (runtime_target, base_target) = (suffixed_ref(&runtime, ref_suffix), suffixed_ref(&base, ref_suffix));
+    let (r, b) = tokio::join!(
+        ensure_runtime_image(&runtime_target, rebuild),
+        ensure_builder_base_at(&base_target, rebuild),
     );
-    let mut failures: Vec<String> = Vec::new();
-    for (name, res) in [
-        ("dispatcher", dispatcher),
-        ("listener", listener),
-        ("broker", broker),
-        ("supervisor", supervisor),
-    ] {
-        if let Err(e) = res {
-            failures.push(format!("{name}: {e:#}"));
-        }
-    }
-    let base = match base {
-        Ok(bare) => Some(bare),
-        Err(e) => {
-            match base_failure {
-                BaseFailure::Fatal => failures.push(format!("builder-base: {e:#}")),
-                BaseFailure::Warn => tracing::warn!(
-                    target: "weft_cli::images",
-                    error = %e,
-                    "pre-warm of worker builder base failed; next `weft run` will retry"
-                ),
-            }
-            None
-        }
-    };
-    anyhow::ensure!(
-        failures.is_empty(),
-        "shared image build failed:\n  {}",
-        failures.join("\n  ")
-    );
-    let worker = match &base {
-        Some(bare) => Some(ensure_standard_worker(bare, rebuild, ref_suffix).await?),
-        None => None,
-    };
-    Ok(SharedImages { system: imgs, builder_base: base, worker })
+    let failures: Vec<String> = [("runtime", r), ("builder-base", b)]
+        .into_iter()
+        .filter_map(|(name, res)| res.err().map(|e| format!("{name}: {e:#}")))
+        .collect();
+    anyhow::ensure!(failures.is_empty(), "shared image build failed:\n  {}", failures.join("\n  "));
+    // After the base: the standard worker is built FROM it.
+    let worker = ensure_standard_worker(&base, rebuild, ref_suffix).await.map_err(|e| anyhow::anyhow!("standard worker: {e:#}"))?;
+    Ok(SharedImages { runtime, builder_base: base, worker })
 }
 
-/// The stock project the standard worker is built from, with the two
-/// answers the CLI needs off it: its image ref and its staged build.
-struct StandardWorkerProject(weft_compiler::build::StockProject);
-
-impl StandardWorkerProject {
-    fn new() -> Result<Self> {
-        Ok(Self(weft_compiler::build::StockProject::materialize()?))
-    }
-
-    /// The image name a stock project's full build resolves to, computed
-    /// without generating or staging anything.
-    fn image_ref(&self) -> Result<String> {
-        let root = weft_compiler::build::resolve_weft_root()
-            .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-        let hash = weft_compiler::hash::compute_binary_hash(
-            &self.0.definition,
-            &self.0.project,
-            &root,
-            &self.0.catalog,
-            weft_compiler::codegen::NodeSet::Full,
-        )?;
-        Ok(qualified_ref(weft_compiler::build::WORKER_IMAGE_REPO, &hash))
-    }
-
-    /// Codegen and stage the full-library build context, FROM `base`.
-    fn stage(&self, base: &str) -> Result<weft_compiler::build::StagedImageBuild> {
-        Ok(weft_compiler::build::build_project(
-            &self.0.project,
-            &self.0.definition,
-            &self.0.catalog,
-            base,
-            weft_compiler::codegen::NodeSet::Full,
-        )?)
-    }
-}
-
-/// The full-library worker's content-addressed ref for the current checkout:
-/// the image every untouched stock project runs on. Computed once per
-/// process: the answer is a function of the checkout, and asking it
-/// means compiling the stock program and walking the whole catalog.
+/// The standard worker's ref for this checkout:
+/// `<registry>/weft-worker:<hash>` (`weft_compiler::build::standard_worker_hash`).
 pub fn standard_worker_ref() -> Result<String> {
-    static REF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(known) = REF.get() {
-        return Ok(known.clone());
-    }
-    // Only an answer is kept: a failure (a catalog mid-update, a full
-    // temp dir) is reported and asked again next time.
-    let computed = StandardWorkerProject::new()?.image_ref()?;
-    Ok(REF.get_or_init(|| computed).clone())
+    let hash = weft_compiler::build::standard_worker_hash()?;
+    Ok(qualified_ref(weft_compiler::build::WORKER_IMAGE_REPO, &hash))
 }
 
-/// Materialize the full-library worker under its content-addressed ref
-/// (present -> pull -> build FROM the already-ensured builder base).
-///
-/// `base` is the builder base this process just ensured, never recomputed
-/// here: its ref hashes the checkout, and a file edited while the base was
-/// building would name a base nobody built, failing the FROM with "not
-/// found".
+/// Make the standard worker exist under its ref (present, else pulled,
+/// else built FROM `base`, the builder base this process just ensured),
+/// and under its bare name too (`weft-worker:<hash>`), which is the name a
+/// local install's own builds look for, so a stock project's build finds
+/// it and compiles nothing.
 async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>) -> Result<String> {
-    let stock = StandardWorkerProject::new()?;
-    let image = stock.image_ref()?;
+    let image = standard_worker_ref()?;
     let target = suffixed_ref(&image, suffix);
     if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
-        let build = stock.stage(&suffixed_ref(base, suffix))?;
-        let dockerfile = build.build_context.join("Dockerfile");
-        docker_build_worker(&target, &dockerfile, &build.build_context, &[]).await?;
+        let stock = weft_compiler::build::StockProject::materialize()?;
+        let bases = weft_compiler::worker_image::BaseImages {
+            builder: suffixed_ref(base, suffix),
+            runtime: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.to_string(),
+        };
+        let build = weft_compiler::build::build_project(
+            &stock.project,
+            &stock.definition,
+            &stock.catalog,
+            &bases,
+            weft_compiler::codegen::NodeSet::Full,
+        )?;
+        docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
     }
-    Ok(image)
-}
-
-/// Give a worker image the registry already holds its bare local name
-/// (`weft-worker:<hash>`), on host docker and on the kind node, so the
-/// project build's presence check finds it and skips compiling. Returns
-/// `false`, touching nothing, when the registry is disabled, when the bare
-/// name already exists locally without a registry copy (a local build the
-/// caller streams into kind itself), or when the registry has no such image.
-/// Only worth asking for the standard worker's ref: the registry holds
-/// the images CI builds, never a project's own hash.
-///
-/// The kind node gets the image by pulling the qualified ref itself
-/// (`kind_load`'s registry path: a pulled multi-arch image does not survive
-/// `docker save`), then the bare name is added on the node with `ctr`.
-pub async fn import_published_worker(local_ref: &str, cluster: Option<&str>) -> Result<bool> {
-    let Some(registry) = image_registry() else { return Ok(false) };
-    let (repo, hash) = ref_repo_tag(local_ref)?;
-    let published = qualified_ref_with(Some(&registry), repo, hash);
-    if !image_present(&published).await?
-        && (image_present(local_ref).await? || !docker_pull(&published).await?)
-    {
-        return Ok(false);
-    }
-    if let Some(cluster) = cluster {
-        kind_load(cluster, &published, false).await?;
-        let node = format!("{cluster}-control-plane");
-        let node_ref = format!("docker.io/library/{local_ref}");
-        if !kind_node_has_tag(cluster, local_ref).await {
-            let output = docker().args(["exec", &node, "ctr", "-n", "k8s.io", "images", "tag", "--force", &published, &node_ref])
-                .output().await?;
-            anyhow::ensure!(output.status.success(), "name published worker on kind: {}", String::from_utf8_lossy(&output.stderr));
+    if suffix.is_none() {
+        let (repo, tag) = ref_repo_tag(&image)?;
+        let bare = format!("{repo}:{tag}");
+        if bare != image && !image_present(&bare).await? {
+            let out = docker().args(["tag", &image, &bare]).output().await?;
+            anyhow::ensure!(out.status.success(), "docker tag {image} {bare}: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
     }
-    let output = docker().args(["tag", &published, local_ref]).output().await?;
-    anyhow::ensure!(output.status.success(), "name published worker locally: {}", String::from_utf8_lossy(&output.stderr));
-    Ok(true)
+    Ok(image)
 }
 
 /// One BuildKit record of a worker compile cache mount, as `docker
@@ -659,12 +428,12 @@ pub struct CompileCacheRecord {
     /// without the compile lane after it: every lane of a key is that
     /// key's cache.
     pub key: String,
-    /// The compile lane after the key, `None` for a cache made before
-    /// builds had lanes.
+    /// The compile lane after the key, `None` when the mount id carries
+    /// no lane number.
     pub lane: Option<u32>,
-    /// The text after the key when it is not a lane number: a mount id
-    /// this build does not make, kept so the size report shows its bytes
-    /// instead of hiding them.
+    /// What the mount id carries after the key instead of a lane number
+    /// (empty when nothing): a mount id this build does not make, kept so
+    /// the size report shows its bytes instead of hiding them.
     pub unreadable_lane: Option<String>,
     pub size: String,
     /// Whole days since BuildKit last used it, read off its "Last used"
@@ -719,7 +488,7 @@ fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
                 Ok(lane) => (key.to_string(), Some(lane), None),
                 Err(_) => (key.to_string(), None, Some(suffix.to_string())),
             },
-            None => (id.to_string(), None, None),
+            None => (id.to_string(), None, Some(String::new())),
         };
         Some(CompileCacheRecord {
             id: field("ID:")?.to_string(),
@@ -748,17 +517,14 @@ fn idle_days(last_used: &str) -> u64 {
 }
 
 /// THE one `docker build` invocation, BuildKit on. Every image the CLI
-/// builds (builder base, system images, worker, infra, node-test)
+/// builds (builder base, runtime, worker, infra, node-test)
 /// funnels here. `labels` stamp the `weft.dev/*` filters later GC
-/// selects on (empty for the shared images, which GC by repo+tag);
-/// `target` selects a named stage of a multi-target Dockerfile (the
-/// system images); `None` builds the final stage.
+/// selects on (empty for the shared images, which GC by repo+tag).
 pub(crate) async fn docker_build(
     image_ref: &str,
     dockerfile: &Path,
     context: &Path,
     labels: &[String],
-    target: Option<&str>,
     build_args: &[String],
 ) -> Result<()> {
     eprintln!(
@@ -776,9 +542,6 @@ pub(crate) async fn docker_build(
     for l in labels {
         cmd.args(["--label", l]);
     }
-    if let Some(stage) = target {
-        cmd.args(["--target", stage]);
-    }
     for arg in build_args {
         cmd.args(["--build-arg", arg]);
     }
@@ -789,10 +552,12 @@ pub(crate) async fn docker_build(
     Ok(())
 }
 
-/// Build a worker image (a Dockerfile from the worker templates, whose
-/// compile cache is split into lanes): [`docker_build`] holding one of
-/// this host's compile lanes for the whole build, named to the build
-/// through [`weft_compiler::worker_image::COMPILE_LANE_ARG`].
+/// Build a node-test image (a Dockerfile from the worker templates, whose
+/// compile cache is split into lanes) on this machine: [`docker_build`]
+/// holding one of this host's compile lanes for the whole build, named to
+/// the build through [`weft_compiler::worker_image::COMPILE_LANE_ARG`].
+/// Project images are built by the install (`weft-dispatcher::build`),
+/// which holds lanes of its own the same way.
 pub(crate) async fn docker_build_worker(
     image_ref: &str,
     dockerfile: &Path,
@@ -801,12 +566,12 @@ pub(crate) async fn docker_build_worker(
 ) -> Result<()> {
     let lane = CompileLane::hold().await?;
     let arg = format!("{}={}", weft_compiler::worker_image::COMPILE_LANE_ARG, lane.number);
-    docker_build(image_ref, dockerfile, context, labels, None, &[arg]).await
+    docker_build(image_ref, dockerfile, context, labels, &[arg]).await
 }
 
-/// How many worker builds compile side by side on this host when nobody
-/// says otherwise. Each lane keeps a compile cache of its own (about
-/// 2GB), so this is also how many of those a host keeps.
+/// How many worker builds compile side by side when nobody says
+/// otherwise. Each lane keeps a compile cache of its own (about 2GB), so
+/// this is also how many of those are kept.
 const DEFAULT_COMPILE_LANES: u32 = 4;
 
 /// Overrides [`DEFAULT_COMPILE_LANES`]: more for a machine that builds
@@ -863,9 +628,10 @@ impl CompileLane {
     }
 }
 
-/// How many compile lanes this host has: [`COMPILE_LANES_ENV`], or
-/// [`DEFAULT_COMPILE_LANES`].
-fn compile_lanes() -> Result<u32> {
+/// How many compile lanes there are: [`COMPILE_LANES_ENV`], or
+/// [`DEFAULT_COMPILE_LANES`]. This host's node-test builds hold one each,
+/// and `weft daemon start` hands the same count to the install's BuildKit.
+pub(crate) fn compile_lanes() -> Result<u32> {
     match std::env::var(COMPILE_LANES_ENV) {
         Err(_) => Ok(DEFAULT_COMPILE_LANES),
         Ok(raw) => match raw.trim().parse::<u32>() {
@@ -876,31 +642,22 @@ fn compile_lanes() -> Result<u32> {
 }
 
 /// Directories inside a crate that the image build never compiles, so a change
-/// in one must not roll four images and the pods running them.
-/// SYNC: what a system image's hash covers <-> .dockerignore (what the
+/// in one must not rebuild the runtime image.
+/// SYNC: what the runtime image's hash covers <-> .dockerignore (what the
 ///       repo-root build context ships). The two need not be byte-equal
 ///       (only the compiled binaries + catalog reach the final stage),
 ///       but a path that changes what a binary compiles TO must be in
 ///       both, or two trees with one hash build different images.
 const NOT_IN_THE_BINARY: &[&str] = &["tests", "benches", "examples"];
 
-/// Hash every regular file under each labeled input path. Shares
-/// framing rules with the project source-hash function
-/// (`hash::hash_path`) so the two hashers can't drift; both use
-/// SHA-256 with explicit `file:` / `dir:` / `path:` / `missing:`
-/// prefixes over machine-independent labels. Returns a 16-char hex
-/// prefix (64 bits), plenty for a content-addressed tag.
-fn hash_inputs(inputs: &[(String, PathBuf)]) -> Result<String> {
-    let mut hasher = Sha256::new();
-    for (label, path) in inputs {
-        weft_compiler::hash::hash_path_skipping(&mut hasher, label, path, NOT_IN_THE_BINARY)?;
-    }
-    let digest = hasher.finalize();
+/// The first 8 bytes of a digest, hex: 64 bits, plenty for a
+/// content-addressed tag.
+fn short_hex(digest: &[u8]) -> String {
     let mut out = String::with_capacity(16);
     for b in digest.iter().take(8) {
         let _ = write!(&mut out, "{:02x}", b);
     }
-    Ok(out)
+    out
 }
 
 pub async fn image_present(image_ref: &str) -> Result<bool> {
@@ -931,111 +688,12 @@ pub async fn image_present(image_ref: &str) -> Result<bool> {
     }
 }
 
-/// Load a locally-present image into the named kind cluster so its
-/// Pods can run it without reaching a registry.
-///
-/// Every ref that goes through here is content-addressed
-/// (`<repo>:<hash>`, worker / infra / system), so a ref already
-/// present on the node IS the right content and the load
-/// short-circuits.
-///
-/// We never compare image IDs across the docker/containerd boundary:
-/// the two runtimes digest the same image differently (docker's config
-/// blob vs containerd's), so an ID comparison never matches.
-///
-/// `force` skips the presence short-circuit and loads unconditionally:
-/// the repair path for a node image whose BYTES are wrong under a
-/// still-matching tag (a `--rebuild` re-made the image under the same
-/// content ref, so tag presence would wrongly say "already right").
-pub async fn kind_load(cluster: &str, image_ref: &str, force: bool) -> Result<()> {
-    if !force && kind_node_has_tag(cluster, image_ref).await {
-        return Ok(());
-    }
-    // A registry-qualified ref pulls on the NODE first: streaming a
-    // registry-pulled multi-arch image through `kind load` fails on
-    // import ("content digest not found": the saved tar references
-    // manifest-list digests docker never stored), so pulling is the
-    // only load that works for what the registry serves. When the pull
-    // fails, the tag may still exist in the LOCAL docker: the ensure
-    // step builds a service locally whenever its content hash names an
-    // image no registry ever saw (uncommitted changes), and a locally
-    // BUILT image is single-arch, which streams through `kind load`
-    // fine. So: pull for unchanged content, stream the local build for
-    // changed content, and only fail when neither source has the ref.
-    if !force && image_ref.contains('/') {
-        let node = format!("{cluster}-control-plane");
-        let out =
-            docker().args(["exec", &node, "crictl", "pull", image_ref]).output().await?;
-        if out.status.success() {
-            return Ok(());
-        }
-        if !image_present(image_ref).await? {
-            anyhow::bail!(
-                "the kind node could not pull {image_ref} and the local docker does not \
-                 hold it either: {}\n\
-                 Is the registry reachable from this machine and the package public? \
-                 To build the image locally, re-run with --rebuild.",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        // Fall through to the docker-stream load below.
-    }
-    let status = quiet_stdout("kind")
-        .args(["load", "docker-image", image_ref, "--name", cluster])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("kind load docker-image {image_ref} failed");
-    }
-    Ok(())
-}
-
-/// Reclaim every system-service image whose tag is NOT the one the
-/// cluster now runs, on host docker and (kind only) the node's
-/// containerd. Content-addressed tags accumulate one image per engine
-/// change with nothing else evicting them; the pods were just rolled
-/// onto `current`, so every other tag of these repos is dead weight.
-/// Also sweeps the pre-registry `:local` spellings. Warn-only: a
-/// busy image (an old pod still terminating) just survives until the
-/// next run.
-pub async fn gc_stale_system_images(kind_cluster: Option<&str>, current: &SystemImages) {
-    // A current ref whose tag cannot be parsed must SKIP its repo, not
-    // condemn everything of that repo (`system_image_ref` validates
-    // overrides, so this is belt over suspenders).
-    let host = async {
-        let out = docker().args(["images", "--format", "{{.Repository}}:{{.Tag}}"]).output().await;
-        let out = match out {
-            Ok(o) if o.status.success() => o,
-            _ => return,
-        };
-        let listing = String::from_utf8_lossy(&out.stdout);
-        for svc in SystemService::ALL {
-            let Ok(condemn) = outside_current(current.get(svc)) else { continue };
-            for stale in host_images_matching(&listing, condemn) {
-                remove_image_warn_only(&["rmi", &stale]).await;
-            }
-        }
-    };
-    let node = async {
-        let Some(cluster) = kind_cluster else { return };
-        let Ok(groups) = kind_node_image_tag_groups(cluster).await else { return };
-        let node = format!("{cluster}-control-plane");
-        for svc in SystemService::ALL {
-            let Ok(condemn) = outside_current(current.get(svc)) else { continue };
-            for image in node_images_matching(&groups, condemn) {
-                remove_image_warn_only(&["exec", &node, "crictl", "rmi", &image]).await;
-            }
-        }
-    };
-    tokio::join!(host, node);
-}
-
 /// The predicate a "current ref" sweep condemns with: every tag of
 /// `current_ref`'s repo except the current one, under any registry
 /// spelling. Owning the ref split here means no caller hand-rolls it,
 /// and a `current_ref` that cannot be split is a loud error, never an
 /// everything-condemned sweep. Compose it with a referenced-set hold
-/// where one applies (`gc_stale_images`).
+/// where one applies.
 pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool + '_> {
     let (repo, current) = ref_repo_tag(current_ref)?;
     Ok(move |r: &str, t: &str| r == repo && t != current)
@@ -1043,7 +701,7 @@ pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool 
 
 /// Host `docker images` lines (one `repo:tag` per line) that a sweep
 /// may delete: those whose prefix-stripped `(repo, tag)` parse and
-/// satisfy `condemn`. THE host-side matcher (system images, builder
+/// satisfy `condemn`. THE host-side matcher (the runtime image, builder
 /// bases, worker and infra reclaims all pass their own predicate over
 /// the same split), the host sibling of `node_images_matching`, pure
 /// for the same reason: the two matchers decide what a sweep may
@@ -1058,248 +716,8 @@ pub fn host_images_matching(listing: &str, condemn: impl Fn(&str, &str) -> bool)
         .collect()
 }
 
-/// One best-effort image removal: a busy image (an old pod still
-/// terminating) legitimately survives to the next run, but the refusal
-/// is still worth a line so a wedged runtime or a permission problem
-/// is not invisible forever.
-async fn remove_image_warn_only(docker_args: &[&str]) {
-    match docker().args(docker_args).output().await {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => tracing::warn!(
-            target: "weft_cli::images",
-            "docker {} failed: {}",
-            docker_args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Err(e) => tracing::warn!(
-            target: "weft_cli::images",
-            error = %e,
-            "docker {} could not run",
-            docker_args.join(" ")
-        ),
-    }
-}
-
-/// The node's images as one `repoTags` group PER IMAGE, via `crictl
-/// images -o json` on the control-plane container. THE one
-/// node-image-list reader: tag-presence checks (`kind_node_has_tag`)
-/// and image reclamation (`weft clean --images`) both parse through
-/// here, so the two cannot drift on how a node ref is spelled. The
-/// grouping preserves which refs share content: `crictl rmi` removes
-/// the whole image behind a ref (every tag on it, not just the named
-/// one), so any node-side removal must decide per IMAGE, never per
-/// tag. Digest-only images list an empty `repoTags` array and come
-/// back as empty groups.
-pub async fn kind_node_image_tag_groups(cluster: &str) -> Result<Vec<Vec<String>>> {
-    let node = format!("{cluster}-control-plane");
-    let out = docker()
-        .args(["exec", &node, "crictl", "images", "-o", "json"])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("docker not reachable on PATH: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "crictl images on {node} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|e| anyhow::anyhow!("parse crictl images output from {node}: {e}"))?;
-    // A listing without an `images` array is an unreadable listing,
-    // not an empty node; treating it as empty would make a reclaim
-    // silently reclaim nothing and report success.
-    let images = parsed.get("images").and_then(|v| v.as_array()).ok_or_else(|| {
-        anyhow::anyhow!("crictl images on {node} returned no `images` array: {parsed}")
-    })?;
-    Ok(images
-        .iter()
-        .filter_map(|img| img.get("repoTags").and_then(|v| v.as_array()))
-        .map(|tags| tags.iter().filter_map(|t| t.as_str()).map(str::to_string).collect())
-        .collect())
-}
-
-/// The dispatcher's answer to "which images does the system still need",
-/// the keep-set every image reclaim subtracts before deleting anything.
-/// `worker_hashes` are bare `weft-worker` tag suffixes; `infra_refs` are
-/// full BARE `weft-infra-<name>:<hash>` refs (the CLI's tag policy never
-/// writes a registry prefix into either list, and the sweep's key
-/// construction below strips prefixes before comparing, so the two
-/// spellings agree by construction). A fetch failure is the caller's
-/// cue to skip the reclaim, never to guess "nothing is referenced".
-// SYNC: response shape <-> crates/weft-dispatcher/src/api/project.rs
-//       (ReferencedImages: {"workerHashes": [...], "infraRefs": [...]})
-#[derive(Debug, Default)]
-pub struct ReferencedImages {
-    pub worker_hashes: std::collections::BTreeSet<String>,
-    pub infra_refs: std::collections::BTreeSet<String>,
-}
-
-impl ReferencedImages {
-    /// Whether the system still needs the image behind a
-    /// prefix-stripped `(repo, tag)`: THE one membership test every
-    /// reclaim composes into its condemn predicate, so no sweep
-    /// hand-rolls which list a repo's keys live in (worker hashes are
-    /// keyed by tag under the worker repo; infra refs by full bare
-    /// `repo:tag`).
-    pub fn is_referenced(&self, repo: &str, tag: &str) -> bool {
-        (repo == weft_compiler::build::WORKER_IMAGE_REPO && self.worker_hashes.contains(tag))
-            || self.infra_refs.contains(&format!("{repo}:{tag}"))
-    }
-}
-
-/// Fetch the referenced keep-set from the dispatcher. Loud error on a
-/// shape the contract does not name: a missing key AND a wrong-typed
-/// element both error, because an unreadable answer must never read as
-/// "nothing is referenced" (a dropped element shrinks the keep-set
-/// below what is running, and the reclaim then deletes a live image).
-pub async fn referenced_images(
-    client: &crate::client::DispatcherClient,
-) -> Result<ReferencedImages> {
-    let json = client
-        .get_json("/images/referenced")
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch referenced images (is the daemon up?): {e}"))?;
-    let strings = |key: &str| -> Result<std::collections::BTreeSet<String>> {
-        let arr = json
-            .get(key)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("/images/referenced returned no `{key}` array: {json}"))?;
-        let mut out = std::collections::BTreeSet::new();
-        for v in arr {
-            let s = v.as_str().ok_or_else(|| {
-                anyhow::anyhow!("/images/referenced `{key}` holds a non-string entry: {v}")
-            })?;
-            out.insert(s.to_string());
-        }
-        Ok(out)
-    };
-    Ok(ReferencedImages {
-        worker_hashes: strings("workerHashes")?,
-        infra_refs: strings("infraRefs")?,
-    })
-}
-
-/// The keep-set for a post-build GC: [`referenced_images`] with the
-/// unlearnable-answer policy the build path needs. `None` (after a
-/// stderr warning) means the answer could not be learned - daemon
-/// unreachable or a contract-broken response - and the caller must skip
-/// the GC, never guess "nothing is referenced" (which would delete live
-/// images). The warning is the breadcrumb: a silent skip would let a
-/// persistent contract break hide behind every `weft build` until
-/// someone happens to run `weft clean --images`.
-pub async fn referenced_set_for_gc(
-    client: &crate::client::DispatcherClient,
-) -> Option<ReferencedImages> {
-    match referenced_images(client).await {
-        Ok(referenced) => Some(referenced),
-        Err(e) => {
-            eprintln!(
-                "warning: could not fetch the referenced-image set, \
-                 skipping the stale-image GC: {e}"
-            );
-            None
-        }
-    }
-}
-
-/// Whether a bare repo (registry prefix stripped) is one of the
-/// per-infra-node image repos `weft clean --images --all` reclaims:
-/// `weft-infra-<name>` for every name EXCEPT the supervisor, which is a
-/// system-service repo owned by `gc_stale_system_images` (an image repo
-/// being system-managed and clean-managed at once would race the two
-/// sweeps against each other).
-/// SYNC: the repo spellings <-> crates/weft-compiler/src/image_set.rs
-///       (infra_image_repo)
-pub fn is_infra_node_repo(repo: &str) -> bool {
-    repo.starts_with("weft-infra-") && repo != SystemService::Supervisor.repo()
-}
-
-/// One ref per NODE IMAGE that a sweep may `crictl rmi`: every tag
-/// group whose refs ALL parse and satisfy `condemn`. Per IMAGE, never
-/// per tag: `crictl rmi` removes the whole image behind a ref (every
-/// tag on it, not just the named one), so an image carrying a live tag
-/// alongside a condemned one (identical content loaded under two tags)
-/// must survive untouched; condemning per tag once deleted a freshly
-/// loaded test image whose bits matched the stale tag being dropped.
-/// Digest-only groups (no parseable `repo:tag`) never match. Only
-/// images made purely of condemned refs ever leave, which is the
-/// guarantee that keeps system images (listener & co) safe from every
-/// node cleanup. Handles bare (`repo:<tag>`), docker-canonical
-/// (`docker.io/library/...`) and registry-qualified
-/// (`host:port/path/repo:<tag>`) spellings through `ref_repo_tag`. THE
-/// node-side matcher, pure so it is unit-testable.
-pub fn node_images_matching(
-    image_tag_groups: &[Vec<String>],
-    condemn: impl Fn(&str, &str) -> bool,
-) -> Vec<String> {
-    image_tag_groups
-        .iter()
-        .filter(|group| {
-            !group.is_empty()
-                && group
-                    .iter()
-                    .all(|full| ref_repo_tag(full).is_ok_and(|(r, t)| condemn(r, t)))
-        })
-        .filter_map(|group| group.first().cloned())
-        .collect()
-}
-
-/// Whether the kind node already has an image under `image_ref`. Ref
-/// presence alone is the answer: tags are content-addressed (the
-/// suffix is the source hash), so a present ref is the right content.
-/// We match on `repoTags`, not the image id, precisely because docker
-/// and containerd report different ids for the same image. Any listing
-/// failure reads as "absent" so the caller just re-loads. A bare ref
-/// (no registry) is stored by containerd under its docker-canonical
-/// `docker.io/library/` spelling, so both spellings match.
-pub(crate) async fn kind_node_has_tag(cluster: &str, image_ref: &str) -> bool {
-    let Ok(groups) = kind_node_image_tag_groups(cluster).await else {
-        return false;
-    };
-    let canonical =
-        (!image_ref.contains('/')).then(|| format!("docker.io/library/{image_ref}"));
-    groups
-        .iter()
-        .flatten()
-        .any(|t| t == image_ref || Some(t.as_str()) == canonical.as_deref())
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn standard_worker_matches_independent_projects_and_changes_with_node_code() {
-        let base = super::builder_base_ref().unwrap();
-        let stock_project = super::StandardWorkerProject::new().unwrap();
-        let stock = stock_project.stage(&base).unwrap();
-        let stock_ref = stock_project.image_ref().unwrap();
-        let (_, stock_hash) = super::ref_repo_tag(&stock_ref).unwrap();
-        assert_eq!(stock_hash, stock.content_hash, "the ref computed without staging names the staged build");
-        let dir = tempfile::tempdir().unwrap();
-        let mut project = weft_compiler::project::Project::init(dir.path(), "a-different-project").unwrap();
-        std::fs::write(project.main_weft(), "answer = Text { value: \"different graph\" }\n").unwrap();
-        let (definition, catalog) = weft_compiler::hash::load_enriched_project(&project).unwrap();
-        let root = weft_compiler::build::resolve_weft_root().unwrap();
-        let hash = |project: &weft_compiler::project::Project, catalog: &weft_catalog::FsCatalog| {
-            weft_compiler::hash::compute_binary_hash(&definition, project, &root, catalog,
-                weft_compiler::codegen::NodeSet::Full).unwrap()
-        };
-        assert_eq!(hash(&project, &catalog), stock.content_hash,
-            "project names, IDs and graphs must share the finished library image");
-        let staged = weft_compiler::build::build_project(&project, &definition, &catalog, &base,
-            weft_compiler::codegen::NodeSet::Full).unwrap();
-        for relative in ["Dockerfile", "build/Cargo.toml", "build/src/main.rs", "build/src/registry.rs"] {
-            assert_eq!(std::fs::read(stock.build_context.join(relative)).unwrap(),
-                std::fs::read(staged.build_context.join(relative)).unwrap(), "{relative}");
-        }
-        project.manifest.build.worker.base_image = Some("alpine:3.21".into());
-        assert_ne!(hash(&project, &catalog), stock.content_hash, "custom runtime needs its own image");
-        project.manifest.build.worker.base_image = None;
-        let source = dir.path().join("nodes/base_catalog/basic/text/mod.rs");
-        let mut code = std::fs::read_to_string(&source).unwrap();
-        code.push_str("\n// Locally edited node.\n");
-        std::fs::write(&source, code).unwrap();
-        assert_ne!(hash(&project, &catalog), stock.content_hash, "local node edits must compile separately");
-    }
     use super::*;
 
     /// Records as `docker buildx du --verbose` printed them on a host that
@@ -1317,7 +735,7 @@ mod tests {
                   Description:  cached mount /cache/target with id \"/weft-worker-target-0123456789abcdef-x2\"\nLast used:    2 minutes ago\n";
         assert_eq!(compile_caches_in(du), vec![
             CompileCacheRecord { id: "z5k0h7hhdmaktflss7bsyjs7u".into(), key: "9af3f2c5f9da6eaa".into(), lane: Some(2), unreadable_lane: None, size: "1.982GB".into(), idle_days: 0 },
-            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: None, size: "6.1GB".into(), idle_days: 35 },
+            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: Some(String::new()), size: "6.1GB".into(), idle_days: 35 },
             CompileCacheRecord { id: "q1".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: Some("x2".into()), size: "3MB".into(), idle_days: 0 },
         ]);
         assert!(compile_caches_in("ID: c\nSize: 1MB\nDescription: something else\n").is_empty());
@@ -1377,7 +795,7 @@ mod tests {
 
     /// The host sweep must remove every other tag of a system repo
     /// (the pre-registry `:local` spelling included), keep the tag the
-    /// cluster runs under EITHER spelling, skip untagged/dangling
+    /// install runs under EITHER spelling, skip untagged/dangling
     /// lines, and never touch foreign repos (`weft-infra-supervisor`
     /// vs a `weft-infra-<node>` image included).
     #[test]
@@ -1406,193 +824,13 @@ weft-infra-postgres:zzz999
         let infra =
             host_images_matching(listing, outside_current("weft-infra-supervisor:abc123").unwrap());
         assert!(infra.is_empty(), "{infra:?}");
-        // Composed with a referenced-set hold: a non-current tag the
-        // set protects survives.
+        // Composed with another hold: a non-current tag it protects
+        // survives.
         let current = outside_current("weft-dispatcher:abc123").unwrap();
         let held = host_images_matching(listing, |r, t| current(r, t) && t != "0ld0ld");
         assert_eq!(held, vec!["weft-dispatcher:local".to_string()]);
         // A current ref that cannot be split is a loud error, never an
         // everything-condemned sweep.
         assert!(outside_current("weft-dispatcher").is_err());
-    }
-
-    /// The node-side sweep must remove every other tag of a system
-    /// repo (the pre-registry `:local` spelling included), keep the
-    /// tag the cluster runs, and never touch foreign repos.
-    #[test]
-    fn gc_condemns_only_stale_system_tags() {
-        let one = |s: &str| vec![s.to_string()];
-        let groups = vec![
-            one("ghcr.io/weavemindai/weft-dispatcher:abc123"),
-            one("docker.io/library/weft-dispatcher:local"),
-            one("ghcr.io/weavemindai/weft-dispatcher:0ld0ld"),
-            one("docker.io/library/weft-worker:abc123"),
-        ];
-        let stale =
-            node_images_matching(&groups, outside_current("weft-dispatcher:abc123").unwrap());
-        assert_eq!(
-            stale,
-            vec![
-                "docker.io/library/weft-dispatcher:local".to_string(),
-                "ghcr.io/weavemindai/weft-dispatcher:0ld0ld".to_string(),
-            ]
-        );
-    }
-
-    /// The referenced set answers per `(repo, tag)`: worker hashes are
-    /// keyed by tag under the worker repo only, infra refs by their
-    /// full bare `repo:tag`, and nothing else is referenced.
-    #[test]
-    fn referenced_set_membership_is_per_repo_and_tag() {
-        let referenced = ReferencedImages {
-            worker_hashes: ["abc".to_string()].into_iter().collect(),
-            infra_refs: ["weft-infra-bridge:abc".to_string()].into_iter().collect(),
-        };
-        assert!(referenced.is_referenced("weft-worker", "abc"));
-        assert!(!referenced.is_referenced("weft-worker", "0ld"));
-        assert!(referenced.is_referenced("weft-infra-bridge", "abc"));
-        assert!(!referenced.is_referenced("weft-infra-bridge", "0ld"));
-        // A worker hash never vouches for another repo's tag.
-        assert!(!referenced.is_referenced("weft-infra-credential", "abc"));
-        assert!(!referenced.is_referenced("postgres", "abc"));
-    }
-
-    /// The infra host sweep condemns exactly the unreferenced tags of
-    /// the infra-node repos (any registry spelling), keeps every other
-    /// repo (the supervisor system repo, workers, system services,
-    /// foreign images), and skips dangling `<none>` lines.
-    #[test]
-    fn host_sweep_condemns_only_unreferenced_infra() {
-        let listing = "\
-weft-infra-bridge:abc
-weft-infra-bridge:0ld
-ghcr.io/weavemindai/weft-infra-bridge:abc
-weft-infra-credential:keep1
-weft-infra-supervisor:abc
-weft-infra-supervisor:0ld
-weft-worker:abc
-weft-dispatcher:abc
-postgres:18
-<none>:<none>
-";
-        let referenced = ReferencedImages {
-            worker_hashes: Default::default(),
-            infra_refs: ["weft-infra-bridge:abc", "weft-infra-credential:keep1"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        };
-        let stale = host_images_matching(listing, |r, t| {
-            is_infra_node_repo(r) && !referenced.is_referenced(r, t)
-        });
-        assert_eq!(stale, vec!["weft-infra-bridge:0ld".to_string()]);
-    }
-
-    /// Repo selection for the infra sweep: every `weft-infra-<name>` is
-    /// in EXCEPT the supervisor (a system-service repo whose stale tags
-    /// `gc_stale_system_images` owns; two sweeps owning one repo would
-    /// race each other).
-    #[test]
-    fn infra_repo_selection_excludes_the_supervisor() {
-        assert!(is_infra_node_repo("weft-infra-bridge"));
-        assert!(is_infra_node_repo("weft-infra-mini_service"));
-        assert!(!is_infra_node_repo("weft-infra-supervisor"));
-        assert!(!is_infra_node_repo("weft-worker"));
-        assert!(!is_infra_node_repo("postgres"));
-    }
-
-    /// The node sweep over several repos at once condemns exactly the
-    /// all-tags-unreferenced groups of the repos of interest (any
-    /// registry spelling), keeps a group that mixes a referenced and an
-    /// unreferenced tag of the same image whole, skips digest-only
-    /// groups (no parseable `repo:tag`, so never condemned), and never
-    /// touches the supervisor or foreign repos.
-    #[test]
-    fn node_sweep_condemns_only_unreferenced_groups() {
-        let groups = vec![
-            vec!["weft-infra-bridge:0ld".to_string()],
-            vec![
-                "docker.io/library/weft-infra-bridge:new".to_string(),
-                "weft-infra-bridge:new".to_string(),
-            ],
-            // Same image, one referenced + one unreferenced tag:
-            // survives whole.
-            vec![
-                "weft-infra-bridge:new".to_string(),
-                "weft-infra-bridge:0ld".to_string(),
-            ],
-            vec!["ghcr.io/weavemindai/weft-infra-credential:dead".to_string()],
-            vec!["weft-infra-supervisor:0ld".to_string()],
-            vec!["weft-worker:0ld".to_string()],
-            vec!["registry.example.com:5000/weft-images/weft-worker:live".to_string()],
-            // The system images (listener & co) must NEVER be
-            // node-pruned (a blanket prune once stranded on-demand
-            // listener pods in ImagePullBackOff), alone or sharing an
-            // image with a stale worker tag.
-            vec!["docker.io/library/weft-listener:local".to_string()],
-            vec![
-                "docker.io/library/weft-worker:stale2".to_string(),
-                "docker.io/library/weft-listener:local".to_string(),
-            ],
-            vec!["postgres:16".to_string()],
-            // Digest-only: no repo:tag spelling ever matches.
-            vec!["weft-infra-bridge@sha256:0011".to_string()],
-        ];
-        let referenced = ReferencedImages {
-            worker_hashes: ["live".to_string()].into_iter().collect(),
-            infra_refs: ["weft-infra-bridge:new".to_string()].into_iter().collect(),
-        };
-        let stale = node_images_matching(&groups, |r, t| {
-            (r == weft_compiler::build::WORKER_IMAGE_REPO || is_infra_node_repo(r))
-                && !referenced.is_referenced(r, t)
-        });
-        assert_eq!(
-            stale,
-            vec![
-                "weft-infra-bridge:0ld".to_string(),
-                "ghcr.io/weavemindai/weft-infra-credential:dead".to_string(),
-                "weft-worker:0ld".to_string(),
-            ]
-        );
-    }
-
-    /// Each system image's hash closure covers its own binary and what that
-    /// binary links, and nothing else. Two properties matter. A crate none of
-    /// them link (weft-e2e, weft-cli) must gate no image, or every CLI edit
-    /// rebuilds and re-rolls four pods for nothing. And a service's own crate
-    /// must gate only its own image, so a dispatcher change does not roll the
-    /// listener, the broker and the supervisor with it.
-    #[test]
-    fn each_system_image_hashes_its_own_binary_and_its_links() {
-        let root = weft_compiler::build::resolve_weft_root().expect("resolve weft root");
-        let closure_of = |seed: &str| {
-            weft_compiler::codegen::workspace_crate_closure(&root, &[seed.to_string()])
-                .expect("compute system closure")
-        };
-
-        let dispatcher = closure_of("weft-dispatcher");
-        for absent in ["weft-e2e", "weft-cli"] {
-            assert!(
-                !dispatcher.contains(&absent.to_string()),
-                "{absent} must not gate an image; closure: {dispatcher:?}"
-            );
-        }
-        // The shared brain every service pulls, so a change there does move
-        // all four.
-        for present in ["weft-dispatcher", "weft-compiler", "weft-core"] {
-            assert!(
-                dispatcher.contains(&present.to_string()),
-                "{present} missing from the dispatcher closure; closure: {dispatcher:?}"
-            );
-        }
-
-        for other in ["weft-listener", "weft-broker", "weft-infra-supervisor"] {
-            let closure = closure_of(other);
-            assert!(closure.contains(&other.to_string()), "{other} misses itself");
-            assert!(
-                !closure.contains(&"weft-dispatcher".to_string()),
-                "a dispatcher-only change must not roll {other}; closure: {closure:?}"
-            );
-        }
     }
 }

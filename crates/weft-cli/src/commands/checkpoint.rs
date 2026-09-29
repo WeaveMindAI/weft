@@ -12,7 +12,7 @@ pub async fn run(ctx: Ctx, label: Option<String>, root: bool) -> anyhow::Result<
     // dispatcher, so tell it the project exists. Source only, no image.
     super::ensure::ensure_project_known(&ctx).await?;
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let id = project.id().to_string();
     let manifest = super::versions::snapshot(&client, project).await?;
     // SYNC: body <-> crates/weft-dispatcher/src/api/versions.rs CheckpointRequest

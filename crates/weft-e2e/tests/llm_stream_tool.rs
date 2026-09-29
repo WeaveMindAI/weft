@@ -38,7 +38,7 @@ async fn llm_stream_and_tool_loop_close_in_the_graph() -> anyhow::Result<()> {
     .await?;
 
     let mut project = Project::prepare("llm_stream_tool", disp).await?;
-    set_account(&project, "prov", "connection", conn.handle())?;
+    set_account(&project, "prov", conn.handle()).await?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

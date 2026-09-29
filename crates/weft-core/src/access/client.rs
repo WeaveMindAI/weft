@@ -430,7 +430,7 @@ pub fn apply_plain_step(
             // A stored base decides where this connection's credential
             // travels, so plain http may carry it only inside a private
             // network (loopback, RFC-1918, link-local, unique-local: a
-            // local or in-cluster S3-compatible store, a LAN service);
+            // local or internal S3-compatible store, a LAN service);
             // any host reachable from the public internet must be https.
             let private = match base.host() {
                 Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
@@ -937,7 +937,7 @@ mod tests {
     /// A stored base carries the credential's destination, so a plain
     /// http base is refused for any publicly reachable host; a
     /// private-network host (loopback, RFC-1918: a local MinIO, an
-    /// in-cluster SeaweedFS) is where cleartext never crosses the
+    /// internal SeaweedFS) is where cleartext never crosses the
     /// public internet.
     #[test]
     fn a_base_url_must_be_https_unless_private() {
@@ -961,8 +961,8 @@ mod tests {
             "http://127.0.0.1:9000/bucket/key.txt"
         );
         assert_eq!(
-            apply_base("http://172.18.0.1:9096").unwrap(),
-            "http://172.18.0.1:9096/bucket/key.txt"
+            apply_base("http://172.18.0.1:14115").unwrap(),
+            "http://172.18.0.1:14115/bucket/key.txt"
         );
         assert_eq!(
             apply_base("http://192.168.1.20:9000").unwrap(),

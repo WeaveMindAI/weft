@@ -63,7 +63,7 @@ Four layers; pick the right one and call it by its name.
 - **Layer 1: pure-function unit tests.** Values in, values out, no I/O. Fast, next to the function. This is where 80% of the test count lives.
 - **Layer 2: wire-shape tests.** Round-trip every cross-process type through its serialization format, next to the type. Catches "renamed a field, broke the contract".
 - **Layer 3: contract tests with fakes.** A subsystem's real code against hand-rolled in-memory fakes of its I/O, in the subsystem's test directory. Catches orchestration bugs the pure functions can't. This is the layer most projects skip.
-- **Layer 4: end-to-end integration tests.** Real binaries, real network, real backing services. Run after every fix and feature once the lower layers are green, only the files the change reaches, as `MEMORY.md` lays out ("Every fix and feature ends with setup.sh and the e2e that cover it"); never on every save.
+- **Layer 4: end-to-end integration tests.** Real binaries, real network, real backing services. Run after every fix and feature once the lower layers are green, only the files the change reaches, as `MEMORY.md` lays out ("Every fix and feature ends with setup.sh and the e2e that cover it"); never on every save. A test must finish in under 5 minutes: the runner stops it at 5 and reports it `SLOW` (`crates/weft-e2e/README.md`, "Five minutes, at most").
 
 Rules when adding code:
 1. **No I/O inside subsystem code.** HTTP clients, clocks, subprocesses, DB drivers, file I/O, env vars go through a trait with a production impl and a fake impl.

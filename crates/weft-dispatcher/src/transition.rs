@@ -7,29 +7,29 @@
 //! or the project row's build `transition = building/cancelling_build`
 //! (`project_store`). While something sits in one, every conflicting
 //! verb is REJECTED instantly; the only offered action is the matching
-//! cancel. This module supplies what the DRIVING pod needs around that:
+//! cancel. This module supplies what the DRIVING process needs around that:
 //!
 //! - `TransitionHeartbeat` / `ActivationHeartbeat`: drop-guarded
 //!   background tasks bumping the row's heartbeat so the stuck-transition
 //!   reaper (`reaper::sweep_stuck_transitions`) can tell a live transition
-//!   (driver bumping) from an orphaned one (driver pod died).
-//! - `ProjectBuildGate` + `ensure_built_gated`: the `building`
-//!   transition around a verb's build. The gate engages
-//!   ONLY when the builder actually submits a build (a cache-hit verb
-//!   never flips the marker, so concurrent runs on a fresh project
-//!   never serialize), and relays the user's cancel request
+//!   (driver bumping) from an orphaned one (driver process died).
+//! - `ProjectBuildGate` + `build_version_gated`: the `building`
+//!   transition around a version's build. The gate engages ONLY when
+//!   an image actually has to be built (a build whose images all exist
+//!   never flips the marker, so concurrent builds of an unchanged
+//!   project never serialize), and relays the user's cancel request
 //!   (`transition = cancelling_build`) into the builder's await loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::http::StatusCode;
 
-use crate::backend::BuildGate;
+use crate::build::BuildGate;
 use crate::events::DispatcherEvent;
 use crate::project_store::{ProjectStore, ProjectTransition};
 use crate::state::DispatcherState;
 
-/// How often a driving pod bumps the transition heartbeat, at this
+/// How often a driving process bumps the transition heartbeat, at this
 /// install's pace (`weft_core::time_scale`): 10 seconds in real time.
 pub fn heartbeat_interval() -> std::time::Duration {
     weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
@@ -84,7 +84,7 @@ impl Drop for TransitionHeartbeat {
 }
 
 /// The same drop-guarded heartbeat for an activation in flight: bumps the
-/// heartbeat of every activation row the setup color `activation` claimed.
+/// heartbeat of every activation row the setup execution `activation` claimed.
 pub struct ActivationHeartbeat {
     handle: tokio::task::JoinHandle<()>,
 }
@@ -268,39 +268,34 @@ impl BuildGate for ProjectBuildGate {
     }
 }
 
-/// THE single build entry for every verb (run / activate / infra sync
-/// all route through it, via `coherent_definition` or directly). A
-/// no-op when there is no builder. Serializes real builds per project
-/// through the `building` transition; a verb that loses the
-/// single-flight is rejected with a 409 naming the in-flight state, and
-/// a user cancel surfaces as 409 "build cancelled" rather than a 500.
-pub(crate) async fn ensure_built_gated(
+/// Build one version of a project through the `building` transition:
+/// the gate engages only when an image actually has to be built
+/// (single-flight per project, heartbeat, cancellable through
+/// `/cancel-build`). A build that loses the single-flight is a 409
+/// naming the in-flight state; a user cancel is a 409 "build cancelled"
+/// rather than a 500.
+pub(crate) async fn build_version_gated(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<(), (StatusCode, String)> {
-    let Some(builder) = state.ensure_built.clone() else {
-        return Ok(());
-    };
+    tenant: &crate::tenant::TenantId,
+    request: &crate::build::VersionBuildRequest,
+    hold: &crate::build::prune::ImageHold,
+) -> Result<crate::build::BuiltProgram, (StatusCode, String)> {
     let gate = ProjectBuildGate::new(state.clone(), id);
-    let result = builder.ensure_built(id, &gate).await;
+    let storage = crate::storage::BrokerStorage(state);
+    let result = state.builder.build(&storage, id, tenant.as_str(), request, &gate, hold).await;
     gate.finish().await;
     match result {
-        Ok(()) => Ok(()),
-        Err(e) if gate.saw_cancel() => Err((
-            StatusCode::CONFLICT,
-            format!("build cancelled by user: {e}"),
-        )),
+        Ok(built) => Ok(built),
+        Err(e) if gate.saw_cancel() => Err((StatusCode::CONFLICT, format!("build cancelled by user: {e}"))),
         // A lost single-flight (gate.begin refused) is a state
         // conflict, not a server fault.
         Err(e) if !gate.engaged() && format!("{e}").starts_with("cannot build now") => {
             Err((StatusCode::CONFLICT, format!("{e}")))
         }
-        // `{e:#}` (alternate) prints the FULL chain so the underlying compile
-        // diagnostics (`line:col message`) reach the client + action bar, not
-        // just the outermost context.
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("build project for verb: {e:#}"),
-        )),
+        // `{e:#}` (alternate) prints the FULL chain so the compile
+        // diagnostics (`line:col message`) reach the client, not just
+        // the outermost context.
+        Err(e) => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}"))),
     }
 }

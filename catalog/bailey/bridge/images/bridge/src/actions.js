@@ -374,7 +374,7 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
     }
 
     // Every outcome leaves one line, the refusals included: a
-    // `result.error` answer fails the node that asked, and the pod
+    // `result.error` answer fails the node that asked, and the container
     // log is where that failure is read back from.
     try {
       const result = await handler(payload || {});

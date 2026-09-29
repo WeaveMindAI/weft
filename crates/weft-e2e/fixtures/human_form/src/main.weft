@@ -12,7 +12,7 @@
 #
 # __E2E_FAKE_URL__ is substituted by the test with the fake SSE feed's URL.
 
-start = TestSseTrigger {
+start = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
   event_name: "go"
 }

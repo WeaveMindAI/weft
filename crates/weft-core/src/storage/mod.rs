@@ -8,7 +8,7 @@
 //! (`{"__weft_<image|video|audio|blob>__": {key, mimeType, sizeBytes,
 //! filename}}`, NO url). Bytes never ride the journal/pulse/task
 //! path; they flow worker<->box or client<->box directly. The key is
-//! the full tenant-local storage path (`exec/<color>/<id>`,
+//! the full tenant-local storage path (`exec/<execution_id>/<id>`,
 //! `project/<project_id>/<id>`, `shared/<name>/<id>`), so a key
 //! alone names both the file and the scope wall that guards it.
 
@@ -238,11 +238,11 @@ pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::By
 
 /// Which key-prefix wall a storage handle operates inside. One box
 /// per tenant; the scope picks the prefix, the caller's verified
-/// identity picks the values inside it (its own color / project).
+/// identity picks the values inside it (its own execution / project).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageScope {
-    /// `exec/<color>/`: walled to a single run, swept on terminate
+    /// `exec/<execution_id>/`: walled to a single run, swept on terminate
     /// unless kept. The default.
     #[default]
     Execution,
@@ -722,7 +722,7 @@ pub struct KeepRequest {
 
 /// `POST /v1/storage/presign`: mint a temporary link to a stored file, scoped
 /// to the one key with a short TTL: the internet-reachable link when the
-/// install serves one, else one signed for the cluster's own address.
+/// install serves one, else one signed for the install's own address.
 /// `POST /v1/storage/public-link` takes the same shape plus `reach`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignRequest {
@@ -901,18 +901,18 @@ pub struct ListPrefixRequest {
     pub prefix: String,
 }
 
-/// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one color's un-kept
+/// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one execution's un-kept
 /// exec files (crashed uploads reaped; completed files stamped to expire
 /// after the post-run linger).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepExecRequest {
     pub tenant: String,
-    pub color: String,
+    pub execution_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepExecResponse {
-    /// Rows removed outright (crashed/abandoned uploads under the color).
+    /// Rows removed outright (crashed/abandoned uploads under the execution).
     pub swept: u64,
     /// Completed un-kept files stamped with the post-run linger expiry
     /// (deleted by the expiry sweep once it passes).
@@ -1279,7 +1279,7 @@ mod tests {
     #[test]
     fn stored_file_value_round_trip() {
         let m = StoredFile {
-            key: "exec/0188-color/9f3a".into(),
+            key: "exec/0188-execution_id/9f3a".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 4_200_000,
             filename: "clip.ogg".into(),
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"__weft_audio__": {
-                "key": "exec/0188-color/9f3a",
+                "key": "exec/0188-execution_id/9f3a",
                 "mimeType": "audio/ogg",
                 "sizeBytes": 4_200_000u64,
                 "filename": "clip.ogg",
@@ -1474,8 +1474,8 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(WipePrefixResponse { wiped: 2 }).unwrap(), json!({"wiped": 2}));
         assert_eq!(
-            serde_json::to_value(SweepExecRequest { tenant: "t1".into(), color: "c1".into() }).unwrap(),
-            json!({"tenant": "t1", "color": "c1"})
+            serde_json::to_value(SweepExecRequest { tenant: "t1".into(), execution_id: "c1".into() }).unwrap(),
+            json!({"tenant": "t1", "execution_id": "c1"})
         );
         assert_eq!(
             serde_json::to_value(SweepExecResponse { swept: 1, lingering: 2 }).unwrap(),

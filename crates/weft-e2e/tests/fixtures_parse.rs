@@ -1,5 +1,5 @@
 //! Every fixture's catalog parses AND its graph compiles, checked
-//! without a cluster.
+//! without an install.
 //!
 //! A fixture's `metadata.json` is only read once the rig has built and
 //! deployed, so a typo in it (a widget kind that does not exist, a field
@@ -8,7 +8,7 @@
 //! That is expensive and it reads like a bug in the feature rather than
 //! a bug in the fixture.
 //!
-//! This runs in an ordinary `cargo test`: no cluster, no docker, no
+//! This runs in an ordinary `cargo test`: no install, no docker, no
 //! feature flag. It is deliberately NOT behind `e2e`, because its whole
 //! value is catching the mistake before the slow suite runs.
 
@@ -53,7 +53,7 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// The catalog check above catches a bad `metadata.json`; this catches
 /// a bad `.weft`, which is the other half and the one an author writing
 /// a fixture gets wrong more often. A mistake here used to surface
-/// minutes into a cluster run as a failure of whatever feature the
+/// minutes into an install run as a failure of whatever feature the
 /// fixture was written to prove, which reads like a bug in the feature
 /// rather than a typo in its fixture.
 ///
@@ -62,7 +62,7 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// chat id, a bucket), so "this required input has no driver" is the
 /// fixture working as intended, not a mistake. The structural tier is
 /// exactly the one that does not depend on the rig having run, which is
-/// what makes this test honest without a cluster.
+/// what makes this test honest without an install.
 /// The fixtures that are INCOMPLETE on disk on purpose: their test
 /// writes the missing value in before running (a chat id read from the
 /// environment, a file the rig uploads first), so the graph only stands
@@ -101,7 +101,7 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         // may sit beside the file that includes it) plus the stdlib. The
         // rig copies the stdlib into each project at deploy time; here
         // every root is read where it already is, so this stays a plain
-        // cargo test with no copying and no cluster.
+        // cargo test with no copying and no install.
         let mut roots = weft_compiler::project::node_roots(fixture).to_vec();
         roots.push(stdlib.clone());
         let catalog = match weft_catalog::FsCatalog::discover_roots_with_policy(

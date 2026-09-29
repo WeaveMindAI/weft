@@ -92,11 +92,10 @@ for a member's calls:
 
 | In the source | Whose key a member's run uses |
 |---|---|
-| your connection (`account: {"id": "..."}`) | yours, for every member |
+| nothing (your pick on the install) | yours, for every member |
 | `account: @member_filled` | the member's own; a member who connected none is refused, naming the field |
-| `account: @member_filled({"id": "..."})` | the member's own if they connected one, yours if they did not |
 
-Only the source can put your key in a member's run. A member can never pick
+Only you can put your key in a member's run, by leaving the field unmarked and picking your connection on the install. A member can never pick
 your connection, or the runtime's shared key, for themselves: connecting with
 the shared key through the member door is refused, and a value saved for a
 member's connection field has to be a connection that member owns in this

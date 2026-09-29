@@ -46,9 +46,9 @@ fn task(dedup: &str) -> tasks::NewTask {
         target: TaskTarget::Dispatcher,
         project_id: None,
         dedup_key: Some(dedup.to_string()),
-        color: None,
+        execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_pod_name: None,
+        target_instance: None,
         binary_hash: None,
         payload: json!({}),
     }

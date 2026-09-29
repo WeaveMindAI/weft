@@ -14,27 +14,48 @@ use weft_assets::{AssetSource, AssetStore};
 
 use crate::client::DispatcherClient;
 
-/// Collect, sync, and resolve the definition's `@asset` refs, in place.
-/// Even an empty reference set is published, so removing the last uploaded
-/// file starts its expiry countdown. A text-typed `@asset` from a URL or a stored
-/// key is fetched here, at build, and cast to its declared type (the same
-/// cast a project-file `@file` gets at parse).
-///
-/// Hands back the publish's warnings (a version whose stored file is
-/// gone), for the caller to show; empty without `publish`.
-pub async fn resolve_project_assets(
+/// What the author's machine resolves of a definition's `@asset` refs
+/// before a build: every file ref's stored-file value (the files synced to
+/// the project's asset plane first), every stored-key ref's, and every text
+/// ref's fetched-and-cast value, by resolution key. The build sends the map
+/// with the version; the install re-reads each stored file it names.
+pub struct AssetResolutions {
+    pub map: BTreeMap<String, serde_json::Value>,
+    /// Stored-key refs whose SOURCE file a future build still needs, even
+    /// when this build inlined its content (a text-typed stored asset).
+    source_refs: Vec<weft_core::project::FileRef>,
+}
+
+/// Resolve the definition's `@asset` refs to the map a build sends
+/// (see [`AssetResolutions`]). With `publish`, a referenced file the asset
+/// plane lacks is uploaded; without, it is an error naming `weft bake`.
+pub async fn asset_resolutions(
     client: &DispatcherClient,
     project_root: &std::path::Path,
-    definition: &mut weft_core::project::ProjectDefinition,
-    sources: Option<&weft_core::project::hash::Manifest>,
+    definition: &weft_core::project::ProjectDefinition,
     publish: bool,
-) -> Result<Vec<String>> {
+) -> Result<AssetResolutions> {
     let project_id = definition.id.to_string();
-    let (key_refs, text_refs) = resolve_assets(client, project_root, &project_id, definition, publish).await?;
-    if !publish { return Ok(Vec::new()); }
-    // Publish only after every reference resolved successfully. This includes
-    // uploaded files selected by stored key, not just this build's disk refs.
-    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter().filter(|r| weft_compiler::file_ref::is_runtime_key_ref(r))))?;
+    let (map, key_refs, text_refs) = resolve_asset_map(client, project_root, &project_id, definition, publish).await?;
+    let source_refs = key_refs
+        .into_iter()
+        .chain(text_refs.into_iter().filter(weft_compiler::file_ref::is_runtime_key_ref))
+        .collect();
+    Ok(AssetResolutions { map, source_refs })
+}
+
+/// Tell the store which assets the project's current source references,
+/// so a file no source uses any more starts expiring. `definition` is the
+/// RESOLVED program (its stored-file values name what it uses); `sources`
+/// adds the version's own blobs. Answers the store's warnings (a version
+/// whose stored file is gone), for the caller to show.
+pub async fn publish_references(
+    client: &DispatcherClient,
+    definition: &weft_core::project::ProjectDefinition,
+    resolutions: &AssetResolutions,
+    sources: Option<&weft_core::project::hash::Manifest>,
+) -> Result<Vec<String>> {
+    let mut references = asset_references(definition, resolutions.source_refs.iter())?;
     if let Some(sources) = sources {
         let scope = weft_core::storage::key::KeyScope::Asset { project_id: definition.id.to_string() };
         for hash in sources.values().filter(|hash| !hash.is_empty()) {
@@ -55,7 +76,7 @@ pub async fn resolve_project_assets(
 
 /// Resolve the `@file` and `@asset` markers in a run's handed values
 /// (`--emit`, `--from`, `--group`, `--fire`, or a saved example) exactly
-/// as the build resolves the same markers written in source: a `@file`
+/// as a build resolves the same markers written in source: a `@file`
 /// read from the project and cast to its type, an `@asset` uploaded into
 /// the project's asset storage (or fetched, or looked up) and replaced by
 /// the value its declared type stands for. An uploaded file is not added
@@ -70,21 +91,23 @@ pub async fn resolve_run_values(
     let fs = weft_compiler::CompileFs::disk(project_root);
     weft_compiler::file_ref::resolve_file_markers(spec, &fs)
         .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
-    resolve_assets(client, project_root, project_id, spec, true).await?;
+    let (map, _, _) = resolve_asset_map(client, project_root, project_id, &*spec, true).await?;
+    weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
+        .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     Ok(())
 }
 
 /// The asset step both callers share: sync the file-kind `@asset`s on
-/// disk, look up the stored-key ones, fetch and cast the text ones, and
-/// put every resolved value in place of its marker. Hands back the
-/// stored-key and text refs, which the build's publish names.
-async fn resolve_assets(
+/// disk, look up the stored-key ones, fetch and cast the text ones. Hands
+/// back every resolved value by resolution key, and the stored-key and
+/// text refs, which a build's publish names.
+async fn resolve_asset_map(
     client: &DispatcherClient,
     project_root: &std::path::Path,
     project_id: &str,
-    target: &mut impl weft_compiler::file_ref::MarkedValues,
+    target: &impl weft_compiler::file_ref::MarkedValues,
     publish: bool,
-) -> Result<(Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
+) -> Result<(BTreeMap<String, serde_json::Value>, Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
     let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
@@ -140,9 +163,27 @@ async fn resolve_assets(
             bail!("text assets could not be fetched:\n  {}", failed.join("\n  "));
         }
     }
-    weft_compiler::file_ref::apply_asset_resolutions(target, &map)
+    Ok((map, key_refs, text_refs))
+}
+
+/// Resolve the definition's `@asset` refs in place (for a caller that
+/// hashes or reads the resolved program itself: `weft status`'s drift,
+/// the editor's preview), and with `publish`, record the references.
+/// Hands back the publish's warnings; empty without `publish`.
+pub async fn resolve_project_assets(
+    client: &DispatcherClient,
+    project_root: &std::path::Path,
+    definition: &mut weft_core::project::ProjectDefinition,
+    publish: bool,
+) -> Result<Vec<String>> {
+    let resolutions = asset_resolutions(client, project_root, definition, publish).await?;
+    weft_compiler::file_ref::apply_asset_resolutions(definition, &resolutions.map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
-    Ok((key_refs, text_refs))
+    if !publish {
+        return Ok(Vec::new());
+    }
+    // Published only after every reference resolved.
+    publish_references(client, definition, &resolutions, None).await
 }
 
 fn asset_references<'a>(
@@ -614,7 +655,7 @@ mod tests {
                 }
             });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-            let client = DispatcherClient::new(base);
+            let client = DispatcherClient::new(base, None);
             let store = DispatcherStore::new(&client, "p".into());
             let result = store.transfer("hash", "text/plain", "test", 4, &mut &b"data"[..]).await;
             server.abort();

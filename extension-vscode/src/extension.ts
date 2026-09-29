@@ -27,6 +27,7 @@ import { registerStreamingEditApi } from './streamingEdits';
 import { canonicalPath, weftPositionToVsCode } from './locations';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import { ActionBarStore } from './actionBarState';
+import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTarget } from './installs';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
@@ -35,12 +36,19 @@ import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
 import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerChoiceIntent } from '../../packages/weft-graph/src/protocol';
+import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
+import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint } from './localInstall';
 import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
 import { emptyActionAvailability, parseRunning, parseStatusPayload } from '../../packages/weft-graph/src/status';
 import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
-  const dispatcher = new DispatcherClient(getDispatcherUrl());
+  const dispatcher = new DispatcherClient();
+  // Before any provider asks it anything. With no address (a named
+  // install never started) the extension still activates: requests fail
+  // with the reason, and the ports.json watcher below points it again
+  // once the install starts.
+  pointAtLocal(dispatcher);
 
   // One warm `weft parse-server` for the whole extension. Both the graph
   // view (live graph) and diagnostics (Problems panel) parse/validate
@@ -56,12 +64,14 @@ export function activate(context: vscode.ExtensionContext) {
   const projectsProvider = new ProjectsProvider();
   // Its file watcher dies with the extension rather than outliving it.
   context.subscriptions.push(projectsProvider);
-  const executionsProvider = new ExecutionsProvider(dispatcher);
+  const executionsProvider = new ExecutionsProvider(dispatcher, () =>
+    pinnedProject ? onArgs(installOf(pinnedProject.id)) : [],
+  );
 
   // Single source of truth for which project the UI is "looking at".
   // Sidebar and graph view both read/write through this so they stay
   // in sync. Which EXECUTION is on screen lives in AutoFollowController
-  // (autoFollow.currentColor()): every follow path updates it there,
+  // (autoFollow.currentExecutionId()): every follow path updates it there,
   // so nothing shadows it here.
   let pinnedProject: WeftProject | undefined;
 
@@ -111,32 +121,32 @@ export function activate(context: vscode.ExtensionContext) {
     follower,
     (msg) => {
       // Mirror autoFollow's followStatus into the action-bar
-      // store so the reducer can compute the watched-live color.
+      // store so the reducer can compute the watched-live execution.
       // Stop button shows iff the user is actually watching a
-      // running execution (pinned color among the running runs, or
+      // running execution (pinned execution among the running runs, or
       // latest mode + something running).
       if (msg.kind === 'followStatus' && pinnedProject) {
-        actionBar.setFollow(pinnedProject.id, msg.status.mode, msg.status.color);
+        actionBar.setFollow(pinnedProject.id, msg.status.mode, msg.status.executionId);
       }
       graphView.post(msg);
     },
     context.workspaceState,
     (ev) => {
       if (ev.kind === 'execution_started') {
-        actionBar.markExecutionStarted(ev.project_id, ev.color, ev.phase);
+        actionBar.markExecutionStarted(ev.project_id, ev.execution_id, ev.phase);
       } else if (
         ev.kind === 'execution_completed' ||
         ev.kind === 'execution_failed' ||
         ev.kind === 'execution_cancelled'
       ) {
-        actionBar.markExecutionFinished(ev.project_id, ev.color);
+        actionBar.markExecutionFinished(ev.project_id, ev.execution_id);
       } else if (ev.kind === 'execution_deleted') {
         // Another window (or the CLI) erased a run. If it is the one on
         // screen, stop showing it; a run that no longer exists cannot
         // be followed. The local delete already did this before its
         // request went out, so this is a no-op for it.
-        actionBar.markExecutionFinished(ev.project_id, ev.color);
-        if (autoFollow.currentColor() === ev.color) stopShowingRun();
+        actionBar.markExecutionFinished(ev.project_id, ev.execution_id);
+        if (autoFollow.currentExecutionId() === ev.execution_id) stopShowingRun();
       } else if (ev.kind === 'project_transition_changed') {
         // The event carries the transition; apply it directly so the
         // bar flips without waiting for the status round-trip.
@@ -220,6 +230,9 @@ export function activate(context: vscode.ExtensionContext) {
       saveRefreshTimer = setTimeout(() => {
         saveRefreshTimer = undefined;
         void refreshActionBarFromStatus();
+        // On another install, the files moving may make them that
+        // install's version or stop being it.
+        if (pinnedProject) void refreshDiskVersion(pinnedProject);
       }, 1_000);
     };
     driftWatcher = vscode.workspace.createFileSystemWatcher(
@@ -254,6 +267,18 @@ export function activate(context: vscode.ExtensionContext) {
   }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
   graphView.setTreeVerbHandler((args) => treeVerb(args));
+  graphView.setSwitchInstallHandler((name) => void switchInstall(name));
+  graphView.setInstallLeftHandler(() => {
+    if (!pinnedProject) return;
+    // The run on screen was the other install's: forget it before the
+    // client moves, so the reconnect's resync lands on a clean follow.
+    autoFollow.setProject(pinnedProject.id);
+    graphView.forgetExecVersion();
+    backToLocal(pinnedProject.id);
+    void refreshActionBarFromStatus();
+    void executionsProvider.refresh();
+    postInstallView();
+  });
   graphView.setCliStatusHandler(() => refreshActionBarFromStatus());
   graphView.setStopActionHandler(() => stopAction());
   graphView.setDismissErrorHandler(() => {
@@ -272,7 +297,14 @@ export function activate(context: vscode.ExtensionContext) {
     // Drop the cached snapshot from whatever was previously
     // pinned. The fresh status fetch below repopulates it.
     lastStatusSnapshot = undefined;
+    // Another project is looked at on the local install until its own
+    // switch says otherwise: the targets are each project's own.
+    if (install.projectId !== project.id) {
+      backToLocal(project.id);
+      graphView.leaveInstall();
+    }
     pinnedProject = project;
+    void loadInstallTargets(project);
     watchPinnedProjectForDrift();
     executionsProvider.setPinnedProject(project);
     projectStream.setProject(project.id);
@@ -283,6 +315,142 @@ export function activate(context: vscode.ExtensionContext) {
     // background); listeners only see the pinned project's view.
     actionBar.setPinnedProject(project.id);
     void graphView.refreshActionAvailability();
+  }
+
+  /// The install the graph shows the pinned project on (`installs.ts`):
+  /// the local one, or a target of the project, with the version of the
+  /// program that target holds and the version the files on disk are.
+  /// `root` is where that program was downloaded (null on the local
+  /// install, whose program is the project's own files).
+  let install: {
+    projectId: string;
+    name: string;
+    version: string | null;
+    diskVersion: string | null;
+    root: string | null;
+  } = {
+    projectId: '',
+    name: LOCAL_INSTALL,
+    version: null,
+    diskVersion: null,
+    root: null,
+  };
+  let installTargets: InstallTarget[] = [];
+  let installSwitching: string | null = null;
+  let installError: string | null = null;
+
+  /// Look at `projectId` on the local install again, with no graph change
+  /// of its own (the caller's is under way, or there is no graph).
+  function backToLocal(projectId: string): void {
+    install = { projectId, name: LOCAL_INSTALL, version: null, diskVersion: null, root: null };
+    installError = null;
+    pointAtLocal(dispatcher);
+  }
+
+  /// The install `projectId` is looked at on: every read and verb for it
+  /// goes there.
+  function installOf(projectId: string): string {
+    return install.projectId === projectId ? install.name : LOCAL_INSTALL;
+  }
+
+  function postInstallView(): void {
+    graphView.setInstallView({
+      installs: installTargets.map((t) => ({ name: t.name, loggedIn: t.name === LOCAL_INSTALL || t.loggedIn })),
+      active: pinnedProject ? installOf(pinnedProject.id) : LOCAL_INSTALL,
+      version: install.version,
+      diskVersion: install.diskVersion,
+      switching: installSwitching,
+      error: installError,
+    });
+  }
+
+  /// Read the pinned project's targets for the switch. A project with no
+  /// target but the local one gets no switch at all.
+  async function loadInstallTargets(project: WeftProject): Promise<void> {
+    let targets: InstallTarget[];
+    try {
+      targets = await listTargets(project.rootPath);
+    } catch (err) {
+      getWeftOutputChannel().append(`weft target list: ${err instanceof Error ? err.message : String(err)}\n`);
+      targets = [];
+    }
+    if (pinnedProject?.id !== project.id) return;
+    installTargets = targets.some((t) => t.name !== LOCAL_INSTALL) ? targets : [];
+    postInstallView();
+  }
+
+  /// Show the pinned project on `name`. Another install than the local
+  /// one shows the program it holds (downloaded into the extension's
+  /// storage), read-only except its connections, and from then on every
+  /// read, stream and verb of the project goes there.
+  async function switchInstall(name: string): Promise<void> {
+    const project = pinnedProject;
+    if (!project || installSwitching || name === installOf(project.id)) return;
+    // A verb still running is bound to the install it started on: its
+    // run would be followed against the other one.
+    if (verbsInFlight.has(project.id)) {
+      installError = `an action is still running on ${installOf(project.id)}; switch once it finishes`;
+      postInstallView();
+      return;
+    }
+    installSwitching = name;
+    installError = null;
+    postInstallView();
+    // The pin can move during any await below; the switch then belongs
+    // to a project no longer shown and stops without touching anything.
+    const stillPinned = () => pinnedProject?.id === project.id;
+    try {
+      if (name === LOCAL_INSTALL) {
+        const doc = await vscode.workspace.openTextDocument(project.entryPath);
+        if (!stillPinned()) return;
+        // The run on screen was the other install's: forget it before
+        // the client moves, so the reconnect's resync lands on a clean
+        // follow.
+        autoFollow.setProject(project.id);
+        graphView.forgetExecVersion();
+        backToLocal(project.id);
+        await graphView.showInstall(doc, project.id, undefined);
+      } else {
+        const access = await installAccess(project.rootPath, name);
+        if (!stillPinned()) return;
+        if (!access.operatorKey) {
+          throw new Error(`you hold no key for ${name}; run \`weft login ${name}\` in the project, then switch again`);
+        }
+        const running = await fetchRunningSource(project.rootPath, project.id, name, context.globalStorageUri.fsPath);
+        if (!stillPinned()) return;
+        const entry = nodePath.join(running.dir, nodePath.relative(project.rootPath, project.entryPath));
+        const doc = await vscode.workspace.openTextDocument(entry);
+        if (!stillPinned()) return;
+        autoFollow.setProject(project.id);
+        graphView.forgetExecVersion();
+        dispatcher.setInstall(access.url, access.operatorKey);
+        install = { projectId: project.id, name, version: running.version, diskVersion: null, root: running.dir };
+        await graphView.showInstall(doc, project.id, { name, root: running.dir });
+        void refreshDiskVersion(project);
+      }
+      void refreshActionBarFromStatus();
+      void executionsProvider.refresh();
+    } catch (err) {
+      installError = err instanceof Error ? err.message : String(err);
+    } finally {
+      installSwitching = null;
+      postInstallView();
+    }
+  }
+
+  /// Which version the files on disk are, beside the one the install
+  /// holds, so the graph can say when they differ.
+  async function refreshDiskVersion(project: WeftProject): Promise<void> {
+    const name = installOf(project.id);
+    if (name === LOCAL_INSTALL) return;
+    try {
+      const tree = await runWeftJson<{ disk_version?: string | null }>([...onArgs(name), 'tree', '--json'], project.rootPath);
+      if (installOf(project.id) !== name) return;
+      install = { ...install, diskVersion: tree.disk_version ?? null };
+      postInstallView();
+    } catch (err) {
+      getWeftOutputChannel().append(`weft tree: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
   }
 
   /// The registered project whose ENTRY file is `doc`, if any. Canonical on
@@ -307,6 +475,12 @@ export function activate(context: vscode.ExtensionContext) {
   /// graph beside it, the same layout opening the file by hand gives.
   async function showProject(project: WeftProject): Promise<void> {
     if (pinnedProject?.id !== project.id) await pinProject(project);
+    // On another install the graph is that install's program, and the
+    // files on disk are not it: bring the graph forward as it is.
+    if (installOf(project.id) !== LOCAL_INSTALL) {
+      graphView.reveal();
+      return;
+    }
     const doc = await vscode.workspace.openTextDocument(project.entryPath);
     await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.One });
     await graphView.open(doc, project.id, vscode.ViewColumn.Beside);
@@ -377,6 +551,8 @@ export function activate(context: vscode.ExtensionContext) {
   ): Promise<TriggerChoiceIntent | undefined> {
     const projectId = project.id;
     const projectRoot = project.rootPath;
+    // The install the graph showed at the click, bound like the project.
+    const on = onArgs(installOf(projectId));
     const verbTag = verbTagFor(verb, args);
     const gated = PREFLIGHT_VERBS.has(verb);
     // The click registered: show the pre-CLI window (save flush + the
@@ -471,7 +647,7 @@ export function activate(context: vscode.ExtensionContext) {
     // down: that is a question for the picker, never an error banner.
     let needsTriggerChoice = false;
     try {
-      await runWeftCliJson(projectId, [verb, ...args], projectRoot, (ev) => {
+      await runWeftCliJson(projectId, [...on, verb, ...args], projectRoot, (ev) => {
         if (isTriggerChoiceRefusal(ev)) {
           needsTriggerChoice = true;
           return;
@@ -483,7 +659,7 @@ export function activate(context: vscode.ExtensionContext) {
         // previous verb apart from the running one's.
         actionBar.cliEvent(projectId, ev.verb === undefined ? { ...ev, verb: verbTag } : ev);
         // A run's dispatcher reply carries the fresh execution's
-        // color: follow it from HERE, the run's own reply channel,
+        // execution: follow it from HERE, the run's own reply channel,
         // never from the project SSE alone. On a brand-new project
         // registration lands milliseconds before the execution
         // starts (the image builds first), so a subscriber that can
@@ -492,11 +668,11 @@ export function activate(context: vscode.ExtensionContext) {
         if (
           verb === 'run' &&
           ev.phase === 'dispatcher_call_done' &&
-          typeof ev.detail?.color === 'string' &&
+          typeof ev.detail?.execution_id === 'string' &&
           ev.detail?.project_id === projectId &&
           pinnedProject?.id === projectId
         ) {
-          autoFollow.followStartedByUser(ev.detail.color);
+          autoFollow.followStartedByUser(ev.detail.execution_id);
         }
       }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
@@ -619,8 +795,8 @@ export function activate(context: vscode.ExtensionContext) {
   ///     spawned CLI process group. cargo / docker / kind
   ///     grandchildren die with it.
   ///   - A live execution exists on the project the user is
-  ///     watching (watched-live color). POST cancel for that
-  ///     color. The dispatcher tears down the worker, journals
+  ///     watching (watched-live executionId). POST cancel for that
+  ///     execution. The dispatcher tears down the worker, journals
   ///     ExecutionFailed { error: "cancelled" }, broadcasts on SSE.
   ///
   /// Both can be true simultaneously: `weft run` spawns a worker
@@ -648,22 +824,22 @@ export function activate(context: vscode.ExtensionContext) {
         actedOn = true;
       }
     }
-    const liveColor = actionBar.watchedRunningColor(projectId);
-    if (liveColor) {
+    const liveExecutionId = actionBar.watchedRunningExecutionId(projectId);
+    if (liveExecutionId) {
       // HTTP cancel: lock the bar into "Cancelling..." until SSE
       // confirms. The dispatcher enqueues a cancel_execution task;
-      // the worker fires its per-color Notify; the loop driver
+      // the worker fires its per-execution Notify; the loop driver
       // exits Failed { error: "cancelled" }; the journal bridge
       // publishes ExecutionFailed to SSE; the store's
       // markExecutionFinished clears pendingAction.
-      actionBar.setPending(projectId, 'run', 'Cancelling...', liveColor);
-      channel.appendLine(`> cancel execution ${liveColor}`);
-      dispatcher.post(`/executions/${liveColor}/cancel`, {}).catch((err) => {
+      actionBar.setPending(projectId, 'run', 'Cancelling...', liveExecutionId);
+      channel.appendLine(`> cancel execution ${liveExecutionId}`);
+      dispatcher.post(`/executions/${liveExecutionId}/cancel`, {}).catch((err) => {
         channel.appendLine(`! cancel failed: ${err}`);
         if (err instanceof HttpError && err.status === 409) {
           // The run had already ended (its terminal event never
           // reached us): it is finished, and the bar says so.
-          actionBar.markExecutionFinished(projectId, liveColor);
+          actionBar.markExecutionFinished(projectId, liveExecutionId);
           return;
         }
         // Network failure: revert the pending state so the user
@@ -740,7 +916,7 @@ export function activate(context: vscode.ExtensionContext) {
   ): Promise<StatusResult | undefined> {
     let out: string;
     try {
-      out = await runWeftCliCapture(['--json', 'status'], projectRoot);
+      out = await runWeftCliCapture(['--json', ...onArgs(installOf(projectId)), 'status'], projectRoot);
     } catch (err) {
       // Two different failures used to read as one here, and the one
       // that got swallowed is the one the person can act on.
@@ -831,7 +1007,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// Refresh the action bar's view of backend ground truth for a
   /// specific project. One `weft status --json` call yields both
   /// the snapshot (drift + available_actions + infra rollup) and
-  /// the active execution color, so the bar can enter
+  /// the active execution, so the bar can enter
   /// execution_running on graph open / project pin without waiting
   /// for an SSE event.
   ///
@@ -1140,12 +1316,12 @@ export function activate(context: vscode.ExtensionContext) {
     // the pin changes, and puts the entry file and its graph in front
     // either way, so a closed or buried panel comes back.
     await showProject(match);
-    autoFollow.lockTo(summary.color);
+    autoFollow.lockTo(summary.execution_id);
     // A run opened from the version tree tells the graph which version
     // it ran and which one the disk is, so it can say when they differ.
     if (version !== undefined) {
       const tree = executionsProvider.currentTree();
-      graphView.setExecVersion(summary.color, version, tree?.disk_version ?? null);
+      graphView.setExecVersion(summary.execution_id, version, tree?.disk_version ?? null);
     }
   }
 
@@ -1158,7 +1334,10 @@ export function activate(context: vscode.ExtensionContext) {
       return undefined;
     }
     try {
-      const out = await runWeftJson<unknown>([...args, '--json'], pinnedProject.rootPath);
+      const out = await runWeftJson<unknown>(
+        [...onArgs(installOf(pinnedProject.id)), ...args, '--json'],
+        pinnedProject.rootPath,
+      );
       await executionsProvider.refresh();
       return out;
     } catch (err) {
@@ -1167,9 +1346,9 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  /// The version or run a tree item names (a version by id, a run by color).
+  /// The version or run a tree item names (a version by id, a run by executionId).
   function treeReference(n: VersionNode | RunNode): string {
-    return n instanceof VersionNode ? n.node.version.id : n.run.color;
+    return n instanceof VersionNode ? n.node.version.id : n.run.execution_id;
   }
 
   async function branchHere(n: VersionNode | RunNode): Promise<void> {
@@ -1204,10 +1383,10 @@ export function activate(context: vscode.ExtensionContext) {
       void vscode.window.showInformationMessage('Weft: head has no run to diff against.');
       return;
     }
-    const out = await treeVerb(['diff', n.run.color, head, '--full']);
+    const out = await treeVerb(['diff', n.run.execution_id, head, '--full']);
     if (!out) return;
     const channel = getWeftOutputChannel();
-    channel.appendLine(`weft diff ${n.run.color.slice(0, 8)} ${head.slice(0, 8)}`);
+    channel.appendLine(`weft diff ${n.run.execution_id.slice(0, 8)} ${head.slice(0, 8)}`);
     channel.appendLine(JSON.stringify(out, null, 2));
     channel.show(true);
   }
@@ -1215,8 +1394,8 @@ export function activate(context: vscode.ExtensionContext) {
   async function freezeRun(n: RunNode): Promise<void> {
     const name = await vscode.window.showInputBox({ prompt: 'Example name (writes examples/<name>.json from this run)' });
     if (!name) return;
-    const out = await treeVerb(['freeze', name, n.run.color]);
-    if (out) void vscode.window.showInformationMessage(`Weft: froze examples/${name}.json from ${n.run.color.slice(0, 8)}.`);
+    const out = await treeVerb(['freeze', name, n.run.execution_id]);
+    if (out) void vscode.window.showInformationMessage(`Weft: froze examples/${name}.json from ${n.run.execution_id.slice(0, 8)}.`);
   }
 
   /** Returns true when the row is gone. False = the delete was
@@ -1231,25 +1410,25 @@ export function activate(context: vscode.ExtensionContext) {
       // loudly instead. (A stale 'running' label on a run that has
       // ended answers 409: nothing to cancel, so the delete goes on.)
       try {
-        await dispatcher.post(`/executions/${summary.color}/cancel`, {});
+        await dispatcher.post(`/executions/${summary.execution_id}/cancel`, {});
       } catch (err) {
         if (!(err instanceof HttpError && err.status === 409)) {
           void vscode.window.showErrorMessage(
-            `Could not cancel ${summary.color}, so it was not deleted (it is still running): ${err}`,
+            `Could not cancel ${summary.execution_id}, so it was not deleted (it is still running): ${err}`,
           );
           return false;
         }
       }
     }
     // If the graph is streaming exactly this execution, drop the
-    // follow through the controller (which owns the followed color)
+    // follow through the controller (which owns the followed executionId)
     // so its state and the webview's pill stay consistent.
-    if (autoFollow.currentColor() === summary.color) {
+    if (autoFollow.currentExecutionId() === summary.execution_id) {
       stopShowingRun();
     }
     let deleted = true;
     try {
-      await dispatcher.del(`/executions/${summary.color}`);
+      await dispatcher.del(`/executions/${summary.execution_id}`);
     } catch (err) {
       void vscode.window.showErrorMessage(`Delete failed: ${err}`);
       deleted = false;
@@ -1339,6 +1518,9 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     await pinIfEntry(editor.document);
+    // Asking for the graph of a file on disk is asking for the local
+    // install's.
+    if (pinnedProject && installOf(pinnedProject.id) !== LOCAL_INSTALL) await switchInstall(LOCAL_INSTALL);
     await graphView.open(editor.document, entryProjectOf(editor.document)?.id, column);
   }
 
@@ -1370,7 +1552,14 @@ export function activate(context: vscode.ExtensionContext) {
         void vscode.window.showErrorMessage('Weft: pin a project before opening a diagnostic location.');
         return;
       }
-      const rel = nodePath.relative(canonicalPath(pinnedProject.rootPath), target);
+      // On another install the graph shows the downloaded copy, and its
+      // diagnostics name the copy's files.
+      const root = installOf(pinnedProject.id) === LOCAL_INSTALL ? pinnedProject.rootPath : install.root;
+      if (!root) {
+        void vscode.window.showErrorMessage(`Weft: the program ${install.name} runs has no downloaded copy.`);
+        return;
+      }
+      const rel = nodePath.relative(canonicalPath(root), target);
       if (rel.startsWith('..') || nodePath.isAbsolute(rel)) {
         void vscode.window.showErrorMessage(`Weft: ${rawTarget} is outside the pinned project.`);
         return;
@@ -1438,14 +1627,31 @@ export function activate(context: vscode.ExtensionContext) {
 
   attachDiagnostics(context, parseServer);
 
+  // Only the local install's address is a setting or a saved port; a
+  // target's is its project's.
+  const followLocalAddress = () => {
+    if (pinnedProject && installOf(pinnedProject.id) !== LOCAL_INSTALL) return;
+    pointAtLocal(dispatcher);
+  };
+
   context.subscriptions.push(
     registerStreamingEditApi(),
     follower,
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('weft.dispatcherUrl')) {
-        dispatcher.setBaseUrl(getDispatcherUrl());
-      }
+      // Only the local install's address is a setting; a target's is
+      // its project's.
+      if (e.affectsConfiguration('weft.dispatcherUrl')) followLocalAddress();
     }),
+    // A `weft daemon start` on another port while VS Code is open moves
+    // the local install; follow it without a reload.
+    (() => {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(installDir()), 'ports.json'),
+      );
+      watcher.onDidCreate(followLocalAddress);
+      watcher.onDidChange(followLocalAddress);
+      return watcher;
+    })(),
   );
 
   // Kick off first refreshes in the background.
@@ -1455,8 +1661,53 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-function getDispatcherUrl(): string {
-  return (
-    vscode.workspace.getConfiguration('weft').get<string>('dispatcherUrl') ?? 'http://localhost:9999'
+let retiredSettingNoticed = false;
+// The last "no local address" reason shown, so the same one is shown once.
+let lastUnavailableShown: string | undefined;
+
+// Point `dispatcher` at the local install: the setting when somebody set
+// it, else the port the install saved. The setting has no default in
+// package.json so that an unset one reads as undefined here. With no
+// address, the client is left unavailable with the reason and the
+// person is told, never pointed somewhere else.
+function pointAtLocal(dispatcher: DispatcherClient): void {
+  const setting = vscode.workspace.getConfiguration('weft').get<string>('dispatcherUrl');
+  const address = localAddress(setting);
+  if (address.ignoredSetting && !retiredSettingNoticed) {
+    retiredSettingNoticed = true;
+    void noticeRetiredSetting();
+  }
+  if ('error' in address) {
+    const reason = `weft: ${address.error}`;
+    dispatcher.setUnavailable(reason);
+    // Said once per reason: switching back to local again with the same
+    // missing address must not pop the same error each time.
+    if (reason !== lastUnavailableShown) {
+      lastUnavailableShown = reason;
+      void vscode.window.showErrorMessage(reason);
+    }
+    return;
+  }
+  lastUnavailableShown = undefined;
+  dispatcher.setInstall(address.url, undefined, unreachableHint(setting));
+}
+
+// The setting holds the old default, which no install answers on: it is
+// passed over, and the person may remove it (never rewritten behind them).
+async function noticeRetiredSetting(): Promise<void> {
+  const remove = 'Remove the setting';
+  const pick = await vscode.window.showWarningMessage(
+    `weft: the \`weft.dispatcherUrl\` setting holds ${RETIRED_DEFAULT_URL}, the old default, which no install answers on. It is ignored; the local install's address now comes from its ports.json.`,
+    remove,
   );
+  if (pick !== remove) return;
+  const config = vscode.workspace.getConfiguration('weft');
+  const found = config.inspect<string>('dispatcherUrl');
+  const scopes: Array<[string | undefined, vscode.ConfigurationTarget]> = [
+    [found?.globalValue, vscode.ConfigurationTarget.Global],
+    [found?.workspaceValue, vscode.ConfigurationTarget.Workspace],
+  ];
+  for (const [value, target] of scopes) {
+    if (value === RETIRED_DEFAULT_URL) await config.update('dispatcherUrl', undefined, target);
+  }
 }

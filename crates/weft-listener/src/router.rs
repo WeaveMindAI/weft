@@ -1,9 +1,13 @@
-//! HTTP router for the listener. Every endpoint is network-trusted:
-//! only Pods in the dispatcher's namespace can reach the listener
-//! port (NetworkPolicy enforces this), so there is no bearer auth.
+//! HTTP router for the listener. Internal: the process that serves it
+//! checks every caller's platform identity before a request reaches
+//! here, and only weft's own roles (the dispatcher, the platform's alarm)
+//! call it.
 //!
-//!   POST /register     add a signal to the registry
-//!   POST /unregister   remove a signal
+//!   POST /prepare      compute a new signal's row (routing, kind
+//!                      state, consumer payload); starts nothing
+//!   POST /start        bring up a signal whose row was just committed
+//!                      (its first wake, its held connection)
+//!   POST /unregister   drop a held connection and its outside state
 //!   POST /process      run kind-specific logic for one fire,
 //!                      return a `ProcessOutcome` (value + target)
 //!                      for the dispatcher to journal on
@@ -12,14 +16,15 @@
 //!   POST /wake_by_hand what one signal wakes with when a person
 //!                      wakes it instead of waiting, or nothing when
 //!                      its kind cannot be woken that way
-//!   POST /render       render the consumer-facing payload for one
-//!                      token. Pure over the spec; called once at
-//!                      register time and the result cached on the
-//!                      signal row.
-//!   GET  /signals      debug: list registry entries
+//!   POST /live         what one signal shows
+//!   POST /rehydrate    reconcile with the durable signal table
+//!   POST /wake         the alarm calling back for a `Wakes` signal
+//!   GET  /signals      debug: list the connections this process holds
 //!   GET  /health       liveness probe
-
-use std::sync::Arc;
+//!
+//! Every endpoint that names a signal reads it through `registry::held`:
+//! from its durable row, or from this process's registry for a kind that
+//! holds a connection.
 
 use axum::{
     extract::State,
@@ -27,54 +32,52 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::kinds;
-use weft_core::signal::listener_protocol::{
-    LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome,
-    ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest, WakeByHandRequest,
-    WakeByHandResponse,
-};
 use crate::ListenerState;
+use weft_core::signal::listener_protocol::{
+    LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome, ProcessRequest,
+    PrepareRequest, PrepareResponse, StartRequest, UnregisterRequest, WakeByHandRequest, WakeByHandResponse,
+};
 
 pub fn router(state: ListenerState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/load", get(load))
-        .route("/register", post(register))
+        .route("/prepare", post(prepare))
+        .route("/start", post(start))
         .route("/unregister", post(unregister))
         .route("/process", post(process))
         .route("/match_push", post(match_push))
         .route("/wake_by_hand", post(wake_by_hand))
-        .route("/render", post(render))
         .route("/live", post(live))
         .route("/signals", get(list_signals))
         .route("/rehydrate", post(rehydrate_handler))
+        // SYNC: the wake route <-> kinds::WAKE_PATH
+        .route(kinds::WAKE_PATH, post(wake))
         .with_state(state)
 }
 
-/// Reconcile the in-memory registry with the durable signal table.
-/// Idempotent: existing entries are left alone, missing ones are
-/// inserted. Called by the dispatcher's activate flow after
-/// TriggerSetup completes, so resume signals (which TriggerSetup
-/// can't replay) come back from the DB before the gate flips to
-/// Active.
+fn internal(e: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+/// Reconcile one project's signals with the durable signal table.
+/// Idempotent. Called by the dispatcher's activate flow once the
+/// activation's rows are written, so what those signals need between
+/// fires (a wake, a held connection) exists before the gate flips to
+/// Active. Rows named in `skip` (the ones the activation is about to
+/// delete) are never brought up. Every other row that can come up does;
+/// any that could not fail the call, named with their reasons (and are
+/// retried meanwhile, see `registry::hold`).
 async fn rehydrate_handler(
     State(state): State<ListenerState>,
+    Json(req): Json<weft_core::signal::listener_protocol::RehydrateRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let broker_url = Arc::new(state.config.broker_url.clone());
-    crate::registry::rehydrate(
-        state.tasks.clone(),
-        broker_url,
-        state.token_source.clone(),
-        &state.config.pod_name,
-        state.registry.clone(),
-        state.config.clone(),
-        state.events_broker.clone(),
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let failed = crate::registry::rehydrate(&state, Some(req.project), &req.skip).await.map_err(internal)?;
+    if !failed.is_empty() {
+        return Err(internal(anyhow::anyhow!("{} signal(s) could not come up: {}", failed.len(), failed.join("; "))));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -82,70 +85,65 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// Load surface for the dispatcher's placement. Returns the pod's
-/// current load + its own saturation call.
-async fn load(State(state): State<ListenerState>) -> Json<weft_core::signal::listener_protocol::LoadReport> {
-    Json(state.load_report())
-}
-
-async fn register(
+async fn prepare(
     State(state): State<ListenerState>,
-    Json(req): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
-    // Admission gate: a saturated pod refuses new signals so a
-    // placement race (the dispatcher chose this pod from a stale load
-    // read) fails loudly with 503 instead of overloading it. The
-    // dispatcher retries placement onto another pod / spawns one.
-    if state.load_report().saturated {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "listener saturated; place on another pod".into(),
-        ));
-    }
-    let (routing, kind_state) = kinds::register_in_registry(
+    Json(req): Json<PrepareRequest>,
+) -> Result<Json<PrepareResponse>, (StatusCode, String)> {
+    let weft_core::signal::listener_protocol::PrepareSource { prior_kind_state, asked_at_unix_ms } = req.source;
+    let prepared = kinds::prepare_signal(
+        &state,
         kinds::SignalIdentity {
             token: req.token,
             tenant_id: req.tenant_id,
-            for_member: req.for_member,
             node_id: req.node_id,
             is_resume: req.is_resume,
-            color: req.color,
-            placement_generation: req.placement_generation,
+            execution_id: req.execution_id,
             spec: req.spec,
         },
-        match req.source {
-            weft_core::signal::listener_protocol::RegisterSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
-                kinds::RoutingSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms }
-            }
-            weft_core::signal::listener_protocol::RegisterSource::Restore { routing, kind_state, seq } => {
-                kinds::RoutingSource::Restore { routing, kind_state, seq }
-            }
-        },
-        state.registry.clone(),
-        state.fire_sink.clone(),
-        state.config.clone(),
-        state.events_broker.clone(),
+        prior_kind_state.as_ref(),
+        asked_at_unix_ms,
     )
-    .await
-    // `{e:#}` keeps the whole cause chain: a register refusal's reason
-    // (a connection missing a required value, an unservable topic)
-    // must reach the user, not just the outermost context line.
+    // `{e:#}` keeps the whole cause chain: a refusal's reason must reach
+    // the user, not just the outermost context line.
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(RegisterResponse { routing, kind_state }))
+    Ok(Json(PrepareResponse {
+        routing: prepared.routing,
+        kind_state: prepared.kind_state,
+        rendered: prepared.rendered.unwrap_or(Value::Null),
+    }))
+}
+
+/// Bring up a signal the dispatcher just registered or put back (see
+/// `StartMode`). Its row is committed before this is called, so no row is
+/// a 404, and a kind refusing to come up (a connection missing a required
+/// value, an unservable topic) is a 400 carrying its reason; a put-back
+/// that refuses is also marked down and retried here.
+async fn start(
+    State(state): State<ListenerState>,
+    Json(req): Json<StartRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let row = state
+        .signals
+        .get_held(&req.token)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, format!("no signal is held under token {}", req.token)))?;
+    crate::registry::hold(&state, row, req.mode).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn live(
     State(state): State<ListenerState>,
     Json(req): Json<LiveRequest>,
 ) -> Result<Json<LiveResponse>, (StatusCode, String)> {
-    let sig = state
-        .registry
-        .get(&req.token)
+    let sig = crate::registry::held(&state, &req.token)
+        .await
+        .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)))?;
-    let live = kinds::compute_live(&kinds::LiveCtx {
-        sig: &sig,
-        address: req.address.as_deref(),
-    });
+    let mut live = kinds::compute_live(&kinds::LiveCtx { sig: &sig, address: req.address.as_deref() });
+    if let Some(reason) = state.registry.down_reason(&req.token) {
+        live.items.insert(0, weft_core::live::LiveItem::text("State", format!("down, retrying: {reason}")));
+    }
     kinds::read_only_display(&sig.spec.kind, &live).map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
     Ok(Json(LiveResponse { live }))
 }
@@ -154,16 +152,9 @@ async fn unregister(
     State(state): State<ListenerState>,
     Json(req): Json<UnregisterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let removed = state.registry.remove(&req.token);
-    // A signal may hold state OUTSIDE this process (a provider-side
-    // subscription); its kind tears that down, detached (the
-    // unregister answer must not wait on a provider round trip) and
-    // loud in logs on failure.
-    if let Some(sig) = removed {
-        let broker = state.events_broker.clone();
-        let token = req.token.clone();
-        tokio::spawn(async move { kinds::on_unregister(&token, &sig, &broker).await });
-    }
+    // Detached teardown: the unregister answer must not wait on a
+    // provider round trip.
+    kinds::forget(&state, &req.token);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -171,9 +162,7 @@ async fn process(
     State(state): State<ListenerState>,
     Json(req): Json<ProcessRequest>,
 ) -> Result<Json<ProcessOutcome>, (StatusCode, String)> {
-    let outcome = kinds::process(&req.token, req.payload, state.registry.clone())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let outcome = kinds::process(&state, &req.token, req.payload).await.map_err(internal)?;
     Ok(Json(outcome))
 }
 
@@ -186,9 +175,9 @@ async fn process(
 async fn match_push(
     State(state): State<ListenerState>,
     Json(req): Json<MatchPushRequest>,
-) -> Json<MatchPushResponse> {
-    let matched = kinds::match_push(&req.push, &req.tokens, state.registry.clone());
-    Json(MatchPushResponse { matched })
+) -> Result<Json<MatchPushResponse>, (StatusCode, String)> {
+    let matched = kinds::match_push(&state, &req.push, &req.tokens).await.map_err(internal)?;
+    Ok(Json(MatchPushResponse { matched }))
 }
 
 /// What a signal wakes with when a person wakes it by hand.
@@ -200,54 +189,30 @@ async fn wake_by_hand(
     State(state): State<ListenerState>,
     Json(req): Json<WakeByHandRequest>,
 ) -> Result<Json<WakeByHandResponse>, (StatusCode, String)> {
-    let payload = kinds::wake_by_hand(&req.token, state.registry.clone())
+    let payload = kinds::wake_by_hand(&state, &req.token)
+        .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     Ok(Json(WakeByHandResponse { payload }))
 }
 
-async fn list_signals(
+/// A `Wakes` signal's wake, delivered by the platform's alarm. A failure
+/// answers 500, which every alarm takes as "try again"; the kind's claim
+/// keeps a retried wake from acting twice. The moment it was aimed at
+/// rides in the body (`WakeBody::due_at_ms`), not the delivery time.
+async fn wake(
     State(state): State<ListenerState>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+    Json(req): Json<weft_platform_traits::WakeCall<kinds::WakeBody>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    kinds::wake(&state, req.body).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_signals(State(state): State<ListenerState>) -> Json<Value> {
     let rows: Vec<Value> = state
         .registry
         .list()
         .into_iter()
-        .map(|(token, sig)| {
-            serde_json::json!({
-                "token": token,
-                "node_id": sig.node_id,
-                "kind": &sig.spec.kind,
-            })
-        })
+        .map(|(token, sig)| serde_json::json!({ "token": token, "node_id": sig.node_id, "kind": &sig.spec.kind }))
         .collect();
-    Ok(Json(Value::Array(rows)))
+    Json(Value::Array(rows))
 }
-
-#[derive(Debug, Deserialize)]
-struct RenderRequest {
-    token: String,
-}
-
-/// Render the consumer payload for one signal. Pure function over
-/// the registered spec; the dispatcher caches the result on the
-/// signal row at register time. Park-mode projects can therefore
-/// serve consumer enumeration with the listener pod reaped.
-async fn render(
-    State(state): State<ListenerState>,
-    Json(req): Json<RenderRequest>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    // Two different failures, two different statuses. "This pod does not
-    // hold that token" is a 404 and means the caller should re-resolve
-    // the holder. "The spec is malformed" is a 400 and means the
-    // registration is wrong. They used to share the 404, so a form whose
-    // schema would not serialize was reported to the user as
-    // `/render returned 404 Not Found`, which reads as "no such signal":
-    // the one diagnosis that sends somebody looking in the wrong place.
-    if state.registry.get(&req.token).is_none() {
-        return Err((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)));
-    }
-    let rendered = kinds::render(&req.token, state.registry.clone())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(rendered.unwrap_or(Value::Null)))
-}
-

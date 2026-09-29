@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{color_of, fire_until_execution, graph_trigger_hold, spawn_weft, tree_of, HOLD};
+use common::{execution_id_of, fire_until_execution, graph_trigger_hold, spawn_weft, tree_of, HOLD};
 use serde_json::Value;
 use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
@@ -37,7 +37,7 @@ async fn an_unparseable_example_file_is_never_overwritten() -> anyhow::Result<()
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?;
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?;
 
     // A spec with one character wrong: valid-looking, not valid JSON.
     let hand_written = "{ \"name\": \"chain\", \"target\": [\"out\"],, }";
@@ -71,9 +71,9 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let color = color_of(&stdout)?;
-    SettledRun::observe(project.dispatcher(), color).await?.completed()?;
-    project.weft(&["freeze", "chain", &color.to_string()]).await?;
+    let execution_id = execution_id_of(&stdout)?;
+    SettledRun::observe(project.dispatcher(), execution_id).await?.completed()?;
+    project.weft(&["freeze", "chain", &execution_id.to_string()]).await?;
     let accepted = project.read_file("examples/chain.json")?;
 
     // Now make the run itself fail: `src` is text, and a Cast to Number
@@ -82,13 +82,13 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
     project.set_main(&main.replace("mid = Cast -> (value: String)", "mid = Cast -> (value: Number)"))?;
 
     let stdout = project.weft(&["run", "chain", "--json"]).await?;
-    let failed_color = color_of(&stdout)?;
-    SettledRun::observe(project.dispatcher(), failed_color).await?
+    let failed_execution_id = execution_id_of(&stdout)?;
+    SettledRun::observe(project.dispatcher(), failed_execution_id).await?
         .failed_with("cannot cast")?;
     let tree = tree_of(&project).await?;
     let failed = tree["head"]["head_run"].as_str().expect("failed run recorded");
-    anyhow::ensure!(failed == failed_color.to_string(), "the failed execution must be the recorded head run");
-    let row = tree["runs"].as_array().unwrap().iter().find(|row| row["color"] == failed).unwrap();
+    anyhow::ensure!(failed == failed_execution_id.to_string(), "the failed execution must be the recorded head run");
+    let row = tree["runs"].as_array().unwrap().iter().find(|row| row["execution_id"] == failed).unwrap();
     anyhow::ensure!(row["status"] == "failed", "execution failure is retained: {row}");
     let diff: Value = serde_json::from_str(project.weft(&["diff", failed, "example:chain", "--json"]).await?.trim())?;
     anyhow::ensure!(!diff["differing"].as_array().unwrap().is_empty(), "failure outputs remain reviewable: {diff}");
@@ -282,9 +282,9 @@ async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<
     project.set_main(&graph_trigger_hold(&feed.url(), "go", &gate.url()))?;
     project.activate().await?;
     let pid = project.id();
-    let before = run::execution_colors(&disp, &pid).await?;
-    let color = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
-    run::wait_for_status(&disp, color, "running").await?;
+    let before = run::executions(&disp, &pid).await?;
+    let execution_id = fire_until_execution(&feed, &disp, &pid, "go", &before).await?;
+    run::wait_for_status(&disp, execution_id, "running").await?;
 
     // Deactivate with a Wait drain: it holds open while the run holds.
     let deact = spawn_weft(
@@ -313,7 +313,7 @@ async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<
     // The claim it just made has to be true: it used to answer success
     // having matched no rows at all, and the drain would then hang until
     // its timeout.
-    let settled = SettledRun::observe(&disp, color).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     anyhow::ensure!(
         settled.status == "cancelled",
         "cancel-running answered success, so the run must actually be cancelled; got {}",

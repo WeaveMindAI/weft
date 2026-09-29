@@ -37,8 +37,8 @@ infra for imagebot (a1b2…):
 | Status | What it means |
 |---|---|
 | `provisioning` | Coming up |
-| `running` | At least one pod is ready |
-| `stopped` | Scaled to nothing, disk kept |
+| `running` | Every unit is ready |
+| `stopped` | Nothing running, disks kept |
 | `flaky` | It was healthy and has dropped below its readiness threshold |
 | `failed` | The last apply failed. The message says at which stage |
 
@@ -188,7 +188,7 @@ That is a bug in the shape of your graph rather than something to wait out.
 
 ### Stopping one
 
-`weft stop <color>` cancels it. If a worker is up, it stops within about fifty
+`weft stop <execution-id>` cancels it. If a worker is up, it stops within about fifty
 milliseconds. If the run was parked, the cancellation is written down and the
 listener forgets its signals, so a late answer finds nothing.
 

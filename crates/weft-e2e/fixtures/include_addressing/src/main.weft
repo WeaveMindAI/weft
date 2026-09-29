@@ -5,7 +5,7 @@
 #   src -> gate (an @include) -> out   the file parks on a timer
 #   gate.key                           an access node, nothing runs it
 #
-# `weft wake <color> gate.hold` resolves the timer, `weft connect --node
+# `weft wake <execution-id> gate.hold` resolves the timer, `weft connect --node
 # gate.key` picks its connection, and `@src:lib:gate.hold` is refused.
 
 src = Text { value: "hello" }

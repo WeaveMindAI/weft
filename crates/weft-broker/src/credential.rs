@@ -16,12 +16,12 @@ use anyhow::Result;
 
 /// Who is asking for the runtime's credential, and for which service.
 /// Everything a policy needs to decide: the tenant, the project, the
-/// exact node, and the VERIFIED pod identity of the caller.
+/// exact node, and the VERIFIED process identity of the caller.
 #[derive(Debug, Clone)]
 pub struct KeyRequest {
     pub tenant: String,
     /// The opening execution, verified against the tenant by the handler.
-    pub color: String,
+    pub execution_id: String,
     pub project_id: uuid::Uuid,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate: a source that books
@@ -35,10 +35,10 @@ pub struct KeyRequest {
     /// follow-up calls applies them to sign those calls in, since a
     /// meter never touches a credential itself.
     pub auth: Vec<weft_core::access::spec::AuthStep>,
-    /// The calling pod, taken from the caller's verified token (not from the
+    /// The calling process, taken from the caller's verified token (not from the
     /// request body). A policy that resolves the running binary uses this;
-    /// `None` means the token was not pod-bound.
-    pub pod_name: Option<String>,
+    /// `None` means the token was not process-bound.
+    pub instance: Option<String>,
     /// How long the caller declared its provider work may take. A source
     /// that hands out time-bounded credentials bounds them by this (the
     /// crash backstop; the runtime normally releases first).

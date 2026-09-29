@@ -59,7 +59,7 @@ export interface FormSchema {
 export interface PendingTask {
   /// Per-signal token. Identifies the signal end-to-end:
   /// fire = `POST /signal/{token}`, cancel = `DELETE /signal/{token}`.
-  /// Replaces the v1 `executionId` field (the dispatcher's `color`
+  /// Replaces the v1 `executionId` field (the dispatcher's `execution_id`
   /// is no longer surfaced to consumers; signal token alone is
   /// sufficient routing).
   token: string;
@@ -486,11 +486,11 @@ export async function cancelRun(task: PendingTask): Promise<void> {
 }
 
 /// Clear all visible tasks for one api_token. Cancels every
-/// distinct execution this token sees (one cancel per color, not
+/// distinct execution this token sees (one cancel per execution, not
 /// per task). Same scope rule as cancelRun: token must be
 /// ≥ project-scoped.
 export async function clearAll(token: ApiToken): Promise<{
-  colorsCancelled: number;
+  executionsCancelled: number;
   entrySignalsDropped: number;
 }> {
   const url = `${token.dispatcherUrl}/signal-token/signals`;
@@ -503,11 +503,11 @@ export async function clearAll(token: ApiToken): Promise<{
     throw new Error(`HTTP ${resp.status}: ${text}`);
   }
   const body = (await resp.json()) as {
-    colors_cancelled?: number;
+    execution_ids_cancelled?: number;
     entry_signals_dropped?: number;
   };
   return {
-    colorsCancelled: body.colors_cancelled ?? 0,
+    executionsCancelled: body.execution_ids_cancelled ?? 0,
     entrySignalsDropped: body.entry_signals_dropped ?? 0,
   };
 }

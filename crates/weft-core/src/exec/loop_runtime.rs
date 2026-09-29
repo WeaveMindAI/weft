@@ -1,6 +1,6 @@
 //! Per-execution `LoopInstance` runtime, and the pure loop machinery
 //! around it. The engine creates one `LoopInstance` for every
-//! `(loop_group_id, parent_frames, color)` triple; the journal fold
+//! `(loop_group_id, parent_frames, execution_id)` triple; the journal fold
 //! creates the same one from the loop's rows. Each instance tracks:
 //!
 //! - the launched iterations (`LoopIn` body emits per iteration);
@@ -50,7 +50,7 @@ use crate::generator::{StreamBuffer, StreamEnd};
 use crate::primitive::{LoopInstanceKey, LoopTerminationReason};
 use crate::project::{EdgeIndex, NodeDefinition, ProjectDefinition};
 use crate::pulse::PulseTable;
-use crate::Color;
+use crate::ExecutionId;
 
 /// One body-side write to a `LoopOut` inward-in port at a single
 /// iteration. The tag distinguishes "wrote a value (which MAY be JSON
@@ -341,12 +341,12 @@ impl LoopRuntime {
     }
 
     /// Retain a finished loop as history without launching any body work.
-    pub fn inherit(&mut self, instance: &LoopInstance, color: Color) -> Result<(), String> {
+    pub fn inherit(&mut self, instance: &LoopInstance, execution_id: ExecutionId) -> Result<(), String> {
         if instance.terminated.is_none() {
             return Err(format!("cannot inherit unfinished loop '{}'", instance.key.group_id));
         }
         let mut inherited = instance.clone();
-        inherited.key.color = color;
+        inherited.key.execution_id = execution_id;
         if self.instances.contains_key(&inherited.key) {
             return Err(format!("loop '{}' already has an instance at these frames", inherited.key.group_id));
         }
@@ -862,10 +862,10 @@ impl LoopRuntime {
     /// emit is the engine's responsibility (it emits closures, not a
     /// real outward emit, on cancellation), plus a `LoopTerminated`
     /// journal write so cancellation is durable across resume.
-    pub fn cancel_inside(&mut self, frames: &LoopFrames, color: Color) -> Vec<LoopInstanceKey> {
+    pub fn cancel_inside(&mut self, frames: &LoopFrames, execution_id: ExecutionId) -> Vec<LoopInstanceKey> {
         let mut cancelled = Vec::new();
         for inst in self.instances.values_mut() {
-            if inst.key.color != color {
+            if inst.key.execution_id != execution_id {
                 continue;
             }
             if inst.terminated.is_some() {
@@ -903,7 +903,7 @@ pub fn iteration_frames(parent_frames: &LoopFrames, index: u32) -> LoopFrames {
 /// (parent_frames + [iter]), so for LoopOut we pop the iteration
 /// frame.
 pub fn boundary_parent_frames(node_type: &str, frames: &LoopFrames) -> LoopFrames {
-    if node_type == "LoopOut" && !frames.is_empty() {
+    if node_type == crate::project::boundary_types::LOOP_OUT && !frames.is_empty() {
         frames[..frames.len() - 1].to_vec()
     } else {
         frames.clone()
@@ -912,7 +912,7 @@ pub fn boundary_parent_frames(node_type: &str, frames: &LoopFrames) -> LoopFrame
 
 /// The instance key a loop boundary firing belongs to, from the
 /// boundary node and the frames it fired at.
-pub fn instance_key(node_def: &NodeDefinition, frames: &LoopFrames, color: Color) -> Result<LoopInstanceKey, String> {
+pub fn instance_key(node_def: &NodeDefinition, frames: &LoopFrames, execution_id: ExecutionId) -> Result<LoopInstanceKey, String> {
     let group_id = node_def
         .group_boundary
         .as_ref()
@@ -922,7 +922,7 @@ pub fn instance_key(node_def: &NodeDefinition, frames: &LoopFrames, color: Color
     Ok(LoopInstanceKey {
         group_id,
         parent_frames: boundary_parent_frames(&node_def.node_type, frames),
-        color,
+        execution_id,
     })
 }
 
@@ -1066,9 +1066,9 @@ pub fn instantiate(
     project: &ProjectDefinition,
     received: &FiringInput,
     frames: &LoopFrames,
-    color: Color,
+    execution_id: ExecutionId,
 ) -> Result<LoopInFiring, String> {
-    let key = instance_key(node_def, frames, color)?;
+    let key = instance_key(node_def, frames, execution_id)?;
     let group_id = key.group_id.clone();
     let mut input = received.input.clone();
     // The loop's gate is consumed at the boundary, never broadcast into
@@ -1220,7 +1220,7 @@ pub fn launch_iteration(
     let emission_id = iteration_launch_emission(group_id, &key.parent_frames, index);
     let mut emissions = Vec::new();
     let mentioned = postprocess_output(
-        &loop_in_id, &output, emission_id, key.color, &body_frames, project, pulses, edge_idx,
+        &loop_in_id, &output, emission_id, key.execution_id, &body_frames, project, pulses, edge_idx,
         &mut emissions,
     )
     .map_err(|e| e.to_string())?;
@@ -1236,7 +1236,7 @@ pub fn launch_iteration(
     // as a FAILED closure closes inside with its error, first, so the
     // sweep leaves it alone: a failure reaches the body as a failure.
     crate::exec::postprocess::close_failed_then_unmentioned_downstream(
-        &loop_in_id, &inst.outer_closed_with_error, &mentioned, emission_id, key.color,
+        &loop_in_id, &inst.outer_closed_with_error, &mentioned, emission_id, key.execution_id,
         &body_frames, project, pulses, edge_idx, &mut emissions,
     )
     .map_err(|e| e.to_string())?;
@@ -1373,7 +1373,7 @@ pub fn emit_loop_outward(
         &loop_out_id,
         &output,
         loop_termination_emission(&key.group_id, &key.parent_frames),
-        key.color,
+        key.execution_id,
         &key.parent_frames,
         project,
         pulses,
@@ -1399,7 +1399,7 @@ pub fn close_loop_outward(
         edge_idx,
         pulses,
         loop_termination_emission(&key.group_id, &key.parent_frames),
-        key.color,
+        key.execution_id,
         &key.group_id,
         &key.parent_frames,
         loop_end_failure(reason),
@@ -1431,7 +1431,7 @@ mod tests {
         LoopInstanceKey {
             group_id: "outer".to_string(),
             parent_frames: Vec::new(),
-            color: Uuid::nil(),
+            execution_id: Uuid::nil(),
         }
     }
 
@@ -1624,12 +1624,12 @@ mod tests {
         let inst_0 = LoopInstanceKey {
             group_id: "inner".into(),
             parent_frames: vec![Frame::Loop { index: 0 }],
-            color: Uuid::nil(),
+            execution_id: Uuid::nil(),
         };
         let inst_1 = LoopInstanceKey {
             group_id: "inner".into(),
             parent_frames: vec![Frame::Loop { index: 1 }],
-            color: Uuid::nil(),
+            execution_id: Uuid::nil(),
         };
         rt.ensure(inst_0.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.ensure(inst_1.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
@@ -1655,12 +1655,12 @@ mod tests {
         let outer_key = LoopInstanceKey {
             group_id: "outer".into(),
             parent_frames: Vec::new(),
-            color: Uuid::nil(),
+            execution_id: Uuid::nil(),
         };
         let inner_key = LoopInstanceKey {
             group_id: "inner".into(),
             parent_frames: vec![Frame::Loop { index: 0 }],
-            color: Uuid::nil(),
+            execution_id: Uuid::nil(),
         };
         rt.ensure(outer_key.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.ensure(inner_key.clone(), cfg(false, &["y"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
@@ -2086,7 +2086,7 @@ mod tests {
     fn emit_and_close_loop_outward_reach_the_consumer_with_derived_ids() {
         let project = loop_project();
         let edge_idx = EdgeIndex::build(&project);
-        let k = LoopInstanceKey { group_id: "lp".into(), parent_frames: Vec::new(), color: Uuid::nil() };
+        let k = LoopInstanceKey { group_id: "lp".into(), parent_frames: Vec::new(), execution_id: Uuid::nil() };
         let mut pulses = PulseTable::default();
         let mut gather = HashMap::new();
         gather.insert("res".to_string(), vec![Some(Arc::new(serde_json::json!(1))), None]);

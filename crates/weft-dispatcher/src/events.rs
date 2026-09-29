@@ -1,18 +1,18 @@
 //! Pub/sub for project and execution events. Two layers:
 //!
-//!   - **Per-pod broadcast** (`EventBus`): SSE handlers subscribe;
+//!   - **Per-process broadcast** (`EventBus`): SSE handlers subscribe;
 //!     local publishers push directly. Tokio `broadcast::Sender` keyed
 //!     by `project_id`.
-//!   - **Cross-pod fanout via Postgres LISTEN/NOTIFY**: a publisher
+//!   - **Cross-process fanout via Postgres LISTEN/NOTIFY**: a publisher
 //!     calls `EventBus::publish`, which (a) pushes locally so this
-//!     pod's SSE consumers see it instantly and (b) issues `NOTIFY
+//!     process's SSE consumers see it instantly and (b) issues `NOTIFY
 //!     weft_dispatcher_events, '<json>'`. A long-lived LISTEN task on
-//!     every other pod receives, decodes, and pushes to its own local
+//!     every other process receives, decodes, and pushes to its own local
 //!     broadcast. Use `publish_local` when the caller knows the event
-//!     is pod-local (no cross-pod fanout needed).
+//!     is process-local (no cross-process fanout needed).
 //!
 //! The split is deliberate: ExecEvent flows through `journal_bridge`
-//! which polls `exec_event` independently on every pod (so each pod
+//! which polls `exec_event` independently on every process (so each process
 //! ends up publishing the same events to its local broadcast). The
 //! NOTIFY channel only carries the smaller cross-cutting events that
 //! don't sit on the journal path: ProjectRegistered, ProjectActivated,
@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, RwLock};
 
 use weft_core::frames::LoopFrames;
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 /// An event and its delivery identity. Journal projections derive identities
 /// from the stored row plus projection index, so replay and live delivery
@@ -58,7 +58,7 @@ impl<T> IdentifiedEvent<T> {
 
 pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
 
-/// LISTEN channel name. Single channel for all cross-pod events;
+/// LISTEN channel name. Single channel for all cross-process events;
 /// receivers route by `project_id` themselves.
 pub const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
 
@@ -80,7 +80,7 @@ pub enum DispatcherEvent {
     /// start` or an activation runs, which the editor shows as that verb
     /// working rather than as a run to stop.
     ExecutionStarted {
-        color: Color,
+        execution_id: ExecutionId,
         entry_node: String,
         phase: weft_core::context::Phase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,14 +94,14 @@ pub enum DispatcherEvent {
         member: Option<weft_core::member::MemberId>,
         at_unix: u64,
     },
-    ExecutionCompleted { color: Color, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },
-    ExecutionFailed { color: Color, project_id: uuid::Uuid, error: String, at_unix: u64 },
+    ExecutionCompleted { execution_id: ExecutionId, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },
+    ExecutionFailed { execution_id: ExecutionId, project_id: uuid::Uuid, error: String, at_unix: u64 },
     /// `cause` is the structured who-or-what behind the cancel (`reason`
     /// is its text). `None` only for a journal row written before the
     /// cause existed; skipped on the wire when absent so the TS peers'
     /// optional (`cause?`) types match reality instead of decoding null.
     ExecutionCancelled {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,14 +111,14 @@ pub enum DispatcherEvent {
     /// The run tagged itself (`ctx.tag_execution`); the inspector shows
     /// the tags on the run. `tags` is this call's list, not the run's
     /// cumulative set.
-    ExecutionTagged { color: Color, project_id: uuid::Uuid, tags: Vec<String>, at_unix: u64 },
+    ExecutionTagged { execution_id: ExecutionId, project_id: uuid::Uuid, tags: Vec<String>, at_unix: u64 },
     /// The run was erased (`weft clean`, a prune, the editor's delete):
     /// its journal, its storage and the wake signals it was parked on
     /// are gone. Rides NOTIFY rather than the journal, since the
     /// journal is what just went; every client drops the run from its
     /// lists and re-reads the project's verbs, because a run parked on
     /// a question counted as preserved state until now.
-    ExecutionDeleted { color: Color, project_id: uuid::Uuid },
+    ExecutionDeleted { execution_id: ExecutionId, project_id: uuid::Uuid },
     /// Every node event carries `inherited_from` when the firing was
     /// not this run's own but taken from the run it was seeded from
     /// (`weft run --seed`): the row is the seed's, painted here so the
@@ -126,7 +126,7 @@ pub enum DispatcherEvent {
     /// the wire for the run's own firings. `provided_ports` on a start
     /// names input ports receiving supplied values; absent when none.
     NodeStarted {
-        color: Color,
+        execution_id: ExecutionId,
         node: String,
         frames: LoopFrames,
         input: serde_json::Value,
@@ -137,29 +137,29 @@ pub enum DispatcherEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         backup_ports: Vec<String>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-        inherited_ports: std::collections::BTreeMap<String, Color>,
+        inherited_ports: std::collections::BTreeMap<String, ExecutionId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        inherited_from: Option<Color>,
+        inherited_from: Option<ExecutionId>,
         project_id: uuid::Uuid,
         at_unix: u64,
     },
-    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeSuspended { execution_id: ExecutionId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeResumed { execution_id: ExecutionId, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeCancelled { execution_id: ExecutionId, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeCompleted { execution_id: ExecutionId, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeFailed { execution_id: ExecutionId, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
     /// `reason` says WHY: the author's `_should_flow` said no, or an
     /// input the node needed never arrived. A decision and a consequence
     /// look identical on the graph without it.
     /// `None` only for a journal row written before the field existed
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
-    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeSkipped { execution_id: ExecutionId, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
     // SYNC: LoopInstantiated <-> extension-vscode/src/execFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
     LoopInstantiated {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -173,7 +173,7 @@ pub enum DispatcherEvent {
     /// An iteration of the loop launched. Inspector renders an
     /// iteration marker at body_frames.
     LoopIterationLaunched {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -186,7 +186,7 @@ pub enum DispatcherEvent {
     /// (a normal pulse) and the per-iteration body activity, not the
     /// LoopOut firing's raw write map.
     LoopOutFired {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -196,7 +196,7 @@ pub enum DispatcherEvent {
     },
     /// The loop terminated outward and emitted its outer outputs.
     LoopTerminated {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -207,10 +207,10 @@ pub enum DispatcherEvent {
     /// the exact firing (`node_id` + `frames`). `amount_usd` `None` = the
     /// meter could not resolve the figure (an honest unknown).
     CostReported {
-        color: Color,
+        execution_id: ExecutionId,
         // SYNC: inherited cost <-> extension-vscode/src/execFollower.ts DispatcherEvent cost_reported
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        inherited_from: Option<Color>,
+        inherited_from: Option<ExecutionId>,
         project_id: uuid::Uuid,
         node_id: String,
         frames: LoopFrames,
@@ -260,7 +260,7 @@ pub enum DispatcherEvent {
     /// to tiebreak same-second entries. `at_unix` is the journal's
     /// stamp so replay renders honest timestamps, not "now".
     BusJoined {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
@@ -270,7 +270,7 @@ pub enum DispatcherEvent {
     /// A bus participant dropped. Pairs with `BusJoined` for the same
     /// `(bus_id, name)`.
     BusLeft {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
@@ -285,7 +285,7 @@ pub enum DispatcherEvent {
     /// `messages` into its per-message log and renders a summary line
     /// for a window that carries only totals.
     BusWindow {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         bus_id: String,
         first_offset: u64,
@@ -297,7 +297,7 @@ pub enum DispatcherEvent {
     /// The bus was closed. Inspector renders an explicit
     /// `* the bus closed here` marker; replay cursors stop here.
     BusClosed {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
@@ -306,7 +306,7 @@ pub enum DispatcherEvent {
     /// A live caller attached to this execution. First event in the
     /// caller stream; the inspector opens a "caller" panel on the run.
     CallerConnected {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         offset: u64,
         protocol: String,
@@ -317,7 +317,7 @@ pub enum DispatcherEvent {
     /// whose content was not kept still appears carrying its size.
     // SYNC: CallerWindow <-> crates/weft-journal/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         first_offset: u64,
         last_offset: u64,
@@ -327,7 +327,7 @@ pub enum DispatcherEvent {
     },
     /// A node error surfaced to the caller.
     CallerErrored {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         offset: u64,
         message: String,
@@ -336,7 +336,7 @@ pub enum DispatcherEvent {
     /// The caller is gone (response complete OR disconnected). Last
     /// event in the caller stream; replay cursors stop here.
     CallerDisconnected {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         offset: u64,
         reason: String,
@@ -350,7 +350,7 @@ pub enum DispatcherEvent {
     /// encodes the bus's mode) so the inspector can render a mode
     /// badge in the panel header without a separate journal event.
     BusParticipant {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         bus_id: String,
         node_id: String,
@@ -362,7 +362,7 @@ pub enum DispatcherEvent {
     /// line. Not alarming by design: corrupt rows are a real but
     /// rare event the user only investigates if they look.
     JournalCorruption {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         site: weft_core::primitive::CorruptionSite,
         reason: String,
@@ -413,36 +413,36 @@ impl DispatcherEvent {
         }
     }
 
-    pub fn color(&self) -> Option<Color> {
+    pub fn execution_id(&self) -> Option<ExecutionId> {
         match self {
-            Self::ExecutionStarted { color, .. }
-            | Self::ExecutionCompleted { color, .. }
-            | Self::ExecutionFailed { color, .. }
-            | Self::ExecutionCancelled { color, .. }
-            | Self::ExecutionTagged { color, .. }
-            | Self::ExecutionDeleted { color, .. }
-            | Self::NodeStarted { color, .. }
-            | Self::NodeSuspended { color, .. }
-            | Self::NodeResumed { color, .. }
-            | Self::NodeCancelled { color, .. }
-            | Self::NodeCompleted { color, .. }
-            | Self::NodeFailed { color, .. }
-            | Self::NodeSkipped { color, .. }
-            | Self::LoopInstantiated { color, .. }
-            | Self::LoopIterationLaunched { color, .. }
-            | Self::LoopOutFired { color, .. }
-            | Self::LoopTerminated { color, .. }
-            | Self::CostReported { color, .. }
-            | Self::BusJoined { color, .. }
-            | Self::BusLeft { color, .. }
-            | Self::BusWindow { color, .. }
-            | Self::BusClosed { color, .. }
-            | Self::BusParticipant { color, .. }
-            | Self::CallerConnected { color, .. }
-            | Self::CallerWindow { color, .. }
-            | Self::CallerErrored { color, .. }
-            | Self::CallerDisconnected { color, .. }
-            | Self::JournalCorruption { color, .. } => Some(*color),
+            Self::ExecutionStarted { execution_id, .. }
+            | Self::ExecutionCompleted { execution_id, .. }
+            | Self::ExecutionFailed { execution_id, .. }
+            | Self::ExecutionCancelled { execution_id, .. }
+            | Self::ExecutionTagged { execution_id, .. }
+            | Self::ExecutionDeleted { execution_id, .. }
+            | Self::NodeStarted { execution_id, .. }
+            | Self::NodeSuspended { execution_id, .. }
+            | Self::NodeResumed { execution_id, .. }
+            | Self::NodeCancelled { execution_id, .. }
+            | Self::NodeCompleted { execution_id, .. }
+            | Self::NodeFailed { execution_id, .. }
+            | Self::NodeSkipped { execution_id, .. }
+            | Self::LoopInstantiated { execution_id, .. }
+            | Self::LoopIterationLaunched { execution_id, .. }
+            | Self::LoopOutFired { execution_id, .. }
+            | Self::LoopTerminated { execution_id, .. }
+            | Self::CostReported { execution_id, .. }
+            | Self::BusJoined { execution_id, .. }
+            | Self::BusLeft { execution_id, .. }
+            | Self::BusWindow { execution_id, .. }
+            | Self::BusClosed { execution_id, .. }
+            | Self::BusParticipant { execution_id, .. }
+            | Self::CallerConnected { execution_id, .. }
+            | Self::CallerWindow { execution_id, .. }
+            | Self::CallerErrored { execution_id, .. }
+            | Self::CallerDisconnected { execution_id, .. }
+            | Self::JournalCorruption { execution_id, .. } => Some(*execution_id),
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
@@ -461,9 +461,9 @@ impl DispatcherEvent {
 pub struct EventBus {
     inner: Arc<RwLock<HashMap<uuid::Uuid, broadcast::Sender<LiveEvent>>>>,
     /// Postgres pool used by `publish` for NOTIFY. `None` for tests
-    /// or single-pod contexts where the cross-pod channel isn't
+    /// or single-process contexts where the cross-process channel isn't
     /// wired; in that case `publish` skips the NOTIFY step and
-    /// behaves like `publish_local` (the absence of cross-pod fanout
+    /// behaves like `publish_local` (the absence of cross-process fanout
     /// is the caller's responsibility to choose by passing None).
     pool: Option<PgPool>,
 }
@@ -478,13 +478,8 @@ impl Default for EventBus {
 }
 
 impl EventBus {
-    /// In-process-only bus (tests, pre-pool init).
-    pub fn local_only() -> Self {
-        Self::default()
-    }
-
-    /// Bus with cross-pod fanout via Postgres NOTIFY: what a sibling pod
-    /// publishes arrives on `signals` (the pod's one `LISTEN`
+    /// Bus with cross-process fanout via Postgres NOTIFY: what a sibling process
+    /// publishes arrives on `signals` (the process's one `LISTEN`
     /// connection, which must listen on [`NOTIFY_CHANNEL`]) and is
     /// pushed into the local broadcast.
     pub fn with_notify(
@@ -510,13 +505,13 @@ impl EventBus {
     }
 
     /// Push to local subscribers only. Used by `journal_bridge`,
-    /// where every pod's bridge polls the journal independently
-    /// (the cross-pod fanout for ExecEvent is the journal itself).
+    /// where every process's bridge polls the journal independently
+    /// (the cross-process fanout for ExecEvent is the journal itself).
     pub async fn publish_local(&self, event: LiveEvent) {
         self.publish_local_inner(&event).await;
     }
 
-    /// Push locally AND issue NOTIFY so sibling pods receive it.
+    /// Push locally AND issue NOTIFY so sibling processes receive it.
     /// Used for the events that don't ride the journal:
     /// ProjectRegistered/Activated/Deactivated, TriggerUrlChanged and
     /// ExecutionDeleted (the one execution event with no journal row
@@ -547,7 +542,7 @@ impl EventBus {
         // InfraStatusChanged / InfraFlaky / InfraRecovered /
         // InfraTerminated / InfraConfigError all ride the NOTIFY-only path.
         // If one of these blows
-        // the cap, sibling pods miss the event entirely until the
+        // the cap, sibling processes miss the event entirely until the
         // next user action triggers a fresh round-trip; this is a
         // real failure mode worth alerting on, not a recoverable
         // race. Every user-string field on a publish-path event
@@ -562,7 +557,7 @@ impl EventBus {
                 target: "weft_dispatcher::events",
                 size = payload.len(),
                 kind = ?std::mem::discriminant(&event.event),
-                "DispatcherEvent too large for Postgres NOTIFY; sibling pods will miss it"
+                "DispatcherEvent too large for Postgres NOTIFY; sibling instances will miss it"
             );
             return;
         }
@@ -591,12 +586,12 @@ impl EventBus {
     }
 }
 
-/// Push every event a sibling pod published into this pod's local
+/// Push every event a sibling process published into this process's local
 /// broadcast. A lost notification is a missed SSE event that no journal
 /// replays (the events published this way have no row to ride), which is
 /// why `publish` bounds their size; a recheck therefore has nothing to
-/// look at. Returns only when the pod's signal watch stops, which crashes
-/// the pod through its supervisor: cross-pod fanout would be gone.
+/// look at. Returns only when the process's signal watch stops, which crashes
+/// the process through its supervisor: cross-process fanout would be gone.
 async fn relay_sibling_events(mut heard: weft_task_store::pg_signal::Subscription, bus: EventBus) {
     loop {
         match heard.next().await {
@@ -613,7 +608,7 @@ async fn relay_sibling_events(mut heard: weft_task_store::pg_signal::Subscriptio
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::error!(target: "weft_dispatcher::events", error = %e, "cross-pod event fanout stopped");
+                tracing::error!(target: "weft_dispatcher::events", error = %e, "cross-instance event fanout stopped");
                 return;
             }
         }
@@ -627,7 +622,7 @@ mod identity_tests {
     #[test]
     fn identities_survive_projection_and_wire_round_trips() {
         let event = DispatcherEvent::ExecutionCompleted {
-            color: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
+            execution_id: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
             outputs: serde_json::json!({}), at_unix: 1,
         };
         let record = IdentifiedEvent::recorded(42, event);

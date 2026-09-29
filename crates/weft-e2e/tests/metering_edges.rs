@@ -12,7 +12,7 @@
 //!     spend with NO figure, when the execution ends, rather than as a
 //!     zero (which would claim the call was free), as nothing at all
 //!     (which would claim it never happened), or only when the worker
-//!     eventually dies (which used to pin the pod alive);
+//!     eventually dies (which used to keep the worker from retiring);
 //!   - a job whose answer IS read back lands with what the provider
 //!     actually stated;
 //!   - a panicking node fails its own execution and leaves the worker
@@ -38,7 +38,7 @@ async fn connect_queue(
         serde_json::json!({ "key": "e2e", "base": fake.base() }),
     )
     .await?;
-    set_account(project, "job", "connection", conn.handle())?;
+    set_account(project, "job", conn.handle()).await?;
     Ok(conn)
 }
 
@@ -48,7 +48,7 @@ async fn connect_queue(
 /// do: a branch stops caring, a person cancels. The spend is real, and
 /// the only honest record is one with no figure on it. It has to land
 /// when the EXECUTION ends: tying it to the worker's own shutdown meant
-/// the record arrived whenever that pod eventually died, and the pod
+/// the record arrived whenever that worker eventually died, and the worker
 /// refused to retire while any such charge was open.
 #[tokio::test]
 async fn a_job_submitted_and_never_read_back_records_spend_with_no_figure() -> anyhow::Result<()> {
@@ -105,7 +105,7 @@ async fn a_job_read_back_records_what_the_provider_stated() -> anyhow::Result<()
 /// Node code panics. The execution has to end failed rather than hang,
 /// and the worker has to be fit to run the next one: a panic unwinds
 /// past the ordinary cleanup, so everything that execution registered on
-/// the pod is released by a guard or not at all.
+/// the worker is released by a guard or not at all.
 #[tokio::test]
 async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -126,31 +126,29 @@ async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyho
         "the node behind a panicking one must not run; its events: {after:?}"
     );
 
-    // THE SAME POD takes another run, which is the part that matters: a
-    // fresh pod would pass this whatever the panic left behind. So the
-    // pod serving the first run is read, the second run goes through, and
-    // the pod is asserted to be that same one, alive and not draining. If
+    // THE SAME WORKER takes another run, which is the part that matters: a
+    // fresh worker would pass this whatever the panic left behind. So the
+    // worker serving the first run is read, the second run goes through,
+    // and the worker is asserted to be that same one, still running. If
     // the panic had left the execution's state behind, this is where it
-    // shows: a cancel flag and a live config for a dead colour, and a
+    // shows: a cancel flag and a live config for a dead execution, and a
     // worker that refuses to retire.
     let platform = weft_e2e::platform::Platform::connect(&disp).await?;
     let pid = project.id();
-    let before = platform.execution_owner(&settled.color).await?
+    let before = platform.execution_owner(&settled.execution_id).await?
         .ok_or_else(|| anyhow::anyhow!("the panicking run has no recorded worker owner"))?;
 
     project.set_node_config("boom", "explode", "false")?;
     let ok = run::run_and_settle(&mut project).await?;
     ok.completed()?;
     ok.assert_completed("after")?;
-    let owner = platform.execution_owner(&ok.color).await?;
+    let owner = platform.execution_owner(&ok.execution_id).await?;
     anyhow::ensure!(owner.as_deref() == Some(before.as_str()), "the second run used {owner:?}, but the panicking run used {before}");
 
-    let after_pods = platform.worker_pods_for_project(&pid).await?;
+    let running = platform.workers_for_project(&pid).await?;
     anyhow::ensure!(
-        after_pods.iter().any(|p| before == p.pod_name && !p.draining),
-        "the second run must be served by a pod that survived the panic, not by a replacement: \
-         before {before:?}, after {:?}",
-        after_pods.iter().map(|p| (&p.pod_name, &p.status, p.draining)).collect::<Vec<_>>()
+        running.len() == 1,
+        "the worker that survived the panic must be the only one serving the project: {running:?}"
     );
 
     project.finish().await

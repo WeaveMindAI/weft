@@ -431,6 +431,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl weft_task_store::TaskStoreClient for RecordingTaskStore {
+        async fn wait_cancels(
+            &self,
+            _project_id: uuid::Uuid,
+            _execution_ids: Vec<String>,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+            Ok(Vec::new())
+        }
+
         async fn enqueue_dedup(
             &self,
             spec: weft_task_store::tasks::NewTask,
@@ -447,22 +456,22 @@ mod tests {
         }
         async fn claim_one(
             &self,
-            _pod_id: &str,
+            _instance: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
         async fn complete(
             &self,
             _task_id: uuid::Uuid,
-            _pod_id: &str,
+            _instance: &str,
             _result: serde_json::Value,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -470,7 +479,7 @@ mod tests {
         async fn fail(
             &self,
             _task_id: uuid::Uuid,
-            _pod_id: &str,
+            _instance: &str,
             _error: String,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -597,7 +606,7 @@ mod tests {
             open_charges: crate::metering::OpenCharges::new(),
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: weft_core::frames::LoopFrames::default(),
             service: "bytesvc".into(),

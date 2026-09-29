@@ -7,7 +7,7 @@
 //! resolves the acting tenant and forwards to the broker as the control plane),
 //! and (2) durably drive the terminate sweep: a worker can stall-then-die before
 //! its eager sweep runs, so the journal bridge enqueues a row per terminated
-//! color and this reaper drains it by asking the broker to sweep the color's
+//! execution and this reaper drains it by asking the broker to sweep the execution's
 //! un-kept exec files.
 
 use anyhow::{Context, Result};
@@ -22,7 +22,6 @@ use weft_core::storage::{
     WipePrefixResponse,
 };
 
-use crate::broker_admin::{admin_url, read_token};
 use crate::state::DispatcherState;
 
 // ---------- broker admin client ----------
@@ -31,9 +30,9 @@ use crate::state::DispatcherState;
 // with the broker's handlers), so the two ends cannot drift.
 
 // The dispatcher's authenticated client of the broker's runtime-file admin
-// surface: SA-token signing + URL joining live in `crate::broker_admin`
-// (shared with the access-admin forwards); the typed retry classes below
-// are this surface's own.
+// surface: identity + URL joining live in `crate::role_client` (shared
+// with the access-admin forwards and the listener); the typed retry
+// classes below are this surface's own.
 
 /// A sentinel in the error chain saying the broker answered 404 for a single-file
 /// op. The api layer downcasts to this so a missing file surfaces as 404 to the
@@ -49,7 +48,7 @@ impl std::fmt::Display for StorageNotFound {
 impl std::error::Error for StorageNotFound {}
 
 /// A broker 4xx other than 404: the broker understood the request and REFUSED
-/// it (bad tenant/color/key shape, denied scope). Terminal for the request as
+/// it (bad tenant/execution/key shape, denied scope). Terminal for the request as
 /// sent; retrying the identical request can never succeed. Carried typed through
 /// the anyhow chain so retry loops (the sweep queue) can tell a dead request
 /// from a transient broker fault.
@@ -83,12 +82,12 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
     // permanently (bad shape, denied scope, over quota, method/conflict). These are
     // BrokerRejected so the sweep queue stops retrying them.
     //
-    // Deliberately NOT terminal: 401 UNAUTHORIZED. The broker returns 401 when the
-    // Kubernetes TokenReview *call itself* fails (kube-apiserver unreachable /
-    // throttled / a momentarily-stale SA token across rotation), i.e. a TRANSIENT
-    // control-plane fault, not a permanent refusal. Treating it as terminal would
-    // permanently dead-letter a storage sweep on a passing apiserver blip and leak
-    // the files. So 401 falls through to the transient bail below and is retried,
+    // Deliberately NOT terminal: 401 UNAUTHORIZED. The broker returns 401 when it
+    // cannot verify the caller's identity token, which includes a TRANSIENT fault
+    // (the platform's signing keys momentarily unreachable, a token minted just
+    // across a key rotation), not only a permanent refusal. Treating it as terminal
+    // would permanently dead-letter a storage sweep on a passing blip and leak the
+    // files. So 401 falls through to the transient bail below and is retried,
     // alongside 5xx.
     let terminal = matches!(
         status,
@@ -110,7 +109,7 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
 }
 
 /// POST one admin verb to the broker and parse its JSON response. Every
-/// admin-surface call is this exact shape (SA bearer, JSON in, JSON out,
+/// admin-surface call is this exact shape (identity bearer, JSON in, JSON out,
 /// status classified by `check`), so it lives once.
 async fn post_admin<Resp: serde::de::DeserializeOwned>(
     state: &DispatcherState,
@@ -119,9 +118,9 @@ async fn post_admin<Resp: serde::de::DeserializeOwned>(
     body: &impl serde::Serialize,
 ) -> Result<Resp> {
     let resp = state
-        .http
-        .post(admin_url(state, path))
-        .bearer_auth(read_token(state).await?)
+        .broker
+        .request(reqwest::Method::POST, path)
+        .await?
         .json(body)
         .send()
         .await
@@ -137,9 +136,9 @@ async fn post_admin_unit(
     body: &impl serde::Serialize,
 ) -> Result<()> {
     let resp = state
-        .http
-        .post(admin_url(state, path))
-        .bearer_auth(read_token(state).await?)
+        .broker
+        .request(reqwest::Method::POST, path)
+        .await?
         .json(body)
         .send()
         .await
@@ -150,8 +149,13 @@ async fn post_admin_unit(
 
 /// Read one active file without changing its lifetime or minting a link.
 pub async fn file_meta(state: &DispatcherState, key: &str) -> Result<StoredFileMeta> {
-    let response = state.http.get(admin_url(state, &format!("/v1/storage/admin/meta/{key}")))
-        .bearer_auth(read_token(state).await?).send().await.context("read stored file metadata")?;
+    let response = state
+        .broker
+        .request(reqwest::Method::GET, &format!("/v1/storage/admin/meta/{key}"))
+        .await?
+        .send()
+        .await
+        .context("read stored file metadata")?;
     check(response, "file metadata").await?.json().await.context("parse stored file metadata")
 }
 
@@ -195,9 +199,9 @@ pub async fn set_asset_references(
 /// Delete one file by its tenant-anchored key (`weft files rm <key>`).
 pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
     let resp = state
-        .http
-        .delete(admin_url(state, &format!("/v1/storage/admin/files/{key}")))
-        .bearer_auth(read_token(state).await?)
+        .broker
+        .request(reqwest::Method::DELETE, &format!("/v1/storage/admin/files/{key}"))
+        .await?
         .send()
         .await
         .context("broker delete-key")?;
@@ -241,6 +245,49 @@ pub async fn download_link(
     })
 }
 
+/// The whole content of one stored file, fetched through the broker (the
+/// one service with bucket reach): a link token minted for it, then the
+/// broker's own relay of that token. What a version build reads its files
+/// with.
+pub async fn read_file(state: &DispatcherState, key: &str) -> Result<Vec<u8>> {
+    let minted: weft_core::storage::DownloadLinkResult = post_admin(
+        state,
+        "/v1/storage/admin/download-link",
+        "download-link",
+        &PresignRequest { key: key.to_string(), ttl_secs: Some(300), reach: weft_core::storage::LinkReach::default() },
+    )
+    .await?;
+    let resp = state
+        .broker
+        .request(reqwest::Method::GET, &format!("/v1/storage/admin/relay/{}", minted.token))
+        .await?
+        .send()
+        .await
+        .context("broker relay")?;
+    let bytes = check(resp, "relay").await?.bytes().await.context("read a stored file")?;
+    anyhow::ensure!(
+        bytes.len() as u64 == minted.size_bytes,
+        "stored file {key} came back {} bytes long, and the store records {}",
+        bytes.len(),
+        minted.size_bytes
+    );
+    Ok(bytes.to_vec())
+}
+
+/// A version build's view of the storage plane (`crate::build::ProjectStorage`).
+pub struct BrokerStorage<'a>(pub &'a DispatcherState);
+
+#[async_trait::async_trait]
+impl crate::build::ProjectStorage for BrokerStorage<'_> {
+    async fn read(&self, key: &str) -> Result<Vec<u8>> {
+        read_file(self.0, key).await
+    }
+
+    async fn meta(&self, key: &str) -> Result<StoredFileMeta> {
+        file_meta(self.0, key).await
+    }
+}
+
 /// The address a minted link is built on: where the client that will
 /// fetch it reaches this dispatcher. Always trailing-slash-free.
 ///
@@ -280,14 +327,14 @@ pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
     Ok(out.wiped)
 }
 
-/// Terminate-sweep a color's un-kept exec files: the broker reaps crashed
+/// Terminate-sweep an execution's un-kept exec files: the broker reaps crashed
 /// uploads now and stamps completed files with the post-run linger expiry.
-async fn sweep_exec(state: &DispatcherState, tenant: &str, color: &str) -> Result<SweepExecResponse> {
+async fn sweep_exec(state: &DispatcherState, tenant: &str, execution_id: &str) -> Result<SweepExecResponse> {
     post_admin(
         state,
         "/v1/storage/admin/sweep-exec",
         "sweep-exec",
-        &SweepExecRequest { tenant: tenant.to_string(), color: color.to_string() },
+        &SweepExecRequest { tenant: tenant.to_string(), execution_id: execution_id.to_string() },
     )
     .await
 }
@@ -432,21 +479,21 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "storage_sweep",
     tables: &["storage_sweep"],
     ddl: &[r#"
-        -- Durable terminate-sweep queue: a row per terminated color whose
+        -- Durable terminate-sweep queue: a row per terminated execution whose
         -- un-kept exec files still need sweeping. Inserted by the journal
         -- bridge (the durable observer of terminate), deleted by the sweep
         -- reaper once the broker confirmed the sweep.
         CREATE TABLE IF NOT EXISTS storage_sweep (
-            color TEXT PRIMARY KEY,
+            execution_id TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
         "#,
-        // Wake the sweep reaper when a color is queued.
+        // Wake the sweep reaper when an execution is queued.
         // SYNC: 'weft_storage_sweep' <-> crate::reaper::STORAGE_SWEEP_CHANNEL
         r#"CREATE OR REPLACE FUNCTION storage_sweep_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_storage_sweep', NEW.color);
+                PERFORM pg_notify('weft_storage_sweep', NEW.execution_id);
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -459,21 +506,21 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
-/// Enqueue a terminate sweep for `color`. Called by the journal bridge when it
+/// Enqueue a terminate sweep for `execution_id`. Called by the journal bridge when it
 /// observes a terminal exec event; idempotent.
-pub async fn enqueue_sweep(pool: &PgPool, tenant: &str, color: &str) -> Result<()> {
+pub async fn enqueue_sweep(pool: &PgPool, tenant: &str, execution_id: &str) -> Result<()> {
     let mut conn = pool.acquire().await?;
-    enqueue_sweep_in(&mut conn, tenant, color).await
+    enqueue_sweep_in(&mut conn, tenant, execution_id).await
 }
 
 /// [`enqueue_sweep`] on the caller's connection, for a writer that queues
 /// the sweep in the same transaction as the run's ending.
-pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, color: &str) -> Result<()> {
+pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, execution_id: &str) -> Result<()> {
     sqlx::query(
-        "INSERT INTO storage_sweep (color, tenant_id, enqueued_at_unix) \
-         VALUES ($1, $2, $3) ON CONFLICT (color) DO NOTHING",
+        "INSERT INTO storage_sweep (execution_id, tenant_id, enqueued_at_unix) \
+         VALUES ($1, $2, $3) ON CONFLICT (execution_id) DO NOTHING",
     )
-    .bind(color)
+    .bind(execution_id)
     .bind(tenant)
     .bind(crate::lease::now_unix())
     .execute(&mut *conn)
@@ -481,46 +528,46 @@ pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, color
     Ok(())
 }
 
-/// Sweep-queue reaper: ask the broker to sweep each pending color's un-kept
+/// Sweep-queue reaper: ask the broker to sweep each pending execution's un-kept
 /// exec files. A row is removed only after the broker confirmed; a TRANSIENT
 /// broker error (unreachable, 5xx) leaves the row for the next tick (the sweep
 /// is idempotent). A TERMINAL refusal (a 4xx: the broker understood and
 /// rejected the request) is loud + dead-lettered: retrying the identical
 /// request every tick forever would be a silent infinite loop over a row the
 /// user can neither see nor clear, so the row is dropped with an error log
-/// naming the color (the files, if any, remain reclaimable via `weft files`).
+/// naming the execution (the files, if any, remain reclaimable via `weft files`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT color, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
+        sqlx::query_as("SELECT execution_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
             .fetch_all(&state.pg_pool)
             .await?;
-    for (color, tenant) in rows {
-        match sweep_exec(&state, &tenant, &color).await {
+    for (execution_id, tenant) in rows {
+        match sweep_exec(&state, &tenant, &execution_id).await {
             Ok(out) => {
                 if out.swept > 0 || out.lingering > 0 {
                     tracing::info!(
                         target: "weft_dispatcher::storage",
-                        %color, tenant = %tenant, swept = out.swept, lingering = out.lingering,
+                        %execution_id, tenant = %tenant, swept = out.swept, lingering = out.lingering,
                         "terminate sweep: reaped crashed uploads, stamped completed \
                          un-kept exec files with the post-run linger expiry"
                     );
                 }
-                sqlx::query("DELETE FROM storage_sweep WHERE color = $1")
-                    .bind(&color)
+                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
+                    .bind(&execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
             Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => {
                 // 404 from the broker means there was nothing to sweep for this
-                // color (its files are already gone). That is terminal SUCCESS, not
+                // execution (its files are already gone). That is terminal SUCCESS, not
                 // a rejection: drop the row quietly (debug, not error).
                 tracing::debug!(
                     target: "weft_dispatcher::storage",
-                    %color, tenant = %tenant,
+                    %execution_id, tenant = %tenant,
                     "terminate sweep found nothing to remove; clearing the queue row"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE color = $1")
-                    .bind(&color)
+                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
+                    .bind(&execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -528,17 +575,17 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
                 // The broker understood and permanently refuses this request (bad
                 // shape / denied / over quota). Retrying it every tick forever would
                 // be a silent infinite loop over a row nobody can clear, so drop it
-                // with a loud error naming the color (any files stay reclaimable via
+                // with a loud error naming the execution (any files stay reclaimable via
                 // `weft files`).
                 tracing::error!(
                     target: "weft_dispatcher::storage",
-                    %color, tenant = %tenant, error = format!("{e:#}"),
+                    %execution_id, tenant = %tenant, error = format!("{e:#}"),
                     "terminate sweep REJECTED by the broker; dropping the queue row \
-                     (any remaining files for this color stay listable/deletable via \
+                     (any remaining files for this execution stay listable/deletable via \
                      the storage API)"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE color = $1")
-                    .bind(&color)
+                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
+                    .bind(&execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -547,7 +594,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
                 // 5xx): keep the row and retry next tick.
                 tracing::warn!(
                     target: "weft_dispatcher::storage",
-                    %color, tenant = %tenant, error = %e,
+                    %execution_id, tenant = %tenant, error = %e,
                     "terminate sweep deferred (transient broker/control-plane fault); will retry"
                 );
             }
@@ -565,7 +612,7 @@ mod link_base_tests {
     /// up in the link.
     #[test]
     fn a_link_is_built_on_the_address_the_caller_used() {
-        for host in ["http://127.0.0.1:9998", "https://weft-dev-copper-lantern.weavemind.ai"] {
+        for host in ["http://127.0.0.1:14112", "https://weft-dev-copper-lantern.weavemind.ai"] {
             let base = LinkBase::from_request_host(Some(host.to_string())).unwrap();
             assert_eq!(base.as_str(), host);
         }

@@ -14,7 +14,7 @@ no such control.
 
 `.weft` files open as the graph by default (a stray text tab is closed
 automatically); the "Source" button is the text view. The extension talks
-to the dispatcher at `http://localhost:9999` (setting `weft.dispatcherUrl`).
+to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
 
 ## Where things live
 
@@ -24,7 +24,7 @@ to the dispatcher at `http://localhost:9999` (setting `weft.dispatcherUrl`).
     and "Run Project"; title-bar "Refresh".
   - **Executions**: runs of the pinned project, newest first (paged, "Load
     more (N more)" at the bottom). Row = status icon, entry node, time;
-    tooltip = the color id. Inline "View in Graph" and "Delete"; title-bar
+    tooltip = the execution id. Inline "View in Graph" and "Delete"; title-bar
     "Refresh Executions" and "Clear All Executions".
 - **The graph panel**, titled "Weft Graph: <project folder name>".
 - **The Problems panel** carries the compiler's live diagnostics.
@@ -76,9 +76,9 @@ or off; click to show the newest and follow again), and **"Source"**
 
 The [follow toggle] has three parts, each explained on hover; only the
 active one shows its word:
-- **"Following · <color>"** (eye icon): every run that starts takes over
+- **"Following · <execution-id>"** (eye icon): every run that starts takes over
   the graph. The default.
-- **"Locked · <color>"** (lock icon): the graph stays on this run; runs
+- **"Locked · <execution-id>"** (lock icon): the graph stays on this run; runs
   that start are counted, not shown. Greyed while no run is on screen.
 - **"Off"** (crossed eye): no run on the graph, just the program.
 
@@ -192,7 +192,7 @@ several times. The Copy button exports the whole inspection.
 Past runs: in the Executions view, "View in Graph" replays the run in the
 graph with every value in place and locks the [follow toggle] onto it;
 "N new run(s) · Follow" jumps to the newest. From the terminal the same
-facts are `weft executions`, `weft events <color>`, `weft logs` (the
+facts are `weft executions`, `weft events <execution-id>`, `weft logs` (the
 `weft-running` skill).
 
 ## Diagnostics and AI edits

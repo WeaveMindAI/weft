@@ -17,14 +17,15 @@ import { ReconnectingStream } from './projectEvents';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
-import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
+import { readProjectIdFromToml, readProjectNameFromToml, findProjectRoot } from './sidebar/projects';
+import { NODE_GLOBS } from './diagnostics';
 
 /// What a parse answers for a project the dispatcher has never seen.
 const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
@@ -33,6 +34,13 @@ const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
 /// display stream names it: its place, spelled the way a person writes
 /// it (`one.door`).
 // SYNC: DisplayRoute.source <-> crates/weft-dispatcher/src/display_feeds.rs (DisplaySource)
+/// Another install whose program the graph shows: its name, and the
+/// folder its program was downloaded into.
+export interface RemoteInstall {
+  name: string;
+  root: string;
+}
+
 interface DisplayRoute {
   source: 'infra' | 'signal';
   node: string;
@@ -89,9 +97,9 @@ export class GraphViewController {
   private parseTimer: NodeJS.Timeout | undefined;
   private catalogRefreshTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
-  /// The `nodes/` watcher for the currently-watched doc's project.
+  /// The node-package watchers for the currently-watched doc's project.
   /// Rebound whenever the panel follows a .weft file in a different
-  /// project (its `nodes/` dir moves with it).
+  /// project (its node packages move with it).
   private nodesWatcher: vscode.Disposable | undefined;
   /// Watches the watched `.weft` file ITSELF on disk (see watchSelfFile).
   private selfWatcher: vscode.Disposable | undefined;
@@ -118,7 +126,7 @@ export class GraphViewController {
   private openSourceHandler: ((location: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
-  /// process or POST /executions/{color}/cancel.
+  /// process or POST /executions/{executionId}/cancel.
   private stopActionHandler: (() => void) | undefined;
   /// User dismissed the action-bar error banner. Extension.ts
   /// clears the slot's `error` field via `actionBar.clearError`.
@@ -142,6 +150,16 @@ export class GraphViewController {
   /// so routing them through `cliVerbHandler` throws before the CLI is
   /// even spawned and the click does nothing. Extension.ts installs the
   /// same runner its own tree commands use.
+  /// The install switch's state, remembered for a panel that mounts later.
+  private installView: InstallView | undefined;
+  /// The install whose program the graph shows, when not the local one:
+  /// its source is a downloaded copy, so nothing but its connections
+  /// changes.
+  /// The install whose program the graph shows, and the folder that
+  /// program was downloaded into; undefined on the local install.
+  private remoteInstall: RemoteInstall | undefined;
+  private switchInstallHandler: ((name: string) => void) | undefined;
+  private installLeftHandler: (() => void) | undefined;
   private treeVerbHandler:
     | ((args: string[]) => Promise<unknown>)
     | undefined;
@@ -202,9 +220,9 @@ export class GraphViewController {
    *  that is not open creates the panel and posts this immediately after,
    *  which the webview never saw, so the "this run is from older code"
    *  banner never appeared on exactly the path it was written for. */
-  setExecVersion(color: string, version: string | null, diskVersion: string | null): void {
+  setExecVersion(executionId: string, version: string | null, diskVersion: string | null): void {
     this.execVersionFor = this.watchedProjectId;
-    this.lastExecVersion = { kind: 'execVersion', color, version, diskVersion };
+    this.lastExecVersion = { kind: 'execVersion', executionId, version, diskVersion };
     void this.panel?.webview.postMessage(this.lastExecVersion satisfies HostMessage);
   }
 
@@ -232,17 +250,17 @@ export class GraphViewController {
    *  followed run here. */
   forgetExecVersion(): void {
     if (!this.lastExecVersion) return;
-    const color = this.lastExecVersion.color;
+    const executionId = this.lastExecVersion.executionId;
     this.lastExecVersion = undefined;
     this.execVersionFor = undefined;
     void this.panel?.webview.postMessage({
       kind: 'execVersion',
-      color,
+      executionId,
       version: null,
       diskVersion: null,
     } satisfies HostMessage);
   }
-  private lastExecVersion: { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null } | undefined;
+  private lastExecVersion: { kind: 'execVersion'; executionId: string; version: string | null; diskVersion: string | null } | undefined;
   /// Which project `lastExecVersion` describes a run of.
   private execVersionFor: string | undefined;
   setFollowModeHandler(fn: (mode: FollowMode) => void): void { this.followModeHandler = fn; }
@@ -298,6 +316,72 @@ export class GraphViewController {
     this.cliStatusHandler = fn;
   }
 
+  setSwitchInstallHandler(fn: (name: string) => void): void {
+    this.switchInstallHandler = fn;
+  }
+
+  /// Called when the graph leaves another install's program on its own
+  /// (its panel closed, or it followed a file outside that program).
+  setInstallLeftHandler(fn: () => void): void {
+    this.installLeftHandler = fn;
+  }
+
+  /// Tell the graph which installs it can show and which one it shows.
+  setInstallView(view: InstallView): void {
+    this.installView = view;
+    void this.panel?.webview.postMessage({ kind: 'installView', view } satisfies HostMessage);
+  }
+
+  /// Show `doc` as the project's graph on the install `remote` (a copy of
+  /// the program it holds, read-only) or, with none, on the local one
+  /// again. The page is rebuilt so its media policy allows the install's
+  /// address.
+  async showInstall(doc: vscode.TextDocument, projectId: string, remote: RemoteInstall | undefined): Promise<void> {
+    this.remoteInstall = remote;
+    this.loadStorageOrigin();
+    await this.open(doc, projectId, vscode.ViewColumn.Beside);
+    if (this.panel) {
+      if (this.panel.title !== this.panelTitle(doc)) this.panel.title = this.panelTitle(doc);
+      this.panel.webview.html = this.renderHtml();
+    }
+  }
+
+  /// Back to the local install without a document of its own to show
+  /// (the pin moved to another project, whose file the caller opens).
+  leaveInstall(): void {
+    if (!this.remoteInstall) return;
+    this.remoteInstall = undefined;
+    this.loadStorageOrigin();
+    if (this.panel) this.panel.webview.html = this.renderHtml();
+  }
+
+  /// Leave another install's program on the graph's own account (not a
+  /// pin change the extension made): back to local, and the extension
+  /// is told so it moves its client and follow back too.
+  private leftInstall(): void {
+    if (!this.remoteInstall) return;
+    this.leaveInstall();
+    this.installLeftHandler?.();
+  }
+
+  /// Whether `fsPath` is a file of the downloaded program the graph shows.
+  private inRemoteCopy(fsPath: string): boolean {
+    if (!this.remoteInstall) return false;
+    const rel = nodePath.relative(this.remoteInstall.root, fsPath);
+    return !rel.startsWith('..') && !nodePath.isAbsolute(rel);
+  }
+
+  /// Refuse a change to the source while the graph shows another
+  /// install's program, saying so; true when refused.
+  private refusedOnInstall(what: string): boolean {
+    if (!this.remoteInstall) return false;
+    void vscode.window.showInformationMessage(
+      `Weft: ${what} is not possible here: the graph shows what ${this.remoteInstall.name} runs. ` +
+        'Switch back to local (top right) to edit your files.',
+    );
+    return true;
+  }
+
   setTreeVerbHandler(fn: (args: string[]) => Promise<unknown>): void {
     this.treeVerbHandler = fn;
   }
@@ -306,6 +390,11 @@ export class GraphViewController {
   post(msg: HostMessage): void {
     if (msg.kind === 'execReset') this.forgetExecVersion();
     this.panel?.webview.postMessage(msg);
+  }
+
+  /// Bring the panel forward as it is.
+  reveal(): void {
+    this.panel?.reveal();
   }
 
   /// True iff the graph panel exists (or is being created). The tab-open
@@ -417,6 +506,9 @@ export class GraphViewController {
       // ask again, and the stream starts with what each node shows now.
       this.panel.onDidChangeViewState(() => this.pointDisplayStream()),
       vscode.workspace.onDidChangeTextDocument((e) => {
+        // The downloaded program is read-only: typing in a text tab of it
+        // changes nothing the graph shows.
+        if (this.inRemoteCopy(e.document.uri.fsPath)) return;
         if (this.watchedDoc && e.document === this.watchedDoc) {
           // Skip when the doc already matches what we rendered: our own edit write,
           // the save pipeline's trim/newline follow-ups, and an undo back to the
@@ -453,7 +545,17 @@ export class GraphViewController {
         // register a nodes-dir watcher onDispose already swept.
         if (this.panel === undefined) return;
         if (vscode.window.activeTextEditor !== ed) return;
+        // Showing another install's program: a text tab of that program,
+        // or of the same project's files on disk (which that graph is
+        // not), keeps it.
+        if (this.remoteInstall) {
+          const path = ed.document.uri.fsPath;
+          if (this.inRemoteCopy(path) || readProjectIdFromToml(path) === this.watchedProjectId) return;
+        }
         if (ed.document.languageId === 'weft' && !isReviewDoc(ed.document)) {
+          // Any other file is a graph of the local install: leave the
+          // other one first, the extension included.
+          this.leftInstall();
           // Focusing a DIFFERENT .weft tab is a fresh context (a whole new
           // graph), not an include navigation (navigateInto sets watchedDoc to
           // its target before this fires, so that case sees no change here).
@@ -528,6 +630,7 @@ export class GraphViewController {
     const onDiskChange = () => {
       void (async () => {
         if (!this.watchedDoc || this.watchedDoc.uri.fsPath !== doc.uri.fsPath) return;
+        if (this.inRemoteCopy(doc.uri.fsPath)) return;
         await this.liveDoc(this.watchedDoc);
         if (this.isRenderCurrent()) return;
         // An external process wrote the file: the same auto-lock a text-tab
@@ -543,7 +646,7 @@ export class GraphViewController {
     );
   }
 
-  /// Watch the project's `nodes/` directory. Editing a node's
+  /// Watch the project's node packages (`nodes/`, and those under `src/`). Editing a node's
   /// metadata.json (ports, fields) changes the catalog on disk, but
   /// nothing in the text-change path notices. Without this, the open
   /// graph shows the stale catalog until the file is reopened. On any
@@ -561,15 +664,12 @@ export class GraphViewController {
     // opened stayed unknown until the window was reloaded.
     const root = findProjectRoot(doc.uri.fsPath);
     if (!root) return;
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(root, 'nodes/**'),
-    );
     const onChange = () => this.scheduleCatalogRefresh();
     this.nodesWatcher = vscode.Disposable.from(
-      watcher,
-      watcher.onDidCreate(onChange),
-      watcher.onDidChange(onChange),
-      watcher.onDidDelete(onChange),
+      ...NODE_GLOBS.flatMap((glob) => {
+        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, glob));
+        return [watcher, watcher.onDidCreate(onChange), watcher.onDidChange(onChange), watcher.onDidDelete(onChange)];
+      }),
     );
   }
 
@@ -1015,7 +1115,7 @@ export class GraphViewController {
   /// trigger's display is read-only, and a press on one is dropped
   /// here rather than sent to a door that would refuse it.
   ///
-  /// On success every dispatcher pod watching the node's display looks
+  /// On success every dispatcher instance watching the node's display looks
   /// again at once (the press is announced to all of them), so the panel
   /// shows what the press changed without waiting for the next look.
   ///
@@ -1172,7 +1272,7 @@ export class GraphViewController {
   /// action-bar verb: it runs outside the bar's pump and reports its own
   /// failure, the same way the sidebar's "branch here" does.
   private async branchTo(reference: string): Promise<void> {
-    if (!this.treeVerbHandler) return;
+    if (!this.treeVerbHandler || this.refusedOnInstall('Branching the files on disk')) return;
     const out = await this.treeVerbHandler(['branch', reference]);
     if (out) {
       void vscode.window.showInformationMessage(
@@ -1207,6 +1307,7 @@ export class GraphViewController {
         // External state (action bar, status snapshot) lives in
         // extension.ts. Hand off so it can re-push.
         this.readyHandler?.();
+        if (this.installView) this.post({ kind: 'installView', view: this.installView });
         break;
       case 'applyEdits':
         void this.applyEditTransaction(msg.requestId, { kind: 'edit', ops: msg.ops });
@@ -1358,6 +1459,12 @@ export class GraphViewController {
       case 'accessCall':
         void this.runAccessCall(msg.requestId, msg.method, msg.path, msg.body);
         break;
+      case 'picksCall':
+        void this.runPicksCall(msg.requestId, msg.method, msg.body);
+        break;
+      case 'switchInstall':
+        this.switchInstallHandler?.(msg.install);
+        break;
       case 'openExternalUrl':
         void vscode.env.openExternal(vscode.Uri.parse(msg.url));
         break;
@@ -1398,6 +1505,7 @@ export class GraphViewController {
   /// source writing the graph. Serialized on the doc's path so it can't race a
   /// concurrent edit transaction to the same file.
   private async adoptActiveSource(source: string): Promise<void> {
+    if (this.refusedOnInstall('Editing the source')) return;
     const doc = this.watchedDoc;
     if (!doc) {
       console.error('[weft] editActiveSource with no watched document');
@@ -1422,7 +1530,7 @@ export class GraphViewController {
   /// the client we are about to call cannot disagree with where the
   /// link comes back pointing.
   private loadStorageOrigin(): void {
-    this.storageOrigin = originOf(this.client.getBaseUrl());
+    this.storageOrigin = originOf(this.client.getBaseUrl() ?? '');
   }
 
   /// Drive one storage-plane verb for the webview: POST the body to the
@@ -1489,6 +1597,45 @@ export class GraphViewController {
       const error =
         e instanceof HttpError ? `${e.body || e.message}` : e instanceof Error ? e.message : String(e);
       this.post({ kind: 'accessResult', requestId, error });
+    }
+  }
+
+  /// The install's picks for the active project's own connections
+  /// (`/projects/{id}/picks`): read them, or change one. A project the
+  /// install has not heard of yet has none, and a change declares it
+  /// first (`POST /projects`), so a node can be connected before the
+  /// project's first run.
+  private async runPicksCall(
+    requestId: number,
+    method: 'GET' | 'PUT',
+    body?: unknown,
+  ): Promise<void> {
+    try {
+      const projectId = this.watchedProjectId;
+      const docPath = this.watchedDoc?.uri.fsPath;
+      if (!projectId || !docPath) throw new Error('this file belongs to no project the daemon knows');
+      const route = `/projects/${projectId}/picks`;
+      let result: unknown;
+      if (method === 'GET') {
+        try {
+          result = await this.client.get<unknown>(route);
+        } catch (e) {
+          if (!(e instanceof HttpError && e.status === 404)) throw e;
+          result = {};
+        }
+      } else {
+        // SYNC: body <-> crates/weft-dispatcher/src/api/project.rs DeclareRequest
+        await this.client.post<unknown>('/projects', {
+          id: projectId,
+          name: readProjectNameFromToml(docPath) ?? projectId,
+        });
+        result = await this.client.put<unknown>(route, body ?? {});
+      }
+      this.post({ kind: 'picksResult', requestId, result });
+    } catch (e) {
+      const error =
+        e instanceof HttpError ? `${e.body || e.message}` : e instanceof Error ? e.message : String(e);
+      this.post({ kind: 'picksResult', requestId, error });
     }
   }
 
@@ -1644,6 +1791,9 @@ export class GraphViewController {
   /// watched doc's per-path write chain (the one `applyEditTransaction` uses).
   async waitForPendingSave(): Promise<void> {
     if (!this.watchedDoc) return;
+    // The downloaded program of another install is never saved: it is
+    // read-only, and no verb builds it.
+    if (this.inRemoteCopy(this.watchedDoc.uri.fsPath)) return;
     // Live resolve: a detached doc's isDirty is frozen, and save() on it
     // cannot land; a fresh open from disk is never dirty (see liveDoc).
     const doc = await this.liveDoc(this.watchedDoc);
@@ -1819,6 +1969,15 @@ export class GraphViewController {
       this.post({ kind: 'editApplied', requestId, ok: false, reason: 'no document is open' });
       return;
     }
+    if (this.remoteInstall) {
+      this.post({
+        kind: 'editApplied',
+        requestId,
+        ok: false,
+        reason: `the graph shows what ${this.remoteInstall.name} runs; switch back to local to edit`,
+      });
+      return;
+    }
     const key = doc.uri.fsPath;
     try {
       const result = await this.serializeOnPath(key, async () => {
@@ -1929,6 +2088,11 @@ export class GraphViewController {
   /// project). Falls back to the file name when the doc isn't under a project
   /// root (no `weft.toml`).
   private panelTitle(doc: vscode.TextDocument): string {
+    // Another install's copy sits in a folder named by when it was
+    // fetched, so its title is the project's name and the install.
+    if (this.remoteInstall) {
+      return `Weft Graph: ${readProjectNameFromToml(doc.uri.fsPath) ?? 'project'} on ${this.remoteInstall.name}`;
+    }
     const root = findProjectRoot(doc.uri.fsPath);
     const name = root
       ? nodePath.basename(root)
@@ -1988,6 +2152,7 @@ export class GraphViewController {
   /// the compiler's escape guard; an escaping path is dropped, not written.
   /// After writing, re-parse so the graph reflects the new resolved value.
   private async saveFileRef(relPath: string, content: string): Promise<void> {
+    if (this.refusedOnInstall('Editing a file')) return;
     const doc = this.watchedDoc;
     if (!doc) return;
     // `@file` paths resolve against the PROJECT ROOT wherever they are
@@ -2153,6 +2318,7 @@ export class GraphViewController {
   /// carrying anything else the CLI does not resolve saved a file the Run
   /// menu could never run.
   private async saveSpec(spec: RunSpec): Promise<void> {
+    if (this.refusedOnInstall('Saving an example')) return;
     spec = parseRunSpec(spec);
     // The spec's OWN name. It used to travel twice, as `spec.name` and
     // as a second field copied from it, and the host then wrote the
@@ -2316,6 +2482,9 @@ export class GraphViewController {
     // every later open then revealed the dead panel and threw the same
     // error until the window was reloaded.
     this.panel = undefined;
+    // Closing the graph of another install's program leaves that install:
+    // the next graph opened is of the files on disk.
+    this.leftInstall();
     if (this.parseTimer) clearTimeout(this.parseTimer);
     // The controller object is reused across panel sessions: a parse owed to
     // the torn-down session must not carry into the next one.

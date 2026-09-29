@@ -56,28 +56,21 @@ async fn run_inner(
     // minute.
     let (running_policy, drain_timeout) =
         parse_running_choice(running_policy.as_deref(), drain_timeout)?;
-    let (client, id, name, binary_hash, definition_hash, infra_hash, image_hashes) = match project {
+    let (client, id, name, binary_hash, definition_hash, infra_hash) = match project {
         // Activate-by-id skips the build/discover step entirely.
-        Some(id) => (ctx.client(), id.clone(), id, None, None, None, None),
+        Some(id) => (ctx.client()?, id.clone(), id, None, None, None),
         None => {
+            // The build makes every place's images, a member's copies
+            // included, so a program starting a member's copy later finds
+            // its images there.
             let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
-            // A program with per-member infra starts its members' copies
-            // itself, whenever it likes, and a copy is applied from the
-            // recorded image tags: they are built and recorded here, so
-            // no `weft infra start` has to come first.
-            let image_hashes = if has_per_member_infra(&handle.plan)? {
-                Some(super::infra::build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?)
-            } else {
-                None
-            };
             (
                 handle.client,
                 handle.id,
                 handle.name,
-                Some(handle.plan.binary_hash),
-                Some(handle.plan.definition_hash),
-                Some(handle.plan.infra_hash),
-                image_hashes,
+                Some(handle.built.binary_hash),
+                Some(handle.built.definition_hash),
+                Some(handle.built.infra_hash),
             )
         }
     };
@@ -98,11 +91,9 @@ async fn run_inner(
 
     let path = format!("/projects/{id}/activate");
     let mut body = serde_json::Map::new();
-    // Only forward hashes when we actually computed them. The
-    // "activate by id" path skips the build/discover step and has
-    // no hashes to send; posting `null` here would overwrite the
-    // dispatcher's stored running hashes and silently flip drift
-    // state to "Resync needed".
+    // The hashes of the build just made, which the dispatcher checks is
+    // still the registered one. The "activate by id" path builds nothing
+    // and sends none: it activates whatever is registered.
     super::ensure::inject_hash_fields_opt(
         &mut body,
         binary_hash.as_deref(),
@@ -111,10 +102,6 @@ async fn run_inner(
     );
     if let Some(choice) = reactivate_choice {
         body.insert("reactivateChoice".into(), serde_json::Value::String(choice));
-    }
-    // SYNC: imageHashes <-> crates/weft-dispatcher/src/api/project.rs ActivationTarget::image_hashes
-    if let Some(tags) = image_hashes {
-        body.insert("imageHashes".into(), serde_json::to_value(tags)?);
     }
     body.extend(running_choice_fields(running_policy, drain_timeout));
     body.insert("scope".into(), serde_json::to_value(&scope)?);
@@ -224,16 +211,4 @@ async fn prompt_reactivate_choice(
         _ => anyhow::bail!("invalid reactivate choice '{line}'; expected 1, 2, or 3"),
     };
     Ok(Some(choice.to_string()))
-}
-
-/// Whether the compiled program has an infra node each member gets a copy
-/// of: one marked `@per_member`, one with a `@member_filled` field, or one
-/// reached from either (the compiler marks all three `per_member`).
-fn has_per_member_infra(plan: &weft_compiler::build_plan::BuildPlan) -> anyhow::Result<bool> {
-    let definition: weft_core::ProjectDefinition = serde_json::from_str(&plan.definition_json)
-        .map_err(|e| anyhow::anyhow!("read the build plan's compiled program: {e}"))?;
-    Ok(definition
-        .nodes
-        .iter()
-        .any(|n| n.requires_infra && n.per_member.is_some()))
 }

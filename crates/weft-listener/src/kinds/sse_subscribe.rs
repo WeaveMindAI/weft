@@ -20,7 +20,7 @@ use crate::registry::RegisteredSignal;
 use super::event_source::Backoff;
 use async_trait::async_trait;
 
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct SseSubscribeHandler;
@@ -29,6 +29,10 @@ pub struct SseSubscribeHandler;
 impl KindHandler for SseSubscribeHandler {
     fn tag(&self) -> &'static str {
         SseSubscribe::TAG
+    }
+
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Holds
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
@@ -183,8 +187,17 @@ fn spawn_loop(
                     continue;
                 }
             };
+            let target = match crate::infra_address::for_listener(&url, &ctx).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "address resolve failed; retrying");
+                    super::set_serving_status(&ctx, format!("address resolve failed; retrying: {e:#}"));
+                    backoff.wait_then_climb().await;
+                    continue;
+                }
+            };
             let resp = match client
-                .get(&url)
+                .get(&target)
                 .header("Accept", "text/event-stream")
                 .send()
                 .await

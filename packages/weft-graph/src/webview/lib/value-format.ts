@@ -7,7 +7,7 @@
 // WHERE the token goes (spans). The `@file` marker is reconstructed to its
 // `@file("path", Type)` source form (config never carries resolved content).
 
-import { memberFilled, memberFilledValue, parseWeftType } from '../../protocol';
+import { installPicked, memberFilled, memberFilledValue, parseWeftType } from '../../protocol';
 
 /** Structural `@file` / `@asset` reference held in a config field. The value
  *  the field resolves to lives elsewhere (host-supplied file content, or the
@@ -145,6 +145,11 @@ export function formatConfigValue(value: unknown): string {
   }
   if (isFileRefValue(value)) {
     return formatFileRef(value);
+  }
+  // A connection the install keeps has no source spelling: the compiler
+  // marks it, and nothing may write the marker back.
+  if (installPicked(value)) {
+    throw new Error('a connection picked on the install is never written in the source');
   }
   // A field each member provides: the marker, with its fallback written
   // the way any value is.

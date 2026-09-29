@@ -23,13 +23,13 @@ async fn human_query_resumes_with_approval() -> anyhow::Result<()> {
 
     // Snapshot existing executions (activation creates a TriggerSetup run) so we
     // can identify the genuine Fire execution the event creates.
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
 
     // Push an event to START a fresh execution; it runs to HumanQuery and
     // suspends. (Brief settle so the listener's SSE connect is live first.)
     tokio::time::sleep(Duration::from_secs(2)).await;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let color =
+    let execution_id =
         run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
 
     // Play the human: wait for the query form, approve it.
@@ -37,7 +37,7 @@ async fn human_query_resumes_with_approval() -> anyhow::Result<()> {
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
 
     // The suspended run resumes and completes; approval flows to Debug as true.
-    let settled = SettledRun::observe(&disp, color).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(true))?;
 

@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS trigger_activation (
             deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
             -- The trigger-setup run of the activation in flight; one run
             -- sets up every activation a verb names, so rows share it.
-            activating_color UUID,
+            activating_execution_id UUID,
             heartbeat_unix BIGINT NOT NULL DEFAULT 0,
             -- What the listeners fire, recorded when setup finished.
             activation_program JSONB,
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS trigger_activation (
         );
 CREATE UNIQUE INDEX IF NOT EXISTS trigger_activation_key
              ON trigger_activation (project_id, trigger, member_id) NULLS NOT DISTINCT;
-CREATE INDEX IF NOT EXISTS trigger_activation_color
-             ON trigger_activation (activating_color) WHERE activating_color IS NOT NULL;
+CREATE INDEX IF NOT EXISTS trigger_activation_execution_id
+             ON trigger_activation (activating_execution_id) WHERE activating_execution_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS trigger_activation_transitional
              ON trigger_activation (status) WHERE status IN ('activating', 'deactivating');

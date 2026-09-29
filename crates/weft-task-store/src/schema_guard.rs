@@ -153,6 +153,12 @@ fn validate_identifiers(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
 /// a name merely appearing somewhere in another group's text (a comment,
 /// a column name).
 fn declared_names(group: &SchemaGroup) -> Vec<String> {
+    declared_in(group.ddl.iter().copied())
+}
+
+/// The functions, enum types, and triggers the CREATE statements of
+/// `sqls` declare.
+fn declared_in<'a>(sqls: impl Iterator<Item = &'a str>) -> Vec<String> {
     const HEADS: &[&str] = &[
         "create or replace function ",
         "create function ",
@@ -161,7 +167,7 @@ fn declared_names(group: &SchemaGroup) -> Vec<String> {
         "create trigger ",
     ];
     let mut out = Vec::new();
-    for stmt in group.ddl {
+    for stmt in sqls {
         for line in stmt.lines() {
             let line = line.trim();
             let lower = line.to_ascii_lowercase();
@@ -271,6 +277,43 @@ fn edited_after_running(
         .collect()
 }
 
+/// Where the migration history starts. The history was restarted once, when
+/// weft moved off Kubernetes: every group's `origin.sql` was frozen again
+/// from the canonical DDL of that day and the migrations before it were
+/// deleted, so no database built earlier can be carried forward. Every
+/// database built since records this id (under [`HISTORY_GROUP`]) when its
+/// first group is built, and one without it is refused with the way out.
+const HISTORY_EPOCH: &str = "serverless";
+const HISTORY_GROUP: &str = "_history";
+
+/// Record the history's start on a new database, and refuse one that was
+/// built before it.
+async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
+    let (built, current): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
+                EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
+    )
+    .bind(HISTORY_GROUP)
+    .bind(HISTORY_EPOCH)
+    .fetch_one(&mut **tx)
+    .await?;
+    anyhow::ensure!(
+        !built || current,
+        "this database was built by a weft from before it moved off Kubernetes, and its \
+         tables cannot be carried forward. Wipe the old install with \
+         scripts/scrub-old-install.sh (this deletes its projects' run history and stored \
+         connections; your project folders are untouched), then run ./setup.sh."
+    );
+    if !built {
+        sqlx::query("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING")
+            .bind(HISTORY_GROUP)
+            .bind(HISTORY_EPOCH)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Bring `pool`'s schema up to what `groups` describe.
 ///
 /// The whole run executes in one transaction under an advisory lock:
@@ -308,6 +351,7 @@ pub async fn apply_groups_with(
     )
     .execute(&mut *tx)
     .await?;
+    refuse_a_database_from_before_the_history(&mut tx).await?;
 
     // Pass 1: read each group's state and refuse rewritten history, so
     // nothing runs before every group has been checked.
@@ -802,8 +846,8 @@ pub struct Planned {
 #[cfg(feature = "db-tests")]
 fn owner_of(thing: &Thing) -> Owner {
     // A trigger files under the group whose DDL DECLARES it, not the
-    // group owning the table it fires on: `worker_pod`'s liveness
-    // triggers attach to `task`, and their change is `worker_pod`'s.
+    // group owning the table it fires on: a group may attach a trigger
+    // to another group's table, and the change is the declaring group's.
     if thing.table.is_empty() || thing.kind == "trigger" {
         Owner::Named(thing.name.clone())
     } else {
@@ -879,6 +923,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
     let new_tables: std::collections::HashSet<&str> =
         new.iter().map(|t| t.table.as_str()).collect();
     let mut dropped: std::collections::HashSet<&str> = Default::default();
+    let mut dropped_functions: Vec<Planned> = Vec::new();
     for thing in old {
         if thing.kind == "index"
             && constraint_backed.contains(&(thing.table.as_str(), thing.name.as_str()))
@@ -912,8 +957,16 @@ pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
                 }
             }
         }
+        if thing.kind == "function" {
+            dropped_functions.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
+            continue;
+        }
         plan.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
     }
+    // A function goes after every trigger the plan drops: its CASCADE
+    // would take a trigger still hanging off it, and the trigger's own
+    // DROP would then fail on a trigger that is gone.
+    plan.extend(dropped_functions);
     plan
 }
 
@@ -1126,8 +1179,9 @@ fn removed(thing: &Thing) -> String {
     match thing.kind.as_str() {
         "index" => format!("DROP INDEX {};", thing.name),
         "trigger" => format!("DROP TRIGGER {} ON {};", thing.name, thing.table),
-        // CASCADE, because anything still hanging off it (a trigger this
-        // same plan also drops) must not wedge the file on ordering.
+        // CASCADE, for anything still hanging off it that the plan does
+        // not drop by name; the plan drops functions last, after the
+        // triggers it names.
         "function" => format!("DROP FUNCTION {} CASCADE;", thing.name),
         "type" => format!("DROP TYPE {};", thing.name),
         "constraint" => {
@@ -1135,7 +1189,7 @@ fn removed(thing: &Thing) -> String {
         }
         _ => format!(
             "-- Throws away what is in {}.{}. Ship this in a later release than the one \n\
-             -- that stopped reading the column, so the old pods do not fall over.\n\
+             -- that stopped reading the column, so the old instances do not fall over.\n\
              ALTER TABLE {} DROP COLUMN {};",
             thing.table, thing.name, thing.table, thing.name
         ),
@@ -1158,6 +1212,17 @@ fn history_created(group: &str, table: &str) -> bool {
         || MIGRATIONS.iter().any(|m| m.group == group && !m.draft && creates(m.sql))
 }
 
+/// Whether `group`'s released history declares the function, type or
+/// trigger `name`: how an object the canonical DDL dropped is still known
+/// to be that group's.
+#[cfg(feature = "db-tests")]
+fn history_declared(group: &str, name: &str) -> bool {
+    let history = embedded_origin(group)
+        .into_iter()
+        .chain(MIGRATIONS.iter().filter(|m| m.group == group && !m.draft).map(|m| m.sql));
+    declared_in(history).iter().any(|n| n == name)
+}
+
 /// Split a plan into one file per group, and say where each file goes.
 ///
 /// A statement is filed under the group that owns it: for a table, the
@@ -1165,7 +1230,7 @@ fn history_created(group: &str, table: &str) -> bool {
 /// longer has (the plan drops it), the group whose history created it
 /// (its `origin.sql` or a released migration); for a named table-less
 /// object (a function, a type), the group whose DDL text declares its
-/// name.
+/// name, or whose history did for one the canonical DDL dropped.
 /// Anything that matches no group is refused rather than filed somewhere
 /// plausible, since a migration in the wrong group runs against
 /// databases that never had the table.
@@ -1193,7 +1258,7 @@ pub fn file_per_group(
             })
             .or_else(|| match &planned.owner {
                 Owner::Table(table) => groups.iter().find(|g| history_created(g.name, table)),
-                Owner::Named(_) => None,
+                Owner::Named(name) => groups.iter().find(|g| history_declared(g.name, name)),
             })
             .ok_or_else(|| {
                 let what = match &planned.owner {
@@ -1697,6 +1762,17 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_plan_drops_a_function_after_the_triggers_it_backs() {
+        use super::{plan_migration, Thing};
+        let thing = |kind: &str, table: &str, name: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: String::new() };
+        let kept = thing("column", "exec_event", "execution_id");
+        let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "exec_event", "check_on_insert")];
+        let plan: Vec<String> = plan_migration(&old, &[kept]).into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, ["DROP TRIGGER check_on_insert ON exec_event;", "DROP FUNCTION check CASCADE;"]);
+    }
     // Layer-1 tests for the pure parts: the fingerprint, and which migrations
     // a database still owes.
     use std::collections::HashMap;
@@ -1728,15 +1804,15 @@ mod tests {
     fn a_non_identifier_name_is_refused() {
         let bad = super::SchemaGroup {
             name: "worker'; DROP TABLE task; --",
-            tables: &["worker_pod"],
-            ddl: &["CREATE TABLE IF NOT EXISTS worker_pod (id INT)"],
+            tables: &["worker_instance"],
+            ddl: &["CREATE TABLE IF NOT EXISTS worker_instance (id INT)"],
             seed: &[],
         };
         let err = super::validate_identifiers(&[&bad]).expect_err("a quoted name must refuse");
         assert!(err.to_string().contains("non-identifier"), "{err}");
         let good = super::SchemaGroup {
-            name: "worker_pod",
-            tables: &["worker_pod", "infra_owner2"],
+            name: "worker_instance",
+            tables: &["worker_instance", "infra_owner2"],
             ddl: &[],
             seed: &[],
         };

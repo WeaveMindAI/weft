@@ -32,7 +32,7 @@
 //! else from a worker.
 //!
 //! The resolve + record run detached from the node's future (the call may
-//! be cut by a cancel), tracked by [`PendingCostRecords`] so the pod never
+//! be cut by a cancel), tracked by [`PendingCostRecords`] so the process never
 //! exits while money is still being written down.
 
 use std::pin::Pin;
@@ -46,14 +46,14 @@ use futures::{FutureExt, Stream, StreamExt};
 
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::frames::LoopFrames;
-use weft_core::Color;
+use weft_core::ExecutionId;
 use weft_providers::{
     CallObservation, FollowUp, MeasuredCost, ObservedCall, ProviderMeter, RouteClass,
 };
 
 // ---------- Pending-record tracking ----------
 
-/// Counts cost resolutions still in flight process-wide, so the pod's exit
+/// Counts cost resolutions still in flight process-wide, so the process's exit
 /// paths can refuse to die while a call's money is still being written
 /// down. Incremented when a metered response ends (the resolve task is
 /// spawned), decremented when its record has landed (or loudly failed).
@@ -83,7 +83,7 @@ impl PendingCostRecords {
     /// Every resolve is internally bounded (the follow-up client has a
     /// request timeout, the ledger poll a fixed budget). An OPEN charge
     /// holds a token until the execution that opened it ends
-    /// (`OpenCharges::flush_color`); a report being read holds one of its
+    /// (`OpenCharges::flush_execution_id`); a report being read holds one of its
     /// own until the read returns (bounded the same way); and each record
     /// being written holds one until it is enqueued. So this returns as
     /// long as the executions being waited on have ended.
@@ -94,10 +94,10 @@ impl PendingCostRecords {
 
 // ---------- Charges awaiting the response that states their amount ----------
 
-/// What tells one open charge from every other the pod is holding: the
+/// What tells one open charge from every other the process is holding: the
 /// METER that opened it, and the id that meter chose.
 ///
-/// The id alone is not enough. One pod holds the charges of every
+/// The id alone is not enough. One process holds the charges of every
 /// service, every connection and every execution it is running, and the
 /// id is a string a meter picks: `job-1` from one provider's example
 /// meter collides with `job-1` from another's, and the collision was
@@ -106,10 +106,10 @@ impl PendingCostRecords {
 /// real figure landed on the wrong execution's trail.
 ///
 /// The service closes the collision BETWEEN meters, and that is all it
-/// closes. Two executions on one pod whose ids come from the same meter
+/// closes. Two executions on one process whose ids come from the same meter
 /// can still collide, because `report` is handed nothing but the meter
 /// and the id (the response is the only thing that arrives, and it says
-/// nothing about which run asked), so there is no color to key on at
+/// nothing about which run asked), so there is no execution to key on at
 /// lookup time. A meter that mints its own ids is what makes that
 /// reachable, which is why the trait's own docs require an id the
 /// PROVIDER assigned.
@@ -281,7 +281,7 @@ impl OpenCharges {
             // The read holds its own pending token: the charge's token can be
             // released under it (a second call displacing the charge books it
             // as unknown), and a figure this read still produces must not
-            // land after `wait_zero` let the pod exit.
+            // land after `wait_zero` let the process exit.
             sink.pending.begin();
             let result = std::panic::AssertUnwindSafe(report.meter.fold_report(
                 &report.path, report.observed, &mut scratch,
@@ -365,15 +365,15 @@ impl OpenCharges {
 
     pub fn flush(&self, why: &str) { self.close_where(|_| true, why); }
 
-    pub fn flush_color(&self, color: weft_core::Color, why: &str) {
-        self.close_where(|charge| charge.sink.color == color, why);
+    pub fn flush_execution_id(&self, execution_id: weft_core::ExecutionId, why: &str) {
+        self.close_where(|charge| charge.sink.execution_id == execution_id, why);
     }
 
     /// Book every matching charge as unknown and drop it. A charge whose
     /// report is being read right now is not booked yet: the read may
     /// still price it, so it is marked to close when the read returns
     /// (`drain_reports`). Until then it holds its pending token, and a
-    /// wait on `PendingCostRecords::wait_zero` (pod shutdown) waits for
+    /// wait on `PendingCostRecords::wait_zero` (process shutdown) waits for
     /// that read, which is bounded by the follow-up client's timeout.
     fn close_where(&self, matches: impl Fn(&OpenCharge) -> bool, why: &str) {
         let held = {
@@ -399,7 +399,7 @@ fn book_open_charge(charge: OpenCharge, why: &str) {
     // `scratch` is meter-owned and a meter may replace it wholesale, so
     // it is not guaranteed to be an object. Indexing a non-object
     // `Value` panics, and this is reached from a destructor that can
-    // run during an unwind, where a panic aborts the pod. Keep whatever
+    // run during an unwind, where a panic aborts the process. Keep whatever
     // the meter left, under a key, rather than trusting its shape.
     let mut metadata = match charge.scratch {
         serde_json::Value::Object(_) => charge.scratch,
@@ -425,11 +425,11 @@ pub struct CostSink {
     pub tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     pub pending: Arc<PendingCostRecords>,
     /// Charges opened by a call whose amount a later response states.
-    /// Pod-wide, because a charge outlives the call that opened it.
+    /// process-wide, because a charge outlives the call that opened it.
     pub open_charges: Arc<OpenCharges>,
     pub project_id: uuid::Uuid,
     pub tenant_id: String,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub node_id: String,
     pub frames: LoopFrames,
     pub service: String,
@@ -442,7 +442,7 @@ impl CostSink {
     /// Book one finished observation's figure: resolve `cost` and write
     /// it down durably, detached from the caller's future (which may be
     /// aborted at any point) and tracked by the pending counter so the
-    /// pod cannot exit while money is still being written. The one
+    /// process cannot exit while money is still being written. The one
     /// begin/spawn/record/end sequence behind every finalizer, HTTP and
     /// session alike; a session hands a ready future, an HTTP call the
     /// meter's resolve.
@@ -489,7 +489,7 @@ impl CostSink {
     /// retries is logged LOUDLY: the money trail is incomplete and says so.
     async fn record(&self, dedup_key: String, cost: MeasuredCost) {
         let payload = weft_task_store::RecordCostPayload {
-            color: self.color.to_string(),
+            execution_id: self.execution_id.to_string(),
             node_id: self.node_id.clone(),
             frames: self.frames.clone(),
             service: self.service.clone(),
@@ -517,9 +517,9 @@ impl CostSink {
                 target: weft_task_store::TaskTarget::Dispatcher,
                 project_id: Some(self.project_id),
                 dedup_key: Some(dedup_key.clone()),
-                color: Some(self.color.to_string()),
+                execution_id: Some(self.execution_id.to_string()),
                 tenant_id: self.tenant_id.clone(),
-                target_pod_name: None,
+                target_instance: None,
                 binary_hash: None,
                 payload: payload_json.clone(),
             };
@@ -839,7 +839,7 @@ struct Finalizer {
     route: String,
     /// Whether this response spent money or reports on an earlier spend.
     class: RouteClass,
-    /// The charges this pod is holding open, for a provider that states a
+    /// The charges this process is holding open, for a provider that states a
     /// call's amount on a later response.
     open_charges: Arc<OpenCharges>,
     /// The signed-in follow-up client (bounded pool + the connection's
@@ -875,7 +875,7 @@ impl Finalizer {
         // A billable call whose amount only a later response states does
         // not resolve here. The charge is opened SYNCHRONOUSLY, before this
         // returns, so the caller's very next request cannot report on a
-        // charge the pod is not yet holding.
+        // charge the process is not yet holding.
         if let Some(id) = meter.opens_charge(&route, &observed) {
             // `data` is whatever the meter's `observe` returned, and the
             // documented default hands back the response body as it
@@ -964,6 +964,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl weft_task_store::TaskStoreClient for RecordingTaskStore {
+        async fn wait_cancels(
+            &self,
+            _project_id: uuid::Uuid,
+            _execution_ids: Vec<String>,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+            Ok(Vec::new())
+        }
+
         async fn enqueue_dedup(
             &self,
             spec: weft_task_store::tasks::NewTask,
@@ -980,22 +989,22 @@ mod tests {
         }
         async fn claim_one(
             &self,
-            _pod_id: &str,
+            _instance: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
         async fn complete(
             &self,
             _task_id: uuid::Uuid,
-            _pod_id: &str,
+            _instance: &str,
             _result: serde_json::Value,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -1003,7 +1012,7 @@ mod tests {
         async fn fail(
             &self,
             _task_id: uuid::Uuid,
-            _pod_id: &str,
+            _instance: &str,
             _error: String,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -1183,7 +1192,7 @@ mod tests {
             open_charges: OpenCharges::new(),
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "testprov".into(),
@@ -1299,7 +1308,7 @@ mod tests {
                     open_charges: OpenCharges::new(),
                     project_id: uuid::Uuid::from_u128(1),
                     tenant_id: "t1".into(),
-                    color: uuid::Uuid::nil(),
+                    execution_id: uuid::Uuid::nil(),
                     node_id: "node-x".into(),
                     frames: LoopFrames::default(),
                     service: "testprov".into(),
@@ -1398,7 +1407,7 @@ mod tests {
             open_charges: OpenCharges::new(),
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
@@ -1430,7 +1439,7 @@ mod tests {
             open_charges: OpenCharges::new(),
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
@@ -1810,7 +1819,7 @@ mod open_charge_tests {
             open_charges: OpenCharges::new(),
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "queued".into(),
@@ -1818,12 +1827,12 @@ mod open_charge_tests {
         })
     }
 
-    /// A sink for one execution, sharing the pod's charge map.
+    /// A sink for one execution, sharing the process's charge map.
     fn sink_on(
         tasks: Arc<RecordingTaskStore>,
         pending: Arc<PendingCostRecords>,
         open_charges: Arc<OpenCharges>,
-        color: weft_core::Color,
+        execution_id: weft_core::ExecutionId,
     ) -> Arc<CostSink> {
         Arc::new(CostSink {
             tasks,
@@ -1831,7 +1840,7 @@ mod open_charge_tests {
             open_charges,
             project_id: uuid::Uuid::from_u128(1),
             tenant_id: "t1".into(),
-            color,
+            execution_id,
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "queued".into(),
@@ -1915,8 +1924,8 @@ mod open_charge_tests {
         let tasks = Arc::new(RecordingTaskStore::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
-        let color = uuid::Uuid::new_v4();
-        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), color);
+        let execution_id = uuid::Uuid::new_v4();
+        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
 
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
@@ -1925,7 +1934,7 @@ mod open_charge_tests {
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &http()));
-        charges.flush_color(color, "the execution ended before the job was read back");
+        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
         pending.wait_zero().await;
 
         assert_eq!(charges.count(), 0);
@@ -1948,8 +1957,8 @@ mod open_charge_tests {
         let tasks = Arc::new(RecordingTaskStore::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
-        let color = weft_core::Color::new_v4();
-        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), color);
+        let execution_id = weft_core::ExecutionId::new_v4();
+        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink: sink.clone() });
         // The fake meter yields once inside `fold_report`; the displacing
         // open lands in that window.
@@ -1960,7 +1969,7 @@ mod open_charge_tests {
         tokio::task::yield_now().await;
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
         read.await;
-        charges.flush_color(color, "the execution ended");
+        charges.flush_execution_id(execution_id, "the execution ended");
         pending.wait_zero().await;
         assert_eq!(charges.count(), 0);
         let mut amounts: Vec<Option<f64>> = recorded_payloads(&tasks).iter().map(|record| record.amount_usd).collect();
@@ -1977,10 +1986,10 @@ mod open_charge_tests {
         let tasks = Arc::new(RecordingTaskStore::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
-        let color = weft_core::Color::new_v4();
-        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), color);
+        let execution_id = weft_core::ExecutionId::new_v4();
+        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
-        charges.flush_color(color, "the execution ended before the job was read back");
+        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
         charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &http()).await;
@@ -1997,17 +2006,17 @@ mod open_charge_tests {
         let charges = OpenCharges::new();
 
         let mine_pending = PendingCostRecords::new();
-        let color = uuid::Uuid::new_v4();
-        let mine = sink_on(tasks.clone(), mine_pending.clone(), charges.clone(), color);
+        let execution_id = uuid::Uuid::new_v4();
+        let mine = sink_on(tasks.clone(), mine_pending.clone(), charges.clone(), execution_id);
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink: mine });
 
-        // Another execution on the same pod, still going. Its own
+        // Another execution on the same process, still going. Its own
         // pending tracker, so waiting for this execution's records does
         // not wait on a charge that is meant to stay open.
         let other = sink_on(tasks.clone(), PendingCostRecords::new(), charges.clone(), uuid::Uuid::new_v4());
         charges.open(QUEUED.service(), "req-2".into(), OpenCharge { token: 0, scratch: submitted("req-2").data, sink: other });
 
-        charges.flush_color(color, "the execution ended before the job was read back");
+        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
         mine_pending.wait_zero().await;
 
         assert_eq!(charges.count(), 1, "the other execution's charge is untouched");
@@ -2019,7 +2028,7 @@ mod open_charge_tests {
     /// Two SERVICES using the same job id are two charges.
     ///
     /// The id is a string a meter picks, and the shipped example meters
-    /// mint `job-1`, so a pod running two providers at once had one
+    /// mint `job-1`, so a process running two providers at once had one
     /// displace the other: the loser was booked as an unknown spend it
     /// was not, and the winner's report priced it through the loser's
     /// sink, putting a real figure on another execution's trail.
@@ -2028,17 +2037,17 @@ mod open_charge_tests {
         let tasks = Arc::new(RecordingTaskStore::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
 
-        let first = sink_on(tasks.clone(), pending.clone(), charges.clone(), color);
+        let first = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
         charges.open("queued", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, sink: first });
-        let second = sink_on(tasks.clone(), pending.clone(), charges.clone(), color);
+        let second = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
         charges.open("otherprov", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, sink: second });
 
         assert_eq!(charges.count(), 2, "neither displaced the other");
         assert!(recorded_payloads(&tasks).is_empty(), "nothing was booked as displaced");
 
-        charges.flush_color(color, "the execution ended");
+        charges.flush_execution_id(execution_id, "the execution ended");
         pending.wait_zero().await;
         assert_eq!(recorded_payloads(&tasks).len(), 2, "both spends are written down");
     }
@@ -2053,7 +2062,7 @@ mod open_charge_tests {
         let charges = sink.open_charges.clone();
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
 
-        charges.flush("the pod shut down");
+        charges.flush("the instance shut down");
         pending.wait_zero().await;
 
         let booked = recorded_payloads(&tasks);
@@ -2061,7 +2070,7 @@ mod open_charge_tests {
         assert_eq!(booked[0].amount_usd, None, "recorded AS unknown, never as zero");
         assert_eq!(booked[0].model.as_deref(), Some("m1"));
         assert!(
-            booked[0].metadata["resolution"].as_str().unwrap().contains("the pod shut down"),
+            booked[0].metadata["resolution"].as_str().unwrap().contains("the instance shut down"),
             "the trail says why it has no figure"
         );
     }

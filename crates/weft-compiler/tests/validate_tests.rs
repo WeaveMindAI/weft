@@ -2537,51 +2537,68 @@ sink.value = g.out
     );
 }
 
-/// The "no connection picked" rule is the LANGUAGE's: any node declaring a
-/// `service` recipe gets it synthesized at runtime level (no metadata
-/// boilerplate), and `connection_optional: true` on the recipe turns it off.
+/// An access node's connection is picked on each install, never written
+/// in the source: the compiler marks the field picked on the install, so
+/// no mode of the compile can say whether one is there (the install says
+/// so when a run starts, `weft_core::picks::run_picks`), and a recipe
+/// that declares the connection optional makes the field optional.
 #[test]
-fn access_nodes_require_a_connection_by_default() {
+fn an_access_nodes_connection_is_picked_on_the_install() {
     use weft_compiler::validate::{validate_with_mode, ValidationMode};
-    // Unconnected access node: the synthesized rule fires in Runtime mode
-    // only (a sketch still builds), naming the access field's message shape.
     let project = parse_enrich("ws = SlackAccess\n");
+    let node = &project.nodes.iter().find(|n| n.id == "ws").unwrap();
+    assert!(weft_core::picks::is_install_picked(&node.port_literals["account"]));
     let runtime = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
-    let hit = runtime
-        .iter()
-        .find(|d| d.code.as_deref() == Some("rule-runtime"))
-        .expect("unconnected SlackAccess must flag rule-runtime");
-    assert!(hit.message.contains("no") && hit.message.contains("connection"), "{}", hit.message);
-    let structural = validate_with_mode(&project, &catalog(), ValidationMode::Structural);
-    assert!(!codes(&structural).contains(&"rule-runtime"), "{structural:?}");
+    assert!(!codes(&runtime).contains(&"rule-runtime"), "{runtime:?}");
+    let optional = parse_enrich("p = CustomProvider { baseUrl: \"http://localhost:1\", model: \"m\" }\n");
+    let provider = optional.nodes.iter().find(|n| n.id == "p").unwrap();
+    let picked: Vec<&str> = weft_core::picks::picked_fields(provider).collect();
+    assert_eq!(picked.len(), 1);
+    assert!(matches!(
+        provider.inputs.iter().find(|i| i.name == picked[0]).unwrap().widget,
+        Some(weft_core::node::Widget::Access { optional: true, .. })
+    ));
+}
 
-    // A picked connection satisfies it.
-    let connected =
-        parse_enrich("ws = SlackAccess { account: {\"id\":\"g-1\",\"identity\":\"q\"} }\n");
-    let diags = validate_with_mode(&connected, &catalog(), ValidationMode::Runtime);
-    assert!(
-        !diags.iter().any(|d| d.code.as_deref() == Some("rule-runtime")
-            && d.message.contains("connection")),
-        "{diags:?}"
-    );
+/// A connection written in the source is the old way, refused naming the
+/// fix and the page that explains it.
+#[test]
+fn a_connection_written_in_the_source_is_refused() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let mut project = compile_with_mode(
+        "ws = SlackAccess { account: {\"id\":\"g-1\",\"identity\":\"q\"} }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Full,
+        COMPONENT,
+    )
+    .unwrap();
+    let e = enrich(&mut project, &catalog()).unwrap_err().to_string();
+    assert!(e.contains("old way") && e.contains("weft connect --node ws"), "{e}");
+    assert!(e.contains(weft_core::picks::PICKS_DOC), "{e}");
+}
 
-    // `connection_optional: true` (CustomProvider) opts out entirely.
-    let optional = parse_enrich(
-        "p = CustomProvider { baseUrl: \"http://localhost:1\", model: \"m\" }\n",
-    );
-    let diags = validate_with_mode(&optional, &catalog(), ValidationMode::Runtime);
-    assert!(
-        !diags.iter().any(|d| d.message.contains("connection picked")),
-        "an optional connection synthesizes no rule: {diags:?}"
-    );
+#[test]
+fn a_members_fallback_connection_is_refused() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let mut project = compile_with_mode(
+        "ws = SlackAccess { account: @member_filled({\"id\":\"g-1\",\"identity\":\"q\"}) }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Full,
+        COMPONENT,
+    )
+    .unwrap();
+    let e = enrich(&mut project, &catalog()).unwrap_err().to_string();
+    assert!(e.contains("falls back to a connection") && e.contains("`@member_filled` alone"), "{e}");
 }
 
 /// A metadata that still carries its OWN rule on the picker field (a
-/// project's copied catalog predating the synthesized rule) reports the
-/// mistake ONCE: the declared rule stands, the twin is not synthesized.
+/// project's copied catalog predating the synthesized rule) checks a
+/// member's connection ONCE: the declared rule stands, the twin is not
+/// synthesized.
 #[test]
 fn declared_picker_rule_suppresses_the_synthesized_twin() {
-    use weft_compiler::validate::{validate_with_mode, ValidationMode};
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("legacy");
     std::fs::create_dir_all(&node_dir).unwrap();
@@ -2610,28 +2627,21 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
     .unwrap();
     let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
     let mut project =
-        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        compile("a = LegacyAccess { account: @member_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &legacy).expect("enrich");
-    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
-    let connection_hits: Vec<_> =
-        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
-    assert_eq!(connection_hits.len(), 1, "exactly one report: {diags:?}");
-    assert!(
-        connection_hits[0].message.contains("old boilerplate"),
-        "the DECLARED rule wins: {}",
-        connection_hits[0].message
-    );
+    let rules = &project.nodes[0].member_rules.as_ref().expect("a member's rules ride along").rules;
+    let on_account: Vec<_> = rules.iter().filter(|r| r.then.field.as_deref() == Some("account")).collect();
+    assert_eq!(on_account.len(), 1, "exactly one rule: {rules:?}");
+    assert!(on_account[0].then.message.contains("old boilerplate"), "the DECLARED rule wins: {}", on_account[0].then.message);
 }
 
 /// The mirror of the above, pinning the guard's NARROWNESS: an
 /// UNRELATED declared rule on the picker field (any condition other
 /// than the synthesized not-nonempty shape) must not swallow the
 /// connection requirement, so the synthesized "no connection picked"
-/// still fires. (The declared rule's own condition needs a picked
-/// connection, so on this unpicked node only the synthesized one can.)
+/// is still among the rules a member's connection is held to.
 #[test]
 fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
-    use weft_compiler::validate::{validate_with_mode, ValidationMode};
     let dir = tempfile::tempdir().unwrap();
     let node_dir = dir.path().join("legacy");
     std::fs::create_dir_all(&node_dir).unwrap();
@@ -2660,14 +2670,12 @@ fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
     .unwrap();
     let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
     let mut project =
-        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        compile("a = LegacyAccess { account: @member_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &legacy).expect("enrich");
-    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
-    let runtime_hits: Vec<_> =
-        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
+    let rules = &project.nodes[0].member_rules.as_ref().expect("a member's rules ride along").rules;
     assert!(
-        runtime_hits.iter().any(|d| d.message.contains("has no legacy connection picked")),
-        "the synthesized rule still fires: {diags:?}"
+        rules.iter().any(|r| r.then.message.contains("has no legacy connection picked")),
+        "the synthesized rule is still there: {rules:?}"
     );
 }
 
@@ -2863,7 +2871,7 @@ fn diagnostics_carry_the_included_file() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("sub.weft"),
-        "Group() -> (out: Access) {\n  ws = SlackAccess\n  self.out = ws.access\n}\n",
+        "Group() -> (out: Number) {\n  r = Range { from: \"x\" }\n  self.out = r.value\n}\n",
     )
     .unwrap();
     let mut project = compile(
@@ -2876,8 +2884,8 @@ fn diagnostics_carry_the_included_file() {
     let diags = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
     let hit = diags
         .iter()
-        .find(|d| d.code.as_deref() == Some("rule-runtime"))
-        .expect("the included access node flags rule-runtime");
+        .find(|d| d.code.as_deref() == Some("config-type-mismatch"))
+        .expect("the included node's mistake is reported");
     assert!(
         hit.file.as_deref().unwrap_or_default().ends_with("sub.weft"),
         "the finding names the included file: {:?}",
@@ -3662,14 +3670,6 @@ send.account = ws.access
     let hit = d.iter().find(|e| e.code.as_deref() == Some("config-type-mismatch"));
     assert!(hit.is_some_and(|e| e.message.contains("string `id`")), "{d:?}");
 
-    let project = parse_enrich(
-        r##"
-ws = SlackAccess { account: {"identity": 42} }
-"##,
-    );
-    let d = validate(&project, &catalog());
-    let hit = d.iter().find(|e| e.code.as_deref() == Some("config-type-mismatch"));
-    assert!(hit.is_some_and(|e| e.message.contains("string `id`")), "{d:?}");
 }
 
 

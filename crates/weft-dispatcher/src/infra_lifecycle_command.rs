@@ -11,22 +11,24 @@
 //!   image-tag map + instance id, hashes, and decides skip / fresh /
 //!   replace internally.
 //! - **Stop**: scale to zero, preserve PVCs. Issued here.
-//! - **Terminate**: delete every resource by label, PVCs too. Issued
-//!   here.
+//! - **Terminate**: delete the copies and their disks, keeping the ones
+//!   the node lists in `keepOnTerminate` unless the command's
+//!   [`TakeDown::Terminate`] says every disk goes (a member's wipe).
+//!   Issued here.
 //!
 //! The supervisor claims through the broker's held
 //! `supervisor_claim_command` (woken by the row's own notification),
-//! acts on the cluster, and writes completion via
+//! acts on the install, and writes completion via
 //! `supervisor_command_complete`. Dispatcher-claimable verbs
 //! (Deactivate, Reactivate, Upgrade) go through `lifecycle_claimer`
 //! (this crate). No HTTP between supervisor and dispatcher; both sides
 //! talk to Postgres, the supervisor through the broker.
 //!
 //! - **Upgrade**: a person's `weft infra upgrade`, once its gates passed.
-//!   Issued here ([`issue_upgrade`]) and run by a dispatcher pod
+//!   Issued here ([`issue_upgrade`]) and run by a dispatcher
 //!   (`api::infra::run_upgrade`): the triggers reading the infra come
 //!   down, the stop leg, then the start. The row
-//!   is what the person follows, and what another pod takes over when
+//!   is what the person follows, and what another process takes over when
 //!   the one running it dies.
 
 use anyhow::Result;
@@ -56,9 +58,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- ignores it. One source of truth per verb.
             running_policy    TEXT,
             spec_json         JSONB,
-            issued_by_pod     TEXT NOT NULL,
+            issued_by_instance     TEXT NOT NULL,
             issued_at_unix    BIGINT NOT NULL,
-            claimed_by_pod    TEXT,
+            claimed_by_instance    TEXT,
             claimed_at_unix   BIGINT,
             completed_at_unix BIGINT,
             -- 'succeeded' | 'failed' | 'cancelled' | NULL.
@@ -81,9 +83,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             force             BOOLEAN NOT NULL DEFAULT FALSE,
             -- The user requested cancellation of this command while it
             -- was CLAIMED (in flight). The executing supervisor polls
-            -- this between cluster calls and halts (leaving per-node
-            -- partial state visible; the Kubernetes API is not
-            -- transactional).
+            -- this between calls to the platform and halts (leaving
+            -- per-node partial state visible; no platform applies a
+            -- whole project transactionally).
             -- Pending unclaimed rows are cancelled outright (outcome =
             -- 'cancelled') instead of flagged.
             cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -108,7 +110,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // terminate). The supervisor `claim_command` SELECT scans
         // uncompleted rows of these verbs ordered by id and gates each
         // on a live `infra_owner` lease (its single-actor authority); it
-        // does NOT use the `claimed_by_pod` lease (that is the
+        // does NOT use the `claimed_by_instance` lease (that is the
         // dispatcher's mechanism). This partial index keyed on id covers
         // that scan and skips dispatcher-owned + completed rows.
         concat!(
@@ -126,7 +128,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
-                AND claimed_by_pod IS NULL
+                AND claimed_by_instance IS NULL
                 AND verb IN ("#,
             weft_broker_client::dispatcher_verbs_sql!(),
             ")",
@@ -168,6 +170,41 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
+/// A take-down a supervisor runs: its verb with the answers only that
+/// verb has, so a force never rides a terminate and every terminate says
+/// what becomes of its kept disks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeDown {
+    /// Scale to zero, keeping the disks. `force` brings down the units
+    /// whose `on_stop` would keep them up.
+    Stop { force: bool },
+    /// Remove the copies, their disks as `disks` says.
+    Terminate { disks: weft_core::infra::TerminateDisks },
+}
+
+impl TakeDown {
+    /// A person's terminate: the disks the node lists stay.
+    pub const TERMINATE: TakeDown = TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::KeepListed };
+
+    pub fn verb(self) -> InfraLifecycleVerb {
+        match self {
+            TakeDown::Stop { .. } => InfraLifecycleVerb::Stop,
+            TakeDown::Terminate { .. } => InfraLifecycleVerb::Terminate,
+        }
+    }
+
+    /// The `(force, spec_json)` columns the command row carries.
+    fn columns(self) -> (bool, Option<serde_json::Value>) {
+        match self {
+            TakeDown::Stop { force } => (force, None),
+            TakeDown::Terminate { disks } => {
+                let work = weft_broker_client::protocol::TerminateWork { disks };
+                (false, Some(serde_json::to_value(work).expect("TerminateWork serializes")))
+            }
+        }
+    }
+}
+
 /// Enqueue a Stop or Terminate command. Returns its id; the
 /// supervisor polling for the tenant claims it on its next tick.
 pub async fn issue_lifecycle(
@@ -176,32 +213,29 @@ pub async fn issue_lifecycle(
     project_id: uuid::Uuid,
     node_id: Option<&str>,
     copies: &weft_core::member::Copies,
-    verb: InfraLifecycleVerb,
+    take_down: TakeDown,
     running_policy: RunningPolicy,
-    force: bool,
     drain_timeout_secs: u64,
-    issued_by_pod: &str,
+    issued_by_instance: &str,
 ) -> Result<i64> {
-    assert!(
-        matches!(verb, InfraLifecycleVerb::Stop | InfraLifecycleVerb::Terminate),
-        "issue_lifecycle is for Stop/Terminate; an apply is issued by the broker for a worker"
-    );
     let (member_id, every_copy) = copies.columns();
+    let (force, spec_json) = take_down.columns();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, force, drain_timeout_secs, \
-          issued_by_pod, issued_at_unix, member_id, every_copy) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10) \
+         (tenant_id, project_id, node_id, verb, running_policy, force, spec_json, drain_timeout_secs, \
+          issued_by_instance, issued_at_unix, member_id, every_copy) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, EXTRACT(EPOCH FROM NOW())::BIGINT, $10, $11) \
          RETURNING id",
     )
     .bind(tenant_id)
     .bind(project_id)
     .bind(node_id)
-    .bind(verb.as_str())
+    .bind(take_down.verb().as_str())
     .bind(running_policy.as_str())
     .bind(force)
+    .bind(spec_json)
     .bind(drain_timeout_secs as i64)
-    .bind(issued_by_pod)
+    .bind(issued_by_instance)
     .bind(member_id)
     .bind(every_copy)
     .fetch_one(pool)
@@ -228,7 +262,6 @@ pub struct UpgradeWork {
     pub binary_hash: Option<String>,
     pub definition_hash: Option<String>,
     pub infra_hash: Option<String>,
-    pub image_hashes: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
     /// The stop leg has landed: a claimer taking the upgrade over goes
     /// straight to the start (stopping again would take down what the
     /// start may already have brought up).
@@ -256,7 +289,7 @@ pub async fn issue_upgrade(
     project_id: uuid::Uuid,
     member: Option<&weft_core::member::MemberId>,
     work: &UpgradeWork,
-    issued_by_pod: &str,
+    issued_by_instance: &str,
 ) -> Result<UpgradeIssued> {
     let member = member.map(|m| m.as_str());
     let mut tx = pool.begin().await?;
@@ -283,7 +316,7 @@ pub async fn issue_upgrade(
     }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, verb, spec_json, issued_by_pod, issued_at_unix, member_id) \
+         (tenant_id, project_id, verb, spec_json, issued_by_instance, issued_at_unix, member_id) \
          VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
          RETURNING id",
     )
@@ -291,7 +324,7 @@ pub async fn issue_upgrade(
     .bind(project_id)
     .bind(InfraLifecycleVerb::Upgrade.as_str())
     .bind(sqlx::types::Json(work))
-    .bind(issued_by_pod)
+    .bind(issued_by_instance)
     .bind(member)
     .fetch_one(&mut *tx)
     .await?;
@@ -299,16 +332,16 @@ pub async fn issue_upgrade(
     Ok(UpgradeIssued::Issued(id))
 }
 
-/// Record that upgrade `command_id`'s stop leg landed, while `pod`
-/// still holds its claim. `false` when it does not (another pod took it
+/// Record that upgrade `command_id`'s stop leg landed, while `process`
+/// still holds its claim. `false` when it does not (another process took it
 /// over): the caller stops there.
-pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, pod: &str) -> Result<bool> {
+pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, instance: &str) -> Result<bool> {
     let res = sqlx::query(
         "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
-         WHERE id = $1 AND claimed_by_pod = $2 AND completed_at_unix IS NULL",
+         WHERE id = $1 AND claimed_by_instance = $2 AND completed_at_unix IS NULL",
     )
     .bind(command_id)
-    .bind(pod)
+    .bind(instance)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -327,8 +360,8 @@ const INFRA_WORK_VERBS_SQL: &str = concat!(weft_broker_client::supervisor_verbs_
 // for supervisor verbs, and by the dispatcher's `lifecycle_claimer`
 // for Deactivate / Reactivate / Upgrade. There is no shared helper because the
 // two claim paths enforce different ownership invariants (broker
-// requires SA-authenticated supervisor pod; dispatcher claims by
-// pod_id with a lease).
+// requires SA-authenticated supervisor process; dispatcher claims by
+// instance with a lease).
 
 /// Wait for a previously-issued command to reach a terminal state.
 /// Returns a typed outcome that distinguishes "the claimer hit a
@@ -337,10 +370,9 @@ const INFRA_WORK_VERBS_SQL: &str = concat!(weft_broker_client::supervisor_verbs_
 /// a `Failed` is a user-visible problem, a `Cancelled` is "no
 /// longer applicable" and shouldn't show up as a failure.
 ///
-/// `Timeout` fires when the supervisor never marks the row
-/// complete within the deadline (typical when no supervisor pod is
-/// alive in the tenant namespace; the caller decides whether to
-/// proceed with cleanup anyway).
+/// `Timeout` fires when no supervisor marks the row complete within
+/// the deadline (typical when no supervisor is running; the caller
+/// decides whether to proceed with cleanup anyway).
 #[derive(Debug, Clone)]
 pub enum WaitOutcome {
     Succeeded,
@@ -549,9 +581,9 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 /// its start): the shared copies' (`member` `None`, which also reaches
 /// a command for every copy, since that one takes the shared copies
 /// down too) or one member's. Flags CLAIMED rows (`cancel_requested =
-/// TRUE`; the executing supervisor polls the flag between cluster
+/// TRUE`; the executing supervisor polls the flag between install
 /// calls and halts) and completes still-UNCLAIMED rows outright with
-/// outcome `cancelled` (nothing has touched the cluster for them yet).
+/// outcome `cancelled` (nothing has touched the install for them yet).
 /// Flag first, then complete: a row claimed between the two statements
 /// has its flag already set, so no window exists where a command
 /// escapes the cancel. Dispatcher-owned verbs (deactivate /
@@ -581,7 +613,7 @@ pub async fn request_cancel_owner(
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = 'cancelled', \
              outcome_message = 'cancelled by user before execution' \
-         WHERE {owner} AND claimed_by_pod IS NULL"
+         WHERE {owner} AND claimed_by_instance IS NULL"
     ))
     .bind(project_id)
     .bind(member)
@@ -642,6 +674,36 @@ mod tests {
         ] {
             assert_eq!(InfraLifecycleVerb::parse(v.as_str()), Some(v));
         }
+    }
+
+    /// A terminate carries what becomes of its kept disks on the row, in
+    /// the shape the supervisor reads back; a stop carries only its force.
+    #[test]
+    fn a_take_down_carries_its_answers_on_the_command() {
+        use weft_broker_client::protocol::{SupervisorCommandRow, TerminateWork};
+        use weft_core::infra::TerminateDisks;
+        let read_back = |take_down: TakeDown| {
+            let (force, spec_json) = take_down.columns();
+            let row = SupervisorCommandRow {
+                id: 1,
+                project_id: uuid::Uuid::from_u128(1),
+                node_id: None,
+                copies: weft_core::member::Copies::Shared,
+                verb: take_down.verb(),
+                running_policy: Some(RunningPolicy::Cancel),
+                spec_json,
+                force,
+                drain_timeout_secs: 60,
+            };
+            (row.force, row.terminate_work())
+        };
+        let wipe = TakeDown::Terminate { disks: TerminateDisks::DeleteAll };
+        assert_eq!(wipe.verb(), InfraLifecycleVerb::Terminate);
+        assert_eq!(read_back(wipe), (false, Ok(TerminateWork { disks: TerminateDisks::DeleteAll })));
+        assert_eq!(read_back(TakeDown::TERMINATE), (false, Ok(TerminateWork { disks: TerminateDisks::KeepListed })));
+        let stop = TakeDown::Stop { force: true };
+        assert_eq!(stop.verb(), InfraLifecycleVerb::Stop);
+        assert_eq!(stop.columns(), (true, None));
     }
 
     #[test]

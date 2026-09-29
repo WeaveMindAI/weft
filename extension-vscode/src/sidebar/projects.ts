@@ -61,9 +61,25 @@ export function findProjectRoot(entryFsPath: string): string | undefined {
   return undefined;
 }
 
+/** The project's name from its `weft.toml`, if any. */
+export function readProjectNameFromToml(entryFsPath: string): string | undefined {
+  const root = findProjectRoot(entryFsPath);
+  if (!root) return undefined;
+  try {
+    return extractPackageField(fs.readFileSync(path.join(root, 'weft.toml'), 'utf8'), 'name');
+  } catch {
+    return undefined;
+  }
+}
+
 function extractPackageId(toml: string): string | undefined {
-  // Match `id = "..."` inside a `[package]` section.
+  return extractPackageField(toml, 'id');
+}
+
+/** A `field = "..."` inside the `[package]` section. */
+function extractPackageField(toml: string, field: string): string | undefined {
   let inPackage = false;
+  const pattern = new RegExp(`^${field}\\s*=\\s*"([^"]+)"`);
   for (const rawLine of toml.split('\n')) {
     const line = rawLine.trim();
     if (line.startsWith('[')) {
@@ -71,7 +87,7 @@ function extractPackageId(toml: string): string | undefined {
       continue;
     }
     if (!inPackage) continue;
-    const m = line.match(/^id\s*=\s*"([^"]+)"/);
+    const m = line.match(pattern);
     if (m) return m[1];
   }
   return undefined;

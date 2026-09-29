@@ -11,6 +11,7 @@ export interface SseSubscription {
 
 function subscribeSse(
     url: string,
+    headers: Record<string, string>,
     onData: (data: string) => void,
     onError?: (err: unknown) => void,
     onClosed?: () => void,
@@ -21,7 +22,7 @@ function subscribeSse(
     (async () => {
         try {
             const res = await fetch(url, {
-                headers: { accept: 'text/event-stream' },
+                headers: { ...headers, accept: 'text/event-stream' },
                 signal: controller.signal,
             });
             if (!res.ok || !res.body) {
@@ -101,29 +102,84 @@ async function httpError(method: string, path: string, res: Response): Promise<H
 // Tracked separately from this slice; each new endpoint should
 // still go through this client for the moment.
 export class DispatcherClient {
-  constructor(private baseUrl: string) {}
+  /// The operator key a request to a remote install carries; the local
+  /// install needs none.
+  private operatorKey: string | undefined;
+  /// Where requests go, or `null` while there is no address to go to (a
+  /// named install never started); then every request fails with
+  /// `unavailable`, and the extension stays up until an address appears.
+  private baseUrl: string | null = null;
+  private unavailable = 'weft: no install to talk to yet';
+  /// Added to a connection failure: where this address came from, so the
+  /// person knows what to fix.
+  private unreachableHint: string | undefined;
+  private readonly installListeners: Array<() => void> = [];
 
-  setBaseUrl(url: string) {
+  /// Point every request, and every stream, at another install: the
+  /// local one (no key) or a target of the project with its operator
+  /// key. Streams reconnect there through `onInstallChange`.
+  setInstall(url: string, operatorKey: string | undefined, unreachableHint?: string) {
+    this.unreachableHint = unreachableHint;
+    if (url === this.baseUrl && operatorKey === this.operatorKey) return;
     this.baseUrl = url;
+    this.operatorKey = operatorKey;
+    for (const listener of this.installListeners) listener();
+  }
+
+  /// There is no install to talk to, for `reason`: requests fail with it
+  /// until the next `setInstall`.
+  setUnavailable(reason: string) {
+    this.unavailable = reason;
+    if (this.baseUrl === null) return;
+    this.baseUrl = null;
+    this.operatorKey = undefined;
+    for (const listener of this.installListeners) listener();
+  }
+
+  private url(path: string): string {
+    if (this.baseUrl === null) throw new Error(this.unavailable);
+    return `${this.baseUrl}${path}`;
+  }
+
+  /// `fetch`, with a connection failure named: the address, and where
+  /// it came from.
+  private async send(path: string, init: RequestInit): Promise<Response> {
+    const url = this.url(path);
+    try {
+      return await fetch(url, init);
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') throw e;
+      const hint = this.unreachableHint ? `; ${this.unreachableHint}` : '';
+      throw new Error(`cannot reach weft at ${this.baseUrl}: ${e instanceof Error ? e.message : e}${hint}`, { cause: e });
+    }
+  }
+
+  /// Called after every `setInstall` that changed the install.
+  onInstallChange(listener: () => void): void {
+    this.installListeners.push(listener);
+  }
+
+  private headers(extra: Record<string, string> = {}): Record<string, string> {
+    return this.operatorKey ? { ...extra, authorization: `Bearer ${this.operatorKey}` } : extra;
   }
 
   /// The address this client reaches the dispatcher at. The webview's
   /// CSP needs it: a minted file link comes back on whichever host the
   /// request went out on, so the origin to allow is this one.
-  getBaseUrl(): string {
+  getBaseUrl(): string | null {
     return this.baseUrl;
   }
 
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, { signal });
+    const res = await this.send(path, { signal, headers: this.headers() });
     if (!res.ok) throw await httpError('GET', path, res);
     return (await res.json()) as T;
   }
 
   async post<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.send(path, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (!res.ok) throw await httpError('POST', path, res);
@@ -131,8 +187,19 @@ export class DispatcherClient {
     return (text ? JSON.parse(text) : ({} as unknown)) as T;
   }
 
+  async put<T>(path: string, body: unknown): Promise<T> {
+    const res = await this.send(path, {
+      method: 'PUT',
+      headers: this.headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw await httpError('PUT', path, res);
+    const text = await res.text();
+    return (text ? JSON.parse(text) : ({} as unknown)) as T;
+  }
+
   async del(path: string): Promise<void> {
-    const res = await fetch(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    const res = await this.send(path, { method: 'DELETE', headers: this.headers() });
     if (!res.ok && res.status !== 204) throw await httpError('DELETE', path, res);
   }
 
@@ -154,13 +221,23 @@ export class DispatcherClient {
       onOpen?: () => void;
     },
   ): SseSubscription {
+    const onError = (err: unknown) => {
+      if (handlers?.onError) handlers.onError(err);
+      else console.warn('[weft/dispatcher] SSE subscription failed:', err);
+    };
+    // No install to stream from: the stream fails the way a refused one
+    // does, after this returns, so every caller's error path runs as usual.
+    if (this.baseUrl === null) {
+      const err = new Error(this.unavailable);
+      let closed = false;
+      queueMicrotask(() => { if (!closed) onError(err); });
+      return { close: () => { closed = true; } };
+    }
     return subscribeSse(
-      `${this.baseUrl}${path}`,
+      this.url(path),
+      this.headers(),
       (data) => onEvent({ data }),
-      (err) => {
-        if (handlers?.onError) handlers.onError(err);
-        else console.warn('[weft/dispatcher] SSE subscription failed:', err);
-      },
+      onError,
       handlers?.onClosed,
       handlers?.onOpen,
     );

@@ -663,7 +663,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         // The target arm needs no generator guard: the early return
         // above already proved one endpoint of this edge is a stream.
         let banned_endpoint =
-            tgt.node_type == "LoopOut" || (src.node_type == "LoopOut" && src_generator);
+            tgt.node_type == weft_core::project::boundary_types::LOOP_OUT || (src.node_type == weft_core::project::boundary_types::LOOP_OUT && src_generator);
         if banned_endpoint {
             push(d, file, span, Severity::Error, "generator-through-group",
                 format!(
@@ -1307,7 +1307,7 @@ fn enclosing_scope_hint(
             .get(weft_core::project::boundary_in_id(g).as_str())
             .is_some_and(|n| n.outputs.iter().any(|p| p.name == handle))
     })?;
-    let inner_kind = if src.node_type == "LoopIn" { "loop" } else { "group" };
+    let inner_kind = if src.node_type == weft_core::project::boundary_types::LOOP_IN { "loop" } else { "group" };
     let inner = &boundary.group_id;
     let inner_short = inner.rsplit('.').next().unwrap_or(inner);
     Some(format!(
@@ -1680,6 +1680,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // (`literal_type`), so `@asset("a.png", Image)` on an Image port
         // is a match and on a Video port a mismatch.
         for (key, value) in &node.port_literals {
+            // A connection picked on the install holds no value in the
+            // program: the install checks the pick when it is made.
+            if weft_core::picks::is_install_picked(value) {
+                continue;
+            }
             // A `@member_filled` field is checked through its fallback,
             // the one value of it known now; the member's own value is
             // checked when they give it (`weft_core::member`).
@@ -2003,6 +2008,9 @@ fn check_port_coverage(
 
             // The widget-level literal checks read the one home.
             let literal_value = node.port_literals.get(&input.name).and_then(|value| {
+                if weft_core::picks::is_install_picked(value) {
+                    return None;
+                }
                 match weft_core::member::as_member_filled(value) {
                     Some(filled) => filled.fallback,
                     None => Some(value),
@@ -2122,7 +2130,7 @@ fn check_port_coverage(
         // declared inputs at all, so every config key would
         // false-positive here.
         if !node.features.can_add_input_ports
-            && !matches!(node.node_type.as_str(), "LoopIn" | "LoopOut")
+            && !matches!(node.node_type.as_str(), weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT)
             && catalog.lookup(&node.node_type).is_some()
         {
             let Some(obj) = node.config.as_object() else { continue };
@@ -2593,8 +2601,8 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for n in &project.nodes {
         let Some(gb) = &n.group_boundary else { continue };
         match n.node_type.as_str() {
-            "LoopIn" => { ins.insert(gb.group_id.as_str(), n); }
-            "LoopOut" => { outs.insert(gb.group_id.as_str(), n); }
+            weft_core::project::boundary_types::LOOP_IN => { ins.insert(gb.group_id.as_str(), n); }
+            weft_core::project::boundary_types::LOOP_OUT => { outs.insert(gb.group_id.as_str(), n); }
             _ => {}
         }
     }

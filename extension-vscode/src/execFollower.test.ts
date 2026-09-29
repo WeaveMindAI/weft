@@ -26,7 +26,7 @@ class FakeDispatcher extends DispatcherClient {
 }
 
 function completed(node: string): DispatcherEvent {
-  return { event_id: `event:${node}`, kind: 'node_completed', color: 'a', project_id: 'p', node, frames: [], output: {}, at_unix: 1 };
+  return { event_id: `event:${node}`, kind: 'node_completed', execution_id: 'a', project_id: 'p', node, frames: [], output: {}, at_unix: 1 };
 }
 
 function rig() {
@@ -71,7 +71,7 @@ describe('execution history and live follow', () => {
     await following;
     expect(client.reads[0].signal?.aborted).toBe(true);
     expect(client.subscriptions[0].closed).toBe(true);
-    expect(posted.at(-1)).toEqual({ kind: 'followLost', color: 'a', reason: 'error' });
+    expect(posted.at(-1)).toEqual({ kind: 'followLost', executionId: 'a', reason: 'error' });
     expect(posted.some((e) => e.kind === 'execEvent')).toBe(false);
   });
 
@@ -98,7 +98,7 @@ describe('execution history and live follow', () => {
     await following;
     expect(client.reads).toHaveLength(0);
     expect(client.subscriptions[0].closed).toBe(true);
-    expect(posted.at(-1)).toEqual({ kind: 'followLost', color: 'a', reason: 'closed' });
+    expect(posted.at(-1)).toEqual({ kind: 'followLost', executionId: 'a', reason: 'closed' });
   });
 
   it('stopping while connecting settles the pending follow', async () => {
@@ -141,6 +141,6 @@ describe('execution history and live follow', () => {
     client.reads[0].resolve([completed('stale')]);
     await following;
     expect(posted.some((e) => e.kind === 'execEvent')).toBe(false);
-    expect(posted.at(-1)).toEqual({ kind: 'followLost', color: 'a', reason: 'closed' });
+    expect(posted.at(-1)).toEqual({ kind: 'followLost', executionId: 'a', reason: 'closed' });
   });
 });

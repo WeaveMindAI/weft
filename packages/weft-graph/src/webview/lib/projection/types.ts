@@ -109,14 +109,20 @@ export interface LockState {
    *  or a UI toggle. */
   lockGraphLogic: boolean;
   lockReason?: string;
+  /** The install whose program the graph shows, when not the local one:
+   *  that source is a copy, so nothing unlocks it but switching back. */
+  installReadOnly?: string;
 }
 
 export function isLogicLocked(lock: LockState, now: number): boolean {
-  return (lock.codeEditLockUntil !== null && now < lock.codeEditLockUntil) || lock.lockGraphLogic;
+  return (lock.codeEditLockUntil !== null && now < lock.codeEditLockUntil) || lock.lockGraphLogic || lock.installReadOnly !== undefined;
 }
 
 /** The user-facing reason for a lock rejection. */
 export function lockReasonText(lock: LockState, now: number): string {
+  if (lock.installReadOnly !== undefined) {
+    return `This is what ${lock.installReadOnly} runs, read-only; switch to local (top right) to edit`;
+  }
   if (lock.lockGraphLogic) {
     return lock.lockReason
       ? `Graph logic locked (${lock.lockReason})`

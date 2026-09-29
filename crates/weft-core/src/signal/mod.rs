@@ -1,7 +1,7 @@
 //! Wake-signal kinds.
 //!
 //! A wake signal is "something the listener listens for on behalf of
-//! a node." Each kind (timer, form, sse_subscribe, route, ...) is
+//! a node." Each kind (timer, form, sse_subscribe, route, socket, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
 //! `ctx.await_signal(...)` (mid-execution resume). The framework
@@ -17,6 +17,10 @@
 //! 3. Create `weft-listener/src/kinds/<name>.rs` with the handler
 //!    impl + registration.
 //!
+//! A kind whose fire is a caller waiting on the line sets
+//! `Signal::CALLER` and answers `Signal::live_connection`; the install's
+//! live door then serves it, whatever the kind is called.
+//!
 //! No central enum, no match dispatch. The framework discovers kinds
 //! at startup via the `inventory` registry.
 
@@ -26,6 +30,10 @@
 // typed runtime kind (cron/chrono/inventory deps), runtime-gated.
 pub mod predicate;
 pub use predicate::{Predicate, PredicateOp};
+
+// Wire-pure like `predicate`: `SignalSpec` carries it.
+pub mod limits;
+pub use limits::{EntryLimits, ResolvedLimits};
 
 // The dispatcher <-> listener wire, also wire-pure, so the dispatcher
 // speaks it without linking the listener.
@@ -68,7 +76,7 @@ pub use socket_listen::{SocketFrame, SocketListen};
 pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
 #[cfg(feature = "runtime")]
 pub use live_connection::{
-    protocol_for_tag, Backpressure, DataType, ErrorMode, JournalMode, LiveConnectionConfig,
+    Backpressure, DataType, ErrorMode, JournalMode, LiveConnectionConfig,
     Protocol, Route, Socket, DEFAULT_CALLER_SILENCE_SECS,
 };
 
@@ -105,6 +113,20 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// config blob. Default `false`: most kinds address a public URL
     /// and take a connection only when the author wires one.
     const REQUIRES_ACCESS: bool = false;
+
+    /// For a kind that serves a caller waiting on the line (its run is
+    /// driven inside that caller's own request): the protocol the caller
+    /// speaks. Such a kind goes through the install's live door
+    /// (`/connect/...`, then `/live/...` to the worker holding the run)
+    /// and hands [`Signal::live_connection`] its connection settings.
+    /// Default `None`: nobody waits on the line.
+    const CALLER: Option<live_connection::Protocol> = None;
+
+    /// The caller's connection settings, for a kind that sets
+    /// [`Signal::CALLER`]; every such kind must answer `Some`.
+    fn live_connection(&self) -> Option<&live_connection::LiveConnectionConfig> {
+        None
+    }
 
     /// Validate the kind's configuration. Override to surface
     /// kind-specific rules (cron expression parses, URL is http(s),
@@ -171,6 +193,8 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         match_predicates: kind.match_predicates().to_vec(),
         config: serde_json::to_value(&kind).expect("kind serialization is infallible"),
         consumer_kind,
+        limits: crate::signal::EntryLimits::default(),
+        run_class: crate::run_class::RunClass::default(),
     }
 }
 
@@ -193,6 +217,10 @@ pub struct SignalKindEntry {
     /// `Err` when the stored config no longer matches the kind's shape,
     /// which is the same failure the listener reports when it renders.
     pub stored_file_json: fn(&Value, &str) -> Result<Option<crate::storage::StoredFile>, String>,
+    /// [`Signal::CALLER`], reachable from a tag alone.
+    pub caller: Option<live_connection::Protocol>,
+    /// Parse `config` as the typed kind and ask [`Signal::live_connection`].
+    pub live_connection_json: fn(&Value) -> Result<Option<live_connection::LiveConnectionConfig>, String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -205,6 +233,26 @@ fn lookup(tag: &str) -> Option<&'static SignalKindEntry> {
     inventory::iter::<SignalKindEntry>
         .into_iter()
         .find(|e| e.tag == tag)
+}
+
+/// The protocol a caller of this kind speaks, when the kind serves one
+/// ([`Signal::CALLER`]); `None` for every other kind and for an unknown
+/// tag.
+#[cfg(feature = "runtime")]
+pub fn caller_protocol(tag: &str) -> Option<live_connection::Protocol> {
+    lookup(tag).and_then(|e| e.caller)
+}
+
+/// A caller-serving signal's protocol and connection settings, read from
+/// its wire shape by the kind's own rule. `Err` when the kind serves no
+/// caller, is not registered here, or its stored config no longer parses.
+#[cfg(feature = "runtime")]
+pub fn live_connection(spec: &SignalSpec) -> Result<(live_connection::Protocol, live_connection::LiveConnectionConfig), String> {
+    let entry = lookup(&spec.kind).ok_or_else(|| format!("unknown signal kind '{}'", spec.kind))?;
+    let protocol = entry.caller.ok_or_else(|| format!("a '{}' signal serves no caller on the line", spec.kind))?;
+    let config = (entry.live_connection_json)(&spec.config)?
+        .ok_or_else(|| format!("kind '{}' declares a caller but hands no connection settings", spec.kind))?;
+    Ok((protocol, config))
 }
 
 /// The stored file a wire-shape `SignalSpec` shows under `field`, by
@@ -234,6 +282,16 @@ pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
         return Err(format!(
             "signal kind '{}' acts as a connection, but none was set; build the kind with \
              the access value the node's input carries",
+            spec.kind
+        ));
+    }
+    // A live caller's run is driven inside the caller's own request, so
+    // it lives exactly as long as that request may: it cannot be a job.
+    if spec.run_class == crate::run_class::RunClass::Long && entry.caller.is_some() {
+        return Err(format!(
+            "a '{}' signal serves a caller who is waiting on the line, so its run is driven \
+             inside their request and cannot be `long`; leave its run class `short`, and hand \
+             long work to a separate run the route starts",
             spec.kind
         ));
     }
@@ -268,6 +326,15 @@ macro_rules! register_signal_kind {
                             <$ty as $crate::signal::Signal>::TAG
                         ))?;
                     <$ty as $crate::signal::Signal>::stored_file(&typed, field)
+                },
+                caller: <$ty as $crate::signal::Signal>::CALLER,
+                live_connection_json: |config: &::serde_json::Value| {
+                    let typed: $ty = ::serde_json::from_value(config.clone())
+                        .map_err(|e| format!(
+                            "kind '{}' config does not deserialize: {e}",
+                            <$ty as $crate::signal::Signal>::TAG
+                        ))?;
+                    ::core::result::Result::Ok(<$ty as $crate::signal::Signal>::live_connection(&typed).cloned())
                 },
             }
         }

@@ -121,7 +121,7 @@
 //! ## "wait" vs "park" vocabulary
 //!
 //! The word "park" in this codebase already names `ctx.await_signal`:
-//! the worker pod is swapped, a fresh worker resumes from the journal,
+//! the worker is swapped, a fresh worker resumes from the journal,
 //! the body re-flows through. That's workflow-level suspension. The bus
 //! has nothing to do with that. A cursor's `next().await` is plain
 //! in-process tokio await; the worker stays alive; no swap; no journal
@@ -801,7 +801,7 @@ impl BusInner {
     /// every other participant (including `BusHandle::drop`, which
     /// runs DURING the panicking task's unwind) would panic on the
     /// lock, and a panic-during-unwind aborts the whole worker
-    /// process, killing every execution on the pod.
+    /// process, killing every execution on the process.
     fn lock_log(&self) -> std::sync::MutexGuard<'_, Vec<BusEntry>> {
         self.log
             .lock()

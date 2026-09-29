@@ -3,7 +3,7 @@
 //! them, each on its own task with its claim renewed while it runs (an
 //! upgrade can wait on a drain for hours). The complementary
 //! supervisor-owned verbs (`apply` / `stop` / `terminate`) are
-//! claimed by the pooled supervisor pod that owns the project, via the
+//! claimed by the pooled supervisor process that owns the project, via the
 //! broker.
 //!
 //! Why a separate loop rather than reusing the supervisor's claim
@@ -13,7 +13,7 @@
 //! granting the supervisor signal-write access, breaking the
 //! tenant-scoping invariant.
 //!
-//! Concurrency: every dispatcher Pod runs one of these loops;
+//! Concurrency: every dispatcher runs one of these loops;
 //! `FOR UPDATE SKIP LOCKED` in the claim SQL keeps them from
 //! double-claiming.
 //!
@@ -28,7 +28,7 @@ use sqlx::PgPool;
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
 
 use crate::infra_lifecycle_command::InfraLifecycleVerb;
-use crate::pg_wake::{self, DrainStep, WakeOn};
+use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 use crate::state::DispatcherState;
 
 /// A command being issued, for any project: the claimer serves them all.
@@ -37,22 +37,16 @@ const WAKE_ON: &[WakeOn] = &[WakeOn {
     concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. })),
 }];
 
-pub fn spawn(state: DispatcherState) {
-    crate::app::spawn_supervised("lifecycle_claimer", async move {
-        pg_wake::run(
-            state.signals.subscribe(),
-            WAKE_ON,
-            pg_wake::SAFETY_POLL_INTERVAL,
-            "weft_dispatcher::lifecycle_claimer",
-            || async {
-                match claim_and_run_one(&state).await? {
-                    true => Ok(DrainStep::More),
-                    false => Ok(DrainStep::Done),
-                }
-            },
-        )
-        .await;
-    });
+pub fn drain_loop(state: DispatcherState) -> DrainLoop {
+    DrainLoop::new("lifecycle_claimer", WAKE_ON, SAFETY_POLL_INTERVAL, move || {
+        let state = state.clone();
+        async move {
+            match claim_and_run_one(&state).await? {
+                true => Ok(DrainStep::More),
+                false => Ok(DrainStep::Done),
+            }
+        }
+    })
 }
 
 /// Three terminal outcomes a dispatcher-claimed verb can produce.
@@ -73,11 +67,11 @@ enum RunOutcome {
 /// never holds up the next claim.
 ///
 /// Contract: if `claim_one` returns a claimed row, EXACTLY ONE
-/// `complete()` write follows, by this pod while it still holds the
+/// `complete()` write follows, by this process while it still holds the
 /// claim. The handler returns a typed `RunOutcome` so "no longer
 /// applicable" cancellations are distinguished from real failures.
 async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
-    let Some(row) = claim_one(&state.pg_pool, state.pod_id.as_str()).await? else {
+    let Some(row) = claim_one(&state.pg_pool, &state.instance).await? else {
         return Ok(false);
     };
     let state = state.clone();
@@ -86,30 +80,30 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
 }
 
 /// Run one claimed command to its outcome and record it, renewing the
-/// claim meanwhile. When the claim is lost (this pod could not renew it
-/// for a whole lease and another pod took the command over), the run
+/// claim meanwhile. When the claim is lost (this process could not renew it
+/// for a whole lease and another process took the command over), the run
 /// stops here and the new holder answers for it.
 async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
-    let pod = state.pod_id.as_str();
+    let instance = state.instance.as_str();
     let outcome = tokio::select! {
         outcome = run_claimed(state, &row) => outcome.unwrap_or_else(|e| RunOutcome::Failed(format!("{e:#}"))),
-        () = hold_claim(&state.pg_pool, row.id, pod) => {
+        () = hold_claim(&state.pg_pool, row.id, instance) => {
             tracing::warn!(
                 target: "weft_dispatcher::lifecycle_claimer",
                 command_id = row.id,
                 verb = %row.verb,
-                "the claim on this command was taken over by another pod; it answers for it now"
+                "the claim on this command was taken over by another instance; it answers for it now"
             );
             return;
         }
     };
-    if let Err(e) = complete(&state.pg_pool, row.id, pod, &outcome).await {
+    if let Err(e) = complete(&state.pg_pool, row.id, instance, &outcome).await {
         tracing::error!(
             target: "weft_dispatcher::lifecycle_claimer",
             command_id = row.id,
             verb = %row.verb,
             error = %format!("{e:#}"),
-            "the command ran but its outcome could not be recorded; the claim lapses and another pod runs it again"
+            "the command ran but its outcome could not be recorded; the claim lapses and another instance runs it again"
         );
         return;
     }
@@ -132,11 +126,11 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
     }
 }
 
-/// Renew `pod`'s claim on command `id` every `CLAIM_RENEW_INTERVAL`,
-/// returning only once the claim is no longer this pod's. A renewal that
+/// Renew `process`'s claim on command `id` every `CLAIM_RENEW_INTERVAL`,
+/// returning only once the claim is no longer this process's. A renewal that
 /// cannot reach the database is retried at the next interval: the lease
 /// outlives several of them.
-async fn hold_claim(pool: &PgPool, id: i64, pod: &str) {
+async fn hold_claim(pool: &PgPool, id: i64, instance: &str) {
     let mut every = tokio::time::interval(weft_broker_client::lifecycle_command::CLAIM_RENEW_INTERVAL);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     every.tick().await; // the first tick fires at once: the claim is fresh
@@ -144,10 +138,10 @@ async fn hold_claim(pool: &PgPool, id: i64, pod: &str) {
         every.tick().await;
         let renewed = sqlx::query(
             "UPDATE infra_lifecycle_command SET claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
-             WHERE id = $1 AND claimed_by_pod = $2 AND completed_at_unix IS NULL",
+             WHERE id = $1 AND claimed_by_instance = $2 AND completed_at_unix IS NULL",
         )
         .bind(id)
-        .bind(pod)
+        .bind(instance)
         .execute(pool)
         .await;
         match renewed {
@@ -209,18 +203,18 @@ pub struct ClaimedCommand {
 /// Atomic claim: UPDATE the row AND parse its typed columns in one
 /// step. A parse failure on a successfully-claimed row would
 /// otherwise leave it claimed-but-never-completed, because the
-/// `WHERE claimed_by_pod IS NULL` filter excludes it from future
+/// `WHERE claimed_by_instance IS NULL` filter excludes it from future
 /// claims.
 ///
 /// Strategy: if `try_get` / `parse` fails on a row we just claimed,
 /// write `complete(failed, msg)` BEFORE returning the error. The
 /// caller's contract ("exactly one complete per claim") stays
 /// intact.
-pub async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<ClaimedCommand>> {
+pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<ClaimedCommand>> {
     use sqlx::Row;
     // Claim predicate (shared with the broker's supervisor claim):
     // either no current claimer OR an expired lease. The lease lets
-    // a dispatcher pod that crashed mid-execution release the row
+    // a dispatcher that crashed mid-execution release the row
     // automatically after `CLAIM_LEASE_TTL` instead of pinning it.
     //
     // A project's health verbs (`deactivate` / `reactivate`) run one at
@@ -230,7 +224,7 @@ pub async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<Claime
     // upgrade is not held behind them, nor holds them.
     let sql = format!(
         "UPDATE infra_lifecycle_command \
-         SET claimed_by_pod = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
+         SET claimed_by_instance = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
             SELECT c.id FROM infra_lifecycle_command c \
             WHERE c.verb IN ({verbs}) \
@@ -255,7 +249,7 @@ pub async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<Claime
         ),
     );
     let row = sqlx::query(&sql)
-        .bind(claimer_pod)
+        .bind(claimer_instance)
         .fetch_optional(pool)
         .await?;
     let Some(r) = row else { return Ok(None) };
@@ -270,7 +264,7 @@ pub async fn claim_one(pool: &PgPool, claimer_pod: &str) -> Result<Option<Claime
             // Best-effort complete: if THIS write also fails we
             // surface both via the bubbled error; the safety poll
             // will retry through the listener loop.
-            if let Err(complete_err) = complete(pool, id, claimer_pod, &outcome).await {
+            if let Err(complete_err) = complete(pool, id, claimer_instance, &outcome).await {
                 anyhow::bail!(
                     "claim parse failed ({parse_err}); subsequent complete also failed: {complete_err}"
                 );
@@ -317,22 +311,22 @@ fn project_outcome(
     }
 }
 
-/// Record `outcome` on command `id`, only while `pod` still holds its
-/// claim: a pod whose claim was taken over never answers for the
+/// Record `outcome` on command `id`, only while `process` still holds its
+/// claim: a process whose claim was taken over never answers for the
 /// command, and one already cancelled keeps its cancel.
-async fn complete(pool: &PgPool, id: i64, pod: &str, outcome: &RunOutcome) -> Result<()> {
+async fn complete(pool: &PgPool, id: i64, instance: &str, outcome: &RunOutcome) -> Result<()> {
     let (lc_outcome, message) = project_outcome(outcome);
     sqlx::query(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = $2, \
              outcome_message = $3 \
-         WHERE id = $1 AND claimed_by_pod = $4 AND completed_at_unix IS NULL",
+         WHERE id = $1 AND claimed_by_instance = $4 AND completed_at_unix IS NULL",
     )
     .bind(id)
     .bind(lc_outcome.as_str())
     .bind(message)
-    .bind(pod)
+    .bind(instance)
     .execute(pool)
     .await?;
     Ok(())

@@ -2089,3 +2089,60 @@ async fn a_members_consent_stays_in_their_project(pool: PgPool) {
     let parked: (i64,) = sqlx::query_as("SELECT count(*) FROM access_connect").fetch_one(&pool).await.unwrap();
     assert_eq!(parked.0, 0, "the refused consent parked nothing");
 }
+
+/// The install keeps each access node's pick: only one of the author's
+/// own connections, of the field's service, can be picked (never a
+/// member's), a change is all or none, and forgetting a connection takes
+/// every pick of it along.
+#[sqlx::test]
+async fn the_install_keeps_the_authors_picks(pool: PgPool) {
+    use weft_access_store::{change_install_picks, install_picks, PickWrite};
+    use weft_core::member::MemberId;
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let connect = |member: Option<MemberId>, token: &str| ConnectDirect {
+        paste: false,
+        spec: static_spec(&base),
+        door: Door::Own,
+        registration: None,
+        values: [("token".to_string(), token.to_string())].into_iter().collect(),
+        label: None,
+        permissions: Vec::new(),
+        project_id: member.as_ref().map(|_| PROJECT_1),
+        member,
+    };
+    let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, TENANT_A, connect(Some(MemberId::new("ada").unwrap()), "tok-ada"))
+        .await
+        .expect("ada connects")
+        .grant;
+    let pick = |step: &str, grant: uuid::Uuid, service: &str| PickWrite {
+        step: step.into(),
+        field: "account".into(),
+        grant_id: grant,
+        service: service.into(),
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("read", adas.id, "fakestatic")], &[])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not one of your connections"), "a member's is refused: {err}");
+    assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "all or none");
+    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "slack")], &[]).await.unwrap_err();
+    assert!(err.to_string().contains("is a 'fakestatic' one"), "{err}");
+    assert!(change_install_picks(&mut conn, TENANT_B, PROJECT_1, &[pick("post", mine.id, "fakestatic")], &[]).await.is_err(),
+        "another tenant's connection is nobody's to pick");
+
+    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("one.post", mine.id, "fakestatic")], &[])
+        .await
+        .unwrap();
+    let picks = install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap();
+    assert_eq!(picks["post"]["account"]["id"], serde_json::json!(mine.id));
+    assert!(picks.contains_key("one.post"), "each place keeps its own pick");
+    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[], &[("one.post".to_string(), "account".to_string())]).await.unwrap();
+    assert!(!install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().contains_key("one.post"));
+
+    delete_grant(&pool, TENANT_A, mine.id, weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "the pick goes with its connection");
+}

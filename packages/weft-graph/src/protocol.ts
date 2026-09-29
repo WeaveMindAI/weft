@@ -950,6 +950,50 @@ export function memberFilled(value: unknown): { fallback?: unknown } | null {
   return inner as { fallback?: unknown };
 }
 
+/// The literal an access node's connection field compiles to when the
+/// install keeps its pick (never written in the source: a connection's id
+/// means nothing on another install). The pick itself is read through the
+/// host (`picksCall`), keyed by the node's place.
+// SYNC: INSTALL_PICKED_KEY <-> crates/weft-core/src/picks.rs INSTALL_PICKED_KEY
+export const INSTALL_PICKED_KEY = '__weft_install_picked__';
+
+/// Whether `value` is the install-picked marker.
+// SYNC: installPicked <-> crates/weft-core/src/picks.rs is_install_picked
+export function installPicked(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== INSTALL_PICKED_KEY) return false;
+  const inner = (value as Record<string, unknown>)[INSTALL_PICKED_KEY];
+  return typeof inner === 'object' && inner !== null && !Array.isArray(inner);
+}
+
+/// A connection as a pick holds it.
+export interface ConnectionHandle {
+  id: string;
+  identity?: string;
+}
+
+/// The install's picks for a project: place (`slack`, `one.slack`) ->
+/// field -> handle.
+// SYNC: Picks <-> crates/weft-core/src/picks.rs Picks
+export type Picks = Record<string, Record<string, ConnectionHandle>>;
+
+/// One pick to keep: `connection` for `field` of the node at `step`.
+// SYNC: PickInput <-> crates/weft-core/src/picks.rs PickInput
+export interface PickInput {
+  step: string;
+  field: string;
+  connection: string;
+  service: string;
+}
+
+/// A change of the install's picks.
+// SYNC: ChangePicks <-> crates/weft-core/src/picks.rs ChangePicks
+export interface ChangePicks {
+  set?: PickInput[];
+  clear?: { step: string; field: string }[];
+}
+
 /// The literal `@member_filled` (or `@member_filled(<fallback>)`) lowers to.
 export function memberFilledValue(fallback?: unknown): MemberFilledValue {
   return { [MEMBER_FILLED_KEY]: fallback === undefined ? {} : { fallback } };
@@ -1155,7 +1199,7 @@ export type BusInspectorEvent =
   | { kind: 'closed'; busId: string; offset: number; atUnix: number };
 
 /// One live-caller-connection event the inspector replays. One caller
-/// per execution (no busId; the execution color is the identity).
+/// per execution (no busId; the execution id is the identity).
 /// `payload` is the same tagged `WirePayload` shape a bus window's
 /// messages carry.
 /// Which way one message of the conversation went. A bus names its
@@ -1424,14 +1468,11 @@ export type ActionVerb =
 /// exhaustive at the type level.
 // SYNC: CliPhase <-> crates/weft-cli/src/progress.rs Phase
 export type CliPhase =
+  /// The install is asked to build the project; detail `project`, its name.
   | 'build_start'
-  | 'build_skip'
+  /// The install built it; detail `project`, and `built`, the image refs
+  /// it had to build (empty when every image was already there).
   | 'build_done'
-  | 'image_push_start'
-  | 'image_push_done'
-  /// The stale-image sweep after an ensure dropped something. Detail
-  /// carries `images`, the refs untagged. Never sent for an empty sweep.
-  | 'images_reclaimed'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
   | 'infra_provision_start'
@@ -1672,7 +1713,7 @@ export type InfraRollup =
 export type ActionBarOverlay =
   | { kind: 'idle' }
   | { kind: 'cli_running'; verb: ActionVerb; phase: BarPhase; detail?: Record<string, unknown> }
-  | { kind: 'execution_running'; color: string }
+  | { kind: 'execution_running'; executionId: string }
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
 /// A verb whose trigger-deactivation choice the dispatcher may ask for.
@@ -1680,6 +1721,31 @@ export type ActionBarOverlay =
 /// a member's), so the webview sends these without a choice and opens
 /// its picker when the host answers `needsTriggerChoice`.
 export type TriggerChoiceIntent = 'resync' | 'infraStop' | 'infraTerminate' | 'infraUpgrade';
+
+/// The install the graph shows the project on. The local install shows
+/// the files on disk, editable. Any other shows the program that install
+/// holds, read-only except its connections, and every read, run and verb
+/// acts there (`--on <install>`).
+// SYNC: InstallView <-> extension-vscode/src/extension.ts postInstallView
+export interface InstallView {
+  /// Every install, the local one first. `loggedIn` is false where this
+  /// person holds no key yet (`weft login <name>`).
+  installs: { name: string; loggedIn: boolean }[];
+  /// The install shown now.
+  active: string;
+  /// On another install than the local one: the version of the program it
+  /// holds, and the version the files on disk are (null when unknown).
+  version: string | null;
+  diskVersion: string | null;
+  /// The install a switch is on its way to.
+  switching: string | null;
+  /// Why the last switch failed.
+  error: string | null;
+}
+
+/// The install every command acts on without `--on`.
+// SYNC: LOCAL_INSTALL <-> crates/weft-compiler/src/project.rs LOCAL_TARGET
+export const LOCAL_INSTALL = 'local';
 
 export type HostMessage =
   /// The verb the webview sent without a trigger-deactivation choice was
@@ -1717,6 +1783,9 @@ export type HostMessage =
   /// Engage / release the explicit graph-logic lock (AI assistant integration;
   /// the webview also renders a banner with `reason` and a release button).
   | { kind: 'setGraphLogicLock'; locked: boolean; reason?: string }
+  /// The installs the graph can show the project on, and which one it
+  /// shows (the install switch, top right).
+  | { kind: 'installView'; view: InstallView }
   /// Resolved state of every `@file`-referenced file in the current view,
   /// keyed by the marker's relative path. Each entry is either the file's
   /// content or a read error (unreadable/missing). The webview displays a
@@ -1744,20 +1813,20 @@ export type HostMessage =
   /// The run reached a terminal. A cancel carries WHY (`reason` is the
   /// text, `cause` the structured value), so a run stopped by a sibling
   /// through `ctx.stop_tagged` reads as that, never as a bare failure.
-  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
+  | { kind: 'execTerminal'; executionId: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
   /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
   /// list; the webview accumulates the run's set.
-  | { kind: 'execTags'; color: string; tags: string[] }
+  | { kind: 'execTags'; executionId: string; tags: string[] }
   /// The run's scope, off its birth row: the places it is held to
   /// (`locatedKey`s; `null` = the whole graph), so every other node
   /// paints as not in this run, and the run it was seeded from with
   /// what it re-ran.
   // SYNC: execScope <-> crates/weft-dispatcher/src/events.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
-  | { kind: 'execScope'; color: string; subgraph: string[] | null; seed: Seed | null }
+  | { kind: 'execScope'; executionId: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
   /// disk are (`null` when the disk matches no recorded version), so the
   /// graph can say "this run is from version X, your code differs".
-  | { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null }
+  | { kind: 'execVersion'; executionId: string; version: string | null; diskVersion: string | null }
   /// No run is on screen any more: the person stopped looking at one,
   /// or the one they were looking at was deleted. Everything a run
   /// painted (statuses, values, scope dimming, the version banner)
@@ -1815,7 +1884,7 @@ export type HostMessage =
   /// (replay-time corruption check). The inspector aggregates these
   /// into a muted "N journal rows corrupted" line; not alarming,
   /// not red, just visible if the user looks. Per-execution; the
-  /// webview groups by execution color and renders the list
+  /// webview groups by execution and renders the list
   /// behind a collapsed disclosure.
   | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
   /// What one node is showing, off its `/live`: the container's for an
@@ -1831,7 +1900,7 @@ export type HostMessage =
   /// completed: the per-node rows keep their last known state, the
   /// run is just no longer being followed. Distinct from execTerminal
   /// (which IS the run finishing) and from execReset (a fresh follow).
-  | { kind: 'followLost'; color: string; reason: 'closed' | 'error' }
+  | { kind: 'followLost'; executionId: string; reason: 'closed' | 'error' }
   | { kind: 'execReset' }
   /// Pushed from the host whenever the action-bar state machine
   /// transitions. The webview is a pure renderer that reads the
@@ -1853,6 +1922,9 @@ export type HostMessage =
   /// dispatcher route's JSON response on success; `error` the failure
   /// reason. Summaries only: no stored value ever rides this channel.
   | { kind: 'accessResult'; requestId: number; result?: unknown; error?: string }
+  /// Reply to `picksCall`, correlated by requestId: the install's picks
+  /// (`GET`) or what the change re-armed (`PUT`), or the failure reason.
+  | { kind: 'picksResult'; requestId: number; result?: unknown; error?: string }
   /// Reply to `pickAsset`: `paths` are the token paths the field writes
   /// into its `@asset("<path>", <Type>)` refs (a path in place locally,
   /// `assets/<name>` for stored bytes). Empty means the user cancelled;
@@ -1886,7 +1958,7 @@ export type ExecutionPhase = (typeof EXECUTION_PHASES)[number];
 
 export interface FollowStatus {
   mode: FollowMode;
-  color: string | undefined;
+  executionId: string | undefined;
   /// Runs that started while not following, so not shown.
   pendingCount: number;
 }
@@ -2003,7 +2075,7 @@ export type WebviewMessage =
   /// User clicked Cancel during status=Activating. Host shells out
   /// to `weft cancel-activate`, which POSTs the dispatcher's
   /// `/cancel-activate` endpoint. That cancels the TriggerSetup
-  /// color, wipes every signal row registered so far, CAS-flips
+  /// execution, wipes every signal row registered so far, CAS-flips
   /// status Activating → Inactive.
   | { kind: 'cancelActivate' }
   /// User clicked Resume Active while in `deactivating`. Host POSTs
@@ -2030,11 +2102,11 @@ export type WebviewMessage =
   | { kind: 'followSetMode'; mode: FollowMode }
   /// Replay a PAST execution onto the canvas: the host loads that execution's
   /// recorded events and feeds them as the editor's execution state (so the
-  /// graph shows that run's final node statuses + outputs). `color` is the
+  /// graph shows that run's final node statuses + outputs). `executionId` is the
   /// execution to replay, or `null` to drop the replay and return to live
   /// follow. A host that surfaces past executions another way (the VS Code
   /// extension has its own history) leaves this unhandled.
-  | { kind: 'replayExecution'; color: string | null }
+  | { kind: 'replayExecution'; executionId: string | null }
   /// User clicked a diagnostic's file:line:column in the error details
   /// modal. Host opens that file as a text tab beside the graph with the
   /// cursor on the position; a tab already showing the file is revealed
@@ -2043,7 +2115,7 @@ export type WebviewMessage =
   /// User clicked the action bar's Stop / Cancel affordance. The
   /// host inspects the current ActionBarState to decide:
   ///   - cli_running       -> SIGTERM the spawned CLI process group.
-  ///   - execution_running -> POST /executions/{color}/cancel.
+  ///   - execution_running -> POST /executions/{executionId}/cancel.
   ///   - any other state   -> ignored (button shouldn't be shown).
   | { kind: 'stopAction' }
   /// User pressed a button one of a node's display items carries
@@ -2088,6 +2160,13 @@ export type WebviewMessage =
       path: string;
       body?: unknown;
     }
+  /// Read (`GET`) or change (`PUT`) the install's picks for the active
+  /// project's own connections (`/projects/{id}/picks`); the host replies
+  /// with a correlated `picksResult`.
+  | { kind: 'picksCall'; requestId: number; method: 'GET' | 'PUT'; body?: ChangePicks }
+  /// Show the project on another install (the install switch): `local`,
+  /// or a target the project's `weft.toml` names.
+  | { kind: 'switchInstall'; install: string }
   /// Open a URL in the user's real browser (the OAuth consent page).
   | { kind: 'openExternalUrl'; url: string }
   /// The file-drop field asks the host to produce an ASSET REF path. With

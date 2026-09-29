@@ -506,7 +506,7 @@ containers element-wise; type variables unify. Everything else is
 ## How a program runs
 
 A node fires when every required input holds a [pulse] that agrees on
-[color] (one run: every run gets one color, and a re-run is a new color) and
+the execution and
 on frames (loop iterations).
 
 A node that emits on some outputs and not others closes the rest. A [closed]
@@ -679,7 +679,7 @@ connection from it stops the one before, so a reconnect REPLACES its run
 instead of stacking on it.
 
 A stopped run ends cancelled, and its journal names who did it:
-`Stopped by execution <color> (tag <tag>)`. Any string is a tag: a Telegram
+`Stopped by execution <execution-id> (tag <tag>)`. Any string is a tag: a Telegram
 chat id, a WhatsApp address (`49151@s.whatsapp.net`), a phone number with a
 `+` and spaces. Both nodes clean it the same way (unsafe characters become
 `_`, a short fingerprint of the original is appended, so two different

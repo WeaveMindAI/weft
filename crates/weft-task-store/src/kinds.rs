@@ -20,14 +20,12 @@ pub enum TaskKind {
     /// Dispatcher: register a wake signal with the listener and
     /// return its mint info to the worker that asked.
     RegisterSignal,
-    /// Dispatcher: a live caller arrived at the worker the handshake
-    /// pointed them to; give birth to the execution the routing token
-    /// promised, pinned to that worker. Producer = worker (via broker).
-    /// Nothing is born at the handshake, so a caller who never follows
-    /// the redirect leaves nothing behind.
+    /// Dispatcher: a live caller's connection reached a worker; give
+    /// birth to the execution the routing token promised, pinned to that
+    /// worker instance. Producer = worker (via broker). Nothing is born
+    /// at the handshake, so a caller who never follows the redirect
+    /// leaves nothing behind.
     LiveArrival,
-    /// Dispatcher: spawn a worker Pod for the project's pool.
-    SpawnPod,
     /// Dispatcher: fire a held-event signal that the listener
     /// observed (Timer fired, SSE event arrived, future browser
     /// session resolved). Producer = listener (via broker).
@@ -40,25 +38,21 @@ pub enum TaskKind {
     Execute,
     /// Worker: resume a suspended execution after a fire.
     Resume,
-    /// Worker: cancel a running execution by color. Addressed to
-    /// one pod via `target_pod_name`.
+    /// Worker: cancel a running execution by execution. Never claimed: the
+    /// worker driving the execution takes it through its cancel wait
+    /// (`tasks::take_cancels`).
     CancelExecution,
     /// Dispatcher: journal a `CostReported` event for one metered
     /// call (a provider meter's figure). Routed
     /// through the task table (not direct journal write) so a
-    /// worker pod dying mid-call still has the cost record
+    /// worker dying mid-call still has the cost record
     /// committed: the atomic INSERT into `task` is the
     /// durable handoff, and the dispatcher's executor catches up
-    /// later regardless of pod state.
+    /// later regardless of process state.
     RecordCost,
     /// Dispatcher: journal a `LogLine` event on behalf of a worker.
     /// Same durability rationale as `RecordCost`.
     RecordLog,
-    /// Dispatcher: persist a signal kind's evolving durable state (a
-    /// delta-poll cursor) onto its signal row. Producer = listener
-    /// (via broker), same trust seam as `FireSignal`: the listener
-    /// never opens an HTTP connection to the dispatcher.
-    UpdateSignalKindState,
     /// Dispatcher: stop every live execution of a project carrying a
     /// tag, on behalf of one of its executions (`ctx.stop_tagged`).
     /// Producer = the broker's `/v1/execution/stop_tagged` handler,
@@ -85,14 +79,12 @@ impl TaskKind {
             Self::RouteEntry => "route_entry",
             Self::RegisterSignal => "register_signal",
             Self::LiveArrival => "live_arrival",
-            Self::SpawnPod => "spawn_pod",
             Self::FireSignal => "fire_signal",
             Self::Execute => "execute",
             Self::Resume => "resume",
             Self::CancelExecution => "cancel_execution",
             Self::RecordCost => "record_cost",
             Self::RecordLog => "record_log",
-            Self::UpdateSignalKindState => "update_signal_kind_state",
             Self::StopTagged => "stop_tagged",
             Self::ProgramCall => "program_call",
         }
@@ -108,7 +100,7 @@ impl From<TaskKind> for String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPayload {
     pub project_id: uuid::Uuid,
-    pub color: String,
+    pub execution_id: String,
     /// `running_definition_hash` snapshotted at enqueue time (same
     /// value the journal's `ExecutionStarted` carries). The worker
     /// passes it as `expected_hash` to the broker's
@@ -138,6 +130,13 @@ pub struct ExecutionPayload {
     /// twice: a re-run would repeat whatever the first one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrecorded_birth: Option<Vec<serde_json::Value>>,
+    /// How long the execution may run, fixed where it started (its
+    /// signal's registration, or `weft run --long`): a short one is served
+    /// as one request to a worker, a long one as a job of its own. Read
+    /// by the delivery (`tasks::take_deliveries`), so it is on every
+    /// execute and resume.
+    // SYNC: run_class <-> crates/weft-task-store/src/tasks.rs (take_deliveries reads payload ->> 'run_class')
+    pub run_class: weft_core::run_class::RunClass,
 }
 
 /// What a live-caller execution starts with: the trigger's full signal
@@ -156,7 +155,7 @@ pub struct LiveConnectionStart {
     /// The point is the loop. A route's program is unrunnable offline
     /// without this, because the trigger and every Reply behind it ask
     /// for the caller and a fired run has nobody there, so trying a
-    /// route meant a cluster, an activation and an image build before
+    /// route meant an install, an activation and an image build before
     /// you could see one value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fired: Option<FiredExchange>,
@@ -191,6 +190,10 @@ pub struct FiredExchange {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveArrivalPayload {
     pub token: String,
+    /// The worker instance the caller's connection reached: the birth
+    /// pins the execution to it. The broker refuses an arrival naming
+    /// any instance but the one calling.
+    pub instance: String,
     pub method: String,
     #[serde(default)]
     pub query: std::collections::BTreeMap<String, String>,
@@ -198,14 +201,14 @@ pub struct LiveArrivalPayload {
     pub headers: Vec<(String, String)>,
 }
 
-/// The dedup key of the arrival task for `color`: one birth per token,
+/// The dedup key of the arrival task for `execution_id`: one birth per token,
 /// so a caller's client that resent the request converges on one task.
-pub fn live_arrival_dedup_key(color: weft_core::Color) -> String {
-    format!("live-arrival:{color}")
+pub fn live_arrival_dedup_key(execution_id: weft_core::ExecutionId) -> String {
+    format!("live-arrival:{execution_id}")
 }
 
-/// What a `LiveArrival` task answers with: the run born (its color and
-/// the pod it runs on), or the refusal the caller at the door gets, with
+/// What a `LiveArrival` task answers with: the run born (its execution and
+/// the process it runs on), or the refusal the caller at the door gets, with
 /// its HTTP status (a run that could not work, refused before it was
 /// born). A refusal is an answer, not a failed task: the worker hands
 /// the caller exactly that status and message.
@@ -213,7 +216,7 @@ pub fn live_arrival_dedup_key(color: weft_core::Color) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LiveArrivalResult {
-    Born { color: String, pod_name: String },
+    Born { execution_id: String, instance: String },
     Refused { status: u16, message: String },
 }
 
@@ -225,27 +228,12 @@ pub struct FireSignalPayload {
     pub payload: serde_json::Value,
 }
 
-/// Payload for `TaskKind::UpdateSignalKindState`. Producer =
-/// listener; consumer = the dispatcher's executor, which writes the
-/// signal row. Two fences make the write safe against reordering:
-/// `placement_generation` (a drained pod's write is rejected once the
-/// signal re-placed) and `seq` (a strictly increasing per-holder
-/// counter, persisted as the row's own `kind_state_seq` column; an
-/// older update arriving late can never regress a newer cursor).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateSignalKindStatePayload {
-    pub token: String,
-    pub kind_state: serde_json::Value,
-    pub seq: i64,
-    pub placement_generation: i64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelExecutionPayload {
     pub project_id: uuid::Uuid,
-    pub color: String,
+    pub execution_id: String,
     /// Why the run is being cancelled. The owning worker flips the
-    /// color's flag WITH this cause, so the terminal event it writes
+    /// execution's flag WITH this cause, so the terminal event it writes
     /// (when it beats the dispatcher's own write to the journal) names
     /// the same cause the dispatcher would have.
     pub cause: weft_core::exec::CancelCause,
@@ -271,14 +259,6 @@ pub struct StopTaggedPayload {
     pub stop_self: weft_core::StopSelf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnPodPayload {
-    pub project_id: uuid::Uuid,
-    pub tenant: String,
-    pub namespace: String,
-    pub owner_dispatcher: String,
-}
-
 /// Payload for `TaskKind::RecordCost`: one metered call's cost, produced by
 /// a provider meter, journaled as a `CostReported` event attributed to the
 /// exact firing (`node_id` + `frames`). `amount_usd: None` = the meter could
@@ -289,7 +269,7 @@ pub struct SpawnPodPayload {
 /// malicious worker can't submit and immediately die before validation runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordCostPayload {
-    pub color: String,
+    pub execution_id: String,
     pub node_id: String,
     pub frames: weft_core::LoopFrames,
     pub service: String,
@@ -304,7 +284,7 @@ pub struct RecordCostPayload {
 /// Payload for `TaskKind::RecordLog`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordLogPayload {
-    pub color: String,
+    pub execution_id: String,
     /// The node that wrote the line, and the iteration it was in.
     /// `default` so a task enqueued by an older worker still decodes.
     #[serde(default)]
@@ -332,9 +312,10 @@ mod live_arrival_wire_tests {
     use super::*;
 
     #[test]
-    fn the_arrival_payload_round_trips_and_the_key_is_per_color() {
+    fn the_arrival_payload_round_trips_and_the_key_is_per_execution_id() {
         let payload = LiveArrivalPayload {
             token: "v1.x.y".into(),
+            instance: "worker-a".into(),
             method: "POST".into(),
             query: [("verbose".to_string(), "1".to_string())].into_iter().collect(),
             headers: vec![("content-type".into(), "application/json".into())],
@@ -342,12 +323,13 @@ mod live_arrival_wire_tests {
         let json = serde_json::to_value(&payload).unwrap();
         let back: LiveArrivalPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back.method, "POST");
+        assert_eq!(back.instance, "worker-a");
         assert_eq!(back.query["verbose"], "1");
         assert_eq!(back.headers.len(), 1);
-        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "method": "GET" })).unwrap();
+        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "instance": "w", "method": "GET" })).unwrap();
         assert!(bare.query.is_empty() && bare.headers.is_empty());
-        let color = weft_core::Color::from_u128(7);
-        assert_eq!(live_arrival_dedup_key(color), format!("live-arrival:{color}"));
+        let execution_id = weft_core::ExecutionId::from_u128(7);
+        assert_eq!(live_arrival_dedup_key(execution_id), format!("live-arrival:{execution_id}"));
     }
 }
 
@@ -360,7 +342,7 @@ mod tests {
     #[test]
     fn a_live_arrival_answer_round_trips() {
         for answer in [
-            LiveArrivalResult::Born { color: "c".into(), pod_name: "p".into() },
+            LiveArrivalResult::Born { execution_id: "c".into(), instance: "p".into() },
             LiveArrivalResult::Refused { status: 422, message: "who is it for".into() },
         ] {
             let wire = serde_json::to_value(&answer).unwrap();
@@ -393,7 +375,7 @@ mod tests {
         }
         let cancel = CancelExecutionPayload {
             project_id: uuid::Uuid::nil(),
-            color: "c2".into(),
+            execution_id: "c2".into(),
             cause: weft_core::exec::CancelCause::Execution { by: uuid::Uuid::nil(), tag: "user_7".into() },
         };
         let json = serde_json::to_value(&cancel).unwrap();
@@ -411,7 +393,7 @@ mod tests {
     fn record_cost_payload_round_trip_both_amount_arms() {
         for amount_usd in [Some(0.000031), None] {
             let payload = RecordCostPayload {
-                color: "c1".into(),
+                execution_id: "c1".into(),
                 node_id: "ask".into(),
                 frames: vec![weft_core::frames::Frame::Loop { index: 2 }],
                 service: "openrouter".into(),
@@ -428,7 +410,7 @@ mod tests {
             assert_eq!(
                 v,
                 serde_json::json!({
-                    "color": "c1", "node_id": "ask", "frames": [{"index": 2}],
+                    "execution_id": "c1", "node_id": "ask", "frames": [{"index": 2}],
                     "service": "openrouter", "model": "m", "amount_usd": amount_usd,
                     "billed": false, "origin": "author",
                     "metadata": {"tokensPrompt": 12}
@@ -456,7 +438,7 @@ mod tests {
         request.caller = Some(serde_json::json!({ "key": 1 }));
         let payload = ExecutionPayload {
             project_id: uuid::Uuid::nil(),
-            color: "c1".into(),
+            execution_id: "c1".into(),
             definition_hash: "h".into(),
             live_connection: Some(LiveConnectionStart {
                 spec: weft_core::primitive::SignalSpec::of_kind(
@@ -467,6 +449,7 @@ mod tests {
                 fired: None,
             }),
             unrecorded_birth: None,
+            run_class: weft_core::run_class::RunClass::Short,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["live_connection"]["spec"]["kind"], "route");
@@ -480,12 +463,14 @@ mod tests {
 
         let plain = ExecutionPayload {
             project_id: uuid::Uuid::nil(),
-            color: "c1".into(),
+            execution_id: "c1".into(),
             definition_hash: "h".into(),
             live_connection: None,
             unrecorded_birth: None,
+            run_class: weft_core::run_class::RunClass::Long,
         };
         let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(json["run_class"], "long", "the delivery reads it off the payload by this name");
         assert!(json.get("live_connection").is_none(), "an ordinary execution omits it");
         assert!(json.get("unrecorded_birth").is_none(), "a recorded run carries no birth rows");
 
@@ -511,7 +496,7 @@ mod tests {
     fn a_fired_run_survives_the_wire() {
         let payload = ExecutionPayload {
             project_id: uuid::Uuid::nil(),
-            color: "c1".into(),
+            execution_id: "c1".into(),
             definition_hash: "h".into(),
             live_connection: Some(LiveConnectionStart {
                 spec: weft_core::primitive::SignalSpec::of_kind("route", serde_json::json!({})),
@@ -523,6 +508,7 @@ mod tests {
                 fired: Some(FiredExchange {}),
             }),
             unrecorded_birth: None,
+            run_class: weft_core::run_class::RunClass::Short,
         };
         let json = serde_json::to_value(&payload).unwrap();
         let back: ExecutionPayload = serde_json::from_value(json).unwrap();

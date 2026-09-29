@@ -61,6 +61,13 @@ describe('lock state', () => {
     expect(r).toEqual({ ok: false, reason: 'Graph logic locked (Weft code is being edited)' });
   });
 
+  it("another install's program refuses every source op, whatever else is released", () => {
+    const lock: LockState = { codeEditLockUntil: null, lockGraphLogic: false, installReadOnly: 'prod' };
+    expect(isLogicLocked(lock, NOW)).toBe(true);
+    const r = runPreflight([{ op: 'removeNode', node: 'a' }], fixture(), lock, catalog, NOW);
+    expect(r).toEqual({ ok: false, reason: expect.stringMatching(/what prod runs, read-only; switch to local/) });
+  });
+
   it('an empty batch (layout-only gesture) bypasses the lock', () => {
     const lock: LockState = { codeEditLockUntil: NOW + 1000, lockGraphLogic: false };
     expect(runPreflight([], fixture(), lock, catalog, NOW).ok).toBe(true);

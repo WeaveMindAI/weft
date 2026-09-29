@@ -68,7 +68,9 @@ cancellation for free) and never does plumbing (transport, credentials,
 acknowledgement protocols, subscriptions, retry bookkeeping are the
 language's).
 
-A new node goes in this project's `nodes/` folder and is usable by its
+A new node goes beside the module that uses it under `src/`
+(`src/billing/stripe/` next to `src/billing/charge.weft`), or under
+`nodes/` when several parts of the program share it, and is usable by its
 `type` name as soon as it is there; the build compiles its Rust directly.
 Its body may only `use` the `weft` crate, the crates its package declares
 in `deps.toml`, and code inside its own package; a sibling package's code is
@@ -314,19 +316,19 @@ node's "Reset password" mints a new one over the database's own socket.
 You walk the container's states and ask what a user does from the graph to
 leave each; a state whose only exit is restarting or terminating the
 infra fails [the review].
-An endpoint is `Expose::ClusterInternal` unless you say otherwise, and only
+An endpoint is `Expose::Project` unless you say otherwise, and only
 weft nodes can reach it. `Expose::SameNetwork` on an endpoint makes it
 reachable from the machine the runtime runs on, so a client that is not a weft
 node can speak the service's own protocol to it: a frontend needing the
 program's database for its sign-in tables, a `psql` session, a dashboard. It
 means that machine on a local install (the port binds to loopback) or the
-cluster's own subnet in a deployed one, never the internet.
+install's private network on a cloud install, never the internet.
 
 The endpoint saying so IS the door. Nothing opens or closes one after the
 fact, and nothing in a project's source can reach past what your spec
 declared, so reading your node tells anybody what is reachable.
 `weft infra list-doors` prints the addresses, because the port is the
-cluster's to allocate and is the one part not in the source.
+install's to allocate and is the one part not in the source.
 
 Rarely does every user of your node want that, so give them the choice rather
 than making it for them. `provision_infra` runs with your inputs already
@@ -335,14 +337,14 @@ computed, so you branch on one like any other decision, off by default:
 ````rust
 let reachable: bool = input.get("reachable")?;
 ...
-expose: if reachable { Expose::SameNetwork } else { Expose::ClusterInternal },
+expose: if reachable { Expose::SameNetwork } else { Expose::Project },
 ````
 
 One rule comes with it, and a node that breaks it fails [the review].
 **An endpoint that hands out a credential is never `SameNetwork`**, whatever
 guards it: `PostgresDatabase` can open `sql`, where reaching Postgres still
 costs a password, and leaves `credential`, the little server that mints that
-password, cluster-internal for ever.
+password, project-only for ever.
 
 Then one judgement call, which is yours and not a rule. A reachable endpoint
 carries the connection your node publishes, the same one the program's own

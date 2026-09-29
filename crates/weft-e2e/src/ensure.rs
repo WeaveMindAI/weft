@@ -97,7 +97,7 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
 /// Poll the dispatcher's `/health` until it answers `ok`. A dispatcher that
 /// was just rolled, or a cell's that just started, can take a beat to accept
 /// connections, so every test confirms reachability before it proceeds.
-pub(crate) async fn wait_healthy(disp: &Dispatcher) -> Result<()> {
+pub async fn wait_healthy(disp: &Dispatcher) -> Result<()> {
     poll_until(
         &format!("dispatcher /health at {} to answer ok", disp.base()),
         Duration::from_secs(60),
@@ -117,4 +117,16 @@ pub(crate) async fn wait_healthy(disp: &Dispatcher) -> Result<()> {
         },
     )
     .await
+}
+
+/// Where a local install keeps its files.
+// SYNC: the install's directory <-> crates/weft-cli/src/commands/daemon.rs
+//       (data_dir, Install::from_env: `installs/<name>` for a named one)
+pub fn install_dir(instance: &weft_core::infra::Instance) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    let root = home.join(".local/share/weft");
+    match instance.name() {
+        None => root,
+        Some(name) => root.join("installs").join(name),
+    }
 }

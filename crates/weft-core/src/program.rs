@@ -38,8 +38,9 @@ pub enum ProgramCall {
     InfraStart { node: String, member: Option<MemberId> },
     /// Scale a copy down, keeping its disk.
     InfraStop { node: String, member: Option<MemberId>, spec: DeactivateSpec },
-    /// Delete a copy and its disk.
-    InfraTerminate { node: String, member: Option<MemberId>, spec: DeactivateSpec },
+    /// Delete a copy and its disks, keeping the ones its node lists in
+    /// `keepOnTerminate` unless `disks` says the owner is going for good.
+    InfraTerminate { node: String, member: Option<MemberId>, spec: DeactivateSpec, disks: crate::infra::TerminateDisks },
     /// One copy's state, or none when it was never started (or was
     /// terminated).
     InfraStatus { node: String, member: Option<MemberId> },
@@ -124,7 +125,7 @@ impl ProgramCall {
 /// happens to the asker when the call takes it down, and the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgramCallPayload {
-    /// The calling run (its color).
+    /// The calling run (its execution).
     pub by: uuid::Uuid,
     pub stop_self: StopSelf,
     pub call: ProgramCall,
@@ -353,7 +354,7 @@ pub struct CostFilter {
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_by: Option<PaidBy>,
-    /// Costs of one run (`ctx.color` for the calling run's own).
+    /// Costs of one run (`ctx.execution_id` for the calling run's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<uuid::Uuid>,
     /// Costs booked at or after this unix second.
@@ -480,7 +481,12 @@ mod tests {
 
     #[test]
     fn only_take_downs_can_stop_the_asker() {
-        assert!(ProgramCall::InfraTerminate { node: "x".into(), member: None, spec: spec() }.takes_down());
+        assert!(ProgramCall::InfraTerminate {
+            node: "x".into(),
+            member: None,
+            spec: spec(),
+            disks: crate::infra::TerminateDisks::KeepListed,
+        }.takes_down());
         assert!(!ProgramCall::InfraStart { node: "x".into(), member: None }.takes_down());
         assert!(!ProgramCall::ConnectionsList { member: MemberId::new("a").unwrap() }.takes_down());
     }

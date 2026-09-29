@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Shared trait surface + production impls for cross-cutting platform
-# concerns (k8s API access, clock). Fakes live behind `test-helpers`
-# so production builds don't link them.
+# The translation layer's traits (one per platform capability), the
+# S3-compatible object store every platform shares, and the fakes behind
+# `test-helpers` so production builds don't link them.
 
 [features]
 default = []
@@ -22,10 +22,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
-kube = { workspace = true }
-k8s-openapi = { workspace = true }
-# Multi-document manifests (`apply_yaml`) are read document by document.
-serde_yaml = { workspace = true }
+# The infra spec an `InfraHost` runs.
+weft-core = { workspace = true }
+uuid = { workspace = true }
+# `WorkerCall` is read off the HTTP call weft makes to a worker.
+reqwest = { workspace = true }
+# Stable wake names (`alarm::Wake::name`).
+sha2 = { workspace = true }
 # S3-compatible object-store client (the production `ObjectStore` impl).
 # Works against any S3 endpoint (GCS, SeaweedFS, AWS, a client's bucket)
 # via an endpoint-URL override, which is exactly the deploy-time slot.
@@ -41,3 +44,7 @@ parking_lot = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The crate's own tests build the fakes (`cfg(test)`) without the feature.
+parking_lot = { workspace = true }

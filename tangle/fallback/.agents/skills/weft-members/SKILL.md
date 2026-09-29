@@ -53,14 +53,13 @@ digest = Cron { cron: @member_filled("0 0 8 * * *") }
 On a connection field, what you write decides whose key pays for a member's
 calls, so ask the user which they want before writing it:
 
-- `connection: {"id": "<connection id>"}`, not marked: every member runs on the
-  user's key;
+- nothing written: every member runs on the connection the user picked on
+  the install;
 - `connection: @member_filled`: each member connects their own and pays, and a
-  member with none is refused, naming the field;
-- `connection: @member_filled({"id": "<connection id>"})`: a member who
-  connected nothing runs on the user's connection, one who did on their own.
+  member with none is refused, naming the field. It takes no fallback: a
+  connection id written in the source is refused.
 
-If a member should run on the user's key, the source has to say so: a member
+If a member should run on the user's key, leave the field unmarked: a member
 can never pick the user's connection, or the runtime's shared key, for
 themselves. The member door refuses the shared key, and a value saved for a member's connection
 field has to be a connection that member owns, whoever saves it (`SetMemberValues`
@@ -139,7 +138,7 @@ they do not cover calls the ctx directly in a node of its own:
 | Call | What it does |
 |---|---|
 | `ctx.member()` | Who this run is for (the `CurrentMember` node fires `member` or `nobody`) |
-| `ctx.infra("bridge").member(id).start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.status()` | One member's copy |
+| `ctx.infra("bridge").member(id).start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.wipe(spec, stop_self)` / `.status()` | One member's copy; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too |
 | `ctx.infra("bridge").copies()` | Every copy (the `ListMemberCopies` node) |
 | `ctx.triggers().member(id).activate()` / `.deactivate(spec, stop_self)` | A member's triggers (`.only([..])` narrows) |
 | `ctx.values().member(id).get()` / `.set(step, field, value)` / `.clear(step, field)` / `.apply()` / `.forget()` | What a member gave for the `@member_filled` fields: read (the `GetMemberValues` node), change in one go (the `SetMemberValues` node; `apply()` returns the triggers it set up again), or forget all |
@@ -166,8 +165,9 @@ weft keeps only a hash of a member token, so a replayed run cannot hand back
 the value it minted: it mints a new value for the same token, and the old value
 stops working.
 
-`WipeMember` removes the member's triggers, the copies you name, their values,
-connections, tokens, files and runs. `weft rm` of the project takes every
+`WipeMember` removes the member's triggers, the copies you name (with every
+disk, the ones kept through a terminate too), their values, connections, tokens,
+files and runs. `weft rm` of the project takes every
 member's values, connections, tokens and files with it.
 
 ## Where the member fills in their values

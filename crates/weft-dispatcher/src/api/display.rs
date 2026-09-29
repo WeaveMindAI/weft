@@ -16,7 +16,7 @@
 //!   - an INFRA node, from its own container's `/live`, which the
 //!     node's author writes (`features.live_endpoint` names the
 //!     endpoint serving it). It may carry buttons;
-//!   - a TRIGGER node, from the listener Pod holding its signal. Read
+//!   - a TRIGGER node, from the listener process holding its signal. Read
 //!     only: nothing about a registration is a reader's to change.
 //!
 //! The editor has had both since the beginning, through the
@@ -644,6 +644,7 @@ mod scope_tests {
     fn scoped_token(displays: &[String], all: bool, projects: Vec<uuid::Uuid>) -> SignalToken {
         SignalToken {
             id: uuid::Uuid::nil(),
+            kind: crate::journal::TokenKind::Caller,
             token_hash: "hash".into(),
             recognizer: "wft-test-…".into(),
             tenant_id: "t".into(),

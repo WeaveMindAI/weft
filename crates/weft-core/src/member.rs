@@ -493,8 +493,8 @@ pub fn filled_node(node: &crate::project::NodeDefinition, values: Option<&PlaceV
 /// The connection one member's run signs a `remote_select` field's lookup
 /// with: the field's widget names an access input of the same node, and
 /// the wire into that input leads (through any group or included file's
-/// ports) to an access node. Its connection field is either a handle
-/// written in the source (the author's connection, shared) or
+/// ports) to an access node. Its connection field is either picked on
+/// the install (the author's connection, shared: `picks` give it) or
 /// `@member_filled`, then `values` (the member's) give it. Nothing wired
 /// there is [`LookupConnection::Unwired`]: the lookup then only works on
 /// a public source. A wired connection the member has not filled yet (or
@@ -509,6 +509,7 @@ pub fn lookup_connection(
     at: &crate::frames::Located,
     field: &str,
     values: &MemberValues,
+    picks: &crate::picks::Picks,
 ) -> Result<LookupConnection, String> {
     let node = project.nodes.iter().find(|n| n.id == at.id).ok_or_else(|| format!("no node '{}'", at.id))?;
     let Some(crate::node::Widget::RemoteSelect { access, .. }) =
@@ -550,7 +551,17 @@ pub fn lookup_connection(
                 }
             }
         }
-        Some(literal) => (literal.clone(), crate::member_door::FieldConnection::Shared),
+        Some(literal) if crate::picks::is_install_picked(literal) => {
+            match picks.get(&spelled).and_then(|fields| fields.get(&input.name)) {
+                Some(handle) => (handle.clone(), crate::member_door::FieldConnection::Shared),
+                None => {
+                    return Ok(LookupConnection::NotConnected(format!(
+                        "'{spelled}' has no connection picked on this install, so this list has nothing to read through"
+                    )))
+                }
+            }
+        }
+        Some(_) => return Err(format!("'{spelled}' holds a connection written in the source; see {}", crate::picks::PICKS_DOC)),
         None => {
             return Ok(LookupConnection::NotConnected(format!(
                 "'{spelled}' has no connection picked, so this list has nothing to read through"

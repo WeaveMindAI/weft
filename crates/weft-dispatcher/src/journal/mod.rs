@@ -7,7 +7,7 @@
 //!
 //! Separate tables still exist for lookups that aren't state
 //! changes: entry tokens (webhook→project routing), suspension
-//! tokens (form URL→color lookup), extension tokens (reviewer
+//! tokens (form URL→execution lookup), extension tokens (reviewer
 //! auth). Those are indexes, not duplicates.
 
 pub mod postgres;
@@ -22,7 +22,7 @@ use weft_journal::ExecEvent;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 /// A successful setup, independent of whether its listeners are armed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -34,7 +34,7 @@ pub struct TriggerBake {
     pub member: Option<weft_core::member::MemberId>,
     pub source_version: String,
     pub program: weft_core::project::hash::ProgramIdentity,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub captured: std::collections::BTreeMap<String, TriggerCapture>,
     /// The triggers this setup set out to capture (spelled). A setup of
     /// some triggers replaces what an earlier one captured for THOSE (one
@@ -70,52 +70,52 @@ impl TriggerBake {
 
     pub fn summary(&self) -> weft_core::run_spec::BakeSummary {
         weft_core::run_spec::BakeSummary { program: self.program.clone(), captured: self.captured.keys().cloned().collect(),
-            color: self.color, at_unix: self.at_unix }
+            execution_id: self.execution_id, at_unix: self.at_unix }
     }
 
     /// Only a successful setup can replace saved settings. A closed group gate
     /// leaves its trigger absent from this capture, including on a refresh.
     pub fn from_events(events: &[ExecEvent]) -> anyhow::Result<Option<Self>> {
-        let Some(ExecEvent::ExecutionStarted { color, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
+        let Some(ExecEvent::ExecutionStarted { execution_id, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
             phase: weft_core::context::Phase::TriggerSetup, member, .. }) = events.first() else {
             anyhow::bail!("trigger setup has no original program or source identity");
         };
         anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash),
-            "trigger setup {color} has conflicting program identities");
-        anyhow::ensure!(events.iter().all(|event| event.color() == *color),
-            "trigger setup {color} contains another run's history");
+            "trigger setup {execution_id} has conflicting program identities");
+        anyhow::ensure!(events.iter().all(|event| event.execution_id() == *execution_id),
+            "trigger setup {execution_id} contains another run's history");
         let Some(terminal) = events.iter().find(|event| event.is_execution_terminal()) else {
-            anyhow::bail!("trigger setup {color} has not finished");
+            anyhow::bail!("trigger setup {execution_id} has not finished");
         };
         let ExecEvent::ExecutionCompleted { at_unix, .. } = terminal else { return Ok(None); };
         let mut captured = std::collections::BTreeMap::new();
         for event in events.iter().take_while(|event| !event.is_execution_terminal()) {
-            if let ExecEvent::TriggerCaptured { color: captured_color, node_id, spec, port_snapshot, .. } = event {
-                anyhow::ensure!(captured_color == color && port_snapshot.is_object(), "invalid trigger capture in setup {color}");
+            if let ExecEvent::TriggerCaptured { execution_id: captured_execution_id, node_id, spec, port_snapshot, .. } = event {
+                anyhow::ensure!(captured_execution_id == execution_id && port_snapshot.is_object(), "invalid trigger capture in setup {execution_id}");
                 weft_core::signal::validate_spec(spec).map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(captured.insert(node_id.clone(), TriggerCapture {
                     spec: spec.clone(), ports: port_snapshot.clone(),
-                }).is_none(), "trigger '{node_id}' captured twice in setup {color}");
+                }).is_none(), "trigger '{node_id}' captured twice in setup {execution_id}");
             }
         }
-        Ok(Some(Self { project_id: *project_id, member: member.clone(), program: program.clone(), color: *color,
+        Ok(Some(Self { project_id: *project_id, member: member.clone(), program: program.clone(), execution_id: *execution_id,
             source_version: source_version.clone(),
             captured, targets: Default::default(), at_unix: *at_unix }))
     }
 }
 
-/// Outcome of looking up a value derived from a color's first
-/// `ExecutionStarted` row. `NotFound` = no such row (the color is
+/// Outcome of looking up a value derived from an execution's first
+/// `ExecutionStarted` row. `NotFound` = no such row (the execution is
 /// unknown). `Corrupt` = the row exists but its stored JSON no
 /// longer decodes: a PERMANENT poison, so callers must word their
-/// failure honestly ("journal row for color X is corrupt; see
+/// failure honestly ("journal row for execution X is corrupt; see
 /// dispatcher logs") and must NOT retry (retrying cannot fix it;
 /// pollers that would loop on an `Err` skip instead). The one
 /// producer of `Corrupt` is `execution_definition_hash`: the
-/// project/tenant lookups read the `execution_color` mirror and
+/// project/tenant lookups read the `execution` mirror and
 /// answer `Option` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorLookup<T> {
+pub enum ExecutionIdLookup<T> {
     Found(T),
     NotFound,
     Corrupt,
@@ -123,11 +123,11 @@ pub enum ColorLookup<T> {
 
 #[async_trait]
 pub trait Journal: Send + Sync {
-    async fn is_trigger_setup_pending(&self, color: Color) -> anyhow::Result<bool>;
+    async fn is_trigger_setup_pending(&self, execution_id: ExecutionId) -> anyhow::Result<bool>;
 
     /// Publish one complete setup and release its birth-time ownership atomically.
     /// A failed/cancelled setup releases ownership without replacing any bake.
-    async fn finish_trigger_setup(&self, color: Color, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
+    async fn finish_trigger_setup(&self, execution_id: ExecutionId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
 
     /// The bakes of one owner's triggers: the shared ones for `None`, a
     /// member's for `Some`.
@@ -148,22 +148,22 @@ pub trait Journal: Send + Sync {
         dedup_key: &str,
     ) -> anyhow::Result<()>;
 
-    /// Full ordered event log for a color, for DISPLAY: undecodable
+    /// Full ordered event log for an execution, for DISPLAY: undecodable
     /// rows come back as their error text instead of failing the read,
     /// so the inspector renders what exists and names the rows it
     /// cannot. The one required read; [`Journal::events_log`] is
     /// derived from it.
     async fn events_log_lossy(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
     ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)>;
 
     /// The same log for STATE-REBUILDING (the cancel writers, stall
     /// re-folds): a row that no longer decodes fails the WHOLE read,
-    /// naming the color and `weft clean`, because a fold over a
+    /// naming the execution and `weft clean`, because a fold over a
     /// partial log rebuilds a state that never existed.
-    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-        let (events, bad) = self.events_log_lossy(color).await?;
+    async fn events_log(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+        let (events, bad) = self.events_log_lossy(execution_id).await?;
         match bad.into_iter().next() {
             Some(reason) => Err(anyhow::Error::msg(reason)),
             None => Ok(events.into_iter().map(|record| record.event).collect()),
@@ -173,7 +173,7 @@ pub trait Journal: Send + Sync {
     // ----- Atomic execution birth / teardown --------------------------
     //
     // An execution's birth is ONE atomic fact: the `ExecutionStarted` event,
-    // its `execution_color` seed, the entry kicks, AND the work item a worker
+    // its `execution` seed, the entry kicks, AND the work item a worker
     // will claim. Committing them together is what makes a "ghost" (a
     // journaled live execution with no work item, which nothing would ever
     // run or reclaim and which would wedge a later drain) impossible by
@@ -188,42 +188,41 @@ pub trait Journal: Send + Sync {
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
-        expected_activation: Option<Color>,
+        expected_activation: Option<ExecutionId>,
     ) -> anyhow::Result<()>;
 
     /// The live-connection variant of [`Journal::start_execution`]: the birth
-    /// commits atomically WITH the pinned-task admission, and ONLY if a worker
-    /// admits it. `Saturated` writes nothing (the caller spawns a pod and
-    /// retries); `AlreadyAdmitted` (a crash-retry of the same handshake)
-    /// writes nothing new and returns the originally chosen pod.
+    /// commits atomically WITH the admission of the execute task pinned to
+    /// the worker instance the caller reached (`task.target_instance`).
+    /// `AlreadyAdmitted` (a retry of the same arrival) writes nothing new and
+    /// returns the instance the execution was born on.
     async fn start_live_execution(
         &self,
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
-        saturation: f64,
     ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome>;
 
     /// THE dispatcher-side cancel of an execution, in ONE transaction:
-    /// strip the color's wake signals (the parked form, the timer, the
+    /// strip the execution's wake signals (the parked form, the timer, the
     /// webhook, so nothing can revive it), journal its cancel terminals
     /// (`NodeCancelled` per non-terminal node + `ExecutionCancelled`,
     /// skipped when a terminal already exists), and queue the
-    /// `cancel_execution` task for the pod driving it (skipped when no
-    /// alive pod owns it). Atomic so a failure leaves the run exactly as
+    /// `cancel_execution` task for the process driving it (skipped when no
+    /// alive process owns it). Atomic so a failure leaves the run exactly as
     /// it was and the next attempt succeeds; the old three-step shape
     /// could strip the signals and then fail, leaving a run that could
-    /// neither wake nor finish. A color with no `execution_color` row
+    /// neither wake nor finish. An execution with no `execution` row
     /// (never started) has its signals stripped and nothing else.
     ///
     /// The listener still holds the stripped signals in RAM: the caller
     /// unregisters them there after the commit (`CancelWrite::removed`).
     /// `program` is the run's definition (the per-node cancels come off
-    /// the fold); `None` for a color with no program, which has no
+    /// the fold); `None` for an execution with no program, which has no
     /// nodes to cancel.
     async fn cancel_execution(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite>;
@@ -231,7 +230,7 @@ pub trait Journal: Send + Sync {
     /// Drop the signal row for a single-use resume token. Called
     /// when a suspension's fire is consumed (the engine has handed
     /// the value back to the waiting firing). Returns the deleted row
-    /// so the caller can unregister it from the pod that held it.
+    /// so the caller can unregister it from the process that held it.
     /// Entry-trigger rows (`is_resume=false`) stay untouched; the
     /// deactivate path manages those separately.
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
@@ -258,22 +257,29 @@ pub trait Journal: Send + Sync {
     /// can't probe other tenants' tokens).
     async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
 
+    /// Record `token` (an operator key) only when its tenant holds no
+    /// operator key at all, in one statement, so replicas booting at
+    /// once record it once. The install's bootstrap key: re-seeded after
+    /// every operator key is revoked, never beside a live one. Returns
+    /// whether it was recorded.
+    async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
+
     // ----- Derived views over the event log --------------------------
     //
     // An execution OUTLIVES its project on purpose: the journal is the
     // record of what ran, and it stays readable after the project is
     // removed. So everything about ownership is read from the
-    // `execution_color` row, stamped in the same transaction as
+    // `execution` row, stamped in the same transaction as
     // `ExecutionStarted` and never rewritten, and NEVER re-derived
     // from the project store (which the user can delete out from under
     // it, once leaving 216 executions listed and undeletable because
     // authorization asked a table that no longer had the answer).
 
-    /// Who an execution belongs to, read from its `execution_color`
+    /// Who an execution belongs to, read from its `execution`
     /// row: BOTH fields in one lookup, because they are one fact about
     /// one row and reading them apart is how they drift. `None` if the
-    /// color is unknown.
-    async fn execution_owner(&self, color: Color) -> anyhow::Result<Option<ExecutionOwner>>;
+    /// execution is unknown.
+    async fn execution_owner(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionOwner>>;
 
     /// Look up the `definition_hash` an execution was STARTED with.
     /// Resume task producers use this to stamp the resume payload,
@@ -281,12 +287,12 @@ pub trait Journal: Send + Sync {
     /// project shape it was started on (not the project row's
     /// CURRENT hash, which may have moved if the user edited and
     /// re-registered between suspend and webhook-fire). Reads the
-    /// first `ExecutionStarted` event of the color. `NotFound` if
-    /// the color is unknown; `Corrupt` if the row no longer decodes.
+    /// first `ExecutionStarted` event of the execution. `NotFound` if
+    /// the execution is unknown; `Corrupt` if the row no longer decodes.
     async fn execution_definition_hash(
         &self,
-        color: Color,
-    ) -> anyhow::Result<ColorLookup<String>>;
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<ExecutionIdLookup<String>>;
 
     /// Every program version the runs this journal still holds were
     /// started against, for one project. What a project removal (and
@@ -296,7 +302,7 @@ pub trait Journal: Send + Sync {
     /// there and unreadable.
     async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
 
-    /// The LAST `limit` log lines of a color, oldest first: every
+    /// The LAST `limit` log lines of an execution, oldest first: every
     /// event `LogEntry::from_event` projects (node log lines and the
     /// failures the journal recorded), in the order they were written
     /// (`LogEntry::tail`). The tail, not the head: a run that wrote
@@ -306,11 +312,11 @@ pub trait Journal: Send + Sync {
     /// decodes is an `error` line naming it and `weft clean`
     /// (`LogEntry::corrupt_row`), so the lines that survive still
     /// read.
-    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
+    async fn logs_for(&self, execution_id: ExecutionId, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
     /// A page of `tenant`'s executions, newest first, matching `query`'s filters
     /// (project + start-time range) with limit/offset paging, plus the total
-    /// matching count. Scoping is in the query (via the `execution_color` table's
+    /// matching count. Scoping is in the query (via the `execution` table's
     /// `tenant_id`, seeded on every start), so one tenant never sees another's
     /// executions or their count; every filter stays inside that wall.
     async fn list_executions(
@@ -319,73 +325,73 @@ pub trait Journal: Send + Sync {
         query: &ExecutionQuery,
     ) -> anyhow::Result<ExecutionPage>;
 
-    /// The summary for one execution, looked up directly by color (no window
-    /// scan). `None` when no `execution_started` row exists for `color`. The
-    /// caller authorizes the color against the tenant separately; this is the
+    /// The summary for one execution, looked up directly by execution (no window
+    /// scan). `None` when no `execution_started` row exists for `execution_id`. The
+    /// caller authorizes the execution against the tenant separately; this is the
     /// pure read.
     async fn execution_summary(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
     ) -> anyhow::Result<Option<ExecutionSummary>>;
 
-    /// Every color `project_id` ever started.
+    /// Every execution `project_id` ever started.
     ///
-    /// The question retirement asks: a version-tree row whose color is
+    /// The question retirement asks: a version-tree row whose execution is
     /// not in here describes a run nothing can read. Separate from
     /// [`Self::execution_summaries_for_project`] because that one decodes
     /// every birth payload, every terminal payload and every tag array to
     /// build a status nobody here looks at, and the reaper asks this
     /// hourly for every removed project it still holds rows for.
-    async fn colors_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<Color>>;
+    async fn execution_ids_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<ExecutionId>>;
 
-    /// Every execution of `project_id`, by color, in ONE read.
+    /// Every execution of `project_id`, by execution, in ONE read.
     ///
     /// `weft tree` and the editor's version sidebar need a status per
     /// recorded run, and asking `execution_summary` per run meant a
     /// round trip each: a project with a thousand runs did a thousand
-    /// point lookups on every refresh. A color the journal has never
+    /// point lookups on every refresh. An execution the journal has never
     /// heard of is simply absent from the map, which is the same answer
     /// `execution_summary` gives as `None`.
     async fn execution_summaries_for_project(
         &self,
         project_id: uuid::Uuid,
-    ) -> anyhow::Result<std::collections::HashMap<Color, ExecutionSummary>>;
+    ) -> anyhow::Result<std::collections::HashMap<ExecutionId, ExecutionSummary>>;
 
-    /// Every execution color of `tenant`'s that starts with `prefix`
+    /// Every execution of `tenant`'s that starts with `prefix`
     /// (the first characters of a uuid, as a person types them). At most
     /// two come back: the caller only needs to know whether the prefix
-    /// names one execution, none, or several. Node-test colors never
+    /// names one execution, none, or several. Node-test executions never
     /// match, the way they never list.
-    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>>;
+    async fn execution_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<ExecutionId>>;
 
-    /// Every color belonging to `project_id` whose journal has no
+    /// Every execution belonging to `project_id` whose journal has no
     /// terminal event yet, each with its phase (a run, or the setup an
     /// `infra start` or an activation runs, which the editor shows as
     /// that verb working rather than as a run to stop). Used by
     /// wipe / cancel_running / the activation sweep to enumerate what
     /// needs cancelling without the limit-truncation problem of
-    /// `list_executions`. Single SQL roundtrip, no per-color fold.
+    /// `list_executions`. Single SQL roundtrip, no per-execution fold.
     ///
     /// Oldest first, so the LAST one is the most recently started. The
     /// editor's action bar follows "the latest run" and the wire
     /// carries no other way to tell which that is, so the order is part
     /// of the contract rather than an accident of the query. Ties break
-    /// on the color, so the answer is stable across calls.
-    async fn list_non_terminal_colors_for_project(
+    /// on the execution, so the answer is stable across calls.
+    async fn list_non_terminal_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<(Color, weft_core::context::Phase)>>;
+    ) -> anyhow::Result<Vec<(ExecutionId, weft_core::context::Phase)>>;
 
-    /// Every color belonging to `project_id` whose journal HAS a
+    /// Every execution belonging to `project_id` whose journal HAS a
     /// terminal event (completed / failed / cancelled). The exact
-    /// complement of `list_non_terminal_colors_for_project` over the
-    /// project's known colors. `running_count` uses it to make sure a
-    /// stray `pending`/`claimed` task row can never resurrect a color
+    /// complement of `list_non_terminal_execution_ids_for_project` over the
+    /// project's known executions. `running_count` uses it to make sure a
+    /// stray `pending`/`claimed` task row can never resurrect an execution
     /// whose execution is already finished.
-    async fn list_terminal_colors_for_project(
+    async fn list_terminal_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
-    ) -> anyhow::Result<std::collections::HashSet<Color>>;
+    ) -> anyhow::Result<std::collections::HashSet<ExecutionId>>;
 
     /// Every live (non-terminal, project-kind) execution of `project_id`
     /// carrying `tag`, with the sequence its tag row got, oldest tag
@@ -400,15 +406,23 @@ pub trait Journal: Send + Sync {
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
-    /// Insert a signal registration, born with its placement (holder pod
-    /// + generation) so the row is never committed with a NULL holder
-    /// while a pod already holds it. Caller mints the token and resolves
-    /// the placement before calling.
-    async fn signal_insert(
-        &self,
-        sig: &SignalRegistration,
-        placement: &SignalPlacement,
-    ) -> anyhow::Result<()>;
+    /// Insert a signal registration (or refresh an entry's row in place
+    /// on reactivate). The caller mints the token. A compare-and-set on
+    /// the kind state's version: see [`SignalWrite`].
+    async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<SignalWrite>;
+
+    /// Write `sig` back over an existing row: the same columns a
+    /// registration's refresh of a replaced row writes (its spec,
+    /// routing, program, source version and kind state; never the row's
+    /// identity), a compare-and-set like [`Self::signal_insert`]: it
+    /// lands only while the row is still at `sig.kind_state_seq` and
+    /// moves it one past. The undo of a registration that replaced a row.
+    /// Unlike `signal_insert` it checks no activation (the one that armed
+    /// `sig` may be long over), but it holds the source version `sig`
+    /// names the same way, and a version removed since is an error.
+    /// `StateMoved` when a claim moved the row; an error when the row is
+    /// gone.
+    async fn signal_restore(&self, sig: &SignalRegistration) -> anyhow::Result<SignalWrite>;
 
     /// Look up a single signal by its token.
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
@@ -427,20 +441,6 @@ pub trait Journal: Send + Sync {
         member: Option<&weft_core::member::MemberId>,
     ) -> anyhow::Result<Option<SignalRegistration>>;
 
-    /// Persist a kind's evolving durable state (a delta-poll cursor)
-    /// onto its signal row. Two fences: the write is rejected when the
-    /// row's placement generation is above `placement_generation` (a
-    /// drained pod writing after the signal moved) or when the row's
-    /// `kind_state_seq` is at or above `seq` (an older update
-    /// arriving late must never regress a newer cursor). Returns
-    /// whether a row was written.
-    async fn signal_update_kind_state(
-        &self,
-        token: &str,
-        kind_state: &Value,
-        seq: i64,
-        placement_generation: i64,
-    ) -> anyhow::Result<bool>;
 
     /// Remove signals by token in one SQL statement. Returns the
     /// deleted rows so the caller can drive listener-unregister
@@ -451,14 +451,14 @@ pub trait Journal: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// The RESUME registrations of one color: what that execution is
+    /// The RESUME registrations of one execution: what that execution is
     /// parked on.
     ///
     /// Every poll of a parked run and every `weft wake` asks this. Asked
     /// as "every signal of the project, then filter", it read every
     /// registration the project has, with its kind state, its port
     /// snapshot and its consumer payload, to answer with three fields.
-    async fn signal_list_for_color(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>>;
+    async fn signal_list_for_execution_id(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// All signals currently registered for a project.
     async fn signal_list_for_project(
@@ -466,15 +466,15 @@ pub trait Journal: Send + Sync {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// All signals tied to one execution color (resume signals).
+    /// All signals tied to one execution (resume signals).
     /// Used on cancel to unregister everything that was waiting.
-    async fn signal_remove_for_color(
+    async fn signal_remove_for_execution_id(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// All signals tied to a project. Used by deactivate sweeps
-    /// after color-by-color cancel has run.
+    /// after execution-by-execution cancel has run.
     async fn signal_remove_for_project(
         &self,
         project_id: uuid::Uuid,
@@ -482,13 +482,13 @@ pub trait Journal: Send + Sync {
 
     // ----- Administrative ---------------------------------------------
 
-    /// Delete all data for a color. Called only by `weft clean`.
+    /// Delete all data for an execution. Called only by `weft clean`.
     ///
     /// Answers the resume signals the run was parked on, which went
-    /// with it: a listener pod still holds each one in RAM and keeps
+    /// with it: a listener process still holds each one in RAM and keeps
     /// answering for a run that no longer exists until the caller
     /// unregisters it there (`unregister_many`), the way a cancel does.
-    async fn delete_execution(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>>;
+    async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// Delete all data for every execution of a project, and say how
     /// many went. Called by `weft rm`.
@@ -526,15 +526,15 @@ pub struct SignalRegistration {
     pub activation_trigger: Option<String>,
     pub source_version: Option<String>,
     /// Setup whose completed capture armed this entry; absent for suspensions.
-    pub setup_color: Option<Color>,
+    pub setup_execution_id: Option<ExecutionId>,
     /// The code armed with these settings. Rebaking cannot retarget a listener.
     pub program: Option<weft_core::project::hash::ProgramIdentity>,
     pub token: String,
     pub tenant_id: String,
     pub project_id: uuid::Uuid,
-    /// `Some(color)` for resume (suspension) signals; `None` for
+    /// `Some(execution_id)` for resume (suspension) signals; `None` for
     /// entry signals registered during trigger setup.
-    pub color: Option<Color>,
+    pub execution_id: Option<ExecutionId>,
     /// The PLACE this registration was made at, spelled the way a
     /// person writes the node: `door`, or `one.door` for the `door`
     /// inside the file the site `one` includes. A file called from two
@@ -545,9 +545,9 @@ pub struct SignalRegistration {
     /// person or looks one up by the name a person gave.
     pub node_id: String,
     pub is_resume: bool,
-    /// JSON-serialized `SignalSpec`. Stored so a listener
-    /// rehydrate after Pod restart can re-POST `/register` without
-    /// re-running trigger-setup.
+    /// JSON-serialized `SignalSpec`. Stored so a listener brings the
+    /// signal back up from its row after a restart without re-running
+    /// trigger-setup.
     pub spec_json: String,
     /// The connection this signal acts as (`spec.access.id`),
     /// denormalized so inbound provider pushes route account-to-
@@ -567,11 +567,11 @@ pub struct SignalRegistration {
     /// a trigger's inputs are whatever they were at trigger setup.
     pub port_snapshot: Option<serde_json::Value>,
     /// Rendered consumer payload (form schema, decorated webhook
-    /// shape, etc). Computed once at register time on the listener
-    /// `/render` endpoint; cached here so consumer enumeration is
+    /// shape, etc). Computed once at register time by the listener's
+    /// `/prepare`; cached here so consumer enumeration is
     /// a pure SQL read with no listener round-trip. Park-mode
     /// projects can serve `/signal-token/.../signals` even with the
-    /// listener pod reaped because the payload is on the row.
+    /// listener process reaped because the payload is on the row.
     pub consumer_payload: Option<serde_json::Value>,
     /// `signal.surface_kind` discriminant: 'public_entry' or
     /// 'task_callback'. Read by `public_url()`, which formats both the
@@ -604,36 +604,32 @@ pub struct SignalRegistration {
     /// the clock. The dispatcher treats this field as opaque
     /// JSON; only the kind's handler interprets it.
     pub kind_state: Value,
-    /// The kind_state write-fence version this state was read/written
-    /// at (see the `signal.kind_state_seq` column). A register that
-    /// carries prior state forward passes the seq it read; a fresh
-    /// token starts at 0.
+    /// The kind_state version (the `signal.kind_state_seq` column). On
+    /// an insert, the version the registration read the row at (0 for a
+    /// token with no row yet): the insert lands only while the row is
+    /// still there and moves it one past, so every claim a wake took at
+    /// the old version fails. Read back, the row's current version.
     pub kind_state_seq: i64,
-    /// The pod holding this signal in RAM when the row was read
-    /// (`signal.listener_pod`); `None` when the holder was reaped and
-    /// the signal waits to be re-placed. Read-side only: `signal_insert`
-    /// stamps the `SignalPlacement` it is handed and never reads this
-    /// field. It rides on the row so an unregister after a DELETE still
-    /// knows which pod to tell: the row is gone by then, so nothing can
-    /// look the holder up again.
-    pub listener_pod: Option<String>,
 }
 
-/// The placement an insert stamps on a new `signal` row: which pod holds
-/// it and under what generation. Passed to `signal_insert` SEPARATELY
-/// from `SignalRegistration` (the signal's identity/config) because it is
-/// WRITE-time data chosen under the pod lock at register time; a read
-/// hands the holder back on `SignalRegistration::listener_pod`. Writing
-/// it WITH the row (rather than a later UPDATE) closes the window where
-/// a committed row had a NULL holder while a pod already held the signal
-/// in RAM (a fire in that window would double-place).
-#[derive(Debug, Clone)]
-pub struct SignalPlacement {
-    pub listener_pod: String,
-    pub generation: i64,
+/// What a [`Journal::signal_insert`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalWrite {
+    /// The row is written, its kind state at a new version.
+    Written,
+    /// The row's kind state moved past the version the registration read
+    /// it at (a wake claimed a moment in between), so nothing was
+    /// written: read the row again and compute the state again from it.
+    StateMoved,
 }
+
 
 impl SignalRegistration {
+    /// The signal's spec, read off `spec_json`.
+    pub fn spec(&self) -> anyhow::Result<weft_core::primitive::SignalSpec> {
+        serde_json::from_str(&self.spec_json).map_err(|e| anyhow::anyhow!("signal {} spec: {e}", self.token))
+    }
+
     /// Compute the public URL for this signal given a dispatcher base
     /// URL. The route depends on the surface AND, for public entries,
     /// whether it is a LIVE connection (served only at `/connect/...`,
@@ -661,7 +657,7 @@ impl SignalRegistration {
                 // is a broken row, which is worth a line in the log.
                 let spec = serde_json::from_str::<weft_core::primitive::SignalSpec>(&self.spec_json);
                 let is_live = match &spec {
-                    Ok(spec) => weft_core::signal::protocol_for_tag(&spec.kind).is_some(),
+                    Ok(spec) => weft_core::signal::caller_protocol(&spec.kind).is_some(),
                     Err(error) => {
                         tracing::error!(
                             target: "weft_dispatcher::journal",
@@ -688,7 +684,7 @@ impl SignalRegistration {
 // ----- Public types -----------------------------------------------
 
 /// Who an execution belongs to: the project it ran for, and the tenant
-/// that owns it. Both are stamped on the `execution_color` row when the
+/// that owns it. Both are stamped on the `execution` row when the
 /// execution is born and frozen for its life (a project cannot change
 /// tenant: re-registering is guarded to the same one).
 ///
@@ -703,7 +699,7 @@ pub struct CancelWrite {
     /// The wake signals stripped, for the listener's in-RAM unregister.
     pub removed: Vec<SignalRegistration>,
     /// Whether a `cancel_execution` task was queued for an alive owner
-    /// pod (false: no pod is driving this color, nothing to flag).
+    /// process (false: no process is driving this execution, nothing to flag).
     pub task_enqueued: bool,
     /// Per-node cancel rows written; `None` when the journal already
     /// held a terminal and nothing was written.
@@ -714,9 +710,9 @@ pub struct CancelWrite {
 pub struct ExecutionOwner {
     pub project_id: uuid::Uuid,
     pub tenant: String,
-    /// Who the run is for (`execution_color.member_id`).
+    /// Who the run is for (`execution.member_id`).
     pub member: Option<weft_core::member::MemberId>,
-    /// The trigger that fired the run (`execution_color.fired_by`).
+    /// The trigger that fired the run (`execution.fired_by`).
     pub fired_by: Option<String>,
 }
 
@@ -724,7 +720,7 @@ pub struct ExecutionOwner {
 //       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecutionSummary {
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub project_id: uuid::Uuid,
     pub entry_node: String,
     /// One of `running`, `completed`, `failed`, `cancelled`, or
@@ -737,7 +733,7 @@ pub struct ExecutionSummary {
     /// resync / infra start runs. The listing mixes all three, and
     /// "has my trigger fired since the change" is unanswerable without
     /// it. Copied from the `ExecutionStarted` row, or, when that row
-    /// no longer decodes, from the `execution_color.phase` column the
+    /// no longer decodes, from the `execution.phase` column the
     /// listing filtered on.
     pub phase: weft_core::context::Phase,
     pub started_at: u64,
@@ -774,7 +770,7 @@ pub struct ExecutionQuery {
     pub project_id: Option<uuid::Uuid>,
     pub started_after: Option<u64>,
     pub started_before: Option<u64>,
-    /// Only runs of this phase (the `execution_color.phase` column):
+    /// Only runs of this phase (the `execution.phase` column):
     /// `Fire` hides the activate / resync / infra-start runs so a
     /// listing answers "what did my triggers actually do".
     pub phase: Option<weft_core::context::Phase>,
@@ -793,11 +789,11 @@ pub struct ExecutionQuery {
     /// Only runs carrying this tag (`ctx.tag_execution`).
     pub tag: Option<String>,
     /// Keyset cursor: only runs strictly after this `(started_at,
-    /// color)` in the listing's order (newest first, then color
+    /// execution)` in the listing's order (newest first, then execution
     /// descending). A walk that hands each page's last run back here
     /// reaches every run exactly once, whatever it deletes or changes
     /// behind itself. `total` ignores it.
-    pub below: Option<(u64, Color)>,
+    pub below: Option<(u64, ExecutionId)>,
 }
 
 /// One page of executions plus the total number matching the same filters
@@ -811,14 +807,49 @@ pub struct ExecutionPage {
     pub total: u64,
 }
 
-/// Token-scoped enumeration credential. Used by external consumers
-/// (browser extension, future Slack bot, etc.) to fetch the subset
-/// of signals they're authorized to see. Each scope vector is
-/// independent; empty = wildcard.
+/// What a token may do. One table, one hash, one mint/list/revoke
+/// surface for both, and the kind is checked at each door: a caller
+/// token never opens the admin surface, and an operator key is never
+/// taken on the outside-caller doors, so a frontend's leaked token can
+/// never administer the install and an admin key is never pasted into
+/// a frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// An outside caller's scoped credential: signals, displays.
+    Caller,
+    /// Full admin of the tenant: every CLI and editor verb.
+    Operator,
+}
+
+impl TokenKind {
+    // SYNC: kind column values <-> the CHECK on signal_token.kind in journal::postgres::GROUP
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Caller => "caller",
+            TokenKind::Operator => "operator",
+        }
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "caller" => Ok(TokenKind::Caller),
+            "operator" => Ok(TokenKind::Operator),
+            other => anyhow::bail!("unknown token kind '{other}'"),
+        }
+    }
+}
+
+/// A hashed bearer credential. A `Caller` token is used by external
+/// consumers (a frontend's server, the browser extension) to fetch the
+/// subset of signals and displays they're authorized to see; each scope
+/// vector is independent, empty = wildcard. An `Operator` token carries
+/// no scope: it is the tenant's admin key.
 #[derive(Debug, Clone)]
 pub struct SignalToken {
     /// The token's stable identity: what list/revoke address. Never secret.
     pub id: uuid::Uuid,
+    pub kind: TokenKind,
     /// sha256 hex of the full token value: the ONLY secret-derived thing at
     /// rest. Lookups hash the presented credential and match this, so a DB
     /// dump exposes no usable token.
@@ -912,7 +943,7 @@ impl SignalToken {
 /// ones and is `None` for a run-level line.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    pub inherited_from: Option<Color>,
+    pub inherited_from: Option<ExecutionId>,
     pub at_unix: u64,
     pub level: String,
     pub node: Option<String>,
@@ -934,7 +965,7 @@ pub struct LogEntry {
 
 impl LogEntry {
     /// The lines as the run wrote them. A node's log line reaches the
-    /// journal through a task a dispatcher pod drains later, eight at
+    /// journal through a task a dispatcher drains later, eight at
     /// a time, so the journal's row order is the drain's, not the
     /// run's: the read sorts by the worker's clock, to the
     /// millisecond, then by the firing's own sequence. A row the
@@ -950,7 +981,7 @@ impl LogEntry {
     /// the same code for both journals, so what a fake-backed test
     /// pins is what the real read does. The cut is made after the
     /// sort, so it is the last lines the run wrote and never the last
-    /// rows a pod happened to drain.
+    /// rows a process happened to drain.
     pub fn tail(entries: Vec<LogEntry>, limit: u32) -> Vec<LogEntry> {
         let mut entries = Self::in_written_order(entries);
         if entries.len() > limit as usize {
@@ -966,7 +997,7 @@ impl LogEntry {
     }
 
     /// The line a journal row that no longer decodes reads as: the
-    /// decode error, which names the color and `weft clean`. Its own
+    /// decode error, which names the execution and `weft clean`. Its own
     /// clock is unreadable, so it is stamped with when the row was
     /// written and sorted last, where the tail always holds it.
     pub fn corrupt_row(written_at_unix: u64, error: String) -> LogEntry {
@@ -1076,18 +1107,19 @@ mod bake_tests {
     use super::*;
 
     fn completed() -> Vec<ExecEvent> {
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         vec![
             ExecEvent::ExecutionStarted {
-                color, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
+                execution_id, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::TriggerSetup,
                 definition_hash: Some("graph".into()),
                 program: Some(weft_core::project::hash::ProgramIdentity {
                     definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
                 }),
-                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 1,
+                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 1,
+                run_class: weft_core::run_class::RunClass::Short,
             },
-            ExecEvent::ExecutionCompleted { color, at_unix: 2 },
+            ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 },
         ]
     }
 
@@ -1099,7 +1131,7 @@ mod bake_tests {
         assert!(TriggerBake::from_events(&rows[..1]).is_err());
         let mut failed = rows;
         failed[1] = ExecEvent::ExecutionCancelled {
-            color: bake.color, reason: "cancelled".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 2,
+            execution_id: bake.execution_id, reason: "cancelled".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 2,
         };
         assert!(TriggerBake::from_events(&failed).unwrap().is_none());
     }
@@ -1107,7 +1139,7 @@ mod bake_tests {
     #[test]
     fn bake_refuses_mixed_run_history_and_conflicting_program_identity() {
         let mut rows = completed();
-        rows[1] = ExecEvent::ExecutionCompleted { color: Color::new_v4(), at_unix: 2 };
+        rows[1] = ExecEvent::ExecutionCompleted { execution_id: ExecutionId::new_v4(), at_unix: 2 };
         assert!(TriggerBake::from_events(&rows).unwrap_err().to_string().contains("another run"));
         let mut rows = completed();
         if let ExecEvent::ExecutionStarted { definition_hash, .. } = &mut rows[0] {
@@ -1123,10 +1155,10 @@ mod log_entry_tests {
     use weft_journal::ExecEvent;
 
     fn sample_events() -> Vec<ExecEvent> {
-        let color = weft_core::Color::new_v4();
+        let execution_id = weft_core::ExecutionId::new_v4();
         vec![
             ExecEvent::LogLine {
-                color,
+                execution_id,
                 node_id: "greet".into(),
                 frames: Default::default(),
                 level: "info".into(),
@@ -1136,28 +1168,28 @@ mod log_entry_tests {
                 seq: Some(0),
             },
             ExecEvent::NodeFailed {
-                color,
+                execution_id,
                 node_id: "llm".into(),
                 frames: Default::default(),
                 error: "boom".into(),
                 at_unix: 2,
             },
             ExecEvent::NodeCancelled {
-                color,
+                execution_id,
                 node_id: "llm".into(),
                 frames: Default::default(),
                 reason: "stopped".into(),
                 at_unix: 3,
             },
-            ExecEvent::ExecutionFailed { color, error: "stuck".into(), at_unix: 5 },
+            ExecEvent::ExecutionFailed { execution_id, error: "stuck".into(), at_unix: 5 },
             ExecEvent::ExecutionCancelled {
-                color,
+                execution_id,
                 reason: "by hand".into(),
                 cause: None,
                 at_unix: 6,
             },
-            ExecEvent::ExecutionCompleted { color, at_unix: 7 },
-            ExecEvent::ExecutionTagged { color, tags: vec!["t".into()], at_unix: 8 },
+            ExecEvent::ExecutionCompleted { execution_id, at_unix: 7 },
+            ExecEvent::ExecutionTagged { execution_id, tags: vec!["t".into()], at_unix: 8 },
         ]
     }
 
@@ -1210,9 +1242,9 @@ mod log_entry_tests {
     /// carried likewise.
     #[test]
     fn lines_read_in_the_order_they_were_written() {
-        let color = weft_core::Color::new_v4();
+        let execution_id = weft_core::ExecutionId::new_v4();
         let line = |node: &str, seq: u64, at_ms: Option<u64>, at_unix: u64| ExecEvent::LogLine {
-            color,
+            execution_id,
             node_id: node.into(),
             frames: Default::default(),
             level: "info".into(),
@@ -1222,7 +1254,7 @@ mod log_entry_tests {
             seq: Some(seq),
         };
         let failed = ExecEvent::NodeFailed {
-            color,
+            execution_id,
             node_id: "a".into(),
             frames: Default::default(),
             error: "boom".into(),

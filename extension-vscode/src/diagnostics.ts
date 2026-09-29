@@ -2,7 +2,7 @@
 // Triggered on a longer debounce than parse so the Problems panel
 // doesn't flash during every keystroke. Validation runs through the
 // local CLI (it needs the project's `nodes/` catalog, which the
-// dispatcher pod can't see).
+// dispatcher, which may run on another machine, can't see).
 //
 // The owner/file bookkeeping (whose findings land where, and at which
 // URI they publish) lives in DiagnosticRouter, pure over strings so
@@ -18,6 +18,11 @@ import { findProjectRoot } from './sidebar/projects';
 import { canonicalPath, weftPositionToVsCode } from './locations';
 import type { ParseServer } from './parseServer';
 import type { Diagnostic as WeftDiagnostic, Severity } from '../../packages/weft-graph/src/protocol';
+
+/// Where a project's node packages live, as globs from its root: all of
+/// `nodes/`, and a package's own files under `src/`.
+// SYNC: NODE_GLOBS <-> crates/weft-compiler/src/project.rs (node_roots)
+export const NODE_GLOBS = ['nodes/**', 'src/**/*.{json,rs,toml}'];
 
 /// One document's diagnostic bookkeeping: its owner key (the URI
 /// string), its canonical file path (resolved ONCE, so validate and
@@ -75,7 +80,7 @@ export function attachDiagnostics(context: vscode.ExtensionContext, parseServer:
     );
   };
 
-  // A change under a `nodes/` dir alters the catalog validation runs
+  // A change to a node package alters the catalog validation runs
   // against, but no text changed, so reschedule the affected .weft
   // docs. Scope to the project that owns the changed node (the docs
   // whose project dir is an ancestor of the change), so a node edit in
@@ -93,13 +98,17 @@ export function attachDiagnostics(context: vscode.ExtensionContext, parseServer:
       // and the warm server kept serving the catalog it started with.
       const projectDir = findProjectRoot(doc.uri.fsPath) ?? docDirOf(doc);
       if (changedPath === projectDir || changedPath.startsWith(projectDir + path.sep)) {
-        // A `nodes/` change altered the catalog: tell the warm server to
+        // A node package changed the catalog: tell the warm server to
         // rebuild it before this validation, else it serves a stale catalog.
         schedule(doc, true);
       }
     }
   };
-  const nodesWatcher = vscode.workspace.createFileSystemWatcher('**/nodes/**');
+  // Node packages live under `nodes/` and beside the modules that use
+  // them under `src/`. Under `src/` only a package's own files count
+  // (a `.weft` edit is the text-change path's).
+  // SYNC: the node roots <-> crates/weft-compiler/src/project.rs (node_roots)
+  const nodeWatchers = NODE_GLOBS.map((glob) => vscode.workspace.createFileSystemWatcher(`**/${glob}`));
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((e) => schedule(e.document)),
@@ -120,10 +129,12 @@ export function attachDiagnostics(context: vscode.ExtensionContext, parseServer:
       if (t) clearTimeout(t);
       timers.delete(doc.uri.toString());
     }),
-    nodesWatcher,
-    nodesWatcher.onDidCreate(revalidateForChange),
-    nodesWatcher.onDidChange(revalidateForChange),
-    nodesWatcher.onDidDelete(revalidateForChange),
+    ...nodeWatchers.flatMap((w) => [
+      w,
+      w.onDidCreate(revalidateForChange),
+      w.onDidChange(revalidateForChange),
+      w.onDidDelete(revalidateForChange),
+    ]),
   );
 
   for (const doc of vscode.workspace.textDocuments) schedule(doc);

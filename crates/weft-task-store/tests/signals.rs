@@ -17,7 +17,6 @@ use sqlx::PgPool;
 
 use weft_task_store::pg_signal::{Heard, Subscription};
 use weft_task_store::tasks::{self, claim_one, ClaimFilter, TASK_READY_CHANNEL};
-use weft_task_store::worker_pod::{self, register_alive, AliveTransition, WORKER_POD_CHANNEL};
 use weft_task_store::{PostgresTaskStoreClient, TaskStoreClient, TaskTarget};
 
 use support::{setup, signals};
@@ -34,9 +33,9 @@ fn task(target: TaskTarget, dedup: &str) -> tasks::NewTask {
         target,
         project_id: (target == TaskTarget::Worker).then_some(PROJECT),
         dedup_key: Some(dedup.to_string()),
-        color: None,
+        execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_pod_name: None,
+        target_instance: None,
         binary_hash: None,
         payload: json!({}),
     }
@@ -59,13 +58,6 @@ fn on(heard: &[Heard], channel: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-async fn alive_pod(pool: &PgPool, pod: &str) {
-    worker_pod::insert_spawning(pool, pod, PROJECT, "ns", "disp-1", Some("bin"), "worker", None)
-        .await
-        .expect("insert_spawning");
-    register_alive(pool, pod, PROJECT, AliveTransition::FromSpawning).await.expect("register_alive");
 }
 
 #[sqlx::test]
@@ -131,82 +123,70 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "completing is silent");
 }
 
-/// A pod row speaks up when the project's capacity changes, never on a
-/// plain heartbeat.
-#[sqlx::test]
-async fn a_worker_pod_is_announced_when_capacity_changes(pool: PgPool) {
-    setup(&pool).await;
-    let watch = signals(&pool).await;
-    let mut heard = watch.subscribe();
-    let sat = weft_platform_traits::SATURATION_MEM_FRACTION;
-
-    alive_pod(&pool, "pod-a").await;
-    assert_eq!(on(&drain(&mut heard).await, WORKER_POD_CHANNEL), vec![PROJECT.to_string(); 2]);
-
-    worker_pod::heartbeat(&pool, "pod-a", sat - 0.05).await.unwrap();
-    assert!(on(&drain(&mut heard).await, WORKER_POD_CHANNEL).is_empty(), "a heartbeat under the line is silent");
-
-    worker_pod::heartbeat(&pool, "pod-a", sat).await.unwrap();
-    assert_eq!(on(&drain(&mut heard).await, WORKER_POD_CHANNEL), vec![PROJECT.to_string()], "crossing the line");
-
-    worker_pod::mark_dead(&pool, "pod-a").await.unwrap();
-    assert_eq!(on(&drain(&mut heard).await, WORKER_POD_CHANNEL), vec![PROJECT.to_string()]);
+fn cancel(execution_id: &str) -> tasks::NewTask {
+    tasks::NewTask {
+        kind: "cancel_execution".to_string(),
+        target: TaskTarget::Worker,
+        project_id: Some(PROJECT),
+        dedup_key: Some(format!("{execution_id}:cancel")),
+        execution_id: Some(execution_id.to_string()),
+        tenant_id: "tenant-1".to_string(),
+        target_instance: None,
+        binary_hash: None,
+        payload: json!({ "project_id": PROJECT, "execution_id": execution_id, "cause": { "kind": "user" } }),
+    }
 }
 
-/// A worker's claim held open ends the moment a task for its project is
-/// enqueued, and comes back empty at its deadline when none is.
+/// A worker's cancel wait held open ends the moment a cancel for one of
+/// its executions is enqueued, and comes back empty at its deadline when none
+/// is.
 #[sqlx::test]
-async fn a_held_claim_ends_when_a_task_arrives_or_at_its_deadline(pool: PgPool) {
+async fn a_held_cancel_wait_ends_when_a_cancel_arrives_or_at_its_deadline(pool: PgPool) {
     setup(&pool).await;
-    alive_pod(&pool, "pod-a").await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
-    let filter = ClaimFilter::Worker { project_id: PROJECT };
+    let execution_ids = vec!["c1".to_string()];
 
     let started = tokio::time::Instant::now();
-    assert!(client.claim_one("pod-a", filter.clone(), Duration::from_millis(500)).await.unwrap().is_none());
+    assert!(client.wait_cancels(PROJECT, execution_ids.clone(), Duration::from_millis(500)).await.unwrap().is_empty());
     assert!(started.elapsed() >= Duration::from_millis(500));
 
     let enqueuer = {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            tasks::enqueue(&pool, task(TaskTarget::Worker, "late")).await.unwrap();
+            tasks::enqueue_dedup(&pool, cancel("c1")).await.unwrap();
         })
     };
     let started = tokio::time::Instant::now();
-    let claimed = client.claim_one("pod-a", filter, Duration::from_secs(20)).await.unwrap();
+    let taken = client.wait_cancels(PROJECT, execution_ids, Duration::from_secs(20)).await.unwrap();
     enqueuer.await.unwrap();
-    assert!(claimed.is_some());
+    assert_eq!(taken.len(), 1);
     assert!(started.elapsed() < Duration::from_secs(10), "woken, not timed out: {:?}", started.elapsed());
 }
 
-/// The subscription is taken before the first claim, so a task that
-/// lands anywhere around the claim (before it, during it, just after
-/// the empty answer) still ends the hold. Raced many times with the
-/// enqueue at shifting offsets, since a subscribe-after-claim window is
-/// only a few microseconds wide.
+/// The subscription is taken before the first look, so a cancel that
+/// lands anywhere around it (before it, during it, just after the empty
+/// answer) still ends the hold. Raced many times with the enqueue at
+/// shifting offsets, since a subscribe-after-look window is only a few
+/// microseconds wide.
 #[sqlx::test]
-async fn a_task_landing_around_the_claim_is_never_missed(pool: PgPool) {
+async fn a_cancel_landing_around_the_wait_is_never_missed(pool: PgPool) {
     setup(&pool).await;
-    alive_pod(&pool, "pod-a").await;
-    let client = std::sync::Arc::new(
-        PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client"),
-    );
-    let filter = ClaimFilter::Worker { project_id: PROJECT };
+    let client = std::sync::Arc::new(PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client"));
     for round in 0..40u64 {
-        let claimer = {
+        let execution_id = format!("race-{round}");
+        let waiter = {
             let client = client.clone();
-            let filter = filter.clone();
-            tokio::spawn(async move { client.claim_one("pod-a", filter, Duration::from_secs(20)).await })
+            let execution_ids = vec![execution_id.clone()];
+            tokio::spawn(async move { client.wait_cancels(PROJECT, execution_ids, Duration::from_secs(20)).await })
         };
         tokio::time::sleep(Duration::from_micros(round * 150)).await;
-        tasks::enqueue(&pool, task(TaskTarget::Worker, &format!("race-{round}"))).await.unwrap();
-        let claimed = tokio::time::timeout(Duration::from_secs(10), claimer)
+        tasks::enqueue_dedup(&pool, cancel(&execution_id)).await.unwrap();
+        let taken = tokio::time::timeout(Duration::from_secs(10), waiter)
             .await
-            .unwrap_or_else(|_| panic!("round {round}: the hold missed its task"))
+            .unwrap_or_else(|_| panic!("round {round}: the wait missed its cancel"))
             .unwrap()
             .unwrap();
-        let claimed = claimed.expect("claimed");
-        tasks::complete(&pool, claimed.id, "pod-a", json!(null)).await.unwrap();
+        assert_eq!(taken.len(), 1, "round {round}");
     }
 }

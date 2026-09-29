@@ -449,7 +449,7 @@ export interface NodeExecution {
 	/// these.
 	costIds?: string[];
 	logs: unknown[];
-	color: string;
+	executionId: string;
 	frames: Frame[];
 	/// Frame stack serialized as JSON, used to correlate completion
 	/// events to the right running row when several firings run

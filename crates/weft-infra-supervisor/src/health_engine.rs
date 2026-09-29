@@ -3,12 +3,12 @@
 //!
 //! Split off from `health.rs` so the windowed transitions can be
 //! tested deterministically without spinning a real supervisor +
-//! broker + kube + tokio runtime. The shape:
+//! broker + host + tokio runtime. The shape:
 //!
 //!   inputs           pure fn                outputs
 //!   ─────────  ───────────────────────  ───────────────
 //!   prior NodeHealthState  +
-//!   observed replicas      ──> evaluate_node_health  ──> NodeDecision
+//!   unit ready or not      ──> evaluate_node_health  ──> NodeDecision
 //!   "now" instant
 //!
 //!   prior in_flight set    +
@@ -18,7 +18,8 @@
 //!
 //! Tests poke values straight into these functions, no fakes
 //! required. The I/O glue in `health.rs` is then a thin caller that
-//! collects k8s state, calls these, dispatches the resulting events.
+//! asks the host how each unit is doing, calls these, dispatches the
+//! resulting events.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -40,8 +41,8 @@ pub const RECOVERY_AFTER: Duration = Duration::from_secs(30);
 /// the caller owns the map of `(project, node) -> state`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NodeHealthState {
-    /// Last observation in which this node was Ready (desired > 0
-    /// AND ready >= desired). None until we've ever seen it Ready.
+    /// Last observation in which this unit was ready. None until we've
+    /// ever seen it ready.
     pub last_ready_at: Option<Instant>,
     /// Last observation in which this node was NOT Ready. None
     /// until we've ever seen it Not-Ready.
@@ -54,8 +55,8 @@ pub struct NodeHealthState {
 impl NodeHealthState {
     /// A fresh latch for a unit whose row already says `status`, so the
     /// first look after the latch is gone (a command on the copy, a
-    /// restart, the project moving to another pod: the latch lives in
-    /// this pod's memory only) argues from the durable row instead of
+    /// restart, the project moving to another process: the latch lives in
+    /// this process's memory only) argues from the durable row instead of
     /// against it.
     ///
     /// A unit the row calls `Flaky` starts declared flaky with its
@@ -65,21 +66,17 @@ impl NodeHealthState {
     /// frozen, still-broken unit to `Running` for as long as it never
     /// becomes ready.
     ///
-    /// A `watched` unit (one the loop's watch can see ready, see
-    /// `UnitRuntime::watched`) the row calls `Running` whose copy was
-    /// applied at least `flaky_after` ago (`applied_at_unix`, wall clock)
-    /// is KNOWN: its apply finished and its workload has had its whole
-    /// window to show up, so it starts as seen ready at `now`. A workload
-    /// missing from the watch then reads as zero ready and turns flaky
-    /// after the window, instead of staying unknown (and counting as
-    /// healthy) for ever. One applied more recently starts empty: its
-    /// workload may not have reached the watch yet. So does a unit the
-    /// watch never shows ready (a Job, a DaemonSet, zero replicas): it
-    /// would otherwise read as vanished and park healthy readers. The
-    /// caller never evaluates a unit outside {Running, Flaky}.
+    /// A unit the row calls `Running` whose copy was applied at least
+    /// `flaky_after` ago (`applied_at_unix`, wall clock) is KNOWN: its
+    /// apply finished and it has had its whole window to show up, so it
+    /// starts as seen ready at `now`. A unit the host then no longer
+    /// reports reads as not ready and turns flaky after the window,
+    /// instead of staying unknown (and counting as healthy) for ever.
+    /// One applied more recently starts empty: the host may not report
+    /// it yet. The caller never evaluates a unit outside {Running,
+    /// Flaky}.
     pub fn seeded_from(
         status: weft_broker_client::protocol::InfraNodeStatus,
-        watched: bool,
         applied_at_unix: Option<i64>,
         flaky_after: Duration,
         now: Instant,
@@ -88,7 +85,6 @@ impl NodeHealthState {
         use weft_broker_client::protocol::InfraNodeStatus;
         let flaky = status == InfraNodeStatus::Flaky;
         let settled = status == InfraNodeStatus::Running
-            && watched
             && applied_at_unix.is_some_and(|at| now_unix.saturating_sub(at) >= flaky_after.as_secs() as i64);
         Self {
             last_ready_at: settled.then_some(now),
@@ -106,29 +102,21 @@ impl NodeHealthState {
     }
 }
 
-/// Pure: one unit's decision from what this look saw of its workload
-/// (`None`: the workload is not in the watched set). A workload never
-/// seen is UNKNOWN (`None` back, the latch untouched): a copy just
-/// applied whose workload has not reached the watch yet is neither ready
-/// nor broken. One seen before and now absent reads as zero ready.
-/// A workload present at zero replicas is UNKNOWN too only when weft
-/// asked for that zero (`zero_intended`, from
-/// `UnitRuntime::zero_replicas_intended`: a protocol's `Scale` to 0, or
-/// a spec at 0): nothing is meant to serve, so it is neither ready nor
-/// broken. Any other zero (scaled down outside weft) is not ready and
-/// runs the flaky window.
+/// Pure: one unit's decision from what this look saw of it (`None`: the
+/// host does not report the unit). A unit never seen is UNKNOWN (`None`
+/// back, the latch untouched): a copy just applied that the host does not
+/// report yet is neither ready nor broken. One seen before and now absent
+/// reads as not ready.
 pub fn observe_unit(
     prior: NodeHealthState,
-    workload: Option<NodeObservation>,
-    zero_intended: bool,
+    observed: Option<NodeObservation>,
     now: Instant,
     flaky_after: Duration,
     recovery_after: Duration,
 ) -> Option<NodeDecision> {
-    let observation = match workload {
-        Some(observation) if observation.desired == 0 && zero_intended => return None,
+    let observation = match observed {
         Some(observation) => observation,
-        None if prior.has_seen() => NodeObservation { desired: 0, ready: 0 },
+        None if prior.has_seen() => NodeObservation { ready: false },
         None => return None,
     };
     Some(evaluate_node_health(prior, observation, now, flaky_after, recovery_after))
@@ -160,21 +148,16 @@ pub struct NodeDecision {
 /// the row-status reconciliation reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEdgeEvent {
-    BecameFlaky { desired: u32, ready: u32 },
+    BecameFlaky,
     Recovered,
 }
 
-/// What the caller observed for one node this tick.
+/// What the caller observed for one unit this tick.
 #[derive(Debug, Clone, Copy)]
 pub struct NodeObservation {
-    pub desired: u32,
-    pub ready: u32,
-}
-
-impl NodeObservation {
-    pub fn is_ready(self) -> bool {
-        self.desired > 0 && self.ready >= self.desired
-    }
+    /// The host reports the unit running and every readiness check
+    /// passing.
+    pub ready: bool,
 }
 
 /// Pure: given prior state + this tick's observation + the current
@@ -196,7 +179,7 @@ pub fn evaluate_node_health(
     let mut next = prior.clone();
     let mut event: Option<NodeEdgeEvent> = None;
 
-    if observation.is_ready() {
+    if observation.ready {
         next.last_ready_at = Some(now);
         if next.declared_flaky {
             // Recovery window: ready continuously since the LAST
@@ -222,10 +205,7 @@ pub fn evaluate_node_health(
             if let Some(t) = prior.last_ready_at {
                 if now.duration_since(t) >= flaky_after {
                     next.declared_flaky = true;
-                    event = Some(NodeEdgeEvent::BecameFlaky {
-                        desired: observation.desired,
-                        ready: observation.ready,
-                    });
+                    event = Some(NodeEdgeEvent::BecameFlaky);
                 }
             }
         }
@@ -233,7 +213,7 @@ pub fn evaluate_node_health(
 
     // Desired status derived from the LATCH, not from the
     // instantaneous observation. The latch only flips on a window
-    // expiry; a single bad replica reading on a tick doesn't drag
+    // expiry; a single bad reading on a tick doesn't drag
     // the row to Flaky, and a single good reading doesn't drag
     // it back to Running. This is what the windows are FOR.
     let desired_status = if next.declared_flaky {
@@ -281,7 +261,7 @@ pub struct ProtocolMatch<'a> {
 ///   ([`broken_copies`], `None` rather than an empty set: such an action
 ///   with no copy has nothing to aim at); when the condition names no
 ///   infra, [`ProtocolAction::unowned_scope`] (the named node's shared
-///   copy for a scale or a bounce, the empty set, the whole project, for
+///   copy for a restart, the empty set, the whole project, for
 ///   a take-down).
 /// - An auto-recover: the copies still broken ([`still_broken_copies`]),
 ///   when the condition holds with those set aside. Empty when nothing
@@ -314,7 +294,7 @@ pub fn protocol_scope(proto: &HealthProtocol, ctx: &ConditionContext<'_>) -> Opt
 ///   last fired, or broke since ([`rearm`]), is broken no longer, with
 ///   the copies still broken now.
 /// - An action on copies acts only on the copies it has not acted on:
-///   a second copy breaking after the first is scaled, bounced or taken
+///   a second copy breaking after the first is restarted or taken
 ///   down alone, never the first one again.
 /// - An action on no copy (a notification, a take-down of the whole
 ///   project) fired once for the episode.
@@ -377,7 +357,7 @@ pub fn record_fire(fired: &mut HashMap<String, BTreeSet<InfraCopy>>, proto: &Hea
 /// Pure: is every seen unit of the project healthy now: fully ready,
 /// and none declared flaky?
 pub fn all_units_healthy(units: &[UnitView]) -> bool {
-    units.iter().all(|u| u.ready_ratio >= 1.0 && !u.flaky)
+    units.iter().all(|u| u.ready && !u.flaky)
 }
 
 /// Pure: re-arm what the protocols fired, copy by copy.
@@ -429,8 +409,8 @@ mod tests {
         Instant::now()
     }
 
-    fn obs(desired: u32, ready: u32) -> NodeObservation {
-        NodeObservation { desired, ready }
+    fn obs(ready: bool) -> NodeObservation {
+        NodeObservation { ready }
     }
 
     // ---------- latch seeding from the row ----------
@@ -442,19 +422,19 @@ mod tests {
     #[test]
     fn latch_seeded_from_row_status_argues_from_the_row() {
         let now = t0();
-        let seeded = NodeHealthState::seeded_from(Status::Flaky, true, None, FLAKY_AFTER, now, 0);
+        let seeded = NodeHealthState::seeded_from(Status::Flaky, None, FLAKY_AFTER, now, 0);
         let still_down =
-            evaluate_node_health(seeded.clone(), obs(1, 0), now, FLAKY_AFTER, RECOVERY_AFTER);
+            evaluate_node_health(seeded.clone(), obs(false), now, FLAKY_AFTER, RECOVERY_AFTER);
         assert_eq!(still_down.desired_status, Status::Flaky);
         assert_eq!(still_down.event, None);
         // Ready right away: not yet recovered (the window has not run).
         let ready_now =
-            evaluate_node_health(seeded.clone(), obs(1, 1), now, FLAKY_AFTER, RECOVERY_AFTER);
+            evaluate_node_health(seeded.clone(), obs(true), now, FLAKY_AFTER, RECOVERY_AFTER);
         assert_eq!(ready_now.desired_status, Status::Flaky);
         // Ready past the window since the seeded not-ready edge: recovered.
         let ready_later = evaluate_node_health(
             seeded,
-            obs(1, 1),
+            obs(true),
             now + RECOVERY_AFTER,
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -462,33 +442,28 @@ mod tests {
         assert_eq!(ready_later.desired_status, Status::Running);
         assert_eq!(ready_later.event, Some(NodeEdgeEvent::Recovered));
         assert_eq!(
-            NodeHealthState::seeded_from(Status::Running, true, Some(100), FLAKY_AFTER, now, 100 + 29),
+            NodeHealthState::seeded_from(Status::Running, Some(100), FLAKY_AFTER, now, 100 + 29),
             NodeHealthState::default(),
-            "applied inside its window: its workload may not be watched yet"
+            "applied inside its window: the host may not report it yet"
         );
     }
 
     /// A Running copy applied longer ago than its flaky window is known
     /// from the row alone: after the latch is lost (a command, a restart,
-    /// a move to another pod) a missing workload still reads as zero
-    /// ready and turns flaky after the window, instead of staying
-    /// unknown for ever.
+    /// a move to another supervisor) a unit the host no longer reports
+    /// still reads as not ready and turns flaky after the window, instead
+    /// of staying unknown for ever.
     #[test]
     fn a_settled_running_copy_is_known_without_the_latch() {
         let now = t0();
-        let seeded = NodeHealthState::seeded_from(Status::Running, true, Some(100), FLAKY_AFTER, now, 100 + 30);
+        let seeded = NodeHealthState::seeded_from(Status::Running, Some(100), FLAKY_AFTER, now, 100 + 30);
         assert!(seeded.has_seen());
-        let gone = observe_unit(seeded, None, false, now, FLAKY_AFTER, RECOVERY_AFTER).expect("known, not unknown");
+        let gone = observe_unit(seeded, None, now, FLAKY_AFTER, RECOVERY_AFTER).expect("known, not unknown");
         assert_eq!(gone.desired_status, Status::Running, "inside the window");
-        let later = observe_unit(gone.next, None, false, now + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER).expect("known");
-        assert_eq!(later.event, Some(NodeEdgeEvent::BecameFlaky { desired: 0, ready: 0 }));
-        // Never applied: nothing says a workload should exist.
-        assert!(!NodeHealthState::seeded_from(Status::Running, true, None, FLAKY_AFTER, now, 1_000).has_seen());
-        // A unit the watch never shows ready (a Job, a DaemonSet, zero
-        // replicas) is never seeded as seen: it would read as vanished.
-        let unwatched = NodeHealthState::seeded_from(Status::Running, false, Some(100), FLAKY_AFTER, now, 100 + 30);
-        assert!(!unwatched.has_seen());
-        assert_eq!(observe_unit(unwatched, None, false, now + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER), None);
+        let later = observe_unit(gone.next, None, now + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER).expect("known");
+        assert_eq!(later.event, Some(NodeEdgeEvent::BecameFlaky));
+        // Never applied: nothing says a unit should exist.
+        assert!(!NodeHealthState::seeded_from(Status::Running, None, FLAKY_AFTER, now, 1_000).has_seen());
     }
 
     // ---------- evaluate_node_health: NoChange paths ----------
@@ -498,7 +473,7 @@ mod tests {
         let now = t0();
         let result = evaluate_node_health(
             NodeHealthState::default(),
-            obs(1, 1),
+            obs(true),
             now,
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -514,11 +489,11 @@ mod tests {
     fn fresh_node_first_observation_not_ready_no_flaky_yet() {
         // The provisioning false-alarm scenario: a node we've never
         // seen Ready shouldn't be declared flaky just because some
-        // other supervisor process saw a previous deployment Ready.
+        // other supervisor process saw a previous copy Ready.
         let now = t0();
         let result = evaluate_node_health(
             NodeHealthState::default(),
-            obs(1, 0),
+            obs(false),
             now,
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -535,7 +510,7 @@ mod tests {
         let t = t0();
         let r1 = evaluate_node_health(
             NodeHealthState::default(),
-            obs(1, 1),
+            obs(true),
             t,
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -543,7 +518,7 @@ mod tests {
         assert!(r1.event.is_none());
         let r2 = evaluate_node_health(
             r1.next,
-            obs(1, 0),
+            obs(false),
             t + Duration::from_secs(5),
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -563,14 +538,14 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 0),
+            obs(false),
             t + Duration::from_secs(31),
             FLAKY_AFTER,
             RECOVERY_AFTER,
         );
         assert_eq!(
             result.event,
-            Some(NodeEdgeEvent::BecameFlaky { desired: 1, ready: 0 })
+            Some(NodeEdgeEvent::BecameFlaky)
         );
         assert!(result.next.declared_flaky);
         assert_eq!(result.desired_status, Status::Flaky);
@@ -586,7 +561,7 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 0),
+            obs(false),
             t + Duration::from_secs(41),
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -597,26 +572,6 @@ mod tests {
         // what drives the I/O-layer reconciliation: even on
         // NoChange ticks, the row should stay (or return to) Flaky.
         assert_eq!(result.desired_status, Status::Flaky);
-    }
-
-    #[test]
-    fn flaky_with_partial_replicas_carries_counts() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            ..Default::default()
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(3, 1),
-            t + Duration::from_secs(35),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert_eq!(
-            result.event,
-            Some(NodeEdgeEvent::BecameFlaky { desired: 3, ready: 1 })
-        );
     }
 
     // ---------- Recovered edge ----------
@@ -631,7 +586,7 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 1),
+            obs(true),
             t + Duration::from_secs(50),
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -651,7 +606,7 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 1),
+            obs(true),
             t + Duration::from_secs(35),
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -673,7 +628,7 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 1),
+            obs(true),
             t + Duration::from_secs(51),
             FLAKY_AFTER,
             Duration::from_secs(0),
@@ -689,23 +644,23 @@ mod tests {
         let mut s = NodeHealthState::default();
 
         // 1) ready at t0
-        let r1 = evaluate_node_health(s, obs(1, 1), t, FLAKY_AFTER, RECOVERY_AFTER);
+        let r1 = evaluate_node_health(s, obs(true), t, FLAKY_AFTER, RECOVERY_AFTER);
         assert!(r1.event.is_none());
         s = r1.next;
         // 2) not ready at t+5s (no flip)
-        let r2 = evaluate_node_health(s, obs(1, 0), t + Duration::from_secs(5), FLAKY_AFTER, RECOVERY_AFTER);
+        let r2 = evaluate_node_health(s, obs(false), t + Duration::from_secs(5), FLAKY_AFTER, RECOVERY_AFTER);
         assert!(r2.event.is_none());
         s = r2.next;
         // 3) still not ready at t+40s (flaky edge fires)
-        let r3 = evaluate_node_health(s, obs(1, 0), t + Duration::from_secs(40), FLAKY_AFTER, RECOVERY_AFTER);
-        assert!(matches!(r3.event, Some(NodeEdgeEvent::BecameFlaky { .. })));
+        let r3 = evaluate_node_health(s, obs(false), t + Duration::from_secs(40), FLAKY_AFTER, RECOVERY_AFTER);
+        assert!(matches!(r3.event, Some(NodeEdgeEvent::BecameFlaky)));
         s = r3.next;
         // 4) ready at t+45s (no flip, recovery window not elapsed)
-        let r4 = evaluate_node_health(s, obs(1, 1), t + Duration::from_secs(45), FLAKY_AFTER, RECOVERY_AFTER);
+        let r4 = evaluate_node_health(s, obs(true), t + Duration::from_secs(45), FLAKY_AFTER, RECOVERY_AFTER);
         assert!(r4.event.is_none());
         s = r4.next;
         // 5) ready at t+80s (recovered edge fires)
-        let r5 = evaluate_node_health(s, obs(1, 1), t + Duration::from_secs(80), FLAKY_AFTER, RECOVERY_AFTER);
+        let r5 = evaluate_node_health(s, obs(true), t + Duration::from_secs(80), FLAKY_AFTER, RECOVERY_AFTER);
         assert_eq!(r5.event, Some(NodeEdgeEvent::Recovered));
     }
 
@@ -726,7 +681,7 @@ mod tests {
         };
         let result = evaluate_node_health(
             state,
-            obs(1, 1),
+            obs(true),
             t + Duration::from_secs(41), // 1s into recovery window
             FLAKY_AFTER,
             RECOVERY_AFTER,
@@ -736,127 +691,26 @@ mod tests {
         assert_eq!(result.desired_status, Status::Flaky);
     }
 
-    #[test]
-    fn observation_is_ready_zero_desired() {
-        // 0 replicas desired is the Stopped state. The pure
-        // function returns is_ready=false (no replicas means
-        // nothing observable). The caller is responsible for
-        // skipping evaluation when status != running/flaky; the
-        // pure function doesn't second-guess that contract.
-        assert!(!obs(0, 0).is_ready());
-    }
-
-    fn unit(scaled_to: Option<u32>) -> weft_broker_client::protocol::UnitRuntime {
-        weft_broker_client::protocol::UnitRuntime {
-            status: Status::Running,
-            stop_behavior: weft_core::StopBehavior::ScaleToZero,
-            flaky_after_seconds: 30,
-            recovery_after_seconds: 30,
-            image_refs: Default::default(),
-            watched: true,
-            scaled_to,
-        }
-    }
-
-    /// A zero a protocol's `Scale` asked for is neither ready nor broken,
-    /// however long it lasts.
-    #[test]
-    fn a_protocol_scale_to_zero_stays_unknown() {
-        let t = t0();
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(1, 1)), false, t, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("seen");
-        let later = t + Duration::from_secs(3600);
-        let intended = unit(Some(0)).zero_replicas_intended();
-        assert!(intended);
-        assert_eq!(observe_unit(seen.next, Some(obs(0, 0)), intended, later, FLAKY_AFTER, RECOVERY_AFTER), None);
-    }
-
-    /// A workload scaled to zero outside weft, while the row expects
-    /// replicas, is not ready and turns flaky after the window.
-    #[test]
-    fn an_outside_scale_to_zero_turns_flaky() {
-        let t = t0();
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(1, 1)), false, t, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("seen");
-        let intended = unit(None).zero_replicas_intended();
-        assert!(!intended, "a watched unit with no protocol scale expects replicas");
-        let zero = observe_unit(seen.next, Some(obs(0, 0)), intended, t + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("an unasked zero is known");
-        assert_eq!(zero.event, Some(NodeEdgeEvent::BecameFlaky { desired: 0, ready: 0 }));
-        assert_eq!(zero.desired_status, Status::Flaky);
-    }
-
-    /// After a protocol scaled a unit to zero, a `Scale` back up records
-    /// the new replicas: the look evaluates the workload again, ready
-    /// once its replicas are up, flaky if they never come.
-    #[test]
-    fn a_scale_back_up_resumes_evaluation() {
-        let t = t0();
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(1, 1)), false, t, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("seen");
-        assert_eq!(
-            observe_unit(seen.next.clone(), Some(obs(0, 0)), unit(Some(0)).zero_replicas_intended(), t + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER),
-            None
-        );
-        let up = unit(Some(2)).zero_replicas_intended();
-        assert!(!up);
-        let ready = observe_unit(seen.next.clone(), Some(obs(2, 2)), up, t + FLAKY_AFTER * 2, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("known again");
-        assert_eq!(ready.desired_status, Status::Running);
-        let stuck = observe_unit(seen.next, Some(obs(2, 0)), up, t + FLAKY_AFTER * 2, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("known again");
-        assert_eq!(stuck.event, Some(NodeEdgeEvent::BecameFlaky { desired: 2, ready: 0 }));
-    }
-
-    /// A row stamped before `scaled_to` existed (and before `watched`)
-    /// says nothing about intent: a zero there is broken, as it always
-    /// was, and turns flaky after the window.
-    #[test]
-    fn a_legacy_row_zero_turns_flaky() {
-        let t = t0();
-        let mut legacy = unit(None);
-        legacy.watched = false;
-        let intended = legacy.zero_replicas_intended();
-        assert!(!intended);
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(1, 1)), false, t, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("seen");
-        let zero = observe_unit(seen.next, Some(obs(0, 0)), intended, t + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("known");
-        assert_eq!(zero.desired_status, Status::Flaky);
-    }
-
-    #[test]
-    fn observation_is_ready_exact_match() {
-        assert!(obs(3, 3).is_ready());
-    }
-
-    #[test]
-    fn observation_is_ready_excess() {
-        // Ready > desired (transient during rolling restart). Still
-        // counts as ready.
-        assert!(obs(2, 3).is_ready());
-    }
-
     // ---------- observe_unit: unknown vs vanished ----------
 
-    /// A workload the loop has never seen is unknown: no decision, the
-    /// latch untouched, whatever the windows. Once seen, its absence
-    /// reads as zero ready and runs the flaky window like any not-ready.
+    /// A unit the host has never reported is unknown: no decision, the
+    /// latch untouched, whatever the windows. Once seen, its absence reads
+    /// as not ready and runs the flaky window like any not-ready.
     #[test]
-    fn an_unseen_workload_is_unknown_and_a_vanished_one_is_not_ready() {
+    fn an_unseen_unit_is_unknown_and_a_vanished_one_is_not_ready() {
         let t = t0();
         assert_eq!(
-            observe_unit(NodeHealthState::default(), None, false, t + Duration::from_secs(600), FLAKY_AFTER, RECOVERY_AFTER),
+            observe_unit(NodeHealthState::default(), None, t + Duration::from_secs(600), FLAKY_AFTER, RECOVERY_AFTER),
             None
         );
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(1, 1)), false, t, FLAKY_AFTER, RECOVERY_AFTER)
+        let seen = observe_unit(NodeHealthState::default(), Some(obs(true)), t, FLAKY_AFTER, RECOVERY_AFTER)
             .expect("seen");
-        let gone = observe_unit(seen.next, None, false, t + Duration::from_secs(31), FLAKY_AFTER, RECOVERY_AFTER)
+        let gone = observe_unit(seen.next, None, t + Duration::from_secs(31), FLAKY_AFTER, RECOVERY_AFTER)
             .expect("vanished is known");
-        assert_eq!(gone.event, Some(NodeEdgeEvent::BecameFlaky { desired: 0, ready: 0 }));
+        assert_eq!(gone.event, Some(NodeEdgeEvent::BecameFlaky));
         // A row seeded Flaky has been seen broken: its absence keeps it so.
-        let seeded = NodeHealthState::seeded_from(Status::Flaky, true, None, FLAKY_AFTER, t, 0);
-        let still = observe_unit(seeded, None, false, t, FLAKY_AFTER, RECOVERY_AFTER).expect("seeded is known");
+        let seeded = NodeHealthState::seeded_from(Status::Flaky, None, FLAKY_AFTER, t, 0);
+        let still = observe_unit(seeded, None, t, FLAKY_AFTER, RECOVERY_AFTER).expect("seeded is known");
         assert_eq!(still.desired_status, Status::Flaky);
     }
 
@@ -872,20 +726,15 @@ mod tests {
     }
 
     fn flaky_when() -> HealthCondition {
-        HealthCondition::NodeReadyRatioBelow {
-            node_id: "*".into(),
-            unit: "*".into(),
-            ratio: 1.0,
-        }
+        HealthCondition::NodeNotReady { node_id: "*".into(), unit: "*".into() }
     }
 
-    fn view(node: &str, member: Option<&str>, ratio: f32, flaky: bool) -> UnitView {
+    fn view(node: &str, member: Option<&str>, ready: bool, flaky: bool) -> UnitView {
         UnitView {
             node_id: node.into(),
             member: member.map(|m| weft_core::member::MemberId::new(m).unwrap()),
             unit: node.into(),
-            ready_ratio: ratio,
-            ready: (ratio >= 1.0) as u32,
+            ready,
             flaky,
         }
     }
@@ -898,8 +747,8 @@ mod tests {
         }
     }
 
-    fn inputs_with_ratio(node: &str, ratio: f32) -> ProtocolEvalInputs {
-        inputs(vec![view(node, None, ratio, false)])
+    fn inputs_with_ready(node: &str, ready: bool) -> ProtocolEvalInputs {
+        inputs(vec![view(node, None, ready, false)])
     }
 
     fn fired(name: &str, scope: BTreeSet<InfraCopy>) -> HashMap<String, BTreeSet<InfraCopy>> {
@@ -920,7 +769,7 @@ mod tests {
                 ),
             ],
         };
-        let inputs = inputs_with_ratio("n1", 0.0);
+        let inputs = inputs_with_ready("n1", false);
         let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs);
         assert_eq!(m.expect("match").protocol.name, "first");
     }
@@ -939,7 +788,7 @@ mod tests {
                 ),
             ],
         };
-        let inputs = inputs_with_ratio("n1", 0.0);
+        let inputs = inputs_with_ready("n1", false);
         let n1 = BTreeSet::from([InfraCopy { node_id: "n1".into(), member: None }]);
         let m = evaluate_protocols(&p, &fired("first", n1), false, &inputs);
         assert_eq!(m.expect("match").protocol.name, "second");
@@ -950,7 +799,7 @@ mod tests {
         let p = HealthProtocols {
             protocols: vec![proto("first", flaky_when(), ProtocolAction::AutoRecover)],
         };
-        let inputs = inputs_with_ratio("n1", 0.0);
+        let inputs = inputs_with_ready("n1", false);
         let m = evaluate_protocols(&p, &HashMap::new(), true, &inputs);
         assert!(m.is_none());
     }
@@ -960,8 +809,8 @@ mod tests {
         let p = HealthProtocols {
             protocols: vec![proto("first", flaky_when(), ProtocolAction::AutoRecover)],
         };
-        // ratio=1.0 → condition NodeReadyRatioBelow(1.0) is false.
-        let inputs = inputs_with_ratio("n1", 1.0);
+        // Ready: `node_not_ready` is false.
+        let inputs = inputs_with_ready("n1", true);
         let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs);
         assert!(m.is_none());
     }
@@ -976,15 +825,15 @@ mod tests {
     }
 
     /// The default park fires on a unit's latch, never on one reading:
-    /// a copy at zero ready that is not declared flaky parks nothing; a
+    /// a copy not ready that is not declared flaky parks nothing; a
     /// declared-flaky one parks, aimed at exactly its copy.
     #[test]
     fn the_default_park_waits_for_the_latch_and_aims_at_the_broken_copy() {
         let p = crate::protocol::default_protocols();
-        let one_bad_reading = inputs(vec![view("svc", Some("ada"), 0.0, false), view("db", None, 1.0, false)]);
+        let one_bad_reading = inputs(vec![view("svc", Some("ada"), false, false), view("db", None, true, false)]);
         assert!(evaluate_protocols(&p, &HashMap::new(), false, &one_bad_reading).is_none());
 
-        let latched = inputs(vec![view("svc", Some("ada"), 0.0, true), view("db", None, 1.0, false)]);
+        let latched = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, true, false)]);
         let m = evaluate_protocols(&p, &HashMap::new(), false, &latched).expect("park");
         assert_eq!(m.protocol.name, "park-while-infra-broken");
         let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
@@ -994,68 +843,68 @@ mod tests {
         // second copy breaking does, aimed at that copy alone.
         let acted = fired("park-while-infra-broken", BTreeSet::from([ada_svc.clone()]));
         assert!(evaluate_protocols(&p, &acted, false, &latched).is_none());
-        let both = inputs(vec![view("svc", Some("ada"), 0.0, true), view("db", None, 0.0, true)]);
+        let both = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, false, true)]);
         let m = evaluate_protocols(&p, &acted, false, &both).expect("the new breakage parks");
         assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "db".into(), member: None }]));
     }
 
-    /// A scale or a bounce fires once per copy: ada's broken copy is
-    /// bounced, and when bob's breaks after it, only bob's is.
+    /// A restart fires once per copy: ada's broken copy is restarted, and
+    /// when bob's breaks after it, only bob's is.
     #[test]
     fn a_protocol_acts_once_per_copy() {
         let p = HealthProtocols {
             protocols: vec![proto(
-                "bounce",
+                "restart",
                 HealthCondition::NodeFlaky { node_id: "svc".into(), unit: "*".into() },
-                ProtocolAction::BouncePods { node_id: "svc".into(), unit: "svc".into() },
+                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
             )],
         };
         let ada = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
         let bob = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("bob").unwrap()) };
         let mut acted = HashMap::new();
-        let first = inputs(vec![view("svc", Some("ada"), 0.0, true), view("svc", Some("bob"), 1.0, false)]);
+        let first = inputs(vec![view("svc", Some("ada"), false, true), view("svc", Some("bob"), true, false)]);
         let m = evaluate_protocols(&p, &acted, false, &first).expect("ada's copy breaks");
         assert_eq!(m.scope, BTreeSet::from([ada.clone()]));
         record_fire(&mut acted, m.protocol, &m.scope);
-        let then = inputs(vec![view("svc", Some("ada"), 0.0, true), view("svc", Some("bob"), 0.0, true)]);
+        let then = inputs(vec![view("svc", Some("ada"), false, true), view("svc", Some("bob"), false, true)]);
         rearm(&mut acted, &p, &then);
         let m = evaluate_protocols(&p, &acted, false, &then).expect("bob's copy breaks after");
-        assert_eq!(m.scope, BTreeSet::from([bob]), "ada's copy is not bounced again");
+        assert_eq!(m.scope, BTreeSet::from([bob]), "ada's copy is not restarted again");
         record_fire(&mut acted, m.protocol, &m.scope);
         assert!(evaluate_protocols(&p, &acted, false, &then).is_none());
     }
 
-    /// A scale on a broken shared copy aims at that shared copy.
+    /// A restart on a broken shared copy aims at that shared copy.
     #[test]
-    fn a_scale_on_a_broken_shared_copy_aims_at_it() {
+    fn a_restart_on_a_broken_shared_copy_aims_at_it() {
         let p = HealthProtocols {
             protocols: vec![proto(
-                "scale",
+                "restart",
                 flaky_when(),
-                ProtocolAction::Scale { node_id: "svc".into(), unit: "svc".into(), replicas: 2 },
+                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
             )],
         };
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs(vec![view("svc", None, 0.5, false)]))
-            .expect("the shared copy is below its ratio");
+        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs(vec![view("svc", None, false, false)]))
+            .expect("the shared copy is not ready");
         assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), member: None }]));
     }
 
     /// A protocol whose condition names no infra acts where it did
-    /// before copies had owners: a scale or a bounce on the named node's
-    /// shared copy, a take-down on the whole project, each once while it
+    /// before copies had owners: a restart of the named node's shared
+    /// copy, a take-down on the whole project, each once while it
     /// holds, and again after it stopped holding.
     #[test]
     fn a_protocol_with_no_unit_condition_acts_as_before() {
         use weft_broker_client::protocol::ProjectStatus;
         let active = HealthCondition::ProjectStatusEq { status: ProjectStatus::Active };
-        let bounce = HealthProtocols {
+        let restart = HealthProtocols {
             protocols: vec![proto(
-                "bounce",
+                "restart",
                 active.clone(),
-                ProtocolAction::BouncePods { node_id: "svc".into(), unit: "svc".into() },
+                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
             )],
         };
-        let m = evaluate_protocols(&bounce, &HashMap::new(), false, &inputs(Vec::new())).expect("fires");
+        let m = evaluate_protocols(&restart, &HashMap::new(), false, &inputs(Vec::new())).expect("fires");
         assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), member: None }]));
 
         let park = HealthProtocols { protocols: vec![proto("park", active, ProtocolAction::ParkTriggers)] };
@@ -1078,7 +927,7 @@ mod tests {
     fn the_default_recover_names_the_copies_still_broken() {
         let p = crate::protocol::default_protocols();
         let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
-        let healthy_parked = ProtocolEvalInputs { health_parked: true, ..inputs(vec![view("svc", None, 1.0, false)]) };
+        let healthy_parked = ProtocolEvalInputs { health_parked: true, ..inputs(vec![view("svc", None, true, false)]) };
         let m = evaluate_protocols(&p, &HashMap::new(), false, &healthy_parked).expect("recover");
         assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
         assert!(m.scope.is_empty(), "nothing is still broken");
@@ -1086,13 +935,13 @@ mod tests {
         let parked_svc = fired("park-while-infra-broken", BTreeSet::from([ada_svc.clone()]));
         let one_still_flaky = ProtocolEvalInputs {
             health_parked: true,
-            ..inputs(vec![view("svc", None, 1.0, false), view("svc", Some("ada"), 0.0, true)])
+            ..inputs(vec![view("svc", None, true, false), view("svc", Some("ada"), false, true)])
         };
         let m = evaluate_protocols(&p, &parked_svc, false, &one_still_flaky).expect("the rest recovers");
         assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
         assert_eq!(m.scope, BTreeSet::from([ada_svc]));
 
-        let nothing_parked = inputs(vec![view("svc", None, 1.0, false)]);
+        let nothing_parked = inputs(vec![view("svc", None, true, false)]);
         assert!(evaluate_protocols(&p, &HashMap::new(), false, &nothing_parked).is_none());
     }
 
@@ -1128,7 +977,7 @@ mod tests {
         // Ada healed, bob is still flaky, and something is still parked.
         let now = ProtocolEvalInputs {
             health_parked: true,
-            ..inputs(vec![view("svc", Some("ada"), 1.0, false), view("svc", Some("bob"), 0.0, true)])
+            ..inputs(vec![view("svc", Some("ada"), true, false), view("svc", Some("bob"), false, true)])
         };
         rearm(&mut acted, &p, &now);
         assert_eq!(acted.get("park-while-infra-broken"), Some(&BTreeSet::from([bob.clone()])));
@@ -1141,15 +990,15 @@ mod tests {
         assert!(evaluate_protocols(&p, &acted, false, &now).is_none(), "nothing healed since");
 
         // Nothing is parked any more: the recovery is forgotten.
-        let done = inputs(vec![view("svc", Some("ada"), 1.0, false), view("svc", Some("bob"), 1.0, false)]);
+        let done = inputs(vec![view("svc", Some("ada"), true, false), view("svc", Some("bob"), true, false)]);
         rearm(&mut acted, &p, &done);
         assert!(!acted.contains_key("auto-recover-when-infra-healthy"));
 
         let notify = HealthProtocols { protocols: vec![proto("tell", flaky_when(), ProtocolAction::Notify { channel: "ops".into() })] };
         let mut told = fired("tell", BTreeSet::new());
-        rearm(&mut told, &notify, &inputs(vec![view("svc", None, 0.5, false)]));
+        rearm(&mut told, &notify, &inputs(vec![view("svc", None, false, false)]));
         assert!(told.contains_key("tell"), "not healthy yet");
-        rearm(&mut told, &notify, &inputs(vec![view("svc", None, 1.0, false)]));
+        rearm(&mut told, &notify, &inputs(vec![view("svc", None, true, false)]));
         assert!(told.is_empty());
     }
 
@@ -1157,9 +1006,9 @@ mod tests {
 
     #[test]
     fn healthy_means_every_unit_ready_and_none_flaky() {
-        assert!(all_units_healthy(&[view("a", None, 1.0, false), view("b", None, 1.0, false)]));
-        assert!(!all_units_healthy(&[view("a", None, 1.0, false), view("b", None, 0.5, false)]));
-        assert!(!all_units_healthy(&[view("a", None, 1.0, true)]), "ready inside the recovery window is not healthy");
+        assert!(all_units_healthy(&[view("a", None, true, false), view("b", None, true, false)]));
+        assert!(!all_units_healthy(&[view("a", None, true, false), view("b", None, false, false)]));
+        assert!(!all_units_healthy(&[view("a", None, true, true)]), "ready inside the recovery window is not healthy");
         // No expected-running unit keeps nothing armed.
         assert!(all_units_healthy(&[]));
     }

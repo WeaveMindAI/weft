@@ -141,11 +141,11 @@ The whole thing is a runnable project in [`examples/whatsapp-support-bot/`](exam
 
 ## Try it
 
-You need [Docker](https://docs.docker.com/get-docker/),
-[kubectl](https://kubernetes.io/docs/tasks/tools/),
-[kind](https://kind.sigs.k8s.io/) and [Rust](https://rustup.rs/).
-The installer sets up a local Kubernetes cluster, the `weft` command and
-the VS Code extension. The extension also installs from the store in VS Code
+You need [Docker](https://docs.docker.com/get-docker/), and
+[Rust](https://rustup.rs/) if the installer has to build the CLI itself (it
+tells you when). The installer sets up weft's runtime on your machine, the
+`weft` command and the VS Code extension. The extension also installs from
+the store in VS Code
 forks such as Devin Desktop. We are working on a CLI-only version, support for other IDEs and a cloud hosted version. If the extension does not install
 automatically, follow the manual instructions the installer prints.
 
@@ -303,9 +303,7 @@ Weft is early, and breaking changes are still possible. This is what we are work
 - implementing our own Tangle cli. In a proof-of-concept, our Tangle prototype wrote
   a working program from a brief in under five minutes. The released version is
   slower because existing coding ai spent too much time on fluff that are worthless for weft.
-- running outside Kubernetes (a local LLM, or an AWS, GCP or Azure service) and
-  connecting it to the rest of the runtime;
-- a guide to deploying weft on your cloud provider.
+- installing weft on AWS and Azure, the way it installs on GCP today.
 
 For more detail, read [the roadmap](https://weavemindai.github.io/weft/appendix/roadmap.html).
 

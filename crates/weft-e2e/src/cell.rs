@@ -2,21 +2,19 @@
 //!
 //! Most tests share the default install and stay out of each other's way,
 //! because each only touches the projects it made. A few cannot: the ones
-//! that test the POOLS (the listener and supervisor pods every project on an
-//! install shares) watch pods move and shrink, and a neighbour's triggers on
-//! the same pool would move with them. Those tests start a cell.
+//! that restart the runtime, or wait on its own timers at a faster pace.
+//! Those tests start a cell.
 //!
-//! A cell is a named install (`weft_core::infra::Instance`) in the same kind
-//! cluster: its own dispatcher, Postgres, broker and pools, in namespaces of
-//! its own, sharing only the node, the front door's gateway, the object store
-//! and the images. It starts from the images the default install already
-//! has, so nothing is built.
+//! A cell is a named install (`weft_core::infra::Instance`) on the same
+//! machine: its own runtime, Postgres and ports, sharing only the object
+//! store and the images. It starts from the images the default install
+//! already has, so nothing is built.
 //!
 //! A cell also chooses how fast its own timers run
-//! (`weft_core::time_scale`): at [`Cell::FAST`], a scale-down that waits a
-//! minute of real time comes round in six seconds, and so does every
-//! heartbeat, lease and silence window it depends on, together. Budgets
-//! for real work (a pod's spawn grace, a boot) keep their real length.
+//! (`weft_core::time_scale`): at `0.1`, a lease that runs a minute
+//! of real time runs out in six seconds, and so does every silence window
+//! it depends on, together. Budgets for real work (a boot) keep their real
+//! length.
 //!
 //! Like a project, a cell is removed when the test passes
 //! ([`Cell::finish`]) and kept when it fails, so what the test saw is still
@@ -26,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::client::{poll_until, Dispatcher};
+use crate::client::Dispatcher;
 
 /// Every cell's name starts with this, so `scripts/run-e2e.sh --clean` can
 /// find the cells failed runs kept without touching any other install.
@@ -42,50 +40,63 @@ pub struct Cell {
 }
 
 impl Cell {
-    /// The pace for a test that waits on the runtime's own timers: ten
-    /// times real time. Faster shrinks the shortest silence window (a
-    /// worker counts as dead after three missed heartbeats, 30 seconds at
-    /// real time) below a few seconds, where a busy machine's own pauses
-    /// start to look like deaths.
-    pub const FAST: f64 = 0.1;
-
     /// Start a cell whose own timers run at `time_scale` times real time
-    /// (`1.0` for real time, [`Self::FAST`] for a test that waits on
-    /// them), and wait until its dispatcher answers.
+    /// (`1.0` for real time, less for a test that waits on them), and
+    /// wait until its dispatcher answers.
     pub async fn start(time_scale: f64) -> Result<Self> {
-        let root = crate::ensure::repo_root()?;
         // Fits `weft_core::infra::MAX_INSTANCE_NAME`: the prefix and nine
         // characters of a fresh id.
         let name = format!("{CELL_NAME_PREFIX}{}", &uuid::Uuid::new_v4().simple().to_string()[..9]);
+        // Said before anything is made, for the post-mortem of a test the
+        // runner stops for running too long (its guards never drop).
+        // SYNC: this line <-> scripts/run-e2e.sh (post_mortem)
+        eprintln!("weft-e2e: made cell '{name}'");
         let instance =
             weft_core::infra::Instance::named(&name).map_err(anyhow::Error::msg)?;
-        let started = std::time::Instant::now();
-        let out = tokio::process::Command::new("weft")
-            .args(["daemon", "start"])
-            .current_dir(&root)
-            .env("WEFT_REPO_ROOT", &root)
-            .env(weft_core::infra::INSTANCE_ENV, &name)
-            .env(weft_core::time_scale::TIME_SCALE_ENV, time_scale.to_string())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .context("spawn `weft daemon start` for a cell")?;
-        eprintln!("[e2e] {:.1}s: weft daemon start (cell {name})", started.elapsed().as_secs_f64());
         // From here on the cell exists, whole or in part: the guard keeps
         // it for inspection if anything below fails.
         let mut cell = Self { instance: instance.clone(), dispatcher: None, time_scale, finished: false };
-        anyhow::ensure!(
-            out.status.success(),
-            "starting the cell {name} failed (exit {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let port = door_port(&instance).await?;
+        cell.daemon("start").await?;
+        let port = public_port(&instance)?;
         let dispatcher = Dispatcher::for_install(&format!("http://127.0.0.1:{port}"), instance)?;
         crate::ensure::wait_healthy(&dispatcher).await?;
         cell.dispatcher = Some(dispatcher);
         Ok(cell)
+    }
+
+    /// Stop the cell's runtime process and start it again, keeping
+    /// everything it stored, and wait until its dispatcher answers: what a
+    /// machine's reboot or an upgrade does to an install.
+    pub async fn restart(&self) -> Result<()> {
+        self.daemon("stop").await?;
+        self.daemon("start").await?;
+        crate::ensure::wait_healthy(&self.dispatcher()).await
+    }
+
+    /// Run `weft daemon <verb>` for this cell, at its pace.
+    async fn daemon(&self, verb: &str) -> Result<()> {
+        let name = self.name();
+        let root = crate::ensure::repo_root()?;
+        let started = std::time::Instant::now();
+        let out = tokio::process::Command::new("weft")
+            .args(["daemon", verb])
+            .current_dir(&root)
+            .env("WEFT_REPO_ROOT", &root)
+            .env(weft_core::infra::INSTANCE_ENV, name)
+            .env(weft_core::time_scale::TIME_SCALE_ENV, self.time_scale.to_string())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("spawn `weft daemon {verb}` for a cell"))?;
+        eprintln!("[e2e] {:.1}s: weft daemon {verb} (cell {name})", started.elapsed().as_secs_f64());
+        anyhow::ensure!(
+            out.status.success(),
+            "`weft daemon {verb}` for the cell {name} failed (exit {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
     }
 
     /// The cell's dispatcher: hand it to [`crate::project::Project::prepare`]
@@ -109,23 +120,7 @@ impl Cell {
     /// project in it finished. A failing test never gets here, and the cell
     /// stays for inspection.
     pub async fn finish(mut self) -> Result<()> {
-        let name = self.name().to_string();
-        let started = std::time::Instant::now();
-        let out = tokio::process::Command::new("weft")
-            .args(["daemon", "remove"])
-            .env(weft_core::infra::INSTANCE_ENV, &name)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .context("spawn `weft daemon remove` for a cell")?;
-        eprintln!("[e2e] {:.1}s: weft daemon remove (cell {name})", started.elapsed().as_secs_f64());
-        anyhow::ensure!(
-            out.status.success(),
-            "removing the cell {name} failed (exit {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        self.daemon("remove").await?;
         self.finished = true;
         Ok(())
     }
@@ -145,43 +140,21 @@ impl Drop for Cell {
         let at = self.dispatcher.as_ref().map(|d| format!(" at {}", d.base())).unwrap_or_default();
         eprintln!(
             "weft-e2e: cell '{name}' NOT finished (test ended early); keeping it for \
-             inspection{at}. Its namespaces are {system} and {db}. Remove it with \
+             inspection{at}. Its files are in {dir}. Remove it with \
              `WEFT_INSTANCE={name} weft daemon remove`, or every kept cell with \
              `scripts/run-e2e.sh --clean`.",
             name = self.name(),
-            system = self.instance.system_namespace(),
-            db = self.instance.db_namespace(),
+            dir = crate::ensure::install_dir(&self.instance).display(),
         );
     }
 }
 
-/// The node port the apiserver gave the cell's door
-/// (`deploy/k8s/instance-door.yaml`).
-async fn door_port(instance: &weft_core::infra::Instance) -> Result<u16> {
-    let namespace = instance.system_namespace();
-    poll_until(
-        &format!("the node port of {namespace}'s door"),
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        || {
-            let namespace = namespace.clone();
-            async move {
-                let out = tokio::process::Command::new("kubectl")
-                    .args([
-                        "-n",
-                        &namespace,
-                        "get",
-                        "service",
-                        "weft-dispatcher-node-port",
-                        "-o",
-                        "jsonpath={.spec.ports[0].nodePort}",
-                    ])
-                    .output()
-                    .await
-                    .context("spawn kubectl")?;
-                Ok(String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok())
-            }
-        },
-    )
-    .await
+/// The port the cell's runtime answers on, from the config its start
+/// wrote.
+fn public_port(instance: &weft_core::infra::Instance) -> Result<u16> {
+    let path = crate::ensure::install_dir(instance).join("config.json");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let config: weft_platform_traits::InstallConfig =
+        serde_json::from_str(&raw).with_context(|| format!("{} is not an install config", path.display()))?;
+    Ok(config.listen.public.port())
 }

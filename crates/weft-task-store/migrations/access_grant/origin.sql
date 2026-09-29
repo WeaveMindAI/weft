@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS access_grant (
             -- OAuth's design, and event routing filters on it in SQL.
             client_id TEXT,
             -- NULL for an exclusive-class shared grant.
-            project_id TEXT,
+            project_id UUID,
             -- The AccessSpec snapshot: refresh/auth need no catalog.
             spec_json JSONB NOT NULL,
             -- The stored values (token, refresh_token, captures, pasted
@@ -64,9 +64,17 @@ CREATE TABLE IF NOT EXISTS access_grant (
             -- making a second one, and terminating the node deletes
             -- it, so it lives exactly as long as the thing it opens.
             published_by_node TEXT,
+            -- Whose connection, inside a project: NULL for one the
+            -- author made (the project's, or a tenant-wide shared one),
+            -- else the member of `project_id` who connected it (or whose
+            -- copy of a node published it). A member is always a
+            -- project's, so a member's connection always names one.
+            member_id TEXT,
             expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT access_grant_member_has_project
+                CHECK (member_id IS NULL OR project_id IS NOT NULL)
         );
         CREATE INDEX IF NOT EXISTS access_grant_tenant_service
             ON access_grant (tenant_id, service);
@@ -74,8 +82,46 @@ CREATE TABLE IF NOT EXISTS access_grant (
         -- republishing is a lookup on this key, and two racing runs
         -- cannot leave two rows behind.
         CREATE UNIQUE INDEX IF NOT EXISTS access_grant_published
-            ON access_grant (tenant_id, project_id, published_by_node, service)
+            ON access_grant (tenant_id, project_id, published_by_node, service, member_id) NULLS NOT DISTINCT
             WHERE published_by_node IS NOT NULL;
+        -- A member's connections, for their picker and their forget.
+        CREATE INDEX IF NOT EXISTS access_grant_member
+            ON access_grant (project_id, member_id) WHERE member_id IS NOT NULL;
+        -- What a member provides for the fields their program writes
+        -- `@member_filled`: the value a run for them puts where the
+        -- source would hold one. The step is its place, spelled the
+        -- way the program reads it (`read`, `one.read`), and the field
+        -- one of its inputs. A value that is a connection (the
+        -- `{id, identity}` handle an access field holds) names its
+        -- grant, so removing the connection removes every value using
+        -- it, and its identity is read fresh from the grant.
+        CREATE TABLE IF NOT EXISTS member_value (
+            tenant_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            member_id TEXT NOT NULL,
+            step TEXT NOT NULL,
+            field TEXT NOT NULL,
+            value JSONB NOT NULL,
+            grant_id UUID REFERENCES access_grant(id) ON DELETE CASCADE,
+            set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (project_id, member_id, step, field)
+        );
+        CREATE INDEX IF NOT EXISTS member_value_grant ON member_value (grant_id) WHERE grant_id IS NOT NULL;
+        -- The connection each of a program's access nodes uses on this
+        -- install (`weft_core::picks`): picked here, never written in the
+        -- source, since a connection's id means nothing on another
+        -- install. One of the author's own connections (no member's),
+        -- and removing the connection removes the pick with it.
+        CREATE TABLE IF NOT EXISTS install_pick (
+            tenant_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            step TEXT NOT NULL,
+            field TEXT NOT NULL,
+            grant_id UUID NOT NULL REFERENCES access_grant(id) ON DELETE CASCADE,
+            set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (project_id, step, field)
+        );
+        CREATE INDEX IF NOT EXISTS install_pick_grant ON install_pick (grant_id);
         -- The inbound-event lookup: an incoming push names a service
         -- and an account, and must find every connection to it
         -- without knowing a tenant (which is the point: the push
@@ -83,16 +129,16 @@ CREATE TABLE IF NOT EXISTS access_grant (
         CREATE INDEX IF NOT EXISTS access_grant_service_account
             ON access_grant (service, provider_account);
         -- One in-flight OAuth connect per state nonce. Postgres-backed so
-        -- the callback may land on any dispatcher pod.
+        -- the callback may land on any dispatcher instance.
         CREATE TABLE IF NOT EXISTS access_connect (
             state TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             service TEXT NOT NULL,
             -- The resolved app credentials for the code exchange, carried
-            -- from begin to callback (any dispatcher pod completes it).
+            -- from begin to callback (any dispatcher instance completes it).
             -- SEALED (crypt.rs).
             registration_sealed TEXT NOT NULL,
-            project_id TEXT,
+            project_id UUID,
             spec_json JSONB NOT NULL,
             scopes JSONB NOT NULL DEFAULT '[]',
             -- SEALED (crypt.rs): with the consent code intercepted, the
@@ -104,6 +150,11 @@ CREATE TABLE IF NOT EXISTS access_grant (
             -- Set when this connect upgrades/rotates an existing
             -- exclusive-class grant in place.
             upgrade_grant_id UUID,
+            -- The member this connect is for (their browser went
+            -- through a member token, or their backend named them):
+            -- recorded onto the grant at completion. NULL for the
+            -- author's own connect.
+            member_id TEXT,
             redirect_uri TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -127,6 +178,11 @@ CREATE TABLE IF NOT EXISTS access_grant (
             -- declared `grants`), parked with the session; a finished
             -- pick unions them into the grant row's granted_scopes.
             grants JSONB NOT NULL DEFAULT '[]',
+            -- The member the pick is for, when it opened at their own
+            -- door: the chooser then signs in with a connection only
+            -- that member may use.
+            project_id UUID,
+            member_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS access_picker_created
@@ -170,6 +226,10 @@ CREATE TABLE IF NOT EXISTS access_grant (
             -- (resource id, anything the unsubscribe call needs).
             captures_json JSONB NOT NULL DEFAULT '{}',
             expires_at TIMESTAMPTZ,
+            -- The member whose signal this is, when the connection is
+            -- theirs: stopping the channel signs in as them.
+            project_id UUID,
+            member_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );

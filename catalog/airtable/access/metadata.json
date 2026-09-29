@@ -15,7 +15,7 @@
       "shared",
       "own"
     ],
-    "callback_https": true,
+    "callback": "https",
     "acquisition": {
       "kind": "oauth2",
       "grant": {

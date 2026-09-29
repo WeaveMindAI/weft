@@ -1,7 +1,7 @@
 # The checks CONTRIBUTING asks you to run locally, run again on every PR.
 #
-# Deliberately NOT here: the end-to-end suite (needs a real cluster, driven by
-# scripts/run-e2e.sh) and the live node-test tier (spends real money). Both are
+# Deliberately NOT here: the end-to-end suite (needs a local weft install and
+# Docker, driven by scripts/run-e2e.sh) and the live node-test tier (spends real money). Both are
 # run by hand before a release.
 name: ci
 

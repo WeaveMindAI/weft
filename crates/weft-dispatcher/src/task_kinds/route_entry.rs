@@ -1,4 +1,4 @@
-//! `route_entry` task: a dispatcher Pod loads the project,
+//! `route_entry` task: a dispatcher loads the project,
 //! computes trigger kicks, journals ExecutionStarted + NodeKicked
 //! events, and enqueues an execute task. Used by the listener
 //! when an entry-trigger fire arrives.
@@ -6,7 +6,7 @@
 //! Idempotency rests on a STABLE per-fire id (`RouteEntryPayload.
 //! fire_id`), minted once at the live-fire enqueue or reused from the
 //! ParkedFire id on a drain pop. The RouteEntry task dedup key is
-//! `entry:{token}:{fire_id}` and the execution color is `v5(fire_id)`.
+//! `entry:{token}:{fire_id}` and the execution is `v5(fire_id)`.
 //! Birth, starting inputs, and worker admission commit together. A rescued
 //! routing task finds the existing run and never reads mutable settings to
 //! rebuild it. Before birth, a failure parks the event for later routing.
@@ -22,9 +22,9 @@ use weft_task_store::tasks::Task;
 
 use crate::state::DispatcherState;
 
-/// Namespace UUID used to derive deterministic execution colors
+/// Namespace UUID used to derive deterministic executions
 /// from task ids. Generated once via `Uuid::new_v4` and frozen.
-const COLOR_NAMESPACE: Uuid = Uuid::from_u128(0x9c4a_e6a4_0b3f_4e8e_a0f1_1d3d_9b2c_5a47);
+const EXECUTION_ID_NAMESPACE: Uuid = Uuid::from_u128(0x9c4a_e6a4_0b3f_4e8e_a0f1_1d3d_9b2c_5a47);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteEntryPayload {
@@ -35,10 +35,10 @@ pub struct RouteEntryPayload {
     pub token: String,
     /// Stable identity of THIS fire, minted once when the fire is
     /// enqueued (live) or popped from the parked queue (drain). It is
-    /// the ParkedFire id when re-parked, the execution color seed
+    /// the ParkedFire id when re-parked, the execution seed
     /// (`v5(fire_id)`), AND the RouteEntry task dedup nonce, so one fire
     /// can never spawn two executions across a park / drain / lease-
-    /// rescue interleaving (every path converges on one color whose
+    /// rescue interleaving (every path converges on one execution whose
     /// events are dedup-keyed). NOT the task id (a re-parked fire is
     /// re-enqueued under a NEW task, but keeps the same fire id).
     pub fire_id: String,
@@ -55,22 +55,22 @@ pub struct RouteEntryPayload {
 }
 
 /// Outcome of a route_entry run. `Routed` carries the execution
-/// color; `Reparked` means the authoritative lifecycle re-check saw
+/// execution; `Reparked` means the authoritative lifecycle re-check saw
 /// a non-Active project and the fire went back onto
 /// `signal.parked_fires` instead of becoming journal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RouteEntryResult {
-    Routed { color: String },
+    Routed { execution_id: String },
     Reparked,
     /// The signal row is gone (the project was wiped under the fire), so
     /// there is nowhere to park it: the fire is dropped, matching the
     /// gate's refusal of a fire for a project that no longer exists.
     Dropped { reason: String },
-    /// A re-run found the color already terminal (cancelled during the
+    /// A re-run found the execution already terminal (cancelled during the
     /// route window, or run to its end by an earlier attempt): nothing
     /// left to finish.
-    AlreadySettled { color: String },
+    AlreadySettled { execution_id: String },
 }
 
 pub struct RouteEntryExecutor;
@@ -93,42 +93,42 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         // from the signal row itself inside `append_parked_fire`, so even
         // a `signal_get`/`lifecycle` read error can still park (the token
         // alone suffices).
-        // The color is a pure function of the fire id, so it is known
-        // before any read. Ask the journal FIRST whether this color was
+        // The execution is a pure function of the fire id, so it is known
+        // before any read. Ask the journal FIRST whether this execution was
         // already born: a start write whose commit landed but whose ack
         // was lost re-parked the fire, and this task is its drained twin;
-        // or a Pod died between the start write and the kicks and this
+        // or a process died between the start write and the kicks and this
         // is the lease rescue. In both cases the fire IS journal state
         // and the only correct thing is to finish it (kicks, execute
-        // task), whatever the project's lifecycle says now: a born color
+        // task), whatever the project's lifecycle says now: a born execution
         // counts in `running_count`, and a wait-mode deactivate waits on
         // it, so re-parking it would leave a ghost that blocks the drain
         // forever. Everything after the start write already runs under
         // that rule (an error journals a terminal); this makes a re-run
         // join it instead of re-entering the pre-journal gate.
-        let color = color_for_fire(&payload)?;
-        let born = match state.journal.execution_definition_hash(color).await {
-            Ok(crate::journal::ColorLookup::Found(hash)) => Some(hash),
-            Ok(crate::journal::ColorLookup::NotFound) => None,
-            Ok(crate::journal::ColorLookup::Corrupt) => anyhow::bail!(
-                "journal row for color {color} is corrupt; see dispatcher logs"
+        let execution_id = execution_id_for_fire(&payload)?;
+        let born = match state.journal.execution_definition_hash(execution_id).await {
+            Ok(crate::journal::ExecutionIdLookup::Found(hash)) => Some(hash),
+            Ok(crate::journal::ExecutionIdLookup::NotFound) => None,
+            Ok(crate::journal::ExecutionIdLookup::Corrupt) => anyhow::bail!(
+                "journal row for execution {execution_id} is corrupt; see dispatcher logs"
             ),
             Err(e) => return park_fire(state, task, &payload, &Unrouted::Retry(format!("journal read: {e}"))).await,
         };
         if born.is_some() {
             forget_parked_twin(state, &payload).await;
             refinish_drain(state, task).await;
-            let terminal = state.journal.events_log(color).await?.iter().any(|event| event.is_execution_terminal());
+            let terminal = state.journal.events_log(execution_id).await?.iter().any(|event| event.is_execution_terminal());
             return Ok(serde_json::to_value(if terminal {
-                RouteEntryResult::AlreadySettled { color: color.to_string() }
-            } else { RouteEntryResult::Routed { color: color.to_string() } })?);
+                RouteEntryResult::AlreadySettled { execution_id: execution_id.to_string() }
+            } else { RouteEntryResult::Routed { execution_id: execution_id.to_string() } })?);
         }
         {
             let routed = match pre_journal_route(state, &payload).await {
                 Ok(v) => v,
                 Err(e) => return park_fire(state, task, &payload, &Unrouted::of(e)).await,
             };
-            let RoutedFire { signal, program, fire, member_values } = routed;
+            let RoutedFire { signal, program, fire, member_values, picks } = routed;
             let candidate_hash = program.definition_hash.clone();
             // A trigger that reaches no output has nothing to run: not a
             // failure, not a park (a park would drain it back into this
@@ -145,31 +145,72 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             let Some(source_version) = signal.source_version.as_deref() else {
                 return park_fire(state, task, &payload, &Unrouted::Retry(format!("trigger '{}' has no original source version; activate it again", signal.node_id))).await;
             };
-            let (start, kick_events) = crate::api::project::execution_birth_events(
-                color,
-                signal.project_id,
-                weft_core::context::Phase::Fire,
-                &signal.node_id,
-                &fire.kicks,
-                &candidate_hash,
-                Some(&program),
-                Some(&fire.subgraph),
-                None,
-                Some(source_version),
-                signal.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
-                Some(&signal.node_id),
-                weft_core::exec::RunKind::Execution,
-                now,
-            );
+            let spec = signal.spec()?;
+            let run_class = spec.run_class;
+            let (start, kick_events) = crate::api::project::execution_birth_events(crate::api::project::Birth {
+                execution_id,
+                project_id: signal.project_id,
+                phase: weft_core::context::Phase::Fire,
+                entry_node: &signal.node_id,
+                kicks: &fire.kicks,
+                program: &program,
+                subgraph: Some(&fire.subgraph),
+                seed: None,
+                source_version: Some(source_version),
+                member: signal.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
+                picks: &picks,
+                fired_trigger: Some(&signal.node_id),
+                run_kind: weft_core::exec::RunKind::Execution,
+                run_class,
+                at_unix: now,
+            });
             // The start write is the LAST fire-loss point: until it commits
             // the fire is not journal state, so a transient error here
             // re-parks like every step before it. A write that committed
             // but failed to acknowledge re-parks too, and the drained twin
-            // finds the color born (above) and finishes it.
-            let execution_task = crate::task_kinds::execute::execution_task_spec(
-                weft_task_store::TaskKind::Execute, signal.project_id, color,
-                &candidate_hash, &program.binary_hash, &payload.tenant_id, None, None, None,
-            )?;
+            // finds the execution born (above) and finishes it.
+            // The entry's at-once limit, taken for this run's execution just
+            // before it is born. A full entry parks the fire, which the
+            // reaper retries on its backoff, so the fire waits for a run
+            // to end instead of being lost. The same execution on a retry
+            // keeps the slot it already holds.
+            let limits = spec.limits.resolve();
+            if let Some(max) = limits.at_once {
+                let now = crate::lease::now_unix();
+                let slot = crate::entry_limits::take_slot(
+                    &state.pg_pool,
+                    &payload.token,
+                    &execution_id.to_string(),
+                    max,
+                    now + crate::entry_limits::UNBORN_FIRE_SLOT_SECS,
+                    now,
+                )
+                .await;
+                match slot {
+                    Ok(Ok(())) => {}
+                    Ok(Err(refused)) => {
+                        if let Err(e) =
+                            crate::entry_limits::note_refusal(&state.pg_pool, &payload.token, refused.reason, now).await
+                        {
+                            tracing::warn!(target: "weft_dispatcher::route_entry", error = %e, "could not count a refusal");
+                        }
+                        return park_fire(state, task, &payload, &Unrouted::Retry(format!("{} is reached", refused.reason.describe()))).await;
+                    }
+                    Err(e) => return park_fire(state, task, &payload, &Unrouted::Retry(format!("entry slot: {e}"))).await,
+                }
+            }
+            let execution_task = crate::task_kinds::execute::execution_task_spec(crate::task_kinds::execute::ExecutionTask {
+                kind: weft_task_store::TaskKind::Execute,
+                project_id: signal.project_id,
+                execution_id,
+                definition_hash: &candidate_hash,
+                binary_hash: &program.binary_hash,
+                tenant_id: &payload.tenant_id,
+                run_class,
+                pinned_to: None,
+                live_connection: None,
+                unrecorded_birth: None,
+            })?;
             if let Err(e) = state
                 .journal
                 .start_execution(&start, &kick_events, execution_task, None)
@@ -187,7 +228,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         // event log itself, which the dedup key keeps single-write.
 
         Ok(serde_json::to_value(RouteEntryResult::Routed {
-            color: color.to_string(),
+            execution_id: execution_id.to_string(),
         })?)
     }
 }
@@ -259,7 +300,7 @@ async fn forget_parked_twin(state: &DispatcherState, payload: &RouteEntryPayload
 }
 
 /// The pre-`ExecutionStarted` half of route_entry: resolve the signal,
-/// re-check the lifecycle gate (a sibling Pod may have finished a
+/// re-check the lifecycle gate (a sibling process may have finished a
 /// deactivation since the HTTP gate), and snapshot the definition hash.
 /// Returns the [`RoutedFire`] on the happy path, its `fire` computed
 /// from the candidate hash's definition (`None` when the trigger reaches
@@ -269,7 +310,7 @@ async fn forget_parked_twin(state: &DispatcherState, payload: &RouteEntryPayload
 /// violation, but parking keeps the fire alive for the operator to
 /// route once the history is repaired, where a bare failure would drop
 /// it. The definition_hash is snapshotted onto
-/// ExecutionStarted so a resume of this color reads THIS hash from the
+/// ExecutionStarted so a resume of this execution reads THIS hash from the
 /// journal, not the project row's current hash (which may change if the
 /// user re-registers mid-flight); the fire is computed here, before the
 /// journal write, because ExecutionStarted carries its subgraph.
@@ -284,7 +325,7 @@ async fn pre_journal_route(
         .ok_or_else(|| anyhow::anyhow!("signal {} not found", payload.token))?;
     // The authoritative re-check of the gate the fire passed: the
     // activation governing the signal must still be Active (a sibling
-    // Pod may have taken it down since).
+    // process may have taken it down since).
     let gate = crate::api::signal::signal_gate(state, &signal).await?;
     if gate.status != crate::activation_store::ProjectStatus::Active {
         anyhow::bail!(
@@ -321,7 +362,13 @@ async fn pre_journal_route(
         crate::api::project::RunGap::MemberValues(refusal) => anyhow::Error::new(MemberValuesGap(refusal.to_string())),
         crate::api::project::RunGap::Other((_, why)) => anyhow::anyhow!("{why}"),
     })?;
-    Ok(RoutedFire { signal, program, fire, member_values })
+    // The program's own connections, as this install picked them. One
+    // nobody picked parks the fire on the backoff: picking it is what
+    // routes it.
+    let picks = crate::api::project::picks_for_run(state, signal.project_id, &project_def, &fire.subgraph)
+        .await
+        .map_err(|(_, why)| anyhow::anyhow!("{why}"))?;
+    Ok(RoutedFire { signal, program, fire, member_values, picks })
 }
 
 /// A fire refused because its member has not given (or gave an invalid)
@@ -372,25 +419,27 @@ struct RoutedFire {
     fire: crate::api::project::TriggerFire,
     /// What the fire's member provides, as the gate read and checked it.
     member_values: weft_core::member::MemberValues,
+    /// The install's picks the run carries.
+    picks: weft_core::picks::Picks,
 }
 
-/// The execution color for a fire: `v5(fire_id)`, derived from the FIRE
+/// The execution for a fire: `v5(fire_id)`, derived from the FIRE
 /// id (not the task id), so a fire re-parked then re-dispatched under a
 /// new task, or the same task re-run after a lease rescue, converges on
-/// ONE color. Every journal event for the color is dedup-keyed on the
+/// ONE execution. Every journal event for the execution is dedup-keyed on the
 /// same fire id, so any number of tasks carrying it replay the same rows.
-fn color_for_fire(payload: &RouteEntryPayload) -> Result<Uuid> {
+fn execution_id_for_fire(payload: &RouteEntryPayload) -> Result<Uuid> {
     let fire_uuid: Uuid = payload
         .fire_id
         .parse()
         .map_err(|e| anyhow::anyhow!("route_entry: invalid fire_id {}: {e}", payload.fire_id))?;
-    Ok(Uuid::new_v5(&COLOR_NAMESPACE, fire_uuid.as_bytes()))
+    Ok(Uuid::new_v5(&EXECUTION_ID_NAMESPACE, fire_uuid.as_bytes()))
 }
 
 /// The project definition recorded for `hash`, parsed. The definition
 /// history must cover every hash a fire or a journal row can name, so
 /// a miss is a contract violation; what the caller does with it (park
-/// before the journal write, fail the color after) is the caller's.
+/// before the journal write, fail the execution after) is the caller's.
 async fn definition_for(
     state: &DispatcherState,
     project_id: Uuid,
@@ -462,7 +511,7 @@ async fn park_fire(
             );
         }
         // A lease-rescue re-run of a task that parked this fire before its
-        // Pod died: the element is there with its backoff stamp, nothing
+        // process died: the element is there with its backoff stamp, nothing
         // is lost, and the reaper's parked-fire sweep retries it when due.
         ParkAppend::Refused(ParkRefusal::AlreadyQueued) => {
             tracing::info!(

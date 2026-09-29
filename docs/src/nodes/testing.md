@@ -54,8 +54,8 @@ weft test-node                  # everything
 Basic and fake run by default. **Live never runs unless you ask**, and the
 runner confirms before it does.
 
-Basic and fake compile and run right there with cargo, so no docker, no
-cluster, no daemon, and only the packages you targeted get built.
+Basic and fake run right there with cargo: they need no Docker and no
+runtime, and only the packages you targeted get built.
 
 Two things to know. A `basic` test is a plain sync function and the runner is
 already inside an async runtime, so building one inside it panics. And for a

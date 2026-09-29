@@ -11,7 +11,7 @@ for other assistants.
 The persona is `AGENTS.md`, OpenCode's own native instructions file, and
 `opencode.json` makes `tangle` the default agent so a session starts in it.
 Skills sit in `.opencode/skills/`, the specialists in `.opencode/agents/`, and
-the six commands in `.opencode/commands/`.
+the seven commands in `.opencode/commands/`.
 
 The specialists use OpenCode's per-agent `permission` block, and the commands
 use its `$ARGUMENTS` and positional `$1` templating.
@@ -22,7 +22,7 @@ tool result the model reads.
 
 ## What is here
 
-Tangle is one persona plus sixteen skills, five specialists and six commands.
+Tangle is one persona plus seventeen skills, six specialists and seven commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

@@ -1,5 +1,5 @@
-//! Health loop. Watches the owned projects' workloads for replica
-//! readiness, evaluates each project's HealthProtocols, and emits
+//! Health loop. Asks the host how every unit of the owned projects is
+//! doing, evaluates each project's HealthProtocols, and emits
 //! `infra_event` rows via the broker when a node's status changes.
 //!
 //! Two concerns:
@@ -11,17 +11,13 @@
 //!      flight, subsequent matches queue (next look re-checks once
 //!      the current one settles).
 //!
-//! When it looks: one watch per owned project hands over every change
-//! to its workloads the moment the cluster makes it, and that project
-//! is evaluated then. Every `health_interval` all of them are evaluated
-//! anyway, from the watched state: the flaky and recovery windows are
-//! about TIME passing with nothing changing, which no watch announces.
-//! What this pod owns is followed as the ownership loop changes it: a
-//! lost project's watch is dropped the moment the loss is known, so no
-//! evaluation of it starts after that (one already running when the
-//! loss lands finishes; its status write is fenced by ownership), and a
-//! claim runs a tick right away, which starts the new project's watch.
-//! The tick also reconciles the watches against the owned set.
+//! When it looks: every `health_interval`, every owned project (the
+//! flaky and recovery windows are about TIME passing with nothing
+//! changing, so a look on a clock is what they need). What this
+//! supervisor owns is followed as the ownership loop changes it: a lost
+//! project's health state is dropped the moment the loss is known (a look
+//! already running finishes; its status write is fenced by ownership),
+//! and a claim runs a tick right away.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -87,7 +83,7 @@ pub struct HealthRegistry {
 
 impl HealthRegistry {
     /// Drop every entry of a project `keep` refuses (deleted, or no
-    /// longer this pod's): a project this loop stops looking at would
+    /// longer this supervisor's): a project this loop stops looking at would
     /// otherwise keep its entries forever, and a reclaimed one would
     /// start from stale windows.
     fn keep_only(&mut self, keep: impl Fn(uuid::Uuid) -> bool) {
@@ -124,238 +120,53 @@ impl HealthRegistry {
     }
 }
 
-/// This pod's watches of its owned projects' workloads, and the last
-/// set each handed out. Held by the loop that evaluates them (and by a
-/// test stepping it), never shared: the next change is awaited on it.
-#[derive(Default)]
-pub struct Watches {
-    by_project: HashMap<uuid::Uuid, ProjectWatch>,
-}
-
-struct ProjectWatch {
-    /// The project as the last tick read it (its namespace, status),
-    /// what a change-driven evaluation is run with.
-    project: weft_broker_client::protocol::SupervisorProject,
-    stream: weft_platform_traits::kube::ReplicaWatch,
-    /// The last set the watch handed out. `None` until its first
-    /// answer: a project whose watch has not answered is not evaluated.
-    latest: Option<Vec<weft_platform_traits::kube::WorkloadReplicaState>>,
-    /// Why the watch's last look failed, cleared by its next answer.
-    /// While set, `latest` may be stale, so the project is not
-    /// evaluated on it.
-    failing: Option<String>,
-}
-
-impl ProjectWatch {
-    fn take(&mut self, item: Result<Vec<weft_platform_traits::kube::WorkloadReplicaState>>) {
-        match item {
-            Ok(set) => {
-                self.latest = Some(set);
-                self.failing = None;
-            }
-            Err(e) => {
-                tracing::warn!(project_id = %self.project.project_id, error = %e, "the watch of the project's workloads failed a look");
-                self.failing = Some(format!("{e:#}"));
-            }
-        }
-    }
-}
-
-/// What a watch says about its project right now.
-enum Watched<'a> {
-    /// Not watched, or started and not answered yet: nothing to
-    /// evaluate until it answers.
-    Unanswered,
-    /// The watch's last look failed; its last set may be stale.
-    Failing(&'a str),
-    Set(&'a [weft_platform_traits::kube::WorkloadReplicaState]),
-}
-
-impl Watches {
-    /// Watch every project in `projects`, starting the ones not watched
-    /// yet (or watched in another namespace) and dropping the rest. A
-    /// started watch is kept without waiting for its first answer,
-    /// which arrives through `changed` like any other.
-    async fn reconcile(
-        &mut self,
-        kube: &dyn weft_platform_traits::kube::KubeClient,
-        projects: &[weft_broker_client::protocol::SupervisorProject],
-    ) {
-        let live: HashSet<uuid::Uuid> = projects.iter().map(|p| p.project_id).collect();
-        self.by_project.retain(|id, _| live.contains(id));
-        for project in projects {
-            match self.by_project.get_mut(&project.project_id) {
-                Some(watch) if watch.project.project_namespace == project.project_namespace => {
-                    watch.project = project.clone();
-                    continue;
-                }
-                _ => {}
-            }
-            match kube.watch_replica_state(&project.project_namespace, crate::lifecycle::INFRA_SELECTOR).await {
-                Ok(stream) => {
-                    self.by_project.insert(
-                        project.project_id,
-                        ProjectWatch { project: project.clone(), stream, latest: None, failing: None },
-                    );
-                }
-                Err(e) => {
-                    // The project is not evaluated until its watch
-                    // starts; the next tick tries again.
-                    self.by_project.remove(&project.project_id);
-                    tracing::warn!(project_id = %project.project_id, error = %e, "could not watch the project's workloads");
-                }
-            }
-        }
-    }
-
-    /// The project's workloads as its watch last said, after taking in
-    /// every change already waiting.
-    fn latest(&mut self, project_id: uuid::Uuid) -> Watched<'_> {
-        use futures::FutureExt;
-        let Some(watch) = self.by_project.get_mut(&project_id) else {
-            return Watched::Unanswered;
-        };
-        loop {
-            match futures::StreamExt::next(&mut watch.stream).now_or_never() {
-                Some(Some(item)) => watch.take(item),
-                // Ended: dropped, and started again on the next tick.
-                Some(None) => {
-                    self.by_project.remove(&project_id);
-                    return Watched::Unanswered;
-                }
-                None => break,
-            }
-        }
-        let watch = &self.by_project[&project_id];
-        match (&watch.failing, &watch.latest) {
-            (Some(why), _) => Watched::Failing(why),
-            (None, Some(set)) => Watched::Set(set),
-            (None, None) => Watched::Unanswered,
-        }
-    }
-
-    /// Wait for the next answer on any watch and hand back the project
-    /// it concerns (a failed look included, so it is reported). Pending
-    /// for ever with nothing watched. Cancel safe: an answer is taken
-    /// in synchronously the moment it is read.
-    async fn changed(&mut self) -> weft_broker_client::protocol::SupervisorProject {
-        loop {
-            if self.by_project.is_empty() {
-                std::future::pending::<()>().await;
-            }
-            let (project_id, item) = {
-                let nexts = self.by_project.iter_mut().map(|(id, watch)| {
-                    Box::pin(async move { (*id, futures::StreamExt::next(&mut watch.stream).await) })
-                });
-                futures::future::select_all(nexts).await.0
-            };
-            match item {
-                Some(item) => {
-                    let watch = self.by_project.get_mut(&project_id).expect("it just answered");
-                    watch.take(item);
-                    return watch.project.clone();
-                }
-                None => {
-                    self.by_project.remove(&project_id);
-                }
-            }
-        }
-    }
-}
-
 pub async fn run_loop(
     state: SupervisorState,
     mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
 ) -> Result<()> {
-    let mut watches = Watches::default();
     loop {
-        if let Err(e) = tick(&state, &mut watches).await {
+        if let Err(e) = tick(&state).await {
             tracing::warn!(error = %e, "health tick failed");
         }
-        between_ticks(&state, &mut watches, &mut changes, state.clock.sleep(state.health_interval)).await?;
-    }
-}
-
-/// Until `next_tick` resolves, evaluate a project the moment its
-/// workloads change, and follow every ownership change the moment it
-/// arrives ([`on_ownership_change`]). Fails when the ownership loop is
-/// gone: nothing would tell this loop about a lost project any more. Only the WAIT races the tick: an evaluation, once
-/// started, runs to its end (it may be mid protocol action, holding the
-/// project's in-flight slot), and the tick comes after it. Exposed so
-/// integration tests can step this half of the loop.
-pub async fn between_ticks(
-    state: &SupervisorState,
-    watches: &mut Watches,
-    changes: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
-    next_tick: impl std::future::Future<Output = ()>,
-) -> Result<()> {
-    tokio::pin!(next_tick);
-    loop {
-        // Ownership first: with a loss and a watch change ready at once,
-        // the lost project's watch is dropped before anything evaluates it.
-        tokio::select! {
-            biased;
-            change = changes.recv() => {
-                let change = change.ok_or_else(|| {
-                    anyhow::anyhow!("the ownership loop is gone; the health loop cannot follow what this pod owns")
-                })?;
-                if let Err(e) = on_ownership_change(state, watches, &change).await {
-                    tracing::warn!(error = %e, "health tick after a claim failed");
+        let next_tick = state.clock.sleep(state.health_interval);
+        tokio::pin!(next_tick);
+        loop {
+            tokio::select! {
+                biased;
+                change = changes.recv() => {
+                    let change = change.ok_or_else(|| {
+                        anyhow::anyhow!("the ownership loop is gone; the health loop cannot follow what this supervisor owns")
+                    })?;
+                    if let Err(e) = on_ownership_change(&state, &change).await {
+                        tracing::warn!(error = %e, "health tick after a claim failed");
+                    }
                 }
+                _ = &mut next_tick => break,
             }
-            _ = &mut next_tick => return Ok(()),
-            project = watches.changed() => evaluate_logged(state, watches, &project).await,
         }
     }
 }
 
-/// Follow one ownership change: a lost project's watch and health state
-/// are dropped at once, so no evaluation of it starts while another pod
-/// owns it; a claim runs a tick now, which starts the new project's
-/// watch instead of leaving it unwatched until the next tick. Exposed
-/// so integration tests can step it.
-pub async fn on_ownership_change(
-    state: &SupervisorState,
-    watches: &mut Watches,
-    change: &crate::ownership::OwnershipChange,
-) -> Result<()> {
+/// Follow one ownership change: a lost project's health state is dropped
+/// at once; a claim runs a tick now rather than at the next interval.
+/// Exposed so integration tests can step it.
+pub async fn on_ownership_change(state: &SupervisorState, change: &crate::ownership::OwnershipChange) -> Result<()> {
     if !change.lost.is_empty() {
-        watches.by_project.retain(|id, _| !change.lost.contains(id));
         state.health.lock().await.keep_only(|project| !change.lost.contains(&project));
     }
     if !change.claimed.is_empty() {
-        tick(state, watches).await?;
+        tick(state).await?;
     }
     Ok(())
 }
 
-/// Wait for the next change to any watched project's workloads, and
-/// evaluate that project. Exposed so integration tests can step the
-/// change-driven half of the loop.
-pub async fn on_change(state: &SupervisorState, watches: &mut Watches) {
-    let project = watches.changed().await;
-    evaluate_logged(state, watches, &project).await;
-}
-
-async fn evaluate_logged(
-    state: &SupervisorState,
-    watches: &mut Watches,
-    project: &weft_broker_client::protocol::SupervisorProject,
-) {
-    if let Err(e) = evaluate(state, watches, project).await {
-        tracing::warn!(project_id = %project.project_id, error = %e, "health look (project) failed");
-    }
-}
-
-/// One tick of the health loop: watch what this pod owns now, then
-/// evaluate every owned project. Exposed (rather than only running
-/// inside `run_loop`) so integration tests can step the loop one tick
-/// at a time.
-pub async fn tick(state: &SupervisorState, watches: &mut Watches) -> Result<()> {
-    let projects = state.broker.owned_projects(&state.pod_name).await?;
-    watches.reconcile(state.kube.as_ref(), &projects).await;
+/// One tick of the health loop: evaluate every owned project. Exposed
+/// (rather than only running inside `run_loop`) so integration tests can
+/// step the loop one tick at a time.
+pub async fn tick(state: &SupervisorState) -> Result<()> {
+    let projects = state.broker.owned_projects(&state.instance).await?;
     for project in &projects {
-        if let Err(e) = evaluate(state, watches, project).await {
+        if let Err(e) = tick_project(state, project).await {
             tracing::warn!(
                 project_id = %project.project_id,
                 error = %e,
@@ -367,10 +178,6 @@ pub async fn tick(state: &SupervisorState, watches: &mut Watches) -> Result<()> 
     // Sweep ALL per-project registry maps for projects that no longer
     // exist (deleted between ticks). A deleted project is never
     // iterated again, so its entries would leak forever without this.
-    // `tick` is the only place that sees the full live set. (The
-    // per-node `state` map is also pruned inside tick_project when a
-    // node leaves running, but a deleted project's nodes never get
-    // iterated, so it must be swept here too.)
     {
         let live: std::collections::HashSet<uuid::Uuid> =
             projects.iter().map(|p| p.project_id).collect();
@@ -379,31 +186,14 @@ pub async fn tick(state: &SupervisorState, watches: &mut Watches) -> Result<()> 
     Ok(())
 }
 
-/// Evaluate one project from its watched workloads. A project whose
-/// watch has not answered yet is left until it does; one whose watch is
-/// failing is an error, never evaluated on a set that may be stale.
-async fn evaluate(
-    state: &SupervisorState,
-    watches: &mut Watches,
-    project: &weft_broker_client::protocol::SupervisorProject,
-) -> Result<()> {
-    let workloads = match watches.latest(project.project_id) {
-        Watched::Unanswered => return Ok(()),
-        Watched::Failing(why) => anyhow::bail!("the watch of the project's workloads is failing: {why}"),
-        Watched::Set(set) => set.to_vec(),
-    };
-    tick_project(state, project, &workloads).await
-}
-
 async fn tick_project(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
-    workloads: &[weft_platform_traits::kube::WorkloadReplicaState],
 ) -> Result<()> {
     // Stand down, copy by copy, while a user infra action runs on it:
     // an uncompleted supervisor command (apply / stop / terminate) that
     // reaches a copy means the lifecycle handler owns that copy's status
-    // right now. Health must NOT look at it (replicas dropping to 0
+    // right now. Health must NOT look at it (units going down
     // during a stop are the action, not a fault), or its autonomous
     // reconcile would race and clobber the action's transition. Every
     // other copy keeps its health. A stood-down copy's latches are
@@ -412,26 +202,20 @@ async fn tick_project(
     let commands = state.broker.infra_commands_in_flight(project.project_id).await?;
     let nodes = state.broker.infra_nodes(project.project_id).await?;
 
-    // Group workloads by `(weft.dev/instance, weft.dev/unit)`. Health is
-    // PER-UNIT: one infra node deploys N units (workloads), each with
+    // How the host sees every unit of the project, by `(instance,
+    // unit)`. Health is PER-UNIT: one infra node runs N units, each with
     // independent health, so a flaky sidecar doesn't drag a healthy
     // primary into "node flaky" (and can be remediated on its own). The
     // instance, not the node, is the key: a node that exists once per
-    // member deploys one instance per member under the same node label,
-    // and one member's broken copy says nothing about another's.
-    let mut by_unit: HashMap<(String, String), (i64, i64)> = HashMap::new();
-    for w in workloads {
-        let (Some(instance), Some(unit)) =
-            (w.labels.get("weft.dev/instance"), w.labels.get("weft.dev/unit"))
-        else {
-            continue;
-        };
-        let entry = by_unit
-            .entry((instance.clone(), unit.clone()))
-            .or_insert((0, 0));
-        entry.0 += w.desired;
-        entry.1 += w.ready;
-    }
+    // member runs one instance per member, and one member's broken copy
+    // says nothing about another's.
+    let seen: HashMap<(String, String), weft_platform_traits::UnitRunState> = state
+        .host
+        .observe(&project.tenant_id, project.project_id)
+        .await?
+        .into_iter()
+        .map(|o| ((o.instance, o.unit), o.state))
+        .collect();
 
     // Per unit of each copy: its windowed health (flaky/recovered
     // transitions, which drive the dispatcher-visible status badge
@@ -452,15 +236,10 @@ async fn tick_project(
     // cycle starts clean (no stale last_ready_at / last_not_ready_at
     // from before the Stop biasing the next flaky-window arithmetic).
     //
-    // A unit whose workload the watch has not handed over yet is
-    // UNKNOWN: no decision, no view, so no protocol reads it as broken
-    // (a copy just applied can reach this look before its workload
-    // reaches the watch). The unit roster comes from the row's `units`
-    // map, so a unit the watch never lists (a Job, a DaemonSet) shows no
-    // workload and stays unknown too: the row's `watched` flag keeps it
-    // from being seeded as seen after a restart. A workload at zero
-    // replicas is unknown only when weft asked for that zero
-    // (`UnitRuntime::zero_replicas_intended`); any other zero is broken.
+    // A unit the host does not report yet is UNKNOWN: no decision, no
+    // view, so no protocol reads it as broken (a copy just applied can
+    // reach this look before the host reports it). The unit roster
+    // comes from the row's `units` map.
     //
     // The state-machine math lives in `health_engine`; this loop is
     // just the I/O harness around it. Each decision carries the unit's
@@ -472,6 +251,7 @@ async fn tick_project(
         String,
         NodeDecision,
         weft_broker_client::protocol::InfraNodeStatus,
+        String,
     )> = Vec::new();
     let mut units: Vec<UnitView> = Vec::new();
     {
@@ -480,14 +260,13 @@ async fn tick_project(
             let stood_down = commands.iter().any(|c| c.reaches(&n.node_id, n.member.as_ref()));
             for (unit, unit_rt) in &n.units {
                 let key = (project.project_id, n.instance_id.clone(), unit.clone());
-                if stood_down || !unit_rt.status.expects_running_replicas() {
+                if stood_down || !unit_rt.status.expects_running_units() {
                     registry.state.remove(&key);
                     continue;
                 }
-                let workload = by_unit.get(&(n.instance_id.clone(), unit.clone())).map(|(desired, ready)| {
-                    NodeObservation { desired: (*desired).max(0) as u32, ready: (*ready).max(0) as u32 }
-                });
-                // No latch yet (first look by this pod, or the copy's
+                let reading = seen.get(&(n.instance_id.clone(), unit.clone()));
+                let observed = reading.map(|s| NodeObservation { ready: *s == weft_platform_traits::UnitRunState::Ready });
+                // No latch yet (first look by this supervisor, or the copy's
                 // latches were cleared by a lifecycle command): start
                 // from what the row says, see `seeded_from`.
                 let now = state.clock.now();
@@ -495,7 +274,6 @@ async fn tick_project(
                 let prior = registry.state.get(&key).cloned().unwrap_or_else(|| {
                     NodeHealthState::seeded_from(
                         unit_rt.status,
-                        unit_rt.watched,
                         n.applied_at_unix,
                         flaky_after,
                         now,
@@ -504,32 +282,32 @@ async fn tick_project(
                 });
                 let Some(decision) = observe_unit(
                     prior,
-                    workload,
-                    unit_rt.zero_replicas_intended(),
+                    observed,
                     now,
                     flaky_after,
                     Duration::from_secs(unit_rt.recovery_after_seconds as u64),
                 ) else {
                     continue;
                 };
-                let seen = workload.unwrap_or(NodeObservation { desired: 0, ready: 0 });
                 units.push(UnitView {
                     node_id: n.node_id.clone(),
                     member: n.member.clone(),
                     unit: unit.clone(),
-                    // A zero weft asked for never gets here (`observe_unit`
-                    // reads it as unknown), so zero desired means gone, or
-                    // scaled down outside weft: nothing serves.
-                    ready_ratio: if seen.desired > 0 {
-                        (seen.ready as f32 / seen.desired as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    },
-                    ready: seen.ready,
+                    ready: observed.is_some_and(|o| o.ready),
                     flaky: decision.next.declared_flaky,
                 });
                 registry.state.insert(key, decision.next.clone());
-                decisions.push((n.node_id.clone(), n.member.clone(), unit.clone(), decision, unit_rt.status));
+                // Why it is not ready, in the host's words, for the
+                // flaky event.
+                let why = match reading {
+                    Some(weft_platform_traits::UnitRunState::NotReady { why })
+                    | Some(weft_platform_traits::UnitRunState::Failed { why }) => why.clone(),
+                    Some(weft_platform_traits::UnitRunState::Starting) => "still starting".into(),
+                    Some(weft_platform_traits::UnitRunState::Stopped) => "stopped outside weft".into(),
+                    Some(weft_platform_traits::UnitRunState::Ready) => "ready".into(),
+                    None => "the host no longer reports it".into(),
+                };
+                decisions.push((n.node_id.clone(), n.member.clone(), unit.clone(), decision, unit_rt.status, why));
             }
         }
 
@@ -560,18 +338,12 @@ async fn tick_project(
     //      The latch is the single source of truth for the row's
     //      status; the broker write is a reconcile, not a
     //      consequence of the edge.
-    for (node_id, member, unit, decision, observed_status) in decisions {
+    for (node_id, member, unit, decision, observed_status, why) in decisions {
         if let Some(edge) = decision.event {
             let infra_event = match edge {
-                NodeEdgeEvent::BecameFlaky { desired, ready } => {
-                    weft_broker_client::protocol::InfraEvent::Flaky(
-                        weft_broker_client::protocol::FlakyPayload {
-                            desired: desired as i64,
-                            ready: ready as i64,
-                            reason: Some(format!("unit '{unit}'")),
-                        },
-                    )
-                }
+                NodeEdgeEvent::BecameFlaky => weft_broker_client::protocol::InfraEvent::Flaky(
+                    weft_broker_client::protocol::FlakyPayload { reason: format!("unit '{unit}' is not ready: {why}") },
+                ),
                 NodeEdgeEvent::Recovered => {
                     weft_broker_client::protocol::InfraEvent::Recovered
                 }
@@ -594,7 +366,7 @@ async fn tick_project(
             let outcome = state
                 .broker
                 .set_status(
-                    &state.pod_name,
+                    &state.instance,
                     None,
                     project.project_id,
                     &node_id,
@@ -639,7 +411,7 @@ async fn tick_project(
                 // protocol shapes (each tried untagged-enum branch
                 // shows up in the message). Bound it before shipping
                 // so a verbose error doesn't blow the 7800-byte
-                // Postgres NOTIFY cap and cause sibling-pod dropout.
+                // Postgres NOTIFY cap and cause a sibling listener to drop out.
                 state
                     .broker
                     .event_record(
@@ -726,7 +498,7 @@ async fn tick_project(
     );
     // Bound the action by the protocol's timeout (always set:
     // `timeout_seconds` is non-optional with a safe default, so
-    // "unbounded" can't be expressed). A hung broker/kube call would
+    // "unbounded" can't be expressed). A hung broker/host call would
     // otherwise pin `in_flight` forever (the remove below only runs
     // after the await), wedging this project's health monitoring.
     // The timeout maps a wedged action to a loud failure so the slot
@@ -737,7 +509,7 @@ async fn tick_project(
         match tokio::time::timeout(dur, run_action(state, project, &matched_proto, &scope)).await {
             Ok(r) => r,
             Err(_elapsed) => Err(anyhow::anyhow!(
-                "HealthProtocol action timed out after {secs}s (broker/kube call hung)"
+                "HealthProtocol action timed out after {secs}s (broker/host call hung)"
             )),
         };
     let now = state.clock.now();
@@ -795,9 +567,9 @@ async fn tick_project(
 }
 
 /// What `plan_action` decided. The I/O wrapper turns each variant
-/// into the corresponding broker/kube call. The split lets us unit-
-/// test the decision (which verb, which payload, which label
-/// selector) without needing fake broker + kube clients.
+/// into the corresponding broker/host call. The split lets us unit-test
+/// the decision (which verb, which payload, which copies) without
+/// needing fake broker + host clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActionPlan {
     /// Emit a `notify` infra_event for UI / observability (the
@@ -815,22 +587,10 @@ pub(crate) enum ActionPlan {
     EnqueueLifecycle {
         spec: weft_broker_client::protocol::LifecycleSpec,
     },
-    /// Scale a (instance, unit) workload to `replicas`, in the copies
-    /// of the node owned by whoever owns a broken copy (the protocol's
-    /// scope). Each copy's instance is resolved from the broker's
-    /// `infra_nodes` list ahead of dispatch; the copy itself is where
-    /// the scale is recorded (`UnitRuntime::scaled_to`).
-    Scale {
-        copies: Vec<CopyInstance>,
-        unit: String,
-        replicas: u32,
-    },
-    /// Delete every Pod matching this (instance, unit). Kubernetes
-    /// restarts them via the Deployment/StatefulSet controller. The
-    /// Deployment / Service / ConfigMap / PVCs are NOT touched :
-    /// this is the "kick the process" hammer, not a teardown. The same
-    /// copies as `Scale`.
-    BouncePods { instance_ids: Vec<String>, unit: String },
+    /// Restart `unit` in the copies of the node owned by whoever owns a
+    /// broken copy (the protocol's scope). Each copy's instance is
+    /// resolved from the broker's `infra_nodes` list ahead of dispatch.
+    RestartUnit { copies: Vec<CopyInstance>, unit: String },
     /// The action references a node with no copy at all in the
     /// project's `infra_nodes`. Logged via tracing; otherwise no-op.
     NodeMissing { node_id: String },
@@ -844,7 +604,7 @@ pub(crate) enum ActionPlan {
     },
 }
 
-/// One copy of a node and the instance its workloads are labelled with.
+/// One copy of a node and the instance the host runs it as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyInstance {
     pub copy: weft_broker_client::protocol::InfraCopy,
@@ -904,20 +664,8 @@ pub(crate) fn plan_action(
         ProtocolAction::AutoRecover => ActionPlan::EnqueueLifecycle {
             spec: LifecycleSpec::Reactivate(RestoreReaders { still_broken: scope.iter().cloned().collect() }),
         },
-        ProtocolAction::Scale {
-            node_id,
-            unit,
-            replicas,
-        } => copies_of(infra_nodes, node_id, scope, |copies| ActionPlan::Scale {
-            copies,
-            unit: unit.clone(),
-            replicas: *replicas,
-        }),
-        ProtocolAction::BouncePods { node_id, unit } => {
-            copies_of(infra_nodes, node_id, scope, |copies| ActionPlan::BouncePods {
-                instance_ids: copies.into_iter().map(|c| c.instance_id).collect(),
-                unit: unit.clone(),
-            })
+        ProtocolAction::RestartUnit { node_id, unit } => {
+            copies_of(infra_nodes, node_id, scope, |copies| ActionPlan::RestartUnit { copies, unit: unit.clone() })
         }
     }
 }
@@ -952,52 +700,14 @@ fn copies_of(
     act(instances)
 }
 
-/// Scale one copy's `unit` workloads to `replicas`, then record it in
-/// the copy's `UnitRuntime::scaled_to`. Errs on a kube failure (nothing
-/// recorded) and on a refused record.
-async fn scale_copy(
-    state: &SupervisorState,
-    project: &weft_broker_client::protocol::SupervisorProject,
-    copy: &weft_broker_client::protocol::InfraCopy,
-    instance_id: &str,
-    unit: &str,
-    replicas: u32,
-) -> Result<()> {
-    // Filter at the apiserver: instance + unit. No in-Rust filter pass.
-    let selector = format!(
-        "{},weft.dev/instance={instance_id},weft.dev/unit={unit}",
-        crate::lifecycle::INFRA_SELECTOR
-    );
-    let workloads = state
-        .kube
-        .list_replica_state(&project.project_namespace, &selector)
-        .await?;
-    for w in workloads.iter() {
-        state
-            .kube
-            .scale_workload(&project.project_namespace, w.kind, &w.name, replicas)
-            .await?;
-    }
-    let outcome = state
-        .broker
-        .set_scaled(&state.pod_name, project.project_id, &copy.node_id, copy.member.as_ref(), unit, replicas)
-        .await?;
-    if !outcome.is_applied() {
-        anyhow::bail!(
-            "scaled to {replicas} but the record was refused ({outcome:?}): the copy or unit is gone, a command is in flight, or ownership moved"
-        );
-    }
-    Ok(())
-}
-
 async fn run_action(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
     proto: &HealthProtocol,
     scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
 ) -> Result<()> {
-    // For Scale / BouncePods we need the current infra_nodes list to
-    // resolve node_id → instance_id. EnqueueLifecycle / Notify don't
+    // For RestartUnit we need the current infra_nodes list to resolve
+    // node_id → instance_id. EnqueueLifecycle / Notify don't
     // need it; pay the broker round-trip up front to keep the
     // planner pure regardless.
     let nodes = state.broker.infra_nodes(project.project_id).await?;
@@ -1017,43 +727,28 @@ async fn run_action(
         ActionPlan::EnqueueLifecycle { spec } => {
             state.broker.enqueue_lifecycle(project.project_id, spec).await?;
         }
-        ActionPlan::Scale {
-            copies,
-            unit,
-            replicas,
-        } => {
-            // Each copy is scaled first and recorded after, so the row
-            // never claims a zero the cluster does not have: a failed
-            // scale records nothing. Any copy left unscaled or
-            // unrecorded (a kube error, or a fenced write refused
-            // because the copy or unit is gone, a command is in flight,
-            // or this pod lost the project) fails the action, which
-            // releases the protocol's latch so it retries next tick;
-            // the retry scales again (idempotent) and records.
+        ActionPlan::RestartUnit { copies, unit } => {
+            // Every copy is attempted; any left unrestarted fails the
+            // action, which releases the protocol's latch so it retries
+            // next tick (a restart is idempotent).
             let mut failed = Vec::new();
             for CopyInstance { copy, instance_id } in copies {
-                if let Err(e) = scale_copy(state, project, &copy, &instance_id, &unit, replicas).await {
+                let node = weft_core::infra::NodeRef {
+                    tenant: project.tenant_id.clone(),
+                    project: project.project_id,
+                    node: copy.node_id.clone(),
+                    instance: instance_id,
+                };
+                if let Err(e) = state.host.restart_unit(&node, &unit).await {
                     failed.push(format!("{}: {e:#}", copy.node_id));
                 }
             }
             if !failed.is_empty() {
                 anyhow::bail!(
-                    "protocol '{}' scaled unit '{unit}' in only some copies; not done: {}",
+                    "protocol '{}' restarted unit '{unit}' in only some copies; not done: {}",
                     proto.name,
                     failed.join("; ")
                 );
-            }
-        }
-        ActionPlan::BouncePods { instance_ids, unit } => {
-            // Pods-only delete: the Deployment / Service /
-            // ConfigMap / PVC / Secret all survive. The Deployment
-            // controller respawns Pods with the same spec.
-            for instance_id in instance_ids {
-                let selector = format!("weft.dev/instance={instance_id},weft.dev/unit={unit}");
-                state
-                    .kube
-                    .delete_pods(&project.project_namespace, &selector)
-                    .await?;
             }
         }
         ActionPlan::NodeMissing { node_id } => {
@@ -1088,11 +783,7 @@ mod tests {
     fn proto(action: ProtocolAction) -> HealthProtocol {
         HealthProtocol {
             name: "p".to_string(),
-            when: HealthCondition::NodeReadyRatioBelow {
-                node_id: "*".into(),
-                unit: "*".into(),
-                ratio: 1.0,
-            },
+            when: HealthCondition::NodeNotReady { node_id: "*".into(), unit: "*".into() },
             action,
             timeout_seconds: 1800,
         }
@@ -1106,7 +797,7 @@ mod tests {
             applied_spec_hash: None,
             applied_at_unix: None,
             addresses: Default::default(),
-            preserve_pvcs: Vec::new(),
+            keep_disks: Vec::new(),
             units: Default::default(),
             member: None,
         }
@@ -1224,35 +915,12 @@ mod tests {
         std::collections::BTreeSet::from([InfraCopy { node_id: node_id.into(), member: None }])
     }
 
+    /// A restart reaches the copies owned by whoever owns a broken copy:
+    /// ada's broken `n1` restarts ada's `n1` only, never the shared one
+    /// or bob's; a broken shared `db` restarts the shared `n1`.
     #[test]
-    fn plan_scale_resolves_instance_id() {
-        let p = proto(ProtocolAction::Scale {
-            node_id: "n1".into(),
-            unit: "main".into(),
-            replicas: 3,
-        });
-        let nodes = vec![node("n1", "inst-abc")];
-        let result = plan_action(&p, &shared_broken("n1"), &nodes);
-        assert_eq!(
-            result,
-            ActionPlan::Scale {
-                copies: vec![shared_instance("n1", "inst-abc")],
-                unit: "main".into(),
-                replicas: 3,
-            }
-        );
-    }
-
-    /// Scaling reaches the copies owned by whoever owns a broken copy:
-    /// ada's broken `n1` scales ada's `n1` only, never the shared one or
-    /// bob's; a broken shared `db` scales the shared `n1`.
-    #[test]
-    fn plan_scale_reaches_only_the_broken_owners_copy() {
-        let p = proto(ProtocolAction::Scale {
-            node_id: "n1".into(),
-            unit: "main".into(),
-            replicas: 0,
-        });
+    fn plan_restart_reaches_only_the_broken_owners_copy() {
+        let p = proto(ProtocolAction::RestartUnit { node_id: "n1".into(), unit: "main".into() });
         let ada_id = weft_core::member::MemberId::new("ada").unwrap();
         let mut ada = node("n1", "inst-ada");
         ada.member = Some(ada_id.clone());
@@ -1262,91 +930,37 @@ mod tests {
         let ada_broken = std::collections::BTreeSet::from([InfraCopy { node_id: "n1".into(), member: Some(ada_id.clone()) }]);
         assert_eq!(
             plan_action(&p, &ada_broken, &nodes),
-            ActionPlan::Scale {
+            ActionPlan::RestartUnit {
                 copies: vec![CopyInstance {
-                    copy: InfraCopy { node_id: "n1".into(), member: Some(ada_id.clone()) },
+                    copy: InfraCopy { node_id: "n1".into(), member: Some(ada_id) },
                     instance_id: "inst-ada".into(),
                 }],
                 unit: "main".into(),
-                replicas: 0,
             }
         );
         assert_eq!(
             plan_action(&p, &shared_broken("db"), &nodes),
-            ActionPlan::Scale {
-                copies: vec![shared_instance("n1", "inst-shared")],
-                unit: "main".into(),
-                replicas: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_scale_node_missing_when_no_match() {
-        let p = proto(ProtocolAction::Scale {
-            node_id: "ghost".into(),
-            unit: "main".into(),
-            replicas: 3,
-        });
-        let nodes = vec![node("n1", "inst-abc")];
-        let result = plan_action(&p, &shared_broken("n1"), &nodes);
-        assert_eq!(
-            result,
-            ActionPlan::NodeMissing {
-                node_id: "ghost".into()
-            }
-        );
-    }
-
-    #[test]
-    fn plan_bounce_pods_resolves_instance_id() {
-        let p = proto(ProtocolAction::BouncePods {
-            node_id: "n1".into(),
-            unit: "main".into(),
-        });
-        let mut ada = node("n1", "inst-ada");
-        ada.member = Some(weft_core::member::MemberId::new("ada").unwrap());
-        let nodes = vec![node("n1", "inst-abc"), ada];
-        let result = plan_action(&p, &shared_broken("n1"), &nodes);
-        assert_eq!(
-            result,
-            ActionPlan::BouncePods {
-                instance_ids: vec!["inst-abc".into()],
-                unit: "main".into()
-            }
+            ActionPlan::RestartUnit { copies: vec![shared_instance("n1", "inst-shared")], unit: "main".into() }
         );
     }
 
     #[test]
     fn plan_names_the_owners_when_the_node_is_on_the_other_side() {
-        let p = proto(ProtocolAction::BouncePods {
-            node_id: "n1".into(),
-            unit: "main".into(),
-        });
+        let p = proto(ProtocolAction::RestartUnit { node_id: "n1".into(), unit: "main".into() });
         let ada = weft_core::member::MemberId::new("ada").unwrap();
         let broken = std::collections::BTreeSet::from([InfraCopy { node_id: "db".into(), member: Some(ada.clone()) }]);
-        let result = plan_action(&p, &broken, &[node("n1", "inst-shared")]);
         assert_eq!(
-            result,
-            ActionPlan::NoCopyForOwners {
-                node_id: "n1".into(),
-                owners: vec![Some(ada)],
-            }
+            plan_action(&p, &broken, &[node("n1", "inst-shared")]),
+            ActionPlan::NoCopyForOwners { node_id: "n1".into(), owners: vec![Some(ada)] }
         );
     }
 
     #[test]
-    fn plan_bounce_pods_node_missing_when_no_match() {
-        let p = proto(ProtocolAction::BouncePods {
-            node_id: "ghost".into(),
-            unit: "main".into(),
-        });
-        let result = plan_action(&p, &shared_broken("ghost"), &[]);
+    fn plan_restart_node_missing_when_no_match() {
+        let p = proto(ProtocolAction::RestartUnit { node_id: "ghost".into(), unit: "main".into() });
         assert_eq!(
-            result,
-            ActionPlan::NodeMissing {
-                node_id: "ghost".into()
-            }
+            plan_action(&p, &shared_broken("ghost"), &[node("n1", "inst-abc")]),
+            ActionPlan::NodeMissing { node_id: "ghost".into() }
         );
     }
 

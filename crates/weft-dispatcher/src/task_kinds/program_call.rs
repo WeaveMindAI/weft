@@ -1,6 +1,6 @@
 //! `program_call` task: one call a program makes on its own project
 //! (`weft_core::program::ProgramCall`). The broker enqueued it for the
-//! asking run, pinned to that run's project; a dispatcher pod carries it
+//! asking run, pinned to that run's project; a dispatcher carries it
 //! out here, through the same functions the CLI and the editor reach, and
 //! the worker reads the answer off the task.
 //!
@@ -30,10 +30,11 @@ use weft_core::program::{
     ProgramCallOutcome, ProgramCallPayload, TokensRevoked,
 };
 use weft_core::running_policy::DeactivateSpec;
-use weft_core::{Color, StopSelf};
+use weft_core::{ExecutionId, StopSelf};
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 
+use crate::infra_lifecycle_command::TakeDown;
 use crate::state::DispatcherState;
 
 pub struct ProgramCallExecutor;
@@ -74,10 +75,12 @@ pub(crate) async fn run_call(
             answered(serde_json::to_value(started).map_err(internal("answer"))?)
         }
         ProgramCall::InfraStop { node, member, spec } => {
-            infra_down(state, project_id, node, member.as_ref(), InfraVerb::Stop, spec, asker, payload.stop_self).await
+            let stop = TakeDown::Stop { force: false };
+            infra_down(state, project_id, node, member.as_ref(), stop, spec, asker, payload.stop_self).await
         }
-        ProgramCall::InfraTerminate { node, member, spec } => {
-            infra_down(state, project_id, node, member.as_ref(), InfraVerb::Terminate, spec, asker, payload.stop_self).await
+        ProgramCall::InfraTerminate { node, member, spec, disks } => {
+            let terminate = TakeDown::Terminate { disks: *disks };
+            infra_down(state, project_id, node, member.as_ref(), terminate, spec, asker, payload.stop_self).await
         }
         ProgramCall::InfraStatus { node, member } => {
             let copy = observed_copies(state, project_id)
@@ -152,21 +155,6 @@ pub(crate) async fn run_call(
                 .await
                 .map_err(internal("revoke tokens"))?;
             answered(serde_json::to_value(TokensRevoked { revoked }).map_err(internal("answer"))?)
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum InfraVerb {
-    Stop,
-    Terminate,
-}
-
-impl InfraVerb {
-    fn lifecycle(self) -> weft_broker_client::protocol::InfraLifecycleVerb {
-        match self {
-            InfraVerb::Stop => weft_broker_client::protocol::InfraLifecycleVerb::Stop,
-            InfraVerb::Terminate => weft_broker_client::protocol::InfraLifecycleVerb::Terminate,
         }
     }
 }
@@ -246,9 +234,9 @@ async fn infra_down(
     project_id: uuid::Uuid,
     node: &str,
     member: Option<&MemberId>,
-    verb: InfraVerb,
+    take_down: TakeDown,
     spec: &DeactivateSpec,
-    asker: Color,
+    asker: ExecutionId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
@@ -260,16 +248,21 @@ async fn infra_down(
     // is the later intent, so the start ends here.
     let cancelled_start = !pending.setups_starting(node, member).is_empty();
     for setup in pending.setups_starting(node, member) {
-        crate::api::execution::cancel_color(state, setup, &weft_core::exec::CancelCause::User)
+        crate::api::execution::cancel_execution_id(state, setup, &weft_core::exec::CancelCause::User)
             .await
             .map_err(internal("cancel the copy's start"))?;
     }
     use crate::infra_node::InfraNodeStatus;
     let row = copies_now.rows.iter().find(|r| r.node_id == node && r.member.as_ref() == member).map(|r| r.status);
-    let already_down = match (row, verb) {
+    // A terminate deleting every disk is never already done: a copy with
+    // no row, or one mid-terminate, may still hold the disks an earlier
+    // terminate kept, and only the supervisor's pass over the host can
+    // tell.
+    let already_down = match (row, take_down) {
+        (_, TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => false,
         (None, _) => true,
-        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), InfraVerb::Stop) => true,
-        (Some(InfraNodeStatus::Terminating), InfraVerb::Terminate) => true,
+        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), TakeDown::Stop { .. }) => true,
+        (Some(InfraNodeStatus::Terminating), TakeDown::Terminate { .. }) => true,
         (Some(_), _) => false,
     };
     if already_down {
@@ -300,7 +293,7 @@ async fn infra_down(
         .await?;
     }
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.color == asker);
+    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.execution_id == asker);
     crate::api::infra::settle_running_before_infra_op(
         state,
         project_id,
@@ -311,14 +304,13 @@ async fn infra_down(
     )
     .await?;
     let drain = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    let command_id = crate::api::infra::issue_lifecycle_ensuring_supervisor(
+    let command_id = crate::api::infra::issue_lifecycle_kicking_supervisor(
         state,
         project_id,
         Some(node),
         &copies,
-        verb.lifecycle(),
+        take_down,
         spec.running_policy,
-        false,
         drain,
     )
     .await?;
@@ -361,7 +353,7 @@ async fn triggers_deactivate(
     project_id: uuid::Uuid,
     scope: &ActivationScope,
     spec: &DeactivateSpec,
-    asker: Color,
+    asker: ExecutionId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     let project = state
@@ -373,7 +365,7 @@ async fn triggers_deactivate(
     let keys = scope.resolve(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let target = crate::take_down::TakeDownTarget::Activations(keys);
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.color == asker);
+    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
     crate::take_down::take_down(state, project_id, &target, spec, false, Some(asker)).await?;
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
@@ -382,9 +374,9 @@ async fn triggers_deactivate(
 
 /// Cancel the asking run when its own call reaches it and it asked to be
 /// stopped with the rest. Its worker is waiting for exactly this.
-async fn stop_asker(state: &DispatcherState, asker: Color, stops: bool) -> Result<(), CallError> {
+async fn stop_asker(state: &DispatcherState, asker: ExecutionId, stops: bool) -> Result<(), CallError> {
     if stops {
-        crate::api::execution::cancel_color(state, asker, &weft_core::exec::CancelCause::User)
+        crate::api::execution::cancel_execution_id(state, asker, &weft_core::exec::CancelCause::User)
             .await
             .map_err(internal("cancel the asking run"))?;
     }
@@ -397,7 +389,7 @@ async fn asker_matches_filter(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     filter: &weft_core::program::RunFilter,
-    asker: Color,
+    asker: ExecutionId,
 ) -> Result<bool, CallError> {
     let Some(run) = state.journal.execution_summary(asker).await.map_err(internal("the asking run"))? else {
         return Ok(false);
@@ -416,14 +408,14 @@ async fn asker_matches_filter(
 }
 
 /// Cost records of the project's runs, filtered. The run's member is its
-/// `execution_color` row's, born with the run and never changed.
+/// `execution` row's, born with the run and never changed.
 async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, CallError> {
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT e.color, e.payload_json, ec.member_id \
-         FROM exec_event e JOIN execution_color ec ON ec.color = e.color \
+        "SELECT e.execution_id, e.payload_json, ec.member_id \
+         FROM exec_event e JOIN execution ec ON ec.execution_id = e.execution_id \
          WHERE ec.project_id = $1 AND e.kind = 'cost_reported' \
            AND ($2::text IS NULL OR ec.member_id = $2) \
-           AND ($3::text IS NULL OR e.color = $3) \
+           AND ($3::text IS NULL OR e.execution_id = $3) \
            AND ($4::bigint IS NULL OR e.created_at >= $4) \
          ORDER BY e.id",
     )
@@ -436,9 +428,9 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
     .map_err(internal("costs"))?;
     let project = state.projects.project(project_id).await.map_err(internal("project"))?;
     let mut out = Vec::new();
-    for (color, payload, member) in rows {
-        let color: Color = color.parse().map_err(internal("cost row color"))?;
-        let event = weft_journal::decode_event(color, &payload).map_err(internal("cost row"))?;
+    for (execution_id, payload, member) in rows {
+        let execution_id: ExecutionId = execution_id.parse().map_err(internal("cost row execution"))?;
+        let event = weft_journal::decode_event(execution_id, &payload).map_err(internal("cost row"))?;
         let weft_journal::ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
             continue;
         };
@@ -456,7 +448,7 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
             continue;
         }
         out.push(CostRecord {
-            run: color,
+            run: execution_id,
             member: member.map(MemberId::new).transpose().map_err(internal("cost row member"))?,
             node,
             service,

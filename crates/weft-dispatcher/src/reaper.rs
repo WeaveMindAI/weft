@@ -1,22 +1,22 @@
-//! Background reapers that sweep stale rows and respawn missing
-//! workers. Every dispatcher Pod runs all of these, and each sweep runs
-//! under its own cluster-wide advisory lock (`lease::REAPER_DOMAIN`,
-//! keyed by the reaper's name), so one replica sweeps at a time and a
-//! sibling that finds the lock held skips that turn: N replicas cost one
-//! sweep, not N. The writes stay idempotent underneath (delete-by-key is
-//! a no-op the second time, `mark_dead` is status-guarded, task reclaim
-//! is conditional), so a sweep that overlaps a request doing the same
-//! work is harmless.
+//! Background reapers that sweep stale rows. Every copy of the
+//! dispatcher runs all of these, and each sweep runs under its own
+//! install-wide advisory lock (`lease::REAPER_DOMAIN`, keyed by the
+//! reaper's name), so one copy sweeps at a time and a sibling that finds
+//! the lock held skips that turn: N copies cost one sweep, not N. The
+//! writes stay idempotent underneath (delete-by-key is a no-op the second
+//! time, task reclaim is conditional), so a sweep that overlaps a request
+//! doing the same work is harmless.
 //!
-//! Two kinds of reaper. The ones that react to a write sleep until that
-//! write is announced (`pg_wake`), with a slow safety tick for what no
-//! write announces. The ones that notice SILENCE (a heartbeat that went
-//! stale, a lease that lapsed, a transition whose driver died) cannot be
-//! woken by anything, so they stay on a timer.
+//! Two kinds of reaper, both `DrainLoop`s. The ones that react to a write
+//! sleep until that write is announced, with a slow safety tick for what
+//! no write announces. The ones that notice SILENCE (a lease that lapsed,
+//! a transition whose driver died) cannot be woken by anything, so they
+//! run on their safety tick alone.
 
 use std::time::Duration;
 
-use crate::pg_wake::{self, DrainStep, WakeOn};
+use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
+
 use crate::state::DispatcherState;
 
 /// The channel a signal row notifies on when a fire is parked on it,
@@ -24,20 +24,20 @@ use crate::state::DispatcherState;
 /// `signal_parked_fire_notify_on_grow` trigger in `journal::postgres::GROUP`.
 pub const PARKED_FIRE_CHANNEL: &str = "weft_parked_fire";
 
-/// The channel a queued terminate sweep notifies on, with its color as
+/// The channel a queued terminate sweep notifies on, with its execution as
 /// the payload, from the `storage_sweep_notify_on_insert` trigger in
 /// `storage::GROUP`.
 pub const STORAGE_SWEEP_CHANNEL: &str = "weft_storage_sweep";
 
 /// The longest the parked-fire sweep sleeps between looks, whatever the
-/// queues say: it also releases the drain claims a dead pod left, which
+/// queues say: it also releases the drain claims a dead copy left, which
 /// nothing announces. 30 seconds in real time, at this install's pace
 /// (`weft_core::time_scale`).
 fn parked_fire_longest_sleep() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(30))
 }
 
-const ON_WORKER_POD: &[WakeOn] = &[WakeOn::any(weft_task_store::worker_pod::WORKER_POD_CHANNEL)];
+const NOTHING: &[WakeOn] = &[];
 const ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
 const ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
 
@@ -47,57 +47,88 @@ fn woken_reaper_safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(60))
 }
 
-/// Spawn every reaper. Returns immediately; the reapers run for the
-/// lifetime of the process.
-pub fn spawn_all(state: DispatcherState) {
-    // Silence detectors: nothing announces a heartbeat that stopped.
-    spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod", sweep_worker_pods);
-    spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod_gc", sweep_terminal_worker_pods);
-    spawn_loop(state.clone(), Duration::from_secs(30), "removed_projects", |state| async move {
-        sweep_removed_projects(&state).await
-    });
-    spawn_loop(state.clone(), Duration::from_secs(3600), "tasks", sweep_tasks);
-    spawn_loop(state.clone(), Duration::from_secs(30), "listener", sweep_listeners);
-    spawn_loop(state.clone(), Duration::from_secs(60), "listener_scaledown", sweep_listener_scaledown);
-    spawn_loop(state.clone(), Duration::from_secs(30), "supervisor", sweep_supervisors);
-    spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
-    spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
-    spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
-    spawn_loop(state.clone(), Duration::from_secs(3600), "retired_rows", sweep_retired_rows);
-    // A pod dying is announced (its row leaves alive); a claim held by a
-    // pod whose row is gone for good is caught by the safety tick.
-    spawn_woken(
-        state.clone(),
-        ON_WORKER_POD,
-        "orphaned_tasks",
-        |s| async move { sweep_orphaned_tasks(s).await.map(|()| DrainStep::Done) },
-    );
-    // Re-parked fires (a route that failed) retry with a backoff stamp on
-    // the element; this is what drives the retry once the stamp is due.
-    // A newly parked fire wakes it at once; otherwise it sleeps until the
-    // earliest head is due.
-    spawn_woken(
-        state.clone(),
-        ON_PARKED_FIRE,
-        "parked_fires",
-        |s| async move {
+/// Every reaper, as the loops the dispatcher runs.
+pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
+    vec![
+        // Silence detectors: nothing announces a lease that lapsed.
+        timed(state, Duration::from_secs(30), "removed_projects", |s| async move { sweep_removed_projects(&s).await }),
+        timed(state, Duration::from_secs(3600), "tasks", sweep_tasks),
+        timed(state, Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions),
+        timed(state, Duration::from_secs(3600), "retired_rows", sweep_retired_rows),
+        timed(state, Duration::from_secs(30), "orphaned_live_executions", sweep_orphaned_live_executions),
+        timed(state, Duration::from_secs(60), "stale_cancels", |s| async move {
+            let dropped = weft_task_store::tasks::drop_stale_cancels(&s.pg_pool).await?;
+            if dropped > 0 {
+                tracing::info!(target: "weft_dispatcher::reaper", dropped, "dropped cancels whose execution nothing drives any more");
+            }
+            Ok(())
+        }),
+        timed(state, Duration::from_secs(300), "ghost_infra_leases", |s| async move {
+            crate::infra_owner::release_ghost_leases(&s.pg_pool).await
+        }),
+        // The public edge's counters: minutes that no longer count, and
+        // slots of runs that never started.
+        timed(state, Duration::from_secs(60), "entry_rate", |s| async move {
+            crate::entry_limits::sweep(&s.pg_pool, crate::lease::now_unix()).await
+        }),
+        // Re-parked fires (a route that failed) retry with a backoff stamp
+        // on the element; this is what drives the retry once the stamp is
+        // due. A newly parked fire wakes it at once; otherwise it sleeps
+        // until the earliest head is due.
+        woken(state, ON_PARKED_FIRE, "parked_fires", |s| async move {
             crate::api::project::drain_due_parked_fires(&s).await?;
             let now = crate::lease::now_unix();
             let next = crate::api::project::next_parked_fire_due(&s.pg_pool).await?;
             Ok(DrainStep::RetryIn(parked_fire_sleep(now, next)))
-        },
-    );
-    // Storage plane: the durable terminate sweep (un-kept exec files of a
-    // terminated color). The queue deletes a color's row only after the
-    // broker confirms the sweep; a transient broker failure leaves it for
-    // the safety tick. The kept-file expiry sweep is the broker's own loop
-    // (it owns the bucket + metadata), not here.
-    spawn_woken(
-        state,
-        ON_STORAGE_SWEEP,
-        "storage_sweep",
-        |s| async move { crate::storage::process_sweep_queue(s).await.map(|()| DrainStep::Done) },
-    );
+        }),
+        // Storage plane: the durable terminate sweep (un-kept exec files of
+        // a terminated execution). The queue deletes an execution's row only after
+        // the broker confirms the sweep; a transient broker failure leaves
+        // it for the safety tick. The kept-file expiry sweep is the
+        // broker's own loop (it owns the bucket + metadata).
+        woken(state, ON_STORAGE_SWEEP, "storage_sweep", |s| async move {
+            crate::storage::process_sweep_queue(s).await.map(|()| DrainStep::Done)
+        }),
+    ]
+}
+
+/// A sweep that runs on its interval alone. `interval` is given in real
+/// time and runs at this install's pace (`weft_core::time_scale`), like
+/// the leases these sweeps judge.
+fn timed<F, Fut>(state: &DispatcherState, interval: Duration, name: &'static str, sweep: F) -> DrainLoop
+where
+    F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let state = state.clone();
+    DrainLoop::new(name, NOTHING, weft_core::time_scale::scaled(interval), move || {
+        let state = state.clone();
+        let sweep = sweep.clone();
+        async move {
+            sweep_alone(&state, name, || sweep(state.clone())).await?;
+            Ok(DrainStep::Done)
+        }
+    })
+}
+
+/// A sweep that runs when one of `wake_on` is announced, and on a slow
+/// safety tick. The body's step says whether to look again early.
+fn woken<F, Fut>(state: &DispatcherState, wake_on: &'static [WakeOn], name: &'static str, sweep: F) -> DrainLoop
+where
+    F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send + 'static,
+{
+    let state = state.clone();
+    DrainLoop::new(name, wake_on, woken_reaper_safety(), move || {
+        let state = state.clone();
+        let sweep = sweep.clone();
+        async move {
+            // A sibling holding the lock is sweeping right now; what it
+            // misses of this wake, its own next look or this one's safety
+            // tick covers.
+            Ok(sweep_alone(&state, name, || sweep(state.clone())).await?.unwrap_or(DrainStep::Done))
+        }
+    })
 }
 
 /// How long the parked-fire sweep sleeps: until the earliest queued head
@@ -179,168 +210,12 @@ async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Grace before a terminal (`done`/`dead`) worker_pod's k8s Pod
-/// object is deleted: keeps a just-finished pod inspectable
-/// (`kubectl logs`) for a window before GC. Never scaled: a window for
-/// a person reading logs.
-const TERMINAL_POD_GRACE_SECS: i64 = 120;
-
-/// Spawn a periodic sweep task. The body is the only thing that
-/// differs across reapers; the loop shape (sleep / sweep alone / log on
-/// error) is identical. `interval` is given in real time and runs at
-/// this install's pace (`weft_core::time_scale`), like the heartbeats
-/// and leases these sweeps judge. The sweep takes the state by clone (cheap,
-/// `DispatcherState` is Arc-fielded), which keeps the trait bound
-/// simple compared to a borrowing closure.
-fn spawn_loop<F, Fut>(
-    state: DispatcherState,
-    interval: Duration,
-    name: &'static str,
-    sweep: F,
-)
-where
-    F: Fn(DispatcherState) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
-{
-    let interval = weft_core::time_scale::scaled(interval);
-    crate::app::spawn_supervised(name, async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            if let Err(e) = sweep_alone(&state, name, || sweep(state.clone())).await {
-                tracing::warn!(
-                    target: "weft_dispatcher::reaper",
-                    reaper = name,
-                    error = %e,
-                    "reaper sweep failed"
-                );
-            }
-        }
-    });
-}
-
-/// Spawn a sweep that runs when one of `wake_on` is announced, and on a
-/// slow safety tick. The body's step says whether to look again early.
-fn spawn_woken<F, Fut>(
-    state: DispatcherState,
-    wake_on: &'static [WakeOn],
-    name: &'static str,
-    sweep: F,
-)
-where
-    F: Fn(DispatcherState) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send,
-{
-    crate::app::spawn_supervised(name, async move {
-        let signals = state.signals.subscribe();
-        pg_wake::run(signals, wake_on, woken_reaper_safety(), name, || async {
-            // A sibling holding the lock is sweeping right now; what it
-            // misses of this wake, its own next look or this one's
-            // safety tick covers.
-            Ok(sweep_alone(&state, name, || sweep(state.clone())).await?.unwrap_or(DrainStep::Done))
-        })
-        .await;
-    });
-}
-
-/// Run one sweep while holding the reaper's cluster-wide lock, or skip
-/// it (`None`) while a sibling replica holds it.
-async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Option<T>>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    crate::lease::with_advisory_lock(
-        &state.pg_pool,
-        crate::lease::advisory_key(crate::lease::REAPER_DOMAIN, name),
-        sweep,
-    )
-    .await
-}
-
-/// Worker-pod reaper. Once every 30s, mark failed pods `dead` (which
-/// makes the fencing trigger reject any further journal writes) +
-/// delete the Pod:
-///   - `alive` rows whose heartbeat went stale (the worker died),
-///   - `spawning` rows that never registered `alive` within the generous
-///     boot deadline. Without sweeping the latter, a ghost `spawning` row
-///     is counted as available capacity by the scale-up check forever, so
-///     the project's pending work hangs with no live worker and no error,
-///     and
-///   - non-terminal `role='node-test'` rows whose owning task is gone or
-///     has been terminal past a full claim duration (the executor's
-///     cleanup failed partway; nothing else re-runs it). The grace keeps
-///     the sweep clear of an executor's own in-flight cleanup: a task
-///     terminal for less than one claim duration may still have its
-///     finishing claim working against the pod.
-///
-/// The spawning deadline (`SPAWN_BOOT_DEADLINE_SECS`) is deliberately
-/// GENEROUS, far above any realistic boot (image pull + binary init), so
-/// a healthy worker always reaches `register_alive` (which leaves the
-/// spawning state) long before it trips: the deadline never false-
-/// positives a slow-but-healthy boot, including a Pending pod waiting for
-/// a node or a slow multi-GB pull. We do NOT try to reap a doomed boot
-/// faster off its k8s state: a genuinely-broken image is already surfaced
-/// loudly at spawn time (`wait_for_pull_ok` fails the spawn task in ~5s),
-/// and trying to classify "stuck" from the container-waiting reason can't
-/// tell an unscheduled pod (must wait) from a wedged one (reap), so it
-/// would false-positive the former. One honest generous deadline instead.
-/// Pending tasks remain claimable: cold-start respawns once the ghost is
-/// gone.
-async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
-    let now = crate::lease::now_unix();
-    let stale = weft_task_store::worker_pod::list_stale(
-        &state.pg_pool,
-        now - weft_task_store::worker_pod::heartbeat_stale_secs(),
-    )
-    .await?;
-    let stuck_spawning = weft_task_store::worker_pod::list_stale_spawning(
-        &state.pg_pool,
-        now - weft_task_store::worker_pod::SPAWN_BOOT_DEADLINE_SECS,
-    )
-    .await?;
-    // Node-test pods are excluded from both queries above (their
-    // liveness is owned by the driving task executor), so they get
-    // their own orphan predicate: a non-terminal node-test row whose
-    // owning task is gone, or terminal past a full claim duration,
-    // means the executor's cleanup failed partway and nothing will
-    // re-run it. A live task, or one terminal for less than a claim
-    // duration (its finishing claim may still be cleaning up), keeps
-    // the row protected.
-    let orphaned_node_tests = weft_task_store::worker_pod::list_orphaned_node_test(
-        &state.pg_pool,
-        now - weft_task_store::claim_duration_secs(),
-    )
-    .await?;
-    // All three sets reap through the same path; a dead row is not
-    // re-listed by any query, so each is reaped once.
-    for (reason, row) in stale
-        .into_iter()
-        .map(|r| ("stale heartbeat", r))
-        .chain(
-            stuck_spawning
-                .into_iter()
-                .map(|r| ("spawning past boot deadline, never registered alive", r)),
-        )
-        .chain(
-            orphaned_node_tests
-                .into_iter()
-                .map(|r| ("node-test row outlived its owning task", r)),
-        )
-    {
-        reap_worker_pod(&state, &row, reason).await?;
-    }
-    Ok(())
-}
-
 /// Clear what removed projects left behind: the work queued for their
-/// workers, the workers themselves, and the signals a listener still
-/// holds for them (a registration no project can fire or take down).
-/// None of it can do anything once the project row is gone: the broker
-/// refuses a pod whose project it cannot find, so a worker started for
-/// it crashes at boot, and a pending task would keep asking for one. `weft rm` runs this as soon as the row is
-/// gone; the loop catches work queued in the moment of the removal.
-/// Node-test pods are left alone: their scratch project is never a row,
-/// and the node-test sweep owns them.
+/// workers, and the signals the listener still holds for them (a
+/// registration no project can fire or take down). None of it can do
+/// anything once the project row is gone. `weft rm` runs this as soon as
+/// the row is gone; the loop catches work queued in the moment of the
+/// removal.
 pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::Result<()> {
     let dropped = drop_work_of_removed_projects(&state.pg_pool).await?;
     if dropped > 0 {
@@ -350,9 +225,6 @@ pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::R
             "dropped work queued for removed projects"
         );
     }
-    for row in workers_of_removed_projects(&state.pg_pool).await? {
-        reap_worker_pod(state, &row, "its project was removed").await?;
-    }
     let signals = crate::journal::postgres::remove_signals_of_removed_projects(&state.pg_pool).await?;
     if !signals.is_empty() {
         tracing::warn!(
@@ -360,7 +232,7 @@ pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::R
             removed = signals.len(),
             "removed the signals of projects that no longer exist"
         );
-        state.listeners.unregister_many(&state.pg_pool, &signals).await;
+        state.listener.unregister_many(&signals).await;
     }
     Ok(())
 }
@@ -378,93 +250,40 @@ pub async fn drop_work_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Resul
     .rows_affected())
 }
 
-/// The spawning or alive worker pods of projects that no longer exist.
-pub async fn workers_of_removed_projects(
-    pool: &sqlx::PgPool,
-) -> anyhow::Result<Vec<weft_task_store::worker_pod::WorkerPodRow>> {
-    let rows: Vec<(String, uuid::Uuid, String, i64, i64)> = sqlx::query_as(
-        "SELECT wp.pod_name, wp.project_id, wp.namespace, wp.last_heartbeat_unix, wp.created_at_unix \
-         FROM worker_pod wp \
-         WHERE wp.status IN ('spawning', 'alive') AND wp.role = 'worker' \
-           AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = wp.project_id)",
+/// Run one sweep while holding the reaper's install-wide lock, or skip
+/// it (`None`) while a sibling replica holds it.
+async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    crate::lease::with_advisory_lock(
+        &state.pg_pool,
+        crate::lease::advisory_key(crate::lease::REAPER_DOMAIN, name),
+        sweep,
     )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(pod_name, project_id, namespace, last_heartbeat_unix, created_at_unix)| {
-            weft_task_store::worker_pod::WorkerPodRow {
-                pod_name,
-                project_id,
-                namespace,
-                last_heartbeat_unix,
-                created_at_unix,
-            }
-        })
-        .collect())
-}
-
-/// Mark a worker pod dead + delete it. Shared by the stale-alive
-/// and failed-spawning paths. A dead row is no longer re-listed by either
-/// query, so each pod is reaped exactly once. Does NOT recover the pod's
-/// stranded tasks (that is `sweep_orphaned_tasks`' job, a self-healing
-/// task-driven sweep; doing it here would run at most once and strand
-/// anything that failed).
-async fn reap_worker_pod(
-    state: &DispatcherState,
-    row: &weft_task_store::worker_pod::WorkerPodRow,
-    reason: &str,
-) -> anyhow::Result<()> {
-    tracing::warn!(
-        target: "weft_dispatcher::reaper",
-        project = %row.project_id,
-        pod = %row.pod_name,
-        last_heartbeat = row.last_heartbeat_unix,
-        reason,
-        "marking failed pod dead"
-    );
-    weft_task_store::worker_pod::mark_dead(&state.pg_pool, &row.pod_name).await?;
-    // Delete the Pod: log loudly on error. A failed kill leaves the pod
-    // alive in k8s while our DB says dead, which means a stale pod can
-    // keep running. Not fatal to the sweep (the next tick retries), but
-    // never silent.
-    if let Err(e) = state
-        .workers
-        .kill_pod(row.pod_name.clone(), row.namespace.clone())
-        .await
-    {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            pod = %row.pod_name,
-            error = %e,
-            "kill_pod failed for failed worker; pod may survive in k8s until next sweep"
-        );
-    }
-    Ok(())
+    .await
 }
 
 /// Stuck-transition reaper: the crash-recovery half of the project
 /// transitional-state model. A transition driven in-process by one
-/// dispatcher Pod (an activation window, a build) carries
+/// dispatcher copy (an activation window, a build) carries
 /// a heartbeat the driver bumps; when the driver dies, the heartbeat
 /// goes stale and this sweep repairs the row per-transition,
-/// status-guarded (safe under N Pods; a live driver's row is never
+/// status-guarded (safe under N copies; a live driver's row is never
 /// touched because its heartbeat is fresh):
 ///
 ///   - an activation stuck `activating` -> the same wipe the activate
 ///     rollback / cancel-activate performs (end the claim + cancel the
-///     leaked TriggerSetup color + drop half-registered signals).
+///     leaked TriggerSetup execution + drop half-registered signals).
 ///   - stuck `building` / `cancelling_build` -> clear the marker; the
-///     builder job died with its pod (or keeps running harmlessly to
+///     build died with its dispatcher (or keeps running harmlessly to
 ///     a content-addressed tag); the next verb rebuilds or cache-hits.
 ///   - `deactivating` -> re-drive the drain-watcher CAS: a
 ///     deactivation whose terminal events were missed (dispatcher
 ///     restart between the last execution finishing and the CAS)
 ///     lands at Inactive here. No heartbeat needed: the check itself
 ///     is idempotent and cheap.
-///
-/// This replaces the old constructor-time blind bulk downgrade, which
-/// reset live status for every tenant's projects on any Pod boot.
 async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
     for stuck in state.projects.list_stuck_transitions(stale_before).await? {
@@ -482,13 +301,13 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
         tracing::warn!(
             target: "weft_dispatcher::reaper",
             project_id = %stuck.project_id,
-            activation = %stuck.color,
+            activation = %stuck.execution_id,
             "activation orphaned (driver heartbeat stale); wiping activating state"
         );
         if let Err((code, msg)) = crate::api::project::wipe_activating_state(
             &state,
             stuck.project_id,
-            stuck.color,
+            stuck.execution_id,
             // The activation's driver died mid-transition and this sweep
             // is repairing the row; nothing superseded the run and no
             // person stopped it.
@@ -557,44 +376,36 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Self-healing recovery of tasks stranded on a non-routable worker pod. Runs
-/// on a timer, INDEPENDENT of how a pod became dead (stale heartbeat, stale-
-/// image replacement, crash). A live-execute task pinned to a dead pod cannot
-/// re-run (its caller was gateway-routed to that exact pod), so its execution
-/// is terminally cancelled; every other stranded task is requeued. The task
-/// row is the durable retry handle: anything not fully recovered this tick is
-/// re-found next tick. See `tasks::reclaim_orphaned_tasks`.
-async fn sweep_orphaned_tasks(state: DispatcherState) -> anyhow::Result<()> {
-    let orphans = weft_task_store::tasks::reclaim_orphaned_tasks(&state.pg_pool).await?;
+/// Live executions whose worker went away (`tasks::orphaned_live_executions`):
+/// the caller was on THAT worker's connection, so the run cannot resume
+/// anywhere else, and its execution is terminally cancelled. The task row
+/// is the durable retry handle: anything not fully recovered this tick is
+/// re-found next tick.
+async fn sweep_orphaned_live_executions(state: DispatcherState) -> anyhow::Result<()> {
+    let orphans = weft_task_store::tasks::orphaned_live_executions(&state.pg_pool).await?;
     for orphan in orphans {
-        let Ok(color) = orphan.color.parse::<weft_core::Color>() else {
-            // Corrupt color: leave the task as evidence, surface loud.
+        let Ok(execution_id) = orphan.execution_id.parse::<weft_core::ExecutionId>() else {
+            // Corrupt execution: leave the task as evidence, surface loud.
             tracing::error!(
                 target: "weft_dispatcher::reaper",
-                color = %orphan.color, task = %orphan.task_id,
-                "orphaned live execution has an unparseable color; leaving its task for inspection"
+                execution_id = %orphan.execution_id, task = %orphan.task_id,
+                "orphaned live execution has an unparseable execution; leaving its task for inspection"
             );
             continue;
         };
         // Record the cancel through THE cancel, THEN delete the task. It
-        // (a) SKIPS the terminal if one already exists for the color, which
-        // closes the race where the worker wrote `ExecutionCompleted`/
-        // `Failed` and then the pod died before its task flipped to
-        // `complete` (a bare `ExecutionCancelled` would stack a second,
-        // contradictory terminal); (b) writes `NodeCancelled` per
-        // still-running node so node UI state is not left stuck on
-        // "running"; and (c) queues no task, since the owner pod is dead.
-        // The task row is the durable retry handle: on failure we `continue`
-        // WITHOUT deleting, so the next tick re-finds this orphan and retries
-        // (the write is idempotent). A per-orphan failure never strands the
-        // others.
-        if let Err(e) = crate::api::execution::cancel_color(
+        // skips the terminal if one already exists for the execution (the
+        // worker wrote its ending, then died before its task flipped),
+        // writes `NodeCancelled` per still-running node, and queues no
+        // task. On failure the task stays, so the next tick retries (the
+        // write is idempotent).
+        if let Err(e) = crate::api::execution::cancel_execution_id(
             &state,
-            color,
+            execution_id,
             &weft_core::exec::CancelCause::Runtime {
-                detail: "worker pod died before the live execution completed; the caller \
-                         connection was routed to that pod and is gone, so the run cannot \
-                         resume elsewhere"
+                detail: "the worker running this live execution went away before it completed; the \
+                         caller's connection was on that worker and is gone, so the run cannot resume \
+                         elsewhere"
                     .into(),
             },
         )
@@ -602,71 +413,25 @@ async fn sweep_orphaned_tasks(state: DispatcherState) -> anyhow::Result<()> {
         {
             tracing::warn!(
                 target: "weft_dispatcher::reaper",
-                color = %color, error = %e,
+                execution_id = %execution_id, error = %e,
                 "failed to record cancel terminal for orphan; task kept, will retry next tick"
             );
             continue;
         }
         tracing::warn!(
             target: "weft_dispatcher::reaper",
-            color = %color,
-            "live execution orphaned by a dead pod; recorded ExecutionCancelled (caller is gone)"
+            execution_id = %execution_id,
+            "live execution orphaned by a worker that went away; recorded ExecutionCancelled (caller is gone)"
         );
         if let Err(e) = weft_task_store::tasks::delete_task(&state.pg_pool, orphan.task_id).await {
-            // The cancel is durably recorded, so a leftover task only means a
-            // harmless retry next tick (re-record is a no-op).
+            // The cancel is durably recorded, so a leftover task only means
+            // a harmless retry next tick (re-record is a no-op).
             tracing::warn!(
                 target: "weft_dispatcher::reaper",
-                color = %color, error = %e,
+                execution_id = %execution_id, error = %e,
                 "failed to delete cancelled orphan task; harmless, next tick retries"
             );
         }
-    }
-    Ok(())
-}
-
-/// Worker-pod GC. Every 30s, delete the k8s Pod object for
-/// worker_pod rows in a terminal status (`done` from an idle
-/// self-exit, `dead` from the stale-heartbeat reaper above) older
-/// than the grace window, then drop the row. Driven off the
-/// `worker_pod` table (the single source of truth), NOT a
-/// cluster listing: the namespace comes from the row itself
-/// (`row.namespace`), so there is no namespace-mapper guessing,
-/// and the whole thing fakes through `state.kube` for tests.
-///
-/// `dead` rows were already `kill_pod`'d by `sweep_worker_pods`
-/// (which deletes the Pod), but a kill that failed there leaves the
-/// row `dead` with the Pod still around; this GC retries the delete
-/// idempotently and finally drops the row.
-async fn sweep_terminal_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
-    let threshold = crate::lease::now_unix() - TERMINAL_POD_GRACE_SECS;
-    let terminal = weft_task_store::list_terminal(&state.pg_pool, threshold).await?;
-    for row in terminal {
-        // Delete via the shared trait, not waiting: the GC loop
-        // shouldn't block on a slow delete. Idempotent (a delete of
-        // a missing object is success), so a Pod
-        // already gone (e.g. clean-exit pod k8s never recreated) is
-        // fine; we still drop the row.
-        if let Err(e) = state
-            .kube
-            .delete_named(
-                &row.namespace,
-                weft_platform_traits::kube::NamedKind::Pod,
-                &row.pod_name,
-                weft_platform_traits::DeleteOpts::no_wait(),
-            )
-            .await
-        {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                pod = %row.pod_name,
-                namespace = %row.namespace,
-                error = %e,
-                "terminal worker pod delete failed; will retry next tick (row kept)"
-            );
-            continue;
-        }
-        weft_task_store::delete_row(&state.pg_pool, &row.pod_name).await?;
     }
     Ok(())
 }
@@ -683,154 +448,6 @@ async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Listener reaper. Every 30s, reap every pooled listener pod holding
-/// ZERO signals (per-pod idle reap). `ListenerPool::reap_idle` scans
-/// the `listener_pod` registry, claims each idle pod (ownership + lease
-/// so two dispatchers do not both reap one), tears it down, and deletes
-/// its registry row. A pod holding even one signal is kept.
-async fn sweep_listeners(state: DispatcherState) -> anyhow::Result<()> {
-    state
-        .listeners
-        .reap_idle(
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-}
-
-/// Listener scale-DOWN. Every 60s (slower than the idle reap so the two
-/// do not fight), drain AT MOST ONE pod whose signals fit on the other
-/// non-saturated pods' headroom: re-place its signals elsewhere, then
-/// reap the emptied pod. The twin of spawn-on-saturation; the idle reap
-/// only catches already-empty pods, this actively consolidates a
-/// partially-loaded pool when load dropped.
-async fn sweep_listener_scaledown(state: DispatcherState) -> anyhow::Result<()> {
-    state
-        .listeners
-        .drain_one(
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-}
-
-/// Supervisor pool reconciliation. Every 30s: drop ghost project leases,
-/// re-seed an EMPTY pool when lifecycle commands sit pending (a command
-/// can be issued after the spawn site already ran, see
-/// `SupervisorPool::reconcile`), and otherwise reap every pooled
-/// supervisor pod that owns ZERO projects (the supervisor twin of the
-/// listener idle reaper). A pod owning even one project is reconciling
-/// that infra and is kept; when no infra exists globally and no command
-/// is pending, the pool drains to zero (cold-start is covered by
-/// `ensure_at_least_one` on the next sync). Ownership plus pending
-/// commands, not a separate node-count check, is what keeps a busy
-/// supervisor alive.
-async fn sweep_supervisors(state: DispatcherState) -> anyhow::Result<()> {
-    state
-        .supervisors
-        .reconcile(
-            state.supervisor_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-}
-
-/// Supervisor scale-DOWN. Every 60s (slower than the idle reap so the
-/// two do not fight), drain AT MOST ONE supervisor whose owned projects
-/// fit on the other pods' headroom: release its project leases for the
-/// survivors' claim loops to adopt, then reap the emptied pod. The twin
-/// of spawn-on-saturation; the idle reap only catches pods that already
-/// own nothing, this actively consolidates a partially-loaded pool when
-/// load dropped.
-async fn sweep_supervisor_scaledown(state: DispatcherState) -> anyhow::Result<()> {
-    state
-        .supervisors
-        .drain_one(
-            state.supervisor_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-        )
-        .await
-}
-
-/// Worker scale-DOWN. Per project running more than one worker, ask the
-/// shared `plan_memory_scaledown` whether the pool has excess memory
-/// headroom, and if so mark ONE worker draining. A draining worker stops
-/// being chosen for NEW executions (`pick_admittable_for_project` and
-/// cold_start both skip draining pods) while its in-flight executions
-/// finish; it then idle-exits itself via the normal `mark_done_if_idle`
-/// CAS and the worker-pod reaper GCs it.
-///
-/// Unlike the supervisor drain there is NO lease release and NO work
-/// hand-off: a running execution is bound to the worker driving it (one
-/// journal stream per color), so consolidation here is purely "stop
-/// admitting new work to the most-drainable pod and let it empty." That
-/// is also why we mark at most one per project per tick: draining frees
-/// memory only as the pod's executions complete, so the planner should
-/// re-measure real pressure before shedding the next.
-///
-/// Serialized cluster-wide by the shared scale-down advisory lock so two
-/// dispatchers don't both drain workers of the same project; a sibling
-/// holding the lock simply skips this tick.
-///
-/// Also emits a breadcrumb for every pod currently draining (elapsed +
-/// remaining in-flight work). A drain has no deadline (a live execution
-/// may legitimately run for hours/days, and we never time out a user's
-/// program), so a pod can sit draining a long time; the breadcrumb keeps
-/// that legible instead of silent, per the long-running-operation rule.
-async fn sweep_worker_scaledown(state: DispatcherState) -> anyhow::Result<()> {
-    crate::lease::with_scaledown_lock(&state.pg_pool, "worker", || async {
-        // Breadcrumb pass: surface every still-draining pod. Runs under
-        // the same lock (one dispatcher logs per tick, no duplicate
-        // spam) and before planning so a pod that has been draining
-        // since a prior tick is reported even if no new drain happens.
-        let now = crate::lease::now_unix();
-        for crumb in weft_task_store::worker_pod::draining_breadcrumbs(&state.pg_pool, now).await? {
-            tracing::info!(
-                target: "weft_dispatcher::reaper",
-                project = %crumb.project_id,
-                pod = %crumb.pod_name,
-                draining_for_secs = now.saturating_sub(crumb.drained_at_unix),
-                in_flight_tasks = crumb.in_flight_tasks,
-                promised_to_a_caller = crumb.promised,
-                "worker still draining (no deadline; it exits when the work it holds lands)"
-            );
-        }
-        let projects =
-            weft_task_store::worker_pod::projects_with_multiple_workers(&state.pg_pool).await?;
-        for project_id in projects {
-            let loads: Vec<weft_platform_traits::PoolPodLoad> =
-                weft_task_store::worker_pod::pod_loads_for_project(&state.pg_pool, project_id)
-                    .await?
-                    .into_iter()
-                    .map(|(pod_name, mem_pressure)| weft_platform_traits::PoolPodLoad {
-                        pod_name,
-                        mem_pressure,
-                    })
-                    .collect();
-            let Some(target) = weft_platform_traits::plan_memory_scaledown(
-                &loads,
-                weft_platform_traits::SATURATION_MEM_FRACTION,
-            ) else {
-                continue;
-            };
-            weft_task_store::worker_pod::set_draining(&state.pg_pool, &target).await?;
-            tracing::info!(
-                target: "weft_dispatcher::reaper",
-                project = %project_id,
-                drain_target = %target,
-                "worker scale-down: marked worker draining; it will finish in-flight work and idle-exit"
-            );
-        }
-        Ok(())
-    })
-    .await
-    .map(|_| ())
 }
 
 #[cfg(test)]

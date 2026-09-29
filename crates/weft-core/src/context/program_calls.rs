@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::activation::ActivationScope;
 use crate::error::{WeftError, WeftResult};
 use crate::member::MemberId;
-use crate::infra::InfraNodeStatus;
+use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::member_door::ValuesChanged;
 use crate::program::{
     CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, InfraCopy, InfraStartAnswer, MemberHoldings, MintedMemberToken,
@@ -30,7 +30,7 @@ use crate::program::{
 use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::signal::timer::{Timer, TimerSpec};
 use crate::tag::StopSelf;
-use crate::Color;
+use crate::ExecutionId;
 
 use super::ExecutionContext;
 
@@ -212,10 +212,22 @@ impl InfraCalls<'_> {
         self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
     }
 
-    /// Delete the copy and its disk. Same `spec` and `stop_self` as
-    /// [`Self::stop`].
+    /// Delete the copy and its disks, keeping the ones its node lists in
+    /// `keepOnTerminate` (a later start of the same copy finds them
+    /// again). Same `spec` and `stop_self` as [`Self::stop`].
     pub async fn terminate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
-        let call = ProgramCall::InfraTerminate { node: self.node, member: member_id(&self.member)?, spec };
+        self.take_away(spec, stop_self, TerminateDisks::KeepListed).await
+    }
+
+    /// Delete the copy and every one of its disks, the ones listed in
+    /// `keepOnTerminate` too: the copy's owner is going for good (a
+    /// member being wiped). Same `spec` and `stop_self` as [`Self::stop`].
+    pub async fn wipe(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
+        self.take_away(spec, stop_self, TerminateDisks::DeleteAll).await
+    }
+
+    async fn take_away(self, spec: DeactivateSpec, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<()> {
+        let call = ProgramCall::InfraTerminate { node: self.node, member: member_id(&self.member)?, spec, disks };
         self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
     }
 
@@ -425,9 +437,9 @@ impl CostQuery<'_> {
         self
     }
 
-    /// Costs of one run (`ctx.color` for this one).
-    pub fn run(mut self, color: Color) -> Self {
-        self.filter.run = Some(color);
+    /// Costs of one run (`ctx.execution_id` for this one).
+    pub fn run(mut self, execution_id: ExecutionId) -> Self {
+        self.filter.run = Some(execution_id);
         self
     }
 

@@ -5,8 +5,10 @@
 //!     implementing `KindHandler`.
 //!   - parses the spec's opaque `config` blob into the kind's typed
 //!     struct from `weft_core::signal`.
-//!   - owns its own background task (timer schedule, SSE connect),
-//!     `process`, `render` and `compute_routing`.
+//!   - says what it needs between fires (`between_fires`), and owns
+//!     what that takes: its wakes (a timer, a poll), or the connection
+//!     it holds (an SSE feed, a socket); plus `process`, `render` and
+//!     `compute_routing`.
 //!   - registers itself with the inventory at the bottom of the file.
 //!
 //! Not every file here is a kind: `event_source.rs` is shared machinery
@@ -17,17 +19,15 @@
 //! file in `weft_core::signal`. The framework discovers it via the
 //! inventory at startup; no central match, no enum.
 //!
-//! Top-level helpers in this file (`register_spec`, `process`,
-//! `render`, `compute_routing`, etc.) look up the kind by tag and
+//! Top-level helpers in this file (`prepare_signal`, `bring_up`,
+//! `process`, `wake`, etc.) look up the kind by tag and
 //! delegate. They never know about specific kinds.
 //!
 //! Conventions enforced by the dispatch helpers below:
-//!   - Stateful kinds (Timer, SSE) raise their own fires internally
-//!     (a tick / an SSE event) and enqueue a `FireSignal` task via the
-//!     broker; the dispatcher picker runs it back through `/process`,
-//!     where the kind's `process_entry` routes it to
-//!     `ProcessTarget::Entry`. (An unknown token still returns Drop;
-//!     that's the genuine "no signal here" case.)
+//!   - Kinds that raise their own fires (a timer's tick, an SSE event)
+//!     enqueue a `FireSignal` task via the broker; the dispatcher picker
+//!     runs it back through `/process`, where the kind's
+//!     `process_entry` routes it to `ProcessTarget::Entry`.
 //!   - Resume signals (`is_resume = true`) always route to
 //!     `ProcessTarget::Resume`; the kind's `process` impl is only
 //!     consulted for entry-mode (`is_resume = false`).
@@ -55,29 +55,23 @@ use parking_lot::Mutex;
 
 use crate::config::ListenerConfig;
 use crate::event_context::FireContext;
-use crate::fire_sink::FireSignalSink;
-use weft_core::signal::listener_protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent};
-use crate::registry::{RegisteredSignal, Registry, ServingState, TaskGuard, Transport};
+use weft_core::signal::listener_protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent, StartMode};
+use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 
-/// Everything a kind's background task is spawned with, bundled: the
+/// Everything a kind's work on one signal runs with, bundled: the
 /// per-signal identity + fire plumbing (as a ready [`FireContext`],
-/// which carries the spec-level pre-fire filter), the listener
-/// config, the broker's event-serving client, and whether this is a
-/// FRESH registration (a fresh one may make broker calls and refuse
-/// activation loudly; a rehydrate must come up and let its task
-/// retry, or one unreachable broker at boot would fail the whole
-/// rebuild).
+/// which carries the spec-level pre-fire filter), the listener config,
+/// the broker's event-serving client, and whether this is a FRESH
+/// registration (a fresh one may make broker calls and refuse
+/// activation loudly; a restore must come up and let its task retry, or
+/// one unreachable broker at boot would fail the whole rebuild). Handed
+/// to a held connection's task at spawn and to a wake.
 #[derive(Clone)]
 pub struct SpawnCtx {
     pub fire: FireContext,
     pub config: Arc<ListenerConfig>,
     pub events_broker: Arc<weft_broker_client::BrokerEventsClient>,
     pub fresh: bool,
-    /// The kind_state write-fence version the spawned task starts
-    /// from: its durable cursor writes continue at `state_seq + 1`.
-    /// Carried OUTSIDE the state blob so no handling of the kind's
-    /// own state can ever lose the fence version.
-    pub state_seq: i64,
     /// The signal's live serving state, shared with the registry
     /// entry so status a serving task writes lands where the node's
     /// display reads it.
@@ -98,6 +92,46 @@ pub struct LiveCtx<'a> {
     pub address: Option<&'a str>,
 }
 
+/// What a kind needs between two fires. It decides where the kind can
+/// run: a listener that scales to zero keeps nothing in memory between
+/// calls, so it serves `Called` and `Wakes` kinds and refuses `Holds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BetweenFires {
+    /// Nothing runs between fires; the outside calls in (a route, a
+    /// form).
+    Called,
+    /// Wants waking at times ([`KindHandler::next_wake`]); each wake is
+    /// handed to the platform's `Alarm`, which calls the listener back
+    /// ([`KindHandler::on_wake`]).
+    Wakes,
+    /// Keeps a connection to the outside open
+    /// ([`KindHandler::spawn_task`]). Needs a listener that stays up: the
+    /// one on the machine.
+    Holds,
+}
+
+/// Why a `Wakes` kind is asked for its next wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeFrom {
+    /// A fresh registration or a restore: arming the first wake.
+    Armed,
+    /// A wake aimed at `aimed_at_ms` was just handled.
+    Woken { aimed_at_ms: i64 },
+}
+
+/// One wake as a kind handles it.
+#[derive(Debug, Clone)]
+pub struct Woken {
+    /// The moment this wake was set for.
+    pub aimed_at_ms: i64,
+    /// When it actually arrived.
+    pub now_ms: i64,
+    /// The signal's durable state as read just now, and the write-fence
+    /// version it is at.
+    pub state: Value,
+    pub seq: i64,
+}
+
 /// Per-kind handler. One unit struct per kind, registered with the
 /// inventory below. Methods take typed config blobs from the spec;
 /// each handler parses what it needs and ignores the rest.
@@ -107,6 +141,30 @@ pub trait KindHandler: Send + Sync {
     /// `Signal::TAG` constant on the corresponding data struct in
     /// `weft_core::signal`.
     fn tag(&self) -> &'static str;
+
+    /// What this kind needs between fires. Required, so a new kind does
+    /// not compile until its author has answered.
+    fn between_fires(&self) -> BetweenFires;
+
+    /// For a `Wakes` kind: the next moment it wants waking (unix ms), or
+    /// `None` when it has nothing left to wait for (a one-shot that
+    /// fired). Computed from the spec and the durable state alone, and
+    /// the SAME moment for every caller asking within one slot, so
+    /// arming a signal twice (a registration and a rehydrate, two copies
+    /// of the listener) sets one wake, never two.
+    fn next_wake(&self, _spec: &SignalSpec, _state: &Value, _from: WakeFrom, _now_ms: i64) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// For a `Wakes` kind: handle one wake. A wake may arrive late,
+    /// twice, or after the thing it was set for changed, so the kind
+    /// recomputes from `woken.state` whether anything is due, CLAIMS the
+    /// moment through [`FireContext::claim_kind_state`] before acting (so
+    /// of two copies woken for it, one acts), fires through `ctx.fire`,
+    /// and answers the state it now stands at (for its next wake).
+    async fn on_wake(&self, _spec: &SignalSpec, _woken: Woken, _ctx: SpawnCtx) -> Result<Value> {
+        anyhow::bail!("the '{}' kind does not wake", self.tag())
+    }
 
     /// Compute the public routing (URL surface + auth gate config)
     /// for this signal. Called once at register time; the dispatcher
@@ -135,12 +193,13 @@ pub trait KindHandler: Send + Sync {
     /// `{}` for Cron/At since those are wall-clock-absolute).
     ///
     /// **Persistence policy**: what this returns replaces the stored
-    /// state, as long as it is not OLDER than what is there. The write
-    /// carries a sequence number and the row keeps the higher one
-    /// (`signal_insert`), so a registration that started before a live
-    /// task's own update cannot land on top of it and undo it. In the
-    /// ordinary case (a re-register on reactivate, with no task
-    /// running) there is nothing newer and this simply replaces.
+    /// state, and moves the row to a new version, only while the row is
+    /// still at the version `prior` was read at (`signal_insert` is a
+    /// compare-and-set). A wake that claimed a moment in between moved
+    /// the version, so the dispatcher reads the row again and asks
+    /// again; a wake claiming after the registration finds the version
+    /// moved and loses. Either way the registration's state is computed
+    /// from the state it replaces.
     ///
     /// `prior` is the previously-persisted state when the reused entry
     /// token already has a row (None on first registration). Timer
@@ -157,22 +216,22 @@ pub trait KindHandler: Send + Sync {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
-    /// Spawn any long-running task this kind needs (timer schedule,
-    /// SSE subscriber). Returns `Ok(None)` for passive kinds that
-    /// wait for an external HTTP fire (Form, live-caller). `Err` on
-    /// malformed spec (or, on a FRESH registration, an unserviceable
-    /// one) so register surfaces a 400 and activation fails loudly
-    /// instead of minting a dead trigger.
+    /// For a `Holds` kind: spawn the task that holds its connection
+    /// (an SSE subscriber, a socket). Every other kind keeps the default
+    /// `Ok(None)`. `Err` on malformed spec (or, on a FRESH registration,
+    /// an unserviceable one) so the start surfaces a 400 and activation
+    /// fails loudly instead of minting a dead trigger.
     ///
     /// `kind_state` is the opaque blob persisted on the row at
-    /// register time (or read back from the row on rehydrate).
-    /// Kinds interpret it however they need. Default is empty `{}`.
+    /// register time (or read back from the row on restore).
     async fn spawn_task(
         &self,
-        spec: &SignalSpec,
-        kind_state: &Value,
-        ctx: SpawnCtx,
-    ) -> Result<Option<JoinHandle<()>>>;
+        _spec: &SignalSpec,
+        _kind_state: &Value,
+        _ctx: SpawnCtx,
+    ) -> Result<Option<JoinHandle<()>>> {
+        Ok(None)
+    }
 
     /// Decide how a fire's payload routes for an entry-mode signal.
     /// `is_resume` signals never reach this method: top-level
@@ -284,74 +343,60 @@ fn handler_or_err(tag: &str) -> Result<&'static dyn KindHandler> {
 
 // ----- Public listener entrypoints (HTTP-driven) ---------------------
 
-/// What the routing and kind_state come from. `Fresh` is the register
-/// path: compute the routing and the initial kind_state from the spec,
-/// handing the kind the token's previously-persisted state (entry
-/// tokens are reused across reactivates) so cursor-bearing kinds carry
-/// it forward. `Restore` is the rehydrate / pod-move path: both values
-/// came back from the durable row, never recompute (the row is what
-/// the dispatcher routes by, and a fresh `compute_initial_state` would
-/// reset a Timer's clock).
-pub enum RoutingSource {
-    Fresh {
-        prior_kind_state: Option<Value>,
-        /// The write-fence version the prior state was read at.
-        prior_seq: i64,
-        /// When the registration was asked for (ms since the epoch).
-        asked_at_unix_ms: i64,
-    },
-    Restore {
-        routing: SignalRouting,
-        kind_state: Value,
-        /// The row's `kind_state_seq` at restore time.
-        seq: i64,
-    },
-}
-
-/// The identity portion of one registered signal: everything the
-/// registry stores about WHO the signal is, as one named-field bundle
-/// so the two build sites (register, rehydrate) cannot transpose a
-/// positional argument.
+/// Who a new signal is, as the dispatcher names it: everything its row
+/// will say about it besides what the kind computes.
 pub struct SignalIdentity {
     pub token: String,
     pub tenant_id: String,
-    /// Whose signal it is (`None` for a shared one).
-    pub for_member: Option<weft_core::member::MemberScope>,
     pub node_id: String,
     /// True iff this is a mid-execution resume (HumanQuery, etc).
     pub is_resume: bool,
-    /// Color of the suspended execution to resume. Set iff `is_resume`.
-    pub color: Option<String>,
-    /// The placement generation under which this pod holds the signal.
-    pub placement_generation: i64,
+    /// Execution of the suspended execution to resume. Set iff `is_resume`.
+    pub execution_id: Option<String>,
     pub spec: SignalSpec,
 }
 
-/// Register a signal in the in-RAM registry. Single path for both
-/// register (fresh registration from the worker) and rehydrate (boot
-/// or post-deactivate reconciliation). Returns the routing and
-/// kind_state for the dispatcher to persist on the signal row; on
-/// the Restore path the returned values are the same ones that came
-/// in.
-pub async fn register_in_registry(
+/// What a kind computes for a new signal's row, from its spec alone.
+#[derive(Debug)]
+pub struct Prepared {
+    pub routing: SignalRouting,
+    pub kind_state: Value,
+    /// What a consumer needs to answer it (see [`KindHandler::render`]),
+    /// `None` for a kind nobody answers by hand.
+    pub rendered: Option<Value>,
+}
+
+/// Compute a new signal's row: its routing, its starting kind state and
+/// its rendered payload. Pure: nothing starts, nothing is held. The
+/// signal comes up with [`bring_up`] once the dispatcher has committed
+/// the row, so whatever it starts (a wake, a held connection) always
+/// finds its row.
+///
+/// `prior_kind_state` is the state the row already holds when the token
+/// is reused (an entry across reactivates), so a kind whose state is a
+/// feed cursor carries it forward instead of re-priming.
+/// `asked_at_unix_ms` is when the registration was asked for.
+pub fn prepare_signal(
+    state: &crate::ListenerState,
     identity: SignalIdentity,
-    source: RoutingSource,
-    registry: Arc<Registry>,
-    sink: FireSignalSink,
-    config: Arc<ListenerConfig>,
-    events_broker: Arc<weft_broker_client::BrokerEventsClient>,
-) -> Result<(SignalRouting, Value)> {
-    let SignalIdentity {
-        token,
-        tenant_id,
-        for_member,
-        node_id,
-        is_resume,
-        color,
-        placement_generation,
-        spec,
-    } = identity;
+    prior_kind_state: Option<&Value>,
+    asked_at_unix_ms: i64,
+) -> Result<Prepared> {
+    let SignalIdentity { token, tenant_id, node_id, is_resume, execution_id, spec } = identity;
     let handler = handler_or_err(&spec.kind)?;
+    // Refused at the earliest place that can see it: a listener that
+    // scales to zero keeps nothing running between calls.
+    if handler.between_fires() == BetweenFires::Holds
+        && state.config.placement == weft_platform_traits::Placement::Serverless
+    {
+        anyhow::bail!(
+            "a '{}' signal keeps a connection open between fires, and this install runs its \
+             listener serverless (`roles.listener: serverless` in the install config), where \
+             nothing stays up between calls. Place the listener on the machine \
+             (`roles.listener: machine`) to use it",
+            spec.kind,
+        );
+    }
     // A resume wait fed by broad account-routed pushes must pin
     // itself with a predicate (its minted correlation id): with none,
     // ANY push on the connection's topic would resume it.
@@ -363,96 +408,282 @@ pub async fn register_in_registry(
             spec.kind,
         );
     }
-    let fresh = matches!(source, RoutingSource::Fresh { .. });
-    let (routing, kind_state_owned, state_seq) = match source {
-        RoutingSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
-            let r = handler.compute_routing(&spec)?;
-            let s = handler.compute_initial_state(&spec, prior_kind_state.as_ref(), asked_at_unix_ms)?;
-            (r, s, prior_seq)
-        }
-        RoutingSource::Restore { routing, kind_state, seq } => (routing, kind_state, seq),
+    let routing = handler.compute_routing(&spec)?;
+    let kind_state = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms)?;
+    let signal = RegisteredSignal {
+        spec,
+        node_id,
+        tenant_id,
+        is_resume,
+        execution_id,
+        task: None,
+        kind_state: Some(kind_state.clone()),
+        routing: routing.clone(),
+        serving: Arc::default(),
     };
-    // The held-event loops (Timer, SSE, poll, socket) capture the
-    // signal's tenant AND its placement generation so the fire they
-    // enqueue is stamped with both. The pod has no single tenant, so
-    // tenant travels with the signal; the generation lets the broker
-    // fence a stale old-pod fire during a scale-down move overlap.
-    // The FireContext also carries the spec-level pre-fire filter, so
-    // every kind's events pass the same gate.
-    let serving = Arc::new(Mutex::new(ServingState::default()));
-    let ctx = SpawnCtx {
+    let rendered = handler.render(&token, &signal)?;
+    Ok(Prepared { routing, kind_state, rendered })
+}
+
+/// Bring a held row up: a kind that holds a connection gets its task
+/// started and its registry entry, after one already running under the
+/// token is stopped ([`stop_held`]); a kind that wakes gets its next
+/// wake set (setting it twice is one wake, see
+/// [`KindHandler::next_wake`]); a kind the outside calls in to needs
+/// nothing.
+///
+/// Only a `Holds` kind is kept in the in-RAM registry: its task lives in
+/// this process, and such a kind only runs on the machine's single
+/// listener, which every unregister reaches. A `Called` or `Wakes` kind is
+/// never cached: any of several serverless copies may answer for it, and
+/// `/unregister` reaches one of them, so a cached copy elsewhere would keep
+/// routing a signal that is gone. Those kinds are read from their held row
+/// on every call ([`crate::registry::held`]).
+///
+/// `StartMode::New` is a signal the dispatcher just registered: the kind
+/// may then make broker calls and refuse loudly (see [`SpawnCtx::fresh`]).
+/// A restore (boot, rehydrate, first use) or a put-back (a row the
+/// dispatcher put back) comes up and lets its task retry.
+///
+/// Every caller goes through [`crate::registry::hold`], which makes the
+/// bring-up single-flight per token and lets go of a row deleted while it
+/// came up.
+pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::protocol::SignalRowWire, mode: StartMode) -> Result<()> {
+    let spec: SignalSpec = serde_json::from_str(&row.spec_json)
+        .map_err(|e| anyhow::anyhow!("malformed spec_json for signal {}: {e}", row.token))?;
+    let handler = handler_or_err(&spec.kind)?;
+    let fresh = mode.fresh();
+    match handler.between_fires() {
+        BetweenFires::Called => Ok(()),
+        BetweenFires::Wakes => arm_next_wake(state, handler, &row.token, &spec, &row.kind_state, WakeFrom::Armed).await,
+        BetweenFires::Holds => {
+            let routing = row.to_routing().map_err(|e| anyhow::anyhow!("to_routing for signal {}: {e}", row.token))?;
+            // What already runs under the token stops, teardown included,
+            // BEFORE the new task starts: an outside teardown is keyed by
+            // the token (a provider subscription is dropped by it), so run
+            // after the new task subscribed it would drop the new one.
+            stop_held(state, &row.token).await;
+            let serving = Arc::new(Mutex::new(ServingState::default()));
+            let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_member.clone(), &spec, fresh, serving.clone());
+            let Some(task) = handler.spawn_task(&spec, &row.kind_state, ctx).await? else {
+                anyhow::bail!(
+                    "the '{}' kind holds a connection but started no task; its `between_fires` \
+                     and its `spawn_task` disagree",
+                    spec.kind,
+                );
+            };
+            state.registry.insert(
+                row.token,
+                RegisteredSignal {
+                    spec,
+                    node_id: row.node_id,
+                    tenant_id: row.tenant_id,
+                    is_resume: row.is_resume,
+                    execution_id: row.execution_id,
+                    task: Some(Arc::new(TaskGuard::new(task))),
+                    kind_state: None,
+                    routing,
+                    serving,
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Stop holding `token`: drop its registry entry (which aborts its task)
+/// and have its kind tear down what it holds outside this process (a
+/// provider-side subscription), detached and loud in logs on failure. A
+/// wake still set for it finds no row and does nothing.
+///
+/// The teardown runs under the token's bring-up guard (the one
+/// [`crate::registry::hold`] takes), so a bring-up of the same token that
+/// comes after this call waits for it: the teardown is keyed by the
+/// token, and run after the new task subscribed it would drop the new
+/// subscription. The guard is taken synchronously when free, which is the
+/// case for an unregister; when a bring-up of this token holds it (a row
+/// found gone while it came up), the teardown queues behind that one.
+pub fn forget(state: &crate::ListenerState, token: &str) {
+    state.registry.clear_down(token);
+    let teardown = stop_held(state, token);
+    let registry = state.registry.clone();
+    let token = token.to_string();
+    let guard = registry.bring_up_guard(&token);
+    let taken = guard.clone().try_lock_owned();
+    tokio::spawn(async move {
+        let held = match taken {
+            Ok(held) => held,
+            Err(_) => guard.clone().lock_owned().await,
+        };
+        teardown.await;
+        drop(held);
+        drop(guard);
+        registry.release_bring_up_guard(&token);
+    });
+}
+
+/// Stop what runs under `token`: its entry leaves the registry at once,
+/// and the returned future aborts its task and has its kind tear down what
+/// it holds outside this process ([`on_unregister`]). Every path that ends
+/// or replaces a held entry goes through here, so no displaced entry skips
+/// its teardown and leaves, say, a provider subscription posting to it.
+pub fn stop_held(state: &crate::ListenerState, token: &str) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let displaced = state.registry.remove(token);
+    let broker = state.events_broker.clone();
+    let token = token.to_string();
+    async move {
+        let Some(mut sig) = displaced else { return };
+        // Our handle to the task goes first, so the loop is not left
+        // serving while its teardown talks to the provider.
+        drop(sig.task.take());
+        on_unregister(&token, &sig, &broker).await;
+    }
+}
+
+/// The context a kind's work on one signal runs with.
+#[allow(clippy::too_many_arguments)]
+fn spawn_ctx(
+    state: &crate::ListenerState,
+    token: &str,
+    tenant_id: &str,
+    for_member: Option<weft_core::member::MemberScope>,
+    spec: &SignalSpec,
+    fresh: bool,
+    serving: Arc<Mutex<ServingState>>,
+) -> SpawnCtx {
+    SpawnCtx {
         fire: FireContext::new(
-            sink.clone(),
-            token.clone(),
-            tenant_id.clone(),
+            state.fire_sink.clone(),
+            token.to_string(),
+            tenant_id.to_string(),
             for_member,
-            placement_generation,
             spec.match_predicates.clone(),
         ),
-        config: config.clone(),
-        events_broker,
+        config: state.config.clone(),
+        events_broker: state.events_broker.clone(),
         fresh,
-        state_seq,
-        serving: serving.clone(),
+        serving,
+    }
+}
+
+/// The path the alarm calls the listener back at.
+// SYNC: WAKE_PATH <-> crates/weft-listener/src/router.rs (the route)
+pub const WAKE_PATH: &str = "/wake";
+
+/// What a wake carries back.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WakeBody {
+    pub token: String,
+    /// The moment the kind asked to be woken at. Carried in the body
+    /// rather than read off the alarm's delivery time, because a platform
+    /// may deliver a far wake EARLY (Cloud Tasks cannot schedule past 30
+    /// days, so the GCP alarm sets the longest it can): a wake arriving
+    /// before this moment is set again for it and wakes nothing.
+    pub due_at_ms: i64,
+}
+
+/// How early a wake may arrive and still count as its moment: clocks on
+/// the alarm's side and on this one never agree to the millisecond, and a
+/// wake set again for a moment a hair away would be the same wake (same
+/// key, same time), which the platform drops as already set.
+const EARLY_WAKE_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Set a `Wakes` signal's next wake from its state, when it has one.
+pub async fn arm_next_wake(
+    state: &crate::ListenerState,
+    handler: &'static dyn KindHandler,
+    token: &str,
+    spec: &SignalSpec,
+    kind_state: &Value,
+    from: WakeFrom,
+) -> Result<()> {
+    let now_ms = now_unix_ms();
+    let Some(at) = handler.next_wake(spec, kind_state, from, now_ms)? else {
+        return Ok(());
     };
-    let task = handler
-        .spawn_task(&spec, &kind_state_owned, ctx)
-        .await?
-        .map(|h| Arc::new(TaskGuard::new(h)));
-    registry.insert(
-        token,
-        RegisteredSignal {
-            spec,
-            node_id,
-            tenant_id,
-            is_resume,
-            color,
-            placement_generation,
-            task,
-            routing: routing.clone(),
-            serving,
-        },
+    set_wake(state, token, at).await
+}
+
+async fn set_wake(state: &crate::ListenerState, token: &str, at_unix_ms: i64) -> Result<()> {
+    state
+        .alarm
+        .set(weft_platform_traits::Wake {
+            key: format!("signal:{token}"),
+            at_unix_ms,
+            role: weft_platform_traits::CoreRole::Listener,
+            path: WAKE_PATH.to_string(),
+            body: serde_json::to_value(WakeBody { token: token.to_string(), due_at_ms: at_unix_ms })?,
+        })
+        .await
+}
+
+/// Handle one wake: read the signal's durable row, let its kind act,
+/// set the next wake. A wake whose signal is gone does nothing (a wake is
+/// only ever set once its row is committed, see [`bring_up`], so no row
+/// means gone); one that arrived before its moment is set again for that
+/// moment. An error answers the alarm with a failure, and every alarm
+/// retries one.
+pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<()> {
+    let now_ms = now_unix_ms();
+    let aimed_at_ms = body.due_at_ms;
+    if aimed_at_ms - now_ms > EARLY_WAKE_TOLERANCE.as_millis() as i64 {
+        return set_wake(state, &body.token, aimed_at_ms).await;
+    }
+    let Some(row) = state.signals.get_held(&body.token).await? else {
+        tracing::debug!(target: "weft_listener::kinds", token = %body.token, "a wake for a signal that is gone; nothing to do");
+        return Ok(());
+    };
+    let spec: SignalSpec = serde_json::from_str(&row.spec_json)
+        .map_err(|e| anyhow::anyhow!("malformed spec_json for signal {}: {e}", row.token))?;
+    let handler = handler_or_err(&spec.kind)?;
+    anyhow::ensure!(
+        handler.between_fires() == BetweenFires::Wakes,
+        "a wake reached signal {} of the '{}' kind, which does not wake",
+        row.token,
+        spec.kind
     );
-    Ok((routing, kind_state_owned))
+    // A `Wakes` kind keeps nothing in this process between calls (see
+    // `bring_up`), so its serving slot lives for this one wake.
+    let serving = Arc::new(Mutex::new(ServingState::default()));
+    let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_member.clone(), &spec, false, serving);
+    let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq };
+    let after = handler.on_wake(&spec, woken, ctx).await?;
+    arm_next_wake(state, handler, &row.token, &spec, &after, WakeFrom::Woken { aimed_at_ms }).await
+}
+
+fn now_unix_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// Process one stateless fire. Resume signals route to the
-/// suspended color regardless of kind; entry signals delegate to
-/// the kind's `process_entry`. Unknown tokens return Drop.
-pub async fn process(
-    token: &str,
-    payload: Value,
-    registry: Arc<Registry>,
-) -> Result<ProcessOutcome> {
-    let Some(signal) = registry.get(token) else {
-        // This pod does not hold the signal. Almost always means the
-        // dispatcher routed here during a scale-down move (the signal was
-        // re-placed onto another pod). Return NotHeld so the dispatcher
-        // re-resolves the holder and retries, instead of silently
-        // dropping the fire.
+/// suspended execution regardless of kind; entry signals delegate to
+/// the kind's `process_entry`. A signal with no held row drops the fire,
+/// saying why.
+pub async fn process(state: &crate::ListenerState, token: &str, payload: Value) -> Result<ProcessOutcome> {
+    let Some(signal) = crate::registry::held(state, token).await? else {
         return Ok(ProcessOutcome {
             value: payload,
-            target: ProcessTarget::NotHeld,
+            target: ProcessTarget::Drop { reason: Some("no signal is held under this token".into()) },
         });
     };
 
     if signal.is_resume {
-        let Some(color) = signal.color.clone() else {
+        let Some(execution_id) = signal.execution_id.clone() else {
             tracing::warn!(
                 target: "weft_listener::kinds",
                 %token,
-                "is_resume signal has no color; dropping"
+                "is_resume signal has no execution; dropping"
             );
             return Ok(ProcessOutcome {
                 value: payload,
                 target: ProcessTarget::Drop {
-                    reason: Some("is_resume signal missing color".into()),
+                    reason: Some("is_resume signal missing execution".into()),
                 },
             });
         };
         return Ok(ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Resume { color },
+            target: ProcessTarget::Resume { execution_id },
         });
     }
 
@@ -460,16 +691,20 @@ pub async fn process(
     Ok(handler.process_entry(&signal, payload))
 }
 
-/// What a signal held here wakes with when a person wakes it by hand.
+/// What a held signal wakes with when a person wakes it by hand.
 ///
 /// `Ok(None)` is a real answer: the kind cannot be woken that way, and
 /// whoever asked should say so rather than invent a payload. An unknown
-/// token is an error, because the caller resolved this pod as the holder
-/// and a token that is not here means the two disagree.
-pub fn wake_by_hand(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
-    let signal = registry
-        .get(token)
+/// token is an error: the caller read the signal's row a moment ago.
+pub async fn wake_by_hand(state: &crate::ListenerState, token: &str) -> Result<Option<Value>> {
+    let signal = crate::registry::held(state, token)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("unknown token: {token}"))?;
+    hand_wake_payload(&signal)
+}
+
+/// [`wake_by_hand`] for a signal already in hand.
+fn hand_wake_payload(signal: &RegisteredSignal) -> Result<Option<Value>> {
     Ok(handler_or_err(&signal.spec.kind)?.wake_by_hand())
 }
 
@@ -481,14 +716,22 @@ pub fn wake_by_hand(token: &str, registry: Arc<Registry>) -> Result<Option<Value
 /// one shared gate every fire passes, so a filter means the same thing
 /// however the event reached us.
 ///
-/// A token this pod no longer holds is skipped rather than reported: the
-/// signal moved during a scale-down and its new holder is asked in the
-/// same round, so answering "not held" here would only duplicate work
-/// the dispatcher already did when it resolved the holders.
-pub fn match_push(push: &PushEvent, tokens: &[String], registry: Arc<Registry>) -> Vec<MatchedPush> {
-    let mut matched = Vec::new();
+/// A token with no held row is skipped: the signal went between the
+/// dispatcher narrowing the candidates and this answer.
+pub async fn match_push(state: &crate::ListenerState, push: &PushEvent, tokens: &[String]) -> Result<Vec<MatchedPush>> {
+    let mut held = Vec::with_capacity(tokens.len());
     for token in tokens {
-        let Some(signal) = registry.get(token) else { continue };
+        if let Some(signal) = crate::registry::held(state, token).await? {
+            held.push((token.clone(), signal));
+        }
+    }
+    Ok(match_held(push, &held))
+}
+
+/// [`match_push`] over signals already in hand.
+fn match_held(push: &PushEvent, held: &[(String, RegisteredSignal)]) -> Vec<MatchedPush> {
+    let mut matched = Vec::new();
+    for (token, signal) in held {
         let Some(handler) = lookup(&signal.spec.kind) else {
             tracing::warn!(
                 target: "weft_listener::kinds",
@@ -497,7 +740,7 @@ pub fn match_push(push: &PushEvent, tokens: &[String], registry: Arc<Registry>) 
             );
             continue;
         };
-        let Some(payload) = handler.match_push(&signal, push) else { continue };
+        let Some(payload) = handler.match_push(signal, push) else { continue };
         if !weft_core::signal::predicate::matches(&signal.spec.match_predicates, &payload) {
             tracing::debug!(
                 target: "weft_listener::kinds",
@@ -509,17 +752,6 @@ pub fn match_push(push: &PushEvent, tokens: &[String], registry: Arc<Registry>) 
         matched.push(MatchedPush { token: token.clone(), payload });
     }
     matched
-}
-
-/// Render what a consumer needs to answer a registered signal (see
-/// [`KindHandler::render`]); `compute_live` is the other question,
-/// what the node shows.
-pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
-    let signal = registry
-        .get(token)
-        .ok_or_else(|| anyhow::anyhow!("unknown token: {token}"))?;
-    let handler = handler_or_err(&signal.spec.kind)?;
-    handler.render(token, &signal)
 }
 
 /// What a registered signal shows: its kind's `live` answer.
@@ -769,13 +1001,15 @@ mod tests {
                 consumer_kind: None,
                 access: None,
                 match_predicates: Vec::new(),
+                limits: Default::default(),
+                run_class: Default::default(),
             },
             node_id: "ask".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            color: None,
-            placement_generation: 0,
+            execution_id: None,
             task: None,
+            kind_state: None,
             routing: SignalRouting { surface, auth, auth_config },
             serving: Arc::new(Mutex::new(ServingState::default())),
         }
@@ -975,7 +1209,7 @@ mod tests {
         );
     }
 
-    // ----- Matching a provider push against what this pod holds ------
+    // ----- Matching a provider push against what this process holds ------
     //
     // These pin the tier boundary. The dispatcher hands over a verified
     // push and a list of candidate tokens; every decision about WHICH of
@@ -991,13 +1225,15 @@ mod tests {
                 consumer_kind: None,
                 access: None,
                 match_predicates: predicates,
+                limits: Default::default(),
+                run_class: Default::default(),
             },
             node_id: "n1".into(),
             tenant_id: "t1".into(),
             is_resume: false,
-            color: None,
-            placement_generation: 1,
+            execution_id: None,
             task: None,
+            kind_state: None,
             routing: SignalRouting {
                 surface: weft_core::primitive::SignalSurface::Internal,
                 auth: weft_core::primitive::SignalAuth::None,
@@ -1015,12 +1251,8 @@ mod tests {
         PushEvent { service: "slack".into(), topic: topic.into(), event }
     }
 
-    fn holding(entries: &[(&str, RegisteredSignal)]) -> Arc<Registry> {
-        let registry = Arc::new(Registry::default());
-        for (token, sig) in entries {
-            registry.insert((*token).to_string(), sig.clone());
-        }
-        registry
+    fn holding(entries: &[(&str, RegisteredSignal)]) -> Vec<(String, RegisteredSignal)> {
+        entries.iter().map(|(token, sig)| ((*token).to_string(), sig.clone())).collect()
     }
 
     #[test]
@@ -1030,7 +1262,7 @@ mod tests {
             "tok",
             registered("provider_events", subscription("messages", "account"), vec![]),
         )]);
-        let got = match_push(&push("messages", event.clone()), &["tok".into()], registry);
+        let got = match_held(&push("messages", event.clone()), &registry);
         assert_eq!(got.len(), 1, "the topics agree, so it fires");
         assert_eq!(got[0].token, "tok");
         assert_eq!(got[0].payload, event, "and it wakes with the event as it arrived");
@@ -1044,7 +1276,7 @@ mod tests {
             "tok",
             registered("provider_events", subscription("files", "account"), vec![]),
         )]);
-        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        let got = match_held(&push("messages", serde_json::json!({})), &registry);
         assert!(got.is_empty());
     }
 
@@ -1057,7 +1289,7 @@ mod tests {
             "tok",
             registered("provider_events", subscription("messages", "app"), vec![]),
         )]);
-        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        let got = match_held(&push("messages", serde_json::json!({})), &registry);
         assert!(got.is_empty());
     }
 
@@ -1072,9 +1304,9 @@ mod tests {
             registered("provider_events", subscription("messages", "account"), only_c1),
         )]);
         let wrong = serde_json::json!({ "channel": "C2" });
-        assert!(match_push(&push("messages", wrong), &["tok".into()], registry.clone()).is_empty());
+        assert!(match_held(&push("messages", wrong), &registry).is_empty());
         let right = serde_json::json!({ "channel": "C1" });
-        assert_eq!(match_push(&push("messages", right), &["tok".into()], registry).len(), 1);
+        assert_eq!(match_held(&push("messages", right), &registry).len(), 1);
     }
 
     /// Every other kind answers "not mine" by default, so a push can
@@ -1086,7 +1318,7 @@ mod tests {
             "tok",
             registered("timer", serde_json::json!({ "topic": "messages" }), vec![]),
         )]);
-        let got = match_push(&push("messages", serde_json::json!({})), &["tok".into()], registry);
+        let got = match_held(&push("messages", serde_json::json!({})), &registry);
         assert!(got.is_empty(), "a timer is not fed by a provider push, whatever its config says");
     }
 
@@ -1098,8 +1330,8 @@ mod tests {
     #[test]
     fn a_timer_is_the_kind_that_can_be_woken_by_hand() {
         let registry = holding(&[("tok", registered("timer", serde_json::json!({}), vec![]))]);
-        let payload = wake_by_hand("tok", registry)
-            .expect("the token is held here")
+        let payload = hand_wake_payload(&registry[0].1)
+            .expect("the kind is known")
             .expect("a timer can be woken");
         assert!(payload["scheduledTime"].is_string(), "{payload}");
         assert!(payload["actualTime"].is_string(), "{payload}");
@@ -1115,26 +1347,8 @@ mod tests {
     fn a_kind_with_no_truthful_stand_in_cannot_be_woken() {
         for kind in ["form", "provider_events", "poll_endpoint", "route", "socket"] {
             let registry = holding(&[("tok", registered(kind, serde_json::json!({}), vec![]))]);
-            let answer = wake_by_hand("tok", registry).expect("the token is held here");
+            let answer = hand_wake_payload(&registry[0].1).expect("the kind is known");
             assert!(answer.is_none(), "{kind} has nothing to wake with");
         }
-    }
-
-    /// A token this pod does not hold is an error, not a quiet nothing:
-    /// whoever asked resolved this pod as the holder, so the two
-    /// disagreeing is worth saying out loud.
-    #[test]
-    fn waking_a_token_this_pod_does_not_hold_is_an_error() {
-        let why = wake_by_hand("gone", holding(&[])).expect_err("not held here");
-        assert!(format!("{why:#}").contains("gone"), "{why:#}");
-    }
-
-    /// A token that moved to another pod mid-push is simply not this
-    /// pod's answer to give; the dispatcher asked its new holder too.
-    #[test]
-    fn a_token_this_pod_no_longer_holds_is_skipped() {
-        let registry = holding(&[]);
-        let got = match_push(&push("messages", serde_json::json!({})), &["gone".into()], registry);
-        assert!(got.is_empty());
     }
 }

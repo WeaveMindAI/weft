@@ -40,8 +40,13 @@ use thiserror::Error;
 use weft_core::is_rust_identifier;
 use weft_core::node::{MetadataCatalog, NodeMetadata};
 
-/// Directory names that are never part of a node's source tree:
-/// build outputs and VCS/dependency caches. The single policy shared
+/// Entry names that are never part of a node's source tree: build
+/// outputs, VCS/dependency caches, local secrets and databases. The
+/// runtime image carries weft's `catalog/` and `crates/` minus exactly
+/// these (`.dockerignore`), and a dispatcher hashes the standard
+/// library from that copy while the CLI hashes it from the checkout,
+/// so every walk leaving out the same entries is what makes the two
+/// agree on one worker hash. The single policy shared
 /// by every traversal of a node directory tree (discovery's descent,
 /// the build's staging copy, and the source-hash walk) so they agree
 /// on exactly which bytes constitute a node. Diverging here is how a
@@ -52,13 +57,20 @@ use weft_core::node::{MetadataCatalog, NodeMetadata};
 /// a symlink into a weft checkout's `catalog/`, e.g. this repo's own
 /// `examples/`); the recursive walks refuse symlink cycles through
 /// `guard_node_tree_cycle` (a descent-chain check) and fail loudly.
-pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".weft"];
+// SYNC: NODE_TREE_EXCLUDE + NODE_TREE_EXCLUDE_SUFFIXES <-> .dockerignore
+//       (the "Even inside the allowlisted dirs" block)
+// Only names that are never a real node directory: `pkg` (wasm-pack
+// output) stays out because a package may well be called that.
+pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".weft", ".svelte-kit", ".env"];
 
-/// True if `name` is an excluded node-tree directory. Convenience over
-/// `NODE_TREE_EXCLUDE.contains(&name)` for callers matching an
-/// `OsStr`/`Cow<str>` entry name.
+/// Name endings excluded the same way (a local SQLite database and its
+/// side files).
+pub const NODE_TREE_EXCLUDE_SUFFIXES: &[&str] = &[".db", ".db-journal", ".db-shm", ".db-wal"];
+
+/// True if an entry of this name, file or directory, is never part of
+/// a node tree. THE check every node-tree walk makes.
 pub fn is_node_tree_excluded(name: &str) -> bool {
-    NODE_TREE_EXCLUDE.contains(&name)
+    NODE_TREE_EXCLUDE.contains(&name) || NODE_TREE_EXCLUDE_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// What one node-tree entry is, symlinks resolved: a symlinked
@@ -1302,17 +1314,22 @@ fn load_node_entry(
     }
     weft_core::node::refuse_removed_metadata_keys(&value)
         .map_err(|error| CatalogError::Parse { path: meta_path.clone(), error })?;
-    let metadata: NodeMetadata =
-        serde_json::from_value(value).map_err(|e| CatalogError::Parse {
-            path: meta_path.clone(),
-            // A stale stdlib COPY is the common way to hold metadata this
-            // weft no longer accepts; name the one-command re-sync.
-            error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
-                format!("{e} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
-            } else {
-                e.to_string()
-            },
-        })?;
+    // A stale stdlib COPY is the common way to hold metadata this weft
+    // no longer accepts (a shape serde refuses, or a setting the
+    // language now owns); name the one-command re-sync.
+    let parse_error = |error: String| CatalogError::Parse {
+        path: meta_path.clone(),
+        error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
+            format!("{error} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
+        } else {
+            error
+        },
+    };
+    let mut metadata: NodeMetadata =
+        serde_json::from_value(value).map_err(|e| parse_error(e.to_string()))?;
+    // The settings the language owns (long runs, entry limits), added
+    // before the semantic check so they are checked like any input.
+    metadata.add_language_inputs().map_err(parse_error)?;
     // Semantic rules serde can't express (field/port name collisions).
     metadata.validate_semantics().map_err(|error| CatalogError::Parse {
         path: meta_path.clone(),

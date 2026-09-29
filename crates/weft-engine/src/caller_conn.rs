@@ -2,14 +2,14 @@
 //! connection) plus the per-worker registry that attaches an accepted
 //! socket to the right execution.
 //!
-//! Shape (one connection per execution color):
+//! Shape (one connection per execution):
 //!   - OUTBOUND: nodes call `send_chunk` / `terminate`; the connection
 //!     pushes onto a bounded single-consumer `OutboundQueue` the socket
 //!     task drains to the wire. The queue is a `VecDeque` the PRODUCER can
 //!     evict the front of, so all three backpressure policies are real:
 //!     `block` awaits a slot, `drop_newest` sheds the incoming chunk,
 //!     `drop_oldest` pops the front and enqueues (so one slow caller
-//!     cannot grow a multiplexing pod's RAM). Terminal items always land.
+//!     cannot grow a multiplexing process's RAM). Terminal items always land.
 //!   - INBOUND (WebSocket): the socket task publishes each decoded
 //!     message onto a bounded `InboundLog`; every node's `receive` holds
 //!     its own absolute-offset cursor over the same window, so inbound
@@ -22,8 +22,8 @@
 //!     same kind of pump the bus uses, so the inspector replays it.
 //!
 //! TLS terminates at the gateway; this server speaks plain HTTP/WS over
-//! the private cluster network and trusts the dispatcher-signed token
-//! (verified in [`crate::run_pod`]'s accept path) for authentication.
+//! the private install network and trusts the dispatcher-signed token
+//! (verified in [`crate::run_instance`]'s accept path) for authentication.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,7 +46,7 @@ use weft_core::caller::{
 };
 use weft_core::caller_token;
 use weft_core::signal::{Backpressure, DataType, Protocol};
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 /// Capacity of the outbound buffer (chunks queued toward the wire before
 /// backpressure kicks in). Bounded so a slow caller slows the producer
@@ -700,7 +700,7 @@ async fn recv_from_log(
 /// A future that resolves once the session cap elapses, or NEVER when the
 /// cap is `0` (no cap). The single legitimate deadline on a live exchange:
 /// per-message waits are unbounded, but the author can bound the TOTAL
-/// session via `max_session_secs` to cap a multiplexing pod's RAM/abuse.
+/// session via `max_session_secs` to cap a multiplexing process's RAM/abuse.
 /// Uses the injected clock so the rig can advance it deterministically.
 /// One write to the caller, raced against the exchange ending under it:
 /// `gone` (the caller's side going away, where the transport says so
@@ -732,14 +732,14 @@ async fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs
 /// caller (a live connection, a fired run's stand-in) writes through
 /// one, so their rows number the same way.
 pub(crate) struct CallerRecord {
-    color: Color,
+    execution_id: ExecutionId,
     sink: Arc<dyn CallerJournalSink>,
     next_offset: AtomicU64,
 }
 
 impl CallerRecord {
-    pub(crate) fn new(color: Color, sink: Arc<dyn CallerJournalSink>) -> Self {
-        Self { color, sink, next_offset: AtomicU64::new(0) }
+    pub(crate) fn new(execution_id: ExecutionId, sink: Arc<dyn CallerJournalSink>) -> Self {
+        Self { execution_id, sink, next_offset: AtomicU64::new(0) }
     }
 
     pub(crate) fn sink(&self) -> Arc<dyn CallerJournalSink> {
@@ -751,23 +751,23 @@ impl CallerRecord {
     }
 
     pub(crate) fn connected(&self, protocol: Protocol) {
-        self.sink.connected(self.color, self.take_offset(), protocol);
+        self.sink.connected(self.execution_id, self.take_offset(), protocol);
     }
 
     pub(crate) fn inbound(&self, msg: &InboundMessage) {
-        self.sink.inbound(self.color, self.take_offset(), msg);
+        self.sink.inbound(self.execution_id, self.take_offset(), msg);
     }
 
     pub(crate) fn outbound(&self, chunk: &OutboundChunk, terminal: bool) {
-        self.sink.outbound(self.color, self.take_offset(), chunk, terminal);
+        self.sink.outbound(self.execution_id, self.take_offset(), chunk, terminal);
     }
 
     pub(crate) fn errored(&self, message: &str) {
-        self.sink.errored(self.color, self.take_offset(), message);
+        self.sink.errored(self.execution_id, self.take_offset(), message);
     }
 
     pub(crate) fn disconnected(&self, reason: &str) {
-        self.sink.disconnected(self.color, self.take_offset(), reason);
+        self.sink.disconnected(self.execution_id, self.take_offset(), reason);
     }
 }
 
@@ -776,11 +776,11 @@ impl CallerRecord {
 /// bus journal pump's projection (connect / inbound / outbound / error /
 /// disconnect, each with an offset).
 pub trait CallerJournalSink: Send + Sync {
-    fn connected(&self, color: Color, offset: u64, protocol: Protocol);
-    fn inbound(&self, color: Color, offset: u64, msg: &InboundMessage);
-    fn outbound(&self, color: Color, offset: u64, chunk: &OutboundChunk, terminal: bool);
-    fn errored(&self, color: Color, offset: u64, message: &str);
-    fn disconnected(&self, color: Color, offset: u64, reason: &str);
+    fn connected(&self, execution_id: ExecutionId, offset: u64, protocol: Protocol);
+    fn inbound(&self, execution_id: ExecutionId, offset: u64, msg: &InboundMessage);
+    fn outbound(&self, execution_id: ExecutionId, offset: u64, chunk: &OutboundChunk, terminal: bool);
+    fn errored(&self, execution_id: ExecutionId, offset: u64, message: &str);
+    fn disconnected(&self, execution_id: ExecutionId, offset: u64, reason: &str);
 
     /// Stop taking rows: write what is held, and resolve once every row
     /// handed over is in the journal. A run closes its caller's sink
@@ -803,18 +803,18 @@ pub trait CallerJournalSink: Send + Sync {
     }
 }
 
-/// Per-worker registry mapping an execution color to its attached live
+/// Per-worker registry mapping an execution to its attached live
 /// connection. The connection server inserts on attach; the loop driver
-/// (`run_one_execution`) reads the connection for a color to wire into
+/// (`run_one_execution`) reads the connection for an execution to wire into
 /// `ctx.caller()`; removal happens when the socket task ends.
 ///
-/// Cross-pod note: this is pod-local RAM, which is correct because a live
-/// connection is pinned to ONE pod for its life (the routing token names
-/// the pod), so the connection for a color only ever exists on the one
+/// Cross-process note: this is process-local RAM, which is correct because a live
+/// connection is pinned to ONE process for its life (the routing token names
+/// the process), so the connection for an execution only ever exists on the one
 /// worker that accepted it.
 #[derive(Clone, Default)]
 pub struct CallerRegistry {
-    inner: Arc<Mutex<HashMap<Color, Arc<LiveCallerConnection>>>>,
+    inner: Arc<Mutex<HashMap<ExecutionId, Arc<LiveCallerConnection>>>>,
     /// Woken on every `attach`. The execute path awaits this when its
     /// caller has not arrived yet (the dispatcher starts the execution
     /// before, or racing with, the caller's socket attaching).
@@ -826,7 +826,7 @@ impl CallerRegistry {
         Self::default()
     }
 
-    /// Attach the one connection for `color`. `false` when this color
+    /// Attach the one connection for `execution_id`. `false` when this execution
     /// already has one, and the caller must refuse rather than proceed.
     ///
     /// A routing token is good for one exchange, and the door it opens
@@ -841,23 +841,23 @@ impl CallerRegistry {
     /// why a connection journals its arrival here, on admission, and a
     /// refused one never journals at all.
     #[must_use]
-    pub fn attach(&self, color: Color, conn: Arc<LiveCallerConnection>) -> bool {
+    pub fn attach(&self, execution_id: ExecutionId, conn: Arc<LiveCallerConnection>) -> bool {
         let mut inner = self.inner.lock().expect("registry poisoned");
-        if inner.contains_key(&color) {
+        if inner.contains_key(&execution_id) {
             return false;
         }
         // Journaled under the lock: nothing reaches this connection before
         // its arrival rows are written.
         conn.record_arrival();
-        inner.insert(color, conn);
+        inner.insert(execution_id, conn);
         drop(inner);
         // `notify_waiters` (not `notify_one`): several execute paths may be
-        // waiting for distinct colors; wake them all to re-check.
+        // waiting for distinct executions; wake them all to re-check.
         self.attached.notify_waiters();
         true
     }
 
-    /// Await the connection for `color` to attach, bounded by `timeout`.
+    /// Await the connection for `execution_id` to attach, bounded by `timeout`.
     /// Returns the connection once attached, or `None` on timeout (the
     /// caller never arrived; the execute path treats that as "no caller"
     /// and proceeds, and the caller handle's `ensure_connected()` then fails
@@ -865,7 +865,7 @@ impl CallerRegistry {
     /// BEFORE the map check closes the attach-between-check-and-wait race.
     pub async fn wait_for_attach(
         &self,
-        color: Color,
+        execution_id: ExecutionId,
         timeout: std::time::Duration,
     ) -> Option<Arc<LiveCallerConnection>> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -874,35 +874,35 @@ impl CallerRegistry {
             tokio::pin!(notified);
             // Arm, THEN check: an attach landing now wakes the armed future.
             notified.as_mut().enable();
-            if let Some(conn) = self.get(color) {
+            if let Some(conn) = self.get(execution_id) {
                 return Some(conn);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.get(color); // last check at deadline
+                return self.get(execution_id); // last check at deadline
             }
         }
     }
 
-    pub fn get(&self, color: Color) -> Option<Arc<LiveCallerConnection>> {
-        self.inner.lock().expect("registry poisoned").get(&color).cloned()
+    pub fn get(&self, execution_id: ExecutionId) -> Option<Arc<LiveCallerConnection>> {
+        self.inner.lock().expect("registry poisoned").get(&execution_id).cloned()
     }
 
-    /// Drop a color's entry.
+    /// Drop an execution's entry.
     ///
     /// Never panics: this runs from `ExecutionResidue`'s destructor,
     /// which can itself run during an unwind, and a panic there aborts
     /// the process. A poisoned registry is reported and the entry stays
-    /// (the pod is already in trouble; taking it down is worse).
-    pub fn detach(&self, color: Color) {
+    /// (the process is already in trouble; taking it down is worse).
+    pub fn detach(&self, execution_id: ExecutionId) {
         match self.inner.lock() {
             Ok(mut inner) => {
-                inner.remove(&color);
+                inner.remove(&execution_id);
             }
             Err(_) => tracing::error!(
                 target: "weft_engine::caller_conn",
-                %color,
+                %execution_id,
                 "the caller registry is poisoned, so this execution's connection entry was not \
-                 dropped; it goes with the pod"
+                 dropped; it goes with the instance"
             ),
         }
     }
@@ -916,7 +916,7 @@ impl CallerRegistry {
 #[allow(clippy::type_complexity)]
 pub(crate) fn new_connection(
     config: CallerRuntimeConfig,
-    color: Color,
+    execution_id: ExecutionId,
     handshake: Arc<LiveRequest>,
     http_body: Option<InboundMessage>,
     journal: Arc<dyn CallerJournalSink>,
@@ -941,7 +941,7 @@ pub(crate) fn new_connection(
         inbound: inbound.clone(),
         handshake,
         http_request,
-        record: CallerRecord::new(color, journal.clone()),
+        record: CallerRecord::new(execution_id, journal.clone()),
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
         connected: tokio::sync::watch::Sender::new(true),
         disconnect_recorded: AtomicBool::new(false),
@@ -995,28 +995,33 @@ fn decode_inbound(data_type: DataType, raw: &[u8]) -> Result<InboundMessage, Str
 // ----- The worker connection server ----------------------------------
 
 /// Shared state for the connection server: the registry it attaches into,
-/// the per-color runtime config + journal factory, and the token secret.
+/// the per-execution runtime config + journal factory, and the token secret.
 #[derive(Clone)]
 pub struct ConnServerState {
     pub registry: CallerRegistry,
     /// Verifies the dispatcher-signed routing token.
     pub token_secret: Arc<Vec<u8>>,
-    /// This pod's name; a token addressed to another pod is rejected
-    /// (per-pod pinning, option A).
-    pub pod_name: String,
-    /// Resolves the per-color runtime config + journal sink. Set by
-    /// `run_pod` from the execution's signal config; the server needs the
+    /// The project this worker serves; a ticket for another project is
+    /// refused.
+    pub project_id: uuid::Uuid,
+    /// This worker's instance: the execution an arriving caller brings is
+    /// born pinned to it.
+    pub instance: String,
+    /// Starts the drive of an execution once its birth is in.
+    pub starter: Arc<dyn LiveStarter>,
+    /// Resolves the per-execution runtime config + journal sink. Set by the
+    /// worker's drive from the execution's signal config; the server needs the
     /// config (protocol, caps, data type) to build the connection, and
-    /// the journal sink to record the exchange. Keyed by color.
+    /// the journal sink to record the exchange. Keyed by execution.
     pub resolver: Arc<dyn ConnConfigResolver>,
     /// Worker clock (for the now()-based session deadline / heartbeat).
     pub clock: Arc<dyn weft_platform_traits::Clock>,
     /// Fires the per-execution cancel flag (cancel-on-disconnect for a
-    /// caller-tied run). Looked up by color.
+    /// caller-tied run). Looked up by execution.
     pub canceller: Arc<dyn ExecutionCanceller>,
     /// The worker's door to the control plane: a caller's arrival is a
     /// `LiveArrival` task the dispatcher answers by giving birth to the
-    /// execution the routing token promised, on this pod.
+    /// execution the routing token promised, on this process.
     pub tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     /// The tenant this worker serves, stamped on the arrival task.
     pub tenant_id: String,
@@ -1036,6 +1041,7 @@ const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// captures) rides the token instead.
 fn arrival_payload(
     token: &str,
+    instance: &str,
     raw_query: &str,
     request: &axum::extract::Request,
 ) -> weft_task_store::kinds::LiveArrivalPayload {
@@ -1043,6 +1049,7 @@ fn arrival_payload(
     query.remove("wct");
     weft_task_store::kinds::LiveArrivalPayload {
         token: token.to_string(),
+        instance: instance.to_string(),
         method: request.method().as_str().to_string(),
         query,
         headers: request
@@ -1054,12 +1061,12 @@ fn arrival_payload(
 }
 
 /// The caller is here: ask the dispatcher for the execution the routing
-/// token promises, born on this pod. The request as it arrived rides
+/// token promises, born on this worker. The request as it arrived rides
 /// the task with the token (the birth reads the route, the gate's
 /// verdict and the path captures off the token, and the method, query
 /// and headers off this). A birth the dispatcher refuses (the project
-/// went down, the pod filled up) is the caller's answer, a `503` with
-/// the reason; a dispatcher that does not answer in time is a `504`.
+/// went down) is the caller's answer, a `503` with the reason; a
+/// dispatcher that does not answer in time is a `504`.
 async fn ask_for_birth(
     state: &ConnServerState,
     claims: &caller_token::CallerTokenClaims,
@@ -1073,42 +1080,47 @@ async fn ask_for_birth(
             kind: weft_task_store::TaskKind::LiveArrival.into(),
             target: TaskTarget::Dispatcher,
             project_id: Some(project_id),
-            dedup_key: Some(weft_task_store::kinds::live_arrival_dedup_key(claims.color)),
-            // No color on the row: the broker scopes a task by every
-            // resource it names, and this color names nothing yet. The
-            // task is what BRINGS it into being, so a color here would
+            dedup_key: Some(weft_task_store::kinds::live_arrival_dedup_key(claims.execution_id)),
+            // No execution on the row: the broker scopes a task by every
+            // resource it names, and this execution names nothing yet. The
+            // task is what BRINGS it into being, so an execution here would
             // be refused as unknown. The project is the anchor the
-            // broker checks, the dedup key carries the color so one
-            // arrival is one birth, and the executor reads the color
+            // broker checks, the dedup key carries the execution so one
+            // arrival is one birth, and the executor reads the execution
             // off the signed token, which is the only trustworthy
             // source for it anyway.
-            color: None,
+            execution_id: None,
             tenant_id: state.tenant_id.clone(),
-            target_pod_name: None,
+            target_instance: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload).expect("the arrival payload serializes"),
         })
         .await;
-    let task_id = match enqueued.map(|outcome| outcome.id()) {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Err((StatusCode::BAD_GATEWAY, "the run could not be asked for: the arrival was fenced").into_response());
-        }
+    let task_id = match enqueued {
+        Ok(outcome) => outcome.id(),
         Err(e) => {
-            tracing::error!(target: "weft_engine::caller_conn", color = %claims.color, error = %e, "arrival enqueue failed");
+            tracing::error!(target: "weft_engine::caller_conn", execution_id = %claims.execution_id, error = %e, "arrival enqueue failed");
             return Err((StatusCode::BAD_GATEWAY, format!("the run could not be asked for: {e}")).into_response());
         }
     };
     let outcome = match state.tasks.wait_for_terminal(task_id, ARRIVAL_WAIT).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            tracing::error!(target: "weft_engine::caller_conn", color = %claims.color, error = %e, "arrival wait failed");
+            tracing::error!(target: "weft_engine::caller_conn", execution_id = %claims.execution_id, error = %e, "arrival wait failed");
             return Err((StatusCode::BAD_GATEWAY, format!("the run could not be started: {e}")).into_response());
         }
     };
     match outcome.status {
         TaskStatus::Complete => match outcome.result.map(serde_json::from_value::<weft_task_store::kinds::LiveArrivalResult>) {
-            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { .. })) => Ok(()),
+            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { instance, .. })) if instance == state.instance => Ok(()),
+            // A resent request that the platform handed to another copy
+            // of the worker: the run was born on the first one and is
+            // driven there, so this copy has nothing to attach to.
+            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { .. })) => Err((
+                StatusCode::CONFLICT,
+                caller_token::refusal("it already opened its connection"),
+            )
+                .into_response()),
             // Refused before the run was born: the caller gets that
             // answer, with its status.
             Some(Ok(weft_task_store::kinds::LiveArrivalResult::Refused { status, message })) => Err((
@@ -1135,7 +1147,7 @@ async fn ask_for_birth(
     }
 }
 
-/// What the server needs to build a color's connection when its caller
+/// What the server needs to build an execution's connection when its caller
 /// attaches: the runtime config, the heartbeat interval, the caller's
 /// opening request (from the execute task's start record), and the
 /// journal sink.
@@ -1146,13 +1158,13 @@ pub struct ResolvedLiveStart {
     pub journal: Arc<dyn CallerJournalSink>,
 }
 
-/// How the server learns a color's connection config + journal sink.
-/// `run_pod` implements this over the worker's per-execution state.
+/// How the server learns an execution's connection config + journal sink. The
+/// worker implements this over its per-execution state.
 pub trait ConnConfigResolver: Send + Sync {
-    /// `Some` when `color` is a live execution expecting a caller; `None`
-    /// for an unknown/expired color (the server rejects the connection
+    /// `Some` when `execution_id` is a live execution expecting a caller; `None`
+    /// for an unknown/expired execution (the server rejects the connection
     /// loud).
-    fn resolve(&self, color: Color) -> Option<ResolvedLiveStart>;
+    fn resolve(&self, execution_id: ExecutionId) -> Option<ResolvedLiveStart>;
 }
 
 
@@ -1240,24 +1252,28 @@ impl ExchangeEnd {
         }
     }
 }
-/// Fires the per-execution cancel flag (cancel-on-disconnect). `run_pod`
-/// implements this over its pod-local cancel registry.
+/// Fires the per-execution cancel flag (cancel-on-disconnect). The worker
+/// implements this over its cancel registry.
 pub trait ExecutionCanceller: Send + Sync {
-    fn cancel(&self, color: Color);
+    fn cancel(&self, execution_id: ExecutionId);
+}
+
+/// Starts driving an execution whose birth an arriving caller just got:
+/// the worker claims it (it is pinned here) and drives it, detached from
+/// the connection.
+pub trait LiveStarter: Send + Sync {
+    fn start(&self, execution_id: ExecutionId);
 }
 
 /// Build the connection server router. The connection is identified by
-/// the signed `?wct=<token>` query param, NOT the path: the gateway
-/// forwards the caller's ORIGINAL path (e.g. `/chat`, the author's mount
-/// path) after stripping the namespace segment, so the worker accepts ANY
-/// path via a fallback handler (any method, so HTTP verbs and the WS
-/// upgrade GET all land here). `/healthz` is the one reserved path, for
-/// the dispatcher's "is the worker routable yet" check.
+/// the signed `?wct=<token>` query param, NOT the path: the install's
+/// relay forwards the caller's ORIGINAL path (e.g. `/chat`, the author's
+/// mount path), so the worker accepts ANY path via a fallback handler (any
+/// method, so HTTP verbs and the WS upgrade GET all land here). The one
+/// reserved prefix is the worker's own, `/_weft/`
+/// (`weft_core::route::RESERVED_PREFIX`).
 pub fn connection_router(state: ConnServerState) -> Router {
-    Router::new()
-        .route("/healthz", any(|| async { StatusCode::OK }))
-        .fallback(any(handle_connect))
-        .with_state(state)
+    Router::new().fallback(any(handle_connect)).with_state(state)
 }
 
 /// How long a connection may be quiet before the machine starts asking
@@ -1335,21 +1351,24 @@ impl CallerSocket {
     }
 }
 
-/// Run the connection server until the process exits. Binds `0.0.0.0:port`
-/// (plain HTTP/WS; TLS terminates at the gateway). Spawned by `run_pod`.
-pub async fn serve(state: ConnServerState, port: u16) -> anyhow::Result<()> {
+/// Serve the worker's router (its own endpoints and the connection
+/// server) on `0.0.0.0:port` (plain HTTP/WS; TLS terminates in front of
+/// the worker) until `shutdown` resolves.
+pub async fn serve(
+    app: Router,
+    port: u16,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(target: "weft_engine::caller_conn", %addr, "connection server listening");
+    tracing::info!(target: "weft_engine::caller_conn", %addr, "worker listening");
     // Each connection's own socket handle reaches its handler as
     // `ConnectInfo<CallerSocket>` (the floor goes on as it is accepted),
     // which is how the route it turns out to want can set its own
     // silence bound on that one connection.
-    axum::serve(
-        listener,
-        connection_router(state).into_make_service_with_connect_info::<CallerSocket>(),
-    )
-    .await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<CallerSocket>())
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -1467,36 +1486,20 @@ async fn handle_connect(
 ) -> Response {
     let raw_query = request.uri().query().unwrap_or("").to_string();
 
-    // 1. Verify the dispatcher-signed token + pod pin.
+    // 1. Verify the dispatcher-signed token, and that it is for this
+    //    worker's project.
     let Some(token) = token_from_query(&raw_query) else {
         return (StatusCode::UNAUTHORIZED, "missing routing token").into_response();
     };
     let now = state.clock.now_unix();
     let claims = match caller_token::validate(&state.token_secret, &token, now) {
         Ok(c) => c,
-        // Every reason a ticket is no good has the same remedy, so the
-        // answer leads with it and names the reason after. The one that
-        // actually happens to people is expiry: a ticket is good for a
-        // couple of minutes, and the pod is kept a little past that
-        // precisely so this sentence can be said instead of the socket
-        // simply being dead.
-        Err(e) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                format!(
-                    "this connection ticket is no good ({e}). Ask for a new one at the \
-                     address you called first and follow where it points: a ticket lasts \
-                     a couple of minutes and opens one connection.",
-                ),
-            )
-                .into_response()
-        }
+        Err(e) => return (StatusCode::UNAUTHORIZED, caller_token::refusal(&e)).into_response(),
     };
-    if claims.pod_name != state.pod_name {
-        // Per-pod pinning: this connection was signed for another pod.
-        return (StatusCode::FORBIDDEN, "routing token addressed to a different pod").into_response();
+    if claims.project_id != state.project_id {
+        return (StatusCode::FORBIDDEN, "this ticket is for another project's workers").into_response();
     }
-    let color = claims.color;
+    let execution_id = claims.execution_id;
 
     // 1b. Hold the caller to the request the gate approved, when the
     //     gate checked anything at all. The door carries the verdict,
@@ -1549,20 +1552,22 @@ async fn handle_connect(
         request
     };
 
-    // 2. The caller is here: have the execution born on this pod. Nothing
-    //    was born at the handshake (a caller who never follows the
-    //    redirect leaves nothing behind); the routing token is the
-    //    dispatcher's promise, and this is where it is kept.
-    let arrival = arrival_payload(&token, &raw_query, &request);
+    // 2. The caller is here: have the execution born on this worker, and
+    //    start driving it. Nothing was born at the handshake (a caller who
+    //    never follows the redirect leaves nothing behind); the routing
+    //    token is the dispatcher's promise, and this is where it is kept.
+    let arrival = arrival_payload(&token, &state.instance, &raw_query, &request);
     if let Err(response) = ask_for_birth(&state, &claims, arrival).await {
         return response;
     }
+    state.starter.start(execution_id);
 
     // 3. Resolve the execution's connection config (protocol, caps, data
     //    type) + journal sink.
     //
-    // The birth inserted the pinned execute task; the worker populates its
-    // resolver when it CLAIMS and starts that task, a beat later. So the
+    // The birth inserted the pinned execute task; the drive just started
+    // populates the resolver when it CLAIMS and starts that task, a beat
+    // later. So the
     // resolver can briefly lag the birth. That is "not ready yet," not
     // "unknown": poll the resolver for a bounded window before giving up.
     // Without this, a fast caller racing the worker's task-claim gets a
@@ -1572,7 +1577,7 @@ async fn handle_connect(
         const POLL: std::time::Duration = std::time::Duration::from_millis(50);
         let deadline = state.clock.now() + READY_WAIT;
         loop {
-            if let Some(r) = state.resolver.resolve(color) {
+            if let Some(r) = state.resolver.resolve(execution_id) {
                 break Some(r);
             }
             if state.clock.now() >= deadline {
@@ -1604,24 +1609,24 @@ async fn handle_connect(
                 Ok(upgrade) => {
                     tracing::info!(
                         target: "weft_engine::caller_conn",
-                        color = %color, "ws upgrade accepted; attaching"
+                        execution_id = %execution_id, "ws upgrade accepted; attaching"
                     );
                     let st = state.clone();
                     // Enforce the inbound size cap at the TRANSPORT so an
                     // oversized frame is rejected before axum buffers it whole
                     // (the per-message check in `drive_ws` is the loud surface,
                     // not the RAM bound). `usize` cast is safe: the cap is a
-                    // byte count that fits the platform word on any real pod.
+                    // byte count that fits the platform word on any real process.
                     let cap = config.max_inbound_bytes as usize;
                     let upgrade = upgrade.max_message_size(cap).max_frame_size(cap);
                     upgrade.on_upgrade(move |socket| {
-                        drive_ws(socket, st, color, config, heartbeat_secs, handshake, journal)
+                        drive_ws(socket, st, execution_id, config, heartbeat_secs, handshake, journal)
                     })
                 }
                 Err(e) => {
                     tracing::warn!(
                         target: "weft_engine::caller_conn",
-                        color = %color, error = ?e, "ws upgrade extraction failed"
+                        execution_id = %execution_id, error = ?e, "ws upgrade extraction failed"
                     );
                     (
                         StatusCode::BAD_REQUEST,
@@ -1636,7 +1641,7 @@ async fn handle_connect(
             // at the handshake and ride in `request`; the worker only
             // reads the body (the 307 made the caller resend it here).
             drop(parts);
-            drive_http(state, color, config, heartbeat_secs, handshake, journal, body).await
+            drive_http(state, execution_id, config, heartbeat_secs, handshake, journal, body).await
         }
     }
 }
@@ -1652,7 +1657,7 @@ async fn handle_connect(
 #[allow(clippy::too_many_arguments)]
 async fn drive_http(
     state: ConnServerState,
-    color: Color,
+    execution_id: ExecutionId,
     config: CallerRuntimeConfig,
     heartbeat_secs: u64,
     request: Arc<LiveRequest>,
@@ -1680,8 +1685,8 @@ async fn drive_http(
     // What the caller sent is journaled on admission, right after the
     // connect row (`record_arrival`).
     let (conn, outbound, _inb) =
-        new_connection(config.clone(), color, request, Some(decoded), journal);
-    if !state.registry.attach(color, conn.clone()) {
+        new_connection(config.clone(), execution_id, request, Some(decoded), journal);
+    if !state.registry.attach(execution_id, conn.clone()) {
         return (StatusCode::CONFLICT, EXCHANGE_TAKEN).into_response();
     }
 
@@ -1804,11 +1809,11 @@ async fn drive_http(
         // when the CALLER ended it; a run that answered finishes on its own.
         outbound.close();
         conn.mark_disconnected(reason.as_str());
-        registry.detach(color);
+        registry.detach(execution_id);
         if reason.caller_initiated()
             && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
         {
-            canceller.cancel(color);
+            canceller.cancel(execution_id);
         }
     });
 
@@ -1927,16 +1932,16 @@ const EXCHANGE_TAKEN: &str = "this exchange already has a caller: a routing toke
 async fn drive_ws(
     mut socket: WebSocket,
     state: ConnServerState,
-    color: Color,
+    execution_id: ExecutionId,
     config: CallerRuntimeConfig,
     heartbeat_secs: u64,
     request: Arc<LiveRequest>,
     journal: Arc<dyn CallerJournalSink>,
 ) {
     let (conn, outbound, inbound) =
-        new_connection(config.clone(), color, request, None, journal.clone());
+        new_connection(config.clone(), execution_id, request, None, journal.clone());
     let inbound = inbound.expect("websocket connection has an inbound channel");
-    if !state.registry.attach(color, conn.clone()) {
+    if !state.registry.attach(execution_id, conn.clone()) {
         // The socket is already upgraded here, so the only way to say
         // no is to close it. One exchange, one connection: the run is
         // already talking to the first socket and would never answer
@@ -2008,7 +2013,7 @@ async fn drive_ws(
                 // one arriving here is a connection bug, loud and skipped.
                 Some(Outbound::Head(_)) => tracing::error!(
                     target: "weft_engine::caller_conn",
-                    color = %color, "a response head reached a websocket drainer"
+                    execution_id = %execution_id, "a response head reached a websocket drainer"
                 ),
                 // A socket reports a caller gone only through a failed
                 // write, so each write races the session cap alone. A
@@ -2082,13 +2087,13 @@ async fn drive_ws(
     inbound.close();
     outbound.close();
     conn.mark_disconnected(reason.as_str());
-    state.registry.detach(color);
+    state.registry.detach(execution_id);
     // A tied run is cancelled only when the CALLER ended the exchange;
     // a socket the program closed leaves the run to finish.
     if reason.caller_initiated()
         && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
     {
-        state.canceller.cancel(color);
+        state.canceller.cancel(execution_id);
     }
 }
 
@@ -2113,19 +2118,19 @@ mod tests {
         }
     }
     impl CallerJournalSink for RecordingSink {
-        fn connected(&self, _c: Color, off: u64, _p: Protocol) {
+        fn connected(&self, _c: ExecutionId, off: u64, _p: Protocol) {
             self.events.lock().unwrap().push(format!("connected@{off}"));
         }
-        fn inbound(&self, _c: Color, off: u64, _m: &InboundMessage) {
+        fn inbound(&self, _c: ExecutionId, off: u64, _m: &InboundMessage) {
             self.events.lock().unwrap().push(format!("inbound@{off}"));
         }
-        fn outbound(&self, _c: Color, off: u64, _ch: &OutboundChunk, terminal: bool) {
+        fn outbound(&self, _c: ExecutionId, off: u64, _ch: &OutboundChunk, terminal: bool) {
             self.events.lock().unwrap().push(format!("outbound@{off}:term={terminal}"));
         }
-        fn errored(&self, _c: Color, off: u64, _m: &str) {
+        fn errored(&self, _c: ExecutionId, off: u64, _m: &str) {
             self.events.lock().unwrap().push(format!("errored@{off}"));
         }
-        fn disconnected(&self, _c: Color, off: u64, _r: &str) {
+        fn disconnected(&self, _c: ExecutionId, off: u64, _r: &str) {
             self.events.lock().unwrap().push(format!("disconnected@{off}"));
         }
 
@@ -2154,11 +2159,11 @@ mod tests {
     #[tokio::test]
     async fn socket_disconnect_is_recorded_after_registry_cleanup() {
         let journal = Arc::new(RecordingSink::default());
-        let (conn, _, _) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, journal.clone());
+        let (conn, _, _) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, journal.clone());
         let registry = CallerRegistry::new();
-        assert!(registry.attach(Color::nil(), conn.clone()), "the first caller attaches");
+        assert!(registry.attach(ExecutionId::nil(), conn.clone()), "the first caller attaches");
         conn.terminate(None, None, None).await.unwrap();
-        registry.detach(Color::nil());
+        registry.detach(ExecutionId::nil());
         conn.mark_disconnected("socket closed");
         conn.mark_disconnected("socket closed again");
         assert_eq!(journal.events.lock().unwrap().iter().filter(|event| event.starts_with("disconnected@")).count(), 1);
@@ -2168,8 +2173,8 @@ mod tests {
     async fn outbound_chunks_reach_the_socket_channel_and_journal() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out_rx, _inb) =
-            new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
-        assert!(CallerRegistry::new().attach(Color::nil(), conn.clone()), "admitted");
+            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
+        assert!(CallerRegistry::new().attach(ExecutionId::nil(), conn.clone()), "admitted");
         let handle = CallerHandle::from_connection(conn.clone());
         let CallerHandle::Websocket(ws) = handle else { unreachable!() };
         ws.send(OutboundChunk::Json(serde_json::json!("hi"))).await.unwrap();
@@ -2193,7 +2198,7 @@ mod tests {
     async fn inbound_broadcasts_to_every_listener() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, _out_rx, inbound) =
-            new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let h1 = CallerHandle::from_connection(conn.clone());
         let h2 = CallerHandle::from_connection(conn.clone());
@@ -2214,7 +2219,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_cursor_pins_at_attach_no_subscribe_race() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         // A message arrives AFTER attach (offset 0) but BEFORE the node
         // builds its handle / first reads. The built-in cursor pins at the
@@ -2233,7 +2238,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_from_start_reads_retained_history() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         inbound.push(InboundMessage::Json(serde_json::json!("a")));
         inbound.push(InboundMessage::Json(serde_json::json!("b")));
@@ -2250,7 +2255,7 @@ mod tests {
     async fn inbound_window_trims_and_below_floor_falls_behind() {
         // ws_cfg() sets inbound_window = 4. Push 6: the oldest 2 are evicted.
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..6 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2279,7 +2284,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_including_last_seeds_most_recent() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         inbound.push(InboundMessage::Json(serde_json::json!("first")));
         inbound.push(InboundMessage::Json(serde_json::json!("latest")));
@@ -2294,7 +2299,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_at_positions_at_absolute_offset() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..4 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2317,7 +2322,7 @@ mod tests {
     async fn now_offset_and_retained_floor_track_window() {
         // window=4: after 7 pushes, now=7, floor=3 (offsets 0,1,2 evicted).
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..7 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2332,7 +2337,7 @@ mod tests {
     #[tokio::test]
     async fn request_via_cursor_reads_next_reply() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, out_rx, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, out_rx, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
             unreachable!()
@@ -2354,7 +2359,7 @@ mod tests {
     #[tokio::test]
     async fn terminate_once_locks_out_second() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, _inb) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, _inb) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.terminate(None, None, None).await.expect("first terminal");
         let err = conn.terminate(None, None, None).await.expect_err("second rejected");
         assert!(matches!(err, CallerError::AlreadyTerminated));
@@ -2371,7 +2376,7 @@ mod tests {
     #[tokio::test]
     async fn receive_delivers_a_late_message() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
             unreachable!()
@@ -2524,18 +2529,18 @@ mod tests {
 
     struct NoResolver;
     impl ConnConfigResolver for NoResolver {
-        fn resolve(&self, _color: Color) -> Option<ResolvedLiveStart> {
+        fn resolve(&self, _execution_id: ExecutionId) -> Option<ResolvedLiveStart> {
             None
         }
     }
 
     #[derive(Default)]
     struct RecordingCanceller {
-        cancelled: Mutex<Vec<Color>>,
+        cancelled: Mutex<Vec<ExecutionId>>,
     }
     impl ExecutionCanceller for RecordingCanceller {
-        fn cancel(&self, color: Color) {
-            self.cancelled.lock().unwrap().push(color);
+        fn cancel(&self, execution_id: ExecutionId) {
+            self.cancelled.lock().unwrap().push(execution_id);
         }
     }
 
@@ -2543,12 +2548,25 @@ mod tests {
         CallerRuntimeConfig { protocol: Protocol::Http, ..ws_cfg() }
     }
 
+    /// Every execution whose drive the server started.
+    #[derive(Default)]
+    struct RecordingStarter {
+        started: Mutex<Vec<ExecutionId>>,
+    }
+    impl LiveStarter for RecordingStarter {
+        fn start(&self, execution_id: ExecutionId) {
+            self.started.lock().unwrap().push(execution_id);
+        }
+    }
+
     fn server_state() -> (ConnServerState, Arc<RecordingCanceller>) {
         let canceller = Arc::new(RecordingCanceller::default());
         let state = ConnServerState {
             registry: CallerRegistry::new(),
             token_secret: Arc::new(Vec::new()),
-            pod_name: "pod-a".into(),
+            project_id: PROJECT,
+            instance: "worker-a".into(),
+            starter: Arc::new(RecordingStarter::default()),
             resolver: Arc::new(NoResolver),
             clock: weft_platform_traits::FakeClock::new(),
             canceller: canceller.clone(),
@@ -2566,9 +2584,20 @@ mod tests {
         /// The status the dispatcher answers every arrival with, and
         /// the reason when it refused.
         answer: Mutex<Option<(weft_task_store::tasks::TaskStatus, Option<String>)>>,
+        /// The result a completed arrival answers with.
+        born: Mutex<Option<serde_json::Value>>,
     }
     #[async_trait]
     impl weft_task_store::TaskStoreClient for ArrivalTasks {
+        async fn wait_cancels(
+            &self,
+            _project_id: uuid::Uuid,
+            _execution_ids: Vec<String>,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+            Ok(Vec::new())
+        }
+
         async fn enqueue_dedup(
             &self,
             spec: weft_task_store::tasks::NewTask,
@@ -2582,49 +2611,50 @@ mod tests {
             _timeout: std::time::Duration,
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             let (status, error) = self.answer.lock().unwrap().clone().expect("the test set an answer");
-            Ok(weft_task_store::tasks::TaskOutcome { status, result: None, error })
+            let result = self.born.lock().unwrap().clone();
+            Ok(weft_task_store::tasks::TaskOutcome { status, result, error })
         }
         async fn claim_one(
             &self,
-            _pod_id: &str,
+            _instance: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn complete(&self, _task_id: uuid::Uuid, _pod_id: &str, _result: serde_json::Value) -> anyhow::Result<()> {
+        async fn complete(&self, _task_id: uuid::Uuid, _instance: &str, _result: serde_json::Value) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn fail(&self, _task_id: uuid::Uuid, _pod_id: &str, _error: String) -> anyhow::Result<()> {
+        async fn fail(&self, _task_id: uuid::Uuid, _instance: &str, _error: String) -> anyhow::Result<()> {
             Ok(())
         }
     }
 
-    fn routing_token(secret: &[u8], pod_name: &str, exp: i64) -> (String, Color) {
+    fn routing_token(secret: &[u8], project: uuid::Uuid, exp: i64) -> (String, ExecutionId) {
         // An open route: the gate approved nobody, so there is no
         // request to hold this caller to.
-        approving_token(secret, pod_name, exp, None)
+        approving_token(secret, project, exp, None)
     }
 
     fn approving_token(
         secret: &[u8],
-        pod_name: &str,
+        project: uuid::Uuid,
         exp: i64,
         approved: Option<caller_token::RequestFingerprint>,
-    ) -> (String, Color) {
-        let color = Color::new_v4();
+    ) -> (String, ExecutionId) {
+        let execution_id = ExecutionId::new_v4();
         let token = caller_token::mint(
             secret,
             &caller_token::CallerTokenClaims {
-                color,
-                project_id: PROJECT,
-                pod_name: pod_name.into(),
+                execution_id,
+                project_id: project,
+                binary_hash: "bin-1".into(),
                 signal: "sig-1".into(),
                 path: "chat/room7".into(),
                 params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
@@ -2634,7 +2664,7 @@ mod tests {
                 exp,
             },
         );
-        (token, color)
+        (token, execution_id)
     }
 
     /// The door opens for the call that was made, and for no other.
@@ -2671,7 +2701,7 @@ mod tests {
             state.tasks = tasks.clone();
             let (token, _) = approving_token(
                 &[],
-                "pod-a",
+                PROJECT,
                 state.clock.now_unix() + 60,
                 Some(approved.clone()),
             );
@@ -2715,7 +2745,7 @@ mod tests {
         let tasks = Arc::new(ArrivalTasks::default());
         *tasks.answer.lock().unwrap() = Some((
             weft_task_store::tasks::TaskStatus::Failed,
-            Some("worker pod 'pod-a' is memory-saturated; retry shortly".into()),
+            Some("the project is not listening".into()),
         ));
         state.tasks = tasks.clone();
         let approved = caller_token::RequestFingerprint::of(
@@ -2725,7 +2755,7 @@ mod tests {
             b"{\"say\":\"hi\"}",
         );
         let (token, _) =
-            approving_token(&[], "pod-a", state.clock.now_unix() + 60, Some(approved));
+            approving_token(&[], PROJECT, state.clock.now_unix() + 60, Some(approved));
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/chat/room7?verbose=1&page=2&wct={token}"))
@@ -2743,17 +2773,17 @@ mod tests {
     /// rather than being handed to whoever arrived last.
     #[tokio::test]
     async fn a_second_caller_cannot_take_over_an_exchange() {
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let sink = Arc::new(RecordingSink::default());
         let (first, _, _) =
-            new_connection(ws_cfg(), color, Arc::new(LiveRequest::default()), None, sink.clone());
+            new_connection(ws_cfg(), execution_id, Arc::new(LiveRequest::default()), None, sink.clone());
         let (second, _, _) =
-            new_connection(ws_cfg(), color, Arc::new(LiveRequest::default()), None, sink.clone());
+            new_connection(ws_cfg(), execution_id, Arc::new(LiveRequest::default()), None, sink.clone());
         let registry = CallerRegistry::new();
-        assert!(registry.attach(color, first.clone()), "the first caller is admitted");
-        assert!(!registry.attach(color, second), "the second is refused");
+        assert!(registry.attach(execution_id, first.clone()), "the first caller is admitted");
+        assert!(!registry.attach(execution_id, second), "the second is refused");
         assert!(
-            Arc::ptr_eq(&registry.get(color).expect("the exchange still has its caller"), &first),
+            Arc::ptr_eq(&registry.get(execution_id).expect("the exchange still has its caller"), &first),
             "the run keeps the caller it already had"
         );
         // The refused caller left nothing in the run: only the first
@@ -2765,7 +2795,7 @@ mod tests {
     /// A caller with a valid token has the execution asked for before
     /// anything else: the arrival task carries the token and the request
     /// as it arrived (its method, query without the routing token,
-    /// headers), keyed to the color. A birth the dispatcher refuses is
+    /// headers), keyed to the execution. A birth the dispatcher refuses is
     /// the caller's answer, with the reason.
     #[tokio::test]
     async fn an_arriving_caller_asks_for_the_birth_and_hears_a_refusal() {
@@ -2774,10 +2804,10 @@ mod tests {
         let tasks = Arc::new(ArrivalTasks::default());
         *tasks.answer.lock().unwrap() = Some((
             weft_task_store::tasks::TaskStatus::Failed,
-            Some("worker pod 'pod-a' is memory-saturated; retry shortly".into()),
+            Some("the project is not listening".into()),
         ));
         state.tasks = tasks.clone();
-        let (token, color) = routing_token(&[], "pod-a", state.clock.now_unix() + 60);
+        let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/chat/room7?verbose=1&wct={token}"))
@@ -2787,38 +2817,67 @@ mod tests {
         let response = connection_router(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("memory-saturated"), "{body:?}");
+        assert!(String::from_utf8_lossy(&body).contains("not listening"), "{body:?}");
         let asked = tasks.asked.lock().unwrap();
         assert_eq!(asked.len(), 1);
         let task = &asked[0];
         assert_eq!(task.kind, "live_arrival");
-        assert_eq!(task.dedup_key.as_deref(), Some(format!("live-arrival:{color}").as_str()));
+        assert_eq!(task.dedup_key.as_deref(), Some(format!("live-arrival:{execution_id}").as_str()));
         assert_eq!(task.project_id, Some(PROJECT), "the project is the anchor the broker checks");
-        assert_eq!(task.color, None, "the color does not exist yet; this task is what creates it");
+        assert_eq!(task.execution_id, None, "the execution does not exist yet; this task is what creates it");
         assert_eq!(task.tenant_id, "tenant-a");
         let payload: weft_task_store::kinds::LiveArrivalPayload = serde_json::from_value(task.payload.clone()).unwrap();
         assert_eq!(payload.token, token);
+        assert_eq!(payload.instance, "worker-a", "the birth is pinned to the worker the caller reached");
         assert_eq!(payload.method, "POST");
         assert_eq!(payload.query.get("verbose").map(String::as_str), Some("1"));
         assert!(!payload.query.contains_key("wct"), "the routing token is the hop's, never the program's");
         assert!(payload.headers.iter().any(|(k, v)| k == "content-type" && v == "application/json"));
     }
 
+    /// Once the birth is in, the drive of the execution starts on this
+    /// worker, the one the caller's connection reached: a live run is
+    /// never delivered, so nothing else would start it.
+    #[tokio::test]
+    async fn a_born_execution_starts_driving_here() {
+        use tower::ServiceExt as _;
+        let (mut state, _) = server_state();
+        let tasks = Arc::new(ArrivalTasks::default());
+        let starter = Arc::new(RecordingStarter::default());
+        state.starter = starter.clone();
+        *tasks.answer.lock().unwrap() = Some((weft_task_store::tasks::TaskStatus::Complete, None));
+        let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
+        *tasks.born.lock().unwrap() = Some(
+            serde_json::to_value(weft_task_store::kinds::LiveArrivalResult::Born {
+                execution_id: execution_id.to_string(),
+                instance: "worker-a".into(),
+            })
+            .unwrap(),
+        );
+        state.tasks = tasks.clone();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/chat/room7?wct={token}"))
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        // No resolver answers here (the drive is a recording), so the
+        // connection itself ends not found; what matters is the start.
+        let _ = connection_router(state).oneshot(request).await.unwrap();
+        assert_eq!(*starter.started.lock().unwrap(), vec![execution_id]);
+    }
+
     /// A caller who took too long gets told so, in words that say what
     /// to do, and leaves no execution behind.
     ///
-    /// This is the answer the pod is deliberately kept alive a while
-    /// longer to be able to give. The dispatcher holds the worker past
-    /// the ticket's own expiry precisely so a late caller reaches
-    /// something that can read their ticket and explain, instead of a
-    /// socket that simply does not answer.
+    /// A late caller reaches something that can read their ticket and
+    /// explain, instead of a socket that simply does not answer.
     #[tokio::test]
     async fn a_caller_whose_ticket_ran_out_is_told_to_ask_again() {
         use tower::ServiceExt as _;
         let (mut state, _) = server_state();
         let tasks = Arc::new(ArrivalTasks::default());
         state.tasks = tasks.clone();
-        let (token, _) = routing_token(&[], "pod-a", state.clock.now_unix() - 1);
+        let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() - 1);
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/chat/room7?wct={token}"))
@@ -2833,14 +2892,15 @@ mod tests {
         assert!(tasks.asked.lock().unwrap().is_empty(), "a refused caller starts nothing");
     }
 
-    /// A token for another pod, or a forged one, never asks for a birth.
+    /// A token for another project, or a forged one, never asks for a
+    /// birth.
     #[tokio::test]
-    async fn a_token_for_another_pod_asks_for_nothing() {
+    async fn a_token_for_another_project_asks_for_nothing() {
         use tower::ServiceExt as _;
         let (mut state, _) = server_state();
         let tasks = Arc::new(ArrivalTasks::default());
         state.tasks = tasks.clone();
-        let (token, _) = routing_token(&[], "pod-b", state.clock.now_unix() + 60);
+        let (token, _) = routing_token(&[], uuid::Uuid::from_u128(0xbad), state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("GET")
             .uri(format!("/feed?wct={token}"))
@@ -2877,12 +2937,12 @@ mod tests {
         Fut: std::future::Future<Output = ()> + Send,
     {
         let (state, canceller) = server_state();
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let registry = state.registry.clone();
         // The program side: wait for the attach, then talk.
         tokio::spawn(async move {
             let conn = registry
-                .wait_for_attach(color, std::time::Duration::from_secs(5))
+                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
                 .await
                 .expect("the connection attaches");
             program(conn).await;
@@ -2894,7 +2954,7 @@ mod tests {
         });
         let response = drive_http(
             state,
-            color,
+            execution_id,
             http_cfg(),
             0,
             request,
@@ -2937,17 +2997,17 @@ mod tests {
     async fn open_exchange<F, Fut>(
         heartbeat_secs: u64,
         program: F,
-    ) -> (Response, Color, Arc<RecordingCanceller>)
+    ) -> (Response, ExecutionId, Arc<RecordingCanceller>)
     where
         F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
         let (state, canceller) = server_state();
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let registry = state.registry.clone();
         tokio::spawn(async move {
             let conn = registry
-                .wait_for_attach(color, std::time::Duration::from_secs(5))
+                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
                 .await
                 .expect("the connection attaches");
             program(conn).await;
@@ -2955,7 +3015,7 @@ mod tests {
         let request = Arc::new(LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() });
         let response = drive_http(
             state,
-            color,
+            execution_id,
             http_cfg(),
             heartbeat_secs,
             request,
@@ -2963,7 +3023,7 @@ mod tests {
             axum::body::Body::empty(),
         )
         .await;
-        (response, color, canceller)
+        (response, execution_id, canceller)
     }
 
     /// A program that streams a first event under an SSE head and then
@@ -3000,7 +3060,7 @@ mod tests {
     #[tokio::test]
     async fn a_caller_leaving_a_quiet_stream_cancels_the_run_without_a_write() {
         use tokio_stream::StreamExt as _;
-        let (response, color, canceller) = open_exchange(0, quiet_feed).await;
+        let (response, execution_id, canceller) = open_exchange(0, quiet_feed).await;
         let mut body = response.into_body().into_data_stream();
         let first = body.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"data: first\n\n");
@@ -3010,7 +3070,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the run was never cancelled after the caller left");
             tokio::task::yield_now().await;
         }
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[color]);
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
     }
 
     /// A feed that has not said ANYTHING yet: the bus it watches was
@@ -3023,11 +3083,11 @@ mod tests {
     #[tokio::test]
     async fn a_caller_leaving_before_the_first_byte_still_ends_the_run() {
         let (state, canceller) = server_state();
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let registry = state.registry.clone();
         tokio::spawn(async move {
             let conn = registry
-                .wait_for_attach(color, std::time::Duration::from_secs(5))
+                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
                 .await
                 .expect("the connection attaches");
             let CallerHandle::Http(_http) = CallerHandle::from_connection(conn) else { unreachable!() };
@@ -3040,7 +3100,7 @@ mod tests {
         // connection goes.
         let handler = tokio::spawn(drive_http(
             state,
-            color,
+            execution_id,
             http_cfg(),
             1,
             request,
@@ -3058,7 +3118,7 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[color]);
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
     }
 
     /// A run that answered ended the exchange itself: it is left to
@@ -3224,7 +3284,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_end_answers_500_with_the_reason() {
         let (state, _canceller) = server_state();
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let registry = state.registry.clone();
         let request = Arc::new(LiveRequest::default());
         let cfg = CallerRuntimeConfig { max_session_secs: 1, ..http_cfg() };
@@ -3233,7 +3293,7 @@ mod tests {
             // returns at once) ends the exchange with the head held.
             let response = drive_http(
                 state,
-                color,
+                execution_id,
                 cfg,
                 0,
                 request,
@@ -3247,7 +3307,7 @@ mod tests {
         };
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("session cap exceeded"), "got: {body}");
-        assert!(registry.get(color).is_none(), "the connection was detached");
+        assert!(registry.get(execution_id).is_none(), "the connection was detached");
     }
 
     #[tokio::test]
@@ -3255,7 +3315,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let (conn, _out, _inb) = new_connection(
             http_cfg(),
-            Color::nil(),
+            ExecutionId::nil(),
             Arc::new(LiveRequest::default()),
             Some(InboundMessage::Json(serde_json::Value::Null)),
             sink,
@@ -3277,7 +3337,7 @@ mod tests {
     async fn a_websocket_drops_heads_and_queues_its_close_reason() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out, _inb) =
-            new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.send_chunk(Some(ResponseHead::new(201)), OutboundChunk::Text("a".into()))
             .await
             .unwrap();
@@ -3302,7 +3362,7 @@ mod tests {
     async fn a_websocket_run_that_ends_closes_the_socket_normally() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out, _inb) =
-            new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.run_ended().await;
         assert!(
             matches!(out.recv().await.unwrap(), Outbound::Terminate(None, None)),
@@ -3331,7 +3391,7 @@ mod tests {
         worker_threads: 4,
         async fn body() {
             let sink = std::sync::Arc::new(RecordingSink::default());
-            let (conn, _out, inbound) = new_connection(ws_cfg(), Color::nil(), Arc::new(LiveRequest::default()), None, sink);
+            let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
             let inbound = inbound.expect("ws has inbound");
             let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
                 unreachable!()

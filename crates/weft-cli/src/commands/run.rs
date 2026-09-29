@@ -87,15 +87,15 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
     let node_set = args.node_set.unwrap_or(weft_compiler::codegen::NodeSet::Full);
     let definition = compiled.definition.clone();
-    let handle = super::ensure::register_compiled(ctx, progress, node_set, compiled).await?;
+    let handle = super::ensure::build_compiled(ctx, progress, node_set, compiled).await?;
     if !ctx.json() {
         println!("registered {} ({})", handle.name, handle.id);
     }
     // SYNC: body <-> crates/weft-dispatcher/src/api/versions.rs VersionRunRequest
     let body = serde_json::json!({
         "manifest": handle.manifest,
-        "definitionHash": handle.plan.definition_hash,
-        "binaryHash": handle.plan.binary_hash,
+        "definitionHash": handle.definition_hash(),
+        "binaryHash": handle.binary_hash(),
         "seed": args.seed,
         "seedUntil": args.seed_until,
         "seedBefore": args.seed_before,
@@ -106,12 +106,12 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
     let started = start_run(&handle.client, &path, &body).await?;
-    let color = started.color.clone();
-    progress.dispatcher_call_done(serde_json::json!({ "color": color, "project_id": handle.id }));
+    let execution_id = started.execution_id.clone();
+    progress.dispatcher_call_done(serde_json::json!({ "execution_id": execution_id, "project_id": handle.id }));
 
     let summary = summary_line(&started, spec.as_ref());
     if !ctx.json() {
-        println!("started color {color} on version {}", super::versions::short(&started.version));
+        println!("started execution {execution_id} on version {}", super::versions::short(&started.version));
     }
     // After the line that says the run started, because that is what
     // they are about ("this run started, but head moved ..."). One
@@ -130,7 +130,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if args.detach || ctx.json() {
         return Ok(());
     }
-    super::follow::follow_color(&handle.client, &color, Some(&definition)).await?;
+    super::follow::follow_execution_id(&handle.client, &execution_id, Some(&definition)).await?;
     Ok(())
 }
 
@@ -154,7 +154,7 @@ fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec
 // SYNC: Started <-> crates/weft-dispatcher/src/api/versions.rs VersionRunResponse
 #[derive(Debug, serde::Deserialize)]
 pub struct Started {
-    pub color: String,
+    pub execution_id: String,
     pub version: String,
     pub seed: Option<String>,
     pub inherited: Vec<String>,
@@ -208,7 +208,7 @@ mod tests {
 
     fn started(seed: Option<&str>, inherited: &[&str], ran: &[&str]) -> Started {
         Started {
-            color: "c".into(),
+            execution_id: "c".into(),
             version: "v".into(),
             seed: seed.map(str::to_string),
             inherited: inherited.iter().map(|s| s.to_string()).collect(),

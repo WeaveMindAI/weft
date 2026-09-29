@@ -13,7 +13,7 @@ use crate::frames::{Located, LoopFrames};
 use crate::project::selection::{source_place, RunSelection, SelectionBounds};
 use crate::project::ProjectDefinition;
 use crate::weft_type::WeftType;
-use crate::Color;
+use crate::ExecutionId;
 
 pub type PortValues = BTreeMap<String, BTreeMap<String, Value>>;
 /// A group's simulated outputs: the group id and one value per output port.
@@ -25,7 +25,7 @@ pub type GroupOutputs = (String, BTreeMap<String, Value>);
 pub struct BakeSummary {
     pub program: crate::project::hash::ProgramIdentity,
     pub captured: Vec<String>,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub at_unix: u64,
 }
 
@@ -81,6 +81,9 @@ pub struct RunSpec {
     /// ([`refuse_memberless`]), unused otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<crate::member::MemberId>,
+    /// How long the run may run (`weft run --long`; `crate::run_class`).
+    #[serde(default, skip_serializing_if = "crate::run_class::RunClass::is_default")]
+    pub run_class: crate::run_class::RunClass,
 }
 
 fn deserialize_unique<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
@@ -191,7 +194,7 @@ pub struct Answer {
 #[serde(deny_unknown_fields)]
 pub struct FrozenFrom {
     pub version: String,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub definition_hash: String,
 }
 
@@ -971,7 +974,7 @@ mod tests {
             definition_hash: "graph".into(), binary_hash: "binary".into(),
             implementations: BTreeMap::from([("T".into(), "implementation".into())]),
         };
-        let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], color: Color::nil(), at_unix: 1 };
+        let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], execution_id: ExecutionId::nil(), at_unix: 1 };
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_ok());
         assert!(validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string().contains("weft bake"));
         bake.captured.clear();

@@ -22,12 +22,12 @@ async fn a_fire_runs_its_own_program_and_skips_the_other() -> anyhow::Result<()>
     let pid = project.id();
 
     project.activate().await?;
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
 
     let form = human::wait_for_form_by_node(&disp, &pid, "start_x").await?;
     human::answer_form(&disp, &form, &json!({ "go": "approve" })).await?;
-    let color = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, color).await?;
+    let execution_id = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
 
     // The fired program runs whole and the run completes.
     settled.completed()?;

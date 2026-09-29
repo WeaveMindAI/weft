@@ -55,15 +55,15 @@ describe('parseStatusPayload', () => {
 describe('parseRunning', () => {
   it('keeps the dispatcher order and each phase', () => {
     const running = parseRunning({
-      executions: { running: [{ color: 'a', phase: 'infra_setup' }, { color: 'b', phase: 'fire' }] },
+      executions: { running: [{ execution_id: 'a', phase: 'infra_setup' }, { execution_id: 'b', phase: 'fire' }] },
     });
-    expect(running).toEqual([{ color: 'a', phase: 'infra_setup' }, { color: 'b', phase: 'fire' }]);
+    expect(running).toEqual([{ execution_id: 'a', phase: 'infra_setup' }, { execution_id: 'b', phase: 'fire' }]);
     expect(parseRunning({})).toEqual([]);
   });
 
   it('refuses a phase it does not know rather than showing it as a run', () => {
     expect(() => parseRunning({
-      executions: { running: [{ color: 'a', phase: 'mystery' as never }] },
+      executions: { running: [{ execution_id: 'a', phase: 'mystery' as never }] },
     })).toThrow(/cannot read/);
   });
 });

@@ -215,7 +215,7 @@ fn a_fallback_is_checked_now_and_a_bare_marker_later() {
 /// A member's list field reads through the connection its run would use:
 /// the wire into the widget's access input leads to the access node, whose
 /// connection is the member's value when it is `@member_filled` and the
-/// written one otherwise. Across a group's port, the same.
+/// install's pick otherwise. Across a group's port, the same.
 #[test]
 fn a_list_field_reads_through_the_members_connection() {
     use weft_core::frames::Located;
@@ -231,26 +231,29 @@ read.account = google.access
     let at = Located::top("read");
     // Not connected yet: the field listing shows no connection (so a new
     // member's settings page still opens), the lookup refuses with why.
-    let pending = lookup_connection(&project, &at, "spreadsheet", &MemberValues::new()).unwrap();
+    let pending = lookup_connection(&project, &at, "spreadsheet", &MemberValues::new(), &MemberValues::new()).unwrap();
     assert!(matches!(&pending, LookupConnection::NotConnected(why) if why.contains("connect your account at 'google' first")), "{pending:?}");
     assert_eq!(pending.whose(), FieldConnection::None);
     let err = pending.signing().unwrap_err();
     assert!(err.contains("connect your account at 'google' first"), "{err}");
     let id = uuid::Uuid::new_v4();
     let values = MemberValues::from([("google".to_string(), [("account".to_string(), serde_json::json!({ "id": id }))].into())]);
-    let found = lookup_connection(&project, &at, "spreadsheet", &values).unwrap().signing().unwrap().expect("a connection");
+    let found = lookup_connection(&project, &at, "spreadsheet", &values, &MemberValues::new()).unwrap().signing().unwrap().expect("a connection");
     assert_eq!((found.id, found.service.as_str()), (id, "google"));
     assert_eq!(found.whose, FieldConnection::Own);
+    let project = build(
+        "google = GoogleAccess\ng = Group(a: Access) -> () {\n  read = GoogleSheetsRead { spreadsheet: @member_filled }\n  read.account = self.a\n}\ng.a = google.access\n",
+    );
+    let unpicked = lookup_connection(&project, &Located::top("g.read"), "spreadsheet", &MemberValues::new(), &MemberValues::new()).unwrap();
+    assert!(matches!(&unpicked, LookupConnection::NotConnected(why) if why.contains("picked on this install")), "{unpicked:?}");
     let shared = uuid::Uuid::new_v4();
-    let project = build(&format!(
-        "google = GoogleAccess {{ account: {{\"id\": \"{shared}\"}} }}\ng = Group(a: Access) -> () {{\n  read = GoogleSheetsRead {{ spreadsheet: @member_filled }}\n  read.account = self.a\n}}\ng.a = google.access\n"
-    ));
-    let found = lookup_connection(&project, &Located::top("g.read"), "spreadsheet", &MemberValues::new())
+    let picks = MemberValues::from([("google".to_string(), [("account".to_string(), serde_json::json!({ "id": shared }))].into())]);
+    let found = lookup_connection(&project, &Located::top("g.read"), "spreadsheet", &MemberValues::new(), &picks)
         .unwrap()
         .signing()
         .unwrap()
         .expect("the shared one");
     assert_eq!(found.id, shared);
     assert_eq!(found.whose, FieldConnection::Shared);
-    assert!(lookup_connection(&project, &Located::top("g.read"), "hasHeader", &MemberValues::new()).is_err());
+    assert!(lookup_connection(&project, &Located::top("g.read"), "hasHeader", &MemberValues::new(), &MemberValues::new()).is_err());
 }

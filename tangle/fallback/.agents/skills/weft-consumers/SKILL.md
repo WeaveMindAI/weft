@@ -72,7 +72,7 @@ Two more, for a [consumer] that manages [signal]s:
 `DELETE /signal/{signal token}` cancels the run behind a [signal] (answers
 204), and
 `DELETE /signal-token/signals` cancels every run the [api token] sees and
-drops its triggers (answers `{ colors_cancelled, entry_signals_dropped }`).
+drops its triggers (answers `{ execution_ids_cancelled, entry_signals_dropped }`).
 Both need an [api token] with **no tag scope** and full project view; a
 narrowed token gets 403, because a cancel reaches sibling questions of the
 same run that the token may not see. `GET /signal-token/health` answers

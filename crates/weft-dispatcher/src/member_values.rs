@@ -19,7 +19,7 @@
 //! Whether a live trigger reads the change is decided and the change
 //! stored under the project row's lock, the one an activation's claim
 //! takes (`ActivationStoreOps::try_begin_activating`), so no activation
-//! on any pod arms on the values this call is replacing.
+//! on any process arms on the values this call is replacing.
 //!
 //! Values are keyed by the project's owning tenant ([`owning_tenant`]),
 //! whichever door the change came through.
@@ -179,7 +179,7 @@ async fn apply(
             .list(project_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read activations: {e}")))?;
-        let reading = triggers_reading(&project, &activations, member, &changes);
+        let reading = triggers_reading(&project, &activations, Some(member), &changes);
         if reading.iter().any(|a| a.lifecycle.status == ProjectStatus::Activating) {
             // One of them is being set up right now (an earlier change of
             // this member's, an activate): this change re-arms after it,
@@ -204,13 +204,8 @@ async fn apply(
         drop(tx);
         let keys = live;
         let rearm = crate::api::project::Rearm {
-            values: &changes,
-            store: crate::activation_store::MemberValuesStore {
-                tenant,
-                member,
-                writes: &writes,
-                cleared: &cleared,
-            },
+            overlay: Some(&changes),
+            store: Some(crate::activation_store::ValuesStore { tenant, member, writes: &writes, cleared: &cleared }),
         };
         let request = crate::api::project::ActivateRequest {
             scope: weft_core::activation::ActivationScope {
@@ -302,17 +297,19 @@ fn refuse_unknown_clears(project: &weft_core::ProjectDefinition, clear: &[(Strin
     Ok(())
 }
 
-/// `member`'s activations whose setup reads a place `changes` touches.
-fn triggers_reading<'a>(
+/// The activations whose setup reads a place `changes` touches: `member`'s
+/// alone, or (`None`, a change of the install's picks, which every owner's
+/// runs read) every owner's.
+pub(crate) fn triggers_reading<'a>(
     project: &weft_core::ProjectDefinition,
     activations: &'a [Activation],
-    member: &MemberId,
+    member: Option<&MemberId>,
     changes: &ValueChanges,
 ) -> Vec<&'a Activation> {
     let touched = changes.places();
     activations
         .iter()
-        .filter(|a| a.key.member() == Some(member))
+        .filter(|a| member.is_none_or(|m| a.key.member() == Some(m)))
         .filter(|a| {
             let (id, path) = weft_core::project::resolve_address(project, &a.key.trigger);
             weft_core::project::selection::RunSelection::setup(project, &[weft_core::frames::Located::new(id, path)])
@@ -331,18 +328,18 @@ fn triggers_reading<'a>(
 
 /// Until the project's activations move: every claim and every end of
 /// one announces itself (`transition::publish_transition_changed`, fanned
-/// out across pods), and the safety interval covers an announcement lost
+/// out across processes), and the safety interval covers an announcement lost
 /// on the way.
-async fn wait_for_activations(events: &mut tokio::sync::broadcast::Receiver<crate::events::LiveEvent>) {
+pub(crate) async fn wait_for_activations(events: &mut tokio::sync::broadcast::Receiver<crate::events::LiveEvent>) {
     tokio::select! {
         _ = events.recv() => {}
-        _ = tokio::time::sleep(crate::pg_wake::SAFETY_POLL_INTERVAL) => {}
+        _ = tokio::time::sleep(weft_task_store::drain::SAFETY_POLL_INTERVAL) => {}
     }
 }
 
 /// An access-store failure as the API answers it (a refusal the store
 /// names keeps its status; anything else is a 500).
-fn access_error(e: anyhow::Error) -> ApiError {
+pub(crate) fn access_error(e: anyhow::Error) -> ApiError {
     let (status, message) = weft_access_store::client_error(e);
     (StatusCode::from_u16(status).expect("store status codes are valid"), message)
 }

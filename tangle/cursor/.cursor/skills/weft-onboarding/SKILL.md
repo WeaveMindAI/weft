@@ -91,7 +91,7 @@ project has the thing to show, or they ask.
 5. **The sidebar.** "Projects" lists every program; "Executions" lists
    every run. "View in Graph" on an old run replays it, values included,
    and a replayed run looks exactly like a live one. Tell them the same
-   list exists as `weft executions` and `weft events <color>` in a
+   list exists as `weft executions` and `weft events <execution-id>` in a
    terminal.
 6. **Build something.** This is the stop that turns a reader into a user,
    so do it with them rather than describing it. Ctrl+P (Cmd+P) opens the
@@ -151,7 +151,7 @@ project has the thing to show, or they ask.
     cyan, the task appears in the browser extension, the answer resumes
     the run. The wait costs nothing, however long, and there is no
     deadline on it: ending one is somebody's decision, through "Cancel
-    run" on the card or `weft stop <color>`. Extension setup, including
+    run" on the card or `weft stop <execution-id>`. Extension setup, including
     minting the token it needs, is in the `weft-connections` skill.
 14. **When it breaks.** The Problems panel fills as they type, the red
     banner names what failed, and a failed box is clickable like any

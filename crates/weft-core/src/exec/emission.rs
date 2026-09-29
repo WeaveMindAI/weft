@@ -5,7 +5,7 @@
 //! to the journal on the `PortEmitted` row), a firing's termination
 //! sweep, a group boundary forwarding, a loop launching an iteration
 //! or emitting outward (those ids are DERIVED from what the journal
-//! already records: the color, the node or group, the frames, the
+//! already records: the execution, the node or group, the frames, the
 //! ordinal of the firing). A pulse's id is then derived from its
 //! emission id and the wire it lands on. So the live engine and the
 //! journal fold, given the same rows and the same program, put the
@@ -60,11 +60,11 @@ pub fn pulse_id(
 /// one location closes its ports twice, and the two sweeps must not
 /// collide.
 ///
-/// None of the derived emissions below folds the run's color in: a
+/// None of the derived emissions below folds the run's execution in: a
 /// pulse table is one run's, so the location and the ordinal already
 /// name the act, and a seeded run folds rows it inherited from another
 /// run into ITS table (`weft_journal::seed`), where an id that changed
-/// with the color would no longer match the pulse ids those rows name.
+/// with the execution would no longer match the pulse ids those rows name.
 pub fn terminal_sweep_emission(node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
     derived(&TERMINAL_SWEEP, &[node_id, &frames_key(frames), &ordinal.to_string()])
 }

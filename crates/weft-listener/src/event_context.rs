@@ -1,6 +1,6 @@
-//! The per-signal fire plumbing every held-event loop holds: who the
-//! signal is (token, tenant, placement generation), the sink its
-//! fires ride, and the spec-level pre-fire filter.
+//! The per-signal fire plumbing every kind that raises its own fires
+//! holds: who the signal is (token, tenant), the sink its fires ride,
+//! and the spec-level pre-fire filter.
 //!
 //! ONE gate for every kind: a payload that fails the signal's
 //! declared predicates is dropped here, between "the kind produced a
@@ -30,10 +30,6 @@ pub enum FireOutcome {
     /// The enqueue failed (logged); the item was NOT delivered and a
     /// cursor must not advance past it.
     EnqueueFailed,
-    /// The broker fenced the enqueue: this pod was drained and the
-    /// fire was deliberately dropped (the replacement pod will offer
-    /// it). NOT delivered; a cursor must not advance past it.
-    Fenced,
     /// The broker does not know this signal's token (HTTP 404). NOT
     /// delivered. It means either the row is not committed yet (a fire
     /// racing its own registration) or the signal is gone; the broker
@@ -47,17 +43,13 @@ pub enum FireOutcome {
 pub struct FireContext {
     sink: FireSignalSink,
     token: String,
-    /// The signal's tenant, stamped on every enqueued fire (a pooled
-    /// listener serves many tenants, so it travels per-signal).
+    /// The signal's tenant, stamped on every enqueued fire (the
+    /// listener serves many tenants, so it travels per signal).
     tenant_id: String,
     /// Whose signal it is (`None` for a shared one), as the dispatcher
     /// registered it: a member's trigger reads through that member's
     /// connections alone.
     for_member: Option<weft_core::member::MemberScope>,
-    /// The generation this pod holds the signal under, stamped on
-    /// every fire so the broker can fence a stale old-pod fire during
-    /// a scale-down move overlap.
-    placement_generation: i64,
     /// The spec-level pre-fire filter. Empty = fire on everything.
     predicates: Vec<Predicate>,
 }
@@ -68,10 +60,9 @@ impl FireContext {
         token: String,
         tenant_id: String,
         for_member: Option<weft_core::member::MemberScope>,
-        placement_generation: i64,
         predicates: Vec<Predicate>,
     ) -> Self {
-        Self { sink, token, tenant_id, for_member, placement_generation, predicates }
+        Self { sink, token, tenant_id, for_member, predicates }
     }
 
     pub fn token(&self) -> &str {
@@ -94,6 +85,18 @@ impl FireContext {
     /// re-offer this one next poll instead of losing it. `target` is
     /// the caller's kind tag, so the log names it.
     pub async fn fire(&self, payload: Value, target: &str) -> FireOutcome {
+        self.fire_keyed(payload, target, crate::fire_sink::FireIdentity::Payload).await
+    }
+
+    /// [`Self::fire`] for an event with a name of its own (a timer's
+    /// moment, `tick:{due}`): a re-fire of the same name collapses onto a
+    /// fire still queued, whatever its payload says, so a kind that fires
+    /// before claiming can retry without firing twice.
+    pub async fn fire_as(&self, payload: Value, target: &str, name: &str) -> FireOutcome {
+        self.fire_keyed(payload, target, crate::fire_sink::FireIdentity::Named(name)).await
+    }
+
+    async fn fire_keyed(&self, payload: Value, target: &str, identity: crate::fire_sink::FireIdentity<'_>) -> FireOutcome {
         if !matches(&self.predicates, &payload) {
             debug!(
                 target: "weft_listener::event_context",
@@ -103,23 +106,8 @@ impl FireContext {
             return FireOutcome::Filtered;
         }
         use weft_task_store::tasks::DedupOutcome;
-        match self
-            .sink
-            .fire(&self.token, &self.tenant_id, self.placement_generation, payload)
-            .await
-        {
-            Ok(DedupOutcome::Inserted(_)) | Ok(DedupOutcome::AlreadyLive(_)) => {
-                FireOutcome::Fired
-            }
-            Ok(DedupOutcome::Fenced) => {
-                debug!(
-                    target: "weft_listener::event_context",
-                    kind = target, token = %self.token,
-                    "fire fenced (this pod was drained); the replacement pod \
-                     will offer the event"
-                );
-                FireOutcome::Fenced
-            }
+        match self.sink.fire(&self.token, &self.tenant_id, payload, identity).await {
+            Ok(DedupOutcome::Inserted(_)) | Ok(DedupOutcome::AlreadyLive(_)) => FireOutcome::Fired,
             Err(e) if e
                 .downcast_ref::<weft_broker_client::BrokerRefused>()
                 .is_some_and(|r| r.status == reqwest::StatusCode::NOT_FOUND) =>
@@ -142,29 +130,11 @@ impl FireContext {
         }
     }
 
-    /// Persist the kind's evolving durable state (a delta-poll
-    /// cursor). Same never-kill-the-loop error posture as `fire`: an
-    /// enqueue failure is logged and the loop keeps serving (the next
-    /// advance re-carries the full state, so a lost write only widens
-    /// the at-least-once redelivery window, never loses ground
-    /// permanently). `target` is the caller's kind tag for the log.
-    pub async fn update_kind_state(&self, kind_state: Value, seq: i64, target: &str) {
-        if let Err(e) = self
-            .sink
-            .update_kind_state(
-                &self.token,
-                &self.tenant_id,
-                self.placement_generation,
-                kind_state,
-                seq,
-            )
-            .await
-        {
-            warn!(
-                target: "weft_listener::event_context",
-                kind = target, token = %self.token, error = %e,
-                "kind-state update enqueue failed"
-            );
-        }
+    /// Claim a moment by moving the kind's state from `from_seq` to
+    /// `kind_state` at `from_seq + 1`: of two copies of the listener
+    /// woken for the same moment, exactly one sees `Ok(true)`, and only
+    /// that one acts on it. `Err` is a write that could not be made.
+    pub async fn claim_kind_state(&self, kind_state: Value, from_seq: i64) -> anyhow::Result<bool> {
+        self.sink.claim_kind_state(&self.token, kind_state, from_seq).await
     }
 }

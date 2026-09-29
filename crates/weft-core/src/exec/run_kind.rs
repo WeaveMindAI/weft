@@ -1,10 +1,10 @@
 //! What a run IS, decided once at its birth: a project run, a node's
 //! self-test, or a project run nobody keeps a record of. Every kind is a
-//! real color (broker scope, cost attribution, owner fencing, cancel);
+//! real execution (broker scope, cost attribution, owner fencing, cancel);
 //! what differs is who owns its lifetime and what the journal keeps.
 //!
 //! The birth event carries it (`ExecutionStarted.run_kind`) and the
-//! `execution_color.kind` column copies it, so every sweep and listing
+//! `execution.kind` column copies it, so every sweep and listing
 //! filters on a column. Only `Execution` is listed and swept by the
 //! project lifecycle.
 
@@ -30,7 +30,7 @@ pub enum RunKind {
 }
 
 impl RunKind {
-    /// The `execution_color.kind` spelling.
+    /// The `execution.kind` spelling.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Execution => "execution",

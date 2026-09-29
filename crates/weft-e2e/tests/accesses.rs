@@ -18,8 +18,8 @@
 //!   s3          WEFT_E2E_S3_ENDPOINT, WEFT_E2E_S3_REGION,
 //!               WEFT_E2E_S3_ACCESS_KEY_ID, WEFT_E2E_S3_SECRET_ACCESS_KEY,
 //!               WEFT_E2E_S3_BUCKET
-//!   db seeding  WEFT_E2E_DATABASE_URL (the store's Postgres, e.g. a
-//!               port-forward of the dev cluster's weft-postgres): the
+//!   db seeding  WEFT_E2E_DATABASE_URL (the store's Postgres; the
+//!               runner reads it from the install's secrets.env): the
 //!               drift-backstop and refresh e2es seed grant rows
 //!               directly (no HTTP door writes arbitrary grants).
 //!
@@ -38,22 +38,53 @@ use weft_e2e::{project::Project, run};
 
 // ---------- runtime stale-connection backstop (no credentials needed) ----------
 
-/// A marker referencing a connection the store does not hold (a
-/// project imported from elsewhere, a deleted connection) fails LOUD
-/// at resolution, naming the fix. Needs a cluster, no creds.
+/// A connection is picked on the install, never in the source: a pick of
+/// a connection the store does not hold is refused as it is made, and
+/// forgetting a picked connection takes the pick with it, so the next run
+/// is refused before it starts, naming `weft connect`. Needs the store's
+/// Postgres (to seed a connection), no provider credentials.
 #[tokio::test]
-async fn a_stale_connection_fails_loud_at_resolution() -> Result<()> {
+async fn a_forgotten_connection_leaves_its_node_unpicked() -> Result<()> {
+    let Some(db_url) = env_or_skip("WEFT_E2E_DATABASE_URL") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("access_stale", disp).await?;
-    set_account(
-        &project,
-        "ws",
-        "account",
-        &json!({ "id": uuid::Uuid::new_v4().to_string(), "identity": "someone-elses" }),
-    )?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url)
+        .await
+        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let project = Project::prepare("access_stale", disp).await?;
     project.set_node_config("send", "channel", "\"C000\"")?;
-    let settled = run::run_and_settle(&mut project).await?;
-    settled.failed_with("pick one on the access node")?;
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let refused = project.weft_refused(&["connect", "--node", "ws", "--grant", &unknown]).await?;
+    anyhow::ensure!(refused.contains(&unknown), "the unknown connection is named: {refused}");
+
+    let grant_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO access_grant
+           (id, tenant_id, service, registration_sealed, project_id, spec_json, values_sealed,
+            granted_scopes, permissions_verified, identity, expires_at)
+         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'stale-test', NULL)",
+    )
+    .bind(grant_id)
+    .bind(catalog_spec("slack", "access")?)
+    .bind(weft_access_store::seal_json(&json!({ "token": "xoxb-never-used" }))?)
+    .bind(json!(["chat:write"]))
+    .execute(&pool)
+    .await?;
+    let seeded = SeededGrant::new(pool.clone(), grant_id)?;
+    set_account(&project, "ws", &json!({ "id": grant_id.to_string() })).await?;
+    seeded.finish().await?;
+
+    let refused = project.weft_refused(&["run"]).await?;
+    anyhow::ensure!(
+        refused.contains("no slack connection picked on this install") && refused.contains("weft connect --node ws"),
+        "{refused}"
+    );
+    anyhow::ensure!(
+        run::executions(project.dispatcher(), &project.id()).await?.is_empty(),
+        "a refused run starts nothing"
+    );
     project.finish().await
 }
 
@@ -73,7 +104,7 @@ async fn exa_key_runs_a_real_search() -> Result<()> {
             .await?;
 
     let mut project = Project::prepare("access_exa", disp).await?;
-    set_account(&project, "exa", "account", conn.handle())?;
+    set_account(&project, "exa", conn.handle()).await?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     let count = settled
@@ -100,7 +131,7 @@ async fn telegram_bot_sends_a_real_message() -> Result<()> {
             .await?;
 
     let mut project = Project::prepare("access_telegram", disp).await?;
-    set_account(&project, "bot", "account", conn.handle())?;
+    set_account(&project, "bot", conn.handle()).await?;
     project.set_node_config("send", "chatId", &format!("{chat:?}"))?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -129,7 +160,7 @@ async fn slack_bot_token_posts_a_real_message() -> Result<()> {
         connect_paste(&disp, catalog_spec("slack", "access")?, json!({ "token": token })).await?;
 
     let mut project = Project::prepare("access_slack_bot", disp).await?;
-    set_account(&project, "ws", "account", conn.handle())?;
+    set_account(&project, "ws", conn.handle()).await?;
     project.set_node_config("send", "channel", &format!("{channel:?}"))?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -174,12 +205,7 @@ async fn scope_drift_is_refused_at_resolution() -> Result<()> {
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
 
     let mut project = Project::prepare("access_slack_oauth", disp).await?;
-    set_account(
-        &project,
-        "ws",
-        "account",
-        &json!({ "id": grant_id.to_string(), "identity": "drift-test" }),
-    )?;
+    set_account(&project, "ws", &json!({ "id": grant_id.to_string(), "identity": "drift-test" })).await?;
     project.set_node_config("send", "channel", "\"C000\"")?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.failed_with("chat:write")?;
@@ -241,12 +267,7 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
 
     let mut project = Project::prepare("access_gdrive", disp).await?;
-    set_account(
-        &project,
-        "acct",
-        "account",
-        &json!({ "id": grant_id.to_string(), "identity": "gdrive-e2e" }),
-    )?;
+    set_account(&project, "acct", &json!({ "id": grant_id.to_string(), "identity": "gdrive-e2e" })).await?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     anyhow::ensure!(
@@ -306,7 +327,7 @@ async fn s3_sigv4_uploads_a_real_object() -> Result<()> {
     .await?;
 
     let mut project = Project::prepare("access_s3", disp).await?;
-    set_account(&project, "store", "account", conn.handle())?;
+    set_account(&project, "store", conn.handle()).await?;
     project.set_node_config("put", "bucket", &format!("{bucket:?}"))?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

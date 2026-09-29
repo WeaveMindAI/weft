@@ -317,8 +317,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ON runtime_file(expires_at_unix) WHERE expires_at_unix IS NOT NULL;
         -- One row per minted PUBLIC RELAY link: the public
         -- `/public/files/{token}` route resolves the token here and
-        -- streams the file. `fetch_url` is a presigned in-cluster GET
-        -- the relay reads the bytes from, signed for the same lifetime
+        -- streams the file. `fetch_url` is a presigned GET, signed for the
+        -- endpoint the runtime does its own I/O on (the broker relays the
+        -- bytes from it), for the same lifetime
         -- as the token. Rows expire with the link; every mint deletes
         -- the expired ones, so the table stays the size of the live
         -- link set. ON DELETE CASCADE ties a link to its file row, so a
@@ -378,7 +379,7 @@ impl FileRow {
 }
 
 /// A resolved public-relay link: the headers the relay answers with and
-/// the presigned in-cluster URL it streams the bytes from.
+/// the presigned internal URL it streams the bytes from.
 #[derive(Debug)]
 pub struct PublicLinkTarget {
     pub mime_type: String,
@@ -2001,7 +2002,7 @@ impl RuntimeStore {
     /// them. Minting counts as access (bumps the expiry), and a missing file
     /// fails the mint rather than handing out a 404 URL. A node body's own
     /// link is `download_url` with the Internal audience: the public endpoint
-    /// of a local install is the host's loopback, which a pod cannot reach.
+    /// of a local install is the host's loopback, which a process cannot reach.
     pub async fn presign(&self, parsed: &ParsedKey, ttl_secs: Option<u64>) -> StoreResult<String> {
         Ok(self.presign_get(parsed, PresignAudience::External, ttl_secs).await?.1)
     }
@@ -2009,8 +2010,8 @@ impl RuntimeStore {
     /// Mint a PUBLIC RELAY link token for a file: the returned token
     /// resolves at the public `/public/files/{token}` route, which
     /// streams the bytes. The row carries the metadata
-    /// plus a presigned INTERNAL-audience fetch URL the relay (an
-    /// in-cluster service) reads from, signed for the token's own
+    /// plus a presigned fetch URL the relay (the broker itself) reads
+    /// from, signed for the runtime's own endpoint and the token's own
     /// lifetime. Minting counts as access (bumps a kept file's
     /// expiry), and a minted link is a PROMISE: a file already carrying
     /// an expiry gets it pushed past the link's, so the bytes outlive
@@ -2023,7 +2024,7 @@ impl RuntimeStore {
     ) -> StoreResult<String> {
         let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
         let (meta, fetch_url) =
-            self.presign_get(parsed, PresignAudience::Internal, Some(ttl)).await?;
+            self.presign_get(parsed, PresignAudience::Runtime, Some(ttl)).await?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let now = self.clock.now_unix();
         let link_expiry = now + ttl as i64;
@@ -2069,7 +2070,7 @@ impl RuntimeStore {
     }
 
     /// Resolve a public-relay token to its file: the metadata for the
-    /// response headers plus the presigned in-cluster fetch URL minted
+    /// response headers plus the presigned internal fetch URL minted
     /// with it. `None` for a missing OR expired token (the two must be
     /// indistinguishable to the outside).
     pub async fn resolve_public_link(&self, token: &str) -> Result<Option<PublicLinkTarget>> {
@@ -2092,7 +2093,7 @@ impl RuntimeStore {
 
     /// Mint a presigned GET URL a WORKER uses to read a runtime file's bytes
     /// DIRECTLY from the bucket, plus its metadata. Bytes never transit the broker.
-    /// Signed for the INTERNAL endpoint (the worker is in-cluster). Counts as access
+    /// Signed for the INTERNAL endpoint (the worker is internal). Counts as access
     /// (bumps a kept file's expiry), like the old streaming get did.
     pub async fn download_url(
         &self,
@@ -2157,8 +2158,8 @@ impl RuntimeStore {
         Ok(removed)
     }
 
-    /// Terminate sweep: close out a color's un-kept exec files (the
-    /// `<tenant>/exec/<color>/` prefix, kept files excepted).
+    /// Terminate sweep: close out an execution's un-kept exec files (the
+    /// `<tenant>/exec/<execution_id>/` prefix, kept files excepted).
     ///
     /// - A COMPLETED un-kept file is not deleted here: it gets
     ///   `expires_at_unix = now + EXEC_LINGER_TTL_SECS` stamped, so the user
@@ -2171,10 +2172,10 @@ impl RuntimeStore {
     ///   file). A leftover 'reaping' row from a crashed reap is retried.
     ///
     /// Returns `(reaped, lingering)`: rows removed now vs stamped to expire.
-    pub async fn sweep_exec(&self, tenant: &str, color: &str) -> Result<(u64, u64)> {
+    pub async fn sweep_exec(&self, tenant: &str, execution_id: &str) -> Result<(u64, u64)> {
         // Rendered through the key grammar (never hand-built): validates both
         // segments and keeps the scope tag single-sourced.
-        let prefix = weft_core::storage::key::exec_prefix(tenant, color)
+        let prefix = weft_core::storage::key::exec_prefix(tenant, execution_id)
             .map_err(|e| anyhow::anyhow!("sweep_exec: {e}"))?;
         let mut reaped = 0;
         let mut lingering = 0;

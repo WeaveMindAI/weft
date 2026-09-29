@@ -32,9 +32,6 @@ its worker.
 for this run. It is how a step says no rather than saying nothing. Not `null`,
 which is data.
 
-**Color.** One execution. A re-run is a new color, so "per color" always means
-per run. The first eight characters are enough to name one.
-
 **Connection.** One account somebody connected to a service. Its credential
 lives in weft's store, sealed, and never in your program.
 
@@ -95,7 +92,7 @@ never states a cost.
 **Node.** One step of a program. On disk, a folder with a `metadata.json` and a
 `mod.rs`.
 
-**Pulse.** One emission travelling to one input, carrying a value, a color and
+**Pulse.** One emission travelling to one input, carrying a value, an execution id and
 a frame stack. The only thing that moves in a running program.
 
 **Recipe.** The `service` block in an access node's metadata: how a credential
@@ -143,8 +140,8 @@ project.
 **Trigger.** A node that starts a run from outside. Two bodies: setup, which
 runs once at activation, and run, which fires on each event.
 
-**Unit.** One pod template inside an infrastructure spec. Most nodes have
-exactly one.
+**Unit.** One set of containers inside an infrastructure spec, running
+together on one machine. Most nodes have exactly one.
 
 **Version.** A snapshot of your project's files, recorded on every run and by
 `weft checkpoint`.
@@ -152,5 +149,6 @@ exactly one.
 **Waiting for input.** A run parked on a person or a service. The worker shuts
 down and costs nothing, and a fresh one picks the run up when the answer lands.
 
-**Worker.** Your compiled program, running as a pod, serving as many runs at
-once as it can. It shuts itself down 30 seconds after it has nothing left.
+**Worker.** A container (on your machine) or Cloud Run service (on a cloud
+install) running your compiled program. For how it starts and stops, go and read
+[the worker](../running/architecture.md#the-worker).

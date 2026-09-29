@@ -1,7 +1,7 @@
-//! Worker-facing task, worker-pod and infra surfaces.
+//! Worker-facing task and infra surfaces.
 //!
-//! The task and worker-pod shapes mirror the free functions in `tasks`
-//! and `worker_pod`; `InfraReader` reads the dispatcher-written
+//! The task shape mirrors the free functions in `tasks`; `InfraReader`
+//! reads the dispatcher-written
 //! `infra_node` table. Two implementations per trait:
 //!   - `Postgres*` (this crate): direct DB. Used by the dispatcher and
 //!     by the broker (after its scope check).
@@ -12,8 +12,8 @@
 //! decides whose copy that run may reach. The broker reads the row
 //! through `PostgresInfraReader::endpoint_address` after that check.
 //!
-//! The engine takes `TaskStoreClient`, `WorkerPodClient` and
-//! `InfraReader`; the listener takes only `TaskStoreClient`.
+//! The engine takes `TaskStoreClient` and `InfraReader`; the listener
+//! takes only `TaskStoreClient`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,10 +26,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::pg_signal::PgSignalWatch;
-use crate::worker_pod::WorkerStanding;
-use crate::tasks::{
-    ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome,
-};
+use crate::tasks::{CancelAsked, ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome};
 
 #[async_trait]
 pub trait TaskStoreClient: Send + Sync {
@@ -40,49 +37,31 @@ pub trait TaskStoreClient: Send + Sync {
     /// [`crate::terminal`]), never on a polling tick.
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome>;
 
-    /// Picker primitive: claim one pending or stale-claimed row that
-    /// matches the filter, and when there is none, hold for up to
-    /// `wait` for one to become claimable (see
-    /// [`crate::tasks::TASK_READY_CHANNEL`]). `None` once `wait` passed
-    /// with nothing to claim; a zero `wait` answers at once. Used by
-    /// both pickers.
-    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
+    /// Claim one pending or stale-claimed row that matches the filter,
+    /// and when there is none, hold for up to `wait` for one to become
+    /// claimable (see [`crate::tasks::TASK_READY_CHANNEL`]). `None` once
+    /// `wait` passed with nothing to claim; a zero `wait` answers at once.
+    /// The dispatcher's picker holds; a worker handed one execution asks
+    /// once.
+    async fn claim_one(&self, instance: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
 
-    async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool>;
+    async fn heartbeat(&self, task_id: Uuid, instance: &str) -> Result<bool>;
 
     /// Surrender a claim back to `pending` (no claimant), guarded on
-    /// `claimed_by = pod_id` so a row already re-claimed elsewhere is
+    /// `claimed_by = instance` so a row already re-claimed elsewhere is
     /// never clobbered. Returns true when the requeue landed. See
     /// `tasks::requeue`.
-    async fn requeue(&self, task_id: Uuid, pod_id: &str) -> Result<bool>;
+    async fn requeue(&self, task_id: Uuid, instance: &str) -> Result<bool>;
 
-    async fn complete(&self, task_id: Uuid, pod_id: &str, result: Value) -> Result<()>;
+    async fn complete(&self, task_id: Uuid, instance: &str, result: Value) -> Result<()>;
 
-    async fn fail(&self, task_id: Uuid, pod_id: &str, error: String) -> Result<()>;
-}
+    async fn fail(&self, task_id: Uuid, instance: &str, error: String) -> Result<()>;
 
-#[async_trait]
-pub trait WorkerPodClient: Send + Sync {
-    async fn register_alive(
-        &self,
-        pod_name: &str,
-        project_id: Uuid,
-    ) -> Result<()>;
-
-    /// Heartbeat + self-reported memory pressure ([0,1]) in one call.
-    /// The worker reads its own cgroup pressure each tick and reports it
-    /// so the dispatcher places / scales workers by real memory load.
-    /// Answers the pod's standing off its own row (`None`: the row is no
-    /// longer alive, the pod shuts down). See `worker_pod::heartbeat`.
-    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>>;
-
-    async fn mark_done(&self, pod_name: &str) -> Result<()>;
-
-    /// Guarded idle self-exit: flip `alive -> done` IFF no
-    /// pending/claimed worker task for the pod's own project (read
-    /// from its row, not a parameter). Returns true if this pod won
-    /// the flip. See `worker_pod::mark_done_if_idle`.
-    async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool>;
+    /// The cancels asked for any of `execution_ids` of `project_id` (the
+    /// executions the asking worker drives), each taken as it is
+    /// answered; when there are none, hold for up to `wait` for one. An
+    /// empty answer once `wait` passed.
+    async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>>;
 }
 
 // ---------- Postgres impls ----------
@@ -115,14 +94,14 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::terminal::wait_for_terminal(&self.pool, &self.signals, task_id, timeout).await
     }
 
-    async fn claim_one(&self, pod_id: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
+    async fn claim_one(&self, instance: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
         let deadline = tokio::time::Instant::now() + wait;
         // Subscribed before the first claim, so a task that lands
         // between an empty claim and the wait still wakes it.
         let mut signals = self.signals.subscribe();
         let ready = filter.ready_payload();
         loop {
-            if let Some(task) = crate::tasks::claim_one(&self.pool, pod_id, &filter).await? {
+            if let Some(task) = crate::tasks::claim_one(&self.pool, instance, &filter).await? {
                 return Ok(Some(task));
             }
             if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
@@ -131,59 +110,39 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         }
     }
 
-    async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
-        crate::tasks::heartbeat(&self.pool, task_id, pod_id).await
+    async fn heartbeat(&self, task_id: Uuid, instance: &str) -> Result<bool> {
+        crate::tasks::heartbeat(&self.pool, task_id, instance).await
     }
 
-    async fn requeue(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
-        crate::tasks::requeue(&self.pool, task_id, pod_id).await
+    async fn requeue(&self, task_id: Uuid, instance: &str) -> Result<bool> {
+        crate::tasks::requeue(&self.pool, task_id, instance).await
     }
 
-    async fn complete(&self, task_id: Uuid, pod_id: &str, result: Value) -> Result<()> {
-        crate::tasks::complete(&self.pool, task_id, pod_id, result).await
+    async fn complete(&self, task_id: Uuid, instance: &str, result: Value) -> Result<()> {
+        crate::tasks::complete(&self.pool, task_id, instance, result).await
     }
 
-    async fn fail(&self, task_id: Uuid, pod_id: &str, error: String) -> Result<()> {
-        crate::tasks::fail(&self.pool, task_id, pod_id, error).await
-    }
-}
-
-pub struct PostgresWorkerPodClient {
-    pool: PgPool,
-}
-
-impl PostgresWorkerPodClient {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-}
-
-#[async_trait]
-impl WorkerPodClient for PostgresWorkerPodClient {
-    async fn register_alive(
-        &self,
-        pod_name: &str,
-        project_id: Uuid,
-    ) -> Result<()> {
-        crate::worker_pod::register_alive(
-            &self.pool,
-            pod_name,
-            project_id,
-            crate::worker_pod::AliveTransition::FromSpawning,
-        )
-        .await
+    async fn fail(&self, task_id: Uuid, instance: &str, error: String) -> Result<()> {
+        crate::tasks::fail(&self.pool, task_id, instance, error).await
     }
 
-    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<Option<WorkerStanding>> {
-        crate::worker_pod::heartbeat(&self.pool, pod_name, mem_pressure).await
-    }
-
-    async fn mark_done(&self, pod_name: &str) -> Result<()> {
-        crate::worker_pod::mark_done(&self.pool, pod_name).await
-    }
-
-    async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool> {
-        crate::worker_pod::mark_done_if_idle(&self.pool, pod_name).await
+    async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        // Subscribed before the first look, so a cancel that lands
+        // between an empty look and the wait still wakes it: a cancel
+        // task is a worker task of the project, announced on its ready
+        // payload like any other.
+        let mut signals = self.signals.subscribe();
+        let ready = crate::tasks::ready_payload(crate::tasks::TaskTarget::Worker, Some(project_id));
+        loop {
+            let taken = crate::tasks::take_cancels(&self.pool, project_id, &execution_ids).await?;
+            if !taken.is_empty() {
+                return Ok(taken);
+            }
+            if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
+                return Ok(Vec::new());
+            }
+        }
     }
 }
 
@@ -192,14 +151,14 @@ impl WorkerPodClient for PostgresWorkerPodClient {
 #[async_trait]
 pub trait InfraReader: Send + Sync {
     /// Where one declared endpoint of an infra node answers, for the
-    /// run `color`. `None` when the node is not Running or declares no
+    /// run `execution_id`. `None` when the node is not Running or declares no
     /// endpoint by that name. Backs `ctx.endpoint(name)` in node code.
     /// The run names only itself: its project, and its member when the
     /// node exists once per member (`per_member`), are the broker's to
     /// resolve, so a run can never reach another member's copy.
     async fn endpoint_address(
         &self,
-        color: weft_core::Color,
+        execution_id: weft_core::ExecutionId,
         node_id: &str,
         per_member: bool,
         endpoint_name: &str,
@@ -208,9 +167,9 @@ pub trait InfraReader: Send + Sync {
 
 pub struct PostgresInfraReader {
     pool: PgPool,
-    /// The front door's base URL, which a `TenantPublic` endpoint's
-    /// stored path hangs off; `None` on an install that has none, and
-    /// then no endpoint has a public URL.
+    /// The install's public base URL, which a public endpoint's stored
+    /// path hangs off; `None` on an install that has none, and then no
+    /// endpoint has a public URL.
     front_door: Option<String>,
 }
 
@@ -253,7 +212,7 @@ impl PostgresInfraReader {
         };
         let public_paths: Value = row.try_get("public_paths_json")?;
         let public_url = match (&self.front_door, entry_in(&public_paths, "public_paths_json", endpoint_name)?) {
-            (Some(base), Some(path)) => Some(weft_core::infra::tenant_public_url(base, &path)),
+            (Some(base), Some(path)) => Some(weft_core::infra::public_url(base, &path)),
             _ => None,
         };
         Ok(Some(weft_core::infra::EndpointAddress { url, public_url }))

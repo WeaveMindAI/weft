@@ -4,7 +4,7 @@
 //! the cancel terminals a tag stop writes. The selection RULE itself is
 //! pure (`weft_journal::tags::select_stop_targets`, layer-1 tested in
 //! its own crate); what this rig proves is the SQL underneath it: the
-//! BIGSERIAL order, the (color, tag) idempotency, the live filter, the
+//! BIGSERIAL order, the (execution, tag) idempotency, the live filter, the
 //! project wall, the row's life ending with the journal's, and the
 //! one-transaction cancel (`Journal::cancel_execution`) that a tag
 //! stop and the stop button both end in.
@@ -22,7 +22,7 @@ use uuid::Uuid;
 use weft_core::exec::CancelCause;
 use weft_core::{ProjectDefinition, StopSelf};
 use weft_dispatcher::journal::postgres::PostgresJournal;
-use weft_dispatcher::journal::{Journal, SignalPlacement, SignalRegistration};
+use weft_dispatcher::journal::{Journal, SignalRegistration};
 use weft_journal::tags::{live_tagged_executions, max_tag_seq, select_stop_targets, tag_execution_in, tag_seq};
 use weft_journal::ExecEvent;
 
@@ -59,7 +59,7 @@ async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
         .expect("register project");
 }
 
-/// Journal a fresh execution for `project` (the `execution_color` seed
+/// Journal a fresh execution for `project` (the `execution` seed
 /// rides in the same transaction, exactly like production). `run_kind`
 /// seeds another kind instead, which the live read must never
 /// select no matter what it carries.
@@ -67,11 +67,11 @@ async fn start_execution(
     journal: &PostgresJournal,
     project: Uuid,
     run_kind: weft_core::exec::RunKind,
-) -> weft_core::Color {
-    let color = weft_core::Color::new_v4();
+) -> weft_core::ExecutionId {
+    let execution_id = weft_core::ExecutionId::new_v4();
     journal
         .record_event(&ExecEvent::ExecutionStarted {
-            color,
+            execution_id,
             project_id: project,
             entry_node: "start".into(),
             phase: weft_core::context::Phase::Fire,
@@ -81,19 +81,20 @@ async fn start_execution(
             source_version: None,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 1,
+            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 1,
+            run_class: weft_core::run_class::RunClass::Short,
         })
         .await
         .expect("ExecutionStarted");
-    color
+    execution_id
 }
 
 /// The broker's write, as `/v1/execution/tag` performs it: event plus
-/// rows, one transaction, no pod (the rig has no fencing row to match).
-async fn tag(pool: &PgPool, color: weft_core::Color, tags: &[&str], at: u64) {
+/// rows, one transaction, no process (the rig has no fencing row to match).
+async fn tag(pool: &PgPool, execution_id: weft_core::ExecutionId, tags: &[&str], at: u64) {
     let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
     let mut tx = pool.begin().await.unwrap();
-    tag_execution_in(&mut tx, color, &tags, at, None).await.expect("tag_execution_in");
+    tag_execution_in(&mut tx, execution_id, &tags, at, None).await.expect("tag_execution_in");
     tx.commit().await.unwrap();
 }
 
@@ -135,7 +136,7 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
         .list_executions(TENANT, &weft_dispatcher::journal::ExecutionQuery { limit: 10, ..Default::default() })
         .await
         .unwrap();
-    let listed_first = page.executions.iter().find(|s| s.color == first).expect("listed");
+    let listed_first = page.executions.iter().find(|s| s.execution_id == first).expect("listed");
     assert_eq!(listed_first.tags, vec!["user_7".to_string()]);
 }
 
@@ -163,14 +164,14 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     tag(&pool, b, &["user_7"], 4).await;
     tag(&pool, probe, &["user_7"], 5).await;
     journal
-        .record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 5 })
+        .record_event(&ExecEvent::ExecutionCompleted { execution_id: done, at_unix: 5 })
         .await
         .unwrap();
 
     let live = live_tagged_executions(&pool, project, "user_7").await.unwrap();
-    let colors: Vec<_> = live.iter().map(|t| t.color).collect();
+    let execution_ids: Vec<_> = live.iter().map(|t| t.execution_id).collect();
     assert_eq!(
-        colors,
+        execution_ids,
         vec![a, b],
         "oldest tag first, no terminal, no other project, no node test: {live:?}"
     );
@@ -180,7 +181,7 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     assert_eq!(select_stop_targets(&live, b, Some(b_seq), StopSelf::Keep), vec![a]);
     // a says the same: nothing newer than a exists below its seq.
     let a_seq = tag_seq(&pool, a, "user_7").await.unwrap().unwrap();
-    assert_eq!(select_stop_targets(&live, a, Some(a_seq), StopSelf::Keep), Vec::<weft_core::Color>::new());
+    assert_eq!(select_stop_targets(&live, a, Some(a_seq), StopSelf::Keep), Vec::<weft_core::ExecutionId>::new());
     // "we are all busted" from a takes both.
     assert_eq!(select_stop_targets(&live, a, None, StopSelf::Include), vec![a, b]);
 
@@ -202,7 +203,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
     tag(&pool, victim, &["user_7"], 1).await;
     journal
         .record_event(&ExecEvent::NodeStarted {
-            color: victim,
+            execution_id: victim,
             node_id: "wait".into(),
             frames: vec![],
             at_unix: 2,
@@ -212,11 +213,9 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
 
     // The run is parked on a form: a resume signal whose wake the
     // cancel must erase in the same step that ends the run.
-    seed_listener_pod(&pool, "listener-a", "disp-1").await;
     journal
         .signal_insert(
-            &resume_signal("form-victim", project, victim),
-            &SignalPlacement { listener_pod: "listener-a".into(), generation: 1 },
+            &resume_signal("form-victim", project, victim)
         )
         .await
         .unwrap();
@@ -227,7 +226,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
     assert_eq!(write.removed.len(), 1, "the parked run's form is gone: {write:?}");
     assert_eq!(write.removed[0].token, "form-victim");
     assert_eq!(write.node_cancellations, Some(1), "{write:?}");
-    assert!(!write.task_enqueued, "no pod owns a parked run");
+    assert!(!write.task_enqueued, "no instance owns a parked run");
     assert!(journal.signal_get("form-victim").await.unwrap().is_none());
     let after = journal.events_log(victim).await.unwrap();
     let node_cancel = after
@@ -264,19 +263,17 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
 
 /// The cancel is one transaction with one outcome per state: a
 /// finished run keeps its own terminal (nothing written, nothing
-/// queued), and a color that never started has only its signals to
+/// queued), and an execution that never started has only its signals to
 /// lose.
 #[sqlx::test]
-async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: PgPool) {
+async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_execution_id(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    seed_listener_pod(&pool, "listener-a", "disp-1").await;
-    let placement = SignalPlacement { listener_pod: "listener-a".into(), generation: 1 };
 
     let done = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
     journal
-        .record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 5 })
+        .record_event(&ExecEvent::ExecutionCompleted { execution_id: done, at_unix: 5 })
         .await
         .unwrap();
     let before = journal.events_log(done).await.unwrap();
@@ -286,28 +283,28 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
     assert_eq!(journal.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
     assert_eq!(journal.execution_summary(done).await.unwrap().unwrap().status, "completed");
 
-    // Never started: a stray resume signal on an unknown color goes,
+    // Never started: a stray resume signal on an unknown execution goes,
     // and no journal is opened for it.
-    let ghost = weft_core::Color::new_v4();
-    journal.signal_insert(&resume_signal("form-ghost", project, ghost), &placement).await.unwrap();
+    let ghost = weft_core::ExecutionId::new_v4();
+    journal.signal_insert(&resume_signal("form-ghost", project, ghost)).await.unwrap();
     let write = journal.cancel_execution(ghost, None, &CancelCause::User).await.unwrap();
     assert_eq!(write.removed.len(), 1, "{write:?}");
     assert!(write.node_cancellations.is_none() && !write.task_enqueued, "{write:?}");
     assert!(journal.events_log(ghost).await.unwrap().is_empty());
 }
 
-/// A resume (form) signal parked on `color`.
-fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> SignalRegistration {
+/// A resume (form) signal parked on `execution_id`.
+fn resume_signal(token: &str, project_id: Uuid, execution_id: weft_core::ExecutionId) -> SignalRegistration {
     SignalRegistration {
         member: None,
         activation_trigger: None,
         source_version: None,
-        setup_color: None,
+        setup_execution_id: None,
         program: None,
         token: token.to_string(),
         tenant_id: TENANT.to_string(),
         project_id,
-        color: Some(color),
+        execution_id: Some(execution_id),
         node_id: "wait".to_string(),
         is_resume: true,
         spec_json: "{}".to_string(),
@@ -323,27 +320,7 @@ fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> Sign
         kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
-        listener_pod: None,
     }
-}
-
-/// A live listener pod row for the placement stamp (`signal_insert`
-/// refuses a pod it does not know).
-async fn seed_listener_pod(pool: &PgPool, pod_name: &str, owner: &str) {
-    let now = weft_dispatcher::lease::now_unix();
-    sqlx::query(
-        "INSERT INTO listener_pod \
-         (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
-         VALUES ($1, $2, 'weft-system', $3, $4, $5)",
-    )
-    .bind(pod_name)
-    .bind(format!("http://{pod_name}.weft-system.svc.cluster.local:8080"))
-    .bind(owner)
-    .bind(now + 3600)
-    .bind(now - 1)
-    .execute(pool)
-    .await
-    .expect("insert listener_pod");
 }
 
 /// A member token names exactly one project and always expires, and
@@ -368,11 +345,18 @@ async fn a_member_token_is_one_project_and_expires(pool: PgPool) {
         created_at: 0,
         member: member.cloned(),
         expires_at,
+        kind: weft_dispatcher::journal::TokenKind::Caller,
     };
     let err = journal.mint_signal_token(&token("h1", Some(&ada), vec![], Some(10))).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_member_has_one_project"), "{err:#}");
     let err = journal.mint_signal_token(&token("h2", Some(&ada), vec![project], None)).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_member_expires"), "{err:#}");
+    let operator_member = SignalToken {
+        kind: weft_dispatcher::journal::TokenKind::Operator,
+        ..token("h3", Some(&ada), vec![project], Some(10))
+    };
+    let err = journal.mint_signal_token(&operator_member).await.unwrap_err();
+    assert!(format!("{err:#}").contains("signal_token_operator_is_nobody"), "{err:#}");
 
     journal.mint_signal_token(&token("ada-1", Some(&ada), vec![project], Some(10))).await.unwrap();
     journal.mint_signal_token(&token("ada-2", Some(&ada), vec![project], Some(20))).await.unwrap();

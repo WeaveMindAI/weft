@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::LoopFrames;
-use crate::Color;
+use crate::ExecutionId;
 
 // SYNC: NodeExecutionStatus <-> packages/weft-graph/src/protocol.ts NodeExecutionStatus
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ pub struct NodeExecution {
     pub skip_reason: Option<super::skip::SkipReason>,
     /// Input pulses consumed by this dispatch.
     pub pulses_absorbed: Vec<uuid::Uuid>,
-    /// This firing's rank among the records at its `(node, color,
+    /// This firing's rank among the records at its `(node, execution,
     /// frames)`: 0 for the first, 1 for a second firing after the
     /// first went terminal. Stamped at creation (`next_firing_ordinal`)
     /// on the live side and in the fold alike; the firing's derived
@@ -87,82 +87,44 @@ pub struct NodeExecution {
     /// Explicit output closures, including generator ends already delivered.
     #[serde(default)]
     pub closed_output_ports: HashSet<String>,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub frames: LoopFrames,
     /// The run this record was inherited from, when a seeded run reused
     /// it instead of firing the node again (`ExecutionStarted.seed`).
     /// `None` for a firing of this run's own. The record still carries
-    /// THIS run's `color` (the table is this run's); the origin is here.
+    /// THIS run's `execution_id` (the table is this run's); the origin is here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<Color>,
+    pub inherited_from: Option<ExecutionId>,
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.
 pub type NodeExecutionTable = BTreeMap<String, Vec<NodeExecution>>;
 
-/// Aggregate status for a node derived from all its executions.
-/// Used by SSE events.
-pub fn summarize_status(executions: &[NodeExecution]) -> String {
-    if executions.is_empty() {
-        return "pending".to_string();
-    }
-    let total = executions.len();
-    let running = executions.iter().filter(|e| matches!(e.status, NodeExecutionStatus::Running | NodeExecutionStatus::WaitingForInput)).count();
-    let failed = executions.iter().filter(|e| e.status == NodeExecutionStatus::Failed).count();
-    let completed = executions.iter().filter(|e| e.status == NodeExecutionStatus::Completed).count();
-    let skipped = executions.iter().filter(|e| e.status == NodeExecutionStatus::Skipped).count();
-    let cancelled = executions.iter().filter(|e| e.status == NodeExecutionStatus::Cancelled).count();
-
-    let base = if running > 0 {
-        "running"
-    } else if cancelled == total {
-        "cancelled"
-    } else if skipped == total {
-        "skipped"
-    } else if failed > 0 && completed == 0 {
-        "failed"
-    } else {
-        "completed"
-    };
-
-    if total <= 1 {
-        return base.to_string();
-    }
-
-    let mut parts = Vec::new();
-    if completed > 0 { parts.push(format!("{completed} completed")); }
-    if failed > 0 { parts.push(format!("{failed} failed")); }
-    if running > 0 { parts.push(format!("{running} running")); }
-    if skipped > 0 { parts.push(format!("{skipped} skipped")); }
-    if cancelled > 0 { parts.push(format!("{cancelled} cancelled")); }
-    format!("{base} ({total} executions: {})", parts.join(", "))
-}
-
-/// The ordinal the NEXT record opened at `(node, color, frames)` gets:
+/// The ordinal the NEXT record opened at `(node, execution_id, frames)` gets:
 /// the count of records already there. Every site that opens a record
 /// (the scheduler, the boundary pass, the journal fold) stamps it on
 /// `NodeExecution::ordinal` at creation; nothing re-derives it later.
 pub fn next_firing_ordinal(
     executions: &NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> usize {
     executions
         .get(node_id)
-        .map(|v| v.iter().filter(|e| e.color == color && &e.frames == frames).count())
+        .map(|v| v.iter().filter(|e| e.execution_id == execution_id && &e.frames == frames).count())
         .unwrap_or(0)
 }
 
-/// The latest record at `(node, color, frames)`: the firing every
+/// The latest record at `(node, execution_id, frames)`: the firing every
 /// row and every sweep about that location is about.
 pub fn latest_firing<'a>(
     executions: &'a NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Option<&'a NodeExecution> {
-    executions.get(node_id)?.iter().rev().find(|e| e.color == color && &e.frames == frames)
+    executions.get(node_id)?.iter().rev().find(|e| e.execution_id == execution_id && &e.frames == frames)
 }
 
 /// `latest_firing`, mutably: the record a lifecycle row about the
@@ -170,8 +132,8 @@ pub fn latest_firing<'a>(
 pub fn latest_firing_mut<'a>(
     executions: &'a mut NodeExecutionTable,
     node_id: &str,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Option<&'a mut NodeExecution> {
-    executions.get_mut(node_id)?.iter_mut().rev().find(|e| e.color == color && &e.frames == frames)
+    executions.get_mut(node_id)?.iter_mut().rev().find(|e| e.execution_id == execution_id && &e.frames == frames)
 }

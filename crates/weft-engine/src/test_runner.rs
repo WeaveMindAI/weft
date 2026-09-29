@@ -3,13 +3,19 @@
 //! so every line of runner logic lives HERE, typechecked, instead of
 //! in generated source.
 //!
-//! Subcommands (JSON on stdout, machine-consumed by `weft test-node`
-//! and by pod-side runners; logs go to stderr):
+//! Subcommands (JSON on stdout, machine-consumed by `weft test-node`;
+//! logs go to stderr):
 //!
 //!   list                       every node's declared tests
-//!   run --node N --test T      one test; live needs --live-connection
-//!                              plus the broker env a worker pod has
+//!   run --node N --test T      one basic or fake test
 //!   run-all [--tier ...]       every basic/fake test in the registry
+//!   serve                      HTTP: `POST /_weft/test` runs one test
+//!                              (live included) and answers its report.
+//!                              How the install runs a test: the test
+//!                              image is started the way a worker is,
+//!                              with a worker's identity, so a live
+//!                              test's connection resolution takes the
+//!                              exact production path.
 //!
 //! Exit code: 0 = everything ran and passed, 1 = at least one test
 //! failed, 2 = the runner itself could not do what was asked.
@@ -28,38 +34,25 @@ use crate::test_rig::LiveTestRunner;
 enum Args {
     /// Print every node's declared tests as JSON.
     List,
-    /// Run one test by node type + test name.
+    /// Run one basic or fake test by node type + test name.
     Run {
         #[arg(long)]
         node: String,
         #[arg(long)]
         test: String,
-        /// Live only: the connection (grant) id resolving the test's
-        /// declared service.
-        #[arg(long)]
-        live_connection: Option<String>,
-        /// Live only: the pre-minted execution color this run's cost
-        /// attributes to. When the runtime spawned this run it minted
-        /// (and registered) the color; without one the runner mints a
-        /// throwaway itself.
-        #[arg(long)]
-        color: Option<uuid::Uuid>,
-        /// Live only: broker base URL (the production credential path).
+    },
+    /// Serve `POST /_weft/test` (one test per request, live included)
+    /// and `GET /_weft/tests` as the install's test runner, until stopped.
+    Serve {
         #[arg(long, env = "WEFT_BROKER_URL")]
-        broker_url: Option<String>,
-        /// Live only: path to the pod's projected SA token.
-        #[arg(long, env = "WEFT_BROKER_TOKEN_PATH", default_value = "/var/run/weft/sa/token")]
-        broker_token_path: String,
-        /// Stamped on broker calls; the pod's own name when running in
-        /// a cluster.
-        #[arg(long, env = "WEFT_POD_NAME", default_value = "node-test")]
-        pod_name: String,
-        #[arg(long, env = "WEFT_TENANT_ID", default_value = "local")]
+        broker_url: String,
+        #[arg(long, env = "WEFT_TENANT_ID")]
         tenant_id: String,
-        /// Live only: the project the run's cost and leases belong to
-        /// (the worker pod's own project in a cluster).
+        /// The project the tests' cost and leases belong to.
         #[arg(long, env = "WEFT_PROJECT_ID")]
-        project_id: Option<uuid::Uuid>,
+        project_id: uuid::Uuid,
+        #[arg(long, env = "PORT", default_value = "8080")]
+        port: u16,
     },
     /// Run every basic/fake test in the registry.
     RunAll {
@@ -153,19 +146,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
     }
     match args {
         Args::List => {
-            let mut nodes: Vec<NodeTestsListing> = Vec::new();
-            let mut types = catalog.all();
-            types.sort();
-            for node_type in types {
-                let node = catalog
-                    .lookup(node_type)
-                    .expect("catalog names only nodes it holds");
-                nodes.push(NodeTestsListing {
-                    node_type: node_type.to_string(),
-                    tests: node.tests().iter().map(|t| t.info()).collect(),
-                });
-            }
-            let out = weft_core::node_test::TestListing { nodes };
+            let out = listing(catalog);
             // Same sentinel protocol as the run reports: every JSON
             // document this binary emits is marker-prefixed, so one
             // reader rule covers all three subcommands.
@@ -177,106 +158,48 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Args::Run {
-            node,
-            test,
-            live_connection,
-            color,
-            broker_url,
-            broker_token_path,
-            pod_name,
-            tenant_id,
-            project_id,
-        } => {
-            let Some(node_impl) = catalog.lookup(&node) else {
-                eprintln!("no node type '{node}' in this package's registry");
-                return ExitCode::from(2);
-            };
-            let tests = node_impl.tests();
-            let Some(declared) = tests.iter().find(|t| t.name == test) else {
-                eprintln!(
-                    "node '{node}' declares no test '{test}' (declared: {:?})",
-                    tests.iter().map(|t| t.name).collect::<Vec<_>>()
-                );
-                return ExitCode::from(2);
-            };
-            let report = match declared.tier {
-                TestTier::Basic | TestTier::Fake => {
-                    if live_connection.is_some() || color.is_some() {
-                        eprintln!(
-                            "test '{test}' on node '{node}' is {}-tier and takes no \
-                             connection or color",
-                            match declared.tier {
-                                TestTier::Basic => "basic",
-                                TestTier::Fake => "fake",
-                                TestTier::Live => unreachable!(),
-                            }
-                        );
-                        return ExitCode::from(2);
-                    }
-                    let result = match declared.tier {
-                        TestTier::Basic => declared.run_basic(),
-                        TestTier::Fake => declared.run_fake().await,
-                        TestTier::Live => unreachable!(),
-                    };
-                    report_of(&node, declared.name, declared.tier, result, Vec::new())
-                }
-                TestTier::Live => {
-                    let (Some(connection), Some(broker_url), Some(project_id)) =
-                        (live_connection, broker_url, project_id)
-                    else {
-                        eprintln!(
-                            "a live test needs --live-connection <grant id>, a broker \
-                             (--broker-url / WEFT_BROKER_URL) and the project it runs for \
-                             (--project-id / WEFT_PROJECT_ID): it runs the production \
-                             credential path"
-                        );
-                        return ExitCode::from(2);
-                    };
-                    let service = declared
-                        .service
-                        .expect("NodeTest::live always carries its service");
-                    let runner = LiveTestRunner::new(
-                        crate::EngineClients::from_broker(
-                            &broker_url,
-                            std::path::Path::new(&broker_token_path),
-                        ),
-                        catalog,
-                        pod_name,
-                        tenant_id,
-                        project_id,
-                        color,
+        Args::Run { node, test } => {
+            let request = TestRequest { node, test, live: None };
+            match run_one(catalog, request, None).await {
+                Ok(report) => {
+                    let passed = report.passed;
+                    println!(
+                        "{}{}",
+                        weft_core::node_test::REPORT_SENTINEL,
+                        serde_json::to_string(&report).expect("report serializes")
                     );
-                    let rig = runner.rig(&connection, service);
-                    let result = declared.run_live(rig).await;
-                    // Release leased connections + wait out in-flight
-                    // cost records BEFORE reporting: money first.
-                    let leaked = runner.settle().await;
-                    let colors = vec![runner.color().to_string()];
-                    let mut report =
-                        report_of(&node, declared.name, declared.tier, result, colors);
-                    if !leaked.is_empty() {
-                        // A leaked lease fails the test even when the
-                        // body passed; the body's own error stays
-                        // primary, the leak is appended so an operator
-                        // can release the named grant(s) by hand.
-                        report.passed = false;
-                        let leak = format!("leases not released: {}", leaked.join("; "));
-                        report.error = Some(match report.error {
-                            Some(body) => format!("{body}; {leak}"),
-                            None => leak,
-                        });
-                    }
-                    report
+                    if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+
+        Args::Serve { broker_url, tenant_id, project_id, port } => {
+            let identity = match crate::worker::identity_from_env() {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    return ExitCode::from(2);
                 }
             };
-            let passed = report.passed;
-            println!(
-                "{}{}",
-                weft_core::node_test::REPORT_SENTINEL,
-                serde_json::to_string(&report).expect("report serializes")
-            );
-            if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            let door = match crate::worker::WorkerDoor::from_env() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    return ExitCode::from(2);
+                }
+            };
+            let live = LiveEnv { broker_url, tenant_id, project_id, identity };
+            match serve(catalog, live, door, port).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("the test server stopped: {e:#}");
+                    ExitCode::from(2)
+                }
+            }
         }
 
         Args::RunAll { tiers, parallel } => {
@@ -341,12 +264,26 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
     }
 }
 
+/// Every node's declared tests.
+fn listing(catalog: &'static dyn NodeCatalog) -> weft_core::node_test::TestListing {
+    let mut types = catalog.all();
+    types.sort();
+    let nodes = types
+        .into_iter()
+        .map(|node_type| {
+            let node = catalog.lookup(node_type).expect("catalog names only nodes it holds");
+            NodeTestsListing { node_type: node_type.to_string(), tests: node.tests().iter().map(|t| t.info()).collect() }
+        })
+        .collect();
+    weft_core::node_test::TestListing { nodes }
+}
+
 fn report_of(
     node: &str,
     test: &str,
     tier: TestTier,
     result: weft_core::error::WeftResult<()>,
-    colors: Vec<String>,
+    execution_ids: Vec<String>,
 ) -> TestReport {
     let error = result.err().map(|e| e.to_string());
     TestReport {
@@ -355,7 +292,141 @@ fn report_of(
         tier,
         passed: error.is_none(),
         error,
-        colors,
+        execution_ids,
     }
 }
 
+
+/// One test to run, as the install asks for it.
+// SYNC: TestRequest <-> crates/weft-dispatcher/src/task_kinds/run_node_test.rs (sent)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TestRequest {
+    pub node: String,
+    pub test: String,
+    /// Present for a live test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveRequest>,
+}
+
+/// What a live test needs besides the node and the test.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LiveRequest {
+    /// The connection (grant) id resolving the test's declared service.
+    pub connection: String,
+    /// The execution the run's cost attributes to, registered by
+    /// the install with `instance` as its driver.
+    pub execution_id: uuid::Uuid,
+    /// The instance id this run names itself with on the broker: the
+    /// driver the install appointed for `execution_id`.
+    pub instance: String,
+    /// `WEFT_NODE_TEST_*` values the test reads (`LiveRig::fixture`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fixtures: std::collections::BTreeMap<String, String>,
+}
+
+/// The broker side a live test runs against: the serving process's own.
+struct LiveEnv {
+    broker_url: String,
+    tenant_id: String,
+    project_id: uuid::Uuid,
+    identity: std::sync::Arc<dyn weft_platform_traits::IdentityTokens>,
+}
+
+/// Run one test. `Err` is a request that could not run at all (no such
+/// node or test, a tier mismatch); a test that ran and failed is a
+/// report with `passed: false`.
+async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_env: Option<&LiveEnv>) -> Result<TestReport, String> {
+    let TestRequest { node, test, live } = request;
+    let node_impl = catalog.lookup(&node).ok_or_else(|| format!("no node type '{node}' in this package's registry"))?;
+    let tests = node_impl.tests();
+    let declared = tests.iter().find(|t| t.name == test).ok_or_else(|| {
+        format!(
+            "node '{node}' declares no test '{test}' (declared: {:?})",
+            tests.iter().map(|t| t.name).collect::<Vec<_>>()
+        )
+    })?;
+    match (declared.tier, live) {
+        (TestTier::Basic, None) => Ok(report_of(&node, declared.name, declared.tier, declared.run_basic(), Vec::new())),
+        (TestTier::Fake, None) => Ok(report_of(&node, declared.name, declared.tier, declared.run_fake().await, Vec::new())),
+        (TestTier::Basic | TestTier::Fake, Some(_)) => {
+            Err(format!("test '{test}' on node '{node}' is a free-tier test and takes no connection"))
+        }
+        (TestTier::Live, None) => Err(format!(
+            "test '{test}' on node '{node}' is live: it runs inside the install, on the production \
+             credential path (`weft test-node --live`)"
+        )),
+        (TestTier::Live, Some(live)) => {
+            let env = live_env.ok_or_else(|| "a live test runs only in the install's test server".to_string())?;
+            let service = declared.service.expect("NodeTest::live always carries its service");
+            let token = weft_broker_client::TokenSource::worker(env.identity.clone(), live.instance.clone());
+            let runner = LiveTestRunner::new(
+                crate::EngineClients::from_broker(&env.broker_url, token),
+                catalog,
+                live.instance,
+                env.tenant_id.clone(),
+                env.project_id,
+                Some(live.execution_id),
+            );
+            let rig = runner.rig(&live.connection, service, live.fixtures);
+            let result = declared.run_live(rig).await;
+            // Release leased connections + wait out in-flight cost records
+            // BEFORE reporting: money first.
+            let leaked = runner.settle().await;
+            let execution_ids = vec![runner.execution_id().to_string()];
+            let mut report = report_of(&node, declared.name, declared.tier, result, execution_ids);
+            if !leaked.is_empty() {
+                // A leaked lease fails the test even when the body passed;
+                // the body's own error stays primary, the leak is appended
+                // so an operator can release the named grant(s) by hand.
+                report.passed = false;
+                let leak = format!("leases not released: {}", leaked.join("; "));
+                report.error = Some(match report.error {
+                    Some(body) => format!("{body}; {leak}"),
+                    None => leak,
+                });
+            }
+            Ok(report)
+        }
+    }
+}
+
+/// Serve one test per `POST /_weft/test`, and the package's listing at
+/// `GET /_weft/tests`, until the platform stops the process. A test's
+/// answer is the report as JSON (200), or the reason the request could
+/// not run (422).
+async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::worker::WorkerDoor, port: u16) -> anyhow::Result<()> {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    #[derive(Clone)]
+    struct Served {
+        catalog: &'static dyn NodeCatalog,
+        live: std::sync::Arc<LiveEnv>,
+        door: crate::worker::WorkerDoor,
+    }
+    async fn test(State(s): State<Served>, headers: HeaderMap, axum::Json(req): axum::Json<TestRequest>) -> axum::response::Response {
+        if !s.door.admits_headers(&headers) {
+            return (StatusCode::UNAUTHORIZED, "this test server answers the install only").into_response();
+        }
+        match run_one(s.catalog, req, Some(&s.live)).await {
+            Ok(report) => axum::Json(report).into_response(),
+            Err(why) => (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
+        }
+    }
+    async fn tests(State(s): State<Served>, headers: HeaderMap) -> axum::response::Response {
+        if !s.door.admits_headers(&headers) {
+            return (StatusCode::UNAUTHORIZED, "this test server answers the install only").into_response();
+        }
+        axum::Json(listing(s.catalog)).into_response()
+    }
+    // SYNC: the test server's routes <-> crates/weft-dispatcher/src/task_kinds/run_node_test.rs
+    let app = axum::Router::new()
+        .route("/_weft/test", axum::routing::post(test))
+        .route("/_weft/tests", axum::routing::get(tests))
+        .route("/_weft/healthz", axum::routing::get(|| async { StatusCode::OK }))
+        .with_state(Served { catalog, live: std::sync::Arc::new(live), door })
+        .layer(axum::middleware::map_response(crate::worker::mark_worker_answer));
+    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}

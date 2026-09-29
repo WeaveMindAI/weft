@@ -44,8 +44,27 @@ weft connect
 Run it in the project folder, pick the step, and answer the prompts. `weft
 connect --list` prints what is already stored and changes nothing. `weft
 connect --node account` goes straight to one step. `--disconnect` clears a
-step's choice and leaves the stored account alone, and `--forget <id>` deletes
+step's pick and leaves the stored account alone, and `--forget <id>` deletes
 the stored account for good.
+
+## Picked on each install
+
+Which connection a step uses is kept by the install you picked it on, never
+written in your `.weft` files. A connection lives in one install, so its id
+means nothing on another: your machine and your cloud each have their own
+accounts, and each keeps its own pick. If you want a step connected on your
+cloud install, run `weft connect --on prod` there (it is the same
+walkthrough). A step inside a file you include twice is two steps, one per
+place, and each place gets its own pick.
+
+If you run a program with a step nobody connected on this install, the run
+is refused before it starts, naming the step and the `weft connect` that
+fixes it. Forgetting a stored connection takes every pick of it with it.
+
+If a build refuses a line like `account: {"id": "...", "identity": "..."}`
+with "that was the old way of connecting a node", the connection was written
+into the source by an older weft. Erase that line and connect the step again;
+the install keeps the pick from then on.
 
 ## Never paste a key into a step's field
 

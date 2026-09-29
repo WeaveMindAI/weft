@@ -12,7 +12,7 @@ import { AutoFollowController, type FollowStatus } from './autoFollow';
 import type { DispatcherEvent, ExecutionFollower } from './execFollower';
 import type { HostMessage } from '../../packages/weft-graph/src/protocol';
 
-type Call = { verb: 'replay' | 'stop'; color?: string };
+type Call = { verb: 'replay' | 'stop'; executionId?: string };
 
 /// The workspace state, as a plain map the tests can read back.
 function memoryOf(seed: Record<string, unknown> = {}) {
@@ -34,7 +34,7 @@ function rig(seed: Record<string, unknown> = {}) {
   // change on the real follower fails this file at compile time; the
   // one cast is at the constructor below.
   const follower: Pick<ExecutionFollower, 'replay' | 'stop'> = {
-    replay: async (color: string) => { calls.push({ verb: 'replay', color }); },
+    replay: async (executionId: string) => { calls.push({ verb: 'replay', executionId }); },
     stop: () => { calls.push({ verb: 'stop' }); },
   };
 
@@ -54,37 +54,37 @@ function rig(seed: Record<string, unknown> = {}) {
   return { c, calls, posted, otherPosts, actionable, memory, latest: () => posted[posted.length - 1] };
 }
 
-function started(color: string): DispatcherEvent {
-  return { kind: 'execution_started', color, entry_node: 'n', project_id: 'p' };
+function started(executionId: string): DispatcherEvent {
+  return { kind: 'execution_started', execution_id: executionId, entry_node: 'n', project_id: 'p' };
 }
 
 describe('following', () => {
   it('is the mode a project starts in', () => {
     const { c, latest } = rig();
     c.setProject('p');
-    expect(latest()).toEqual({ mode: 'following', color: undefined, pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'following', executionId: undefined, pendingCount: 0 });
   });
 
   it('jumps to a new execution and replays it', () => {
     const { c, calls, latest } = rig();
     c.handleEvent(started('a'));
-    expect(calls).toEqual([{ verb: 'replay', color: 'a' }]);
-    expect(latest()).toEqual({ mode: 'following', color: 'a', pendingCount: 0 });
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'a' }]);
+    expect(latest()).toEqual({ mode: 'following', executionId: 'a', pendingCount: 0 });
   });
 
-  it('does not replay twice when the run command already followed the color', () => {
+  it('does not replay twice when the run command already followed the execution', () => {
     const { c, calls } = rig();
     c.followStartedByUser('a');    // the /run response
     c.handleEvent(started('a'));   // the same start, echoed on the project stream
-    expect(calls).toEqual([{ verb: 'replay', color: 'a' }]);
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'a' }]);
   });
 
-  it('picks up the next execution when the caller did not know the color', () => {
+  it('picks up the next execution when the caller did not know the execution id', () => {
     const { c, calls, latest } = rig();
-    c.followStartedByUser(undefined); // activate: the color arrives over SSE
+    c.followStartedByUser(undefined); // activate: the execution arrives over SSE
     c.handleEvent(started('a'));
-    expect(calls).toEqual([{ verb: 'replay', color: 'a' }]);
-    expect(latest().color).toBe('a');
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'a' }]);
+    expect(latest().executionId).toBe('a');
   });
 });
 
@@ -95,15 +95,15 @@ describe('locked', () => {
     c.handleEvent(started('a'));
     c.handleEvent(started('b'));
 
-    expect(calls).toEqual([{ verb: 'replay', color: 'old' }]);
-    expect(latest()).toEqual({ mode: 'locked', color: 'old', pendingCount: 2 });
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'old' }]);
+    expect(latest()).toEqual({ mode: 'locked', executionId: 'old', pendingCount: 2 });
   });
 
   it('locks the execution on screen from the toggle', () => {
     const { c, latest } = rig();
     c.handleEvent(started('a'));
     c.setMode('locked');
-    expect(latest()).toEqual({ mode: 'locked', color: 'a', pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'locked', executionId: 'a', pendingCount: 0 });
   });
 
   it('cannot be picked with nothing on screen to hold', () => {
@@ -118,7 +118,7 @@ describe('locked', () => {
     c.stopShowing();
     expect(calls.at(-1)).toEqual({ verb: 'stop' });
     expect(otherPosts).toEqual(['execCleared']);
-    expect(latest()).toEqual({ mode: 'off', color: undefined, pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'off', executionId: undefined, pendingCount: 0 });
   });
 });
 
@@ -129,9 +129,9 @@ describe('off', () => {
     c.setMode('off');
     c.handleEvent(started('b'));
     c.handleEvent(started('c'));
-    expect(calls).toEqual([{ verb: 'replay', color: 'a' }, { verb: 'stop' }]);
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'a' }, { verb: 'stop' }]);
     expect(otherPosts).toEqual(['execCleared']);
-    expect(latest()).toEqual({ mode: 'off', color: undefined, pendingCount: 2 });
+    expect(latest()).toEqual({ mode: 'off', executionId: undefined, pendingCount: 2 });
   });
 
   it('re-picking off keeps the count', () => {
@@ -146,8 +146,8 @@ describe('off', () => {
     const { c, calls, latest } = rig();
     c.setMode('off');
     c.followStartedByUser('mine');
-    expect(calls.at(-1)).toEqual({ verb: 'replay', color: 'mine' });
-    expect(latest()).toEqual({ mode: 'following', color: 'mine', pendingCount: 0 });
+    expect(calls.at(-1)).toEqual({ verb: 'replay', executionId: 'mine' });
+    expect(latest()).toEqual({ mode: 'following', executionId: 'mine', pendingCount: 0 });
   });
 });
 
@@ -159,33 +159,33 @@ describe('following again', () => {
     c.handleEvent(started('b'));
     c.setMode('following');
 
-    expect(calls.at(-1)).toEqual({ verb: 'replay', color: 'b' });
-    expect(latest()).toEqual({ mode: 'following', color: 'b', pendingCount: 0 });
+    expect(calls.at(-1)).toEqual({ verb: 'replay', executionId: 'b' });
+    expect(latest()).toEqual({ mode: 'following', executionId: 'b', pendingCount: 0 });
   });
 
   it('with nothing queued keeps the run on screen', () => {
     const { c, latest } = rig();
     c.lockTo('old');
     c.setMode('following');
-    expect(latest()).toEqual({ mode: 'following', color: 'old', pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'following', executionId: 'old', pendingCount: 0 });
   });
 
   it('from off with nothing queued waits for the next run', () => {
     const { c, calls, latest } = rig();
     c.setMode('off');
     c.setMode('following');
-    expect(latest()).toEqual({ mode: 'following', color: undefined, pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'following', executionId: undefined, pendingCount: 0 });
     c.handleEvent(started('fresh'));
-    expect(calls.at(-1)).toEqual({ verb: 'replay', color: 'fresh' });
+    expect(calls.at(-1)).toEqual({ verb: 'replay', executionId: 'fresh' });
   });
 
   it('keeps following when the run on screen is deleted', () => {
     const { c, calls, latest } = rig();
     c.handleEvent(started('a'));
     c.stopShowing();
-    expect(latest()).toEqual({ mode: 'following', color: undefined, pendingCount: 0 });
+    expect(latest()).toEqual({ mode: 'following', executionId: undefined, pendingCount: 0 });
     c.handleEvent(started('b'));
-    expect(calls.at(-1)).toEqual({ verb: 'replay', color: 'b' });
+    expect(calls.at(-1)).toEqual({ verb: 'replay', executionId: 'b' });
   });
 });
 
@@ -225,8 +225,8 @@ describe('remembering the choice per project', () => {
     c.handleEvent(started('a'));
     c.setProject('q');
     expect(calls.at(-1)).toEqual({ verb: 'stop' });
-    expect(latest()).toEqual({ mode: 'following', color: undefined, pendingCount: 0 });
-    expect(c.currentColor()).toBeUndefined();
+    expect(latest()).toEqual({ mode: 'following', executionId: undefined, pendingCount: 0 });
+    expect(c.currentExecutionId()).toBeUndefined();
   });
 });
 
@@ -234,8 +234,8 @@ describe('reconnect', () => {
   it('jumps to the running execution it missed', () => {
     const { c, calls, latest } = rig();
     c.handleReconnect('a');
-    expect(calls).toEqual([{ verb: 'replay', color: 'a' }]);
-    expect(latest().color).toBe('a');
+    expect(calls).toEqual([{ verb: 'replay', executionId: 'a' }]);
+    expect(latest().executionId).toBe('a');
   });
 
   it('says nothing when already following that execution', () => {
@@ -250,7 +250,7 @@ describe('reconnect', () => {
     const { c, latest } = rig();
     c.lockTo('old');
     c.handleReconnect('a');
-    expect(latest()).toEqual({ mode: 'locked', color: 'old', pendingCount: 1 });
+    expect(latest()).toEqual({ mode: 'locked', executionId: 'old', pendingCount: 1 });
   });
 
   it('does not queue the same execution twice', () => {
@@ -262,8 +262,8 @@ describe('reconnect', () => {
   });
 
   it('does not double-count a reconnect resync and its backlogged start', () => {
-    // The reconnect names the running color, then the reconnected
-    // stream delivers the same color's execution_started off the
+    // The reconnect names the running execution, then the reconnected
+    // stream delivers the same execution's execution_started off the
     // backlog: one run, one pending entry.
     const { c, latest } = rig();
     c.lockTo('old');
@@ -277,7 +277,7 @@ describe('actionable events', () => {
   it('forwards the events that change what the action bar can offer', () => {
     const { c, actionable } = rig();
     c.handleEvent(started('a'));
-    c.handleEvent({ kind: 'execution_completed', color: 'a', project_id: 'p' } as DispatcherEvent);
+    c.handleEvent({ kind: 'execution_completed', execution_id: 'a', project_id: 'p' } as DispatcherEvent);
     c.handleEvent({ kind: 'infra_flaky', project_id: 'p' } as unknown as DispatcherEvent);
     expect(actionable.map((e) => e.kind)).toEqual([
       'execution_started',
@@ -289,7 +289,7 @@ describe('actionable events', () => {
   it('ignores per-node traffic', () => {
     const { c, actionable } = rig();
     c.handleEvent({
-      kind: 'node_started', color: 'a', node: 'n', frames: [], input: null,
+      kind: 'node_started', execution_id: 'a', node: 'n', frames: [], input: null,
       closed_ports: [], project_id: 'p',
     });
     expect(actionable).toEqual([]);

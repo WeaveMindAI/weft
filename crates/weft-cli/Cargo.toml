@@ -13,6 +13,8 @@ path = "src/main.rs"
 # `.env` loading at CLI startup (provider keys, local overrides).
 dotenvy = "0.15"
 weft-core = { workspace = true }
+# The install config a local install writes for its runtime.
+weft-platform-traits = { workspace = true }
 weft-assets = { workspace = true }
 weft-compiler = { workspace = true }
 weft-catalog = { workspace = true }
@@ -23,10 +25,6 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The Envoy Gateway controller's config file (a YAML document inside a
-# ConfigMap) is edited as a document, not as text, and the front door's
-# manifest is read back by its tests.
-serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 terminal_size = { workspace = true }
@@ -39,6 +37,7 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 # User-level CLI settings file (`~/.config/weft/cli.toml`).
 toml = { workspace = true }
+toml_edit = { workspace = true }
 # Local-time rendering of the journal's unix stamps (`weft executions`,
 # `weft events`, `weft logs`).
 chrono = { workspace = true }
@@ -47,7 +46,6 @@ rpassword = { workspace = true }
 # Open the browser on the OAuth consent URL (`weft connect`).
 open = { workspace = true }
 sha2 = { workspace = true }
-ipnet = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

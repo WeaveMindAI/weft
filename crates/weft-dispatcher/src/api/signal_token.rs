@@ -27,6 +27,7 @@ use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::Serialize;
 
 use crate::authenticator::CallerTenant;
+use crate::journal::TokenKind;
 use crate::state::DispatcherState;
 
 #[derive(Debug, serde::Deserialize)]
@@ -56,12 +57,33 @@ pub struct MintTokenBody {
     /// member token (it lives in a browser); optional otherwise.
     #[serde(default, rename = "expiresInSecs")]
     pub expires_in_secs: Option<u64>,
+    /// What the token may do. Absent is a caller token, the scoped
+    /// credential; `operator` is an admin key and takes no scope.
+    #[serde(default = "caller_kind")]
+    pub kind: TokenKind,
 }
 
-/// Why a mint request cannot make the token it asks for: a member token
-/// names exactly one project and an expiry. How long an expiry may be is
-/// `weft_core::signal_token::expiry_at`'s, checked at the mint.
+fn caller_kind() -> TokenKind {
+    TokenKind::Caller
+}
+
+/// Why a mint request cannot make the token it asks for. A member token
+/// names exactly one project and an expiry; how long an expiry may be is
+/// `weft_core::signal_token::expiry_at`'s, checked at the mint. An
+/// operator key is the tenant's admin: a scope or a member on it would
+/// read as a limit it does not have.
 pub(crate) fn check_mint_shape(body: &MintTokenBody) -> Result<(), String> {
+    if body.kind == TokenKind::Operator
+        && (!body.allowed_projects.is_empty()
+            || !body.allowed_tags.is_empty()
+            || !body.allowed_displays.is_empty()
+            || body.all_displays
+            || body.member.is_some())
+    {
+        return Err("an operator key administers the whole install and takes no scope and no \
+                    member; mint a caller token for scoped access"
+            .into());
+    }
     if let Some(member) = &body.member {
         if body.allowed_projects.len() != 1 {
             return Err(format!(
@@ -81,6 +103,7 @@ pub(crate) fn check_mint_shape(body: &MintTokenBody) -> Result<(), String> {
 #[derive(Debug, Serialize)]
 pub struct MintedToken {
     pub id: uuid::Uuid,
+    pub kind: TokenKind,
     /// The full secret, shown once. The client copies it now; the server
     /// keeps only its hash and can never show it again.
     pub token: String,
@@ -106,9 +129,11 @@ pub struct MintedToken {
 }
 
 /// A listed token: metadata + recognizer only, no secret.
+// SYNC: fields <-> crates/weft-cli/src/commands/target.rs ListedToken
 #[derive(Debug, Serialize)]
 pub struct TokenSummary {
     pub id: uuid::Uuid,
+    pub kind: TokenKind,
     pub recognizer: String,
     pub name: Option<String>,
     #[serde(rename = "createdAtUnix")]
@@ -182,6 +207,7 @@ pub async fn mint_token(
     let token = names::generate_token();
     let signal_token = crate::journal::SignalToken {
         id: uuid::Uuid::new_v4(),
+        kind: body.kind,
         token_hash: names::token_hash(&token),
         recognizer: names::recognizer(&token),
         tenant_id: caller.0.as_str().to_string(),
@@ -206,6 +232,7 @@ pub async fn mint_token(
     let url = token_url(state.external_base_url(), &token);
     Ok(Json(MintedToken {
         id: signal_token.id,
+        kind: signal_token.kind,
         token,
         recognizer: signal_token.recognizer,
         name,
@@ -233,6 +260,7 @@ pub async fn list_tokens(
             .into_iter()
             .map(|t| TokenSummary {
                 id: t.id,
+                kind: t.kind,
                 recognizer: t.recognizer,
                 name: t.name,
                 created_at_unix: t.created_at,
@@ -277,7 +305,16 @@ mod tests {
             all_displays: false,
             member: member.map(|m| weft_core::member::MemberId::new(m).unwrap()),
             expires_in_secs: expires,
+            kind: TokenKind::Caller,
         }
+    }
+
+    #[test]
+    fn an_operator_key_takes_no_scope_and_no_member() {
+        let operator = |b: MintTokenBody| MintTokenBody { kind: TokenKind::Operator, ..b };
+        assert!(check_mint_shape(&operator(body(None, 0, None))).is_ok());
+        assert!(check_mint_shape(&operator(body(None, 1, None))).unwrap_err().contains("no scope"));
+        assert!(check_mint_shape(&operator(body(Some("ada"), 1, Some(60)))).is_err());
     }
 
     #[test]

@@ -237,6 +237,20 @@ export async function accessCall<T = unknown>(
   return reply.result as T;
 }
 
+/// Read or change the install's picks for the active project's own
+/// connections (see `picksCall`). Resolves to the route's parsed answer or
+/// rejects with the host's reason.
+export async function picksCall<T = unknown>(method: 'GET' | 'PUT', body?: import('../protocol').ChangePicks): Promise<T> {
+  const reply = await hostRequest('picksResult', (requestId) => ({
+    kind: 'picksCall',
+    requestId,
+    method,
+    body,
+  }));
+  if (reply.error !== undefined) throw new Error(reply.error);
+  return reply.result as T;
+}
+
 /// Open a URL in the user's real browser (the OAuth consent page).
 export function openExternalUrl(url: string): void {
   send({ kind: 'openExternalUrl', url });

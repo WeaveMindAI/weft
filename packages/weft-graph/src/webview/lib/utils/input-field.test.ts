@@ -216,9 +216,12 @@ describe('hasUnpickedAccess', () => {
 		expect(hasUnpickedAccess([access()], {}, none)).toBe(true);
 	});
 
-	it('unlocks once a connection handle is stored', () => {
-		const literals = { connection: { id: 'g-1', identity: 'Quentin' } };
-		expect(hasUnpickedAccess([access()], literals, none)).toBe(false);
+	it('unlocks once the install holds a pick for the marked field', () => {
+		const literals = { connection: { __weft_install_picked__: {} } };
+		const picked = (_: string, literal: unknown) =>
+			literal && typeof literal === 'object' && '__weft_install_picked__' in literal ? { id: 'g-1', identity: 'Quentin' } : literal;
+		expect(hasUnpickedAccess([access()], literals, none, picked)).toBe(false);
+		expect(hasUnpickedAccess([access()], literals, none, () => undefined)).toBe(true);
 	});
 
 	it('never pins an optional connection (the node runs without one)', () => {

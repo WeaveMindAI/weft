@@ -1,50 +1,53 @@
-//! The weft dispatcher daemon.
+//! The weft dispatcher role.
 //!
 //! Owns:
 //! - Event routing (webhook URLs, form URLs, cron, infra events).
-//! - Worker lifecycle (via pluggable `WorkerBackend`).
-//! - Infrastructure orchestration: per-project namespace creation,
-//!   the `infra_lifecycle_command` table the per-project supervisor
-//!   claims, and a polling bridge that fans supervisor-emitted
+//! - Handing executions to the project's workers (`delivery`, through
+//!   the platform's `Runner`).
+//! - Infrastructure orchestration: the `infra_lifecycle_command` table the
+//!   project's supervisor claims, and a bridge that fans supervisor-emitted
 //!   `infra_event` rows out over SSE.
 //! - Journal (Postgres-backed; `weft-journal` crate).
 //! - Cost aggregation.
 //!
 //! Does NOT execute user node code. Workers run the user's compiled
-//! binary; node trait impls live inside that binary. Does NOT do
-//! runtime health probing of infra; that's the supervisor's job.
+//! binary; node trait impls live inside that binary. Does NOT do runtime
+//! health probing of infra; that's the supervisor's job.
 
 pub mod activation_store;
 pub mod api;
 pub mod app;
 pub mod authenticator;
-pub mod backend;
-pub mod cold_start;
+pub mod build;
+pub mod delivery;
+pub mod domains;
+pub mod entry_limits;
 pub mod display_feeds;
 pub mod events;
 pub mod infra_event;
 pub mod infra_event_bridge;
 pub mod infra_lifecycle_command;
+pub mod infra_door;
 pub mod infra_node;
+pub mod infra_owner;
 pub mod journal;
 pub mod journal_bridge;
 pub mod lease;
 pub mod lifecycle_claimer;
 pub mod listener;
+pub mod live_relay;
+pub mod proxy;
 pub mod member_values;
-pub mod pg_wake;
-pub mod placement;
-pub mod project_namespace;
+pub mod install_picks;
 pub mod projection;
 pub mod project_store;
 pub mod reaper;
-pub mod registry;
+pub mod reclaim;
 pub mod settled;
-pub mod shared_worker_namespace;
 pub mod state;
 pub mod broker_admin;
+pub mod role_client;
 pub mod storage;
-pub mod supervisor_pool;
 pub mod take_down;
 pub mod task_kinds;
 pub mod tenant;
@@ -56,8 +59,6 @@ pub mod versions;
 /// trait from `weft_task_store::executor`.
 pub mod task_executor {
     use crate::state::DispatcherState;
-
-    pub use weft_task_store::executor::run_dispatcher_picker as run_picker_loop;
 
     pub type TaskRegistry = weft_task_store::executor::TaskRegistry<DispatcherState>;
     pub type TaskRegistryBuilder =

@@ -95,7 +95,7 @@ app.get('/live', (_req, res) => {
 
 // SSE event stream, clients connect and receive events in real time.
 // This avoids the bridge needing to POST back to a callback URL (which
-// fails from inside a k8s pod when the API is on the host).
+// fails from inside the container when the API is on the host).
 app.get('/events', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -140,7 +140,7 @@ app.get('/media/:messageId', async (req, res) => {
 
   // Streamed through, never held whole: the bytes go from WhatsApp to
   // the caller (the receive node, which streams them into storage) as
-  // they decrypt, so a long video costs this pod a buffer, not its size.
+  // they decrypt, so a long video costs this bridge a buffer, not its size.
   let stream;
   try {
     const { downloadMediaMessage } = await import('baileys');

@@ -22,10 +22,10 @@ fn resume() -> tasks::NewTask {
         kind: "resume".to_string(),
         target: TaskTarget::Dispatcher,
         project_id: None,
-        dedup_key: Some("color-1:resume".to_string()),
-        color: None,
+        dedup_key: Some("execution_id-1:resume".to_string()),
+        execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_pod_name: None,
+        target_instance: None,
         binary_hash: None,
         payload: json!({}),
     }

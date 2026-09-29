@@ -39,7 +39,7 @@ cron = { version = "0.12", optional = true }
 # The zone a cron timer counts in, validated where the signal is written.
 chrono-tz = { workspace = true, optional = true }
 # Signed routing-token mint/verify (`caller_token`): the dispatcher signs
-# a (color, project, pod) token at the control handshake; the worker
+# an (execution id, project, binary) token at the control handshake; the worker
 # verifies it before accepting a live connection. HMAC-SHA256 over a
 # base64url payload.
 hmac = { workspace = true, optional = true }

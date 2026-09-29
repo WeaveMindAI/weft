@@ -57,8 +57,8 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
     // A run reaches each call's own instance, and each call's rows
     // carry that call's frame. Observed with the program in hand, so the
     // names below are read through their sites.
-    let color = run::start(&mut project).await?;
-    let settled = project.settled(color).await?;
+    let execution_id = run::start(&mut project).await?;
+    let settled = project.settled(execution_id).await?;
     settled.completed()?;
     settled.assert_input("first", "data", &json!("ready"))?;
     settled.assert_input("second", "data", &json!("ready"))?;

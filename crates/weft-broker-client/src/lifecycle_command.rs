@@ -3,7 +3,7 @@
 //! Two consumers claim rows from this table, by DIFFERENT authorities:
 //!   - the dispatcher's `lifecycle_claimer` loop (dispatcher verbs:
 //!     deactivate / reactivate / upgrade) serializes via the per-command
-//!     `claimed_by_pod` claim lease (`claimable_predicate`), because the
+//!     `claimed_by_instance` claim lease (`claimable_predicate`), because the
 //!     dispatcher has no per-project ownership lease of its own;
 //!   - the broker's `supervisor_claim_command` handler
 //!     (`lifecycle_writes::next_command`; supervisor
@@ -30,8 +30,8 @@ use std::time::Duration;
 /// long as the verb runs (an upgrade waits on a drain and a setup run,
 /// for hours if the person asked to wait), so the TTL only bounds how
 /// long a DEAD claimer's command waits to be taken over. A dispatcher
-/// pod that gets `SIGTERM` mid-verb drops its claim implicitly (the row
-/// sits with `claimed_by_pod = <old>` until the lease expires).
+/// process that gets `SIGTERM` mid-verb drops its claim implicitly (the row
+/// sits with `claimed_by_instance = <old>` until the lease expires).
 pub const CLAIM_LEASE_TTL: Duration = Duration::from_secs(300);
 
 /// How often a live dispatcher claimer renews its command's claim: a
@@ -53,13 +53,9 @@ pub fn infra_owner_lease_secs() -> i64 {
     weft_core::time_scale::scaled_secs(45)
 }
 
-/// Max projects a supervisor claims in ONE ownership tick. Claiming is
-/// memory-gated (a pod stops claiming once its memory pressure reaches
-/// the shared saturation threshold), so this just bounds how fast a pod
-/// fills between ticks: it claims a batch, the next tick re-reads its
-/// (now higher) pressure, and stops when saturated. Small enough that
-/// pressure feedback throttles before a pod overshoots, large enough
-/// that a cold pool fills in a few ticks.
+/// Max projects a supervisor claims in ONE ownership tick, so one tick's
+/// claim stays one short statement however many projects wait; the rest
+/// are claimed by the next ticks.
 pub const SUPERVISOR_CLAIM_BATCH: i64 = 16;
 
 /// SQL predicate that identifies "claimable" rows. Use inside the
@@ -67,7 +63,7 @@ pub const SUPERVISOR_CLAIM_BATCH: i64 = 16;
 ///
 /// ```ignore
 /// "UPDATE infra_lifecycle_command \
-///  SET claimed_by_pod = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
+///  SET claimed_by_instance = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
 ///  WHERE id = ( \
 ///     SELECT id FROM infra_lifecycle_command \
 ///     WHERE <caller's tenant/verb filter> AND <CLAIMABLE_PREDICATE> \
@@ -78,76 +74,96 @@ pub const SUPERVISOR_CLAIM_BATCH: i64 = 16;
 ///
 /// The predicate covers two cases:
 ///   - "not yet claimed" (the original happy path);
-///   - "claimed by a dead pod whose lease expired" (the recovery
+///   - "claimed by a dead process whose lease expired" (the recovery
 ///     path). The lease bound is the SQL fragment
 ///     `NOW() - INTERVAL 'CLAIM_LEASE_TTL_SECS seconds'` rendered
 ///     by `claimable_predicate()`.
 pub fn claimable_predicate() -> String {
     format!(
-        "(claimed_by_pod IS NULL \
+        "(claimed_by_instance IS NULL \
           OR claimed_at_unix < EXTRACT(EPOCH FROM NOW() - INTERVAL '{secs} seconds')::BIGINT) \
          AND completed_at_unix IS NULL",
         secs = CLAIM_LEASE_TTL.as_secs()
     )
 }
 
-/// SQL `EXISTS (...)` fragment that is true iff `$pod_param` currently
+/// SQL `EXISTS (...)` fragment that is true iff `$instance_param` currently
 /// holds a LIVE `infra_owner` lease over the project named by
 /// `project_col`. This is the supervisor's ONE single-actor authority:
 /// a supervisor may run a project's lifecycle command, and write its
 /// `infra_node` state, only while it owns the project. The moment a
-/// drain / lease-takeover moves ownership to another pod, every write
-/// from the old pod is rejected and the command flows to the new owner.
+/// drain / lease-takeover moves ownership to another process, every write
+/// from the old process is rejected and the command flows to the new owner.
 ///
-/// Unlike the dispatcher's `claimed_by_pod` claim lease (which serializes
+/// Unlike the dispatcher's `claimed_by_instance` claim lease (which serializes
 /// the dispatcher's own verbs and is the right tool there), the
 /// supervisor needs no per-command claim lease at all: `infra_owner` is
-/// exclusive (one pod per project) and continuously renewed on each
+/// exclusive (one process per project) and continuously renewed on each
 /// ownership tick, and the owner runs one project's commands in order,
-/// so two supervisors can never change one project's cluster objects. The
-/// supervisor's cluster calls are declarative (apply manifests, scale-to-N, delete-by-
+/// so two supervisors can never change one project's infrastructure. The
+/// supervisor's platform calls are declarative (apply manifests, scale-to-N, delete-by-
 /// label), so even the bounded window of one in-flight call from a
 /// just-displaced owner converges rather than corrupts: it is the SAME
 /// command's desired state, re-applied.
 ///
-/// `$pod_param` is the 1-based bind index of the pod name (e.g. `"$1"`);
+/// `$instance_param` is the 1-based bind index of the process name (e.g. `"$1"`);
 /// `project_col` is the SQL expression yielding the project id to check
 /// (a column reference like `"c.project_id"` or a bind like `"$2"`). All
 /// time comes from the DB clock so a skewed app host can't mis-judge the
 /// lease.
 ///
-/// The pod bound at `$pod_param` MUST be the supervisor's `WEFT_POD_NAME`
-/// (the Deployment name stored in `infra_owner.supervisor_pod`), NOT the
-/// auth token's (suffixed) pod name.
-// SYNC: supervisor pod_name (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.pod_name), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.pod_name), crates/weft-dispatcher/src/supervisor_pool.rs (render_supervisor_manifest WEFT_POD_NAME env)
-pub fn owns_project_predicate(pod_param: &str, project_col: &str) -> String {
-    live_lease_exists(Some(pod_param), project_col)
+/// The value bound at `$instance_param` is the supervisor's instance id (the
+/// key stored in `infra_owner.supervisor_instance`).
+// SYNC: supervisor instance (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.instance), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.instance)
+pub fn owns_project_predicate(instance_param: &str, project_col: &str) -> String {
+    live_lease_exists(Some(instance_param), project_col)
 }
 
 /// SQL `EXISTS (...)` fragment that is true iff a LIVE `infra_owner`
-/// lease covers the project named by `project_col`: held by the pod
-/// bound at `pod_param` when one is given (that is
+/// lease covers the project named by `project_col`: held by the process
+/// bound at `instance_param` when one is given (that is
 /// [`owns_project_predicate`]), by any supervisor otherwise. Time comes
 /// from the DB clock.
-pub fn live_lease_exists(pod_param: Option<&str>, project_col: &str) -> String {
-    let pod = pod_param
-        .map(|p| format!("AND io.supervisor_pod = {p} "))
+pub fn live_lease_exists(instance_param: Option<&str>, project_col: &str) -> String {
+    let instance = instance_param
+        .map(|p| format!("AND io.supervisor_instance = {p} "))
         .unwrap_or_default();
     format!(
         "EXISTS ( \
             SELECT 1 FROM infra_owner io \
             WHERE io.project_id = {project_col} \
-              {pod}AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
+              {instance}AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
          )"
     )
 }
 
 /// SQL condition that is true iff the `project` row aliased
-/// `project_alias` is one a supervisor may own: only a namespaced
-/// (paid-tier) project has infra. The ownership tick claims only these,
-/// so every `infra_owner` row names one.
-pub fn claimable_project(project_alias: &str) -> String {
-    format!("{project_alias}.project_namespace <> ''")
+/// `project_alias` is one a supervisor may own. The ownership tick
+/// claims AND renews through this one condition, and a supervisor's
+/// owned set is exactly its live leases, so it never reports a project
+/// lost while it still holds the lease, and a lease over a project with
+/// nothing left to own lapses on its own. A project is ownable while:
+///   - it declares infra, or still has infra nodes to tear down;
+///   - the host holds a copy of it (the bind `held_param`, a uuid
+///     array), which the gone-copy sweep judges only under its lease,
+///     and which a program that declares no infra any more can still
+///     leave behind as kept disks;
+///   - a supervisor command waits on it. Only an owner runs a command
+///     and completes it, so without this a command on a project with no
+///     infra and nothing on the host (a Terminate the orphan reap issued
+///     for the last `infra_node` row, once that row is gone) would never
+///     find an owner, and the owner running it would lose its lease
+///     mid-command.
+pub fn ownable_project(project_alias: &str, held_param: &str) -> String {
+    format!(
+        "({p}.has_infra \
+          OR EXISTS (SELECT 1 FROM infra_node ownable_n WHERE ownable_n.project_id = {p}.id) \
+          OR {p}.id = ANY({held_param}) \
+          OR EXISTS (SELECT 1 FROM infra_lifecycle_command ownable_c \
+                     WHERE ownable_c.project_id = {p}.id AND {pending}))",
+        p = project_alias,
+        pending = pending_supervisor_command("ownable_c"),
+    )
 }
 
 /// The verbs a supervisor claims, as the SQL list inside `verb IN (...)`.
@@ -184,20 +200,15 @@ pub const DISPATCHER_VERBS_SQL: &str = dispatcher_verbs_sql!();
 /// SQL condition that is true iff the `infra_lifecycle_command` row
 /// aliased `command_alias` still waits on a supervisor: not completed,
 /// of a supervisor verb (apply / stop / terminate; deactivate and
-/// reactivate are the dispatcher's), on a [`claimable_project`]. A
-/// cancel-flagged row still counts: only a supervisor running it (and
-/// hitting the cancel check) completes it.
+/// reactivate are the dispatcher's). Such a command makes its project
+/// [`ownable_project`], so it always finds an owner. A cancel-flagged
+/// row still counts: only a supervisor running it (and hitting the
+/// cancel check) completes it.
 pub fn pending_supervisor_command(command_alias: &str) -> String {
     format!(
-        "{c}.verb IN ({verbs}) \
-         AND {c}.completed_at_unix IS NULL \
-         AND EXISTS ( \
-             SELECT 1 FROM project cp \
-             WHERE cp.id = {c}.project_id AND {claimable} \
-         )",
+        "{c}.verb IN ({verbs}) AND {c}.completed_at_unix IS NULL",
         c = command_alias,
         verbs = SUPERVISOR_VERBS_SQL,
-        claimable = claimable_project("cp"),
     )
 }
 

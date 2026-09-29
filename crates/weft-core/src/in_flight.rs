@@ -1,6 +1,6 @@
 //! "How much work is still running, and tell me when there is none."
 //!
-//! A worker pod dies in the middle of things unless something holds the
+//! A worker dies in the middle of things unless something holds the
 //! door: a cost record still being written, an execution still folding
 //! its journal. Both want the same thing, a count that goes up when the
 //! work starts, down when it lands, and a way to park until it reaches

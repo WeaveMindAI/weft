@@ -22,7 +22,7 @@ pub async fn run(
         let (running_policy, drain_timeout) =
             parse_running_choice(running_policy.as_deref(), drain_timeout)?;
         let (client, id) = match project {
-            Some(id) => (inner.client(), id),
+            Some(id) => (inner.client()?, id),
             None => {
                 let handle = super::ensure::ensure_registered(&inner, &progress, node_set).await?;
                 (handle.client, handle.id)

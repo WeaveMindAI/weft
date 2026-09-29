@@ -43,7 +43,10 @@ async fn order(rig: FakeRig) -> WeftResult<()> {
     let selves: Vec<StopSelf> = calls.iter().map(|(_, s)| *s).collect();
     assert_eq!(selves, vec![StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Include]);
     match &calls[1].0 {
-        ProgramCall::InfraTerminate { node, .. } => assert_eq!(node, "bridge"),
+        ProgramCall::InfraTerminate { node, disks, .. } => {
+            assert_eq!(node, "bridge");
+            assert_eq!(*disks, weft::infra::TerminateDisks::DeleteAll, "the kept disks go too");
+        }
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())
